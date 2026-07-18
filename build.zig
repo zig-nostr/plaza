@@ -1,8 +1,8 @@
 //! Plaza's build. `native eject` wrote the baseline, which drives the standard
 //! app build through the framework's `addApp`. We extend it to link `nostr`
 //! directly into the app process: `nostr` vendors secp256k1 + LMDB, so this is
-//! what makes the one-process architecture — the local store opening in the
-//! render process — real, rather than a second daemon reached over IPC.
+//! what makes the one-process architecture, the local store opening in the
+//! render process, real, rather than a second daemon reached over IPC.
 //!
 //! `addAppArtifacts` returns the app executable and the test compile. The exe
 //! builds ReleaseFast and the tests build Debug, so each gets its own `nostr`

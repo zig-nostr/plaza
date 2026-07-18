@@ -35,12 +35,12 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
-/// A signed kind:1 note with the given content, for the view + store tests.
-fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, content: []const u8) !nostr.event.Event {
-    return nostr.event.create(arena, signer, kp, 1_700_000_000, 1, &.{}, content, null);
+/// A signed kind:1 note with the given timestamp and content.
+fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, created_at: i64, content: []const u8) !nostr.event.Event {
+    return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
 }
 
-test "the empty feed renders the brand and a placeholder" {
+test "the empty feed renders the brand and a connecting header" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -49,11 +49,10 @@ test "the empty feed renders the brand and a placeholder" {
     const tree = try buildTree(arena, &model);
 
     try testing.expect(findByText(tree.root, .text, "Plaza") != null);
-    // The default (connecting, empty) state shows the placeholder.
     try testing.expect(findByText(tree.root, .text, "Connecting…") != null);
 }
 
-test "the feed renders notes from the model" {
+test "a note becomes an npub-labelled card with a relative time" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -61,44 +60,41 @@ test "the feed renders notes from the model" {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey([_]u8{3} ** 32);
-    const ev = try signedNote(arena, signer, kp, "hello from plaza");
 
-    var model = main.initialModel();
-    model.conn = .connected;
-    model.notes[0] = main.noteFrom(ev);
-    model.notes_len = 1;
+    const now: i64 = 1_800_000_000;
+    const ev = try signedNote(arena, signer, kp, now - 300, "hello from plaza"); // 5 minutes ago
+    const note = main.noteFrom(ev, now);
 
-    const tree = try buildTree(arena, &model);
-    // The note content is bound into a card, and the status bar counts it.
-    try testing.expect(findByText(tree.root, .text, "hello from plaza") != null);
-    try testing.expect(findByText(tree.root, .status_bar, "1 notes") != null);
+    // Author is the abbreviated, canonical npub.
+    try testing.expect(std.mem.startsWith(u8, note.author(), "npub1"));
+    try testing.expect(std.mem.indexOfScalar(u8, note.author(), '\xe2') != null); // the "…" abbreviation marker
+    // Relative time and avatar initials.
+    try testing.expectEqualStrings("5m", note.time());
+    try testing.expectEqual(@as(usize, 2), note.initials().len);
+    // Content survives.
+    try testing.expectEqualStrings("hello from plaza", note.content());
 }
 
-test "the feed key survives a high-bit event id" {
+test "the feed renders a note card from the model" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
-
-    // Find a note whose id begins with the high bit set — the case that
-    // overflows the markup engine's i64 key cast if the key is stored as u64.
-    var seed: u8 = 1;
-    const ev = while (seed < 255) : (seed += 1) {
-        const kp = try signer.keyPairFromSecretKey([_]u8{seed} ** 32);
-        const e = try signedNote(arena, signer, kp, "high-bit id");
-        if (e.id[0] >= 0x80) break e;
-    } else return error.NoHighBitIdFound;
+    const kp = try signer.keyPairFromSecretKey([_]u8{4} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a note in the feed");
 
     var model = main.initialModel();
     model.conn = .connected;
-    model.notes[0] = main.noteFrom(ev);
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
     model.notes_len = 1;
 
-    // Building the list resolves the item key; a u64 key would panic here.
     const tree = try buildTree(arena, &model);
-    try testing.expect(findByText(tree.root, .text, "high-bit id") != null);
+    // The card shows the content, the npub author, and the count in the footer.
+    try testing.expect(findByText(tree.root, .text, "a note in the feed") != null);
+    try testing.expect(findByText(tree.root, .text, model.notes[0].author()) != null);
+    try testing.expect(findByText(tree.root, .status_bar, "1 notes") != null);
 }
 
 test "the view lays out through the canvas engine" {
@@ -121,7 +117,7 @@ test "one-process: a signed note round-trips through the local store" {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
-    const ev = try signedNote(arena, signer, kp, "stored in-process");
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "stored in-process");
 
     // A throwaway store under the test tmp dir (self-cleaning).
     var tmp = testing.tmpDir(.{});
@@ -132,7 +128,7 @@ test "one-process: a signed note round-trips through the local store" {
     var store = try nostr.store.Store.open(db_path, .{});
     defer store.deinit();
 
-    // Ingest verifies (secp256k1) and stores (LMDB) — the whole in-process path.
+    // Ingest verifies (secp256k1) and stores (LMDB), the whole in-process path.
     const result = try store.ingest(arena, ev, .{ .verify_with = signer });
     try testing.expectEqual(nostr.store.IngestResult.added, result);
 
@@ -142,4 +138,31 @@ test "one-process: a signed note round-trips through the local store" {
     defer q.deinit();
     try testing.expectEqual(@as(usize, 1), q.events.len);
     try testing.expectEqualStrings("stored in-process", q.events[0].content);
+}
+
+test "the feed key survives a high-bit event id" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    // Find a note whose id begins with the high bit set, the case that
+    // overflows the markup engine's i64 key cast if the key is stored as u64.
+    var seed: u8 = 1;
+    const ev = while (seed < 255) : (seed += 1) {
+        const kp = try signer.keyPairFromSecretKey([_]u8{seed} ** 32);
+        const e = try signedNote(arena, signer, kp, 1_800_000_000, "high-bit id");
+        if (e.id[0] >= 0x80) break e;
+    } else return error.NoHighBitIdFound;
+
+    var model = main.initialModel();
+    model.conn = .connected;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+
+    // Building the list resolves the item key; a u64 key would panic here.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findByText(tree.root, .text, "high-bit id") != null);
 }
