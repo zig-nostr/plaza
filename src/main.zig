@@ -1,13 +1,12 @@
 //! Plaza, the flagship native Nostr client.
 //!
-//! M2 turns M1's raw architecture proof into a feed that reads like a client.
-//! The background thread still ingests notes from a relay into the local store;
-//! the UI now renders them as proper cards, an avatar, the author's npub, a
-//! relative timestamp, and the note, and reconciles smoothly: it only
-//! re-queries the store when something actually changed, and refreshes the
-//! relative times every tick. Everything still runs in one process, reading
-//! straight from disk. Real names (kind:0 profiles), a relay pool with the
-//! outbox model, and community "places" come in the milestones ahead.
+//! M3 grows the feed from a single relay to a pool. Each relay in `relays` runs
+//! on its own thread, dialing and ingesting recent notes into the one shared
+//! local store, which dedupes across them by event id; the header summarises how
+//! much of the pool is live. The UI still renders cards (avatar, npub, relative
+//! time, note) and reconciles from the store on a timer, all in one process
+//! reading straight from disk. Real names (kind:0 profiles), NIP-65 outbox
+//! routing, composing, and community "places" come in the milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
@@ -25,9 +24,18 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 440;
 const window_height: f32 = 680;
 
-// The one relay this milestone dials, and how many recent notes to keep on
-// screen. A relay pool with the outbox model (NIP-65) is a later milestone.
-const relay_url = "wss://relay.damus.io";
+// The relay pool this milestone dials, and how many recent notes to keep on
+// screen. Each relay runs on its own thread and ingests into the one shared
+// store, which dedupes by event id. NIP-65 outbox routing (reading each author
+// from their own write relays) needs a follow list, so it arrives with a later
+// milestone; here a fixed pool is the relay engine.
+const relays = [_][]const u8{
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://relay.nostr.band",
+    "wss://relay.snort.social",
+};
 const feed_capacity = 60;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
@@ -49,17 +57,24 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // ------------------------------------------------- one-process runtime wiring
 //
 // A native app is a single process and a single instance, so the shared store,
-// the ingest thread's connection state, and the wall clock live as process
-// globals, the Model stays pure view state (the framework reflects Model/Msg
-// for markup checking). Sharing the store across the UI and ingest threads is
-// safe: LMDB serialises its own writers and hands readers an MVCC snapshot, and
-// every `nostr.store` call is a self-contained transaction on its calling
-// thread.
+// each relay's connection state, and the wall clock live as process globals,
+// the Model stays pure view state (the framework reflects Model/Msg for markup
+// checking). Sharing the store across the UI thread and the several ingest
+// threads is safe: LMDB serialises its writers (the pool's ingests take the
+// write lock one at a time) and hands readers an MVCC snapshot, and every
+// `nostr.store` call is a self-contained transaction on its calling thread.
 
 const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2 };
 
 var g_store: ?*nostr.store.Store = null;
-var g_conn = std.atomic.Value(u8).init(@intFromEnum(Conn.connecting));
+// One connection state per relay in the pool, flipped by that relay's ingest
+// thread and read by the UI thread to summarise the pool.
+var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** relays.len;
+
+/// Sets relay `index`'s live connection state.
+fn setRelayStatus(index: usize, state: Conn) void {
+    g_relay_status[index].store(@intFromEnum(state), .monotonic);
+}
 // The UI thread's Io, for wall-clock time when rendering relative timestamps
 // (set once in `main`, read only on the UI thread).
 var g_io: ?std.Io = null;
@@ -127,12 +142,13 @@ pub const Note = struct {
 pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
     notes_len: usize = 0,
-    conn: Conn = .connecting,
+    live_relays: usize = 0,
+    offline_relays: usize = 0,
 
     // These fields reach the view only through methods, `notes`/`notes_len`
-    // through `note_list`/`has_notes`/`footer`, `conn` through the state
-    // predicates, so the raw fields are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "conn" };
+    // through `note_list`/`has_notes`/`footer`, the relay counts through the
+    // status line, so the raw fields are never bound by name.
+    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays" };
 
     /// The feed, iterated by `<for each="note_list">`, newest first.
     pub fn note_list(self: *const Model, arena: std.mem.Allocator) []const Note {
@@ -147,19 +163,16 @@ pub const Model = struct {
     pub fn empty(self: *const Model) bool {
         return self.notes_len == 0;
     }
-    /// Header connection line.
-    pub fn status(self: *const Model) []const u8 {
-        return switch (self.conn) {
-            .connecting => "Connecting…",
-            .connected => "Live · " ++ relay_url,
-            .offline => "Offline, reconnecting…",
-        };
+    /// Header status line: how much of the relay pool is live.
+    pub fn status(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (self.live_relays > 0)
+            return std.fmt.allocPrint(arena, "Live · {d}/{d} relays", .{ self.live_relays, relays.len }) catch "Live";
+        if (self.offline_relays >= relays.len) return "Offline, reconnecting…";
+        return "Connecting…";
     }
     pub fn empty_text(self: *const Model) []const u8 {
-        return switch (self.conn) {
-            .offline => "Can't reach the relay. Retrying…",
-            else => "Connecting to " ++ relay_url ++ " …",
-        };
+        if (self.offline_relays >= relays.len) return "Can't reach any relay. Retrying…";
+        return "Connecting to the relay pool…";
     }
     /// Status-bar summary.
     pub fn footer(self: *const Model, arena: std.mem.Allocator) []const u8 {
@@ -172,7 +185,18 @@ pub const Model = struct {
     /// count changed since the last rebuild; and re-computes relative times for
     /// the notes on screen. `now_s` is the current wall-clock second.
     fn refresh(self: *Model, now_s: i64) void {
-        self.conn = @enumFromInt(g_conn.load(.acquire));
+        var live: usize = 0;
+        var offline: usize = 0;
+        for (&g_relay_status) |*s| {
+            switch (@as(Conn, @enumFromInt(s.load(.acquire)))) {
+                .connected => live += 1,
+                .offline => offline += 1,
+                .connecting => {},
+            }
+        }
+        self.live_relays = live;
+        self.offline_relays = offline;
+
         const store = g_store orelse return;
 
         const count = store.eventCount() catch return;
@@ -347,11 +371,17 @@ fn startFeed(init: std.process.Init) void {
     };
     g_store = store;
 
-    const thread = std.Thread.spawn(.{}, ingestForever, .{gpa}) catch |err| {
-        std.debug.print("plaza: could not start relay ingest: {s}\n", .{@errorName(err)});
-        return;
-    };
-    thread.detach();
+    // One ingest thread per relay in the pool. Each dials independently, so a
+    // slow or down relay never holds up the others, and all write into the one
+    // shared store (LMDB serialises the concurrent writers).
+    for (0..relays.len) |i| {
+        const thread = std.Thread.spawn(.{}, ingestRelay, .{ gpa, i }) catch |err| {
+            std.debug.print("plaza: [{s}] could not start: {s}\n", .{ relays[i], @errorName(err) });
+            setRelayStatus(i, .offline);
+            continue;
+        };
+        thread.detach();
+    }
 }
 
 /// Opens (creating if needed) the feed store at `$HOME/.plaza/feed.mdb`.
@@ -370,14 +400,15 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 
 // ----------------------------------------------------------- background ingest
 //
-// The ingest loop runs on its own thread with its own `std.Io.Threaded` and its
-// own secp256k1 context, the io backend and the signer are not shared across
-// threads, the exact shape the Signet daemon uses per relay. It dials,
+// Each relay's ingest loop runs on its own thread with its own `std.Io.Threaded`
+// and its own secp256k1 context, the io backend and the signer are not shared
+// across threads, the exact shape the Signet daemon uses per relay. It dials,
 // subscribes for recent kind:1, verifies each event, and writes it into the
 // shared store; the UI thread reads it back through `Model.refresh`.
 
-/// Relay ingest loop: dial, serve, and reconnect after a short delay, forever.
-fn ingestForever(gpa: std.mem.Allocator) void {
+/// One relay's ingest loop: dial, serve, and reconnect after a short delay,
+/// forever.
+fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -386,21 +417,21 @@ fn ingestForever(gpa: std.mem.Allocator) void {
     defer signer.deinit();
 
     while (true) {
-        g_conn.store(@intFromEnum(Conn.connecting), .monotonic);
-        ingestOnce(gpa, io, signer) catch |err| {
-            std.debug.print("plaza: [{s}] {s}\n", .{ relay_url, @errorName(err) });
+        setRelayStatus(index, .connecting);
+        ingestOnce(gpa, io, signer, index) catch |err| {
+            std.debug.print("plaza: [{s}] {s}\n", .{ relays[index], @errorName(err) });
         };
-        g_conn.store(@intFromEnum(Conn.offline), .monotonic);
+        setRelayStatus(index, .offline);
         io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
     }
 }
 
-/// Dials the relay, subscribes for recent kind:1, and ingests each event into
-/// the store until the connection closes.
-fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer) !void {
-    var relay = try nostr.relay.dial(gpa, io, relay_url);
+/// Dials relay `index`, subscribes for recent kind:1, and ingests each event
+/// into the shared store until the connection closes.
+fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, index: usize) !void {
+    var relay = try nostr.relay.dial(gpa, io, relays[index]);
     defer relay.deinit();
-    g_conn.store(@intFromEnum(Conn.connected), .monotonic);
+    setRelayStatus(index, .connected);
 
     const kinds = [_]u16{1};
     const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = feed_capacity }};
