@@ -1,7 +1,9 @@
-<!-- Plaza, M2: the local-first feed. A background thread ingests notes from a
-     relay into the local store; the UI reconciles from the store on a timer and
-     renders them as cards (avatar · npub · relative time · note). Logic is in
-     src/main.zig. Edit while `native dev` runs to hot-reload. Validate: native check -->
+<!-- Plaza, M4: the local-first feed plus a composer. A pool of background threads
+     ingests notes into the local store; the UI reconciles from the store on a
+     timer and renders them as cards (avatar · npub · relative time · note). The
+     composer signs a kind:1 with the local identity, stores it at once, and
+     publishes it to the pool. Logic is in src/main.zig. Edit while `native dev`
+     runs to hot-reload. Validate: native check -->
 <column gap="0">
   <column gap="4" padding="16">
     <text size="heading">Plaza</text>
@@ -33,5 +35,16 @@
       </column>
     </scroll>
   </if>
+  <separator/>
+  <column gap="8" padding="12">
+    <input-group>
+      <textarea text="{draft}" placeholder="Share something with the network…" on-input="draft_edit" on-submit="post"/>
+      <input-group-actions>
+        <text size="sm" foreground="text_muted">{identity}</text>
+        <spacer grow="1"/>
+        <button size="sm" variant="primary" disabled="{draft_empty}" on-press="post">Post</button>
+      </input-group-actions>
+    </input-group>
+  </column>
   <status-bar>{footer}</status-bar>
 </column>
