@@ -60,6 +60,8 @@ test "first run shows the onboarding welcome, not the feed" {
 
     try testing.expect(findAnyText(tree.root, "Welcome to Nostr") != null);
     try testing.expect(findAnyText(tree.root, "Create your identity") != null);
+    // Both onboarding paths render: create a local key, or connect a signer.
+    try testing.expect(findAnyText(tree.root, "Connect") != null);
     // The feed's connecting header does not show on the welcome screen.
     try testing.expect(findAnyText(tree.root, "Connecting…") == null);
 }

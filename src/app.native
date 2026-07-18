@@ -13,6 +13,16 @@
       <text wrap="true" foreground="text_muted">Create an identity and Plaza sets you up with a starter feed of great accounts. Your notes stay on your device and publish straight to the network.</text>
       <button size="lg" variant="primary" on-press="create_identity">Create your identity</button>
       <text size="sm" foreground="text_muted">A second to set up. No email, no signup.</text>
+      <separator/>
+      <text size="sm" foreground="text_muted">Already have a signer? Paste its bunker link to keep your key off this device.</text>
+      <input-group width="340">
+        <textarea text="{bunker_draft}" placeholder="bunker://…" on-input="bunker_edit" on-submit="connect_signer"/>
+        <input-group-actions>
+          <text size="sm" foreground="text_muted">{connect_status}</text>
+          <spacer grow="1"/>
+          <button size="sm" disabled="{bunker_empty}" on-press="connect_signer">Connect</button>
+        </input-group-actions>
+      </input-group>
     </column>
   </if>
   <if test="{show_feed}">
