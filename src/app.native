@@ -1,9 +1,32 @@
-<!-- Plaza — the flagship native Nostr client. M0: a minimal branded window.
-     The feed, community "places", and compose land in later milestones.
-     Edit while `native dev` runs to hot-reload. Validate with:
-     native markup check src/app.native -->
-<column gap="10" main="center" cross="center" padding="24" grow="1">
-  <text>Plaza</text>
-  <text>A fast, local-first Nostr client.</text>
-  <status-bar>early — building in the open</status-bar>
+<!-- Plaza — M1 architecture spike. A live feed rendered straight from the local
+     store: a background thread ingests kind:1 notes from a relay, the UI
+     re-queries the store on a timer and lists what it finds. Logic is in
+     src/main.zig. Edit while `native dev` runs to hot-reload. Validate with:
+     native check -->
+<column gap="0">
+  <column gap="4" padding="16">
+    <text size="heading">Plaza</text>
+    <text foreground="text_muted">{status}</text>
+  </column>
+  <separator/>
+  <if test="{empty}">
+    <column gap="12" main="center" cross="center" grow="1" padding="24">
+      <text foreground="text_muted">{empty_text}</text>
+    </column>
+  </if>
+  <if test="{has_notes}">
+    <scroll grow="1">
+      <column gap="8" padding="12">
+        <for each="note_list" key="id" as="n">
+          <card padding="12">
+            <column gap="6">
+              <text foreground="text_muted">{n.author}</text>
+              <text wrap="true">{n.content}</text>
+            </column>
+          </card>
+        </for>
+      </column>
+    </scroll>
+  </if>
+  <status-bar>{footer}</status-bar>
 </column>
