@@ -1,0 +1,9 @@
+<!-- Plaza — the flagship native Nostr client. M0: a minimal branded window.
+     The feed, community "places", and compose land in later milestones.
+     Edit while `native dev` runs to hot-reload. Validate with:
+     native markup check src/app.native -->
+<column gap="10" main="center" cross="center" padding="24" grow="1">
+  <text>Plaza</text>
+  <text>A fast, local-first Nostr client.</text>
+  <status-bar>early — building in the open</status-bar>
+</column>
