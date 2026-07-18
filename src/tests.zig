@@ -49,12 +49,28 @@ fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.key
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
 }
 
+test "first run shows the onboarding welcome, not the feed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Default stage is onboarding (a fresh install with no identity on disk).
+    var model = main.initialModel();
+    const tree = try buildTree(arena, &model);
+
+    try testing.expect(findAnyText(tree.root, "Welcome to Nostr") != null);
+    try testing.expect(findAnyText(tree.root, "Create your identity") != null);
+    // The feed's connecting header does not show on the welcome screen.
+    try testing.expect(findAnyText(tree.root, "Connecting…") == null);
+}
+
 test "the empty feed renders the brand and a connecting header" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var model = main.initialModel();
+    model.stage = .ready;
     const tree = try buildTree(arena, &model);
 
     try testing.expect(findByText(tree.root, .text, "Plaza") != null);
@@ -95,6 +111,7 @@ test "the feed renders a note card from the model" {
     const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a note in the feed");
 
     var model = main.initialModel();
+    model.stage = .ready;
     model.notes[0] = main.noteFrom(ev, 1_800_000_000);
     model.notes_len = 1;
 
@@ -112,12 +129,14 @@ test "the header summarises the relay pool" {
 
     // Some relays live: the header shows the live count out of the pool.
     var live = main.initialModel();
+    live.stage = .ready;
     live.live_relays = 3;
     const live_tree = try buildTree(arena, &live);
     try testing.expect(findByText(live_tree.root, .text, "Live · 3/5 relays") != null);
 
     // The whole pool down: the header says so.
     var down = main.initialModel();
+    down.stage = .ready;
     down.offline_relays = 5;
     const down_tree = try buildTree(arena, &down);
     try testing.expect(findByText(down_tree.root, .text, "Offline, reconnecting…") != null);
@@ -128,6 +147,7 @@ test "the view lays out through the canvas engine" {
     defer arena_state.deinit();
 
     var model = main.initialModel();
+    model.stage = .ready;
     const tree = try buildTree(arena_state.allocator(), &model);
 
     var nodes: [64]canvas.WidgetLayoutNode = undefined;
@@ -172,6 +192,7 @@ test "the composer renders a Post action and, without a key, an identity prompt"
     const arena = arena_state.allocator();
 
     var model = main.initialModel();
+    model.stage = .ready;
     const tree = try buildTree(arena, &model);
 
     // Building the tree exercises the composer markup (input-group, textarea,
@@ -205,6 +226,7 @@ test "the feed key survives a high-bit event id" {
     } else return error.NoHighBitIdFound;
 
     var model = main.initialModel();
+    model.stage = .ready;
     model.notes[0] = main.noteFrom(ev, 1_800_000_000);
     model.notes_len = 1;
 

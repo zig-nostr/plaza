@@ -1,15 +1,16 @@
 //! Plaza, the flagship native Nostr client.
 //!
-//! M4 adds composing. A local identity (a keypair generated and persisted on
-//! first run) signs a kind:1 note, which is stored locally at once so it shows
-//! in the feed immediately, then published to the relay pool on a background
-//! thread so it propagates to the network. The feed still runs as a pool (each
+//! M5 adds onboarding. A first run opens a welcome screen; creating an identity
+//! generates and persists a local keypair, then drops into a follow-based feed
+//! seeded by a curated starter pack (the `starter_pack` authors), so a newcomer
+//! is browsing and posting in seconds. Composing signs a kind:1 that is stored
+//! locally at once and published to the pool (M4). The feed runs as a pool (each
 //! relay on its own thread ingesting into the one shared store, deduped by event
-//! id), rendering cards (avatar, npub, relative time, note) reconciled on a
-//! timer, all in one process reading straight from disk. Real names (kind:0
-//! profiles), NIP-65 outbox routing, connecting an external signer (Signet, over
-//! NIP-46, so the key never enters the client), and community "places" come in
-//! the milestones ahead.
+//! id), now scoped to the follow set, rendering cards (avatar, npub, relative
+//! time, note) reconciled on a timer, all in one process reading straight from
+//! disk. Real names (kind:0 profiles), NIP-65 outbox routing, connecting an
+//! external signer (Signet, over NIP-46, so the key never enters the client),
+//! and community "places" come in the milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
@@ -39,6 +40,31 @@ const relays = [_][]const u8{
     "wss://relay.nostr.band",
     "wss://relay.snort.social",
 };
+
+// The curated starter pack a newcomer follows on first run: a handful of
+// well-known, active accounts so the feed is alive from the first second. The
+// feed is scoped to these authors (plus the user's own notes); follow
+// management and NIP-51 lists come later. Pubkeys are hex, decoded to bytes at
+// comptime.
+const starter_pack_hex = [_][]const u8{
+    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d", // fiatjaf
+    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2", // jack
+    "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55
+    "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // ODELL
+    "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93", // gigi
+    "84dee6e676e5bb67b4ad4e042cf70cbd8681155db535942fcc6a0533858a7240", // Snowden
+    "fa984bd7dbb282f07e16e7ae87b26a2a7b9b90b7246a44771f0cf5ae58018f52", // Vitor (Amethyst)
+    "eab0e756d32b80bcd464f3d844b8040303075a13eabc3599a762c9ac7ab91f4f", // hodlbod
+    "460c25e682fda7832b52d1f22d3d22b3176d972f60dcdc3212ed8c92ef85065c", // Lyn Alden
+};
+const starter_pack = blk: {
+    var pks: [starter_pack_hex.len][32]u8 = undefined;
+    for (starter_pack_hex, 0..) |h, i| {
+        _ = std.fmt.hexToBytes(&pks[i], h) catch unreachable;
+    }
+    break :blk pks;
+};
+
 const feed_capacity = 60;
 // The composer's fixed text capacity. Comfortably longer than a typical note;
 // the display buffer (`Note.content_buf`) truncates for rendering, but the
@@ -85,17 +111,21 @@ fn setRelayStatus(index: usize, state: Conn) void {
 // The UI thread's Io, for wall-clock time when rendering relative timestamps
 // (set once in `main`, read only on the UI thread).
 var g_io: ?std.Io = null;
+// The process environment, stashed in `main` so the onboarding "create identity"
+// action can resolve `$HOME` and open the store off the UI thread event loop.
+var g_environ: ?*const std.process.Environ.Map = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
 var g_last_count: usize = std.math.maxInt(usize);
 
-// Plaza's local identity: the keypair that signs composed notes. Loaded once on
-// the UI thread in `main` and read only there, so no synchronisation is needed.
-// The signer holds a secp256k1 context (not shared across threads); the publish
-// path never signs, it forwards an already-signed event, so it needs neither.
-// This is the zero-config local signer; connecting an external signer (Signet,
-// over NIP-46, so the key never touches the client) is the onboarding path in a
-// later milestone, and swaps in at `signNote` below.
+// Plaza's local identity: the keypair that signs composed notes. Loaded in
+// `main` (returning user) or created by the onboarding action, both on the UI
+// thread, and read only there, so no synchronisation is needed. The signer holds
+// a secp256k1 context (not shared across threads); the publish path never signs,
+// it forwards an already-signed event, so it needs neither. This is the
+// zero-config local signer; connecting an external signer (Signet, over NIP-46,
+// so the key never touches the client) is the next onboarding option, and swaps
+// in at `signNote` below.
 var g_identity_signer: ?nostr.keys.Signer = null;
 var g_identity_kp: ?nostr.keys.KeyPair = null;
 var g_identity_npub_buf: [24]u8 = undefined;
@@ -158,6 +188,9 @@ pub const Note = struct {
     }
 };
 
+/// Which top-level screen the app shows.
+const Stage = enum { onboarding, ready };
+
 pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
     notes_len: usize = 0,
@@ -167,12 +200,25 @@ pub const Model = struct {
     // text through `draft()`, never the buffer itself, and every edit event is
     // mirrored here in `update`.
     draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
+    // Which screen shows. A returning user (identity already on disk) starts at
+    // `.ready`; a newcomer starts at `.onboarding` and moves to `.ready` when
+    // they create an identity.
+    stage: Stage = .onboarding,
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
-    // status line, the draft through `draft`/`draft_empty`, so the raw fields
-    // are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer" };
+    // status line, the draft through `draft`/`draft_empty`, the stage through
+    // `show_onboarding`/`show_feed`, so the raw fields are never bound by name.
+    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage" };
+
+    /// Whether the first-run welcome screen shows (no identity yet).
+    pub fn show_onboarding(self: *const Model) bool {
+        return self.stage == .onboarding;
+    }
+    /// Whether the main feed shows (identity established).
+    pub fn show_feed(self: *const Model) bool {
+        return self.stage == .ready;
+    }
 
     /// The composer's current text (what `text="{draft}"` binds).
     pub fn draft(self: *const Model) []const u8 {
@@ -250,7 +296,17 @@ pub const Model = struct {
 
     fn rebuildNotes(self: *Model, store: *nostr.store.Store, now_s: i64) void {
         const kinds = [_]u16{1};
-        var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .limit = feed_capacity }) catch return;
+        // Scope the feed to the follow set (the starter pack) plus the user's own
+        // notes, so it reads as a real follow feed, not a firehose. Filtering
+        // here (not just at the subscription) also hides notes an earlier,
+        // unscoped run may have left in the store.
+        var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
+        var authors_len: usize = starter_pack.len;
+        if (g_identity_kp) |kp| {
+            authors[authors_len] = kp.public_key;
+            authors_len += 1;
+        }
+        var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = feed_capacity }) catch return;
         defer result.deinit();
         var n: usize = 0;
         for (result.events) |ev| {
@@ -337,6 +393,8 @@ pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     /// Post the current draft: sign, store locally, and publish to the pool.
     post,
+    /// Onboarding: create a local identity and enter the feed.
+    create_identity,
 
     // `tick` is dispatched by the refresh timer in Zig, never from markup.
     pub const view_unbound = .{"tick"};
@@ -369,6 +427,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .draft_edit => |edit| model.draft_buffer.apply(edit),
         .post => submitPost(model),
+        .create_identity => {
+            // Generate the local key, then bring the feed up and switch screens.
+            if (!createLocalIdentity()) return;
+            model.stage = .ready;
+            if (g_store == null) {
+                if (g_io) |io| if (g_environ) |env| startFeed(io, env);
+            }
+        },
     }
 }
 
@@ -453,11 +519,13 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
+    g_environ = init.environ_map;
 
-    // Load (or, on first run, generate) the local identity before the first
-    // paint, so the composer knows who it posts as. Best-effort: on failure the
-    // app still runs, with posting disabled until an identity exists.
-    loadOrCreateIdentity(init.io, init.environ_map);
+    // A returning user has an identity on disk: load it and skip onboarding. A
+    // newcomer starts at the welcome screen, and the feed comes up when they
+    // create an identity (see `update`). Best-effort: on failure the app still
+    // runs, showing onboarding.
+    const has_identity = loadIdentityIfPresent(init.io, init.environ_map);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
@@ -469,10 +537,12 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModel();
-
-    // Open the local store and start the background relay ingest before the
-    // window comes up. Best-effort: if either fails the window still opens.
-    startFeed(init);
+    if (has_identity) {
+        // Returning user: open the store and start the background ingest before
+        // the window appears. A newcomer's feed starts on identity creation.
+        app_state.model.stage = .ready;
+        startFeed(init.io, init.environ_map);
+    }
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "plaza",
@@ -495,10 +565,11 @@ pub fn main(init: std.process.Init) !void {
 /// blocked in a relay read at quit, so we deliberately never tear them down,
 /// process exit reclaims them without racing the detached thread. A failure
 /// here is non-fatal: the app runs with an empty feed that reads "offline".
-fn startFeed(init: std.process.Init) void {
+fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
+    if (g_store != null) return; // already running
     const gpa = std.heap.page_allocator;
     const store = gpa.create(nostr.store.Store) catch return;
-    store.* = openFeedStore(init.io, init.environ_map) catch |err| {
+    store.* = openFeedStore(io, environ) catch |err| {
         std.debug.print("plaza: local store unavailable: {s}\n", .{@errorName(err)});
         gpa.destroy(store);
         return;
@@ -535,63 +606,82 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 // ----------------------------------------------------------------- identity
 //
 // Plaza's local signing identity lives beside the feed store, at
-// `$HOME/.plaza/identity.key` (the raw 32-byte secret, mode 0600), generated on
-// first run. This is the zero-config local signer so the app posts out of the
-// box; connecting an external signer (Signet, over NIP-46) so the key never
-// touches the client is the onboarding path in a later milestone.
+// `$HOME/.plaza/identity.key` (the raw 32-byte secret, mode 0600). It is created
+// on the user's onboarding action, not silently: a first run with no key file
+// opens the welcome screen, and "Create your identity" generates and persists
+// it. This is the zero-config local signer; connecting an external signer
+// (Signet, over NIP-46) so the key never touches the client is the next
+// onboarding option, and swaps in at `signNote`.
 
-/// Loads the local identity into the process globals, generating and persisting
-/// a fresh key on first run. Best-effort: on any failure the globals stay unset
-/// and posting is disabled, but the app still runs.
-fn loadOrCreateIdentity(io: std.Io, environ: *const std.process.Environ.Map) void {
-    var signer = nostr.keys.Signer.init();
-    const secret = identitySecret(io, environ, signer) catch |err| {
-        std.debug.print("plaza: identity unavailable: {s}\n", .{@errorName(err)});
-        signer.deinit();
-        return;
-    };
-    const kp = signer.keyPairFromSecretKey(secret) catch |err| {
-        std.debug.print("plaza: identity key invalid: {s}\n", .{@errorName(err)});
-        signer.deinit();
-        return;
-    };
-    g_identity_signer = signer;
-    g_identity_kp = kp;
-    const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
-    g_identity_npub_len = npub.len;
-}
-
-/// Returns the identity's 32-byte secret, reading `$HOME/.plaza/identity.key` or
-/// generating and persisting it on first run (mode 0600). `signer` provides the
-/// entropy for a freshly generated key.
-fn identitySecret(io: std.Io, environ: *const std.process.Environ.Map, signer: nostr.keys.Signer) ![32]u8 {
+/// Opens (creating if needed) `$HOME/.plaza`, returning the directory handle.
+fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
     const home = environ.get("HOME") orelse ".";
     var dir_buf: [512]u8 = undefined;
     const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza", .{home});
     // mkdir -p (idempotent); an absolute sub-path ignores the cwd handle.
-    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+    return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+}
+
+/// Loads the identity from `identity.key` if present, adopting it and returning
+/// true. Never generates a key, that is the onboarding action's job.
+fn loadIdentityIfPresent(io: std.Io, environ: *const std.process.Environ.Map) bool {
+    var dir = plazaDir(io, environ) catch return false;
     defer dir.close(io);
 
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "identity.key", gpa, std.Io.Limit.limited(64)) catch |err| switch (err) {
-        error.FileNotFound => {
-            // First run: generate a key and persist it, refusing to clobber a
-            // key another instance may have written between the read and here.
-            const kp = try signer.generateKeyPair(io);
-            dir.writeFile(io, .{
-                .sub_path = "identity.key",
-                .data = &kp.secret_key,
-                .flags = .{ .exclusive = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
-            }) catch |werr| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(werr)});
-            return kp.secret_key;
-        },
-        else => return err,
-    };
+    const raw = dir.readFileAlloc(io, "identity.key", gpa, std.Io.Limit.limited(64)) catch return false;
     defer gpa.free(raw);
-    if (raw.len != 32) return error.BadIdentityFile;
+    if (raw.len != 32) return false;
+
+    var signer = nostr.keys.Signer.init();
     var secret: [32]u8 = undefined;
     @memcpy(&secret, raw[0..32]);
-    return secret;
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        signer.deinit();
+        return false;
+    };
+    setIdentity(signer, kp);
+    return true;
+}
+
+/// Generates a fresh identity, persists it (mode 0600), and adopts it. Backs the
+/// onboarding "create identity" action, using the io and environment stashed in
+/// `main`. Returns true on success.
+fn createLocalIdentity() bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+
+    var signer = nostr.keys.Signer.init();
+    const kp = signer.generateKeyPair(io) catch {
+        signer.deinit();
+        return false;
+    };
+
+    var dir = plazaDir(io, environ) catch {
+        signer.deinit();
+        return false;
+    };
+    defer dir.close(io);
+    // Refuse to clobber a key another instance may have written; a failure to
+    // persist still lets this session run with the in-memory key.
+    dir.writeFile(io, .{
+        .sub_path = "identity.key",
+        .data = &kp.secret_key,
+        .flags = .{ .exclusive = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
+
+    setIdentity(signer, kp);
+    return true;
+}
+
+/// Sets the identity globals: the signer, the keypair, and the abbreviated npub
+/// the composer shows. The signer's secp256k1 context is used only on the UI
+/// thread.
+fn setIdentity(signer: nostr.keys.Signer, kp: nostr.keys.KeyPair) void {
+    g_identity_signer = signer;
+    g_identity_kp = kp;
+    const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
+    g_identity_npub_len = npub.len;
 }
 
 // ----------------------------------------------------------- background ingest
@@ -629,8 +719,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     defer relay.deinit();
     setRelayStatus(index, .connected);
 
+    // Follow-scoped: only the starter pack's recent notes, so the pool streams
+    // the user's feed rather than the whole firehose.
     const kinds = [_]u16{1};
-    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = feed_capacity }};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &starter_pack, .kinds = &kinds, .limit = feed_capacity }};
     try relay.subscribe("plaza-feed", &filters);
 
     while (true) {

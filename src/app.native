@@ -1,50 +1,64 @@
-<!-- Plaza, M4: the local-first feed plus a composer. A pool of background threads
-     ingests notes into the local store; the UI reconciles from the store on a
-     timer and renders them as cards (avatar · npub · relative time · note). The
-     composer signs a kind:1 with the local identity, stores it at once, and
-     publishes it to the pool. Logic is in src/main.zig. Edit while `native dev`
-     runs to hot-reload. Validate: native check -->
+<!-- Plaza, M5: onboarding plus the local-first feed. A first run shows a welcome
+     screen; creating an identity drops into a follow-based feed seeded by a
+     curated starter pack. A pool of background threads ingests the follow set's
+     notes into the local store; the UI reconciles on a timer and renders cards
+     (avatar · npub · relative time · note). The composer signs a kind:1 with the
+     local identity, stores it at once, and publishes it to the pool. Logic is in
+     src/main.zig. Edit while `native dev` runs to hot-reload. Validate: native check -->
 <column gap="0">
-  <column gap="4" padding="16">
-    <text size="heading">Plaza</text>
-    <text foreground="text_muted">{status}</text>
-  </column>
-  <separator/>
-  <if test="{empty}">
-    <column gap="12" main="center" cross="center" grow="1" padding="24">
-      <text foreground="text_muted">{empty_text}</text>
+  <if test="{show_onboarding}">
+    <column gap="16" main="center" cross="center" grow="1" padding="32">
+      <text size="display">Plaza</text>
+      <text size="heading">Welcome to Nostr</text>
+      <text wrap="true" foreground="text_muted">Create an identity and Plaza sets you up with a starter feed of great accounts. Your notes stay on your device and publish straight to the network.</text>
+      <button size="lg" variant="primary" on-press="create_identity">Create your identity</button>
+      <text size="sm" foreground="text_muted">A second to set up. No email, no signup.</text>
     </column>
   </if>
-  <if test="{has_notes}">
-    <scroll grow="1">
-      <column gap="8" padding="12">
-        <for each="note_list" key="id" as="n">
-          <card padding="12">
-            <row gap="10" cross="start">
-              <avatar>{n.initials}</avatar>
-              <column gap="4" grow="1">
-                <row gap="8" cross="center">
-                  <text grow="1" foreground="text_muted">{n.author}</text>
-                  <text foreground="text_muted">{n.time}</text>
-                </row>
-                <text wrap="true">{n.content}</text>
-              </column>
-            </row>
-          </card>
-        </for>
+  <if test="{show_feed}">
+    <column gap="0" grow="1">
+      <column gap="4" padding="16">
+        <text size="heading">Plaza</text>
+        <text foreground="text_muted">{status}</text>
       </column>
-    </scroll>
+      <separator/>
+      <if test="{empty}">
+        <column gap="12" main="center" cross="center" grow="1" padding="24">
+          <text foreground="text_muted">{empty_text}</text>
+        </column>
+      </if>
+      <if test="{has_notes}">
+        <scroll grow="1">
+          <column gap="8" padding="12">
+            <for each="note_list" key="id" as="n">
+              <card padding="12">
+                <row gap="10" cross="start">
+                  <avatar>{n.initials}</avatar>
+                  <column gap="4" grow="1">
+                    <row gap="8" cross="center">
+                      <text grow="1" foreground="text_muted">{n.author}</text>
+                      <text foreground="text_muted">{n.time}</text>
+                    </row>
+                    <text wrap="true">{n.content}</text>
+                  </column>
+                </row>
+              </card>
+            </for>
+          </column>
+        </scroll>
+      </if>
+      <separator/>
+      <column gap="8" padding="12">
+        <input-group>
+          <textarea text="{draft}" placeholder="Share something with the network…" on-input="draft_edit" on-submit="post"/>
+          <input-group-actions>
+            <text size="sm" foreground="text_muted">{identity}</text>
+            <spacer grow="1"/>
+            <button size="sm" variant="primary" disabled="{draft_empty}" on-press="post">Post</button>
+          </input-group-actions>
+        </input-group>
+      </column>
+      <status-bar>{footer}</status-bar>
+    </column>
   </if>
-  <separator/>
-  <column gap="8" padding="12">
-    <input-group>
-      <textarea text="{draft}" placeholder="Share something with the network…" on-input="draft_edit" on-submit="post"/>
-      <input-group-actions>
-        <text size="sm" foreground="text_muted">{identity}</text>
-        <spacer grow="1"/>
-        <button size="sm" variant="primary" disabled="{draft_empty}" on-press="post">Post</button>
-      </input-group-actions>
-    </input-group>
-  </column>
-  <status-bar>{footer}</status-bar>
 </column>

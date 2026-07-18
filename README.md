@@ -9,12 +9,12 @@ on the [`nostr`](https://github.com/zig-nostr/nostr) protocol library, and can
 sign through [Signet](https://github.com/zig-nostr/signet) so your key never
 enters a client.
 
-> **Status: early (M4).** The core loop works: `nostr` links directly into the
-> app, the local store opens in the render process, a pool of background threads
-> streams notes from several relays into it, and the UI renders a live feed from
-> disk, one process, no IPC. Composing works too, a signed note is stored locally
-> at once and published to the pool. Community "places," profiles, and the outbox
-> model land in the milestones ahead. macOS first.
+> **Status: early (M5).** A first run opens a welcome screen; creating an identity
+> drops you into a follow-based feed seeded by a curated starter pack, rendered
+> straight from a local store that a pool of background threads keeps filled, one
+> process, no IPC. Composing signs a note that is stored locally at once and
+> published to the pool. Connecting an external signer, community "places," and
+> the outbox model land in the milestones ahead. macOS first.
 
 ## Develop
 
