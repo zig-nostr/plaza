@@ -1,12 +1,15 @@
 //! Plaza, the flagship native Nostr client.
 //!
-//! M3 grows the feed from a single relay to a pool. Each relay in `relays` runs
-//! on its own thread, dialing and ingesting recent notes into the one shared
-//! local store, which dedupes across them by event id; the header summarises how
-//! much of the pool is live. The UI still renders cards (avatar, npub, relative
-//! time, note) and reconciles from the store on a timer, all in one process
-//! reading straight from disk. Real names (kind:0 profiles), NIP-65 outbox
-//! routing, composing, and community "places" come in the milestones ahead.
+//! M4 adds composing. A local identity (a keypair generated and persisted on
+//! first run) signs a kind:1 note, which is stored locally at once so it shows
+//! in the feed immediately, then published to the relay pool on a background
+//! thread so it propagates to the network. The feed still runs as a pool (each
+//! relay on its own thread ingesting into the one shared store, deduped by event
+//! id), rendering cards (avatar, npub, relative time, note) reconciled on a
+//! timer, all in one process reading straight from disk. Real names (kind:0
+//! profiles), NIP-65 outbox routing, connecting an external signer (Signet, over
+//! NIP-46, so the key never enters the client), and community "places" come in
+//! the milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
@@ -37,6 +40,10 @@ const relays = [_][]const u8{
     "wss://relay.snort.social",
 };
 const feed_capacity = 60;
+// The composer's fixed text capacity. Comfortably longer than a typical note;
+// the display buffer (`Note.content_buf`) truncates for rendering, but the
+// published event carries the full draft.
+const compose_capacity = 512;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
 
@@ -81,6 +88,18 @@ var g_io: ?std.Io = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
 var g_last_count: usize = std.math.maxInt(usize);
+
+// Plaza's local identity: the keypair that signs composed notes. Loaded once on
+// the UI thread in `main` and read only there, so no synchronisation is needed.
+// The signer holds a secp256k1 context (not shared across threads); the publish
+// path never signs, it forwards an already-signed event, so it needs neither.
+// This is the zero-config local signer; connecting an external signer (Signet,
+// over NIP-46, so the key never touches the client) is the onboarding path in a
+// later milestone, and swaps in at `signNote` below.
+var g_identity_signer: ?nostr.keys.Signer = null;
+var g_identity_kp: ?nostr.keys.KeyPair = null;
+var g_identity_npub_buf: [24]u8 = undefined;
+var g_identity_npub_len: usize = 0;
 
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 fn nowSeconds() i64 {
@@ -144,11 +163,33 @@ pub const Model = struct {
     notes_len: usize = 0,
     live_relays: usize = 0,
     offline_relays: usize = 0,
+    // The composer's edit state (text + caret + selection). The view binds the
+    // text through `draft()`, never the buffer itself, and every edit event is
+    // mirrored here in `update`.
+    draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
-    // status line, so the raw fields are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays" };
+    // status line, the draft through `draft`/`draft_empty`, so the raw fields
+    // are never bound by name.
+    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer" };
+
+    /// The composer's current text (what `text="{draft}"` binds).
+    pub fn draft(self: *const Model) []const u8 {
+        return self.draft_buffer.text();
+    }
+    /// Whether the draft is blank (only whitespace), which disables Post.
+    pub fn draft_empty(self: *const Model) bool {
+        return std.mem.trim(u8, self.draft_buffer.text(), " \t\r\n").len == 0;
+    }
+    /// The composer's "posting as" line: the local identity's abbreviated npub,
+    /// or a setup note while the key is still being prepared.
+    pub fn identity(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        _ = self;
+        if (g_identity_npub_len == 0) return "Preparing your key…";
+        const npub = g_identity_npub_buf[0..g_identity_npub_len];
+        return std.fmt.allocPrint(arena, "Posting as {s}", .{npub}) catch npub;
+    }
 
     /// The feed, iterated by `<for each="note_list">`, newest first.
     pub fn note_list(self: *const Model, arena: std.mem.Allocator) []const Note {
@@ -245,28 +286,37 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     return note;
 }
 
-/// Formats the author as an abbreviated npub (`npub1p9x8h…7k2q`), the canonical
-/// Nostr identifier, falling back to a short hex prefix if bech32 encoding
-/// fails. bech32's encoder grows an ArrayList and hands back an owned slice, so
-/// on a fixed buffer the intermediate reallocations accumulate well past the
-/// ~63-char result; 1 KiB of stack covers that churn without touching the heap.
 fn setAuthor(note: *Note, pubkey: [32]u8) void {
+    const s = abbreviateNpub(&note.author_buf, pubkey);
+    note.author_len = @intCast(s.len);
+}
+
+/// Writes an abbreviated npub (`npub1p9x8h…7k2q`), the canonical Nostr
+/// identifier, for `pubkey` into `out`, returning the written slice; falls back
+/// to a short hex prefix if bech32 encoding fails. The result always lives in
+/// `out` (never the scratch buffer), so the caller can hold it safely. `out`
+/// should be at least 20 bytes for the abbreviated form. bech32's encoder grows
+/// an ArrayList and hands back an owned slice, so on a fixed buffer the
+/// intermediate reallocations accumulate well past the ~63-char result; 1 KiB of
+/// scratch covers that churn without touching the heap.
+fn abbreviateNpub(out: []u8, pubkey: [32]u8) []const u8 {
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const npub = nostr.nip19.encodeNpub(fba.allocator(), pubkey) catch {
         const hexdigits = "0123456789abcdef";
-        for (0..8) |i| {
-            note.author_buf[i * 2] = hexdigits[pubkey[i] >> 4];
-            note.author_buf[i * 2 + 1] = hexdigits[pubkey[i] & 0x0f];
+        var n: usize = 0;
+        while (n < 16 and n + 1 < out.len) : (n += 2) {
+            out[n] = hexdigits[pubkey[n / 2] >> 4];
+            out[n + 1] = hexdigits[pubkey[n / 2] & 0x0f];
         }
-        note.author_len = 16;
-        return;
+        return out[0..n];
     };
-    const abbreviated = if (npub.len > 18)
-        std.fmt.bufPrint(&note.author_buf, "{s}…{s}", .{ npub[0..12], npub[npub.len - 5 ..] }) catch npub[0..@min(npub.len, note.author_buf.len)]
-    else
-        std.fmt.bufPrint(&note.author_buf, "{s}", .{npub}) catch npub[0..@min(npub.len, note.author_buf.len)];
-    note.author_len = @intCast(abbreviated.len);
+    if (npub.len > 18) {
+        if (std.fmt.bufPrint(out, "{s}…{s}", .{ npub[0..12], npub[npub.len - 5 ..] })) |s| return s else |_| {}
+    }
+    const n = @min(npub.len, out.len);
+    @memcpy(out[0..n], npub[0..n]);
+    return out[0..n];
 }
 
 /// The largest prefix of `s` no longer than `max` that ends on a UTF-8
@@ -283,6 +333,10 @@ fn utf8SafeLen(s: []const u8, max: usize) usize {
 pub const Msg = union(enum) {
     /// The repeating refresh timer fired: reconcile the feed with the store.
     tick: native_sdk.EffectTimer,
+    /// A text edit in the composer, mirrored into the draft buffer.
+    draft_edit: canvas.TextInputEvent,
+    /// Post the current draft: sign, store locally, and publish to the pool.
+    post,
 
     // `tick` is dispatched by the refresh timer in Zig, never from markup.
     pub const view_unbound = .{"tick"};
@@ -313,6 +367,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome == .fired) model.refresh(nowSeconds());
         },
+        .draft_edit => |edit| model.draft_buffer.apply(edit),
+        .post => submitPost(model),
     }
 }
 
@@ -320,10 +376,88 @@ pub fn initialModel() Model {
     return .{};
 }
 
+// -------------------------------------------------------------- compose & post
+//
+// Posting is local-first: a composed note is signed, written to the local store
+// straight away (so it shows in the feed on the next tick), and published to the
+// pool on a detached thread. The feed dedupes by event id, so when a relay later
+// echoes our own note back through the ingest subscriptions it collapses onto
+// the local copy.
+
+/// Posts the current draft: sign a kind:1 note, store it locally at once, and
+/// publish it to the pool in the background. A blank draft or a not-yet-ready
+/// identity is a no-op.
+fn submitPost(model: *Model) void {
+    const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
+    if (text.len == 0) return;
+    const store = g_store orelse return;
+    const gpa = std.heap.page_allocator;
+
+    // The signed event references its content slice rather than copying it, and
+    // both the local store write and the detached publisher read it after the
+    // draft buffer is cleared and reused. Keep a process-lifetime copy (never
+    // freed, like the store and the ingest threads): posts are rare and small.
+    const owned = gpa.dupe(u8, text) catch return;
+    const ev = signNote(gpa, owned) orelse {
+        gpa.free(owned);
+        return;
+    };
+
+    // Local-first: our own note lands in the store immediately (no re-verify, we
+    // just produced the signature), then propagates to relays off the UI thread.
+    _ = store.ingest(gpa, ev, .{}) catch {};
+
+    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch {
+        // Couldn't start the publisher; the note is still stored locally.
+        model.draft_buffer.clear();
+        return;
+    };
+    thread.detach();
+
+    model.draft_buffer.clear();
+}
+
+/// Signs a kind:1 note with the local identity. This is the signing seam: a
+/// later milestone routes it through an external signer (Signet, over NIP-46, so
+/// the key never enters the client) instead, leaving the rest of the compose and
+/// publish path unchanged. `content` must outlive the returned event (it is
+/// referenced, not copied). Returns null if no identity is ready.
+fn signNote(gpa: std.mem.Allocator, content: []const u8) ?nostr.event.Event {
+    const signer = g_identity_signer orelse return null;
+    const kp = g_identity_kp orelse return null;
+    return nostr.event.create(gpa, signer, kp, nowSeconds(), 1, &.{}, content, null) catch null;
+}
+
+/// Publishes `ev` to every relay in the pool, each on a throwaway connection,
+/// best-effort. Posting is a rare, human-paced action, so a fresh dial per post
+/// keeps the ingest loops untouched; the note is already in the local store, so
+/// the feed shows it regardless of publish latency. Runs on a detached thread
+/// with its own io backend, never the UI thread's.
+fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for (relays) |url| {
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        relay.publish(ev) catch continue;
+        // Read the relay's OK so the frame is flushed and acknowledged before we
+        // close the connection; best-effort, its verdict is not surfaced yet.
+        var msg = (relay.receive() catch continue) orelse continue;
+        msg.deinit();
+    }
+}
+
 // -------------------------------------------------------------------- app run
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
+
+    // Load (or, on first run, generate) the local identity before the first
+    // paint, so the composer knows who it posts as. Best-effort: on failure the
+    // app still runs, with posting disabled until an identity exists.
+    loadOrCreateIdentity(init.io, init.environ_map);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
@@ -396,6 +530,68 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
     var path_buf: [512]u8 = undefined;
     const db_path = try std.fmt.bufPrintZ(&path_buf, "{s}/feed.mdb", .{dir_path});
     return nostr.store.Store.open(db_path, .{});
+}
+
+// ----------------------------------------------------------------- identity
+//
+// Plaza's local signing identity lives beside the feed store, at
+// `$HOME/.plaza/identity.key` (the raw 32-byte secret, mode 0600), generated on
+// first run. This is the zero-config local signer so the app posts out of the
+// box; connecting an external signer (Signet, over NIP-46) so the key never
+// touches the client is the onboarding path in a later milestone.
+
+/// Loads the local identity into the process globals, generating and persisting
+/// a fresh key on first run. Best-effort: on any failure the globals stay unset
+/// and posting is disabled, but the app still runs.
+fn loadOrCreateIdentity(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var signer = nostr.keys.Signer.init();
+    const secret = identitySecret(io, environ, signer) catch |err| {
+        std.debug.print("plaza: identity unavailable: {s}\n", .{@errorName(err)});
+        signer.deinit();
+        return;
+    };
+    const kp = signer.keyPairFromSecretKey(secret) catch |err| {
+        std.debug.print("plaza: identity key invalid: {s}\n", .{@errorName(err)});
+        signer.deinit();
+        return;
+    };
+    g_identity_signer = signer;
+    g_identity_kp = kp;
+    const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
+    g_identity_npub_len = npub.len;
+}
+
+/// Returns the identity's 32-byte secret, reading `$HOME/.plaza/identity.key` or
+/// generating and persisting it on first run (mode 0600). `signer` provides the
+/// entropy for a freshly generated key.
+fn identitySecret(io: std.Io, environ: *const std.process.Environ.Map, signer: nostr.keys.Signer) ![32]u8 {
+    const home = environ.get("HOME") orelse ".";
+    var dir_buf: [512]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza", .{home});
+    // mkdir -p (idempotent); an absolute sub-path ignores the cwd handle.
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+    defer dir.close(io);
+
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, "identity.key", gpa, std.Io.Limit.limited(64)) catch |err| switch (err) {
+        error.FileNotFound => {
+            // First run: generate a key and persist it, refusing to clobber a
+            // key another instance may have written between the read and here.
+            const kp = try signer.generateKeyPair(io);
+            dir.writeFile(io, .{
+                .sub_path = "identity.key",
+                .data = &kp.secret_key,
+                .flags = .{ .exclusive = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
+            }) catch |werr| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(werr)});
+            return kp.secret_key;
+        },
+        else => return err,
+    };
+    defer gpa.free(raw);
+    if (raw.len != 32) return error.BadIdentityFile;
+    var secret: [32]u8 = undefined;
+    @memcpy(&secret, raw[0..32]);
+    return secret;
 }
 
 // ----------------------------------------------------------- background ingest

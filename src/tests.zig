@@ -35,6 +35,15 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
+/// Like `findByText`, but matches on text content regardless of widget kind.
+fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
+    if (std.mem.eql(u8, widget.text, text)) return widget;
+    for (widget.children) |child| {
+        if (findAnyText(child, text)) |found| return found;
+    }
+    return null;
+}
+
 /// A signed kind:1 note with the given timestamp and content.
 fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, created_at: i64, content: []const u8) !nostr.event.Event {
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
@@ -155,6 +164,27 @@ test "one-process: a signed note round-trips through the local store" {
     defer q.deinit();
     try testing.expectEqual(@as(usize, 1), q.events.len);
     try testing.expectEqualStrings("stored in-process", q.events[0].content);
+}
+
+test "the composer renders a Post action and, without a key, an identity prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    const tree = try buildTree(arena, &model);
+
+    // Building the tree exercises the composer markup (input-group, textarea,
+    // button). The Post label renders, and with no identity loaded in the test
+    // process the "posting as" line shows the setup prompt.
+    try testing.expect(findAnyText(tree.root, "Post") != null);
+    try testing.expect(findAnyText(tree.root, "Preparing your key…") != null);
+}
+
+test "a fresh draft is empty and disables Post" {
+    var model = main.initialModel();
+    try testing.expect(model.draft_empty());
+    try testing.expectEqualStrings("", model.draft());
 }
 
 test "the feed key survives a high-bit event id" {
