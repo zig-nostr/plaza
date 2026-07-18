@@ -86,7 +86,6 @@ test "the feed renders a note card from the model" {
     const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a note in the feed");
 
     var model = main.initialModel();
-    model.conn = .connected;
     model.notes[0] = main.noteFrom(ev, 1_800_000_000);
     model.notes_len = 1;
 
@@ -95,6 +94,24 @@ test "the feed renders a note card from the model" {
     try testing.expect(findByText(tree.root, .text, "a note in the feed") != null);
     try testing.expect(findByText(tree.root, .text, model.notes[0].author()) != null);
     try testing.expect(findByText(tree.root, .status_bar, "1 notes") != null);
+}
+
+test "the header summarises the relay pool" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Some relays live: the header shows the live count out of the pool.
+    var live = main.initialModel();
+    live.live_relays = 3;
+    const live_tree = try buildTree(arena, &live);
+    try testing.expect(findByText(live_tree.root, .text, "Live · 3/5 relays") != null);
+
+    // The whole pool down: the header says so.
+    var down = main.initialModel();
+    down.offline_relays = 5;
+    const down_tree = try buildTree(arena, &down);
+    try testing.expect(findByText(down_tree.root, .text, "Offline, reconnecting…") != null);
 }
 
 test "the view lays out through the canvas engine" {
@@ -158,7 +175,6 @@ test "the feed key survives a high-bit event id" {
     } else return error.NoHighBitIdFound;
 
     var model = main.initialModel();
-    model.conn = .connected;
     model.notes[0] = main.noteFrom(ev, 1_800_000_000);
     model.notes_len = 1;
 
