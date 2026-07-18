@@ -9,9 +9,11 @@ on the [`nostr`](https://github.com/zig-nostr/nostr) protocol library, and can
 sign through [Signet](https://github.com/zig-nostr/signet) so your key never
 enters a client.
 
-> **Status: early (M0).** This is the initial scaffold — a minimal native window.
-> The local-first feed, community "places," and composing land in the milestones
-> ahead. macOS first.
+> **Status: early (M1).** The architecture spike is in: `nostr` links directly
+> into the app, the local store opens in the render process, and a background
+> thread streams notes from a relay into it while the UI renders a live feed
+> from disk — one process, no IPC. Community "places," composing, and the outbox
+> model land in the milestones ahead. macOS first.
 
 ## Develop
 
