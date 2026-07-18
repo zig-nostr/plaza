@@ -1,8 +1,7 @@
-<!-- Plaza — M1 architecture spike. A live feed rendered straight from the local
-     store: a background thread ingests kind:1 notes from a relay, the UI
-     re-queries the store on a timer and lists what it finds. Logic is in
-     src/main.zig. Edit while `native dev` runs to hot-reload. Validate with:
-     native check -->
+<!-- Plaza, M2: the local-first feed. A background thread ingests notes from a
+     relay into the local store; the UI reconciles from the store on a timer and
+     renders them as cards (avatar · npub · relative time · note). Logic is in
+     src/main.zig. Edit while `native dev` runs to hot-reload. Validate: native check -->
 <column gap="0">
   <column gap="4" padding="16">
     <text size="heading">Plaza</text>
@@ -19,10 +18,16 @@
       <column gap="8" padding="12">
         <for each="note_list" key="id" as="n">
           <card padding="12">
-            <column gap="6">
-              <text foreground="text_muted">{n.author}</text>
-              <text wrap="true">{n.content}</text>
-            </column>
+            <row gap="10" cross="start">
+              <avatar>{n.initials}</avatar>
+              <column gap="4" grow="1">
+                <row gap="8" cross="center">
+                  <text grow="1" foreground="text_muted">{n.author}</text>
+                  <text foreground="text_muted">{n.time}</text>
+                </row>
+                <text wrap="true">{n.content}</text>
+              </column>
+            </row>
           </card>
         </for>
       </column>
