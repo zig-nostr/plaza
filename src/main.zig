@@ -1,16 +1,16 @@
 //! Plaza, the flagship native Nostr client.
 //!
-//! M5 adds onboarding. A first run opens a welcome screen; creating an identity
-//! generates and persists a local keypair, then drops into a follow-based feed
-//! seeded by a curated starter pack (the `starter_pack` authors), so a newcomer
-//! is browsing and posting in seconds. Composing signs a kind:1 that is stored
-//! locally at once and published to the pool (M4). The feed runs as a pool (each
+//! M5 adds onboarding. A first run opens a welcome screen with two ways in:
+//! create a local identity (a persisted keypair), or connect an external signer
+//! (Signet) from a `bunker://` URL over NIP-46, so the secret key never enters
+//! Plaza. Either way you land in a follow-based feed seeded by a curated starter
+//! pack (the `starter_pack` authors), browsing and posting in seconds. Composing
+//! signs a kind:1 (locally, or by a `sign_event` round-trip to the bunker), which
+//! is stored locally and published to the pool. The feed runs as a pool (each
 //! relay on its own thread ingesting into the one shared store, deduped by event
-//! id), now scoped to the follow set, rendering cards (avatar, npub, relative
-//! time, note) reconciled on a timer, all in one process reading straight from
-//! disk. Real names (kind:0 profiles), NIP-65 outbox routing, connecting an
-//! external signer (Signet, over NIP-46, so the key never enters the client),
-//! and community "places" come in the milestones ahead.
+//! id), scoped to the follow set, rendered from disk on a timer, all in one
+//! process. Real names (kind:0 profiles), NIP-65 outbox routing, and community
+//! "places" come in the milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
@@ -131,10 +131,42 @@ var g_identity_kp: ?nostr.keys.KeyPair = null;
 var g_identity_npub_buf: [24]u8 = undefined;
 var g_identity_npub_len: usize = 0;
 
+// How composed notes are signed: with the local key, or remotely over NIP-46 by
+// an external signer (Signet) so the secret key never enters Plaza. `submitPost`
+// branches on this; it is set once during onboarding.
+const SignerKind = enum { local, remote };
+var g_signer_kind: SignerKind = .local;
+
+// Remote-signer (NIP-46) connection state, set at connect time and read by the
+// background threads. The ephemeral client keypair is Plaza's transport identity
+// with the bunker (never the user's key); the user's identity is the bunker's
+// own pubkey. Each worker thread makes its own secp256k1 signer, only these
+// bytes are shared.
+var g_remote_client_kp: ?nostr.keys.KeyPair = null;
+var g_remote_pubkey: [32]u8 = undefined;
+var g_remote_relay_buf: [256]u8 = undefined;
+var g_remote_relay_len: usize = 0;
+var g_remote_secret_buf: [128]u8 = undefined;
+var g_remote_secret_len: usize = 0;
+// 0 idle, 1 connecting, 2 connected, 3 failed. Drives the onboarding status line.
+var g_remote_status = std.atomic.Value(u8).init(0);
+// Monotonic source of unique NIP-46 request ids.
+var g_req_counter = std.atomic.Value(u64).init(0);
+
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 fn nowSeconds() i64 {
     const io = g_io orelse return 0;
     return std.Io.Timestamp.now(io, .real).toSeconds();
+}
+
+/// The pubkey Plaza posts as: the local key, or the remote signer's, or null
+/// before an identity is established. The feed includes it so your own notes
+/// show alongside the follows you read.
+fn activePubkey() ?[32]u8 {
+    return switch (g_signer_kind) {
+        .local => if (g_identity_kp) |kp| kp.public_key else null,
+        .remote => g_remote_pubkey,
+    };
 }
 
 // ------------------------------------------------------------------ model
@@ -204,12 +236,16 @@ pub const Model = struct {
     // `.ready`; a newcomer starts at `.onboarding` and moves to `.ready` when
     // they create an identity.
     stage: Stage = .onboarding,
+    // The onboarding "connect a signer" field: a `bunker://` URL to pair with an
+    // external NIP-46 signer (Signet).
+    bunker_buffer: canvas.TextBuffer(220) = .{},
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
     // status line, the draft through `draft`/`draft_empty`, the stage through
-    // `show_onboarding`/`show_feed`, so the raw fields are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage" };
+    // `show_onboarding`/`show_feed`, the bunker field through `bunker_draft`, so
+    // the raw fields are never bound by name.
+    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage", "bunker_buffer" };
 
     /// Whether the first-run welcome screen shows (no identity yet).
     pub fn show_onboarding(self: *const Model) bool {
@@ -228,13 +264,34 @@ pub const Model = struct {
     pub fn draft_empty(self: *const Model) bool {
         return std.mem.trim(u8, self.draft_buffer.text(), " \t\r\n").len == 0;
     }
-    /// The composer's "posting as" line: the local identity's abbreviated npub,
-    /// or a setup note while the key is still being prepared.
+    /// The composer's "posting as" line: the identity's abbreviated npub, marked
+    /// when signing is routed through an external signer, or a setup note while
+    /// the key is still being prepared.
     pub fn identity(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
         if (g_identity_npub_len == 0) return "Preparing your key…";
         const npub = g_identity_npub_buf[0..g_identity_npub_len];
-        return std.fmt.allocPrint(arena, "Posting as {s}", .{npub}) catch npub;
+        const prefix = if (g_signer_kind == .remote) "Signing via your signer · " else "Posting as ";
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, npub }) catch npub;
+    }
+
+    /// The onboarding "connect a signer" field text (what `text="{bunker_draft}"`
+    /// binds).
+    pub fn bunker_draft(self: *const Model) []const u8 {
+        return self.bunker_buffer.text();
+    }
+    /// Whether the bunker field is blank, which disables Connect.
+    pub fn bunker_empty(self: *const Model) bool {
+        return std.mem.trim(u8, self.bunker_buffer.text(), " \t\r\n").len == 0;
+    }
+    /// The onboarding connect-status line under the bunker field.
+    pub fn connect_status(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_remote_status.load(.acquire)) {
+            1 => "Connecting to your signer…",
+            3 => "Couldn't read that bunker link.",
+            else => "",
+        };
     }
 
     /// The feed, iterated by `<for each="note_list">`, newest first.
@@ -302,8 +359,8 @@ pub const Model = struct {
         // unscoped run may have left in the store.
         var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
         var authors_len: usize = starter_pack.len;
-        if (g_identity_kp) |kp| {
-            authors[authors_len] = kp.public_key;
+        if (activePubkey()) |pk| {
+            authors[authors_len] = pk;
             authors_len += 1;
         }
         var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = feed_capacity }) catch return;
@@ -395,6 +452,10 @@ pub const Msg = union(enum) {
     post,
     /// Onboarding: create a local identity and enter the feed.
     create_identity,
+    /// A text edit in the onboarding bunker-URL field.
+    bunker_edit: canvas.TextInputEvent,
+    /// Onboarding: connect an external signer from the bunker URL and enter the feed.
+    connect_signer,
 
     // `tick` is dispatched by the refresh timer in Zig, never from markup.
     pub const view_unbound = .{"tick"};
@@ -430,11 +491,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
-            model.stage = .ready;
-            if (g_store == null) {
-                if (g_io) |io| if (g_environ) |env| startFeed(io, env);
-            }
+            enterFeed(model);
         },
+        .bunker_edit => |edit| model.bunker_buffer.apply(edit),
+        .connect_signer => {
+            // Pair with the external signer from the bunker URL; on success the
+            // feed comes up and posts route through it. A bad URL stays on
+            // onboarding with an error (see `connect_status`).
+            if (!connectRemoteSigner(model.bunker_buffer.text())) return;
+            enterFeed(model);
+        },
+    }
+}
+
+/// Switches to the feed and brings the store + ingest pool up if they are not
+/// already running. Shared by both onboarding paths (local key and remote signer).
+fn enterFeed(model: *Model) void {
+    model.stage = .ready;
+    if (g_store == null) {
+        if (g_io) |io| if (g_environ) |env| startFeed(io, env);
     }
 }
 
@@ -456,38 +531,39 @@ pub fn initialModel() Model {
 fn submitPost(model: *Model) void {
     const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
     if (text.len == 0) return;
-    const store = g_store orelse return;
     const gpa = std.heap.page_allocator;
 
-    // The signed event references its content slice rather than copying it, and
-    // both the local store write and the detached publisher read it after the
-    // draft buffer is cleared and reused. Keep a process-lifetime copy (never
-    // freed, like the store and the ingest threads): posts are rare and small.
+    // A process-lifetime copy of the content: `event.create` references its
+    // content slice rather than copying it, and the store write and either the
+    // publisher or the NIP-46 round-trip read it after the draft is cleared.
     const owned = gpa.dupe(u8, text) catch return;
+    switch (g_signer_kind) {
+        .local => postLocally(gpa, owned),
+        .remote => requestRemoteSign(gpa, owned),
+    }
+    model.draft_buffer.clear();
+}
+
+/// Local path: sign with the local key, store the note at once (so it shows in
+/// the feed on the next tick), and publish it to the pool off the UI thread.
+fn postLocally(gpa: std.mem.Allocator, owned: []const u8) void {
+    const store = g_store orelse {
+        gpa.free(owned);
+        return;
+    };
     const ev = signNote(gpa, owned) orelse {
         gpa.free(owned);
         return;
     };
-
-    // Local-first: our own note lands in the store immediately (no re-verify, we
-    // just produced the signature), then propagates to relays off the UI thread.
+    // No re-verify: we just produced the signature.
     _ = store.ingest(gpa, ev, .{}) catch {};
-
-    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch {
-        // Couldn't start the publisher; the note is still stored locally.
-        model.draft_buffer.clear();
-        return;
-    };
+    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch return;
     thread.detach();
-
-    model.draft_buffer.clear();
 }
 
-/// Signs a kind:1 note with the local identity. This is the signing seam: a
-/// later milestone routes it through an external signer (Signet, over NIP-46, so
-/// the key never enters the client) instead, leaving the rest of the compose and
-/// publish path unchanged. `content` must outlive the returned event (it is
-/// referenced, not copied). Returns null if no identity is ready.
+/// Signs a kind:1 note with the local key. `SignerKind` selects this or the
+/// remote path (`requestRemoteSign`). `content` must outlive the returned event
+/// (it is referenced, not copied). Null if no local identity is ready.
 fn signNote(gpa: std.mem.Allocator, content: []const u8) ?nostr.event.Event {
     const signer = g_identity_signer orelse return null;
     const kp = g_identity_kp orelse return null;
@@ -512,6 +588,227 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
         // close the connection; best-effort, its verdict is not surfaced yet.
         var msg = (relay.receive() catch continue) orelse continue;
         msg.deinit();
+    }
+}
+
+// ------------------------------------------------------- remote signer (NIP-46)
+//
+// Signing can be routed to an external signer (Signet) over NIP-46 so the user's
+// secret key never enters Plaza. Plaza is the CLIENT: it holds an ephemeral
+// transport keypair, and the user's identity is the bunker's own pubkey. The
+// wire is kind:24133 events whose content is a NIP-44-encrypted request/response
+// `p`-tagged to the recipient. A persistent listener thread holds the bunker
+// relay and processes responses; each request (connect, then one per post) goes
+// out on its own short-lived connection, so a blocked receive never stalls a
+// send. A signed note returns as a response `result`, stored and published to
+// the feed pool exactly like a locally signed one.
+
+/// Pairs with an external signer from a `bunker://` URL: parses it, mints an
+/// ephemeral client key, starts the response listener, and sends the connect
+/// request. Returns false (and marks the status failed) on a bad URL.
+fn connectRemoteSigner(url_raw: []const u8) bool {
+    const url = std.mem.trim(u8, url_raw, " \t\r\n");
+    const io = g_io orelse return false;
+    const gpa = std.heap.page_allocator;
+
+    var parsed = nostr.nip46.parseBunkerUri(gpa, url) catch {
+        g_remote_status.store(3, .release);
+        return false;
+    };
+    defer parsed.deinit();
+    const bunker = parsed.value;
+    if (bunker.relays.len == 0 or bunker.relays[0].len > g_remote_relay_buf.len) {
+        g_remote_status.store(3, .release);
+        return false;
+    }
+    const relay_url = bunker.relays[0];
+
+    // Mint the ephemeral transport key (never the user's key).
+    var signer = nostr.keys.Signer.init();
+    const client_kp = signer.generateKeyPair(io) catch {
+        signer.deinit();
+        g_remote_status.store(3, .release);
+        return false;
+    };
+    signer.deinit();
+
+    // Stash the connection details for the worker threads.
+    g_remote_pubkey = bunker.remote_signer_pubkey;
+    @memcpy(g_remote_relay_buf[0..relay_url.len], relay_url);
+    g_remote_relay_len = relay_url.len;
+    if (bunker.secret) |s| {
+        const n = @min(s.len, g_remote_secret_buf.len);
+        @memcpy(g_remote_secret_buf[0..n], s[0..n]);
+        g_remote_secret_len = n;
+    } else g_remote_secret_len = 0;
+    g_remote_client_kp = client_kp;
+
+    // The user's identity is the bunker's pubkey.
+    const npub = abbreviateNpub(&g_identity_npub_buf, g_remote_pubkey);
+    g_identity_npub_len = npub.len;
+    g_signer_kind = .remote;
+    g_remote_status.store(1, .release);
+
+    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{gpa}) catch {
+        g_remote_status.store(3, .release);
+        return false;
+    };
+    thread.detach();
+
+    sendConnect(gpa);
+    return true;
+}
+
+/// Sends the NIP-46 `connect` request (remote pubkey + optional secret).
+fn sendConnect(gpa: std.mem.Allocator) void {
+    var hexbuf: [64]u8 = undefined;
+    hexLower(&hexbuf, g_remote_pubkey);
+    var idbuf: [24]u8 = undefined;
+    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
+    sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
+}
+
+/// Remote path: build the unsigned kind:1 event and send a `sign_event` request.
+/// The signed event returns to the listener, which stores and publishes it.
+fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
+    defer gpa.free(content_owned);
+    const created_at = nowSeconds();
+    // A canonical unsigned event (the bunker fills in the signature). The id is
+    // computed against the user's pubkey so the bunker's result matches it.
+    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, 1, &.{}, content_owned) catch return;
+    const unsigned = nostr.event.Event{
+        .id = id,
+        .pubkey = g_remote_pubkey,
+        .created_at = created_at,
+        .kind = 1,
+        .tags = &.{},
+        .content = content_owned,
+        .sig = [_]u8{0} ** 64,
+    };
+    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch return;
+    defer gpa.free(unsigned_json);
+
+    var idbuf: [24]u8 = undefined;
+    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    const params = [_][]const u8{unsigned_json};
+    sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
+}
+
+/// Serializes `request` and spawns a one-shot thread to seal and publish it.
+fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
+    const req_json = request.toJson(gpa) catch return;
+    const thread = std.Thread.spawn(.{}, nip46Send, .{ gpa, req_json }) catch {
+        gpa.free(req_json);
+        return;
+    };
+    thread.detach();
+}
+
+/// Seals `req_json` to the remote signer and publishes it on a throwaway
+/// connection to the bunker relay. Owns `req_json`. Its own io and signer.
+fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
+    defer gpa.free(req_json);
+    const client_kp = g_remote_client_kp orelse return;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const created_at = std.Io.Timestamp.now(io, .real).toSeconds();
+    var sealed = nostr.nip46.seal(gpa, io, signer, client_kp, g_remote_pubkey, req_json, created_at) catch return;
+    defer sealed.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]) catch return;
+    defer relay.deinit();
+    relay.publish(sealed.event) catch return;
+    // Read the relay's OK so the frame flushes before we close; best-effort.
+    var msg = (relay.receive() catch return) orelse return;
+    msg.deinit();
+}
+
+/// The response listener: holds the bunker relay and processes responses,
+/// reconnecting forever. Its own io backend and signer, never the UI thread's.
+fn nip46ReceiveLoop(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const client_kp = g_remote_client_kp orelse return;
+
+    while (true) {
+        nip46ReceiveOnce(gpa, io, signer, client_kp) catch |err| {
+            std.debug.print("plaza: [signer] {s}\n", .{@errorName(err)});
+        };
+        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+    }
+}
+
+/// Dials the bunker relay, subscribes for responses addressed to our client key
+/// (`#p` = the ephemeral pubkey, which only our bunker knows), and handles each.
+fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair) !void {
+    var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
+    defer relay.deinit();
+
+    var client_hex: [64]u8 = undefined;
+    hexLower(&client_hex, client_kp.public_key);
+    const pvals = [_][]const u8{&client_hex};
+    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &pvals }};
+    const kinds = [_]u16{nostr.nip46.kind};
+    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .tags = &tag_filters }};
+    try relay.subscribe("plaza-nip46", &filters);
+
+    while (true) {
+        var msg = (try relay.receive()) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| handleNip46Response(gpa, signer, client_kp, e.event),
+            else => {},
+        }
+    }
+}
+
+/// Decrypts and parses a NIP-46 response. Any valid response marks the signer
+/// connected; a response whose `result` is a signed event is stored and
+/// published to the feed pool, the remote equivalent of the local post path.
+fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event) void {
+    const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
+    defer gpa.free(plaintext);
+    var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
+    defer resp.deinit();
+    if (resp.value.err.len != 0) {
+        std.debug.print("plaza: [signer] {s}\n", .{resp.value.err});
+        return;
+    }
+    g_remote_status.store(2, .release);
+
+    // A sign_event result is a full event JSON; the connect ack is a plain string
+    // and simply fails to parse here, which is fine, it only marks us connected.
+    var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
+    defer parsed.deinit();
+    const store = g_store orelse return;
+    // Verify the bunker actually signed it before trusting it into the feed.
+    _ = store.ingest(gpa, parsed.value, .{ .verify_with = signer }) catch return;
+
+    // Republish to the user's feed pool so the note propagates. Our composer
+    // produces tagless kind:1 notes, so an empty tag set matches the signed id.
+    const owned = gpa.dupe(u8, parsed.value.content) catch return;
+    var out = parsed.value;
+    out.content = owned;
+    out.tags = &.{};
+    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, out }) catch return;
+    thread.detach();
+}
+
+/// Lowercase-hex-encodes a 32-byte key into `out`.
+fn hexLower(out: *[64]u8, bytes: [32]u8) void {
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0x0f];
     }
 }
 

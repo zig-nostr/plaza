@@ -9,12 +9,13 @@ on the [`nostr`](https://github.com/zig-nostr/nostr) protocol library, and can
 sign through [Signet](https://github.com/zig-nostr/signet) so your key never
 enters a client.
 
-> **Status: early (M5).** A first run opens a welcome screen; creating an identity
-> drops you into a follow-based feed seeded by a curated starter pack, rendered
-> straight from a local store that a pool of background threads keeps filled, one
-> process, no IPC. Composing signs a note that is stored locally at once and
-> published to the pool. Connecting an external signer, community "places," and
-> the outbox model land in the milestones ahead. macOS first.
+> **Status: early (M5).** A first run opens a welcome screen: create a local
+> identity, or connect an external signer (Signet) over NIP-46 so your key never
+> touches the app. Either way you land in a follow-based feed seeded by a curated
+> starter pack, rendered straight from a local store that a pool of background
+> threads keeps filled, one process, no IPC. Composing signs a note (locally, or
+> by a round-trip to the signer) that is stored at once and published to the pool.
+> Community "places" and the outbox model land in the milestones ahead. macOS first.
 
 ## Develop
 
