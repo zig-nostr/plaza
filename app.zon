@@ -2,7 +2,7 @@
     .id = "com.zig-nostr.plaza",
     .name = "plaza",
     .display_name = "Plaza",
-    .description = "A fast, local-first Nostr client organized around community places.",
+    .description = "A fast, local-first Nostr client, built natively in Zig.",
     .version = "0.1.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},

@@ -9,8 +9,8 @@
 //! is stored locally and published to the pool. The feed runs as a pool (each
 //! relay on its own thread ingesting into the one shared store, deduped by event
 //! id), scoped to the follow set, rendered from disk on a timer, all in one
-//! process. Real names (kind:0 profiles), NIP-65 outbox routing, and community
-//! "places" come in the milestones ahead.
+//! process. Real names (kind:0 profiles) and NIP-65 outbox routing come in the
+//! milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
