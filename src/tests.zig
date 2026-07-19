@@ -60,10 +60,58 @@ test "first run shows the onboarding welcome, not the feed" {
 
     try testing.expect(findAnyText(tree.root, "Welcome to Nostr") != null);
     try testing.expect(findAnyText(tree.root, "Create your identity") != null);
-    // Both onboarding paths render: create a local key, or connect a signer.
-    try testing.expect(findAnyText(tree.root, "Connect") != null);
+    // The sign-in paths (import a key or connect a signer) share one field with a
+    // Continue action.
+    try testing.expect(findAnyText(tree.root, "Continue") != null);
     // The feed's connecting header does not show on the welcome screen.
     try testing.expect(findAnyText(tree.root, "Connecting…") == null);
+}
+
+test "login text is classified by prefix" {
+    try testing.expectEqual(main.LoginTarget.nsec, main.classifyLogin("nsec1abcdef"));
+    try testing.expectEqual(main.LoginTarget.bunker, main.classifyLogin("bunker://pubkey?relay=wss://r"));
+    try testing.expectEqual(main.LoginTarget.nsec, main.classifyLogin("  nsec1withspace  "));
+    // An npub (read-only) is not a sign-in path yet, nor is arbitrary text.
+    try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("npub1abcdef"));
+    try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("hello"));
+    try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin(""));
+}
+
+test "the settings screen shows the identity, key backup, and logout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+
+    try testing.expect(findByText(tree.root, .text, "Settings") != null);
+    try testing.expect(findAnyText(tree.root, "Signed in as") != null);
+    // Default signer kind is a local key, so the key-backup card and its reveal
+    // control render.
+    try testing.expect(findAnyText(tree.root, "Local key") != null);
+    try testing.expect(findAnyText(tree.root, "Reveal secret key") != null);
+    // The logout entry point is present; the confirmation is not yet.
+    try testing.expect(findAnyText(tree.root, "Log out") != null);
+    try testing.expect(findAnyText(tree.root, "Cancel") == null);
+    // The version line renders.
+    try testing.expect(findAnyText(tree.root, "Plaza 0.1.0") != null);
+}
+
+test "the logout confirmation replaces the log-out button" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.logout_pending = true;
+    const tree = try buildTree(arena, &model);
+
+    // The confirmation shows a warning and a Cancel/Log out pair.
+    try testing.expect(findAnyText(tree.root, "Cancel") != null);
+    try testing.expect(findAnyText(tree.root, "Log out") != null);
 }
 
 test "the empty feed renders the brand and a connecting header" {

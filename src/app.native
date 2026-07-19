@@ -1,10 +1,10 @@
-<!-- Plaza, M5: onboarding plus the local-first feed. A first run shows a welcome
-     screen; creating an identity drops into a follow-based feed seeded by a
-     curated starter pack. A pool of background threads ingests the follow set's
-     notes into the local store; the UI reconciles on a timer and renders cards
-     (avatar · npub · relative time · note). The composer signs a kind:1 with the
-     local identity, stores it at once, and publishes it to the pool. Logic is in
-     src/main.zig. Edit while `native dev` runs to hot-reload. Validate: native check -->
+<!-- Plaza, M6: accounts and sessions. A first run shows a welcome screen with
+     three ways in (create, import an nsec, or connect a signer); the choice is
+     persisted, so a returning user is signed straight back in. The feed carries
+     a Settings screen where you can back up a local key or log out, never locked
+     in. Below onboarding is the follow-based feed and composer from earlier
+     milestones. Logic is in src/main.zig. Edit while `native dev` runs to
+     hot-reload. Validate: native check -->
 <column gap="0">
   <if test="{show_onboarding}">
     <column gap="16" main="center" cross="center" grow="1" padding="32">
@@ -14,23 +14,26 @@
       <button size="lg" variant="primary" on-press="create_identity">Create your identity</button>
       <text size="sm" foreground="text_muted">A second to set up. No email, no signup.</text>
       <separator/>
-      <text size="sm" foreground="text_muted">Already have a signer? Paste its bunker link to keep your key off this device.</text>
+      <text size="sm" foreground="text_muted">Already on Nostr? Paste your nsec to bring your key, or a bunker link to sign with your own signer and keep the key off this device.</text>
       <input-group width="340">
-        <textarea text="{bunker_draft}" placeholder="bunker://…" on-input="bunker_edit" on-submit="connect_signer"/>
+        <textarea text="{login_draft}" placeholder="nsec1… or bunker://…" on-input="login_edit" on-submit="login_submit"/>
         <input-group-actions>
-          <text size="sm" foreground="text_muted">{connect_status}</text>
+          <text size="sm" foreground="text_muted">{login_status}</text>
           <spacer grow="1"/>
-          <button size="sm" disabled="{bunker_empty}" on-press="connect_signer">Connect</button>
+          <button size="sm" disabled="{login_empty}" on-press="login_submit">Continue</button>
         </input-group-actions>
       </input-group>
     </column>
   </if>
   <if test="{show_feed}">
     <column gap="0" grow="1">
-      <column gap="4" padding="16">
-        <text size="heading">Plaza</text>
-        <text foreground="text_muted">{status}</text>
-      </column>
+      <row gap="8" cross="center" padding="16">
+        <column gap="4" grow="1">
+          <text size="heading">Plaza</text>
+          <text foreground="text_muted">{status}</text>
+        </column>
+        <button size="sm" variant="ghost" on-press="open_settings">Settings</button>
+      </row>
       <separator/>
       <if test="{empty}">
         <column gap="12" main="center" cross="center" grow="1" padding="24">
@@ -69,6 +72,65 @@
         </input-group>
       </column>
       <status-bar>{footer}</status-bar>
+    </column>
+  </if>
+  <if test="{show_settings}">
+    <column gap="0" grow="1">
+      <row gap="8" cross="center" padding="16">
+        <button size="sm" variant="ghost" on-press="close_settings">Back</button>
+        <text size="heading" grow="1">Settings</text>
+      </row>
+      <separator/>
+      <scroll grow="1">
+        <column gap="16" padding="16">
+          <card padding="16">
+            <column gap="8">
+              <text size="sm" foreground="text_muted">Signed in as</text>
+              <text wrap="true">{active_npub}</text>
+              <row gap="8" cross="center">
+                <text size="sm" foreground="accent">{identity_kind_label}</text>
+                <spacer grow="1"/>
+                <button size="sm" variant="ghost" on-press="copy_npub">Copy npub</button>
+              </row>
+            </column>
+          </card>
+          <if test="{is_local_key}">
+            <card padding="16">
+              <column gap="8">
+                <text size="sm" foreground="text_muted">Your secret key</text>
+                <text wrap="true" foreground="text_muted">Back this up. It's the only way to restore this identity on another device, and Plaza never sends it anywhere.</text>
+                <if test="{nsec_hidden}">
+                  <button size="sm" variant="ghost" on-press="toggle_nsec">Reveal secret key</button>
+                </if>
+                <if test="{nsec_shown}">
+                  <text wrap="true">{revealed_nsec}</text>
+                  <row gap="8" cross="center">
+                    <button size="sm" on-press="copy_nsec">Copy nsec</button>
+                    <spacer grow="1"/>
+                    <button size="sm" variant="ghost" on-press="toggle_nsec">Hide</button>
+                  </row>
+                </if>
+              </column>
+            </card>
+          </if>
+          <if test="{logout_idle}">
+            <button variant="destructive" on-press="logout_request">Log out</button>
+          </if>
+          <if test="{logout_confirming}">
+            <card padding="16">
+              <column gap="12">
+                <text wrap="true">{logout_warning}</text>
+                <row gap="8" cross="center">
+                  <button size="sm" variant="ghost" on-press="logout_cancel">Cancel</button>
+                  <spacer grow="1"/>
+                  <button size="sm" variant="destructive" on-press="logout_confirm">Log out</button>
+                </row>
+              </column>
+            </card>
+          </if>
+          <text size="sm" foreground="text_muted">{version_line}</text>
+        </column>
+      </scroll>
     </column>
   </if>
 </column>

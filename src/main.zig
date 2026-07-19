@@ -1,16 +1,21 @@
 //! Plaza, the flagship native Nostr client.
 //!
-//! M5 adds onboarding. A first run opens a welcome screen with two ways in:
-//! create a local identity (a persisted keypair), or connect an external signer
-//! (Signet) from a `bunker://` URL over NIP-46, so the secret key never enters
-//! Plaza. Either way you land in a follow-based feed seeded by a curated starter
-//! pack (the `starter_pack` authors), browsing and posting in seconds. Composing
-//! signs a kind:1 (locally, or by a `sign_event` round-trip to the bunker), which
-//! is stored locally and published to the pool. The feed runs as a pool (each
-//! relay on its own thread ingesting into the one shared store, deduped by event
-//! id), scoped to the follow set, rendered from disk on a timer, all in one
-//! process. Real names (kind:0 profiles) and NIP-65 outbox routing come in the
-//! milestones ahead.
+//! A first run opens a welcome screen with three ways in: create a fresh
+//! identity, paste an existing `nsec` to import a key, or paste a `bunker://`
+//! link to connect an external signer (Signet) over NIP-46 so the secret key
+//! never enters Plaza. The choice is persisted as a session, so a returning user
+//! is signed straight back in (a local key from disk, or a silent bunker
+//! reconnect). A Settings screen shows who you are signed in as, lets a local
+//! user back up their secret key, and logs out without locking anyone in: your
+//! key is always yours to copy and take elsewhere.
+//!
+//! Signed in, you land in a follow-based feed seeded by a curated starter pack
+//! (the `starter_pack` authors). Composing signs a kind:1 (locally, or by a
+//! `sign_event` round-trip to the bunker), which is stored locally and published
+//! to the pool. The feed runs as a pool (each relay on its own thread ingesting
+//! into the one shared store, deduped by event id), scoped to the follow set,
+//! rendered from disk on a timer, all in one process. Real names (kind:0
+//! profiles) and NIP-65 outbox routing come in the milestones ahead.
 //!
 //! The view lives in `app.native`; this file is the logic.
 
@@ -72,8 +77,14 @@ const feed_capacity = 60;
 const compose_capacity = 512;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
+// The app version shown in Settings. Keep in step with app.zon's `.version`.
+const plaza_version = "0.1.0";
+// Effect keys for the two Settings clipboard copies (npub, nsec). Clipboard
+// effects share the effect key space, so these stay distinct from the timer key.
+const copy_npub_key: u64 = 100;
+const copy_nsec_key: u64 = 101;
 
-const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
+const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Plaza canvas", .accessibility_label = "Plaza", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
@@ -153,6 +164,24 @@ var g_remote_status = std.atomic.Value(u8).init(0);
 // Monotonic source of unique NIP-46 request ids.
 var g_req_counter = std.atomic.Value(u64).init(0);
 
+// A synchronous error from the unified login field (nsec / bunker), shown under
+// it. `.none` while idle or when the async bunker path is in charge (its state
+// comes from `g_remote_status`). See `LoginError` and `Model.login_status`.
+const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2 };
+var g_login_error = std.atomic.Value(u8).init(0);
+
+/// What the pasted login text is: a secret key to import, a signer to connect,
+/// or neither.
+pub const LoginTarget = enum { nsec, bunker, invalid };
+
+/// Classifies pasted login text by its prefix. Pure, so it is unit-tested.
+pub fn classifyLogin(text: []const u8) LoginTarget {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.startsWith(u8, t, "nsec1")) return .nsec;
+    if (std.mem.startsWith(u8, t, "bunker://")) return .bunker;
+    return .invalid;
+}
+
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 fn nowSeconds() i64 {
     const io = g_io orelse return 0;
@@ -221,7 +250,7 @@ pub const Note = struct {
 };
 
 /// Which top-level screen the app shows.
-const Stage = enum { onboarding, ready };
+const Stage = enum { onboarding, ready, settings };
 
 pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
@@ -232,28 +261,36 @@ pub const Model = struct {
     // text through `draft()`, never the buffer itself, and every edit event is
     // mirrored here in `update`.
     draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
-    // Which screen shows. A returning user (identity already on disk) starts at
-    // `.ready`; a newcomer starts at `.onboarding` and moves to `.ready` when
-    // they create an identity.
+    // Which screen shows. A returning user (session on disk) starts at `.ready`;
+    // a newcomer starts at `.onboarding` and moves to `.ready` when they sign in.
+    // `.settings` is reached from the feed and returns to it.
     stage: Stage = .onboarding,
-    // The onboarding "connect a signer" field: a `bunker://` URL to pair with an
-    // external NIP-46 signer (Signet).
-    bunker_buffer: canvas.TextBuffer(220) = .{},
+    // The onboarding sign-in field: an existing `nsec` to import a key, or a
+    // `bunker://` URL to pair with an external NIP-46 signer (Signet).
+    login_buffer: canvas.TextBuffer(220) = .{},
+    // Settings: whether the "log out" confirmation is showing, and whether the
+    // local secret key is revealed for backup.
+    logout_pending: bool = false,
+    reveal_nsec: bool = false,
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
     // status line, the draft through `draft`/`draft_empty`, the stage through
-    // `show_onboarding`/`show_feed`, the bunker field through `bunker_draft`, so
-    // the raw fields are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage", "bunker_buffer" };
+    // `show_onboarding`/`show_feed`/`show_settings`, the login field through
+    // `login_draft`, so the raw fields are never bound by name.
+    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage", "login_buffer", "logout_pending", "reveal_nsec" };
 
-    /// Whether the first-run welcome screen shows (no identity yet).
+    /// Whether the first-run welcome screen shows (no session yet).
     pub fn show_onboarding(self: *const Model) bool {
         return self.stage == .onboarding;
     }
-    /// Whether the main feed shows (identity established).
+    /// Whether the main feed shows (signed in).
     pub fn show_feed(self: *const Model) bool {
         return self.stage == .ready;
+    }
+    /// Whether the Settings screen shows.
+    pub fn show_settings(self: *const Model) bool {
+        return self.stage == .settings;
     }
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -275,23 +312,84 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, npub }) catch npub;
     }
 
-    /// The onboarding "connect a signer" field text (what `text="{bunker_draft}"`
-    /// binds).
-    pub fn bunker_draft(self: *const Model) []const u8 {
-        return self.bunker_buffer.text();
+    /// The onboarding sign-in field text (what `text="{login_draft}"` binds).
+    pub fn login_draft(self: *const Model) []const u8 {
+        return self.login_buffer.text();
     }
-    /// Whether the bunker field is blank, which disables Connect.
-    pub fn bunker_empty(self: *const Model) bool {
-        return std.mem.trim(u8, self.bunker_buffer.text(), " \t\r\n").len == 0;
+    /// Whether the sign-in field is blank, which disables Continue.
+    pub fn login_empty(self: *const Model) bool {
+        return std.mem.trim(u8, self.login_buffer.text(), " \t\r\n").len == 0;
     }
-    /// The onboarding connect-status line under the bunker field.
-    pub fn connect_status(self: *const Model) []const u8 {
+    /// The status line under the sign-in field: a synchronous parse error, or
+    /// the async bunker-connect state.
+    pub fn login_status(self: *const Model) []const u8 {
         _ = self;
+        switch (@as(LoginError, @enumFromInt(g_login_error.load(.acquire)))) {
+            .format => return "Paste an nsec or a bunker link.",
+            .bad_key => return "That doesn't look like a valid key.",
+            .none => {},
+        }
         return switch (g_remote_status.load(.acquire)) {
             1 => "Connecting to your signer…",
             3 => "Couldn't read that bunker link.",
             else => "",
         };
+    }
+
+    // -- Settings ------------------------------------------------------------
+
+    /// The abbreviated npub of the signed-in identity (empty before sign-in).
+    pub fn active_npub(self: *const Model) []const u8 {
+        _ = self;
+        return g_identity_npub_buf[0..g_identity_npub_len];
+    }
+    /// How the identity signs: a local key on this device, or a remote signer.
+    pub fn identity_kind_label(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_signer_kind) {
+            .local => "Local key",
+            .remote => "Remote signer",
+        };
+    }
+    /// Whether the identity is a local key (so its secret can be backed up here).
+    pub fn is_local_key(self: *const Model) bool {
+        _ = self;
+        return g_signer_kind == .local;
+    }
+    /// Whether the local secret key is hidden (the reveal toggle's off state).
+    pub fn nsec_hidden(self: *const Model) bool {
+        return !self.reveal_nsec;
+    }
+    /// Whether the secret key is currently revealed.
+    pub fn nsec_shown(self: *const Model) bool {
+        return self.reveal_nsec;
+    }
+    /// The revealed nsec (bech32 secret key), or empty when hidden or not local.
+    pub fn revealed_nsec(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!self.reveal_nsec or g_signer_kind != .local) return "";
+        const kp = g_identity_kp orelse return "";
+        return nostr.nip19.encodeNsec(arena, kp.secret_key) catch "";
+    }
+    /// Whether the logout confirmation is not yet showing.
+    pub fn logout_idle(self: *const Model) bool {
+        return !self.logout_pending;
+    }
+    /// Whether the logout confirmation is showing.
+    pub fn logout_confirming(self: *const Model) bool {
+        return self.logout_pending;
+    }
+    /// The logout confirmation warning, sharper for a local key (it is deleted).
+    pub fn logout_warning(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_signer_kind) {
+            .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
+            .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
+        };
+    }
+    /// The app version line for the Settings footer.
+    pub fn version_line(self: *const Model) []const u8 {
+        _ = self;
+        return "Plaza " ++ plaza_version;
     }
 
     /// The feed, iterated by `<for each="note_list">`, newest first.
@@ -450,12 +548,28 @@ pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     /// Post the current draft: sign, store locally, and publish to the pool.
     post,
-    /// Onboarding: create a local identity and enter the feed.
+    /// Onboarding: create a fresh local identity and enter the feed.
     create_identity,
-    /// A text edit in the onboarding bunker-URL field.
-    bunker_edit: canvas.TextInputEvent,
-    /// Onboarding: connect an external signer from the bunker URL and enter the feed.
-    connect_signer,
+    /// A text edit in the onboarding sign-in field.
+    login_edit: canvas.TextInputEvent,
+    /// Onboarding: sign in with the pasted nsec or bunker link and enter the feed.
+    login_submit,
+    /// Open the Settings screen.
+    open_settings,
+    /// Return from Settings to the feed.
+    close_settings,
+    /// Reveal (or hide) the local secret key for backup.
+    toggle_nsec,
+    /// Copy the signed-in npub to the clipboard.
+    copy_npub,
+    /// Copy the local secret key (nsec) to the clipboard.
+    copy_nsec,
+    /// Ask to log out: show the confirmation.
+    logout_request,
+    /// Dismiss the logout confirmation.
+    logout_cancel,
+    /// Confirm logout: wipe the session (and a local key) and return to onboarding.
+    logout_confirm,
 
     // `tick` is dispatched by the refresh timer in Zig, never from markup.
     pub const view_unbound = .{"tick"};
@@ -481,7 +595,6 @@ pub fn boot(model: *Model, fx: *Effects) void {
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
-    _ = fx;
     switch (msg) {
         .tick => |t| {
             if (t.outcome == .fired) model.refresh(nowSeconds());
@@ -491,23 +604,67 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
+            persistSession();
             enterFeed(model);
         },
-        .bunker_edit => |edit| model.bunker_buffer.apply(edit),
-        .connect_signer => {
-            // Pair with the external signer from the bunker URL; on success the
-            // feed comes up and posts route through it. A bad URL stays on
-            // onboarding with an error (see `connect_status`).
-            if (!connectRemoteSigner(model.bunker_buffer.text())) return;
-            enterFeed(model);
+        .login_edit => |edit| model.login_buffer.apply(edit),
+        .login_submit => {
+            g_login_error.store(@intFromEnum(LoginError.none), .release);
+            const raw = std.mem.trim(u8, model.login_buffer.text(), " \t\r\n");
+            switch (classifyLogin(raw)) {
+                // Import an existing key: it lands on disk (0600) as the local
+                // identity. A bad nsec keeps us on onboarding with an error.
+                .nsec => {
+                    if (!importNsec(raw)) return;
+                    persistSession();
+                    enterFeed(model);
+                },
+                // Pair with the external signer from the bunker URL; on success
+                // the feed comes up and posts route through it. A bad URL keeps
+                // us on onboarding with an error (see `login_status`).
+                .bunker => {
+                    if (!connectRemoteSigner(raw)) return;
+                    persistSession();
+                    enterFeed(model);
+                },
+                .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
+            }
         },
+        .open_settings => model.stage = .settings,
+        .close_settings => {
+            model.logout_pending = false;
+            model.reveal_nsec = false;
+            model.stage = .ready;
+        },
+        .toggle_nsec => model.reveal_nsec = !model.reveal_nsec,
+        .copy_npub => {
+            const pk = activePubkey() orelse return;
+            var scratch: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const npub = nostr.nip19.encodeNpub(fba.allocator(), pk) catch return;
+            fx.writeClipboard(.{ .key = copy_npub_key, .text = npub });
+        },
+        .copy_nsec => {
+            if (g_signer_kind != .local) return;
+            const kp = g_identity_kp orelse return;
+            var scratch: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const nsec = nostr.nip19.encodeNsec(fba.allocator(), kp.secret_key) catch return;
+            fx.writeClipboard(.{ .key = copy_nsec_key, .text = nsec });
+        },
+        .logout_request => model.logout_pending = true,
+        .logout_cancel => model.logout_pending = false,
+        .logout_confirm => performLogout(model),
     }
 }
 
 /// Switches to the feed and brings the store + ingest pool up if they are not
-/// already running. Shared by both onboarding paths (local key and remote signer).
+/// already running. Shared by all sign-in paths (create, import, remote signer).
+/// A fresh identity means the feed's author filter changed, so force a rebuild
+/// on the next tick by invalidating the change guard.
 fn enterFeed(model: *Model) void {
     model.stage = .ready;
+    g_last_count = std.math.maxInt(usize);
     if (g_store == null) {
         if (g_io) |io| if (g_environ) |env| startFeed(io, env);
     }
@@ -818,11 +975,11 @@ pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     g_environ = init.environ_map;
 
-    // A returning user has an identity on disk: load it and skip onboarding. A
-    // newcomer starts at the welcome screen, and the feed comes up when they
-    // create an identity (see `update`). Best-effort: on failure the app still
-    // runs, showing onboarding.
-    const has_identity = loadIdentityIfPresent(init.io, init.environ_map);
+    // A returning user has a persisted session: restore it (load the local key,
+    // or silently reconnect the bunker) and skip onboarding. A newcomer starts
+    // at the welcome screen, and the feed comes up when they sign in (see
+    // `update`). Best-effort: on failure the app still runs, showing onboarding.
+    const restored = restoreSession(init.io, init.environ_map);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
@@ -834,9 +991,9 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModel();
-    if (has_identity) {
+    if (restored) {
         // Returning user: open the store and start the background ingest before
-        // the window appears. A newcomer's feed starts on identity creation.
+        // the window appears. A newcomer's feed starts on sign-in.
         app_state.model.stage = .ready;
         startFeed(init.io, init.environ_map);
     }
@@ -937,6 +1094,7 @@ fn loadIdentityIfPresent(io: std.Io, environ: *const std.process.Environ.Map) bo
         signer.deinit();
         return false;
     };
+    g_signer_kind = .local;
     setIdentity(signer, kp);
     return true;
 }
@@ -954,21 +1112,53 @@ fn createLocalIdentity() bool {
         return false;
     };
 
-    var dir = plazaDir(io, environ) catch {
-        signer.deinit();
-        return false;
-    };
-    defer dir.close(io);
-    // Refuse to clobber a key another instance may have written; a failure to
-    // persist still lets this session run with the in-memory key.
-    dir.writeFile(io, .{
-        .sub_path = "identity.key",
-        .data = &kp.secret_key,
-        .flags = .{ .exclusive = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
-    }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
-
+    persistIdentityKey(io, environ, kp.secret_key);
+    g_signer_kind = .local;
     setIdentity(signer, kp);
     return true;
+}
+
+/// Imports an existing key from a bech32 `nsec`, persists it (mode 0600), and
+/// adopts it as the local identity. Backs the onboarding "paste your nsec" path.
+/// On a malformed key sets the login error and returns false.
+fn importNsec(nsec: []const u8) bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+    const gpa = std.heap.page_allocator;
+
+    const secret = nostr.nip19.decodeNsec(gpa, nsec) catch {
+        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
+        return false;
+    };
+    var signer = nostr.keys.Signer.init();
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        signer.deinit();
+        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
+        return false;
+    };
+
+    persistIdentityKey(io, environ, secret);
+    g_signer_kind = .local;
+    setIdentity(signer, kp);
+    return true;
+}
+
+/// Writes the raw 32-byte secret to `$HOME/.plaza/identity.key` at mode 0600,
+/// replacing any existing file. A failure to persist is non-fatal: the session
+/// still runs with the in-memory key (it just will not survive a relaunch).
+fn persistIdentityKey(io: std.Io, environ: *const std.process.Environ.Map, secret: [32]u8) void {
+    var dir = plazaDir(io, environ) catch |err| {
+        std.debug.print("plaza: could not open key dir: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer dir.close(io);
+    // Replace any prior key (a logout deletes it, so normally there is none).
+    dir.deleteFile(io, "identity.key") catch {};
+    dir.writeFile(io, .{
+        .sub_path = "identity.key",
+        .data = &secret,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
 }
 
 /// Sets the identity globals: the signer, the keypair, and the abbreviated npub
@@ -979,6 +1169,166 @@ fn setIdentity(signer: nostr.keys.Signer, kp: nostr.keys.KeyPair) void {
     g_identity_kp = kp;
     const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
     g_identity_npub_len = npub.len;
+}
+
+// ------------------------------------------------------------------- session
+//
+// The active identity is persisted as a small session file at
+// `$HOME/.plaza/session` (mode 0600), a line-based `key=value` record, so a
+// returning user is signed straight back in without re-entering anything. A
+// local session points at `identity.key` (the raw secret already on disk); a
+// remote session carries everything needed to silently reconnect the NIP-46
+// bunker (the signer's pubkey, its relay, our ephemeral transport secret, and
+// the connect secret), never the user's own key, which lives only in the signer.
+
+/// Writes the session file for the current identity kind. Best-effort: a failure
+/// to persist just means this identity will not auto-restore next launch.
+fn persistSession() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+
+    var buf: [1024]u8 = undefined;
+    const data = switch (g_signer_kind) {
+        .local => std.fmt.bufPrint(&buf, "kind=local\n", .{}) catch return,
+        .remote => blk: {
+            const kp = g_remote_client_kp orelse return;
+            var pk_hex: [64]u8 = undefined;
+            hexLower(&pk_hex, g_remote_pubkey);
+            var cs_hex: [64]u8 = undefined;
+            hexLower(&cs_hex, kp.secret_key);
+            break :blk std.fmt.bufPrint(&buf, "kind=remote\nremote_pubkey={s}\nrelay={s}\nclient_secret={s}\nsecret={s}\n", .{
+                &pk_hex,
+                g_remote_relay_buf[0..g_remote_relay_len],
+                &cs_hex,
+                g_remote_secret_buf[0..g_remote_secret_len],
+            }) catch return;
+        },
+    };
+    dir.writeFile(io, .{
+        .sub_path = "session",
+        .data = data,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| std.debug.print("plaza: could not persist session: {s}\n", .{@errorName(err)});
+}
+
+/// Restores the persisted identity at boot. Returns whether a session was
+/// restored (so the feed should start). Reads `$HOME/.plaza/session`; falls back
+/// to migrating a legacy `identity.key` (pre-session installs) into a local
+/// session. Any missing or malformed data returns false, landing on onboarding.
+fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
+    var dir = plazaDir(io, environ) catch return false;
+    defer dir.close(io);
+    const gpa = std.heap.page_allocator;
+
+    const raw = dir.readFileAlloc(io, "session", gpa, std.Io.Limit.limited(2048)) catch {
+        // No session file: adopt a legacy local key if one is on disk.
+        if (loadIdentityIfPresent(io, environ)) {
+            persistSession();
+            return true;
+        }
+        return false;
+    };
+    defer gpa.free(raw);
+
+    var kind: []const u8 = "";
+    var f_pubkey: []const u8 = "";
+    var f_relay: []const u8 = "";
+    var f_client_secret: []const u8 = "";
+    var f_secret: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const val = line[eq + 1 ..];
+        if (std.mem.eql(u8, key, "kind")) kind = val;
+        if (std.mem.eql(u8, key, "remote_pubkey")) f_pubkey = val;
+        if (std.mem.eql(u8, key, "relay")) f_relay = val;
+        if (std.mem.eql(u8, key, "client_secret")) f_client_secret = val;
+        if (std.mem.eql(u8, key, "secret")) f_secret = val;
+    }
+
+    if (std.mem.eql(u8, kind, "local")) return loadIdentityIfPresent(io, environ);
+    if (std.mem.eql(u8, kind, "remote")) return restoreRemoteSigner(gpa, f_pubkey, f_relay, f_client_secret, f_secret);
+    return false;
+}
+
+/// Rebuilds the remote-signer connection from a persisted session and reconnects
+/// silently: adopts the bunker pubkey as the identity, reconstructs the ephemeral
+/// transport key, starts the response listener, and re-sends `connect`.
+fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []const u8, client_secret_hex: []const u8, secret: []const u8) bool {
+    if (pubkey_hex.len != 64 or client_secret_hex.len != 64) return false;
+    if (relay.len == 0 or relay.len > g_remote_relay_buf.len) return false;
+    if (secret.len > g_remote_secret_buf.len) return false;
+
+    var pubkey: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pubkey, pubkey_hex) catch return false;
+    var client_secret: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&client_secret, client_secret_hex) catch return false;
+
+    var signer = nostr.keys.Signer.init();
+    const client_kp = signer.keyPairFromSecretKey(client_secret) catch {
+        signer.deinit();
+        return false;
+    };
+    signer.deinit();
+
+    g_remote_pubkey = pubkey;
+    @memcpy(g_remote_relay_buf[0..relay.len], relay);
+    g_remote_relay_len = relay.len;
+    @memcpy(g_remote_secret_buf[0..secret.len], secret);
+    g_remote_secret_len = secret.len;
+    g_remote_client_kp = client_kp;
+
+    const npub = abbreviateNpub(&g_identity_npub_buf, pubkey);
+    g_identity_npub_len = npub.len;
+    g_signer_kind = .remote;
+    g_remote_status.store(1, .release);
+
+    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{gpa}) catch return false;
+    thread.detach();
+    sendConnect(gpa);
+    return true;
+}
+
+/// Logs out: deletes the session (and, for a local key, the key file itself),
+/// resets the identity globals, and returns to onboarding. The feed store and
+/// its ingest threads keep running (they serve the starter pack regardless of
+/// who is signed in); a subsequent sign-in reuses them. The user is never locked
+/// in, a local key can always be copied from Settings first, and a remote
+/// signer keeps the user's key throughout.
+fn performLogout(model: *Model) void {
+    if (g_io) |io| if (g_environ) |environ| {
+        if (plazaDir(io, environ)) |dir_const| {
+            var dir = dir_const;
+            defer dir.close(io);
+            dir.deleteFile(io, "session") catch {};
+            if (g_signer_kind == .local) dir.deleteFile(io, "identity.key") catch {};
+        } else |_| {}
+    };
+
+    // Reset identity state. The detached NIP-46 listener (if any) keeps looping
+    // against the old bunker but is orphaned: nothing reads its results once the
+    // identity is cleared. A clean per-session teardown is future work.
+    if (g_identity_signer) |*s| s.deinit();
+    g_identity_signer = null;
+    g_identity_kp = null;
+    g_identity_npub_len = 0;
+    g_signer_kind = .local;
+    g_remote_client_kp = null;
+    g_remote_relay_len = 0;
+    g_remote_secret_len = 0;
+    g_remote_status.store(0, .release);
+    g_login_error.store(@intFromEnum(LoginError.none), .release);
+    g_last_count = std.math.maxInt(usize);
+
+    model.login_buffer.clear();
+    model.draft_buffer.clear();
+    model.logout_pending = false;
+    model.reveal_nsec = false;
+    model.notes_len = 0;
+    model.stage = .onboarding;
 }
 
 // ----------------------------------------------------------- background ingest
