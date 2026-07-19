@@ -46,7 +46,7 @@
             <for each="note_list" key="id" as="n">
               <card padding="12">
                 <row gap="10" cross="start">
-                  <avatar>{n.initials}</avatar>
+                  <avatar image="{n.avatar_id}">{n.initials}</avatar>
                   <column gap="4" grow="1">
                     <row gap="8" cross="center">
                       <text grow="1" foreground="text_muted">{n.author}</text>

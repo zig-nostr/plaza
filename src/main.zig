@@ -83,8 +83,26 @@ const plaza_version = "0.1.0";
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
+// Avatar fetches use effect keys `avatar_fetch_key_base + slot`, kept clear of
+// the timer and clipboard keys above.
+const avatar_fetch_key_base: u64 = 1000;
 
-const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard };
+// The profile cache holds display names and avatars keyed by pubkey. It is
+// larger than the feed's author set so a mention can resolve to a name too.
+const profile_cap = 32;
+// The image registry caps at 16 slots, shared across the app. The feed's author
+// set (the starter pack plus the user) is small, so the first `max_avatar_images`
+// cache slots own an avatar image id; beyond that, and for mention-only entries,
+// the avatar falls back to initials. Media in the next milestone shares this
+// budget, so an LRU arrives with it.
+const max_avatar_images = 16;
+// The largest avatar body we accept: the fetch effect caps at 256 KiB, and an
+// avatar over ~240 KiB is almost never worth decoding, so we skip it (initials
+// fallback) rather than spend the decode budget. Proxy-resized avatars in the
+// next milestone make this moot.
+const max_avatar_bytes = 240 * 1024;
+
+const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Plaza canvas", .accessibility_label = "Plaza", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
@@ -182,6 +200,107 @@ pub fn classifyLogin(text: []const u8) LoginTarget {
     return .invalid;
 }
 
+// ------------------------------------------------------------------ profiles
+//
+// Kind:0 metadata gives each author a display name and an avatar. The pool
+// ingests kind:0 for the feed's authors alongside their notes (the store keeps
+// only the newest per author, kind:0 being replaceable); the UI thread parses
+// them into this cache during the feed rebuild, keyed by pubkey. The feed reads
+// names and avatar image ids from the cache at render time, so a name or a
+// just-loaded avatar shows on the next frame without a re-query. Avatars are
+// fetched (bounded, cap-aware) and registered as canvas images; the cache is
+// UI-thread-only, so no synchronisation is needed.
+
+/// A cached author profile.
+const Profile = struct {
+    used: bool = false,
+    pubkey: [32]u8 = [_]u8{0} ** 32,
+    name_buf: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    picture_buf: [200]u8 = [_]u8{0} ** 200,
+    picture_len: u8 = 0,
+    // The avatar's lifecycle: not yet fetched, in flight, registered, or given
+    // up on (initials fallback).
+    avatar_state: enum { idle, fetching, loaded, failed } = .idle,
+    // The registered canvas-image id for this profile's avatar (0 = none). Fixed
+    // per cache slot, so a re-fetch replaces the same id.
+    image_id: u64 = 0,
+
+    fn name(self: *const Profile) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn picture(self: *const Profile) []const u8 {
+        return self.picture_buf[0..self.picture_len];
+    }
+};
+
+var g_profiles = [_]Profile{.{}} ** profile_cap;
+
+/// Clears the profile cache. For tests, which share the process globals.
+pub fn resetProfilesForTest() void {
+    g_profiles = [_]Profile{.{}} ** profile_cap;
+}
+
+/// Finds the cached profile for `pubkey`, or null.
+fn lookupProfile(pubkey: [32]u8) ?*Profile {
+    for (&g_profiles) |*p| {
+        if (p.used and std.mem.eql(u8, &p.pubkey, &pubkey)) return p;
+    }
+    return null;
+}
+
+/// The cache slot for `pubkey`, allocating a free one on first sight. Null only
+/// when the cache is full (then that author renders from its npub and initials).
+pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
+    if (lookupProfile(pubkey)) |p| return p;
+    for (&g_profiles, 0..) |*p, i| {
+        if (!p.used) {
+            p.* = .{ .used = true, .pubkey = pubkey };
+            // The first slots own an avatar image id; beyond the registry's
+            // budget, an entry is name-only (initials avatar).
+            if (i < max_avatar_images) p.image_id = @intCast(i + 1);
+            return p;
+        }
+    }
+    return null;
+}
+
+/// Parses a kind:0 metadata JSON content into `profile`'s name and picture.
+/// Tolerant: unknown fields are ignored and a malformed blob leaves the profile
+/// unchanged (it just keeps rendering from its npub). Prefers `display_name`
+/// (or the legacy `displayName`) over `name`.
+pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
+    const Metadata = struct {
+        name: ?[]const u8 = null,
+        display_name: ?[]const u8 = null,
+        displayName: ?[]const u8 = null,
+        picture: ?[]const u8 = null,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const md = std.json.parseFromSliceLeaky(Metadata, arena_state.allocator(), content, .{ .ignore_unknown_fields = true }) catch return;
+
+    const display = md.displayName orelse md.display_name orelse md.name;
+    if (display) |d| {
+        const trimmed = std.mem.trim(u8, d, " \t\r\n");
+        const n = utf8SafeLen(trimmed, profile.name_buf.len);
+        @memcpy(profile.name_buf[0..n], trimmed[0..n]);
+        profile.name_len = @intCast(n);
+    }
+    if (md.picture) |pic| {
+        const trimmed = std.mem.trim(u8, pic, " \t\r\n");
+        if (trimmed.len <= profile.picture_buf.len and (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://"))) {
+            // A changed picture URL means the old avatar is stale: refetch it
+            // into the same image slot.
+            if (!std.mem.eql(u8, trimmed, profile.picture())) {
+                @memcpy(profile.picture_buf[0..trimmed.len], trimmed);
+                profile.picture_len = @intCast(trimmed.len);
+                if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
+            }
+        }
+    }
+}
+
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 fn nowSeconds() i64 {
     const io = g_io orelse return 0;
@@ -210,6 +329,10 @@ pub const Note = struct {
     // bytes would overflow and panic. Mask off the sign bit.
     id: i64 = 0,
     created_at: i64 = 0,
+    // The author's full pubkey, so the view can resolve a display name and an
+    // avatar from the profile cache at render time (picking up a name or a
+    // just-loaded avatar without rebuilding the note).
+    pubkey: [32]u8 = [_]u8{0} ** 32,
     initials_buf: [2]u8 = [_]u8{0} ** 2,
     author_buf: [24]u8 = [_]u8{0} ** 24,
     author_len: u8 = 0,
@@ -221,8 +344,20 @@ pub const Note = struct {
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
     }
+    /// The author's display name from their kind:0 profile, or the abbreviated
+    /// npub until (or unless) a profile is known.
     pub fn author(self: *const Note) []const u8 {
+        if (lookupProfile(self.pubkey)) |p| {
+            if (p.name_len > 0) return p.name();
+        }
         return self.author_buf[0..self.author_len];
+    }
+    /// The registered avatar image id for this author, or 0 to draw initials.
+    pub fn avatar_id(self: *const Note) u64 {
+        if (lookupProfile(self.pubkey)) |p| {
+            if (p.avatar_state == .loaded) return p.image_id;
+        }
+        return 0;
     }
     pub fn time(self: *const Note) []const u8 {
         return self.time_buf[0..self.time_len];
@@ -307,9 +442,15 @@ pub const Model = struct {
     pub fn identity(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
         if (g_identity_npub_len == 0) return "Preparing your key…";
-        const npub = g_identity_npub_buf[0..g_identity_npub_len];
+        // Show the user's own display name once their kind:0 is known, else npub.
+        var who: []const u8 = g_identity_npub_buf[0..g_identity_npub_len];
+        if (activePubkey()) |pk| {
+            if (lookupProfile(pk)) |p| {
+                if (p.name_len > 0) who = p.name();
+            }
+        }
         const prefix = if (g_signer_kind == .remote) "Signing via your signer · " else "Posting as ";
-        return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, npub }) catch npub;
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, who }) catch who;
     }
 
     /// The onboarding sign-in field text (what `text="{login_draft}"` binds).
@@ -444,6 +585,8 @@ pub const Model = struct {
         const count = store.eventCount() catch return;
         if (count != g_last_count) {
             g_last_count = count;
+            // Profiles first, so a note's mentions resolve to names as it builds.
+            refreshProfiles(store);
             rebuildNotes(self, store, now_s);
         }
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
@@ -473,28 +616,169 @@ pub const Model = struct {
     }
 };
 
+/// Reads kind:0 metadata for the feed's authors from the store and parses each
+/// into the profile cache. The store keeps only the newest kind:0 per author, so
+/// this always reflects the current metadata.
+fn refreshProfiles(store: *nostr.store.Store) void {
+    const kinds = [_]u16{0};
+    var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
+    var authors_len: usize = starter_pack.len;
+    if (activePubkey()) |pk| {
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap }) catch return;
+    defer result.deinit();
+    for (result.events) |ev| {
+        const p = upsertProfile(ev.pubkey) orelse continue;
+        parseMetadataInto(p, ev.content);
+    }
+}
+
+/// Fires avatar fetches for cached profiles that have a picture and an image
+/// slot but no avatar yet, a few per tick to stay well inside the effect budget.
+/// The response lands on `avatar_fetched`.
+fn scanAvatarFetches(fx: *Effects) void {
+    const per_tick = 6;
+    var fired: usize = 0;
+    for (&g_profiles, 0..) |*p, i| {
+        if (fired >= per_tick) break;
+        if (!p.used or p.avatar_state != .idle or p.picture_len == 0 or p.image_id == 0) continue;
+        p.avatar_state = .fetching;
+        fx.fetch(.{
+            .key = avatar_fetch_key_base + @as(u64, @intCast(i)),
+            .url = p.picture(),
+            .on_response = Effects.responseMsg(.avatar_fetched),
+        });
+        fired += 1;
+    }
+}
+
+/// Handles an avatar fetch response: registers the decoded image on success, or
+/// retries a slot-starved rejection and gives up (initials) on anything else.
+fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key < avatar_fetch_key_base) return;
+    const slot = response.key - avatar_fetch_key_base;
+    if (slot >= g_profiles.len) return;
+    const p = &g_profiles[@intCast(slot)];
+    if (!p.used) return;
+
+    // A rejection means every effect slot was busy: try again next tick.
+    if (response.outcome == .rejected) {
+        p.avatar_state = .idle;
+        return;
+    }
+    // Anything but a clean, whole, OK image body falls back to initials.
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_avatar_bytes) {
+        p.avatar_state = .failed;
+        return;
+    }
+    // Decode and register into this profile's fixed image id. A decode failure,
+    // or a decoded size over the image budget (an avatar larger than 512x512,
+    // which this milestone does not yet downscale), falls back to initials.
+    _ = fx.registerImageBytes(p.image_id, response.body) catch {
+        p.avatar_state = .failed;
+        return;
+    };
+    p.avatar_state = .loaded;
+}
+
 /// Builds a `Note` view-model from a stored event.
 pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     var note = Note{
         .created_at = ev.created_at,
+        .pubkey = ev.pubkey,
         .id = @intCast(std.mem.readInt(u64, ev.id[0..8], .big) & std.math.maxInt(i64)),
     };
 
-    // Avatar initials: the first pubkey byte as two hex digits, stable and
-    // distinct per author until real kind:0 profiles land.
+    // Avatar initials fallback: the first pubkey byte as two hex digits, stable
+    // and distinct per author, shown until an avatar image loads.
     const hexdigits = "0123456789abcdef";
     note.initials_buf = .{ hexdigits[ev.pubkey[0] >> 4], hexdigits[ev.pubkey[0] & 0x0f] };
 
     setAuthor(&note, ev.pubkey);
 
-    // Content: copied up to the buffer, trimmed back to a UTF-8 boundary so a
-    // split multi-byte codepoint never reaches the text shaper.
-    const clen = utf8SafeLen(ev.content, note.content_buf.len);
-    @memcpy(note.content_buf[0..clen], ev.content[0..clen]);
-    note.content_len = @intCast(clen);
+    // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
+    // whole-codepoint so a split multi-byte sequence never reaches the shaper.
+    note.content_len = @intCast(renderContent(&note.content_buf, ev.content));
 
     note.setTime(now_s);
     return note;
+}
+
+/// Copies note content into `dst`, rewriting NIP-27 `nostr:npub…`/`nostr:nprofile…`
+/// mentions into a readable `@name` (from the profile cache) or a short `@npub`.
+/// Plain text is copied one whole codepoint at a time and stops at `dst`'s
+/// capacity, so the buffer never ends mid-sequence. Returns the byte length.
+pub fn renderContent(dst: []u8, src: []const u8) usize {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (parseMentionAt(arena, src, i)) |m| {
+            var label_buf: [80]u8 = undefined;
+            const label = mentionLabel(m.pubkey, &label_buf);
+            if (out + label.len > dst.len) break;
+            @memcpy(dst[out..][0..label.len], label);
+            out += label.len;
+            i = m.end;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(src[i]) catch 1;
+        const take = @min(seq_len, src.len - i);
+        if (out + take > dst.len) break;
+        @memcpy(dst[out..][0..take], src[i..][0..take]);
+        out += take;
+        i += take;
+    }
+    return out;
+}
+
+/// A parsed `nostr:` mention at `src[i]`: the byte just past its token, and the
+/// referenced pubkey. Null when `src[i]` is not the start of one.
+fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct { end: usize, pubkey: [32]u8 } {
+    const prefix = "nostr:";
+    if (!std.mem.startsWith(u8, src[i..], prefix)) return null;
+    const rest = src[i + prefix.len ..];
+    var j: usize = 0;
+    while (j < rest.len and isBech32Char(rest[j])) j += 1;
+    if (j == 0) return null;
+    const token = rest[0..j];
+    const end = i + prefix.len + j;
+
+    if (std.mem.startsWith(u8, token, "npub1")) {
+        const pk = nostr.nip19.decodeNpub(arena, token) catch return null;
+        return .{ .end = end, .pubkey = pk };
+    }
+    if (std.mem.startsWith(u8, token, "nprofile1")) {
+        const pp = nostr.nip19.decodeNprofile(arena, token) catch return null;
+        return .{ .end = end, .pubkey = pp.pubkey };
+    }
+    return null;
+}
+
+/// Writes `@` + the cached display name (or a short npub) for `pubkey` into
+/// `buf`, returning the written slice. `buf` should be at least 80 bytes.
+fn mentionLabel(pubkey: [32]u8, buf: []u8) []const u8 {
+    buf[0] = '@';
+    if (lookupProfile(pubkey)) |p| {
+        if (p.name_len > 0) {
+            const n = @min(p.name_len, buf.len - 1);
+            @memcpy(buf[1..][0..n], p.name_buf[0..n]);
+            return buf[0 .. 1 + n];
+        }
+    }
+    const npub = abbreviateNpub(buf[1..], pubkey);
+    return buf[0 .. 1 + npub.len];
+}
+
+/// Whether `c` is a bech32 data character (lowercase letter or digit), the run
+/// that follows a `nostr:` prefix.
+fn isBech32Char(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
 fn setAuthor(note: *Note, pubkey: [32]u8) void {
@@ -570,9 +854,11 @@ pub const Msg = union(enum) {
     logout_cancel,
     /// Confirm logout: wipe the session (and a local key) and return to onboarding.
     logout_confirm,
+    /// An avatar fetch finished: register the image or fall back to initials.
+    avatar_fetched: native_sdk.EffectResponse,
 
-    // `tick` is dispatched by the refresh timer in Zig, never from markup.
-    pub const view_unbound = .{"tick"};
+    // `tick` and `avatar_fetched` are dispatched by effects in Zig, not markup.
+    pub const view_unbound = .{ "tick", "avatar_fetched" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -597,8 +883,14 @@ pub fn boot(model: *Model, fx: *Effects) void {
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .tick => |t| {
-            if (t.outcome == .fired) model.refresh(nowSeconds());
+            if (t.outcome == .fired) {
+                model.refresh(nowSeconds());
+                // Start any pending avatar fetches (needs effects, so here, not
+                // in refresh). The feed reads loaded avatars at render time.
+                scanAvatarFetches(fx);
+            }
         },
+        .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| model.draft_buffer.apply(edit),
         .post => submitPost(model),
         .create_identity => {
@@ -1366,10 +1658,21 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     defer relay.deinit();
     setRelayStatus(index, .connected);
 
-    // Follow-scoped: only the starter pack's recent notes, so the pool streams
-    // the user's feed rather than the whole firehose.
-    const kinds = [_]u16{1};
-    const filters = [_]nostr.filter.Filter{.{ .authors = &starter_pack, .kinds = &kinds, .limit = feed_capacity }};
+    // Follow-scoped: the starter pack's recent notes for the feed, plus their
+    // kind:0 metadata (and the user's own) so the feed can show real names and
+    // avatars. Two filters share one subscription.
+    var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
+    var authors_len: usize = starter_pack.len;
+    if (activePubkey()) |pk| {
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    const feed_kinds = [_]u16{1};
+    const profile_kinds = [_]u16{0};
+    const filters = [_]nostr.filter.Filter{
+        .{ .authors = &starter_pack, .kinds = &feed_kinds, .limit = feed_capacity },
+        .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
+    };
     try relay.subscribe("plaza-feed", &filters);
 
     while (true) {

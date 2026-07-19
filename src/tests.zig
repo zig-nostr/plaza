@@ -99,6 +99,89 @@ test "the settings screen shows the identity, key backup, and logout" {
     try testing.expect(findAnyText(tree.root, "Plaza 0.1.0") != null);
 }
 
+test "a kind:0 profile gives an author a display name" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{7} ** 32);
+
+    // Before a profile is known, the author renders as an abbreviated npub.
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+    const before = main.noteFrom(ev, 1_800_000_000);
+    try testing.expect(std.mem.startsWith(u8, before.author(), "npub1"));
+
+    // Seed the cache from kind:0 metadata; the author now renders as the name,
+    // and no avatar is loaded yet (initials fallback).
+    const p = main.upsertProfile(kp.public_key).?;
+    main.parseMetadataInto(p, "{\"display_name\":\"Satoshi\",\"name\":\"nakamoto\",\"picture\":\"https://ex.com/a.png\"}");
+    const after = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqualStrings("Satoshi", after.author());
+    try testing.expectEqual(@as(u64, 0), after.avatar_id());
+}
+
+test "malformed or empty kind:0 leaves the npub fallback" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    const pk = [_]u8{8} ** 32;
+    const p = main.upsertProfile(pk).?;
+    // Not JSON, and JSON with no usable fields: neither sets a name.
+    main.parseMetadataInto(p, "this is not json");
+    main.parseMetadataInto(p, "{\"about\":\"just a bio\"}");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(pk);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "x");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expect(std.mem.startsWith(u8, note.author(), "npub1"));
+}
+
+test "nostr: mentions render as @name or a short npub" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{5} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+
+    var buf: [220]u8 = undefined;
+
+    // Unknown pubkey: the mention becomes a short @npub, and "nostr:" is gone.
+    const src_unknown = try std.fmt.allocPrint(arena, "hey nostr:{s} welcome", .{npub});
+    const n1 = main.renderContent(&buf, src_unknown);
+    const out1 = buf[0..n1];
+    try testing.expect(std.mem.indexOf(u8, out1, "nostr:") == null);
+    try testing.expect(std.mem.indexOf(u8, out1, "@npub1") != null);
+    try testing.expect(std.mem.startsWith(u8, out1, "hey @npub1"));
+
+    // Known pubkey: the mention becomes @<name>.
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"jack\"}");
+    const n2 = main.renderContent(&buf, src_unknown);
+    const out2 = buf[0..n2];
+    try testing.expect(std.mem.indexOf(u8, out2, "@jack") != null);
+    try testing.expect(std.mem.indexOf(u8, out2, "nostr:") == null);
+}
+
+test "plain content passes through renderContent unchanged" {
+    var buf: [220]u8 = undefined;
+    const src = "just a normal note with a https://example.com link";
+    const n = main.renderContent(&buf, src);
+    try testing.expectEqualStrings(src, buf[0..n]);
+}
+
 test "the logout confirmation replaces the log-out button" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
