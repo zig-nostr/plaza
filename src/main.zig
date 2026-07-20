@@ -462,6 +462,10 @@ const Profile = struct {
     /// The resolved avatar URL, which is also its cache key.
     url_buf: [1024]u8 = [_]u8{0} ** 1024,
     url_len: u16 = 0,
+    /// The id of the kind:0 event these fields came from, so an unchanged
+    /// event is never parsed twice (the store keeps only the newest per
+    /// author, but the feed reconciles every second).
+    meta_id: [32]u8 = [_]u8{0} ** 32,
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
@@ -482,9 +486,16 @@ const Profile = struct {
 
 var g_profiles = [_]Profile{.{}} ** profile_cap;
 
+// Bumped whenever a profile gains or changes a display name. Mention labels are
+// baked into note text at parse time, so the feed re-parses (rather than
+// reuses) its notes when this moves; author lines resolve live and never need it.
+var g_names_generation: u64 = 0;
+
 /// Clears the profile cache. For tests, which share the process globals.
 pub fn resetProfilesForTest() void {
     g_profiles = [_]Profile{.{}} ** profile_cap;
+    g_names_generation = 0;
+    g_notes_names_generation = 0;
 }
 
 /// Finds the cached profile for `pubkey`, or null.
@@ -926,15 +937,94 @@ pub const Model = struct {
         const limit = @min(self.feed_limit, feed_capacity);
         var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(limit) }) catch return;
         defer result.deinit();
+
+        // The store's count moves on every kind of ingest (profiles included),
+        // and the pool streams all day, so this runs about once a second. The
+        // notes themselves rarely change: reuse the already-parsed card whenever
+        // the event is one we hold, and parse only what is genuinely new.
+        // Mention labels are baked into content at parse time, so a new display
+        // name (the generation) forces one full parse pass to refresh them.
+        const reuse_ok = g_names_generation == g_notes_names_generation;
+        g_notes_names_generation = g_names_generation;
+
+        // Nothing new at all: the usual tick, when the count moved for some
+        // other kind of event. Keep every card exactly as it is.
+        if (reuse_ok and result.events.len == self.notes_len) {
+            var same = true;
+            for (result.events, 0..) |ev, i| {
+                if (noteIdOf(ev) != self.notes[i].id) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return;
+        }
+
+        // The old cards, so new positions can take them over by id.
+        const old = &g_notes_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= limit) break;
-            self.notes[n] = noteFrom(ev, now_s);
+            const id = noteIdOf(ev);
+            self.notes[n] = blk: {
+                if (reuse_ok) {
+                    for (old[0..old_len]) |*prev| {
+                        if (prev.id == id) break :blk prev.*;
+                    }
+                }
+                break :blk noteFrom(ev, now_s);
+            };
             n += 1;
         }
         self.notes_len = n;
     }
 };
+
+/// Adopts `secret` as the active local identity. For tests: the feed scopes
+/// its queries to the follow set plus the signed-in user, so a test that
+/// stores its own events needs to BE somebody.
+pub fn setIdentityForTest(secret: [32]u8) void {
+    var signer = nostr.keys.Signer.init();
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        signer.deinit();
+        return;
+    };
+    g_signer_kind = .local;
+    setIdentity(signer, kp);
+}
+
+/// Clears the active identity again. For tests.
+pub fn clearIdentityForTest() void {
+    if (g_identity_signer) |*sgn| sgn.deinit();
+    g_identity_signer = null;
+    g_identity_kp = null;
+    g_identity_npub_len = 0;
+    g_signer_kind = .local;
+}
+
+/// Reconciles profiles and notes against `store` directly, bypassing the
+/// count guard. For tests, which drive the store themselves.
+pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    refreshProfiles(store);
+    model.rebuildNotes(store, now_s);
+}
+
+/// The feed key derived from an event id: the first eight bytes, sign bit
+/// masked so the markup engine's i64 key round-trip never overflows.
+pub fn noteIdOf(ev: nostr.event.Event) i64 {
+    return @intCast(std.mem.readInt(u64, ev.id[0..8], .big) & std.math.maxInt(i64));
+}
+
+// The previous feed, kept across one rebuild so unchanged notes carry over
+// without being re-parsed. Static rather than stack: three hundred cards of
+// fixed buffers are far too big for a frame's stack.
+var g_notes_scratch: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity;
+// The names generation the current cards were parsed under (see
+// `g_names_generation`).
+var g_notes_names_generation: u64 = 0;
 
 /// Reads kind:0 metadata for the feed's authors from the store and parses each
 /// into the profile cache. The store keeps only the newest kind:0 per author, so
@@ -961,7 +1051,15 @@ fn refreshProfiles(store: *nostr.store.Store) void {
     defer result.deinit();
     for (result.events) |ev| {
         const p = upsertProfile(ev.pubkey) orelse continue;
+        // The same event parses to the same fields; skip the JSON work.
+        if (std.mem.eql(u8, &p.meta_id, &ev.id)) continue;
+        const named_before = p.name_len > 0;
+        const name_before = p.name_buf;
         parseMetadataInto(p, ev.content);
+        p.meta_id = ev.id;
+        if ((p.name_len > 0) != named_before or !std.mem.eql(u8, &p.name_buf, &name_before)) {
+            g_names_generation +%= 1;
+        }
     }
 }
 
@@ -1247,7 +1345,20 @@ fn mediaSlotFor(note_id: i64) ?*MediaSlot {
 }
 
 /// The slot for `note_id`, claiming a free one or evicting the least recently
-/// wanted (never one with a fetch in flight). Null when every slot is busy.
+/// wanted. Never evicts a slot whose note is still on screen (touched this
+/// pass), and never one with a fetch in flight: when more pictures are visible
+/// than there are slots, the extras hold their reserved space rather than
+/// stealing each other's slot back and forth, which decoded images on the UI
+/// thread every pass and made a tall window feel heavy.
+pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
+    return claimMediaSlot(fx, note_id);
+}
+
+pub fn touchMediaClockForTest() u64 {
+    g_media_clock += 1;
+    return g_media_clock;
+}
+
 fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     if (mediaSlotFor(note_id)) |m| return m;
     for (&g_media, 0..) |*m, i| {
@@ -1259,6 +1370,7 @@ fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     var victim: ?*MediaSlot = null;
     for (&g_media) |*m| {
         if (m.state == .fetching) continue;
+        if (m.last_used == g_media_clock) continue; // still wanted on screen
         if (victim == null or m.last_used < victim.?.last_used) victim = m;
     }
     const v = victim orelse return null;
@@ -1387,13 +1499,21 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     g_media_clock += 1;
 
     const window = model.visibleRange();
+
+    // First mark every slot whose note is on screen as wanted, so the claim
+    // pass below can only ever evict pictures that have scrolled away. Without
+    // this, a viewport showing more pictures than there are slots would evict
+    // a slot needed later in this very pass, endlessly.
+    var touch = window.first;
+    while (touch <= window.last and touch < model.notes_len) : (touch += 1) {
+        if (mediaSlotFor(model.notes[touch].id)) |m| m.last_used = g_media_clock;
+    }
+
     var index = window.first;
     while (index <= window.last and index < model.notes_len) : (index += 1) {
         const note = &model.notes[index];
         if (!note.hasImage()) continue;
         const slot = claimMediaSlot(fx, note.id) orelse continue;
-        // Touch it every pass so an on-screen picture is never the eviction
-        // victim for one further down.
         slot.last_used = g_media_clock;
         if (slot.state != .idle) continue;
 
@@ -1496,7 +1616,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     var note = Note{
         .created_at = ev.created_at,
         .pubkey = ev.pubkey,
-        .id = @intCast(std.mem.readInt(u64, ev.id[0..8], .big) & std.math.maxInt(i64)),
+        .id = noteIdOf(ev),
     };
 
     // Avatar initials fallback: the first pubkey byte as two hex digits, stable
@@ -1580,9 +1700,12 @@ pub fn firstImageUrl(content: []const u8) ?[]const u8 {
 /// Plain text is copied one whole codepoint at a time and stops at `dst`'s
 /// capacity, so the buffer never ends mid-sequence. Returns the byte length.
 pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // Mention decoding needs an allocator for bech32 scratch; a stack buffer
+    // covers it without touching the heap for every note parsed. A pathological
+    // mention that will not fit simply stays as its raw token.
+    var scratch: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const arena = fba.allocator();
 
     var out: usize = 0;
     var i: usize = 0;
@@ -2082,6 +2205,8 @@ pub fn pictureWidth(note: *const Note) f32 {
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
 const Effects = PlazaApp.Effects;
+/// The effects type, exported so tests can exercise the fx-free slot paths.
+pub const EffectsForTest = Effects;
 
 /// Boot: seed the feed once, register whatever images are already cached, then
 /// arm the repeating timers.
@@ -2178,10 +2303,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
         .open_url => |url| openExternally(fx, url),
-        .expand_image => |note_id| {
-            std.debug.print("plaza: [viewer] expand note={d} found={}\n", .{ note_id, model.noteById(note_id) != null });
-            model.expanded_note = note_id;
-        },
+        .expand_image => |note_id| model.expanded_note = note_id,
         .close_image => model.expanded_note = null,
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;

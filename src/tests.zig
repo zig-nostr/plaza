@@ -414,6 +414,131 @@ test "bare npub mentions resolve, but not inside a URL" {
     try testing.expect(std.mem.indexOf(u8, buf[0..n2], "njump.me") != null);
 }
 
+test "an unchanged note is reused across rebuilds, not re-parsed" {
+    main.resetProfilesForTest();
+    main.resetMediaForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{51} ** 32);
+    // The feed scopes to the follow set plus the signed-in user; BE the user.
+    main.setIdentityForTest([_]u8{51} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/reuse.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "the original text");
+    _ = try store.ingest(arena, ev, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), model.notes_len);
+
+    // Plant a sentinel: if the next rebuild re-parses this note, the store's
+    // content overwrites it; if the card is reused, it survives.
+    const sentinel = "SENTINEL";
+    @memcpy(model.notes[0].content_buf[0..sentinel.len], sentinel);
+    model.notes[0].content_len = sentinel.len;
+
+    // A second note arrives: the old card must carry over by id untouched.
+    const ev2 = try signedNote(arena, signer, kp, 1_800_000_050, "another note");
+    _ = try store.ingest(arena, ev2, .{});
+    main.reconcileForTest(&model, &store, 1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 2), model.notes_len);
+    var found_sentinel = false;
+    for (model.notes[0..model.notes_len]) |*note| {
+        if (std.mem.eql(u8, note.content(), sentinel)) found_sentinel = true;
+    }
+    try testing.expect(found_sentinel);
+
+    // A profile gaining a name moves the generation, which forces a re-parse
+    // (mention labels are baked into content), replacing the sentinel.
+    var meta_buf: [128]u8 = undefined;
+    const meta = try std.fmt.bufPrint(&meta_buf, "{{\"name\":\"reuse-test\"}}", .{});
+    const kind0 = try nostr.event.create(arena, signer, kp, 1_800_000_060, 0, &.{}, meta, null);
+    _ = try store.ingest(arena, kind0, .{});
+    main.reconcileForTest(&model, &store, 1_800_000_100);
+
+    var still_there = false;
+    for (model.notes[0..model.notes_len]) |*note| {
+        if (std.mem.eql(u8, note.content(), sentinel)) still_there = true;
+    }
+    try testing.expect(!still_there);
+}
+
+test "a kind:0 event is parsed once, not every reconcile" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{53} ** 32);
+    // Profile queries scope to the follow set plus the signed-in user.
+    main.setIdentityForTest([_]u8{53} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/meta.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kind0 = try nostr.event.create(arena, signer, kp, 1_800_000_000, 0, &.{}, "{\"name\":\"once\"}", null);
+    _ = try store.ingest(arena, kind0, .{});
+
+    var model = main.initialModel();
+    main.reconcileForTest(&model, &store, 1_800_000_100);
+
+    // Corrupt the cached name; an unchanged kind:0 must NOT overwrite it (the
+    // parse is skipped), which is what proves the guard.
+    const p = main.upsertProfile(kp.public_key).?;
+    try testing.expectEqualStrings("once", p.name_buf[0..p.name_len]);
+    p.name_buf[0] = 'X';
+    main.reconcileForTest(&model, &store, 1_800_000_100);
+    try testing.expectEqualStrings("Xnce", p.name_buf[0..p.name_len]);
+
+    // A NEWER kind:0 replaces it and is parsed.
+    const newer = try nostr.event.create(arena, signer, kp, 1_800_000_500, 0, &.{}, "{\"name\":\"twice\"}", null);
+    _ = try store.ingest(arena, newer, .{});
+    main.reconcileForTest(&model, &store, 1_800_000_600);
+    try testing.expectEqualStrings("twice", p.name_buf[0..p.name_len]);
+}
+
+test "a slot wanted on screen is never evicted for another visible picture" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+
+    // Fill every slot and mark them all wanted at the current clock, which is
+    // what the touch pass does for pictures on screen.
+    const clock = main.touchMediaClockForTest();
+    var fx: main.EffectsForTest = undefined;
+    var i: i64 = 1;
+    while (i <= 6) : (i += 1) {
+        const slot = main.claimMediaSlotForTest(&fx, i) orelse return error.NoSlot;
+        slot.last_used = clock;
+    }
+    // A seventh visible picture must get NOTHING rather than steal a wanted
+    // slot: stealing is the thrash that decoded images every pass.
+    try testing.expect(main.claimMediaSlotForTest(&fx, 7) == null);
+}
+
 test "the logout confirmation replaces the log-out button" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
