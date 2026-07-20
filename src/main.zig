@@ -89,16 +89,18 @@ const copy_nsec_key: u64 = 101;
 // clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
+const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It is
 // larger than the feed's author set so a mention can resolve to a name too.
 const profile_cap = 32;
 // The canvas image registry has 16 slots for the whole app, so avatars and feed
-// media split it: profile cache slots 0..7 own avatar image ids 1..8, and feed
-// images take ids 9..16 through a small LRU. A profile past the avatar budget,
-// and any mention-only entry, renders initials.
-const max_avatar_images = 8;
-const max_media_images = 8;
+// media split it. The avatar share covers every author the follow feed can show
+// (the starter pack plus the user), so nobody in the feed is stuck on initials;
+// feed images take the rest through a small LRU. A mention-only cache entry,
+// past the avatar budget, renders initials.
+const max_avatar_images = 10;
+const max_media_images = 6;
 const media_image_id_base: u64 = max_avatar_images + 1;
 // What each image is requested at. Avatars draw at 40pt, so asking for more
 // than a couple of hundred pixels is pure waste. Feed images are bounded as a
@@ -110,6 +112,18 @@ const media_target_px: u32 = 480;
 // The largest body we accept from a fetch. The effect caps at 256 KiB anyway;
 // stopping a little short keeps the decode budget for images that will fit.
 const max_image_bytes = 240 * 1024;
+// The registry's own ceiling on one decoded image.
+const max_registered_image_bytes = 1024 * 1024;
+// Animated GIFs decode every frame up front, so they are bounded twice over: by
+// frame count and by total decoded bytes. An animated GIF is asked for at this
+// smaller size, since it has to arrive whole inside the fetch cap.
+const gif_target_px: u32 = 240;
+const max_gif_frames = 64;
+const max_gif_total_bytes = 24 * 1024 * 1024;
+// How many play at once, and how often the shared animation timer ticks.
+const max_playing_gifs = 2;
+const animation_interval_ms: u32 = 80;
+const animation_timer_key: u64 = 2;
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{
@@ -251,7 +265,17 @@ pub const MediaFit = enum {
     /// Scaled down to fit inside a square box, aspect preserved: feed images.
     /// Bounding both edges is what keeps a tall image inside the pixel budget.
     inside,
+    /// Like `inside`, but every frame is kept and the result stays a GIF, so it
+    /// can still animate. Asked for smaller, since the whole animation has to
+    /// arrive inside the fetch cap.
+    animation,
 };
+
+/// Whether `src` points at a GIF, which is fetched keeping its frames.
+pub fn isGifUrl(src: []const u8) bool {
+    const path_end = std.mem.indexOfScalar(u8, src, '?') orelse src.len;
+    return std.ascii.endsWithIgnoreCase(src[0..path_end], ".gif");
+}
 
 /// Builds the URL to fetch `src` at roughly `width` pixels, writing into `out`
 /// and returning the slice to request. Falls back to `src` itself whenever no
@@ -270,6 +294,9 @@ pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u
     return switch (fit) {
         .square => std.fmt.bufPrint(out, "{s}{s}?url={s}&w={d}&h={d}&fit=cover&output=webp", .{ proxy, sep, encoded, width, width }) catch src,
         .inside => std.fmt.bufPrint(out, "{s}{s}?url={s}&w={d}&h={d}&fit=inside&output=webp", .{ proxy, sep, encoded, width, width }) catch src,
+        // `n=-1` keeps every frame; the output stays a GIF because that is the
+        // animated format the vendored decoder can read frame by frame.
+        .animation => std.fmt.bufPrint(out, "{s}{s}?url={s}&w={d}&h={d}&fit=inside&n=-1&output=gif", .{ proxy, sep, encoded, width, width }) catch src,
     };
 }
 
@@ -315,6 +342,9 @@ const Profile = struct {
     name_len: u8 = 0,
     picture_buf: [200]u8 = [_]u8{0} ** 200,
     picture_len: u8 = 0,
+    /// The resolved avatar URL, which is also its cache key.
+    url_buf: [1024]u8 = [_]u8{0} ** 1024,
+    url_len: u16 = 0,
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
@@ -327,6 +357,9 @@ const Profile = struct {
     }
     fn picture(self: *const Profile) []const u8 {
         return self.picture_buf[0..self.picture_len];
+    }
+    fn url(self: *const Profile) []const u8 {
+        return self.url_buf[0..self.url_len];
     }
 };
 
@@ -376,12 +409,18 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
     defer arena_state.deinit();
     const md = std.json.parseFromSliceLeaky(Metadata, arena_state.allocator(), content, .{ .ignore_unknown_fields = true }) catch return;
 
-    const display = md.displayName orelse md.display_name orelse md.name;
-    if (display) |d| {
-        const trimmed = std.mem.trim(u8, d, " \t\r\n");
+    // The first name that is actually SET wins. Checking presence alone is not
+    // enough: plenty of real profiles carry `"display_name": ""` alongside a
+    // real `name` (jb55's does), and an empty winner drops the author back to a
+    // bare npub.
+    for ([_]?[]const u8{ md.displayName, md.display_name, md.name }) |candidate| {
+        const raw = candidate orelse continue;
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
         const n = utf8SafeLen(trimmed, profile.name_buf.len);
         @memcpy(profile.name_buf[0..n], trimmed[0..n]);
         profile.name_len = @intCast(n);
+        break;
     }
     if (md.picture) |pic| {
         const trimmed = std.mem.trim(u8, pic, " \t\r\n");
@@ -526,26 +565,26 @@ pub const Model = struct {
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
+    // Where the feed is scrolled, so images load around the viewport instead of
+    // only at the top. The windowed list replaces this estimate with the
+    // runtime's exact visible range in the next milestone.
+    feed_scroll: canvas.ScrollState = .{},
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
     // status line, the draft through `draft`/`draft_empty`, the stage through
     // `show_onboarding`/`show_feed`/`show_settings`, the login field through
     // `login_draft`, so the raw fields are never bound by name.
-    pub const view_unbound = .{ "notes", "notes_len", "live_relays", "offline_relays", "draft_buffer", "stage", "login_buffer", "logout_pending", "reveal_nsec" };
-
-    /// Whether the first-run welcome screen shows (no session yet).
-    pub fn show_onboarding(self: *const Model) bool {
-        return self.stage == .onboarding;
-    }
-    /// Whether the main feed shows (signed in).
-    pub fn show_feed(self: *const Model) bool {
-        return self.stage == .ready;
-    }
-    /// Whether the Settings screen shows.
-    pub fn show_settings(self: *const Model) bool {
-        return self.stage == .settings;
-    }
+    // Everything the FEED reads is listed here too: that screen is a Zig view
+    // now, so markup never binds its state (the welcome and Settings fragments
+    // still bind theirs, and are still checked).
+    pub const view_unbound = .{
+        "notes",       "notes_len",    "live_relays",    "offline_relays", "draft_buffer",
+        "stage",       "login_buffer", "logout_pending", "reveal_nsec",    "proxy_buffer",
+        "proxy_saved", "feed_scroll",  "draft",          "draft_empty",    "identity",
+        "has_notes",   "empty",        "status",         "empty_text",     "footer",
+        "note_list",
+    };
 
     /// The composer's current text (what `text="{draft}"` binds).
     pub fn draft(self: *const Model) []const u8 {
@@ -691,6 +730,28 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{d} notes", .{self.notes_len}) catch "";
     }
 
+    /// The span of notes at or near the viewport, which is what gets pictures.
+    /// Card heights vary, so this estimates from the average (total content over
+    /// note count) and pads generously; being a row or two wide only costs a
+    /// prefetch. Before the first scroll event it reports the top of the feed.
+    pub fn visibleRange(self: *const Model) struct { first: usize, last: usize } {
+        const overscan = 2;
+        if (self.notes_len == 0) return .{ .first = 0, .last = 0 };
+        const content = self.feed_scroll.content_extent;
+        const viewport = self.feed_scroll.viewport_extent;
+        if (content <= 0 or viewport <= 0) {
+            return .{ .first = 0, .last = @min(self.notes_len - 1, max_media_images - 1) };
+        }
+        const average = content / @as(f32, @floatFromInt(self.notes_len));
+        if (average <= 0) return .{ .first = 0, .last = self.notes_len - 1 };
+
+        const first_f = @max(0, self.feed_scroll.offset / average - overscan);
+        const last_f = (self.feed_scroll.offset + viewport) / average + overscan;
+        const first: usize = @intFromFloat(first_f);
+        const last: usize = @intFromFloat(@max(0, last_f));
+        return .{ .first = @min(first, self.notes_len - 1), .last = @min(last, self.notes_len - 1) };
+    }
+
     /// Reconciles the feed with the store. Updates the connection line every
     /// tick; re-queries and rebuilds the note cards only when the store's event
     /// count changed since the last rebuild; and re-computes relative times for
@@ -767,17 +828,28 @@ fn refreshProfiles(store: *nostr.store.Store) void {
 /// slot but no avatar yet, a few per tick to stay well inside the effect budget.
 /// The response lands on `avatar_fetched`.
 fn scanAvatarFetches(fx: *Effects) void {
-    const per_tick = 6;
+    const per_tick = 8;
     var fired: usize = 0;
     for (&g_profiles, 0..) |*p, i| {
-        if (fired >= per_tick) break;
         if (!p.used or p.avatar_state != .idle or p.picture_len == 0 or p.image_id == 0) continue;
-        p.avatar_state = .fetching;
+
         var url_buf: [1024]u8 = undefined;
         const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+        const n = @min(url.len, p.url_buf.len);
+        @memcpy(p.url_buf[0..n], url[0..n]);
+        p.url_len = @intCast(n);
+
+        // Local-first: a cached avatar is registered before the first paint, so
+        // faces arrive with the feed rather than seconds after it.
+        if (loadCachedImage(fx, p.image_id, p.url(), avatar_target_px)) |_| {
+            p.avatar_state = .loaded;
+            continue;
+        }
+        if (fired >= per_tick) continue;
+        p.avatar_state = .fetching;
         fx.fetch(.{
             .key = avatar_fetch_key_base + @as(u64, @intCast(i)),
-            .url = url,
+            .url = p.url(),
             .on_response = Effects.responseMsg(.avatar_fetched),
         });
         fired += 1;
@@ -806,7 +878,12 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     // Decode into this profile's fixed image id, downscaling if the platform
     // decoder will not take it as-is. Only a genuinely undecodable body falls
     // back to initials now.
-    p.avatar_state = if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) .loaded else .failed;
+    if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) |_| {
+        p.avatar_state = .loaded;
+        storeCachedImage(p.url(), response.body);
+    } else {
+        p.avatar_state = .failed;
+    }
 }
 
 // --------------------------------------------------------------- image decode
@@ -818,6 +895,7 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
 // OS does, WebP and HEIC included), and stb takes over when it refuses.
 
 extern fn stbi_load_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) ?[*]u8;
+extern fn stbi_load_gif_from_memory(buffer: [*]const u8, len: c_int, delays: *?[*]c_int, x: *c_int, y: *c_int, z: *c_int, comp: ?*c_int, req_comp: c_int) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 extern fn stbir_resize_uint8_linear(input_pixels: [*]const u8, input_w: c_int, input_h: c_int, input_stride_in_bytes: c_int, output_pixels: [*]u8, output_w: c_int, output_h: c_int, output_stride_in_bytes: c_int, pixel_layout: c_int) ?[*]u8;
 
@@ -825,19 +903,85 @@ extern fn stbir_resize_uint8_linear(input_pixels: [*]const u8, input_w: c_int, i
 /// hands back and the registry wants.
 const stbir_rgba: c_int = 4;
 
+// The image cache: every image Plaza fetches is written to `$HOME/.plaza/media`
+// under a hash of the URL it was fetched from (which encodes the requested
+// size), and read back before the network is touched. This is what makes
+// avatars and pictures local-first like the notes themselves: on every launch
+// after the first they are on screen with the feed, not seconds later.
+
+/// The cache file name for `url`: its SHA-256, hex encoded.
+fn cacheName(out: *[64]u8, url: []const u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+    const hexdigits = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hexdigits[b >> 4];
+        out[i * 2 + 1] = hexdigits[b & 0x0f];
+    }
+    return out[0..];
+}
+
+/// Opens (creating if needed) `$HOME/.plaza/media`.
+fn mediaCacheDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
+    const home = environ.get("HOME") orelse ".";
+    var dir_buf: [512]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza/media", .{home});
+    return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+}
+
+/// Registers `url`'s image from the on-disk cache, if it is there. Reading a
+/// handful of small files is fast enough to do inline, and it is what lets the
+/// first painted frame already carry avatars.
+fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?DecodedSize {
+    const io = g_io orelse return null;
+    const environ = g_environ orelse return null;
+    var dir = mediaCacheDir(io, environ) catch return null;
+    defer dir.close(io);
+
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, url);
+    const gpa = std.heap.page_allocator;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return null;
+    defer gpa.free(bytes);
+    return decodeAndRegister(fx, id, bytes, max_dim);
+}
+
+/// Writes a freshly fetched image into the cache. Best-effort: a failure here
+/// only costs a re-download next launch.
+fn storeCachedImage(url: []const u8, bytes: []const u8) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = mediaCacheDir(io, environ) catch return;
+    defer dir.close(io);
+
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, url);
+    dir.writeFile(io, .{
+        .sub_path = name,
+        .data = bytes,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch {};
+}
+
+/// The pixel size an image ended up registered at, so the view can lay it out
+/// at its real aspect instead of stretching it into whatever box it is given.
+const DecodedSize = struct { width: usize, height: usize };
+
 /// Decodes `bytes` and registers the pixels under `id`, downscaling so the long
-/// edge is at most `max_dim`. Returns whether the image is now registered.
-fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) bool {
+/// edge is at most `max_dim`. Returns the registered size, or null on failure.
+fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?DecodedSize {
     // Fast path: let the platform decode and register directly. This succeeds
     // whenever the image already fits the registry's budget.
-    if (fx.registerImageBytes(id, bytes)) |_| return true else |_| {}
+    if (fx.registerImageBytes(id, bytes)) |registered| {
+        return .{ .width = registered.width, .height = registered.height };
+    } else |_| {}
 
     var w: c_int = 0;
     var h: c_int = 0;
     var comp: c_int = 0;
-    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
+    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return null;
     defer stbi_image_free(pixels);
-    if (w <= 0 or h <= 0) return false;
+    if (w <= 0 or h <= 0) return null;
 
     const src_w: usize = @intCast(w);
     const src_h: usize = @intCast(h);
@@ -845,8 +989,8 @@ fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) boo
     if (longest <= max_dim) {
         // The platform refused it for some other reason; the decoded pixels
         // still fit, so register them as they are.
-        fx.registerImage(id, src_w, src_h, pixels[0 .. src_w * src_h * 4]) catch return false;
-        return true;
+        fx.registerImage(id, src_w, src_h, pixels[0 .. src_w * src_h * 4]) catch return null;
+        return .{ .width = src_w, .height = src_h };
     }
 
     const scale = @as(f64, @floatFromInt(max_dim)) / @as(f64, @floatFromInt(longest));
@@ -854,11 +998,11 @@ fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) boo
     const dst_h: usize = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(src_h)) * scale)));
 
     const gpa = std.heap.page_allocator;
-    const out = gpa.alloc(u8, dst_w * dst_h * 4) catch return false;
+    const out = gpa.alloc(u8, dst_w * dst_h * 4) catch return null;
     defer gpa.free(out);
-    if (stbir_resize_uint8_linear(pixels, w, h, 0, out.ptr, @intCast(dst_w), @intCast(dst_h), 0, stbir_rgba) == null) return false;
-    fx.registerImage(id, dst_w, dst_h, out) catch return false;
-    return true;
+    if (stbir_resize_uint8_linear(pixels, w, h, 0, out.ptr, @intCast(dst_w), @intCast(dst_h), 0, stbir_rgba) == null) return null;
+    fx.registerImage(id, dst_w, dst_h, out) catch return null;
+    return .{ .width = dst_w, .height = dst_h };
 }
 
 // ---------------------------------------------------------------- feed media
@@ -875,6 +1019,35 @@ const MediaSlot = struct {
     state: enum { idle, fetching, loaded, failed } = .idle,
     /// Tick counter at the last time this note was still wanted, for eviction.
     last_used: u64 = 0,
+    /// The registered pixel size, so the card can lay the picture out at its
+    /// own aspect rather than stretching it.
+    width: usize = 0,
+    height: usize = 0,
+    /// The resolved URL this image is fetched from, which is also its cache key.
+    url_buf: [1024]u8 = [_]u8{0} ** 1024,
+    url_len: u16 = 0,
+    /// Every frame of an animated GIF, decoded once and owned by stb (freed on
+    /// eviction). Null for a still picture.
+    frames: ?[*]u8 = null,
+    frame_count: u16 = 0,
+    frame_index: u16 = 0,
+    /// Milliseconds this GIF holds each frame, and how much of that has elapsed.
+    frame_delay_ms: u32 = 100,
+    elapsed_ms: u32 = 0,
+
+    fn url(self: *const MediaSlot) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+    fn animated(self: *const MediaSlot) bool {
+        return self.frames != null and self.frame_count > 1;
+    }
+    /// Releases the decoded frames, if any. Called before a slot is reused.
+    fn releaseFrames(self: *MediaSlot) void {
+        if (self.frames) |px| stbi_image_free(px);
+        self.frames = null;
+        self.frame_count = 0;
+        self.frame_index = 0;
+    }
 };
 
 var g_media = [_]MediaSlot{.{}} ** max_media_images;
@@ -911,31 +1084,156 @@ fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     }
     const v = victim orelse return null;
     const id = v.image_id;
-    // Free the registry slot before reusing the id for different content.
+    // Free the registry slot and any decoded frames before reusing the id.
     _ = fx.unregisterImage(id);
+    v.releaseFrames();
     v.* = .{ .used = true, .note_id = note_id, .image_id = id };
     return v;
 }
 
-/// Fires media fetches for the top of the feed, a few per tick.
+/// Decodes every frame of an animated GIF into `slot` and registers the first,
+/// so the shared animation timer can cycle it. Returns false for a still image
+/// (including a single-frame GIF), leaving the normal still path to handle it.
+fn loadAnimatedGif(fx: *Effects, slot: *MediaSlot, bytes: []const u8) bool {
+    if (bytes.len < 3 or !std.mem.eql(u8, bytes[0..3], "GIF")) return false;
+
+    var delays: ?[*]c_int = null;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var count: c_int = 0;
+    var comp: c_int = 0;
+    const pixels = stbi_load_gif_from_memory(bytes.ptr, @intCast(bytes.len), &delays, &w, &h, &count, &comp, 4) orelse return false;
+    if (count <= 1 or w <= 0 or h <= 0) {
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    const frame_w: usize = @intCast(w);
+    const frame_h: usize = @intCast(h);
+    const frame_bytes = frame_w * frame_h * 4;
+    const frames: usize = @intCast(count);
+    // stb decodes every frame up front, so a long or large GIF is the real
+    // memory hazard rather than the per-frame cost. Refuse the extremes and let
+    // the caller fall back to a still first frame.
+    if (frame_bytes > max_registered_image_bytes or frames > max_gif_frames or frame_bytes * frames > max_gif_total_bytes) {
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    fx.registerImage(slot.image_id, frame_w, frame_h, pixels[0..frame_bytes]) catch {
+        stbi_image_free(pixels);
+        return false;
+    };
+
+    slot.releaseFrames();
+    slot.frames = pixels;
+    slot.frame_count = @intCast(frames);
+    slot.frame_index = 0;
+    slot.elapsed_ms = 0;
+    // GIF delays are centiseconds x10; anything implausibly fast gets the
+    // browsers' customary floor.
+    slot.frame_delay_ms = if (delays) |d| (if (d[0] >= 20) @intCast(d[0]) else 100) else 100;
+    slot.width = frame_w;
+    slot.height = frame_h;
+    slot.state = .loaded;
+    return true;
+}
+
+/// Registers a feed picture from the on-disk cache, animating it if it is a GIF.
+/// Returns whether the slot is now loaded.
+fn loadCachedMedia(fx: *Effects, slot: *MediaSlot, gif: bool) bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+    var dir = mediaCacheDir(io, environ) catch return false;
+    defer dir.close(io);
+
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, slot.url());
+    const gpa = std.heap.page_allocator;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return false;
+    defer gpa.free(bytes);
+
+    if (gif and loadAnimatedGif(fx, slot, bytes)) return true;
+    if (decodeAndRegister(fx, slot.image_id, bytes, media_target_px)) |size| {
+        slot.state = .loaded;
+        slot.width = size.width;
+        slot.height = size.height;
+        return true;
+    }
+    return false;
+}
+
+/// Advances the animated pictures currently in view, one shared timer for all of
+/// them (a timer each would exhaust the 16-slot timer table). Only a couple play
+/// at once: the rest hold their first frame until they scroll into that budget.
+fn advanceAnimations(fx: *Effects, model: *const Model) void {
+    const window = model.visibleRange();
+    var playing: usize = 0;
+    for (&g_media) |*slot| {
+        if (!slot.used or !slot.animated() or slot.state != .loaded) continue;
+        // In view? The note has to still be one of the ones on screen.
+        var visible = false;
+        var index = window.first;
+        while (index <= window.last and index < model.notes_len) : (index += 1) {
+            if (model.notes[index].id == slot.note_id) {
+                visible = true;
+                break;
+            }
+        }
+        if (!visible) continue;
+        if (playing >= max_playing_gifs) break;
+        playing += 1;
+
+        slot.elapsed_ms += animation_interval_ms;
+        if (slot.elapsed_ms < slot.frame_delay_ms) continue;
+        slot.elapsed_ms = 0;
+        slot.frame_index = (slot.frame_index + 1) % slot.frame_count;
+
+        const frames = slot.frames orelse continue;
+        const frame_bytes = slot.width * slot.height * 4;
+        const offset = @as(usize, slot.frame_index) * frame_bytes;
+        // Re-registering the same id swaps the pixels everywhere it is drawn.
+        fx.registerImage(slot.image_id, slot.width, slot.height, frames[offset..][0..frame_bytes]) catch {};
+    }
+}
+
+/// Loads the pictures for the notes around the viewport: the cached ones
+/// straight from disk, the rest over the network a few per tick. Notes outside
+/// the window keep their slot only until something on screen needs it.
 fn scanMediaFetches(fx: *Effects, model: *const Model) void {
-    const per_tick = 3;
+    const per_tick = 6;
     var fired: usize = 0;
     g_media_clock += 1;
-    const limit = @min(model.notes_len, max_media_images);
-    for (model.notes[0..limit]) |*note| {
+
+    const window = model.visibleRange();
+    var index = window.first;
+    while (index <= window.last and index < model.notes_len) : (index += 1) {
+        const note = &model.notes[index];
         if (!note.hasImage()) continue;
         const slot = claimMediaSlot(fx, note.id) orelse continue;
+        // Touch it every pass so an on-screen picture is never the eviction
+        // victim for one further down.
         slot.last_used = g_media_clock;
         if (slot.state != .idle) continue;
-        if (fired >= per_tick) continue;
 
         var url_buf: [1024]u8 = undefined;
-        const url = mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
+        const gif = isGifUrl(note.imageUrl());
+        const url = if (gif)
+            mediaUrl(&url_buf, note.imageUrl(), gif_target_px, .animation)
+        else
+            mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
+        const n = @min(url.len, slot.url_buf.len);
+        @memcpy(slot.url_buf[0..n], url[0..n]);
+        slot.url_len = @intCast(n);
+
+        // Local-first: a picture we already have appears with the note, with no
+        // network round-trip at all.
+        if (loadCachedMedia(fx, slot, gif)) continue;
+        if (fired >= per_tick) continue;
         slot.state = .fetching;
         fx.fetch(.{
             .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
-            .url = url,
+            .url = slot.url(),
             .on_response = Effects.responseMsg(.media_fetched),
         });
         fired += 1;
@@ -958,7 +1256,47 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         slot.state = .failed;
         return;
     }
-    slot.state = if (decodeAndRegister(fx, slot.image_id, response.body, media_target_px)) .loaded else .failed;
+    // An animated GIF keeps all its frames; anything else (including a GIF with
+    // only one frame) takes the still path.
+    if (loadAnimatedGif(fx, slot, response.body)) {
+        storeCachedImage(slot.url(), response.body);
+        return;
+    }
+    if (decodeAndRegister(fx, slot.image_id, response.body, media_target_px)) |size| {
+        slot.state = .loaded;
+        slot.width = size.width;
+        slot.height = size.height;
+        // Keep it for next launch: the feed should come back with its pictures.
+        storeCachedImage(slot.url(), response.body);
+    } else {
+        slot.state = .failed;
+    }
+}
+
+// A pressed link is handed to the OS opener. The URL comes from note content,
+// which is untrusted, so it is validated before it ever becomes an argument: it
+// must be a plain http(s) URL with no whitespace or control bytes. There is no
+// shell involved (argv is passed as a vector), and a leading scheme means the
+// opener can never read it as a flag or a local path.
+var g_open_url_buf: [1024]u8 = undefined;
+
+/// Whether `url` is safe to hand to the system opener.
+pub fn isSafeExternalUrl(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://")) return false;
+    if (url.len > g_open_url_buf.len) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Opens `url` in the user's browser, if it passes validation.
+fn openExternally(fx: *Effects, url: []const u8) void {
+    if (!isSafeExternalUrl(url)) return;
+    // The link slice lives in the view arena, so copy it before the effect runs.
+    @memcpy(g_open_url_buf[0..url.len], url);
+    const owned = g_open_url_buf[0..url.len];
+    fx.spawn(.{ .key = open_url_key, .argv = &.{ "/usr/bin/open", owned }, .output = .collect });
 }
 
 /// Lets everything that failed to load try again, after the media proxy changed.
@@ -1195,10 +1533,16 @@ pub const Msg = union(enum) {
     proxy_edit: canvas.TextInputEvent,
     /// Save the media-proxy setting.
     proxy_save,
+    /// The feed scrolled: remember where, so images load around the viewport.
+    feed_scrolled: canvas.ScrollState,
+    /// A link in a note was pressed: open it in the browser.
+    open_url: []const u8,
+    /// The animation timer fired: advance any playing GIFs.
+    animate: native_sdk.EffectTimer,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings" };
+    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -1245,7 +1589,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
             })
         else
-            ui.scroll(.{ .grow = 1 }, .{
+            ui.scroll(.{ .grow = 1, .on_scroll = AppUi.scrollMsg(.feed_scrolled) }, .{
                 ui.column(.{ .gap = 8, .padding = 12 }, .{cards}),
             }),
         ui.separator(.{}),
@@ -1281,18 +1625,11 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                     ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, note.author()),
                     ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, note.time()),
                 }),
-                ui.text(.{ .wrap = true }, note.content()),
-                // The picture, once it has loaded. The row keeps its height
-                // whether or not the image is ready, so the feed does not jump
-                // as images arrive.
-                if (note.hasImage())
-                    ui.image(.{
-                        .image = note.media_id(),
-                        .height = 200,
-                        .semantics = .{ .label = "Attached image" },
-                    })
-                else
-                    ui.spacer(0),
+                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url) }, contentSpans(ui, note.content())),
+                // The picture, once it is registered. Nothing is drawn while it
+                // loads: an empty box reads as a broken image, and the card
+                // simply grows when the picture arrives.
+                if (note.media_id() != 0) notePicture(ui, note) else ui.spacer(0),
             }),
         }),
     });
@@ -1301,17 +1638,102 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
     return node;
 }
 
+/// Splits rendered note text into styled runs so a note reads like a note: web
+/// links are accented, underlined, and pressable, and `@mentions` are accented.
+/// Every span's text is a subslice of the note's own content, so nothing is
+/// copied. A paragraph holds at most 32 runs, so a link-heavy note keeps its
+/// tail as one plain run rather than losing it.
+pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
+    const max_spans = 32;
+    if (text.len == 0) return &.{};
+    const spans = ui.arena.alloc(canvas.TextSpan, max_spans) catch return &.{};
+
+    var n: usize = 0;
+    var i: usize = 0;
+    var plain_start: usize = 0;
+    while (i < text.len) {
+        const is_url = std.mem.startsWith(u8, text[i..], "https://") or std.mem.startsWith(u8, text[i..], "http://");
+        const is_mention = text[i] == '@' and i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1]);
+        if (!is_url and !is_mention) {
+            i += 1;
+            continue;
+        }
+        // Two slots for this run plus the trailing plain run.
+        if (n + 3 > max_spans) break;
+        if (i > plain_start) {
+            spans[n] = .{ .text = text[plain_start..i] };
+            n += 1;
+        }
+        var j = i;
+        while (j < text.len and !std.ascii.isWhitespace(text[j])) j += 1;
+        const run = text[i..j];
+        spans[n] = if (is_url)
+            .{ .text = run, .color = .accent, .underline = true, .link = run }
+        else
+            .{ .text = run, .color = .accent };
+        n += 1;
+        i = j;
+        plain_start = j;
+    }
+    if (plain_start < text.len and n < max_spans) {
+        spans[n] = .{ .text = text[plain_start..] };
+        n += 1;
+    }
+    return spans[0..n];
+}
+
+/// A note's picture, laid out at the image's own aspect ratio and drawn with
+/// `contain`, so it is never stretched and stays undistorted as the window
+/// resizes. The height is derived from the registered pixel size against a
+/// nominal card width and clamped, so one tall image cannot take over the feed.
+fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
+    const nominal_width: f32 = 300;
+    const min_height: f32 = 80;
+    const max_height: f32 = 320;
+
+    var height: f32 = 200;
+    if (mediaSlotFor(note.id)) |slot| {
+        if (slot.width > 0 and slot.height > 0) {
+            const aspect = @as(f32, @floatFromInt(slot.height)) / @as(f32, @floatFromInt(slot.width));
+            height = std.math.clamp(nominal_width * aspect, min_height, max_height);
+        }
+    }
+    var node = ui.image(.{
+        .image = note.media_id(),
+        .height = height,
+        .semantics = .{ .label = "Attached image" },
+    });
+    // `ui.image` leaves the fit at `stretch`, which distorts the picture into
+    // whatever box it is given (and worse as the window resizes).
+    node.widget.image_fit = .contain;
+    return node;
+}
+
 const PlazaApp = native_sdk.UiApp(Model, Msg);
 const Effects = PlazaApp.Effects;
 
-/// Boot: seed the feed once, then arm the repeating refresh timer.
+/// Boot: seed the feed once, register whatever images are already cached, then
+/// arm the repeating timers.
 pub fn boot(model: *Model, fx: *Effects) void {
     model.refresh(nowSeconds());
+    // Local-first, all the way to the first frame: cached avatars and pictures
+    // are registered here, so a returning user gets faces WITH the notes rather
+    // than a tick later. Only what is on disk resolves now; the rest is fetched
+    // from the first tick onward.
+    scanAvatarFetches(fx);
+    scanMediaFetches(fx, model);
     fx.startTimer(.{
         .key = refresh_timer_key,
         .interval_ms = refresh_interval_ms,
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.tick),
+    });
+    // One timer drives every playing GIF; a timer each would exhaust the table.
+    fx.startTimer(.{
+        .key = animation_timer_key,
+        .interval_ms = animation_interval_ms,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.animate),
     });
 }
 
@@ -1325,6 +1747,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
             }
+        },
+        .animate => |t| {
+            if (t.outcome == .fired) advanceAnimations(fx, model);
         },
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| model.draft_buffer.apply(edit),
@@ -1376,6 +1801,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             retryFailedImages();
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
+        .open_url => |url| openExternally(fx, url),
+        .feed_scrolled => |scroll| {
+            model.feed_scroll = scroll;
+            // Load what just came into view without waiting for the next tick.
+            scanMediaFetches(fx, model);
+        },
         .close_settings => {
             model.logout_pending = false;
             model.reveal_nsec = false;
