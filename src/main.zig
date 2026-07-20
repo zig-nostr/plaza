@@ -22,6 +22,7 @@
 //! grammar does not carry). This file is the logic.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
@@ -85,6 +86,13 @@ const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
 // The app version shown in Settings. Keep in step with app.zon's `.version`.
 const plaza_version = "0.1.0";
+// Owner-only permissions for the files holding secrets. POSIX gets 0600;
+// Windows has no mode bits (its permissions are file ATTRIBUTES), so it takes
+// the default there and inherits the profile directory's access control.
+const secret_file_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows)
+    .default_file
+else
+    std.Io.File.Permissions.fromMode(0o600);
 // Effect keys for the two Settings clipboard copies (npub, nsec). Clipboard
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
@@ -1092,7 +1100,7 @@ fn storeCachedImage(url: []const u8, bytes: []const u8) void {
     dir.writeFile(io, .{
         .sub_path = name,
         .data = bytes,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch {};
 }
 
@@ -2714,7 +2722,7 @@ fn persistIdentityKey(io: std.Io, environ: *const std.process.Environ.Map, secre
     dir.writeFile(io, .{
         .sub_path = "identity.key",
         .data = &secret,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
 }
 
@@ -2766,7 +2774,7 @@ fn persistSession() void {
     dir.writeFile(io, .{
         .sub_path = "session",
         .data = data,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist session: {s}\n", .{@errorName(err)});
 }
 
@@ -2877,7 +2885,7 @@ fn saveSettings() void {
     dir.writeFile(io, .{
         .sub_path = "settings",
         .data = data,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
 }
 
