@@ -1743,41 +1743,55 @@ pub const AppUi = canvas.Ui(Msg);
 const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboarding.native"));
 const SettingsView = canvas.CompiledMarkupView(Model, Msg, @embedFile("settings.native"));
 
-/// The root view: one screen at a time, chosen by the stage. An expanded
-/// picture takes over the window until it is dismissed.
+/// The root view: one screen at a time, chosen by the stage, with an expanded
+/// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
-    if (model.expanded_note) |note_id| {
-        if (model.noteById(note_id)) |note| return imageViewer(ui, note);
-    }
-    return switch (model.stage) {
+    const base = switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
         .settings => SettingsView.build(ui, model),
         .ready => feedView(ui, model),
     };
+    if (model.expanded_note) |note_id| {
+        if (model.noteById(note_id)) |note| {
+            // Layered OVER the feed rather than replacing it, so the scroll
+            // region stays mounted and holds its offset. Swapping the tree out
+            // unmounts it, and closing would drop the reader back at the top.
+            return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
+        }
+    }
+    return base;
 }
 
-/// The expanded picture, filling the window. The registry decodes at most 512
-/// pixels on a side, so rather than upscale a small copy into a blur, this shows
-/// it at its own size and offers the full-resolution original in the browser.
+/// The expanded picture, filling the window over the feed. The registry decodes
+/// at most 512 pixels on a side, so rather than upscale a small copy into a
+/// blur, this shows it as large as it honestly goes and offers the
+/// full-resolution original in the browser. Pressing the backdrop closes it,
+/// which also stops presses reaching the feed underneath.
 fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
     const image_id = note.media_id();
     return ui.column(.{
         .grow = 1,
         .gap = 12,
         .padding = 16,
-        .main = .center,
-        .cross = .center,
+        .cross = .stretch,
+        .on_press = .close_image,
         .style_tokens = .{ .background = .background },
+        .semantics = .{ .label = "Expanded image, press to close" },
     }, .{
-        if (image_id != 0) blk: {
-            var node = ui.image(.{
-                .image = image_id,
-                .grow = 1,
-                .semantics = .{ .label = "Expanded image" },
-            });
-            node.widget.image_fit = .contain;
-            break :blk node;
-        } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
+        // The picture needs a definite box: an image is a leaf with no
+        // intrinsic size, so it draws nothing unless a stretching parent hands
+        // it one (a centered column would collapse its width to zero).
+        ui.row(.{ .grow = 1, .cross = .stretch }, .{
+            if (image_id != 0) blk: {
+                var node = ui.image(.{
+                    .image = image_id,
+                    .grow = 1,
+                    .semantics = .{ .label = "Expanded image" },
+                });
+                node.widget.image_fit = .contain;
+                break :blk node;
+            } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
+        }),
         ui.row(.{ .gap = 8, .cross = .center }, .{
             ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_image }, "Close"),
             ui.spacer(1),
@@ -1934,14 +1948,35 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     picture.widget.image_fit = .contain;
     // The picture sits in a pressable row rather than carrying the press
     // itself: an image is a leaf, and the hit target belongs on a container.
-    // `quiet_hover` keeps it from washing over on hover like a list row.
+    // `quiet_hover` keeps it from washing over on hover like a list row, and the
+    // box is sized to the drawn picture so only the picture itself is pressable,
+    // not the empty width beside a narrow one.
+    //
+    // The link role is what puts the pointing hand over it: the engine follows
+    // the native convention, where the hand marks a link and ordinary controls
+    // keep the arrow, so this is the one role that advertises "clickable".
     return ui.el(.list_item, .{
+        .width = pictureWidth(note),
         .height = height,
         .padding = 0,
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .expand_image = note.id },
-        .semantics = .{ .role = .button, .label = "Attached image, press to enlarge", .focusable = true },
+        .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
     }, .{picture});
+}
+
+/// How wide the drawn picture is: its own shape at the reserved height, never
+/// wider than the card. `contain` centres a narrow picture in its box, so
+/// matching the box to the picture is what keeps the press on the picture.
+pub fn pictureWidth(note: *const Note) f32 {
+    const nominal_width: f32 = 300;
+    const height = pictureHeight(note);
+    const aspect = if (note.image_aspect > 0)
+        note.image_aspect
+    else
+        recalledAspect(note.id) orelse 0.66;
+    if (aspect <= 0) return nominal_width;
+    return @min(nominal_width, height / aspect);
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
