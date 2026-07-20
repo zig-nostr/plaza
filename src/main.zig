@@ -342,8 +342,13 @@ const wanted_profiles_cap = 24;
 const WantedProfile = struct {
     used: bool = false,
     requested: bool = false,
+    /// How many times this one has been asked for. Some pubkeys simply have no
+    /// metadata published anywhere, so the asking is bounded.
+    attempts: u8 = 0,
     pubkey: [32]u8 = [_]u8{0} ** 32,
 };
+/// How many rounds to ask for a mentioned profile before letting it be.
+const max_profile_attempts = 3;
 var g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
 
 /// Notes that `pubkey` was mentioned but has no known name yet.
@@ -362,22 +367,38 @@ fn wantProfile(pubkey: [32]u8) void {
     }
 }
 
+/// Ticks between re-asking for metadata that has not arrived.
+const profile_retry_ticks: u64 = 20;
+var g_profile_round: u64 = 0;
+
+/// Lets the still-unnamed be asked for again on the next pass.
+fn rearmWantedProfiles() void {
+    for (&g_wanted) |*w| {
+        if (w.used and w.attempts < max_profile_attempts) w.requested = false;
+    }
+}
+
 /// Asks the relays for the metadata of everyone mentioned but still unnamed, in
 /// one batch on a throwaway connection.
 fn requestWantedProfiles() void {
     var batch: [wanted_profiles_cap][32]u8 = undefined;
     var n: usize = 0;
     for (&g_wanted) |*w| {
-        if (!w.used or w.requested) continue;
+        if (!w.used) continue;
+        // Resolved: free the slot so later mentions can use it. Without this the
+        // table fills with names we already have and new mentions are dropped.
         if (lookupProfile(w.pubkey)) |p| {
             if (p.name_len > 0) {
-                w.requested = true;
+                w.* = .{};
                 continue;
             }
         }
+        if (w.attempts >= max_profile_attempts) continue;
+        if (w.requested) continue;
         batch[n] = w.pubkey;
         n += 1;
         w.requested = true;
+        w.attempts += 1;
         if (n == batch.len) break;
     }
     if (n == 0) return;
@@ -413,8 +434,8 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
                 else => {},
             }
         }
-        // One relay that answered is enough for metadata.
-        return;
+        // Keep going: no single relay holds everyone's metadata, and the store
+        // keeps only the newest copy of each anyway.
     }
 }
 
@@ -1769,33 +1790,37 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// which also stops presses reaching the feed underneath.
 fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
     const image_id = note.media_id();
-    return ui.column(.{
+    // A dialog, not a bare column: modal surfaces paint their own opaque
+    // surface and always claim their own input, so the feed underneath neither
+    // shows through nor scrolls, and Escape or a click outside closes it.
+    // Stacking kinds layer their children, so the contents go in a column.
+    return ui.el(.dialog, .{
         .grow = 1,
-        .gap = 12,
         .padding = 16,
-        .cross = .stretch,
-        .on_press = .close_image,
+        .on_dismiss = .close_image,
         .style_tokens = .{ .background = .background },
-        .semantics = .{ .label = "Expanded image, press to close" },
+        .semantics = .{ .label = "Expanded image" },
     }, .{
-        // The picture needs a definite box: an image is a leaf with no
-        // intrinsic size, so it draws nothing unless a stretching parent hands
-        // it one (a centered column would collapse its width to zero).
-        ui.row(.{ .grow = 1, .cross = .stretch }, .{
-            if (image_id != 0) blk: {
-                var node = ui.image(.{
-                    .image = image_id,
-                    .grow = 1,
-                    .semantics = .{ .label = "Expanded image" },
-                });
-                node.widget.image_fit = .contain;
-                break :blk node;
-            } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
-        }),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_image }, "Close"),
-            ui.spacer(1),
-            ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageUrl() } }, "Open original"),
+        ui.column(.{ .grow = 1, .gap = 12, .cross = .stretch }, .{
+            // The picture needs a definite box: an image is a leaf with no
+            // intrinsic size, so it draws nothing unless a stretching parent
+            // hands it one (a centred column collapses its width to zero).
+            ui.row(.{ .grow = 1, .cross = .stretch }, .{
+                if (image_id != 0) blk: {
+                    var node = ui.image(.{
+                        .image = image_id,
+                        .grow = 1,
+                        .semantics = .{ .label = "Expanded image" },
+                    });
+                    node.widget.image_fit = .contain;
+                    break :blk node;
+                } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
+            }),
+            ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_image }, "Close"),
+                ui.spacer(1),
+                ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageUrl() } }, "Open original"),
+            }),
         }),
     });
 }
@@ -1823,7 +1848,17 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
             })
         else
-            ui.scroll(.{ .grow = 1, .on_scroll = AppUi.scrollMsg(.feed_scrolled) }, .{
+            // The offset is mirrored like text: the Msg carries what the runtime
+            // already applied, the model keeps it, and echoing it back through
+            // `value` is what stops a rebuild from stomping the reader's place
+            // (opening the viewer rebuilds the tree around this region).
+            // `global_key` pins the region's identity so it survives that too.
+            ui.scroll(.{
+                .grow = 1,
+                .value = model.feed_scroll.offset,
+                .global_key = .{ .str = "feed-scroll" },
+                .on_scroll = AppUi.scrollMsg(.feed_scrolled),
+            }, .{
                 ui.column(.{ .gap = 8, .padding = 12 }, .{cards}),
             }),
         ui.separator(.{}),
@@ -2016,6 +2051,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                // Re-arm the still-unnamed every so often: a relay that had
+                // nothing a moment ago may have it now.
+                g_profile_round +%= 1;
+                if (g_profile_round % profile_retry_ticks == 0) rearmWantedProfiles();
                 requestWantedProfiles();
             }
         },
