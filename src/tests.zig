@@ -27,6 +27,14 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
+/// How many note cards the tree actually built (the windowed list materialises
+/// only the rows near the viewport).
+fn countCards(widget: canvas.Widget) usize {
+    var n: usize = if (widget.kind == .card) 1 else 0;
+    for (widget.children) |child| n += countCards(child);
+    return n;
+}
+
 /// Like `findByText`, but matches on text content regardless of widget kind.
 fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
     if (std.mem.eql(u8, widget.text, text)) return widget;
@@ -299,22 +307,40 @@ test "gif sources are recognised so their frames are kept" {
     try testing.expect(!main.isGifUrl("https://x.com/a.jpg"));
 }
 
-test "the loaded window follows the scroll position" {
+test "the feed builds only the rows the window asked for" {
+    main.resetProfilesForTest();
+    main.resetMediaForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{41} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a note in a long feed");
+
+    // A feed far longer than any viewport.
     var model = main.initialModel();
-    model.notes_len = 40;
+    model.stage = .ready;
+    for (0..200) |i| {
+        model.notes[i] = main.noteFrom(ev, 1_800_000_000);
+        // Distinct ids so the list can key its rows.
+        model.notes[i].id = @intCast(i + 1);
+    }
+    model.notes_len = 200;
 
-    // Before any scroll, the top of the feed is what loads.
-    const at_rest = model.visibleRange();
-    try testing.expectEqual(@as(usize, 0), at_rest.first);
-    try testing.expect(at_rest.last < 40);
+    const tree = try buildTree(arena, &model);
 
-    // Scrolled halfway down a 40-note feed of 100pt rows: the window follows,
-    // with a row or two of overscan either side.
-    model.feed_scroll = .{ .offset = 2000, .viewport_extent = 600, .content_extent = 4000 };
-    const scrolled = model.visibleRange();
-    try testing.expect(scrolled.first >= 16 and scrolled.first <= 20);
-    try testing.expect(scrolled.last >= 25 and scrolled.last <= 40);
-    try testing.expect(scrolled.last < 40);
+    // Windowed: the built rows are a small fraction of the 200 notes, which is
+    // the whole point (the cost follows the viewport, not the feed length).
+    const built = countCards(tree.root);
+    try testing.expect(built > 0);
+    try testing.expect(built < 60);
+
+    // And the range the view reported back is inside the feed.
+    const visible = model.visibleRange();
+    try testing.expect(visible.last < model.notes_len);
 }
 
 test "a picture reserves the same space loaded or not" {
