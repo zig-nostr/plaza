@@ -52,6 +52,12 @@ jobs:
   portability:
     name: portability (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Windows reports but does not block: the relay transport resolves hostnames
+    # through libc `getaddrinfo`, which Zig's standard library does not declare
+    # for Windows, so the build cannot link there yet. That is a gap in the
+    # protocol library rather than in Plaza (zig-nostr/nostr#59); Linux blocks
+    # normally, and this flips to blocking once the resolver is portable.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
