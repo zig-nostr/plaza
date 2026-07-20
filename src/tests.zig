@@ -317,6 +317,77 @@ test "the loaded window follows the scroll position" {
     try testing.expect(scrolled.last < 40);
 }
 
+test "a picture reserves the same space loaded or not" {
+    main.resetProfilesForTest();
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{21} ** 32);
+
+    // A note whose imeta declares a tall picture: the height is known before a
+    // single byte is downloaded, which is what stops the feed shifting.
+    const url = "https://host.example/tall.jpg";
+    const tags = [_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ url, "dim 400x800" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &tags, "look " ++ url, null);
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    try testing.expect(note.hasImage());
+    // 2:1 tall against the nominal 300pt width would be 600, clamped to 320.
+    try testing.expectApproxEqAbs(@as(f32, 320), main.pictureHeight(&note), 0.5);
+    // Nothing is loaded, yet the reserved height is already the final one.
+    try testing.expectEqual(@as(u64, 0), note.media_id());
+}
+
+test "imeta dimensions parse, including float forms" {
+    const url = "https://host.example/a.png";
+    const wide = [_]nostr.event.Tag{&.{ "imeta", "url " ++ url, "dim 800x400" }};
+    try testing.expectApproxEqAbs(@as(f32, 0.5), main.imetaAspect(&wide, url), 0.001);
+
+    // Real notes carry float dimensions too.
+    const floaty = [_]nostr.event.Tag{&.{ "imeta", "url " ++ url, "dim 1320.0x2868.0" }};
+    try testing.expect(main.imetaAspect(&floaty, url) > 2.0);
+
+    // An imeta for a different URL says nothing about this one.
+    const other = [_]nostr.event.Tag{&.{ "imeta", "url https://host.example/b.png", "dim 800x400" }};
+    try testing.expectEqual(@as(f32, 0), main.imetaAspect(&other, url));
+    try testing.expectEqual(@as(f32, 0), main.imetaAspect(&.{}, url));
+}
+
+test "bare npub mentions resolve, but not inside a URL" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{31} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"alice\"}");
+
+    var buf: [220]u8 = undefined;
+
+    // Written without the nostr: scheme, it still resolves.
+    const bare = try std.fmt.allocPrint(arena, "hey {s} hi", .{npub});
+    const n1 = main.renderContent(&buf, bare, "");
+    try testing.expect(std.mem.indexOf(u8, buf[0..n1], "@alice") != null);
+
+    // The same token inside a URL is left alone.
+    const in_url = try std.fmt.allocPrint(arena, "see https://njump.me/{s} ok", .{npub});
+    const n2 = main.renderContent(&buf, in_url, "");
+    try testing.expect(std.mem.indexOf(u8, buf[0..n2], "@alice") == null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n2], "njump.me") != null);
+}
+
 test "the logout confirmation replaces the log-out button" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

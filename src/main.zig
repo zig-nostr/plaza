@@ -334,6 +334,90 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 // fetched (bounded, cap-aware) and registered as canvas images; the cache is
 // UI-thread-only, so no synchronisation is needed.
 
+// Pubkeys a note mentioned that we have no name for. The pool only subscribes
+// to the follow set's metadata, so a mention of anyone else would render as a
+// bare npub forever; these are fetched separately, once each, and then resolve
+// like any other name.
+const wanted_profiles_cap = 24;
+const WantedProfile = struct {
+    used: bool = false,
+    requested: bool = false,
+    pubkey: [32]u8 = [_]u8{0} ** 32,
+};
+var g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+
+/// Notes that `pubkey` was mentioned but has no known name yet.
+fn wantProfile(pubkey: [32]u8) void {
+    if (lookupProfile(pubkey)) |p| {
+        if (p.name_len > 0) return;
+    }
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return;
+    }
+    for (&g_wanted) |*w| {
+        if (!w.used) {
+            w.* = .{ .used = true, .pubkey = pubkey };
+            return;
+        }
+    }
+}
+
+/// Asks the relays for the metadata of everyone mentioned but still unnamed, in
+/// one batch on a throwaway connection.
+fn requestWantedProfiles() void {
+    var batch: [wanted_profiles_cap][32]u8 = undefined;
+    var n: usize = 0;
+    for (&g_wanted) |*w| {
+        if (!w.used or w.requested) continue;
+        if (lookupProfile(w.pubkey)) |p| {
+            if (p.name_len > 0) {
+                w.requested = true;
+                continue;
+            }
+        }
+        batch[n] = w.pubkey;
+        n += 1;
+        w.requested = true;
+        if (n == batch.len) break;
+    }
+    if (n == 0) return;
+    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
+    thread.detach();
+}
+
+/// Fetches kind:0 for `batch` and ingests it, then closes. Its own io backend
+/// and signer, like every other background worker.
+fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8, len: usize) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const kinds = [_]u16{0};
+    const filters = [_]nostr.filter.Filter{.{ .authors = batch[0..len], .kinds = &kinds, .limit = @intCast(len) }};
+    for (relays) |url| {
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        relay.subscribe("plaza-mentions", &filters) catch continue;
+        while (true) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const store = g_store orelse continue;
+                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                },
+                // Everything stored has been sent; no need to hold the socket.
+                .eose => break,
+                else => {},
+            }
+        }
+        // One relay that answered is enough for metadata.
+        return;
+    }
+}
+
 /// A cached author profile.
 const Profile = struct {
     used: bool = false,
@@ -479,6 +563,11 @@ pub const Note = struct {
     // picture instead (see `renderContent`'s `omit`).
     image_url_buf: [300]u8 = [_]u8{0} ** 300,
     image_url_len: u16 = 0,
+    // Height divided by width, taken from the note's own NIP-92 `imeta dim`
+    // when it carries one. Knowing the shape BEFORE the picture downloads is
+    // what lets the card reserve exactly the right space, so nothing shifts
+    // when the image arrives (or is evicted and comes back).
+    image_aspect: f32 = 0,
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
@@ -565,6 +654,8 @@ pub const Model = struct {
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
+    // Which note's picture is expanded to fill the window, if any.
+    expanded_note: ?i64 = null,
     // Where the feed is scrolled, so images load around the viewport instead of
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
@@ -579,11 +670,11 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",       "notes_len",    "live_relays",    "offline_relays", "draft_buffer",
-        "stage",       "login_buffer", "logout_pending", "reveal_nsec",    "proxy_buffer",
-        "proxy_saved", "feed_scroll",  "draft",          "draft_empty",    "identity",
-        "has_notes",   "empty",        "status",         "empty_text",     "footer",
-        "note_list",
+        "notes",       "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
+        "stage",       "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
+        "proxy_saved", "feed_scroll",   "draft",          "draft_empty",    "identity",
+        "has_notes",   "empty",         "status",         "empty_text",     "footer",
+        "note_list",   "expanded_note",
     };
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -730,6 +821,14 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{d} notes", .{self.notes_len}) catch "";
     }
 
+    /// The note with this id, if it is still in the feed.
+    pub fn noteById(self: *const Model, note_id: i64) ?*const Note {
+        for (self.notes[0..self.notes_len]) |*note| {
+            if (note.id == note_id) return note;
+        }
+        return null;
+    }
+
     /// The span of notes at or near the viewport, which is what gets pictures.
     /// Card heights vary, so this estimates from the average (total content over
     /// note count) and pads generously; being a row or two wide only costs a
@@ -810,13 +909,23 @@ pub const Model = struct {
 /// this always reflects the current metadata.
 fn refreshProfiles(store: *nostr.store.Store) void {
     const kinds = [_]u16{0};
-    var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
-    var authors_len: usize = starter_pack.len;
+    var authors: [starter_pack.len + 1 + wanted_profiles_cap][32]u8 = undefined;
+    var authors_len: usize = 0;
+    for (starter_pack) |pk| {
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
     if (activePubkey()) |pk| {
         authors[authors_len] = pk;
         authors_len += 1;
     }
-    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap }) catch return;
+    // Anyone a note mentioned, so their name resolves once it arrives.
+    for (&g_wanted) |*w| {
+        if (!w.used) continue;
+        authors[authors_len] = w.pubkey;
+        authors_len += 1;
+    }
+    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap + wanted_profiles_cap }) catch return;
     defer result.deinit();
     for (result.events) |ev| {
         const p = upsertProfile(ev.pubkey) orelse continue;
@@ -1053,6 +1162,38 @@ const MediaSlot = struct {
 var g_media = [_]MediaSlot{.{}} ** max_media_images;
 var g_media_clock: u64 = 0;
 
+// What shape each note's picture turned out to be, remembered per note id and
+// OUTLIVING both the media slot and the note itself. A slot is evicted as soon
+// as the note scrolls out of the window; without this the card would forget how
+// tall its picture was, shrink, and shift the feed under the reader, then shift
+// it back on the way up. Notes whose `imeta` declared a size never need it.
+const aspect_memory_cap = 128;
+const AspectEntry = struct { note_id: i64 = 0, aspect: f32 = 0 };
+var g_aspects = [_]AspectEntry{.{}} ** aspect_memory_cap;
+var g_aspect_next: usize = 0;
+
+/// Records the shape of `note_id`'s picture.
+fn rememberAspect(note_id: i64, width: usize, height: usize) void {
+    if (width == 0 or height == 0) return;
+    const aspect = @as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(width));
+    for (&g_aspects) |*entry| {
+        if (entry.note_id == note_id) {
+            entry.aspect = aspect;
+            return;
+        }
+    }
+    g_aspects[g_aspect_next] = .{ .note_id = note_id, .aspect = aspect };
+    g_aspect_next = (g_aspect_next + 1) % aspect_memory_cap;
+}
+
+/// The remembered shape of `note_id`'s picture, if it has been seen.
+fn recalledAspect(note_id: i64) ?f32 {
+    for (&g_aspects) |entry| {
+        if (entry.note_id == note_id and entry.aspect > 0) return entry.aspect;
+    }
+    return null;
+}
+
 /// Clears the media cache. For tests, which share the process globals.
 pub fn resetMediaForTest() void {
     g_media = [_]MediaSlot{.{}} ** max_media_images;
@@ -1136,6 +1277,7 @@ fn loadAnimatedGif(fx: *Effects, slot: *MediaSlot, bytes: []const u8) bool {
     slot.width = frame_w;
     slot.height = frame_h;
     slot.state = .loaded;
+    rememberAspect(slot.note_id, frame_w, frame_h);
     return true;
 }
 
@@ -1158,6 +1300,7 @@ fn loadCachedMedia(fx: *Effects, slot: *MediaSlot, gif: bool) bool {
         slot.state = .loaded;
         slot.width = size.width;
         slot.height = size.height;
+        rememberAspect(slot.note_id, size.width, size.height);
         return true;
     }
     return false;
@@ -1266,6 +1409,7 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         slot.state = .loaded;
         slot.width = size.width;
         slot.height = size.height;
+        rememberAspect(slot.note_id, size.width, size.height);
         // Keep it for next launch: the feed should come back with its pictures.
         storeCachedImage(slot.url(), response.body);
     } else {
@@ -1332,6 +1476,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             @memcpy(note.image_url_buf[0..url.len], url);
             note.image_url_len = @intCast(url.len);
             image_url = note.imageUrl();
+            note.image_aspect = imetaAspect(ev.tags, url);
         }
     }
 
@@ -1341,6 +1486,31 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     note.setTime(now_s);
     return note;
+}
+
+/// The aspect (height over width) the note's own NIP-92 `imeta` tag declares for
+/// `url`, or 0 when it says nothing. An `imeta` tag reads
+/// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
+/// written as floats, so both forms parse.
+pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
+    for (tags) |tag| {
+        if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
+        var matches_url = false;
+        var aspect: f32 = 0;
+        for (tag[1..]) |field| {
+            if (std.mem.startsWith(u8, field, "url ")) {
+                matches_url = std.mem.eql(u8, std.mem.trim(u8, field[4..], " "), url);
+            } else if (std.mem.startsWith(u8, field, "dim ")) {
+                const dim = std.mem.trim(u8, field[4..], " ");
+                const x = std.mem.indexOfScalar(u8, dim, 'x') orelse continue;
+                const w = std.fmt.parseFloat(f32, dim[0..x]) catch continue;
+                const h = std.fmt.parseFloat(f32, dim[x + 1 ..]) catch continue;
+                if (w > 0 and h > 0) aspect = h / w;
+            }
+        }
+        if (matches_url and aspect > 0) return aspect;
+    }
+    return 0;
 }
 
 /// The first image URL in `content`, or null. Recognised by extension, which is
@@ -1412,13 +1582,23 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
 /// referenced pubkey. Null when `src[i]` is not the start of one.
 fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct { end: usize, pubkey: [32]u8 } {
     const prefix = "nostr:";
-    if (!std.mem.startsWith(u8, src[i..], prefix)) return null;
-    const rest = src[i + prefix.len ..];
+    var body_start = i;
+    if (std.mem.startsWith(u8, src[i..], prefix)) {
+        body_start = i + prefix.len;
+    } else {
+        // A bare npub/nprofile counts too (plenty of clients write them without
+        // the scheme), but only at a word boundary, so one inside a URL or a
+        // longer token is left alone.
+        const bare = std.mem.startsWith(u8, src[i..], "npub1") or std.mem.startsWith(u8, src[i..], "nprofile1");
+        if (!bare) return null;
+        if (i > 0 and (isBech32Char(src[i - 1]) or src[i - 1] == '/' or src[i - 1] == ':')) return null;
+    }
+    const rest = src[body_start..];
     var j: usize = 0;
     while (j < rest.len and isBech32Char(rest[j])) j += 1;
     if (j == 0) return null;
     const token = rest[0..j];
-    const end = i + prefix.len + j;
+    const end = body_start + j;
 
     if (std.mem.startsWith(u8, token, "npub1")) {
         const pk = nostr.nip19.decodeNpub(arena, token) catch return null;
@@ -1442,6 +1622,8 @@ fn mentionLabel(pubkey: [32]u8, buf: []u8) []const u8 {
             return buf[0 .. 1 + n];
         }
     }
+    // No name for this one: ask for it, so the next rebuild can show it.
+    wantProfile(pubkey);
     const npub = abbreviateNpub(buf[1..], pubkey);
     return buf[0 .. 1 + npub.len];
 }
@@ -1539,10 +1721,14 @@ pub const Msg = union(enum) {
     open_url: []const u8,
     /// The animation timer fired: advance any playing GIFs.
     animate: native_sdk.EffectTimer,
+    /// Expand a note's picture to fill the window.
+    expand_image: i64,
+    /// Dismiss the expanded picture.
+    close_image,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url" };
+    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -1557,13 +1743,47 @@ pub const AppUi = canvas.Ui(Msg);
 const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboarding.native"));
 const SettingsView = canvas.CompiledMarkupView(Model, Msg, @embedFile("settings.native"));
 
-/// The root view: one screen at a time, chosen by the stage.
+/// The root view: one screen at a time, chosen by the stage. An expanded
+/// picture takes over the window until it is dismissed.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
+    if (model.expanded_note) |note_id| {
+        if (model.noteById(note_id)) |note| return imageViewer(ui, note);
+    }
     return switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
         .settings => SettingsView.build(ui, model),
         .ready => feedView(ui, model),
     };
+}
+
+/// The expanded picture, filling the window. The registry decodes at most 512
+/// pixels on a side, so rather than upscale a small copy into a blur, this shows
+/// it at its own size and offers the full-resolution original in the browser.
+fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
+    const image_id = note.media_id();
+    return ui.column(.{
+        .grow = 1,
+        .gap = 12,
+        .padding = 16,
+        .main = .center,
+        .cross = .center,
+        .style_tokens = .{ .background = .background },
+    }, .{
+        if (image_id != 0) blk: {
+            var node = ui.image(.{
+                .image = image_id,
+                .grow = 1,
+                .semantics = .{ .label = "Expanded image" },
+            });
+            node.widget.image_fit = .contain;
+            break :blk node;
+        } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_image }, "Close"),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageUrl() } }, "Open original"),
+        }),
+    });
 }
 
 /// The feed screen: header, the note list, the composer, and a status bar.
@@ -1626,10 +1846,11 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                     ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, note.time()),
                 }),
                 ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url) }, contentSpans(ui, note.content())),
-                // The picture, once it is registered. Nothing is drawn while it
-                // loads: an empty box reads as a broken image, and the card
-                // simply grows when the picture arrives.
-                if (note.media_id() != 0) notePicture(ui, note) else ui.spacer(0),
+                // The picture. The space is reserved at the picture's own shape
+                // whether or not it has loaded, so the feed never shifts as
+                // images arrive, or as they are evicted and fetched again while
+                // scrolling back and forth.
+                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
             }),
         }),
     });
@@ -1682,31 +1903,45 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
     return spans[0..n];
 }
 
-/// A note's picture, laid out at the image's own aspect ratio and drawn with
-/// `contain`, so it is never stretched and stays undistorted as the window
-/// resizes. The height is derived from the registered pixel size against a
-/// nominal card width and clamped, so one tall image cannot take over the feed.
-fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
+/// The height a note's picture occupies, whether or not it has loaded. Taken
+/// from the note's declared `imeta` shape, else the shape it turned out to be
+/// last time it was decoded, else a gentle default. Clamped so one very tall
+/// image cannot take over the feed.
+pub fn pictureHeight(note: *const Note) f32 {
     const nominal_width: f32 = 300;
-    const min_height: f32 = 80;
-    const max_height: f32 = 320;
+    const default_aspect: f32 = 0.66;
+    const aspect = if (note.image_aspect > 0)
+        note.image_aspect
+    else
+        recalledAspect(note.id) orelse default_aspect;
+    return std.math.clamp(nominal_width * aspect, 80, 320);
+}
 
-    var height: f32 = 200;
-    if (mediaSlotFor(note.id)) |slot| {
-        if (slot.width > 0 and slot.height > 0) {
-            const aspect = @as(f32, @floatFromInt(slot.height)) / @as(f32, @floatFromInt(slot.width));
-            height = std.math.clamp(nominal_width * aspect, min_height, max_height);
-        }
+/// A note's picture: the image once registered, or a placeholder holding the
+/// exact same space while it loads. Drawn with `contain` at its own aspect, so
+/// it is never stretched and stays undistorted as the window resizes. Pressing
+/// it opens the viewer.
+fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
+    const height = pictureHeight(note);
+    const image_id = note.media_id();
+    if (image_id == 0) {
+        // Reserved space, not an empty frame: same height the picture will take.
+        return ui.el(.skeleton, .{ .height = height, .semantics = .{ .label = "Loading image" } }, .{});
     }
-    var node = ui.image(.{
-        .image = note.media_id(),
-        .height = height,
-        .semantics = .{ .label = "Attached image" },
-    });
+    var picture = ui.image(.{ .image = image_id, .grow = 1 });
     // `ui.image` leaves the fit at `stretch`, which distorts the picture into
     // whatever box it is given (and worse as the window resizes).
-    node.widget.image_fit = .contain;
-    return node;
+    picture.widget.image_fit = .contain;
+    // The picture sits in a pressable row rather than carrying the press
+    // itself: an image is a leaf, and the hit target belongs on a container.
+    // `quiet_hover` keeps it from washing over on hover like a list row.
+    return ui.el(.list_item, .{
+        .height = height,
+        .padding = 0,
+        .style = .{ .quiet_hover = true },
+        .on_press = Msg{ .expand_image = note.id },
+        .semantics = .{ .role = .button, .label = "Attached image, press to enlarge", .focusable = true },
+    }, .{picture});
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
@@ -1746,6 +1981,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                requestWantedProfiles();
             }
         },
         .animate => |t| {
@@ -1802,6 +2038,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
         .open_url => |url| openExternally(fx, url),
+        .expand_image => |note_id| {
+            std.debug.print("plaza: [viewer] expand note={d} found={}\n", .{ note_id, model.noteById(note_id) != null });
+            model.expanded_note = note_id;
+        },
+        .close_image => model.expanded_note = null,
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
             // Load what just came into view without waiting for the next tick.
