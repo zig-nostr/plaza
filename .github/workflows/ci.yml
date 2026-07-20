@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  # The Plaza app (Native SDK): macOS only, via the native CLI.
+  # The full check on the platform Plaza ships from today.
   app:
     runs-on: macos-latest
     steps:
@@ -41,4 +41,54 @@ jobs:
         run: native build
 
       - name: Check formatting
+        run: zig fmt --check src
+
+  # Linux builds the whole stack (the library with its vendored secp256k1 and
+  # LMDB, the stb codecs, and the app) and runs the test suite, so a portability
+  # break surfaces on the pull request that causes it rather than months later.
+  # A packaged Linux release comes later: the toolkit renders through a software
+  # rasteriser off macOS today, so shipping one now would misrepresent how Plaza
+  # performs.
+  #
+  # Windows is not in the matrix yet: the relay transport resolves hostnames
+  # through libc `getaddrinfo`, which Zig's standard library does not declare
+  # for Windows, so nothing depending on the library links there. That is a gap
+  # in the protocol library rather than in Plaza, filed as zig-nostr/nostr#59
+  # (found by this job on its first run), and Windows joins the matrix as soon
+  # as it lands.
+  portability:
+    name: portability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        shell: bash
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      # The Linux host binds GTK4 and WebKitGTK; without the dev packages the
+      # link fails on the host layer rather than on anything of ours.
+      - name: Install Linux host dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Check formatting
+        shell: bash
         run: zig fmt --check src

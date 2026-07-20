@@ -22,6 +22,7 @@
 //! grammar does not carry). This file is the logic.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
@@ -72,7 +73,11 @@ const starter_pack = blk: {
     break :blk pks;
 };
 
-const feed_capacity = 60;
+// How many notes the feed can hold, and how many it asks the store for at
+// first. The list is windowed, so holding more costs memory, not frames; the
+// query grows a page at a time as the reader reaches the end.
+const feed_capacity = 300;
+const feed_page = 60;
 // The composer's fixed text capacity. Comfortably longer than a typical note;
 // the display buffer (`Note.content_buf`) truncates for rendering, but the
 // published event carries the full draft.
@@ -81,6 +86,13 @@ const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
 // The app version shown in Settings. Keep in step with app.zon's `.version`.
 const plaza_version = "0.1.0";
+// Owner-only permissions for the files holding secrets. POSIX gets 0600;
+// Windows has no mode bits (its permissions are file ATTRIBUTES), so it takes
+// the default there and inherits the profile directory's access control.
+const secret_file_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows)
+    .default_file
+else
+    std.Io.File.Permissions.fromMode(0o600);
 // Effect keys for the two Settings clipboard copies (npub, nsec). Clipboard
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
@@ -681,6 +693,9 @@ pub const Model = struct {
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
     feed_scroll: canvas.ScrollState = .{},
+    // How many notes the feed currently asks the store for; grows a page at a
+    // time as the reader reaches the end.
+    feed_limit: usize = feed_page,
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
@@ -691,11 +706,11 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",       "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
-        "stage",       "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
-        "proxy_saved", "feed_scroll",   "draft",          "draft_empty",    "identity",
-        "has_notes",   "empty",         "status",         "empty_text",     "footer",
-        "note_list",   "expanded_note",
+        "notes",       "notes_len",    "live_relays",    "offline_relays", "draft_buffer",
+        "stage",       "login_buffer", "logout_pending", "reveal_nsec",    "proxy_buffer",
+        "proxy_saved", "feed_scroll",  "feed_limit",     "draft",          "draft_empty",
+        "identity",    "has_notes",    "empty",          "status",         "empty_text",
+        "footer",      "note_list",    "expanded_note",
     };
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -855,21 +870,14 @@ pub const Model = struct {
     /// note count) and pads generously; being a row or two wide only costs a
     /// prefetch. Before the first scroll event it reports the top of the feed.
     pub fn visibleRange(self: *const Model) struct { first: usize, last: usize } {
-        const overscan = 2;
         if (self.notes_len == 0) return .{ .first = 0, .last = 0 };
-        const content = self.feed_scroll.content_extent;
-        const viewport = self.feed_scroll.viewport_extent;
-        if (content <= 0 or viewport <= 0) {
-            return .{ .first = 0, .last = @min(self.notes_len - 1, max_media_images - 1) };
+        // The windowed list reports the exact rows it put on screen, so this is
+        // no longer an estimate. Before the first build it reports the top.
+        const last_row = self.notes_len - 1;
+        if (g_visible_last == 0 and g_visible_first == 0) {
+            return .{ .first = 0, .last = @min(last_row, max_media_images - 1) };
         }
-        const average = content / @as(f32, @floatFromInt(self.notes_len));
-        if (average <= 0) return .{ .first = 0, .last = self.notes_len - 1 };
-
-        const first_f = @max(0, self.feed_scroll.offset / average - overscan);
-        const last_f = (self.feed_scroll.offset + viewport) / average + overscan;
-        const first: usize = @intFromFloat(first_f);
-        const last: usize = @intFromFloat(@max(0, last_f));
-        return .{ .first = @min(first, self.notes_len - 1), .last = @min(last, self.notes_len - 1) };
+        return .{ .first = @min(g_visible_first, last_row), .last = @min(g_visible_last, last_row) };
     }
 
     /// Reconciles the feed with the store. Updates the connection line every
@@ -913,11 +921,14 @@ pub const Model = struct {
             authors[authors_len] = pk;
             authors_len += 1;
         }
-        var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = feed_capacity }) catch return;
+        // Only as much as the reader has paged into, so the rebuild cost stays
+        // flat until they actually ask for more.
+        const limit = @min(self.feed_limit, feed_capacity);
+        var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(limit) }) catch return;
         defer result.deinit();
         var n: usize = 0;
         for (result.events) |ev| {
-            if (n >= feed_capacity) break;
+            if (n >= limit) break;
             self.notes[n] = noteFrom(ev, now_s);
             n += 1;
         }
@@ -1089,7 +1100,7 @@ fn storeCachedImage(url: []const u8, bytes: []const u8) void {
     dir.writeFile(io, .{
         .sub_path = name,
         .data = bytes,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch {};
 }
 
@@ -1182,6 +1193,12 @@ const MediaSlot = struct {
 
 var g_media = [_]MediaSlot{.{}} ** max_media_images;
 var g_media_clock: u64 = 0;
+
+// The rows the windowed list last put on screen. Written by the view (which is
+// where the runtime resolves the window) and read by the fetch pass in
+// `update`, so the image budget follows the reader exactly.
+var g_visible_first: usize = 0;
+var g_visible_last: usize = 0;
 
 // What shape each note's picture turned out to be, remembered per note id and
 // OUTLIVING both the media slot and the note itself. A slot is evicted as soon
@@ -1746,10 +1763,12 @@ pub const Msg = union(enum) {
     expand_image: i64,
     /// Dismiss the expanded picture.
     close_image,
+    /// The reader reached the end of the feed: ask the store for another page.
+    load_older,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image" };
+    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -1825,14 +1844,70 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
     });
 }
 
+/// The one options value both `virtualWindow` and `virtualList` read. The MODEL
+/// owns the notes; the runtime only ever sees how many there are, an estimate
+/// per row, and the window it asked for.
+fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
+    return .{
+        .id = "feed",
+        .item_count = model.notes_len,
+        // Variable-extent mode: cards are as tall as their wrapped text and
+        // their picture. The estimate prices unbuilt rows; the engine patches in
+        // measured heights as rows mount, and anchors the viewport so those
+        // corrections never move what the reader is looking at.
+        .item_extent = 0,
+        .extent_estimate = noteExtentEstimate,
+        .extent_context = model,
+        .gap = 8,
+        .padding = 12,
+        .overscan = 3,
+        .grow = 1,
+        // Only bare builds (tests, previews) read this: under the app the
+        // runtime supplies the real viewport. Without it a test resolves an
+        // empty window and renders no rows at all.
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Feed" },
+        .on_reach_end = .load_older,
+    };
+}
+
+/// A cheap height estimate for the note at `index`, from model facts only
+/// (never layout): the card's chrome, its wrapped lines, and its picture.
+fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
+    const chrome: f32 = 58;
+    const line_height: f32 = 18;
+    const chars_per_line: f32 = 42;
+
+    const model: *const Model = @ptrCast(@alignCast(context orelse return chrome + line_height));
+    const i: usize = @intCast(index);
+    if (i >= model.notes_len) return chrome + line_height;
+    const note = &model.notes[i];
+
+    const chars: f32 = @floatFromInt(note.content_len);
+    const lines = @max(1, @ceil(chars / chars_per_line));
+    var extent = chrome + lines * line_height;
+    if (note.hasImage()) extent += pictureHeight(note) + 4;
+    return extent;
+}
+
 /// The feed screen: header, the note list, the composer, and a status bar.
 fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
-    const notes = model.notes[0..model.notes_len];
-    const cards = ui.arena.alloc(AppUi.Node, notes.len) catch {
+    // The data-window seam: the runtime resolves scroll offset and viewport
+    // into a visible index range, and only those rows are built. A feed of any
+    // length then costs what the handful on screen costs.
+    const options = feedOptions(model);
+    const window = ui.virtualWindow(options);
+    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch {
         ui.failed = true;
         return ui.column(.{}, .{});
     };
-    for (cards, notes) |*card, *note| card.* = noteCard(ui, note);
+    for (rows, 0..) |*row, offset| row.* = noteCard(ui, &model.notes[window.start_index + offset]);
+
+    // Exactly which rows are on screen, which is what decides where the image
+    // budget goes. Recorded here because the runtime resolves it during the
+    // build, while the fetch pass runs later, in `update`.
+    g_visible_first = window.first_visible_index;
+    g_visible_last = window.last_visible_index;
 
     return ui.column(.{ .grow = 1 }, .{
         ui.row(.{ .gap = 8, .cross = .center, .padding = 16 }, .{
@@ -1843,24 +1918,15 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
         }),
         ui.separator(.{}),
-        if (notes.len == 0)
+        if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
             })
         else
-            // The offset is mirrored like text: the Msg carries what the runtime
-            // already applied, the model keeps it, and echoing it back through
-            // `value` is what stops a rebuild from stomping the reader's place
-            // (opening the viewer rebuilds the tree around this region).
-            // `global_key` pins the region's identity so it survives that too.
-            ui.scroll(.{
-                .grow = 1,
-                .value = model.feed_scroll.offset,
-                .global_key = .{ .str = "feed-scroll" },
-                .on_scroll = AppUi.scrollMsg(.feed_scrolled),
-            }, .{
-                ui.column(.{ .gap = 8, .padding = 12 }, .{cards}),
-            }),
+            // The list owns its scroll state, keyed by the id in `feedOptions`,
+            // so the offset survives every rebuild (and the image viewer
+            // opening over it) without the model mirroring it.
+            ui.virtualList(options, window, .{rows}),
         ui.separator(.{}),
         ui.column(.{ .gap = 8, .padding = 12 }, .{
             ui.inputGroup(
@@ -2121,6 +2187,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.feed_scroll = scroll;
             // Load what just came into view without waiting for the next tick.
             scanMediaFetches(fx, model);
+        },
+        .load_older => {
+            // One more page from the store, up to what the feed can hold.
+            if (model.feed_limit >= feed_capacity) return;
+            model.feed_limit = @min(model.feed_limit + feed_page, feed_capacity);
+            g_last_count = std.math.maxInt(usize);
+            model.refresh(nowSeconds());
         },
         .close_settings => {
             model.logout_pending = false;
@@ -2649,7 +2722,7 @@ fn persistIdentityKey(io: std.Io, environ: *const std.process.Environ.Map, secre
     dir.writeFile(io, .{
         .sub_path = "identity.key",
         .data = &secret,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
 }
 
@@ -2701,7 +2774,7 @@ fn persistSession() void {
     dir.writeFile(io, .{
         .sub_path = "session",
         .data = data,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist session: {s}\n", .{@errorName(err)});
 }
 
@@ -2812,7 +2885,7 @@ fn saveSettings() void {
     dir.writeFile(io, .{
         .sub_path = "settings",
         .data = data,
-        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
 }
 
