@@ -242,6 +242,81 @@ test "media URLs route through the proxy, the host, or neither" {
     try testing.expectEqualStrings("https://host.example/a.jpg", direct);
 }
 
+test "an empty display_name falls through to the name" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{12} ** 32);
+
+    // Real profiles ship `"display_name": ""` alongside a real name (jb55's
+    // does); the empty one must not win and drop the author to an npub.
+    const p = main.upsertProfile(kp.public_key).?;
+    main.parseMetadataInto(p, "{\"display_name\":\"\",\"name\":\"jb55\"}");
+
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqualStrings("jb55", note.author());
+}
+
+test "note text splits into link, mention, and plain runs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const spans = main.contentSpans(&ui, "hi @alice see https://example.com/x ok");
+    try testing.expectEqual(@as(usize, 5), spans.len);
+    // The mention and the link are accented; only the link is pressable.
+    try testing.expectEqualStrings("@alice", spans[1].text);
+    try testing.expectEqual(@as(usize, 0), spans[1].link.len);
+    try testing.expectEqualStrings("https://example.com/x", spans[3].text);
+    try testing.expectEqualStrings("https://example.com/x", spans[3].link);
+    try testing.expect(spans[3].underline);
+    // Plain text has no link payload.
+    try testing.expectEqual(@as(usize, 0), spans[0].link.len);
+}
+
+test "only plain http(s) links are handed to the opener" {
+    try testing.expect(main.isSafeExternalUrl("https://example.com/a"));
+    try testing.expect(main.isSafeExternalUrl("http://example.com"));
+    // Anything that is not a plain web URL, or that could be read as a flag or
+    // carry control bytes, is refused.
+    try testing.expect(!main.isSafeExternalUrl("file:///etc/passwd"));
+    try testing.expect(!main.isSafeExternalUrl("-a/Applications/Calculator.app"));
+    try testing.expect(!main.isSafeExternalUrl("nostr:npub1abc"));
+    try testing.expect(!main.isSafeExternalUrl("https://example.com/a b"));
+    try testing.expect(!main.isSafeExternalUrl("https://example.com/a\nb"));
+    try testing.expect(!main.isSafeExternalUrl(""));
+}
+
+test "gif sources are recognised so their frames are kept" {
+    try testing.expect(main.isGifUrl("https://x.com/a.gif"));
+    try testing.expect(main.isGifUrl("https://x.com/a.GIF?v=1"));
+    try testing.expect(!main.isGifUrl("https://x.com/a.jpg"));
+}
+
+test "the loaded window follows the scroll position" {
+    var model = main.initialModel();
+    model.notes_len = 40;
+
+    // Before any scroll, the top of the feed is what loads.
+    const at_rest = model.visibleRange();
+    try testing.expectEqual(@as(usize, 0), at_rest.first);
+    try testing.expect(at_rest.last < 40);
+
+    // Scrolled halfway down a 40-note feed of 100pt rows: the window follows,
+    // with a row or two of overscan either side.
+    model.feed_scroll = .{ .offset = 2000, .viewport_extent = 600, .content_extent = 4000 };
+    const scrolled = model.visibleRange();
+    try testing.expect(scrolled.first >= 16 and scrolled.first <= 20);
+    try testing.expect(scrolled.last >= 25 and scrolled.last <= 40);
+    try testing.expect(scrolled.last < 40);
+}
+
 test "the logout confirmation replaces the log-out button" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
