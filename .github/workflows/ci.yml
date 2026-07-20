@@ -43,12 +43,12 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src
 
-  # Linux builds the whole stack (the library with its vendored
-  # secp256k1 and LMDB, the stb codecs, and the app) and run the test suite, so
-  # a portability break surfaces on the PR that causes it rather than months
-  # later. Packaged releases for these platforms come later: the toolkit
-  # renders through a software rasteriser off macOS today, so shipping one now
-  # would misrepresent how Plaza performs.
+  # Linux builds the whole stack (the library with its vendored secp256k1 and
+  # LMDB, the stb codecs, and the app) and runs the test suite, so a portability
+  # break surfaces on the pull request that causes it rather than months later.
+  # A packaged Linux release comes later: the toolkit renders through a software
+  # rasteriser off macOS today, so shipping one now would misrepresent how Plaza
+  # performs.
   #
   # Windows is not in the matrix yet: the relay transport resolves hostnames
   # through libc `getaddrinfo`, which Zig's standard library does not declare
