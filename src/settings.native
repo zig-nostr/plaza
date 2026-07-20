@@ -1,0 +1,74 @@
+<!-- Plaza's Settings screen: who you are signed in as, secret-key backup for a
+     local identity, the media proxy, and logging out. Compiled into the Zig
+     view (see `settingsView` in src/main.zig). Validate: native check -->
+<column gap="0" grow="1">
+  <row gap="8" cross="center" padding="16">
+    <button size="sm" variant="ghost" on-press="close_settings">Back</button>
+    <text size="heading" grow="1">Settings</text>
+  </row>
+  <separator/>
+  <scroll grow="1">
+    <column gap="16" padding="16">
+      <card padding="16">
+        <column gap="8">
+          <text size="sm" foreground="text_muted">Signed in as</text>
+          <text wrap="true">{active_npub}</text>
+          <row gap="8" cross="center">
+            <text size="sm" foreground="accent">{identity_kind_label}</text>
+            <spacer grow="1"/>
+            <button size="sm" variant="ghost" on-press="copy_npub">Copy npub</button>
+          </row>
+        </column>
+      </card>
+      <if test="{is_local_key}">
+        <card padding="16">
+          <column gap="8">
+            <text size="sm" foreground="text_muted">Your secret key</text>
+            <text wrap="true" foreground="text_muted">Back this up. It's the only way to restore this identity on another device, and Plaza never sends it anywhere.</text>
+            <if test="{nsec_hidden}">
+              <button size="sm" variant="ghost" on-press="toggle_nsec">Reveal secret key</button>
+            </if>
+            <if test="{nsec_shown}">
+              <text wrap="true">{revealed_nsec}</text>
+              <row gap="8" cross="center">
+                <button size="sm" on-press="copy_nsec">Copy nsec</button>
+                <spacer grow="1"/>
+                <button size="sm" variant="ghost" on-press="toggle_nsec">Hide</button>
+              </row>
+            </if>
+          </column>
+        </card>
+      </if>
+      <card padding="16">
+        <column gap="8">
+          <text size="sm" foreground="text_muted">Media proxy</text>
+          <text wrap="true" foreground="text_muted">Images are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.</text>
+          <input-group>
+            <textarea text="{proxy_draft}" placeholder="https://wsrv.nl/" on-input="proxy_edit" on-submit="proxy_save"/>
+            <input-group-actions>
+              <text size="sm" foreground="text_muted">{proxy_status}</text>
+              <spacer grow="1"/>
+              <button size="sm" on-press="proxy_save">Save</button>
+            </input-group-actions>
+          </input-group>
+        </column>
+      </card>
+      <if test="{logout_idle}">
+        <button variant="destructive" on-press="logout_request">Log out</button>
+      </if>
+      <if test="{logout_confirming}">
+        <card padding="16">
+          <column gap="12">
+            <text wrap="true">{logout_warning}</text>
+            <row gap="8" cross="center">
+              <button size="sm" variant="ghost" on-press="logout_cancel">Cancel</button>
+              <spacer grow="1"/>
+              <button size="sm" variant="destructive" on-press="logout_confirm">Log out</button>
+            </row>
+          </column>
+        </card>
+      </if>
+      <text size="sm" foreground="text_muted">{version_line}</text>
+    </column>
+  </scroll>
+</column>

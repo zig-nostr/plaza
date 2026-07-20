@@ -17,7 +17,9 @@
 //! rendered from disk on a timer, all in one process. Real names (kind:0
 //! profiles) and NIP-65 outbox routing come in the milestones ahead.
 //!
-//! The view lives in `app.native`; this file is the logic.
+//! The static screens live in `onboarding.native` and `settings.native`; the
+//! feed is a Zig view (inline images need a runtime image reference the markup
+//! grammar does not carry). This file is the logic.
 
 const std = @import("std");
 const runner = @import("runner");
@@ -83,24 +85,31 @@ const plaza_version = "0.1.0";
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
-// Avatar fetches use effect keys `avatar_fetch_key_base + slot`, kept clear of
-// the timer and clipboard keys above.
+// Image fetches use effect keys `<base> + slot`, kept clear of the timer and
+// clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
+const media_fetch_key_base: u64 = 2000;
 
 // The profile cache holds display names and avatars keyed by pubkey. It is
 // larger than the feed's author set so a mention can resolve to a name too.
 const profile_cap = 32;
-// The image registry caps at 16 slots, shared across the app. The feed's author
-// set (the starter pack plus the user) is small, so the first `max_avatar_images`
-// cache slots own an avatar image id; beyond that, and for mention-only entries,
-// the avatar falls back to initials. Media in the next milestone shares this
-// budget, so an LRU arrives with it.
-const max_avatar_images = 16;
-// The largest avatar body we accept: the fetch effect caps at 256 KiB, and an
-// avatar over ~240 KiB is almost never worth decoding, so we skip it (initials
-// fallback) rather than spend the decode budget. Proxy-resized avatars in the
-// next milestone make this moot.
-const max_avatar_bytes = 240 * 1024;
+// The canvas image registry has 16 slots for the whole app, so avatars and feed
+// media split it: profile cache slots 0..7 own avatar image ids 1..8, and feed
+// images take ids 9..16 through a small LRU. A profile past the avatar budget,
+// and any mention-only entry, renders initials.
+const max_avatar_images = 8;
+const max_media_images = 8;
+const media_image_id_base: u64 = max_avatar_images + 1;
+// What each image is requested at. Avatars draw at 40pt, so asking for more
+// than a couple of hundred pixels is pure waste. Feed images are bounded as a
+// BOX, not just a width: the registry's budget is 1 MiB of decoded pixels, so a
+// 512-wide image that happens to be tall (512x717 is a real example) still
+// blows it. 480x480 leaves honest headroom under the cap.
+const avatar_target_px: u32 = 128;
+const media_target_px: u32 = 480;
+// The largest body we accept from a fetch. The effect caps at 256 KiB anyway;
+// stopping a little short keeps the decode budget for images that will fit.
+const max_image_bytes = 240 * 1024;
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{
@@ -198,6 +207,93 @@ pub fn classifyLogin(text: []const u8) LoginTarget {
     if (std.mem.startsWith(u8, t, "nsec1")) return .nsec;
     if (std.mem.startsWith(u8, t, "bunker://")) return .bunker;
     return .invalid;
+}
+
+// --------------------------------------------------------------- media proxy
+//
+// The image registry decodes at most a 512x512 image and the fetch effect caps
+// bodies at 256 KiB, so a full-size photo can neither be downloaded nor decoded
+// as-is. Images are therefore requested at the size they will actually be drawn:
+// through a host's own resizer when it has one, otherwise through a
+// weserv-compatible proxy (the free public wsrv.nl by default, and any instance
+// the user prefers, including their own). Clearing the setting loads originals
+// straight from their host, which still works for anything small enough.
+
+const default_media_proxy = "https://wsrv.nl/";
+var g_media_proxy_buf: [200]u8 = undefined;
+var g_media_proxy_len: usize = 0;
+
+/// The configured proxy base URL, empty when images load directly.
+pub fn mediaProxy() []const u8 {
+    return g_media_proxy_buf[0..g_media_proxy_len];
+}
+
+/// Sets the proxy base URL (trimmed; empty disables proxying).
+pub fn setMediaProxy(url: []const u8) void {
+    const trimmed = std.mem.trim(u8, url, " \t\r\n");
+    const n = @min(trimmed.len, g_media_proxy_buf.len);
+    @memcpy(g_media_proxy_buf[0..n], trimmed[0..n]);
+    g_media_proxy_len = n;
+}
+
+/// Whether the host serves its own resized variants via `?w=`, letting us skip
+/// the proxy hop entirely. nostr.build's Blossom hosts do; most others ignore it.
+fn hostSupportsWidthParam(src: []const u8) bool {
+    return std.mem.indexOf(u8, src, "://blossom.nostr.build/") != null or
+        std.mem.indexOf(u8, src, "://blossom.band/") != null or
+        std.mem.indexOf(u8, src, ".blossom.band/") != null;
+}
+
+/// How an image is fitted when resized.
+pub const MediaFit = enum {
+    /// Square, cropped to fill: avatars.
+    square,
+    /// Scaled down to fit inside a square box, aspect preserved: feed images.
+    /// Bounding both edges is what keeps a tall image inside the pixel budget.
+    inside,
+};
+
+/// Builds the URL to fetch `src` at roughly `width` pixels, writing into `out`
+/// and returning the slice to request. Falls back to `src` itself whenever no
+/// resizing route applies or the URL would not fit.
+pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u8 {
+    // A host that resizes for us: cheapest path, no third party involved.
+    if (hostSupportsWidthParam(src) and std.mem.indexOfScalar(u8, src, '?') == null) {
+        return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
+    }
+    const proxy = mediaProxy();
+    if (proxy.len == 0) return src;
+
+    var encoded_buf: [768]u8 = undefined;
+    const encoded = percentEncode(&encoded_buf, src) orelse return src;
+    const sep: []const u8 = if (std.mem.endsWith(u8, proxy, "/")) "" else "/";
+    return switch (fit) {
+        .square => std.fmt.bufPrint(out, "{s}{s}?url={s}&w={d}&h={d}&fit=cover&output=webp", .{ proxy, sep, encoded, width, width }) catch src,
+        .inside => std.fmt.bufPrint(out, "{s}{s}?url={s}&w={d}&h={d}&fit=inside&output=webp", .{ proxy, sep, encoded, width, width }) catch src,
+    };
+}
+
+/// Percent-encodes `src` into `out` (everything outside the unreserved set), so
+/// a source URL survives as one query parameter. Null if it would not fit.
+fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
+    const hexdigits = "0123456789ABCDEF";
+    var n: usize = 0;
+    for (src) |c| {
+        const unreserved = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '.' or c == '_' or c == '~';
+        if (unreserved) {
+            if (n + 1 > out.len) return null;
+            out[n] = c;
+            n += 1;
+        } else {
+            if (n + 3 > out.len) return null;
+            out[n] = '%';
+            out[n + 1] = hexdigits[c >> 4];
+            out[n + 2] = hexdigits[c & 0x0f];
+            n += 3;
+        }
+    }
+    return out[0..n];
 }
 
 // ------------------------------------------------------------------ profiles
@@ -340,9 +436,29 @@ pub const Note = struct {
     time_len: u8 = 0,
     content_buf: [220]u8 = [_]u8{0} ** 220,
     content_len: u16 = 0,
+    // The first image URL in the note, lifted out of the text and rendered as a
+    // picture instead (see `renderContent`'s `omit`).
+    image_url_buf: [300]u8 = [_]u8{0} ** 300,
+    image_url_len: u16 = 0,
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
+    }
+    /// Whether this note carries an image to render.
+    pub fn hasImage(self: *const Note) bool {
+        return self.image_url_len > 0;
+    }
+    /// The note's image URL (empty when it has none).
+    pub fn imageUrl(self: *const Note) []const u8 {
+        return self.image_url_buf[0..self.image_url_len];
+    }
+    /// The registered image id for this note's picture, or 0 while it is
+    /// loading, unavailable, or absent.
+    pub fn media_id(self: *const Note) u64 {
+        if (mediaSlotFor(self.id)) |m| {
+            if (m.state == .loaded) return m.image_id;
+        }
+        return 0;
     }
     /// The author's display name from their kind:0 profile, or the abbreviated
     /// npub until (or unless) a profile is known.
@@ -407,6 +523,9 @@ pub const Model = struct {
     // local secret key is revealed for backup.
     logout_pending: bool = false,
     reveal_nsec: bool = false,
+    // The media-proxy field in Settings (see `g_media_proxy_buf`).
+    proxy_buffer: canvas.TextBuffer(200) = .{},
+    proxy_saved: bool = false,
 
     // These fields reach the view only through methods, `notes`/`notes_len`
     // through `note_list`/`has_notes`/`footer`, the relay counts through the
@@ -527,6 +646,15 @@ pub const Model = struct {
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
         };
     }
+    /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
+    pub fn proxy_draft(self: *const Model) []const u8 {
+        return self.proxy_buffer.text();
+    }
+    /// Confirmation under the media-proxy field.
+    pub fn proxy_status(self: *const Model) []const u8 {
+        if (!self.proxy_saved) return "";
+        return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
+    }
     /// The app version line for the Settings footer.
     pub fn version_line(self: *const Model) []const u8 {
         _ = self;
@@ -645,9 +773,11 @@ fn scanAvatarFetches(fx: *Effects) void {
         if (fired >= per_tick) break;
         if (!p.used or p.avatar_state != .idle or p.picture_len == 0 or p.image_id == 0) continue;
         p.avatar_state = .fetching;
+        var url_buf: [1024]u8 = undefined;
+        const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
         fx.fetch(.{
             .key = avatar_fetch_key_base + @as(u64, @intCast(i)),
-            .url = p.picture(),
+            .url = url,
             .on_response = Effects.responseMsg(.avatar_fetched),
         });
         fired += 1;
@@ -669,18 +799,176 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         return;
     }
     // Anything but a clean, whole, OK image body falls back to initials.
-    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_avatar_bytes) {
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
         p.avatar_state = .failed;
         return;
     }
-    // Decode and register into this profile's fixed image id. A decode failure,
-    // or a decoded size over the image budget (an avatar larger than 512x512,
-    // which this milestone does not yet downscale), falls back to initials.
-    _ = fx.registerImageBytes(p.image_id, response.body) catch {
-        p.avatar_state = .failed;
+    // Decode into this profile's fixed image id, downscaling if the platform
+    // decoder will not take it as-is. Only a genuinely undecodable body falls
+    // back to initials now.
+    p.avatar_state = if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) .loaded else .failed;
+}
+
+// --------------------------------------------------------------- image decode
+//
+// The canvas image registry decodes through the platform codec and refuses
+// anything over 512x512, with no downscaler of its own. Most real avatars and
+// nearly every feed photo are larger than that, so Plaza decodes and resizes
+// them itself: the platform decoder is tried first (it knows every format the
+// OS does, WebP and HEIC included), and stb takes over when it refuses.
+
+extern fn stbi_load_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) ?[*]u8;
+extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
+extern fn stbir_resize_uint8_linear(input_pixels: [*]const u8, input_w: c_int, input_h: c_int, input_stride_in_bytes: c_int, output_pixels: [*]u8, output_w: c_int, output_h: c_int, output_stride_in_bytes: c_int, pixel_layout: c_int) ?[*]u8;
+
+/// `STBIR_RGBA`: four channels, alpha not premultiplied, which is what both stb
+/// hands back and the registry wants.
+const stbir_rgba: c_int = 4;
+
+/// Decodes `bytes` and registers the pixels under `id`, downscaling so the long
+/// edge is at most `max_dim`. Returns whether the image is now registered.
+fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) bool {
+    // Fast path: let the platform decode and register directly. This succeeds
+    // whenever the image already fits the registry's budget.
+    if (fx.registerImageBytes(id, bytes)) |_| return true else |_| {}
+
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
+    defer stbi_image_free(pixels);
+    if (w <= 0 or h <= 0) return false;
+
+    const src_w: usize = @intCast(w);
+    const src_h: usize = @intCast(h);
+    const longest = @max(src_w, src_h);
+    if (longest <= max_dim) {
+        // The platform refused it for some other reason; the decoded pixels
+        // still fit, so register them as they are.
+        fx.registerImage(id, src_w, src_h, pixels[0 .. src_w * src_h * 4]) catch return false;
+        return true;
+    }
+
+    const scale = @as(f64, @floatFromInt(max_dim)) / @as(f64, @floatFromInt(longest));
+    const dst_w: usize = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(src_w)) * scale)));
+    const dst_h: usize = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(src_h)) * scale)));
+
+    const gpa = std.heap.page_allocator;
+    const out = gpa.alloc(u8, dst_w * dst_h * 4) catch return false;
+    defer gpa.free(out);
+    if (stbir_resize_uint8_linear(pixels, w, h, 0, out.ptr, @intCast(dst_w), @intCast(dst_h), 0, stbir_rgba) == null) return false;
+    fx.registerImage(id, dst_w, dst_h, out) catch return false;
+    return true;
+}
+
+// ---------------------------------------------------------------- feed media
+//
+// Feed images take the image ids the avatars do not, through a small LRU keyed
+// by note. Only the top of the feed loads for now: that is what the budget
+// holds and what is on screen at rest. Windowed visibility (load exactly what
+// is in view, evict what leaves) arrives with the virtual list.
+
+const MediaSlot = struct {
+    used: bool = false,
+    note_id: i64 = 0,
+    image_id: u64 = 0,
+    state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Tick counter at the last time this note was still wanted, for eviction.
+    last_used: u64 = 0,
+};
+
+var g_media = [_]MediaSlot{.{}} ** max_media_images;
+var g_media_clock: u64 = 0;
+
+/// Clears the media cache. For tests, which share the process globals.
+pub fn resetMediaForTest() void {
+    g_media = [_]MediaSlot{.{}} ** max_media_images;
+    g_media_clock = 0;
+}
+
+/// The slot holding `note_id`'s image, if any.
+fn mediaSlotFor(note_id: i64) ?*MediaSlot {
+    for (&g_media) |*m| {
+        if (m.used and m.note_id == note_id) return m;
+    }
+    return null;
+}
+
+/// The slot for `note_id`, claiming a free one or evicting the least recently
+/// wanted (never one with a fetch in flight). Null when every slot is busy.
+fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
+    if (mediaSlotFor(note_id)) |m| return m;
+    for (&g_media, 0..) |*m, i| {
+        if (!m.used) {
+            m.* = .{ .used = true, .note_id = note_id, .image_id = media_image_id_base + i };
+            return m;
+        }
+    }
+    var victim: ?*MediaSlot = null;
+    for (&g_media) |*m| {
+        if (m.state == .fetching) continue;
+        if (victim == null or m.last_used < victim.?.last_used) victim = m;
+    }
+    const v = victim orelse return null;
+    const id = v.image_id;
+    // Free the registry slot before reusing the id for different content.
+    _ = fx.unregisterImage(id);
+    v.* = .{ .used = true, .note_id = note_id, .image_id = id };
+    return v;
+}
+
+/// Fires media fetches for the top of the feed, a few per tick.
+fn scanMediaFetches(fx: *Effects, model: *const Model) void {
+    const per_tick = 3;
+    var fired: usize = 0;
+    g_media_clock += 1;
+    const limit = @min(model.notes_len, max_media_images);
+    for (model.notes[0..limit]) |*note| {
+        if (!note.hasImage()) continue;
+        const slot = claimMediaSlot(fx, note.id) orelse continue;
+        slot.last_used = g_media_clock;
+        if (slot.state != .idle) continue;
+        if (fired >= per_tick) continue;
+
+        var url_buf: [1024]u8 = undefined;
+        const url = mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
+        slot.state = .fetching;
+        fx.fetch(.{
+            .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
+            .url = url,
+            .on_response = Effects.responseMsg(.media_fetched),
+        });
+        fired += 1;
+    }
+}
+
+/// Handles a feed-image fetch response, mirroring the avatar path.
+fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key < media_fetch_key_base) return;
+    const index = response.key - media_fetch_key_base;
+    if (index >= g_media.len) return;
+    const slot = &g_media[@intCast(index)];
+    if (!slot.used) return;
+
+    if (response.outcome == .rejected) {
+        slot.state = .idle;
         return;
-    };
-    p.avatar_state = .loaded;
+    }
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
+        slot.state = .failed;
+        return;
+    }
+    slot.state = if (decodeAndRegister(fx, slot.image_id, response.body, media_target_px)) .loaded else .failed;
+}
+
+/// Lets everything that failed to load try again, after the media proxy changed.
+fn retryFailedImages() void {
+    for (&g_profiles) |*p| {
+        if (p.used and p.avatar_state == .failed) p.avatar_state = .idle;
+    }
+    for (&g_media) |*m| {
+        if (m.used and m.state == .failed) m.state = .idle;
+    }
 }
 
 /// Builds a `Note` view-model from a stored event.
@@ -698,19 +986,54 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     setAuthor(&note, ev.pubkey);
 
+    // An image link becomes a picture, so lift it out of the text and omit it
+    // from the rendered content rather than showing a bare URL beside it.
+    var image_url: []const u8 = "";
+    if (firstImageUrl(ev.content)) |url| {
+        if (url.len <= note.image_url_buf.len) {
+            @memcpy(note.image_url_buf[0..url.len], url);
+            note.image_url_len = @intCast(url.len);
+            image_url = note.imageUrl();
+        }
+    }
+
     // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
-    note.content_len = @intCast(renderContent(&note.content_buf, ev.content));
+    note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
 
     note.setTime(now_s);
     return note;
 }
 
+/// The first image URL in `content`, or null. Recognised by extension, which is
+/// what Nostr media hosts serve; a link without one stays ordinary text.
+pub fn firstImageUrl(content: []const u8) ?[]const u8 {
+    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] != 'h') continue;
+        if (!std.mem.startsWith(u8, content[i..], "http://") and !std.mem.startsWith(u8, content[i..], "https://")) continue;
+        // The URL runs to the first whitespace.
+        var j = i;
+        while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+        const url = content[i..j];
+        // Ignore a trailing bare query string when matching the extension.
+        const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+        const path = url[0..path_end];
+        for (exts) |ext| {
+            if (std.ascii.endsWithIgnoreCase(path, ext)) return url;
+        }
+        i = j;
+    }
+    return null;
+}
+
 /// Copies note content into `dst`, rewriting NIP-27 `nostr:npub…`/`nostr:nprofile…`
-/// mentions into a readable `@name` (from the profile cache) or a short `@npub`.
+/// mentions into a readable `@name` (from the profile cache) or a short `@npub`,
+/// and dropping `omit` (the URL rendered as a picture) wherever it appears.
 /// Plain text is copied one whole codepoint at a time and stops at `dst`'s
 /// capacity, so the buffer never ends mid-sequence. Returns the byte length.
-pub fn renderContent(dst: []u8, src: []const u8) usize {
+pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -718,6 +1041,10 @@ pub fn renderContent(dst: []u8, src: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;
     while (i < src.len) {
+        if (omit.len > 0 and std.mem.startsWith(u8, src[i..], omit)) {
+            i += omit.len;
+            continue;
+        }
         if (parseMentionAt(arena, src, i)) |m| {
             var label_buf: [80]u8 = undefined;
             const label = mentionLabel(m.pubkey, &label_buf);
@@ -733,6 +1060,12 @@ pub fn renderContent(dst: []u8, src: []const u8) usize {
         @memcpy(dst[out..][0..take], src[i..][0..take]);
         out += take;
         i += take;
+    }
+    // Lifting a URL out can leave whitespace stranded at either edge.
+    const trimmed = std.mem.trim(u8, dst[0..out], " \t\r\n");
+    if (trimmed.len != out) {
+        std.mem.copyForwards(u8, dst[0..trimmed.len], trimmed);
+        return trimmed.len;
     }
     return out;
 }
@@ -856,15 +1189,117 @@ pub const Msg = union(enum) {
     logout_confirm,
     /// An avatar fetch finished: register the image or fall back to initials.
     avatar_fetched: native_sdk.EffectResponse,
+    /// A media fetch finished: decode, downscale if needed, and register it.
+    media_fetched: native_sdk.EffectResponse,
+    /// A text edit in the Settings media-proxy field.
+    proxy_edit: canvas.TextInputEvent,
+    /// Save the media-proxy setting.
+    proxy_save,
 
-    // `tick` and `avatar_fetched` are dispatched by effects in Zig, not markup.
-    pub const view_unbound = .{ "tick", "avatar_fetched" };
+    // Dispatched from Zig rather than markup: the effect results, and every
+    // action on the feed screen (a Zig view now, not a markup file).
+    pub const view_unbound = .{ "tick", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings" };
 };
 
 // ---------------------------------------------------------------- app + view
 
 pub const AppUi = canvas.Ui(Msg);
-pub const app_markup = @embedFile("app.native");
+
+// The two static screens stay declarative markup, compiled into the view at
+// build time (so their bindings are still checked, now by the compiler). The
+// feed is hand-written below: an inline image needs a runtime `ImageId`
+// reference, which the markup grammar deliberately does not carry, so a media
+// feed has to be a Zig view.
+const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboarding.native"));
+const SettingsView = canvas.CompiledMarkupView(Model, Msg, @embedFile("settings.native"));
+
+/// The root view: one screen at a time, chosen by the stage.
+pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
+    return switch (model.stage) {
+        .onboarding => OnboardingView.build(ui, model),
+        .settings => SettingsView.build(ui, model),
+        .ready => feedView(ui, model),
+    };
+}
+
+/// The feed screen: header, the note list, the composer, and a status bar.
+fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const notes = model.notes[0..model.notes_len];
+    const cards = ui.arena.alloc(AppUi.Node, notes.len) catch {
+        ui.failed = true;
+        return ui.column(.{}, .{});
+    };
+    for (cards, notes) |*card, *note| card.* = noteCard(ui, note);
+
+    return ui.column(.{ .grow = 1 }, .{
+        ui.row(.{ .gap = 8, .cross = .center, .padding = 16 }, .{
+            ui.column(.{ .gap = 4, .grow = 1 }, .{
+                ui.text(.{ .size = .heading }, "Plaza"),
+                ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.status(ui.arena)),
+            }),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
+        }),
+        ui.separator(.{}),
+        if (notes.len == 0)
+            ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
+                ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
+            })
+        else
+            ui.scroll(.{ .grow = 1 }, .{
+                ui.column(.{ .gap = 8, .padding = 12 }, .{cards}),
+            }),
+        ui.separator(.{}),
+        ui.column(.{ .gap = 8, .padding = 12 }, .{
+            ui.inputGroup(
+                .{},
+                ui.el(.textarea, .{
+                    .text = model.draft(),
+                    .placeholder = "Share something with the network…",
+                    .on_input = AppUi.inputMsg(.draft_edit),
+                    .on_submit = .post,
+                }, .{}),
+                ui.inputGroupActions(.{}, .{
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, model.identity(ui.arena)),
+                    ui.spacer(1),
+                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+                }),
+            ),
+        }),
+        ui.statusBar(.{}, model.footer(ui.arena)),
+    });
+}
+
+/// One note: avatar, author line, content, and any inline image. Keyed by the
+/// note id so the list diff holds scroll position across reconciles. This is
+/// the per-row builder the windowed list will call in the milestone ahead.
+fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
+    var node = ui.el(.card, .{ .padding = 12 }, .{
+        ui.row(.{ .gap = 10, .cross = .start }, .{
+            ui.avatar(.{ .image = note.avatar_id() }, note.initials()),
+            ui.column(.{ .gap = 4, .grow = 1 }, .{
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, note.author()),
+                    ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, note.time()),
+                }),
+                ui.text(.{ .wrap = true }, note.content()),
+                // The picture, once it has loaded. The row keeps its height
+                // whether or not the image is ready, so the feed does not jump
+                // as images arrive.
+                if (note.hasImage())
+                    ui.image(.{
+                        .image = note.media_id(),
+                        .height = 200,
+                        .semantics = .{ .label = "Attached image" },
+                    })
+                else
+                    ui.spacer(0),
+            }),
+        }),
+    });
+    // The note id is masked non-negative at build time, so this cast is safe.
+    node.key = .{ .int = @intCast(note.id) };
+    return node;
+}
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
 const Effects = PlazaApp.Effects;
@@ -885,9 +1320,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome == .fired) {
                 model.refresh(nowSeconds());
-                // Start any pending avatar fetches (needs effects, so here, not
-                // in refresh). The feed reads loaded avatars at render time.
+                // Start any pending image fetches (needs effects, so here, not
+                // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
+                scanMediaFetches(fx, model);
             }
         },
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
@@ -922,7 +1358,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
             }
         },
-        .open_settings => model.stage = .settings,
+        .open_settings => {
+            // Seed the proxy field from the live setting so it edits in place.
+            model.proxy_buffer.set(mediaProxy());
+            model.proxy_saved = false;
+            model.stage = .settings;
+        },
+        .proxy_edit => |edit| {
+            model.proxy_buffer.apply(edit);
+            model.proxy_saved = false;
+        },
+        .proxy_save => {
+            setMediaProxy(model.proxy_buffer.text());
+            saveSettings();
+            model.proxy_saved = true;
+            // Retry anything that failed to load under the previous setting.
+            retryFailedImages();
+        },
+        .media_fetched => |response| handleMediaFetched(fx, response),
         .close_settings => {
             model.logout_pending = false;
             model.reveal_nsec = false;
@@ -1271,6 +1724,7 @@ pub fn main(init: std.process.Init) !void {
     // or silently reconnect the bunker) and skip onboarding. A newcomer starts
     // at the welcome screen, and the feed comes up when they sign in (see
     // `update`). Best-effort: on failure the app still runs, showing onboarding.
+    loadSettings(init.io, init.environ_map);
     const restored = restoreSession(init.io, init.environ_map);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
@@ -1279,7 +1733,7 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .init_fx = boot,
         .update_fx = update,
-        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        .view = appView,
     });
     defer app_state.destroy();
     app_state.model = initialModel();
@@ -1582,6 +2036,38 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
     thread.detach();
     sendConnect(gpa);
     return true;
+}
+
+/// Loads app-wide settings (the media proxy) from `$HOME/.plaza/settings`,
+/// starting from the default so a fresh install proxies out of the box.
+fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
+    setMediaProxy(default_media_proxy);
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(1024)) catch return;
+    defer gpa.free(raw);
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        // An empty value is meaningful: the user chose to load originals.
+        if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
+    }
+}
+
+/// Persists app-wide settings. Best-effort, like the session file.
+fn saveSettings() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    var buf: [512]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\n", .{mediaProxy()}) catch return;
+    dir.writeFile(io, .{
+        .sub_path = "settings",
+        .data = data,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
 }
 
 /// Logs out: deletes the session (and, for a local key, the key file itself),
