@@ -1,0 +1,9 @@
+# stb_image and stb_image_resize2 are vendored verbatim from
+# https://github.com/nothings/stb (public domain, single-header). They are
+# third-party code carried in-tree, not written here, so they are excluded from
+# the repository's language statistics and from diffs by default.
+#
+# Plaza's own C is src/stb_impl.c: nineteen lines choosing which decoders to
+# compile in. Everything else in this repository is Zig.
+src/stb_image.h linguist-vendored
+src/stb_image_resize2.h linguist-vendored
