@@ -22,11 +22,17 @@ pub fn build(b: *std.Build) void {
     // 512x512 and has no downscaler, so Plaza decodes and resizes oversized
     // images itself before registering the pixels.
     //
-    // Added to the exe module ONLY. `addAppArtifacts` builds the test compile
-    // from the same root module, so adding the C source to both appends it
-    // twice and every stb symbol collides at link time.
-    app.exe.root_module.addCSourceFile(.{ .file = b.path("src/stb_impl.c"), .flags = &.{"-O2"} });
-    app.exe.root_module.addIncludePath(b.path("src"));
+    // Built once as a static library and linked into each artifact, so the exe
+    // and the test binary both get the symbols exactly once. (Adding the C
+    // source file to both root modules duplicated the object within one link.)
+    const stb = b.addLibrary(.{
+        .name = "stb",
+        .root_module = b.createModule(.{ .target = app.exe.root_module.resolved_target.?, .optimize = .ReleaseFast, .link_libc = true }),
+    });
+    stb.root_module.addCSourceFile(.{ .file = b.path("src/stb_impl.c"), .flags = &.{"-O2"} });
+    stb.root_module.addIncludePath(b.path("src"));
+    app.exe.root_module.linkLibrary(stb);
+    app.tests.root_module.linkLibrary(stb);
 }
 
 /// Adds the `nostr` import to `mod`, compiling the library (and its bundled

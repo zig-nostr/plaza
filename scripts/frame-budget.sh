@@ -19,6 +19,10 @@ set -euo pipefail
 REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-400}
 LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-1500}
 PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-200}
+# The plan stage grows with the number of registered images the app draws
+# (upstream reprocesses them every frame); this bound catches the app suddenly
+# registering far more than it means to.
+PLAN_P90_BUDGET=${PLAN_P90_BUDGET:-3000}
 
 cd "$(dirname "$0")/.."
 SNAPSHOT=".zig-cache/native-sdk-automation/snapshot.txt"
@@ -54,6 +58,8 @@ stat() { grep -oE "$1=[0-9]+" "$SNAPSHOT" | head -1 | cut -d= -f2; }
 REBUILD=$(stat rebuild_p90_us)
 LAYOUT=$(stat layout_p90_us)
 PATCH=$(stat patch_p90_us)
+PLAN=$(stat plan_p90_us)
+PRESENT=$(stat present_p90_us)
 NODES=$(grep -oE 'widget_nodes=[0-9]+/[0-9]+' "$SNAPSHOT" | head -1)
 FALLBACK=$(stat present_fallback_frames)
 
@@ -61,6 +67,8 @@ echo
 echo "  rebuild p90   ${REBUILD}us  (budget ${REBUILD_P90_BUDGET})"
 echo "  layout  p90   ${LAYOUT}us  (budget ${LAYOUT_P90_BUDGET})"
 echo "  patch   p90   ${PATCH}us  (budget ${PATCH_P90_BUDGET})"
+echo "  plan    p90   ${PLAN}us  (budget ${PLAN_P90_BUDGET})"
+echo "  present p90   ${PRESENT}us  (informational: scales with window pixels, not app work)"
 echo "  mounted nodes ${NODES}"
 echo "  gpu fallback frames ${FALLBACK}"
 echo
@@ -72,6 +80,7 @@ check() { # name value budget
 check "rebuild p90" "$REBUILD" "$REBUILD_P90_BUDGET"
 check "layout p90" "$LAYOUT" "$LAYOUT_P90_BUDGET"
 check "patch p90" "$PATCH" "$PATCH_P90_BUDGET"
+check "plan p90" "$PLAN" "$PLAN_P90_BUDGET"
 # A silent fall back to CPU pixels would make every number above meaningless.
 if [ "${FALLBACK:-0}" -gt 0 ]; then
   echo "OVER BUDGET: the GPU path fell back to CPU pixels ${FALLBACK} times" >&2
