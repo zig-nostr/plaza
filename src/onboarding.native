@@ -1,0 +1,20 @@
+<!-- Plaza's first-run welcome: create a fresh identity, or sign in with an
+     existing nsec or a bunker link. Compiled into the Zig view (see
+     `onboardingView` in src/main.zig). Validate: native check -->
+<column gap="16" main="center" cross="center" grow="1" padding="32">
+  <text size="display">Plaza</text>
+  <text size="heading">Welcome to Nostr</text>
+  <text wrap="true" foreground="text_muted">Create an identity and Plaza sets you up with a starter feed of great accounts. Your notes stay on your device and publish straight to the network.</text>
+  <button size="lg" variant="primary" on-press="create_identity">Create your identity</button>
+  <text size="sm" foreground="text_muted">A second to set up. No email, no signup.</text>
+  <separator/>
+  <text size="sm" foreground="text_muted">Already on Nostr? Paste your nsec to bring your key, or a bunker link to sign with your own signer and keep the key off this device.</text>
+  <input-group width="340">
+    <textarea text="{login_draft}" placeholder="nsec1… or bunker://…" on-input="login_edit" on-submit="login_submit"/>
+    <input-group-actions>
+      <text size="sm" foreground="text_muted">{login_status}</text>
+      <spacer grow="1"/>
+      <button size="sm" disabled="{login_empty}" on-press="login_submit">Continue</button>
+    </input-group-actions>
+  </input-group>
+</column>

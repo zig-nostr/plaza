@@ -17,6 +17,16 @@ pub fn build(b: *std.Build) void {
 
     linkNostr(b, app.exe.root_module);
     linkNostr(b, app.tests.root_module);
+
+    // The vendored stb codecs: the canvas image registry decodes at most
+    // 512x512 and has no downscaler, so Plaza decodes and resizes oversized
+    // images itself before registering the pixels.
+    //
+    // Added to the exe module ONLY. `addAppArtifacts` builds the test compile
+    // from the same root module, so adding the C source to both appends it
+    // twice and every stb symbol collides at link time.
+    app.exe.root_module.addCSourceFile(.{ .file = b.path("src/stb_impl.c"), .flags = &.{"-O2"} });
+    app.exe.root_module.addIncludePath(b.path("src"));
 }
 
 /// Adds the `nostr` import to `mod`, compiling the library (and its bundled

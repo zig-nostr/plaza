@@ -10,20 +10,12 @@ const AppUi = main.AppUi;
 const Model = main.Model;
 const Msg = main.Msg;
 
-const AppMarkup = canvas.MarkupView(Model, Msg);
-
+/// Builds the real view for `model`: the same root the app runs, so a test sees
+/// the markup screens (compiled in) and the hand-written feed exactly as shipped.
 fn buildTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
-    var view = try AppMarkup.init(arena, main.app_markup);
     var ui = AppUi.init(arena);
-    const node = view.build(&ui, model) catch |err| {
-        // Name the app.native position instead of a bare error trace: the
-        // usual cause is a binding without a matching Model field or an
-        // on-* message without a Msg arm.
-        if (err == error.MarkupBuild) {
-            std.debug.print("app.native:{d}:{d}: {s}\n", .{ view.diagnostic.line, view.diagnostic.column, view.diagnostic.message });
-        }
-        return err;
-    };
+    const node = main.appView(&ui, model);
+    if (ui.failed) return error.ViewBuild;
     return ui.finalize(node);
 }
 
@@ -160,7 +152,7 @@ test "nostr: mentions render as @name or a short npub" {
 
     // Unknown pubkey: the mention becomes a short @npub, and "nostr:" is gone.
     const src_unknown = try std.fmt.allocPrint(arena, "hey nostr:{s} welcome", .{npub});
-    const n1 = main.renderContent(&buf, src_unknown);
+    const n1 = main.renderContent(&buf, src_unknown, "");
     const out1 = buf[0..n1];
     try testing.expect(std.mem.indexOf(u8, out1, "nostr:") == null);
     try testing.expect(std.mem.indexOf(u8, out1, "@npub1") != null);
@@ -169,7 +161,7 @@ test "nostr: mentions render as @name or a short npub" {
     // Known pubkey: the mention becomes @<name>.
     const p = main.upsertProfile(pk).?;
     main.parseMetadataInto(p, "{\"name\":\"jack\"}");
-    const n2 = main.renderContent(&buf, src_unknown);
+    const n2 = main.renderContent(&buf, src_unknown, "");
     const out2 = buf[0..n2];
     try testing.expect(std.mem.indexOf(u8, out2, "@jack") != null);
     try testing.expect(std.mem.indexOf(u8, out2, "nostr:") == null);
@@ -178,8 +170,76 @@ test "nostr: mentions render as @name or a short npub" {
 test "plain content passes through renderContent unchanged" {
     var buf: [220]u8 = undefined;
     const src = "just a normal note with a https://example.com link";
-    const n = main.renderContent(&buf, src);
+    const n = main.renderContent(&buf, src, "");
     try testing.expectEqualStrings(src, buf[0..n]);
+}
+
+test "an image link is lifted out of the note text" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{11} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "look at this https://i.example.com/cat.jpg");
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // The URL becomes the note's picture and leaves the text (trimmed).
+    try testing.expect(note.hasImage());
+    try testing.expectEqualStrings("https://i.example.com/cat.jpg", note.imageUrl());
+    try testing.expectEqualStrings("look at this", note.content());
+    // Nothing is registered yet, so the card draws no image.
+    try testing.expectEqual(@as(u64, 0), note.media_id());
+}
+
+test "image links are recognised by extension only" {
+    try testing.expect(main.firstImageUrl("https://x.com/a.png") != null);
+    try testing.expect(main.firstImageUrl("https://x.com/a.JPEG") != null);
+    try testing.expect(main.firstImageUrl("https://x.com/a.gif?v=2") != null);
+    // A plain link, a non-image file, and bare text are not images.
+    try testing.expect(main.firstImageUrl("https://example.com/page") == null);
+    try testing.expect(main.firstImageUrl("https://x.com/clip.mp4") == null);
+    try testing.expect(main.firstImageUrl("no links here") == null);
+    // The first of several wins.
+    try testing.expectEqualStrings(
+        "https://a.com/1.png",
+        main.firstImageUrl("see https://a.com/1.png and https://b.com/2.png").?,
+    );
+}
+
+test "media URLs route through the proxy, the host, or neither" {
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
+
+    var buf: [1024]u8 = undefined;
+
+    // With a proxy configured, the source is percent-encoded into it.
+    main.setMediaProxy("https://wsrv.nl/");
+    const proxied = main.mediaUrl(&buf, "https://host.example/a b.jpg", 512, .inside);
+    try testing.expect(std.mem.startsWith(u8, proxied, "https://wsrv.nl/?url="));
+    try testing.expect(std.mem.indexOf(u8, proxied, "https%3A%2F%2Fhost.example%2Fa%20b.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, proxied, "w=512") != null);
+
+    // Avatars ask for a square crop at their own size.
+    const square = main.mediaUrl(&buf, "https://host.example/a.jpg", 128, .square);
+    try testing.expect(std.mem.indexOf(u8, square, "fit=cover") != null);
+    try testing.expect(std.mem.indexOf(u8, square, "h=128") != null);
+
+    // A host that resizes for itself skips the proxy entirely.
+    const native_resize = main.mediaUrl(&buf, "https://blossom.nostr.build/abc.jpg", 512, .inside);
+    try testing.expectEqualStrings("https://blossom.nostr.build/abc.jpg?w=512", native_resize);
+
+    // No proxy configured: load the original, untouched.
+    main.setMediaProxy("");
+    const direct = main.mediaUrl(&buf, "https://host.example/a.jpg", 512, .inside);
+    try testing.expectEqualStrings("https://host.example/a.jpg", direct);
 }
 
 test "the logout confirmation replaces the log-out button" {
