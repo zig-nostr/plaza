@@ -216,6 +216,148 @@ var g_remote_secret_len: usize = 0;
 var g_remote_status = std.atomic.Value(u8).init(0);
 // Monotonic source of unique NIP-46 request ids.
 var g_req_counter = std.atomic.Value(u64).init(0);
+// The listener runs for one connection generation. A logout or a reconnect
+// bumps this; the detached listener and the in-flight workers see the change
+// and stop, so an old bunker's listener never processes into a new session (or
+// a dead one). Correlating this into every pending request is the teardown fix.
+var g_remote_generation = std.atomic.Value(u64).init(0);
+// A remote sign that never came back, surfaced once in the composer identity
+// line so a restored draft is explained rather than silently reappearing.
+// Set by the timeout scan, cleared on the next edit or a later success.
+var g_remote_sign_notice = std.atomic.Value(bool).init(false);
+
+// Pending NIP-46 requests, keyed by id, so a response is correlated to the
+// request that asked for it (not guessed from whether `result` parses as an
+// event), and a request that never returns times out instead of losing the
+// draft. A tiny spinlock guards the table: every critical section is a handful
+// of field writes or an 8-slot scan and never touches IO, so a lock this cheap
+// is the right tool (std.Io.Mutex would drag a per-thread `io` through every
+// access, across threads that deliberately never share one).
+const remote_sign_timeout_s: i64 = 30;
+const max_pending_remote = 8;
+const RemoteMethod = enum { connect, sign_event };
+const PendingRemote = struct {
+    active: bool = false,
+    id_buf: [24]u8 = undefined,
+    id_len: usize = 0,
+    method: RemoteMethod = .connect,
+    deadline_s: i64 = 0,
+    generation: u64 = 0,
+    // The listener flags a failed response here; the UI tick, which owns the
+    // composer, is what actually restores the draft (see `scanPendingRemote`).
+    failed: bool = false,
+    // sign_event only: the draft text, restored to the composer on failure or
+    // timeout. Owned by the slot; freed when the request resolves or is swept.
+    content: ?[]const u8 = null,
+
+    fn id(self: *const PendingRemote) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+};
+var g_pending_lock = std.atomic.Value(bool).init(false);
+var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
+
+fn pendingLock() void {
+    while (g_pending_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn pendingUnlock() void {
+    g_pending_lock.store(false, .release);
+}
+
+/// Records a request as awaiting its response, taking ownership of `content`
+/// (the draft, for `sign_event`, so a timeout can restore it). Returns false
+/// when the table is full or the id does not fit, in which case the caller
+/// still owns `content`.
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
+    if (req_id.len > 24) return false;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active) continue;
+        slot.* = .{
+            .active = true,
+            .method = method,
+            .id_len = req_id.len,
+            .deadline_s = nowSeconds() + remote_sign_timeout_s,
+            .generation = g_remote_generation.load(.acquire),
+            .content = content,
+        };
+        @memcpy(slot.id_buf[0..req_id.len], req_id);
+        return true;
+    }
+    return false;
+}
+
+/// Takes the pending request matching `req_id` out of the table, or null when
+/// none matches (an unknown id, or one already resolved: dropping it keeps a
+/// duplicated response from publishing twice). The caller owns the returned
+/// slot's `content`.
+fn takePending(req_id: []const u8) ?PendingRemote {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
+            const taken = slot.*;
+            slot.* = .{};
+            return taken;
+        }
+    }
+    return null;
+}
+
+/// Marks the pending request matching `req_id` failed, leaving it in the table
+/// for the UI tick to restore the draft and free the content. Returns whether a
+/// slot matched.
+fn failPending(req_id: []const u8) bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
+            slot.failed = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Test seams for the NIP-46 pending-request table (the correlation and teardown
+// logic), exercised without threads or a live bunker.
+pub const RemoteMethodForTest = RemoteMethod;
+pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
+    return registerPending(req_id, method, content);
+}
+pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
+    const taken = takePending(req_id) orelse return null;
+    return .{ .method = taken.method, .content = taken.content };
+}
+pub fn failPendingForTest(req_id: []const u8) bool {
+    return failPending(req_id);
+}
+pub fn clearPendingForTest() void {
+    clearPending();
+}
+pub fn bumpRemoteGenerationForTest() void {
+    _ = g_remote_generation.fetchAdd(1, .monotonic);
+}
+pub fn scanPendingRemoteForTest(model: *Model) void {
+    scanPendingRemote(model);
+}
+pub fn remoteSignNoticeForTest() bool {
+    return g_remote_sign_notice.load(.acquire);
+}
+
+/// Empties the pending table, freeing every held draft. For logout, so a new
+/// session never inherits the old one's in-flight requests.
+fn clearPending() void {
+    const gpa = std.heap.page_allocator;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active) continue;
+        if (slot.content) |c| gpa.free(c);
+        slot.* = .{};
+    }
+}
 
 // A synchronous error from the unified login field (nsec / bunker), shown under
 // it. `.none` while idle or when the async bunker path is in charge (its state
@@ -737,6 +879,10 @@ pub const Model = struct {
     /// the key is still being prepared.
     pub fn identity(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
+        // A remote sign that never came back: the draft has been restored to the
+        // composer, so say why rather than let it silently reappear.
+        if (g_signer_kind == .remote and g_remote_sign_notice.load(.acquire))
+            return "Your signer didn't respond. Draft restored, try again.";
         if (g_identity_npub_len == 0) return "Preparing your key…";
         // Show the user's own display name once their kind:0 is known, else npub.
         var who: []const u8 = g_identity_npub_buf[0..g_identity_npub_len];
@@ -2247,13 +2393,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 g_profile_round +%= 1;
                 if (g_profile_round % profile_retry_ticks == 0) rearmWantedProfiles();
                 requestWantedProfiles();
+                // Retire timed-out or refused signer requests, restoring a lost
+                // draft to the composer (this thread owns it).
+                if (g_signer_kind == .remote) scanPendingRemote(model);
             }
         },
         .animate => |t| {
             if (t.outcome == .fired) advanceAnimations(fx, model);
         },
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
-        .draft_edit => |edit| model.draft_buffer.apply(edit),
+        .draft_edit => |edit| {
+            model.draft_buffer.apply(edit);
+            // The user is composing again: retire a stale "signer didn't respond".
+            g_remote_sign_notice.store(false, .release);
+        },
         .post => submitPost(model),
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
@@ -2491,8 +2644,13 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
     g_identity_npub_len = npub.len;
     g_signer_kind = .remote;
     g_remote_status.store(1, .release);
+    g_remote_sign_notice.store(false, .release);
 
-    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{gpa}) catch {
+    // A fresh generation: any prior listener (a reconnect to a second bunker)
+    // stops processing, and every request registered from here carries it.
+    const generation = g_remote_generation.fetchAdd(1, .monotonic) + 1;
+
+    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch {
         g_remote_status.store(3, .release);
         return false;
     };
@@ -2508,6 +2666,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    if (!registerPending(req_id, .connect, null)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -2515,11 +2674,15 @@ fn sendConnect(gpa: std.mem.Allocator) void {
 /// Remote path: build the unsigned kind:1 event and send a `sign_event` request.
 /// The signed event returns to the listener, which stores and publishes it.
 fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
-    defer gpa.free(content_owned);
+    // `content_owned` is handed to the pending slot (so a timeout can restore
+    // it to the composer); it is freed here only on an early return.
     const created_at = nowSeconds();
     // A canonical unsigned event (the bunker fills in the signature). The id is
     // computed against the user's pubkey so the bunker's result matches it.
-    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, 1, &.{}, content_owned) catch return;
+    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, 1, &.{}, content_owned) catch {
+        gpa.free(content_owned);
+        return;
+    };
     const unsigned = nostr.event.Event{
         .id = id,
         .pubkey = g_remote_pubkey,
@@ -2529,11 +2692,23 @@ fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
         .content = content_owned,
         .sig = [_]u8{0} ** 64,
     };
-    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch return;
+    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch {
+        gpa.free(content_owned);
+        return;
+    };
     defer gpa.free(unsigned_json);
 
     var idbuf: [24]u8 = undefined;
-    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch {
+        gpa.free(content_owned);
+        return;
+    };
+    // Track before sending: the response can arrive on the listener thread the
+    // instant the send lands, and it must find the pending slot already there.
+    if (!registerPending(req_id, .sign_event, content_owned)) {
+        gpa.free(content_owned);
+        return;
+    }
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
 }
@@ -2573,8 +2748,10 @@ fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
 }
 
 /// The response listener: holds the bunker relay and processes responses,
-/// reconnecting forever. Its own io backend and signer, never the UI thread's.
-fn nip46ReceiveLoop(gpa: std.mem.Allocator) void {
+/// reconnecting until its `generation` is superseded (a logout or a reconnect
+/// bumps `g_remote_generation`). Its own io backend and signer, never the UI
+/// thread's.
+fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -2582,17 +2759,19 @@ fn nip46ReceiveLoop(gpa: std.mem.Allocator) void {
     defer signer.deinit();
     const client_kp = g_remote_client_kp orelse return;
 
-    while (true) {
-        nip46ReceiveOnce(gpa, io, signer, client_kp) catch |err| {
+    while (generation == g_remote_generation.load(.acquire)) {
+        nip46ReceiveOnce(gpa, io, signer, client_kp, generation) catch |err| {
             std.debug.print("plaza: [signer] {s}\n", .{@errorName(err)});
         };
+        if (generation != g_remote_generation.load(.acquire)) break;
         io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
     }
 }
 
 /// Dials the bunker relay, subscribes for responses addressed to our client key
-/// (`#p` = the ephemeral pubkey, which only our bunker knows), and handles each.
-fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair) !void {
+/// (`#p` = the ephemeral pubkey, which only our bunker knows), and handles each
+/// until the connection drops or this listener's `generation` is superseded.
+fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, generation: u64) !void {
     var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
     defer relay.deinit();
 
@@ -2604,46 +2783,116 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
     const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .tags = &tag_filters }};
     try relay.subscribe("plaza-nip46", &filters);
 
-    while (true) {
+    while (generation == g_remote_generation.load(.acquire)) {
         var msg = (try relay.receive()) orelse break;
         defer msg.deinit();
         switch (msg.value) {
-            .event => |e| handleNip46Response(gpa, signer, client_kp, e.event),
+            .event => |e| handleNip46Response(gpa, signer, client_kp, e.event, generation),
             else => {},
         }
     }
 }
 
-/// Decrypts and parses a NIP-46 response. Any valid response marks the signer
-/// connected; a response whose `result` is a signed event is stored and
-/// published to the feed pool, the remote equivalent of the local post path.
-fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event) void {
+/// Decrypts, parses, and correlates a NIP-46 response to the request that asked
+/// for it. An error response flags its request so the UI restores the draft; a
+/// `sign_event` result is verified, stored, and published to the feed pool (the
+/// remote equivalent of the local post path); a `connect` ack marks connected.
+/// An unknown or already-handled id is dropped, so a duplicate never publishes
+/// twice and a stale session's response never lands.
+fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event, generation: u64) void {
+    if (generation != g_remote_generation.load(.acquire)) return;
     const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
     defer gpa.free(plaintext);
     var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
     defer resp.deinit();
+
     if (resp.value.err.len != 0) {
         std.debug.print("plaza: [signer] {s}\n", .{resp.value.err});
+        // Leave the slot in the table, flagged: the UI tick owns the composer,
+        // so it restores the draft (sign) or fails the status (connect).
+        _ = failPending(resp.value.id);
         return;
     }
+
+    // Correlate to the request that asked. A missing slot means an unknown id
+    // or one already handled: drop it (no double publish, no stray "connected").
+    const pending = takePending(resp.value.id) orelse return;
+    defer if (pending.content) |c| gpa.free(c);
+
     g_remote_status.store(2, .release);
+    g_remote_sign_notice.store(false, .release);
 
-    // A sign_event result is a full event JSON; the connect ack is a plain string
-    // and simply fails to parse here, which is fine, it only marks us connected.
-    var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
-    defer parsed.deinit();
-    const store = g_store orelse return;
-    // Verify the bunker actually signed it before trusting it into the feed.
-    _ = store.ingest(gpa, parsed.value, .{ .verify_with = signer }) catch return;
+    switch (pending.method) {
+        // The connect ack is a plain "ack" string; the status above is the point.
+        .connect => {},
+        .sign_event => {
+            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
+            defer parsed.deinit();
+            const store = g_store orelse return;
+            // Verify the bunker actually signed it before trusting it into the feed.
+            _ = store.ingest(gpa, parsed.value, .{ .verify_with = signer }) catch return;
 
-    // Republish to the user's feed pool so the note propagates. Our composer
-    // produces tagless kind:1 notes, so an empty tag set matches the signed id.
-    const owned = gpa.dupe(u8, parsed.value.content) catch return;
-    var out = parsed.value;
-    out.content = owned;
-    out.tags = &.{};
-    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, out }) catch return;
-    thread.detach();
+            // Republish to the user's feed pool so the note propagates. Our composer
+            // produces tagless kind:1 notes, so an empty tag set matches the signed id.
+            const owned = gpa.dupe(u8, parsed.value.content) catch return;
+            var out = parsed.value;
+            out.content = owned;
+            out.tags = &.{};
+            const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, out }) catch return;
+            thread.detach();
+        },
+    }
+}
+
+/// UI-thread sweep of the pending table (called each tick): a request that
+/// failed or ran past its deadline is retired here, where the composer can be
+/// touched. A timed-out or refused `sign_event` restores its draft (only into
+/// an empty composer, so a newer draft is never clobbered) and shows a notice;
+/// a `connect` that never returned fails the connection status. A slot from a
+/// superseded generation (logout/reconnect) is dropped silently.
+fn scanPendingRemote(model: *Model) void {
+    const now = nowSeconds();
+    const gpa = std.heap.page_allocator;
+    const generation = g_remote_generation.load(.acquire);
+    var restore: ?[]const u8 = null;
+    var sign_failed = false;
+    var connect_failed = false;
+
+    pendingLock();
+    for (&g_pending) |*slot| {
+        if (!slot.active) continue;
+        const stale = slot.generation != generation;
+        const due = slot.failed or now >= slot.deadline_s;
+        if (!stale and !due) continue;
+        const method = slot.method;
+        const content = slot.content;
+        slot.* = .{};
+        if (stale) {
+            if (content) |c| gpa.free(c);
+            continue;
+        }
+        switch (method) {
+            .sign_event => {
+                // The composer holds one draft: keep the first, free the rest.
+                if (content) |c| {
+                    if (restore == null) restore = c else gpa.free(c);
+                }
+                sign_failed = true;
+            },
+            .connect => {
+                if (content) |c| gpa.free(c);
+                connect_failed = true;
+            },
+        }
+    }
+    pendingUnlock();
+
+    if (restore) |c| {
+        if (model.draft_empty()) model.draft_buffer.set(c);
+        gpa.free(c);
+    }
+    if (sign_failed) g_remote_sign_notice.store(true, .release);
+    if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }
 
 /// Lowercase-hex-encodes a 32-byte key into `out`.
@@ -2972,8 +3221,11 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
     g_identity_npub_len = npub.len;
     g_signer_kind = .remote;
     g_remote_status.store(1, .release);
+    g_remote_sign_notice.store(false, .release);
 
-    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{gpa}) catch return false;
+    // A fresh generation for this reconnected session (see `connectRemoteSigner`).
+    const generation = g_remote_generation.fetchAdd(1, .monotonic) + 1;
+    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch return false;
     thread.detach();
     sendConnect(gpa);
     return true;
@@ -3027,9 +3279,13 @@ fn performLogout(model: *Model) void {
         } else |_| {}
     };
 
-    // Reset identity state. The detached NIP-46 listener (if any) keeps looping
-    // against the old bunker but is orphaned: nothing reads its results once the
-    // identity is cleared. A clean per-session teardown is future work.
+    // Tear down the NIP-46 session: bumping the generation stops the detached
+    // listener from processing into the next session, and the pending table is
+    // emptied so no in-flight request survives the logout.
+    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    clearPending();
+    g_remote_sign_notice.store(false, .release);
+
     if (g_identity_signer) |*s| s.deinit();
     g_identity_signer = null;
     g_identity_kp = null;
