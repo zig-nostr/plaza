@@ -724,3 +724,65 @@ test "the feed key survives a high-bit event id" {
     const tree = try buildTree(arena, &model);
     try testing.expect(findByText(tree.root, .text, "high-bit id") != null);
 }
+
+// ---- NIP-46 client hardening: request correlation, timeout, teardown --------
+
+test "a NIP-46 response is matched to its request by id, and unknown ids are dropped" {
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    // The pending table frees held drafts with the page allocator, so a draft
+    // handed to it must come from the same allocator.
+    const gpa = std.heap.page_allocator;
+
+    try testing.expect(main.registerPendingForTest("req-1", .sign_event, try gpa.dupe(u8, "hello world")));
+
+    // An unknown id resolves nothing: this is the drop that keeps a stray or
+    // duplicated response from being published as if it were our note.
+    try testing.expect(main.takePendingContentForTest("req-99") == null);
+
+    // The matching id returns the slot, carrying the original draft back.
+    const taken = main.takePendingContentForTest("req-1") orelse return error.NoMatch;
+    try testing.expect(taken.method == .sign_event);
+    try testing.expectEqualStrings("hello world", taken.content.?);
+    gpa.free(taken.content.?);
+
+    // A second response for the same id finds nothing: no double resolve.
+    try testing.expect(main.takePendingContentForTest("req-1") == null);
+}
+
+test "logout empties the NIP-46 pending table so a new session inherits nothing" {
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    const gpa = std.heap.page_allocator;
+
+    try testing.expect(main.registerPendingForTest("req-a", .sign_event, try gpa.dupe(u8, "draft a")));
+    try testing.expect(main.registerPendingForTest("req-b", .connect, null));
+
+    main.clearPendingForTest(); // what performLogout calls; frees the held draft
+
+    try testing.expect(main.takePendingContentForTest("req-a") == null);
+    try testing.expect(main.takePendingContentForTest("req-b") == null);
+}
+
+test "a refused remote sign restores the lost draft to the composer" {
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    const gpa = std.heap.page_allocator;
+
+    try testing.expect(main.registerPendingForTest("req-x", .sign_event, try gpa.dupe(u8, "my precious note")));
+
+    // The signer refused: the listener flags the slot rather than dropping it,
+    // because only the UI thread may touch the composer.
+    try testing.expect(main.failPendingForTest("req-x"));
+
+    // The UI sweep restores the draft into the empty composer and raises the
+    // notice, so the text is never silently lost on a hung or refused sign.
+    var model = main.initialModel();
+    try testing.expect(model.draft_empty());
+    main.scanPendingRemoteForTest(&model);
+    try testing.expectEqualStrings("my precious note", model.draft());
+    try testing.expect(main.remoteSignNoticeForTest());
+
+    // The slot is retired: a late response for it now finds nothing.
+    try testing.expect(main.takePendingContentForTest("req-x") == null);
+}
