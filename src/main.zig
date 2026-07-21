@@ -27,6 +27,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
+const plaza_icons = @import("plaza_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -34,8 +35,12 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const canvas_label = "main-canvas";
-const window_width: f32 = 440;
-const window_height: f32 = 680;
+// A desktop window sized for the redesign's centered reading column: the feed
+// content is a fixed 620px column, so the window opens wide enough to seat it
+// with margin, and extra width past that becomes margin, never a longer line.
+const window_width: f32 = 680;
+const window_height: f32 = 820;
+const feed_column_width: f32 = 620;
 
 // The relay pool this milestone dials, and how many recent notes to keep on
 // screen. Each relay runs on its own thread and ingests into the one shared
@@ -2230,22 +2235,72 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// One note: avatar, author line, content, and any inline image. Keyed by the
 /// note id so the list diff holds scroll position across reconciles. This is
 /// the per-row builder the windowed list will call in the milestone ahead.
+/// The warm avatar tint for an author, chosen deterministically from the
+/// pubkey so a face keeps the same color across sessions. Neutral graphite is
+/// the last entry and the natural fallback for an all-zero key.
+fn avatarTint(pubkey: [32]u8) theme.palette.Tint {
+    const key = @as(usize, pubkey[0]) +% pubkey[15] +% pubkey[31];
+    return theme.palette.avatar_tints[key % theme.palette.avatar_tints.len];
+}
+
+/// The 40px feed avatar: the fetched picture clipped to the circle when it has
+/// loaded, else the author's initials on their warm tint.
+fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
+    const tint = avatarTint(note.pubkey);
+    return ui.avatar(.{
+        .image = note.avatar_id(),
+        .width = 40,
+        .height = 40,
+        .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+    }, note.initials());
+}
+
+/// The engagement row: reply, repost, like, zap, in that fixed order, as muted
+/// action glyphs. The counts are backend data the feed does not carry yet (the
+/// app ingests only kinds 0 and 1), so the row ships with actionable icons and
+/// no numbers, and the numbers arrive when the aggregation pipeline lands.
+fn engagementRow(ui: *AppUi) AppUi.Node {
+    const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style_tokens = .{ .foreground = .text_muted } };
+    return ui.row(.{ .gap = 30, .cross = .center, .opacity = 0.75 }, .{
+        ui.appIcon(glyph, "reply"),
+        ui.icon(glyph, "repeat"),
+        ui.appIcon(glyph, "like"),
+        ui.appIcon(glyph, "zap"),
+    });
+}
+
+/// One feed note: a bare row on the window, no card. Avatar column, then an
+/// identity line (name, and the time hung to the right), the body, any image,
+/// and the engagement row. The content is a fixed reading column centered in
+/// the window, with a hairline under each row as the only separation. Keyed by
+/// the note id so the list diff holds scroll position across reconciles.
 fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
-    var node = ui.el(.card, .{ .padding = 12 }, .{
-        ui.row(.{ .gap = 10, .cross = .start }, .{
-            ui.avatar(.{ .image = note.avatar_id() }, note.initials()),
-            ui.column(.{ .gap = 4, .grow = 1 }, .{
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, note.author()),
-                    ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, note.time()),
+    var node = ui.row(.{ .main = .center }, .{
+        ui.column(.{ .width = feed_column_width }, .{
+            ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+                noteAvatar(ui, note),
+                ui.column(.{ .gap = 5, .grow = 1 }, .{
+                    ui.row(.{ .gap = 6, .cross = .center }, .{
+                        ui.paragraph(
+                            .{ .grow = 1, .style = .{ .foreground = theme.palette.text_primary } },
+                            &.{.{ .text = note.author(), .weight = .bold }},
+                        ),
+                        ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
+                    }),
+                    ui.paragraph(
+                        .{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } },
+                        contentSpans(ui, note.content()),
+                    ),
+                    // The picture. The space is reserved at the picture's own
+                    // shape whether or not it has loaded, so the feed never
+                    // shifts as images arrive.
+                    if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                    engagementRow(ui),
                 }),
-                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url) }, contentSpans(ui, note.content())),
-                // The picture. The space is reserved at the picture's own shape
-                // whether or not it has loaded, so the feed never shifts as
-                // images arrive, or as they are evicted and fetched again while
-                // scrolling back and forth.
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
             }),
+            // The only separation between rows: a hairline, so a real border
+            // can later mean something (a quote, a reply).
+            ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_feedrow } }, .{}),
         }),
     });
     // The note id is masked non-negative at build time, so this cast is safe.
@@ -2945,6 +3000,10 @@ fn hexLower(out: *[64]u8, bytes: [32]u8) void {
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     g_environ = init.environ_map;
+
+    // The action glyphs the feed draws (reply/like/zap) that the built-in set
+    // does not carry. Registered before the first view build.
+    canvas.icons.registerAppIcons(&plaza_icons.app_icons);
 
     // A returning user has a persisted session: restore it (load the local key,
     // or silently reconnect the bunker) and skip onboarding. A newcomer starts

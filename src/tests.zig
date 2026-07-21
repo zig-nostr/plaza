@@ -27,11 +27,12 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
-/// How many note cards the tree actually built (the windowed list materialises
-/// only the rows near the viewport).
-fn countCards(widget: canvas.Widget) usize {
-    var n: usize = if (widget.kind == .card) 1 else 0;
-    for (widget.children) |child| n += countCards(child);
+/// How many note rows the tree actually built (the windowed list materialises
+/// only the rows near the viewport). Each note row has exactly one avatar, so
+/// avatars are the stable per-row marker now that the rows are not cards.
+fn countNoteRows(widget: canvas.Widget) usize {
+    var n: usize = if (widget.kind == .avatar) 1 else 0;
+    for (widget.children) |child| n += countNoteRows(child);
     return n;
 }
 
@@ -334,7 +335,7 @@ test "the feed builds only the rows the window asked for" {
 
     // Windowed: the built rows are a small fraction of the 200 notes, which is
     // the whole point (the cost follows the viewport, not the feed length).
-    const built = countCards(tree.root);
+    const built = countNoteRows(tree.root);
     try testing.expect(built > 0);
     try testing.expect(built < 60);
 
