@@ -84,6 +84,11 @@ const feed_page = 60;
 const compose_capacity = 512;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
+// Wanted-profile fetching runs on its own cadence, decoupled from the view
+// refresh: an author's name and avatar do not need per-second freshness, and a
+// separate engine timer is the seam a future data-plane extraction cuts along.
+const profile_timer_key: u64 = 3;
+const profile_interval_ms: u64 = 2_000;
 // The app version shown in Settings. Keep in step with app.zon's `.version`.
 const plaza_version = "0.1.0";
 // Owner-only permissions for the files holding secrets. POSIX gets 0600;
@@ -521,8 +526,9 @@ fn wantProfile(pubkey: [32]u8) void {
     }
 }
 
-/// Ticks between re-asking for metadata that has not arrived.
-const profile_retry_ticks: u64 = 20;
+/// Profile-timer rounds between re-asking for metadata that has not arrived
+/// (about 20s at the profile interval).
+const profile_rearm_rounds: u64 = 10;
 var g_profile_round: u64 = 0;
 
 /// Lets the still-unnamed be asked for again on the next pass.
@@ -2028,6 +2034,9 @@ pub const Msg = union(enum) {
     open_url: []const u8,
     /// The animation timer fired: advance any playing GIFs.
     animate: native_sdk.EffectTimer,
+    /// The profile-fetch timer: re-ask for wanted metadata, decoupled from the
+    /// view refresh (see `profile_timer_key`).
+    profiles: native_sdk.EffectTimer,
     /// Expand a note's picture to fill the window.
     expand_image: i64,
     /// Dismiss the expanded picture.
@@ -2037,7 +2046,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2377,6 +2386,13 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.animate),
     });
+    // Background metadata fetching on its own cadence, off the view refresh.
+    fx.startTimer(.{
+        .key = profile_timer_key,
+        .interval_ms = profile_interval_ms,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.profiles),
+    });
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -2388,11 +2404,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
-                // Re-arm the still-unnamed every so often: a relay that had
-                // nothing a moment ago may have it now.
-                g_profile_round +%= 1;
-                if (g_profile_round % profile_retry_ticks == 0) rearmWantedProfiles();
-                requestWantedProfiles();
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -2400,6 +2411,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .animate => |t| {
             if (t.outcome == .fired) advanceAnimations(fx, model);
+        },
+        .profiles => |t| {
+            if (t.outcome == .fired) {
+                // Re-arm the still-unnamed every so often: a relay that had
+                // nothing a moment ago may have it now.
+                g_profile_round +%= 1;
+                if (g_profile_round % profile_rearm_rounds == 0) rearmWantedProfiles();
+                requestWantedProfiles();
+            }
         },
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| {
@@ -2540,21 +2560,38 @@ fn submitPost(model: *Model) void {
     model.draft_buffer.clear();
 }
 
-/// Local path: sign with the local key, store the note at once (so it shows in
-/// the feed on the next tick), and publish it to the pool off the UI thread.
+/// The engine write seam: a note this process now holds, whether locally signed
+/// or returned signed from the remote signer, enters the local store and is
+/// published to the pool. The store is the single-writer data plane, only ever
+/// written from this process. `verify` re-checks a signature we did not produce
+/// ourselves and gates such a note out of both the store and the pool on
+/// failure; a note we just signed skips the check and publishes even if the
+/// store rejects the write (a duplicate). `ev.content` must be a
+/// process-lifetime allocation, since the detached publisher reads it after
+/// this returns.
+fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer) void {
+    const store = g_store orelse return;
+    if (verify) |signer| {
+        // A note we did not produce: verification is the gate into the store
+        // AND the pool, so a bad signature is dropped rather than propagated.
+        _ = store.ingest(gpa, ev, .{ .verify_with = signer }) catch return;
+    } else {
+        // A note we just signed: a store failure (e.g. a duplicate id) must not
+        // stop it reaching the pool.
+        _ = store.ingest(gpa, ev, .{}) catch {};
+    }
+    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch return;
+    thread.detach();
+}
+
+/// Local path: sign with the local key, then hand the note to the write seam so
+/// it lands in the store (shown on the next tick) and reaches the pool.
 fn postLocally(gpa: std.mem.Allocator, owned: []const u8) void {
-    const store = g_store orelse {
-        gpa.free(owned);
-        return;
-    };
     const ev = signNote(gpa, owned) orelse {
         gpa.free(owned);
         return;
     };
-    // No re-verify: we just produced the signature.
-    _ = store.ingest(gpa, ev, .{}) catch {};
-    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch return;
-    thread.detach();
+    ingestAndPublish(gpa, ev, null);
 }
 
 /// Signs a kind:1 note with the local key. `SignerKind` selects this or the
@@ -2828,18 +2865,16 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
-            const store = g_store orelse return;
-            // Verify the bunker actually signed it before trusting it into the feed.
-            _ = store.ingest(gpa, parsed.value, .{ .verify_with = signer }) catch return;
-
-            // Republish to the user's feed pool so the note propagates. Our composer
-            // produces tagless kind:1 notes, so an empty tag set matches the signed id.
+            // A process-lifetime copy of the content: `parsed` is freed on
+            // return, but the detached publisher reads it afterwards. Our
+            // composer produces tagless kind:1 notes, so an empty tag set still
+            // matches the signed id, and the write seam verifies that before
+            // trusting it into the feed.
             const owned = gpa.dupe(u8, parsed.value.content) catch return;
             var out = parsed.value;
             out.content = owned;
             out.tags = &.{};
-            const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, out }) catch return;
-            thread.detach();
+            ingestAndPublish(gpa, out, signer);
         },
     }
 }
