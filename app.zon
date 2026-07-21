@@ -13,8 +13,8 @@
             .{
                 .label = "main",
                 .title = "Plaza",
-                .width = 440,
-                .height = 680,
+                .width = 680,
+                .height = 820,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{
