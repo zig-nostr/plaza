@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
+const theme = @import("theme.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -2959,6 +2960,14 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .view = appView,
+        // The app renders in its own type on every platform: Geist for prose,
+        // Geist Mono for metadata, registered on the installing frame.
+        .fonts = &.{
+            .{ .id = theme.geist_font_id, .name = "Geist-Regular.ttf", .ttf = theme.geist_ttf },
+            .{ .id = theme.geist_mono_font_id, .name = "GeistMono-Regular.ttf", .ttf = theme.geist_mono_ttf },
+        },
+        // The dark, cool-grey, white-accent look (see theme.zig).
+        .tokens_fn = theme.tokens(Model),
     });
     defer app_state.destroy();
     app_state.model = initialModel();
