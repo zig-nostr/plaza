@@ -854,6 +854,10 @@ pub const Model = struct {
     proxy_saved: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
+    // Whether the compose sheet is open. Compose is on demand from the "New
+    // note" button in the titlebar, not a permanent bar, so the feed fills the
+    // window.
+    composing: bool = false,
     // Where the feed is scrolled, so images load around the viewport instead of
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
@@ -871,11 +875,12 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",       "notes_len",    "live_relays",    "offline_relays", "draft_buffer",
-        "stage",       "login_buffer", "logout_pending", "reveal_nsec",    "proxy_buffer",
-        "proxy_saved", "feed_scroll",  "feed_limit",     "draft",          "draft_empty",
-        "identity",    "has_notes",    "empty",          "status",         "empty_text",
-        "footer",      "note_list",    "expanded_note",
+        "notes",        "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
+        "stage",        "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
+        "proxy_saved",  "feed_scroll",   "feed_limit",     "draft",          "draft_empty",
+        "identity",     "has_notes",     "empty",          "status",         "empty_text",
+        "footer",       "note_list",     "expanded_note",  "composing",      "caught_up",
+        "relay_health", "relays_online", "scope_voices",
     };
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -1024,6 +1029,30 @@ pub const Model = struct {
     pub fn footer(self: *const Model, arena: std.mem.Allocator) []const u8 {
         if (self.notes_len == 0) return "";
         return std.fmt.allocPrint(arena, "{d} notes", .{self.notes_len}) catch "";
+    }
+
+    /// The status bar's left text, which doubles as the caught-up footer: there
+    /// is no separate spinner, the feed renders from disk before the window
+    /// finishes opening.
+    pub fn caught_up(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (self.notes_len == 0) return "Starter pack";
+        return std.fmt.allocPrint(arena, "Caught up · starter pack · {d} notes", .{self.notes_len}) catch "Starter pack";
+    }
+
+    /// The status bar's relay health, drawn after the online dot.
+    pub fn relay_health(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        return std.fmt.allocPrint(arena, "{d}/{d} relays", .{ self.live_relays, relays.len }) catch "relays";
+    }
+
+    /// Whether at least one relay is connected (drives the status dot color).
+    pub fn relays_online(self: *const Model) bool {
+        return self.live_relays > 0;
+    }
+
+    /// The feed's scope line: how many hand-picked voices it is scoped to.
+    pub fn scope_voices(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        _ = self;
+        return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{starter_pack.len}) catch "hand-picked";
     }
 
     /// The note with this id, if it is still in the feed.
@@ -2004,6 +2033,10 @@ pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     /// Post the current draft: sign, store locally, and publish to the pool.
     post,
+    /// Open the compose sheet.
+    open_compose,
+    /// Dismiss the compose sheet.
+    close_compose,
     /// Onboarding: create a fresh local identity and enter the feed.
     create_identity,
     /// A text edit in the onboarding sign-in field.
@@ -2052,7 +2085,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2083,7 +2116,41 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
             return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
         }
     }
+    if (model.stage == .ready and model.composing) {
+        return ui.stack(.{ .grow = 1 }, .{ base, composeSheet(ui, model) });
+    }
     return base;
+}
+
+/// The compose sheet: a modal over the feed with the note field and the actions.
+/// On demand from the titlebar's "New note", so the feed is not sharing the
+/// window with a permanent composer. Escape or a click outside closes it.
+fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .on_dismiss = .close_compose,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "New note" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            ui.column(.{ .width = 520, .gap = 10, .padding = 16, .style = .{ .background = theme.palette.surface_modal, .border = theme.palette.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+                ui.el(.textarea, .{
+                    .text = model.draft(),
+                    .placeholder = "Share something with the network…",
+                    .on_input = AppUi.inputMsg(.draft_edit),
+                    .on_submit = .post,
+                    .height = 140,
+                }, .{}),
+                ui.row(.{ .cross = .center, .gap = 8 }, .{
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = theme.palette.text_muted } }, model.identity(ui.arena)),
+                    ui.spacer(1),
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+                }),
+            }),
+        }),
+    });
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes
@@ -2158,9 +2225,12 @@ fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
 /// A cheap height estimate for the note at `index`, from model facts only
 /// (never layout): the card's chrome, its wrapped lines, and its picture.
 fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
-    const chrome: f32 = 58;
-    const line_height: f32 = 18;
-    const chars_per_line: f32 = 42;
+    // Re-derived for the redesign row (B1): 14px top and bottom padding, the
+    // identity line, the body gaps, the engagement row, and the hairline, with
+    // the body wrapping in the ~540px text column beside the 40px avatar.
+    const chrome: f32 = 74;
+    const line_height: f32 = 22;
+    const chars_per_line: f32 = 70;
 
     const model: *const Model = @ptrCast(@alignCast(context orelse return chrome + line_height));
     const i: usize = @intCast(index);
@@ -2193,15 +2263,9 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     g_visible_first = window.first_visible_index;
     g_visible_last = window.last_visible_index;
 
-    return ui.column(.{ .grow = 1 }, .{
-        ui.row(.{ .gap = 8, .cross = .center, .padding = 16 }, .{
-            ui.column(.{ .gap = 4, .grow = 1 }, .{
-                ui.text(.{ .size = .heading }, "Plaza"),
-                ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.status(ui.arena)),
-            }),
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
-        }),
-        ui.separator(.{}),
+    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        titleBar(ui),
+        scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
@@ -2211,24 +2275,60 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
             // so the offset survives every rebuild (and the image viewer
             // opening over it) without the model mirroring it.
             ui.virtualList(options, window, .{rows}),
-        ui.separator(.{}),
-        ui.column(.{ .gap = 8, .padding = 12 }, .{
-            ui.inputGroup(
-                .{},
-                ui.el(.textarea, .{
-                    .text = model.draft(),
-                    .placeholder = "Share something with the network…",
-                    .on_input = AppUi.inputMsg(.draft_edit),
-                    .on_submit = .post,
-                }, .{}),
-                ui.inputGroupActions(.{}, .{
-                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, model.identity(ui.arena)),
-                    ui.spacer(1),
-                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
-                }),
+        statusBar(ui, model),
+    });
+}
+
+/// The chromeless titlebar: the mark and wordmark on the left, then the compose
+/// and settings actions. One bar, so the feed fills the rest of the window.
+fn titleBar(ui: *AppUi) AppUi.Node {
+    return ui.column(.{}, .{
+        ui.row(.{ .height = 48, .cross = .center, .gap = 10, .padding = 14 }, .{
+            ui.appIcon(.{ .width = 20, .height = 20, .style_tokens = .{ .foreground = .text } }, "mark"),
+            ui.paragraph(
+                .{ .style = .{ .foreground = theme.palette.text_primary } },
+                &.{.{ .text = "Plaza", .weight = .bold }},
+            ),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note"),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
+        }),
+        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+    });
+}
+
+/// The feed's scope line: which feed this is (the starter pack) and how wide it
+/// reaches. A property of the feed, not a destination to choose between.
+fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.column(.{}, .{
+        ui.row(.{ .cross = .center, .gap = 8, .padding = 12 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = theme.palette.text_primary } },
+                &.{.{ .text = "Starter pack", .weight = .bold }},
+            ),
+            ui.spacer(1),
+            // Geist Mono: the metadata voice, via a monospace span.
+            ui.paragraph(
+                .{ .style = .{ .foreground = theme.palette.text_faint_alt } },
+                &.{.{ .text = model.scope_voices(ui.arena), .monospace = true }},
             ),
         }),
-        ui.statusBar(.{}, model.footer(ui.arena)),
+        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_feedrow } }, .{}),
+    });
+}
+
+/// The status bar: the caught-up line on the left (there is no spinner, the feed
+/// renders from disk), relay health on the right after an online dot.
+fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
+    const dot_color = if (model.relays_online()) theme.palette.status_success else theme.palette.text_faint_alt;
+    return ui.column(.{}, .{
+        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+        ui.row(.{ .height = 30, .cross = .center, .gap = 6, .padding = 10 }, .{
+            ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.caught_up(ui.arena)),
+            ui.spacer(1),
+            ui.column(.{ .width = 6, .height = 6, .style = .{ .background = dot_color, .radius = 3 } }, .{}),
+            ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.relay_health(ui.arena)),
+        }),
     });
 }
 
@@ -2483,7 +2583,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // The user is composing again: retire a stale "signer didn't respond".
             g_remote_sign_notice.store(false, .release);
         },
-        .post => submitPost(model),
+        .post => {
+            submitPost(model);
+            // Posting closes the sheet; the note is already local and will
+            // appear on the next tick.
+            model.composing = false;
+        },
+        .open_compose => model.composing = true,
+        .close_compose => model.composing = false,
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
