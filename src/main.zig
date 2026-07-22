@@ -300,6 +300,10 @@ fn resolveHelper(init: std.process.Init) void {
 var g_signet_win_buf: [1024]u8 = undefined;
 var g_signet_win_len: usize = 0;
 const signet_spawn_key: u64 = 44;
+const helper_reset_key: u64 = 45;
+// Set on logout, so the health-check does not re-adopt the daemon's key before
+// the async /reset lands. Cleared when the user explicitly signs in again.
+var g_logged_out: bool = false;
 
 fn resolveSignetWindow(init: std.process.Init) void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -328,6 +332,23 @@ fn spawnSignetWindow(fx: *Effects) void {
         .key = signet_spawn_key,
         .argv = &.{g_signet_win_buf[0..g_signet_win_len]},
         .output = .collect,
+    });
+}
+
+/// Tells the daemon to forget the key (wipe memory + delete the file), so a
+/// logout is not undone when the health-check next reads /pubkey. Fire and
+/// forget; the g_logged_out latch covers the window until it lands.
+fn helperReset(fx: *Effects) void {
+    if (g_helper_token_len == 0) return;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reset", .{helper_port}) catch return;
+    var auth_buf: [96]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
+    fx.fetch(.{
+        .key = helper_reset_key,
+        .url = url,
+        .method = .POST,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
     });
 }
 
@@ -392,6 +413,7 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     // terminal or window import (which Plaza did not initiate) signs the user
     // in live. A Plaza-initiated setup is left to handleHelperSetup, which owns
     // the name beat and the remembered intent.
+    if (g_logged_out) return; // a just-logged-out session must stay out
     if (activePubkey() != null) return;
     if (g_helper_setup != .none or g_helper_pending_in_flight != .none) return;
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
@@ -423,6 +445,7 @@ fn helperReachable() bool {
 /// Queues a helper setup and fires it now if the daemon is already up (else the
 /// tick fires it the moment the health-check confirms reachability).
 fn queueHelperSetup(fx: *Effects, kind: HelperSetup, secret: ?[32]u8) void {
+    g_logged_out = false; // an explicit sign-in re-enables adopt-on-appear
     g_helper_setup = kind;
     if (secret) |sk| g_helper_setup_secret = sk;
     driveHelperSetup(fx);
@@ -3377,7 +3400,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .logout_request => model.logout_pending = true,
         .logout_cancel => model.logout_pending = false,
-        .logout_confirm => performLogout(model),
+        .logout_confirm => performLogout(model, fx),
     }
 }
 
@@ -4279,7 +4302,12 @@ fn saveSettings() void {
 /// who is signed in); a subsequent sign-in reuses them. The user is never locked
 /// in, a local key can always be copied from Settings first, and a remote
 /// signer keeps the user's key throughout.
-fn performLogout(model: *Model) void {
+fn performLogout(model: *Model, fx: *Effects) void {
+    // Forget the key in the daemon's MEMORY, not just on disk: without this the
+    // health-check reads /pubkey, still sees the key, and re-adopts within a
+    // tick. The latch holds until the async reset lands.
+    if (g_signer_kind == .helper) helperReset(fx);
+    g_logged_out = true;
     if (g_io) |io| if (g_environ) |environ| {
         if (plazaDir(io, environ)) |dir_const| {
             var dir = dir_const;
