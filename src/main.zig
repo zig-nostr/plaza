@@ -476,7 +476,9 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
         return;
     }
     if (response.status != 200) {
-        setToast(model, "Could not set up your key");
+        // A migration is a silent background upgrade: on failure the in-process
+        // key keeps working, so say nothing. Foreground setups report.
+        if (purpose != .migrate) setToast(model, "Could not set up your key");
         return;
     }
     const gpa = std.heap.page_allocator;
@@ -484,12 +486,29 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     defer parsed.deinit();
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
     persistSession();
-    enterFeed(model);
-    if (purpose == .create) {
-        model.naming = true; // the name beat; replay follows it
-    } else {
-        replayPending(model);
+    switch (purpose) {
+        .create => {
+            enterFeed(model);
+            model.naming = true; // the name beat; replay follows it
+        },
+        .import_user => {
+            enterFeed(model);
+            replayPending(model);
+        },
+        // A completed migration: the daemon now holds the key, so delete the
+        // in-process file. The user was already signed in; nothing else changes.
+        .migrate => deleteIdentityKeyFile(),
+        .none => {},
     }
+}
+
+/// Deletes the legacy in-process key file, once its secret is safe in the daemon.
+fn deleteIdentityKeyFile() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    dir.deleteFile(io, "identity.key") catch {};
 }
 
 /// Ingests and publishes a signed event returned by the daemon. Trusted: it
@@ -3928,6 +3947,12 @@ fn loadIdentityIfPresent(io: std.Io, environ: *const std.process.Environ.Map) bo
     };
     g_signer_kind = .local;
     setIdentity(signer, kp);
+    // Queue a silent, background upgrade: move this in-process key into the
+    // isolated daemon. The tick fires it once the daemon is reachable; on
+    // success the identity becomes helper-held and identity.key is deleted. If
+    // it never lands, the key keeps working in-process, no loss.
+    g_helper_setup_secret = secret;
+    g_helper_setup = .migrate;
     return true;
 }
 
