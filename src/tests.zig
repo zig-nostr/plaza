@@ -272,6 +272,74 @@ test "an empty display_name falls through to the name" {
     try testing.expectEqualStrings("jb55", note.author());
 }
 
+test "the @handle is the kind:0 name, else a short npub" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{21} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+
+    // No profile yet: the handle is the short npub.
+    const bare = main.noteFrom(ev, 1_800_000_000);
+    try testing.expect(std.mem.startsWith(u8, bare.handle(arena), "@npub1"));
+
+    // display_name distinct from name: the handle is @name.
+    const p = main.upsertProfile(kp.public_key).?;
+    main.parseMetadataInto(p, "{\"display_name\":\"Satoshi\",\"name\":\"nakamoto\"}");
+    const named = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqualStrings("Satoshi", named.author());
+    try testing.expectEqualStrings("@nakamoto", named.handle(arena));
+
+    // Only a name, so it also becomes the display: the handle would just repeat
+    // it, so it falls back to the short npub instead of "alice @alice".
+    main.parseMetadataInto(p, "{\"name\":\"alice\"}");
+    const dup = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqualStrings("alice", dup.author());
+    try testing.expect(std.mem.startsWith(u8, dup.handle(arena), "@npub1"));
+}
+
+test "a NIP-05 check needs a real well-known name to pubkey match" {
+    const pubkey = [_]u8{0xAB} ** 32;
+    // The hex of the pubkey above, which a matching well-known maps the name to.
+    const hex = "ab" ** 32;
+
+    const good = "{\"names\":{\"bob\":\"" ++ hex ++ "\"}}";
+    try testing.expect(main.nip05Matches("bob@example.com", pubkey, good));
+    // The root "_" name is a valid identifier form and verifies the same way.
+    const root = "{\"names\":{\"_\":\"" ++ hex ++ "\"}}";
+    try testing.expect(main.nip05Matches("_@example.com", pubkey, root));
+
+    // A different pubkey for the name is NOT a match (impersonation guard).
+    const other = "{\"names\":{\"bob\":\"" ++ ("cd" ** 32) ++ "\"}}";
+    try testing.expect(!main.nip05Matches("bob@example.com", pubkey, other));
+    // The queried name is simply absent.
+    try testing.expect(!main.nip05Matches("carol@example.com", pubkey, good));
+    // Malformed body, or no @ in the identifier: never a match.
+    try testing.expect(!main.nip05Matches("bob@example.com", pubkey, "not json"));
+    try testing.expect(!main.nip05Matches("nobody", pubkey, good));
+}
+
+test "a NIP-05 identifier must be well-formed to be fetched" {
+    try testing.expect(main.validNip05Name("dergigi"));
+    try testing.expect(main.validNip05Name("_"));
+    try testing.expect(main.validNip05Name("a.b-c_1"));
+    try testing.expect(!main.validNip05Name(""));
+    try testing.expect(!main.validNip05Name("has space"));
+    try testing.expect(!main.validNip05Name("naïve")); // non-ASCII
+
+    try testing.expect(main.validNip05Domain("example.com"));
+    try testing.expect(main.validNip05Domain("relay.example.com:8443"));
+    try testing.expect(!main.validNip05Domain("localhost")); // no dot
+    try testing.expect(!main.validNip05Domain("has space.com"));
+    try testing.expect(!main.validNip05Domain(""));
+}
+
 test "note text splits into link, mention, and plain runs" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

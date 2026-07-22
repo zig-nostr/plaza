@@ -112,6 +112,8 @@ const copy_nsec_key: u64 = 101;
 // clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
+// NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
+const nip05_fetch_key_base: u64 = 3000;
 const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It is
@@ -990,6 +992,16 @@ const Profile = struct {
     pubkey: [32]u8 = [_]u8{0} ** 32,
     name_buf: [64]u8 = [_]u8{0} ** 64,
     name_len: u8 = 0,
+    // The kind:0 `name` (the @handle), kept apart from the resolved display
+    // name so the identity line can show "Display Name @handle".
+    handle_buf: [64]u8 = [_]u8{0} ** 64,
+    handle_len: u8 = 0,
+    // The kind:0 `nip05` identifier (`name@domain`), and where its verification
+    // stands. The check draws only on `.verified`: a well-known lookup that maps
+    // the name back to this pubkey, never on mere presence of the string.
+    nip05_buf: [128]u8 = [_]u8{0} ** 128,
+    nip05_len: u8 = 0,
+    nip05_state: enum { idle, fetching, verified, failed } = .idle,
     picture_buf: [200]u8 = [_]u8{0} ** 200,
     picture_len: u8 = 0,
     /// The resolved avatar URL, which is also its cache key.
@@ -1008,6 +1020,12 @@ const Profile = struct {
 
     fn name(self: *const Profile) []const u8 {
         return self.name_buf[0..self.name_len];
+    }
+    fn handle(self: *const Profile) []const u8 {
+        return self.handle_buf[0..self.handle_len];
+    }
+    fn nip05(self: *const Profile) []const u8 {
+        return self.nip05_buf[0..self.nip05_len];
     }
     fn picture(self: *const Profile) []const u8 {
         return self.picture_buf[0..self.picture_len];
@@ -1065,6 +1083,7 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
         display_name: ?[]const u8 = null,
         displayName: ?[]const u8 = null,
         picture: ?[]const u8 = null,
+        nip05: ?[]const u8 = null,
     };
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1094,6 +1113,36 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
                 if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
             }
         }
+    }
+
+    // The @handle is the kind:0 `name` verbatim, distinct from the resolved
+    // display name above.
+    profile.handle_len = 0;
+    if (md.name) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        const n = utf8SafeLen(trimmed, profile.handle_buf.len);
+        @memcpy(profile.handle_buf[0..n], trimmed[0..n]);
+        profile.handle_len = @intCast(n);
+    }
+
+    // NIP-05: keep the identifier and (re)arm verification when it is present
+    // and changed. Absent or oversized means there is nothing to verify, so no
+    // check ever draws.
+    if (md.nip05) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0 and trimmed.len <= profile.nip05_buf.len and std.mem.indexOfScalar(u8, trimmed, '@') != null) {
+            if (!std.mem.eql(u8, trimmed, profile.nip05())) {
+                @memcpy(profile.nip05_buf[0..trimmed.len], trimmed);
+                profile.nip05_len = @intCast(trimmed.len);
+                if (profile.nip05_state != .fetching) profile.nip05_state = .idle;
+            }
+        } else {
+            profile.nip05_len = 0;
+            profile.nip05_state = .failed;
+        }
+    } else {
+        profile.nip05_len = 0;
+        profile.nip05_state = .failed;
     }
 }
 
@@ -1180,6 +1229,27 @@ pub const Note = struct {
             if (p.avatar_state == .loaded) return p.image_id;
         }
         return 0;
+    }
+    /// The @handle for the identity line: the kind:0 `name` when it adds
+    /// something past the display name, else a short `@npub`. Allocated in the
+    /// caller's arena for the frame.
+    pub fn handle(self: *const Note, arena: std.mem.Allocator) []const u8 {
+        if (lookupProfile(self.pubkey)) |p| {
+            if (p.handle_len > 0 and !std.ascii.eqlIgnoreCase(p.handle(), self.author())) {
+                return std.fmt.allocPrint(arena, "@{s}", .{p.handle()}) catch self.shortHandle(arena);
+            }
+        }
+        return self.shortHandle(arena);
+    }
+    /// `@` plus the abbreviated npub, the handle fallback when there is no name.
+    fn shortHandle(self: *const Note, arena: std.mem.Allocator) []const u8 {
+        return std.fmt.allocPrint(arena, "@{s}", .{self.author_buf[0..self.author_len]}) catch "@npub";
+    }
+    /// Whether this author's NIP-05 has been verified (well-known JSON maps the
+    /// name back to their pubkey). Only then does the identity line show a check.
+    pub fn verified(self: *const Note) bool {
+        if (lookupProfile(self.pubkey)) |p| return p.nip05_state == .verified;
+        return false;
     }
     pub fn time(self: *const Note) []const u8 {
         return self.time_buf[0..self.time_len];
@@ -1756,6 +1826,102 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     } else {
         p.avatar_state = .failed;
     }
+}
+
+/// A NIP-05 local part (`^[a-z0-9-_.]+$`, case-insensitive per the spec), so the
+/// name drops straight into the query string without escaping.
+pub fn validNip05Name(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.')) return false;
+    }
+    return true;
+}
+
+/// A plausible host (optionally `host:port`) for the well-known URL. Guards the
+/// fetch against a malformed identifier rather than trusting the kind:0 blob.
+pub fn validNip05Domain(domain: []const u8) bool {
+    if (domain.len == 0 or domain.len > 253) return false;
+    if (std.mem.indexOfScalar(u8, domain, '.') == null) return false;
+    for (domain) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_' or c == ':')) return false;
+    }
+    return true;
+}
+
+/// Fires NIP-05 well-known lookups for cached profiles that carry an identifier
+/// and have not been checked, a few per tick. The response lands on
+/// `nip05_verified`; only a match flips the profile to `.verified`, and only
+/// then does the identity line draw its check.
+fn scanNip05Fetches(fx: *Effects) void {
+    const per_tick = 4;
+    var fired: usize = 0;
+    for (&g_profiles, 0..) |*p, i| {
+        if (!p.used or p.nip05_state != .idle or p.nip05_len == 0) continue;
+        const at = std.mem.indexOfScalar(u8, p.nip05(), '@') orelse {
+            p.nip05_state = .failed;
+            continue;
+        };
+        const name = p.nip05()[0..at];
+        const domain = p.nip05()[at + 1 ..];
+        if (!validNip05Name(name) or !validNip05Domain(domain)) {
+            p.nip05_state = .failed;
+            continue;
+        }
+        if (fired >= per_tick) continue;
+        var url_buf: [320]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "https://{s}/.well-known/nostr.json?name={s}", .{ domain, name }) catch {
+            p.nip05_state = .failed;
+            continue;
+        };
+        p.nip05_state = .fetching;
+        fx.fetch(.{
+            .key = nip05_fetch_key_base + @as(u64, @intCast(i)),
+            .url = url,
+            .on_response = Effects.responseMsg(.nip05_verified),
+        });
+        fired += 1;
+    }
+}
+
+/// True when the well-known JSON maps the identifier's name to `pubkey`. This is
+/// the whole trust test: a check is drawn on this and nothing weaker.
+pub fn nip05Matches(identifier: []const u8, pubkey: [32]u8, body: []const u8) bool {
+    const at = std.mem.indexOfScalar(u8, identifier, '@') orelse return false;
+    const name = identifier[0..at];
+    if (name.len == 0) return false;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{}) catch return false;
+    if (root != .object) return false;
+    const names = root.object.get("names") orelse return false;
+    if (names != .object) return false;
+    const entry = names.object.get(name) orelse return false;
+    if (entry != .string) return false;
+
+    const want = std.fmt.bytesToHex(pubkey, .lower);
+    return std.ascii.eqlIgnoreCase(entry.string, &want);
+}
+
+/// Handles a NIP-05 fetch response: verified only on a well-known name→pubkey
+/// match; a busy slot retries next tick; anything else fails closed (no check).
+fn handleNip05Fetched(response: native_sdk.EffectResponse) void {
+    if (response.key < nip05_fetch_key_base) return;
+    const slot = response.key - nip05_fetch_key_base;
+    if (slot >= g_profiles.len) return;
+    const p = &g_profiles[@intCast(slot)];
+    if (!p.used or p.nip05_len == 0) return;
+
+    if (response.outcome == .rejected) {
+        p.nip05_state = .idle;
+        return;
+    }
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0) {
+        p.nip05_state = .failed;
+        return;
+    }
+    p.nip05_state = if (nip05Matches(p.nip05(), p.pubkey, response.body)) .verified else .failed;
 }
 
 // --------------------------------------------------------------- image decode
@@ -2544,6 +2710,8 @@ pub const Msg = union(enum) {
     avatar_fetched: native_sdk.EffectResponse,
     /// A media fetch finished: decode, downscale if needed, and register it.
     media_fetched: native_sdk.EffectResponse,
+    /// A NIP-05 well-known lookup finished: mark the author verified on a match.
+    nip05_verified: native_sdk.EffectResponse,
     /// A text edit in the Settings media-proxy field.
     proxy_edit: canvas.TextInputEvent,
     /// Save the media-proxy setting.
@@ -2566,7 +2734,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -3060,11 +3228,19 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
                 noteAvatar(ui, note),
                 ui.column(.{ .gap = 5, .grow = 1 }, .{
+                    // Identity line: name, a verified check when (and only when)
+                    // the author's NIP-05 resolves to their pubkey, the @handle,
+                    // then the relative time hung to the far right.
                     ui.row(.{ .gap = 6, .cross = .center }, .{
                         ui.paragraph(
-                            .{ .grow = 1, .style = .{ .foreground = theme.palette.text_primary } },
-                            &.{.{ .text = note.author(), .weight = .bold }},
+                            .{ .style = .{ .foreground = theme.palette.text_primary } },
+                            &.{.{ .text = note.author(), .weight = .medium }},
                         ),
+                        if (note.verified())
+                            ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.status_success } }, "check-circle")
+                        else
+                            ui.spacer(0),
+                        ui.text(.{ .grow = 1, .style = .{ .foreground = theme.palette.text_faint } }, note.handle(ui.arena)),
                         ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
                     }),
                     ui.paragraph(
@@ -3209,6 +3385,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // from the first tick onward.
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
+    scanNip05Fetches(fx);
     fx.startTimer(.{
         .key = refresh_timer_key,
         .interval_ms = refresh_interval_ms,
@@ -3242,6 +3419,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                scanNip05Fetches(fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -3408,6 +3586,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             retryFailedImages();
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
+        .nip05_verified => |response| handleNip05Fetched(response),
         .open_url => |url| openExternally(fx, url),
         .expand_image => |note_id| model.expanded_note = note_id,
         .close_image => model.expanded_note = null,
