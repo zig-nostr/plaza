@@ -2764,7 +2764,10 @@ fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
         .item_extent = 0,
         .extent_estimate = noteExtentEstimate,
         .extent_context = model,
-        .gap = 8,
+        // No gap between rows: the hairline under each row is the separation,
+        // so a border can mean something (a quote, a reply) and rows do not
+        // float apart with the divider lost in the space.
+        .gap = 0,
         .padding = 12,
         .overscan = 3,
         .grow = 1,
