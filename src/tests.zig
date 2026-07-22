@@ -959,3 +959,37 @@ test "a toast shows its text and the backup nudge states the stakes" {
     try testing.expect(findAnyText(tree.root, "Right now this key lives on one Mac. Back it up so losing the Mac is not losing the account.") != null);
     try testing.expect(findAnyText(tree.root, "Not now") != null);
 }
+
+// ---- 3b: helper-held identity restore --------------------------------------
+
+test "a helper session restores the identity from its pubkey, no key in process" {
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{71} ** 32);
+    var hexbuf: [64]u8 = undefined;
+    const digits = "0123456789abcdef";
+    for (kp.public_key, 0..) |b, i| {
+        hexbuf[i * 2] = digits[b >> 4];
+        hexbuf[i * 2 + 1] = digits[b & 0x0f];
+    }
+
+    // A valid pubkey restores the signed-in helper identity.
+    try testing.expect(main.restoreHelperForTest(&hexbuf));
+    var model = main.initialModel();
+    try testing.expect(!model.is_guest());
+
+    // The feed shows no guest affordances once restored.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    model.stage = .ready;
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findAnyText(tree.root, "Browsing as a guest. Reading is yours forever. Join in when something moves you.") == null);
+
+    // A short or empty pubkey restores nothing (the parser-mismatch regression).
+    main.clearIdentityForTest();
+    try testing.expect(!main.restoreHelperForTest(""));
+    try testing.expect(!main.restoreHelperForTest("abcd"));
+}
