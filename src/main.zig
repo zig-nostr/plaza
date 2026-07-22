@@ -295,6 +295,42 @@ fn resolveHelper(init: std.process.Init) void {
     }) catch return;
 }
 
+// The Signet ceremony window binary. In a packaged app it sits beside Plaza in
+// Contents/MacOS; in the dev tree it is the sub-project's own build output.
+var g_signet_win_buf: [1024]u8 = undefined;
+var g_signet_win_len: usize = 0;
+const signet_spawn_key: u64 = 44;
+
+fn resolveSignetWindow(init: std.process.Init) void {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    const argv0 = args.next() orelse return;
+    const dir = std.fs.path.dirname(argv0) orelse ".";
+    // Packaged: a sibling. Dev: the sub-project's zig-out. Take whichever is
+    // there, sibling first (that is the shipped layout).
+    const sibling = std.fmt.bufPrint(&g_signet_win_buf, "{s}/signet-window", .{dir}) catch return;
+    if (std.Io.Dir.cwd().access(init.io, sibling, .{})) |_| {
+        g_signet_win_len = sibling.len;
+        return;
+    } else |_| {}
+    const dev = std.fmt.bufPrint(&g_signet_win_buf, "{s}/../../signet-window/zig-out/bin/signet-window", .{dir}) catch return;
+    if (std.Io.Dir.cwd().access(init.io, dev, .{})) |_| {
+        g_signet_win_len = dev.len;
+    } else |_| g_signet_win_len = 0;
+}
+
+/// Opens the Signet ceremony window (a separate process) for a key import, so
+/// the pasted key never enters Plaza. The window reads the token itself and
+/// talks to the daemon; Plaza adopts the identity when the key appears
+/// (see handleHelperPubkey). No args needed.
+fn spawnSignetWindow(fx: *Effects) void {
+    if (g_signet_win_len == 0) return;
+    fx.spawn(.{
+        .key = signet_spawn_key,
+        .argv = &.{g_signet_win_buf[0..g_signet_win_len]},
+        .output = .collect,
+    });
+}
+
 /// Spawns the keyholder daemon: keyless, it idles serving /pubkey and /setup.
 /// The parent-pid is Plaza's, so the daemon exits when Plaza does.
 fn spawnHelper(fx: *Effects) void {
@@ -2427,8 +2463,11 @@ pub const Msg = union(enum) {
     close_join,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
-    /// The sheet's other paths: the join screen's field takes an nsec or a
-    /// bunker link. The remembered intent survives the trip.
+    /// The sheet's import path: open the Signet window (a separate process),
+    /// so a pasted key never enters Plaza. The remembered intent survives.
+    open_signet_import,
+    /// The sheet's other paths: the join screen's field takes a bunker link.
+    /// The remembered intent survives the trip.
     join_bring_key,
     /// Leave the join screen back to the feed; reading never needs an identity.
     keep_browsing,
@@ -2500,7 +2539,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2627,7 +2666,7 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     .{ .style = .{ .foreground = p.text_faint_alt } },
                     &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
                 ),
-                ui.button(.{ .on_press = .join_bring_key }, "Bring your key"),
+                ui.button(.{ .on_press = .open_signet_import }, "Bring your key"),
                 ui.button(.{ .on_press = .join_bring_key }, "Use your own signer"),
                 ui.row(.{ .gap = 8, .cross = .center }, .{
                     ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
@@ -3201,9 +3240,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.joining = false;
             queueHelperSetup(fx, .create, null);
         },
+        .open_signet_import => {
+            // Key material never enters Plaza: the Signet window takes the
+            // paste and hands it to the daemon; Plaza signs in when the key
+            // appears (handleHelperPubkey). If the window binary is missing,
+            // fall back to the in-Plaza field rather than a dead button.
+            model.joining = false;
+            if (g_signet_win_len > 0) spawnSignetWindow(fx) else model.stage = .onboarding;
+        },
         .join_bring_key => {
-            // The join screen's field handles both an nsec and a bunker link;
-            // the remembered intent survives the trip and replays on entry.
+            // The bunker path: a bunker link is not a secret key, so Plaza's
+            // own field is fine. The remembered intent replays on entry.
             model.joining = false;
             model.stage = .onboarding;
         },
@@ -3839,6 +3886,7 @@ pub fn main(init: std.process.Init) !void {
     // Resolve the keyholder daemon (its path and a fresh bearer token); boot
     // spawns it. Best-effort, and non-fatal: signing still works in-process.
     resolveHelper(init);
+    resolveSignetWindow(init);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",

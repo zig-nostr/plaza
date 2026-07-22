@@ -1,0 +1,21 @@
+.{
+    .name = .signet_window,
+    .fingerprint = 0xda252d886e911c64,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The Native SDK, pinned to the SAME commit as Plaza (../build.zig.zon).
+        // Keep the two in lockstep: move both in one commit.
+        .native_sdk = .{
+            .url = "git+https://github.com/vercel-labs/native.git#57bf56bc58058768d436099c1005bfc66bd55ac3",
+            .hash = "native_sdk-0.1.0-hzDzQpQckAGeCmVAbrh-HSbhfoPszOProz1IbrRXU6Du",
+        },
+        // The nostr library, for nip19 (validate an nsec, derive the npub),
+        // keystore (open an ncryptsec), and the signer_ipc wire types.
+        .nostr = .{
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.7.tar.gz",
+            .hash = "nostr-0.3.7-CMyPzYjUBgCkDDn87deF1SI6FEGvUOeaeDAArMKUkER7",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },
+}
