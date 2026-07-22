@@ -21,8 +21,8 @@
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the
         // render process for zero-copy feed reads, the one-process architecture.
         .nostr = .{
-            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.5.tar.gz",
-            .hash = "nostr-0.3.5-CMyPzQYEBgB49B99FEh3r6sTngSrBHS45t5Hxx0n-vNk",
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.7.tar.gz",
+            .hash = "nostr-0.3.7-CMyPzYjUBgCkDDn87deF1SI6FEGvUOeaeDAArMKUkER7",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },

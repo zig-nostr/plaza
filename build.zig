@@ -33,6 +33,32 @@ pub fn build(b: *std.Build) void {
     stb.root_module.addIncludePath(b.path("src"));
     app.exe.root_module.linkLibrary(stb);
     app.tests.root_module.linkLibrary(stb);
+
+    // plaza-signer: the isolated keyholder daemon. A SEPARATE binary from the
+    // SDK app, built from the nostr library ALONE (no SDK), so the process that
+    // holds the key links none of the UI's image or JSON parsers. Plaza spawns
+    // it at launch and talks to it over loopback.
+    addSigner(b, app.exe.root_module.resolved_target.?, app.exe.root_module.optimize.?);
+}
+
+/// Builds the plaza-signer daemon and its test step. Library-only: it imports
+/// nostr (secp256k1 + LMDB, hence libc) and nothing else.
+fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/signer/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkNostr(b, mod);
+
+    const exe = b.addExecutable(.{ .name = "plaza-signer", .root_module = mod });
+    b.installArtifact(exe);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const run_tests = b.addRunArtifact(tests);
+    const step = b.step("test-signer", "Run the plaza-signer daemon tests");
+    step.dependOn(&run_tests.step);
 }
 
 /// Adds the `nostr` import to `mod`, compiling the library (and its bundled
