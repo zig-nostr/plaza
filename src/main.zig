@@ -920,8 +920,17 @@ pub const Model = struct {
                 if (p.name_len > 0) who = p.name();
             }
         }
-        const prefix = if (g_signer_kind == .remote) "Signing via your signer · " else "Posting as ";
-        return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, who }) catch who;
+        if (g_signer_kind == .remote) {
+            // The connection's honest state, not just its happy path: reaching,
+            // signing as (which key), or unreachable.
+            return switch (g_remote_status.load(.acquire)) {
+                1 => std.fmt.allocPrint(arena, "Reaching your signer · {s}", .{who}) catch who,
+                2 => std.fmt.allocPrint(arena, "Signing via your signer · {s}", .{who}) catch who,
+                3 => "Your signer is unreachable. Posts will not sign.",
+                else => std.fmt.allocPrint(arena, "Your signer · {s}", .{who}) catch who,
+            };
+        }
+        return std.fmt.allocPrint(arena, "Posting as {s}", .{who}) catch who;
     }
 
     /// The onboarding sign-in field text (what `text="{login_draft}"` binds).
@@ -2849,6 +2858,21 @@ fn replayPending(model: *Model) void {
 /// The replay seam, exercised without disk or relays. For tests.
 pub fn replayPendingForTest(model: *Model) void {
     replayPending(model);
+}
+
+/// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
+/// 3 unreachable) plus a remote identity, so the presentation is testable
+/// without a live bunker. For tests.
+pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
+    g_signer_kind = if (status == 0) .local else .remote;
+    g_remote_status.store(status, .release);
+    g_remote_sign_notice.store(false, .release);
+    if (npub_len > 0) {
+        const stub = "npub1testsigner";
+        const n = @min(stub.len, g_identity_npub_buf.len);
+        @memcpy(g_identity_npub_buf[0..n], stub[0..n]);
+        g_identity_npub_len = n;
+    } else g_identity_npub_len = 0;
 }
 
 fn enterFeed(model: *Model) void {
