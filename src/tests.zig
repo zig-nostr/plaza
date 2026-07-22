@@ -798,3 +798,56 @@ test "a refused remote sign restores the lost draft to the composer" {
     // The slot is retired: a late response for it now finds nothing.
     try testing.expect(main.takePendingContentForTest("req-x") == null);
 }
+
+// ---- B3: guest-first launch ------------------------------------------------
+
+test "a guest feed shows the join strip; dismissing keeps the Guest chip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    try testing.expect(model.is_guest());
+
+    // The strip invites without blocking: the feed is fully built around it.
+    const with_strip = try buildTree(arena, &model);
+    try testing.expect(findAnyText(with_strip.root, "Browsing as a guest. Reading is yours forever. Join in when something moves you.") != null);
+    try testing.expect(findAnyText(with_strip.root, "Create identity") != null);
+
+    // Dismissal hides the strip but never the way in: the Guest chip stays.
+    model.guest_strip_dismissed = true;
+    const dismissed = try buildTree(arena, &model);
+    try testing.expect(findAnyText(dismissed.root, "Browsing as a guest. Reading is yours forever. Join in when something moves you.") == null);
+    try testing.expect(findAnyText(dismissed.root, "Guest") != null);
+}
+
+test "a signed-in feed carries no guest affordances" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{61} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    try testing.expect(!model.is_guest());
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Browsing as a guest. Reading is yours forever. Join in when something moves you.") == null);
+    try testing.expect(findAnyText(tree.root, "Guest") == null);
+}
+
+test "the join screen always offers the way back to reading" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .onboarding;
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Keep browsing") != null);
+    try testing.expect(findAnyText(tree.root, "Reading never needs an identity.") != null);
+}
