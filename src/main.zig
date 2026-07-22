@@ -209,7 +209,7 @@ var g_identity_npub_len: usize = 0;
 // How composed notes are signed: with the local key, or remotely over NIP-46 by
 // an external signer (Signet) so the secret key never enters Plaza. `submitPost`
 // branches on this; it is set once during onboarding.
-const SignerKind = enum { local, remote };
+const SignerKind = enum { local, remote, helper };
 var g_signer_kind: SignerKind = .local;
 
 // Remote-signer (NIP-46) connection state, set at connect time and read by the
@@ -345,6 +345,171 @@ fn handleHelperPubkey(response: native_sdk.EffectResponse) void {
     const ready = std.mem.indexOf(u8, response.body, "\"state\":\"ready\"") != null;
     g_helper_state.store(if (ready) 2 else 1, .release);
     std.debug.print("plaza: [helper] reachable, state={s}\n", .{if (ready) "ready" else "uninitialized"});
+}
+
+// The signed-in helper identity: its pubkey lives here (the SECRET lives only in
+// the daemon). `.helper` is the built-in local key now; `g_identity_kp` stays
+// null for it, so the key is never in this process.
+var g_helper_identity_pk: [32]u8 = undefined;
+var g_helper_has_identity = false;
+
+// Helper setup is async and can race the daemon coming up, so an intent is
+// queued and fired by the tick once the daemon is reachable. `create` mints a
+// fresh key (then the name beat); `import_user` adopts a pasted nsec; `migrate`
+// moves a legacy in-process key into the daemon and deletes it, silently.
+const HelperSetup = enum { none, create, import_user, migrate };
+var g_helper_setup: HelperSetup = .none;
+var g_helper_setup_secret: [32]u8 = undefined;
+const helper_setup_key: u64 = 42;
+const helper_sign_key: u64 = 43;
+
+fn helperReachable() bool {
+    return g_helper_state.load(.acquire) >= 1;
+}
+
+/// Queues a helper setup and fires it now if the daemon is already up (else the
+/// tick fires it the moment the health-check confirms reachability).
+fn queueHelperSetup(fx: *Effects, kind: HelperSetup, secret: ?[32]u8) void {
+    g_helper_setup = kind;
+    if (secret) |sk| g_helper_setup_secret = sk;
+    driveHelperSetup(fx);
+}
+
+/// Fires a queued setup once the daemon is reachable. Called on the tick and
+/// right after queueing.
+fn driveHelperSetup(fx: *Effects) void {
+    if (g_helper_setup == .none or !helperReachable()) return;
+    const gpa = std.heap.page_allocator;
+    switch (g_helper_setup) {
+        .none => {},
+        .create => helperFetch(fx, helper_setup_key, "/setup", "{\"method\":\"create\"}", Effects.responseMsg(.helper_setup)),
+        .import_user, .migrate => {
+            const nsec = nostr.nip19.encodeNsec(gpa, g_helper_setup_secret) catch return;
+            defer gpa.free(nsec);
+            std.crypto.secureZero(u8, &g_helper_setup_secret);
+            var body_buf: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"method\":\"import\",\"secret\":\"{s}\"}}", .{nsec}) catch return;
+            defer std.crypto.secureZero(u8, &body_buf);
+            helperFetch(fx, helper_setup_key, "/setup", body, Effects.responseMsg(.helper_setup));
+        },
+    }
+    // In flight now; the response either completes it or, on failure, requeues.
+    g_helper_pending_in_flight = g_helper_setup;
+    g_helper_setup = .none;
+}
+var g_helper_pending_in_flight: HelperSetup = .none;
+
+/// A POST to the daemon with the bearer token. The body is copied by the effect,
+/// so a stack buffer is fine.
+fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup))) void {
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}" ++ path, .{helper_port}) catch return;
+    var auth_buf: [96]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
+    fx.fetch(.{
+        .key = key,
+        .url = url,
+        .method = .POST,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .body = body,
+        .on_response = on_response,
+    });
+}
+
+/// Sends one event to the daemon to be signed. Builds the unsigned event against
+/// the helper's own pubkey (so the returned id matches), wraps it, and POSTs
+/// /sign; the response is the signed event, ingested and published like any
+/// other. Frees `content_owned` once the request is built (the signed event
+/// carries the content back).
+fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, content_owned: []const u8, kind: u16) void {
+    defer gpa.free(content_owned);
+    const pk = activePubkey() orelse return;
+    const created = nowSeconds();
+    const id = nostr.event.computeId(gpa, pk, created, kind, &.{}, content_owned) catch return;
+    const unsigned = nostr.event.Event{
+        .id = id,
+        .pubkey = pk,
+        .created_at = created,
+        .kind = kind,
+        .tags = &.{},
+        .content = content_owned,
+        .sig = [_]u8{0} ** 64,
+    };
+    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch return;
+    defer gpa.free(unsigned_json);
+    const body = (nostr.signer_ipc.SignEvent{ .event = unsigned_json }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    helperFetch(fx, helper_sign_key, "/sign", body, Effects.responseMsg(.helper_signed));
+}
+
+/// Adopts a helper-held identity: only the pubkey lives here, never the secret
+/// (that stays in the daemon). Clears any in-UI local key.
+fn adoptHelperIdentity(pk: [32]u8) void {
+    if (g_identity_signer) |*sig| sig.deinit();
+    g_identity_signer = null;
+    g_identity_kp = null;
+    g_helper_identity_pk = pk;
+    g_helper_has_identity = true;
+    g_signer_kind = .helper;
+    const npub = abbreviateNpub(&g_identity_npub_buf, pk);
+    g_identity_npub_len = npub.len;
+    g_last_count = std.math.maxInt(usize);
+}
+
+/// Restores a helper identity from a persisted session pubkey. Synchronous: the
+/// daemon independently loads its own key, so Plaza only needs to know who it is.
+fn restoreHelperIdentity(pubkey_hex: []const u8) bool {
+    if (pubkey_hex.len != 64) return false;
+    var pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pk, pubkey_hex) catch return false;
+    adoptHelperIdentity(pk);
+    return true;
+}
+
+/// Completes an async helper setup. On a fresh create it adopts the minted
+/// identity and opens the name beat; a transient failure requeues for the tick.
+fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
+    const purpose = g_helper_pending_in_flight;
+    g_helper_pending_in_flight = .none;
+    if (response.outcome != .ok) {
+        g_helper_setup = purpose; // the daemon was not up; the tick retries
+        return;
+    }
+    if (response.status != 200) {
+        setToast(model, "Could not set up your key");
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, response.body) catch return;
+    defer parsed.deinit();
+    if (!restoreHelperIdentity(parsed.value.pubkey)) return;
+    persistSession();
+    enterFeed(model);
+    if (purpose == .create) {
+        model.naming = true; // the name beat; replay follows it
+    } else {
+        replayPending(model);
+    }
+}
+
+/// Ingests and publishes a signed event returned by the daemon. Trusted: it
+/// came from our own daemon over authenticated loopback. A kind:0 seeds the
+/// profile cache so the name shows at once.
+fn handleHelperSigned(response: native_sdk.EffectResponse) void {
+    if (response.outcome != .ok or response.status != 200) return;
+    const gpa = std.heap.page_allocator;
+    var wrapped = nostr.signer_ipc.parse(nostr.signer_ipc.SignEvent, gpa, response.body) catch return;
+    defer wrapped.deinit();
+    var parsed = nostr.event.fromJson(gpa, wrapped.value.event) catch return;
+    defer parsed.deinit();
+    const owned = gpa.dupe(u8, parsed.value.content) catch return;
+    var out = parsed.value;
+    out.content = owned;
+    out.tags = &.{};
+    if (out.kind == 0) {
+        if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
+    }
+    ingestAndPublish(gpa, out, null);
 }
 // The listener runs for one connection generation. A logout or a reconnect
 // bumps this; the detached listener and the in-flight workers see the change
@@ -850,6 +1015,7 @@ fn activePubkey() ?[32]u8 {
     return switch (g_signer_kind) {
         .local => if (g_identity_kp) |kp| kp.public_key else null,
         .remote => g_remote_pubkey,
+        .helper => if (g_helper_has_identity) g_helper_identity_pk else null,
     };
 }
 
@@ -1117,6 +1283,7 @@ pub const Model = struct {
         return switch (g_signer_kind) {
             .local => "Local key",
             .remote => "Remote signer",
+            .helper => "Signet",
         };
     }
     /// Whether the identity is a local key (so its secret can be backed up here).
@@ -1152,6 +1319,7 @@ pub const Model = struct {
         return switch (g_signer_kind) {
             .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
+            .helper => "Your key will be removed from Signet on this device. Back it up first if you want to keep this identity.",
         };
     }
     /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
@@ -2266,6 +2434,10 @@ pub const Msg = union(enum) {
     helper_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
+    /// A /setup (create) answered: adopt the new helper identity.
+    helper_setup: native_sdk.EffectResponse,
+    /// A /sign answered: ingest and publish the signed event.
+    helper_signed: native_sdk.EffectResponse,
     /// An avatar fetch finished: register the image or fall back to initials.
     avatar_fetched: native_sdk.EffectResponse,
     /// A media fetch finished: decode, downscale if needed, and register it.
@@ -2292,7 +2464,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2923,8 +3095,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
-                // Health-check the signer daemon until the loopback IPC answers.
+                // Health-check the signer daemon until the loopback IPC answers,
+                // then fire any queued key setup.
                 pollHelper(fx);
+                driveHelperSetup(fx);
                 // A toast lives a few seconds, then the tick retires it.
                 if (model.toast_until != 0 and nowSeconds() >= model.toast_until) {
                     model.toast_until = 0;
@@ -2947,7 +3121,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
-        .helper_pubkey => |response| handleHelperPubkey(response),
+        .helper_pubkey => |response| {
+            handleHelperPubkey(response);
+            // A queued setup fires the moment the daemon is reachable.
+            driveHelperSetup(fx);
+        },
+        .helper_setup => |response| handleHelperSetup(model, response),
+        .helper_signed => |response| handleHelperSigned(response),
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
@@ -2955,7 +3135,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_remote_sign_notice.store(false, .release);
         },
         .post => {
-            submitPost(model);
+            submitPost(model, fx);
             // Posting closes the sheet; the note is already local and will
             // appear on the next tick.
             model.composing = false;
@@ -2980,12 +3160,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending_compose = false;
         },
         .join_create => {
+            // Async: the daemon mints the key (the key never enters Plaza), the
+            // response adopts the identity and opens the name beat.
             model.joining = false;
-            if (!createLocalIdentity()) return;
-            persistSession();
-            enterFeed(model);
-            // The name beat first; the remembered intent replays after it.
-            model.naming = true;
+            queueHelperSetup(fx, .create, null);
         },
         .join_bring_key => {
             // The join screen's field handles both an nsec and a bunker link;
@@ -3000,7 +3178,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
-            publishName(model);
+            publishName(model, fx);
             model.naming = false;
             setToast(model, "Name set");
             replayPending(model);
@@ -3018,13 +3196,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.backup_nudge = false;
             model.backup_nudge_dismissed = true;
         },
-        .create_identity => {
-            // Generate the local key, then bring the feed up and switch screens.
-            if (!createLocalIdentity()) return;
-            persistSession();
-            enterFeed(model);
-            model.naming = true;
-        },
+        .create_identity => queueHelperSetup(fx, .create, null),
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
@@ -3126,7 +3298,7 @@ fn setToast(model: *Model, text: []const u8) void {
 /// the local profile cache so the app shows the name at once. Local keys only
 /// (the beat never runs for imports or signers). Quotes and backslashes are
 /// dropped rather than escaped: a display name is prose, not JSON.
-fn publishName(model: *Model) void {
+fn publishName(model: *Model, fx: *Effects) void {
     const raw = std.mem.trim(u8, model.name_buffer.text(), " \t\r\n");
     if (raw.len == 0) return;
     const signer = g_identity_signer orelse return;
@@ -3144,6 +3316,12 @@ fn publishName(model: *Model) void {
     if (clean.len == 0) return;
 
     const json = std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{clean}) catch return;
+    if (g_signer_kind == .helper) {
+        // The daemon signs the kind:0; the response seeds the cache.
+        requestHelperSign(fx, gpa, json, 0);
+        model.name_buffer.clear();
+        return;
+    }
     const ev = nostr.event.create(gpa, signer, kp, nowSeconds(), 0, &.{}, json, null) catch {
         gpa.free(json);
         return;
@@ -3166,6 +3344,11 @@ fn replayPending(model: *Model) void {
 /// The replay seam, exercised without disk or relays. For tests.
 pub fn replayPendingForTest(model: *Model) void {
     replayPending(model);
+}
+
+/// Restores a helper identity from a session pubkey hex. For tests.
+pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
+    return restoreHelperIdentity(pubkey_hex);
 }
 
 /// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
@@ -3206,7 +3389,7 @@ pub fn initialModel() Model {
 /// Posts the current draft: sign a kind:1 note, store it locally at once, and
 /// publish it to the pool in the background. A blank draft or a not-yet-ready
 /// identity is a no-op.
-fn submitPost(model: *Model) void {
+fn submitPost(model: *Model, fx: *Effects) void {
     const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
     if (text.len == 0) return;
     const gpa = std.heap.page_allocator;
@@ -3218,6 +3401,7 @@ fn submitPost(model: *Model) void {
     switch (g_signer_kind) {
         .local => postLocally(gpa, owned),
         .remote => requestRemoteSign(gpa, owned),
+        .helper => requestHelperSign(fx, gpa, owned, 1),
     }
     model.draft_buffer.clear();
 }
@@ -3840,6 +4024,12 @@ fn persistSession() void {
     var buf: [1024]u8 = undefined;
     const data = switch (g_signer_kind) {
         .local => std.fmt.bufPrint(&buf, "kind=local\n", .{}) catch return,
+        .helper => blk: {
+            if (!g_helper_has_identity) return;
+            var pk_hex: [64]u8 = undefined;
+            hexLower(&pk_hex, g_helper_identity_pk);
+            break :blk std.fmt.bufPrint(&buf, "kind=helper\npubkey={s}\n", .{&pk_hex}) catch return;
+        },
         .remote => blk: {
             const kp = g_remote_client_kp orelse return;
             var pk_hex: [64]u8 = undefined;
@@ -3892,11 +4082,13 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
         const val = line[eq + 1 ..];
         if (std.mem.eql(u8, key, "kind")) kind = val;
         if (std.mem.eql(u8, key, "remote_pubkey")) f_pubkey = val;
+        if (std.mem.eql(u8, key, "pubkey")) f_pubkey = val;
         if (std.mem.eql(u8, key, "relay")) f_relay = val;
         if (std.mem.eql(u8, key, "client_secret")) f_client_secret = val;
         if (std.mem.eql(u8, key, "secret")) f_secret = val;
     }
 
+    if (std.mem.eql(u8, kind, "helper")) return restoreHelperIdentity(f_pubkey);
     if (std.mem.eql(u8, kind, "local")) return loadIdentityIfPresent(io, environ);
     if (std.mem.eql(u8, kind, "remote")) return restoreRemoteSigner(gpa, f_pubkey, f_relay, f_client_secret, f_secret);
     return false;
@@ -3988,6 +4180,11 @@ fn performLogout(model: *Model) void {
             defer dir.close(io);
             dir.deleteFile(io, "session") catch {};
             if (g_signer_kind == .local) dir.deleteFile(io, "identity.key") catch {};
+            // The helper's key lives in the daemon's file; remove it too, so a
+            // logout leaves no key on disk. (The running daemon keeps its copy
+            // in memory until it exits with Plaza; recreating an identity in the
+            // same session needs a restart.)
+            if (g_signer_kind == .helper) dir.deleteFile(io, "signer.key") catch {};
         } else |_| {}
     };
 
@@ -4002,6 +4199,7 @@ fn performLogout(model: *Model) void {
     g_identity_signer = null;
     g_identity_kp = null;
     g_identity_npub_len = 0;
+    g_helper_has_identity = false;
     g_signer_kind = .local;
     g_remote_client_kp = null;
     g_remote_relay_len = 0;
