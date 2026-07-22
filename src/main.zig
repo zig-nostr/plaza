@@ -862,6 +862,13 @@ pub const Model = struct {
     // hides the strip; the join surface stays reachable through every gated
     // verb and the status bar's Guest chip.
     guest_strip_dismissed: bool = false,
+    // Whether the first-intent join sheet is up (the ladder: create, bring a
+    // key, use a signer). Rises when a guest presses a gated verb, or from the
+    // strip and the Guest chip.
+    joining: bool = false,
+    // The remembered intent: the guest reached for the composer, so composing
+    // opens by itself the moment an identity exists. The sheet says so.
+    pending_compose: bool = false,
     // Where the feed is scrolled, so images load around the viewport instead of
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
@@ -879,13 +886,13 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                 "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
-        "stage",                 "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
-        "proxy_saved",           "feed_scroll",   "feed_limit",     "draft",          "draft_empty",
-        "identity",              "has_notes",     "empty",          "status",         "empty_text",
-        "footer",                "note_list",     "expanded_note",  "composing",      "caught_up",
-        "relay_health",          "relays_online", "scope_voices",   "is_guest",       "show_guest_strip",
-        "guest_strip_dismissed",
+        "notes",                 "notes_len",     "live_relays",     "offline_relays", "draft_buffer",
+        "stage",                 "login_buffer",  "logout_pending",  "reveal_nsec",    "proxy_buffer",
+        "proxy_saved",           "feed_scroll",   "feed_limit",      "draft",          "draft_empty",
+        "identity",              "has_notes",     "empty",           "status",         "empty_text",
+        "footer",                "note_list",     "expanded_note",   "composing",      "caught_up",
+        "relay_health",          "relays_online", "scope_voices",    "is_guest",       "show_guest_strip",
+        "guest_strip_dismissed", "joining",       "pending_compose",
     };
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -2054,8 +2061,15 @@ pub const Msg = union(enum) {
     open_compose,
     /// Dismiss the compose sheet.
     close_compose,
-    /// Open the join screen (create / bring a key / use a signer).
+    /// Open the first-intent join sheet (create / bring a key / use a signer).
     open_join,
+    /// Dismiss the join sheet; a remembered intent is forgotten with it.
+    close_join,
+    /// The sheet's primary: mint a local identity and replay the intent.
+    join_create,
+    /// The sheet's other paths: the join screen's field takes an nsec or a
+    /// bunker link. The remembered intent survives the trip.
+    join_bring_key,
     /// Leave the join screen back to the feed; reading never needs an identity.
     keep_browsing,
     /// Hide the guest strip for this session.
@@ -2108,7 +2122,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "dismiss_guest_strip", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2139,10 +2153,60 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
             return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
         }
     }
+    if (model.stage == .ready and model.joining) {
+        return ui.stack(.{ .grow = 1 }, .{ base, joinSheet(ui, model) });
+    }
     if (model.stage == .ready and model.composing) {
         return ui.stack(.{ .grow = 1 }, .{ base, composeSheet(ui, model) });
     }
     return base;
+}
+
+/// The first-intent sheet: the join ladder over the dimmed feed. Three ways in,
+/// most confident first, and always the way back to reading. When the guest
+/// reached for the composer, the sheet says the note is waiting.
+fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .on_dismiss = .close_join,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "Join" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+                if (model.pending_compose)
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
+                else
+                    ui.spacer(0),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = 1.3 }},
+                ),
+                ui.text(
+                    .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    "Everything here is signed with a key of your own, not an account someone holds for you.",
+                ),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = "NEW HERE", .monospace = true, .scale = 0.85 }},
+                ),
+                ui.button(.{ .variant = .primary, .on_press = .join_create }, "Create your identity"),
+                ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Ready in seconds. Nothing to write down."),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
+                ),
+                ui.button(.{ .on_press = .join_bring_key }, "Bring your key"),
+                ui.button(.{ .on_press = .join_bring_key }, "Use your own signer"),
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
+                }),
+            }),
+        }),
+    });
 }
 
 /// The compose sheet: a modal over the feed with the note field and the actions.
@@ -2646,20 +2710,43 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_compose => {
             // The gate is on press, not on sight: a guest reaching for the
-            // composer is exactly first intent, so the join screen rises. The
-            // first-intent sheet (with the remembered action) replaces this
-            // jump in the milestone ahead.
-            if (model.is_guest()) model.stage = .onboarding else model.composing = true;
+            // composer is exactly first intent, so the sheet rises and
+            // remembers what was reached for.
+            if (model.is_guest()) {
+                model.joining = true;
+                model.pending_compose = true;
+            } else model.composing = true;
         },
         .close_compose => model.composing = false,
-        .open_join => model.stage = .onboarding,
-        .keep_browsing => model.stage = .ready,
+        .open_join => model.joining = true,
+        .close_join => {
+            model.joining = false;
+            model.pending_compose = false;
+        },
+        .join_create => {
+            model.joining = false;
+            if (!createLocalIdentity()) return;
+            persistSession();
+            enterFeed(model);
+            replayPending(model);
+        },
+        .join_bring_key => {
+            // The join screen's field handles both an nsec and a bunker link;
+            // the remembered intent survives the trip and replays on entry.
+            model.joining = false;
+            model.stage = .onboarding;
+        },
+        .keep_browsing => {
+            model.stage = .ready;
+            model.pending_compose = false;
+        },
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
             persistSession();
             enterFeed(model);
+            replayPending(model);
         },
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
@@ -2672,6 +2759,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     if (!importNsec(raw)) return;
                     persistSession();
                     enterFeed(model);
+                    replayPending(model);
                 },
                 // Pair with the external signer from the bunker URL; on success
                 // the feed comes up and posts route through it. A bad URL keeps
@@ -2680,6 +2768,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     if (!connectRemoteSigner(raw)) return;
                     persistSession();
                     enterFeed(model);
+                    replayPending(model);
                 },
                 .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
             }
@@ -2748,6 +2837,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// already running. Shared by all sign-in paths (create, import, remote signer).
 /// A fresh identity means the feed's author filter changed, so force a rebuild
 /// on the next tick by invalidating the change guard.
+/// Completes the remembered first intent once an identity exists: the guest
+/// reached for the composer, so it opens by itself. The welcome-in moment.
+fn replayPending(model: *Model) void {
+    if (model.pending_compose) {
+        model.pending_compose = false;
+        model.composing = true;
+    }
+}
+
+/// The replay seam, exercised without disk or relays. For tests.
+pub fn replayPendingForTest(model: *Model) void {
+    replayPending(model);
+}
+
 fn enterFeed(model: *Model) void {
     model.stage = .ready;
     g_last_count = std.math.maxInt(usize);

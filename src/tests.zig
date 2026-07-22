@@ -851,3 +851,46 @@ test "the join screen always offers the way back to reading" {
     try testing.expect(findAnyText(tree.root, "Keep browsing") != null);
     try testing.expect(findAnyText(tree.root, "Reading never needs an identity.") != null);
 }
+
+// ---- C1: the first-intent sheet ---------------------------------------------
+
+test "the join sheet renders the ladder and remembers a waiting note" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+
+    // Bare ladder: title, three ways in, and always the way back.
+    const bare = try buildTree(arena, &model);
+    try testing.expect(findAnyText(bare.root, "How do you want to join?") != null);
+    try testing.expect(findAnyText(bare.root, "Create your identity") != null);
+    try testing.expect(findAnyText(bare.root, "Bring your key") != null);
+    try testing.expect(findAnyText(bare.root, "Use your own signer") != null);
+    try testing.expect(findAnyText(bare.root, "Keep browsing") != null);
+    try testing.expect(findAnyText(bare.root, "Your note is waiting.") == null);
+
+    // With a remembered intent, the sheet says so.
+    model.pending_compose = true;
+    const pending = try buildTree(arena, &model);
+    try testing.expect(findAnyText(pending.root, "Your note is waiting.") != null);
+}
+
+test "a remembered intent replays once and only once" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.pending_compose = true;
+
+    // Identity arrives: the composer opens by itself, the intent is spent.
+    main.replayPendingForTest(&model);
+    try testing.expect(model.composing);
+    try testing.expect(!model.pending_compose);
+
+    // A second replay is a no-op: closing the sheet stays closed.
+    model.composing = false;
+    main.replayPendingForTest(&model);
+    try testing.expect(!model.composing);
+}
