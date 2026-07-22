@@ -59,7 +59,7 @@ pub const palette = struct {
     pub const surface_toast = hex("#232327");
 
     // Borders and dividers.
-    pub const divider_feedrow = hex("#1c1c21");
+    pub const divider_feedrow = hex("#26262c");
     pub const divider_chrome = hex("#1f1f24");
     pub const border_hairline = hex("#26262c");
     pub const border_window = hex("#2a2a30");
