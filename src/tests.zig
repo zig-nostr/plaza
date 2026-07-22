@@ -340,6 +340,72 @@ test "a NIP-05 identifier must be well-formed to be fetched" {
     try testing.expect(!main.validNip05Domain(""));
 }
 
+test "engagement counts format terse, and omit zero" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try testing.expectEqualStrings("", main.formatCount(arena, 0));
+    try testing.expectEqualStrings("6", main.formatCount(arena, 6));
+    try testing.expectEqualStrings("854", main.formatCount(arena, 854));
+    try testing.expectEqualStrings("1.2k", main.formatCount(arena, 1200));
+    try testing.expectEqualStrings("12.1k", main.formatCount(arena, 12100));
+}
+
+test "a guest like is remembered and routed to the join, never published" {
+    main.resetLikesForTest();
+    main.clearIdentityForTest();
+    defer main.resetLikesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{31} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "hi");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    // A guest press cannot sign: the like is remembered and the join opens, but
+    // the heart does not fill (nothing was published).
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .like = id }, &fx);
+    try testing.expectEqual(id, model.pending_like);
+    try testing.expect(model.joining);
+    try testing.expect(!main.isLikedForTest(id));
+}
+
+test "a signed-in like fills the heart, and pressing again clears it" {
+    main.resetLikesForTest();
+    main.setIdentityForTest([_]u8{5} ** 32);
+    defer {
+        main.resetLikesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "like me");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    // Optimistic: the heart fills on the first press without waiting on publish,
+    // and a second press toggles it back off (the un-like path).
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .like = id }, &fx);
+    try testing.expect(main.isLikedForTest(id));
+    main.update(&model, Msg{ .like = id }, &fx);
+    try testing.expect(!main.isLikedForTest(id));
+}
+
 test "note text splits into link, mention, and plain runs" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

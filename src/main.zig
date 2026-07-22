@@ -202,7 +202,7 @@ var g_last_count: usize = std.math.maxInt(usize);
 // it forwards an already-signed event, so it needs neither. This is the
 // zero-config local signer; connecting an external signer (Signet, over NIP-46,
 // so the key never touches the client) is the next onboarding option, and swaps
-// in at `signNote` below.
+// in at `signAndPublish` below.
 var g_identity_signer: ?nostr.keys.Signer = null;
 var g_identity_kp: ?nostr.keys.KeyPair = null;
 var g_identity_npub_buf: [24]u8 = undefined;
@@ -494,22 +494,21 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
     });
 }
 
-/// Sends one event to the daemon to be signed. Builds the unsigned event against
-/// the helper's own pubkey (so the returned id matches), wraps it, and POSTs
-/// /sign; the response is the signed event, ingested and published like any
-/// other. Frees `content_owned` once the request is built (the signed event
-/// carries the content back).
-fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, content_owned: []const u8, kind: u16) void {
-    defer gpa.free(content_owned);
+/// Sends one event of `kind` (with `tags`, stamped `created`) to the daemon to
+/// be signed. Builds the unsigned event against the helper's own pubkey so the
+/// returned id matches, wraps it, and POSTs /sign; the response is the signed
+/// event, ingested and published like any other. `content_owned` and `tags` are
+/// process-lifetime (the local and remote paths reference them too), so this
+/// does not free them.
+fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8) void {
     const pk = activePubkey() orelse return;
-    const created = nowSeconds();
-    const id = nostr.event.computeId(gpa, pk, created, kind, &.{}, content_owned) catch return;
+    const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch return;
     const unsigned = nostr.event.Event{
         .id = id,
         .pubkey = pk,
         .created_at = created,
         .kind = kind,
-        .tags = &.{},
+        .tags = tags,
         .content = content_owned,
         .sig = [_]u8{0} ** 64,
     };
@@ -602,7 +601,10 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     const owned = gpa.dupe(u8, parsed.value.content) catch return;
     var out = parsed.value;
     out.content = owned;
-    out.tags = &.{};
+    // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
+    // empty would leave the published id not matching its content, so relays
+    // would reject it. Deep-copied because `parsed` is freed on return.
+    out.tags = dupeTags(gpa, parsed.value.tags);
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -641,6 +643,9 @@ const PendingRemote = struct {
     // sign_event only: the draft text, restored to the composer on failure or
     // timeout. Owned by the slot; freed when the request resolves or is swept.
     content: ?[]const u8 = null,
+    // Whether `content` is a composer draft worth restoring on failure. A
+    // reaction (kind:7 "+") is not, so its failure is silent, not a stray "+".
+    restorable: bool = false,
 
     fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -657,10 +662,10 @@ fn pendingUnlock() void {
 }
 
 /// Records a request as awaiting its response, taking ownership of `content`
-/// (the draft, for `sign_event`, so a timeout can restore it). Returns false
-/// when the table is full or the id does not fit, in which case the caller
-/// still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
+/// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
+/// Returns false when the table is full or the id does not fit, in which case
+/// the caller still owns `content`.
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -673,6 +678,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
             .deadline_s = nowSeconds() + remote_sign_timeout_s,
             .generation = g_remote_generation.load(.acquire),
             .content = content,
+            .restorable = restorable,
         };
         @memcpy(slot.id_buf[0..req_id.len], req_id);
         return true;
@@ -716,7 +722,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content);
+    return registerPending(req_id, method, content, content != null);
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -1049,6 +1055,68 @@ pub fn resetProfilesForTest() void {
     g_notes_names_generation = 0;
 }
 
+// The notes this session has liked, so the heart renders filled and an un-like
+// knows which reaction (kind:7) to delete. In-memory: a returning session
+// rediscovers its likes from the ingested crowd reactions (PR-7 dedupes by
+// reactor), so this is the optimistic layer, not the source of truth.
+const my_likes_cap = 512;
+const MyLike = struct {
+    used: bool = false,
+    note_id: i64 = 0,
+    // The id of our own kind:7 reaction, e-tagged by the kind:5 that un-likes it.
+    reaction_id: [32]u8 = [_]u8{0} ** 32,
+};
+var g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
+
+/// Whether this session has liked `note_id`.
+fn isLiked(note_id: i64) bool {
+    return likeEntry(note_id) != null;
+}
+
+/// The like record for `note_id`, or null.
+fn likeEntry(note_id: i64) ?*MyLike {
+    for (&g_my_likes) |*e| {
+        if (e.used and e.note_id == note_id) return e;
+    }
+    return null;
+}
+
+/// Records a like on `note_id` with our reaction's id, so the heart fills and an
+/// un-like can find the reaction. Silently drops when the table is full (the
+/// like still publishes; only the optimistic bookkeeping is skipped).
+fn rememberLike(note_id: i64, reaction_id: [32]u8) void {
+    if (likeEntry(note_id)) |e| {
+        e.reaction_id = reaction_id;
+        return;
+    }
+    for (&g_my_likes) |*e| {
+        if (!e.used) {
+            e.* = .{ .used = true, .note_id = note_id, .reaction_id = reaction_id };
+            return;
+        }
+    }
+}
+
+/// Drops the like on `note_id`, returning its reaction id (to e-tag the un-like).
+fn forgetLike(note_id: i64) ?[32]u8 {
+    if (likeEntry(note_id)) |e| {
+        const id = e.reaction_id;
+        e.* = .{};
+        return id;
+    }
+    return null;
+}
+
+/// Clears the like table. For tests, which share the process globals.
+pub fn resetLikesForTest() void {
+    g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
+}
+
+/// Whether this session has liked the note (for tests and the view).
+pub fn isLikedForTest(note_id: i64) bool {
+    return isLiked(note_id);
+}
+
 /// Finds the cached profile for `pubkey`, or null.
 fn lookupProfile(pubkey: [32]u8) ?*Profile {
     for (&g_profiles) |*p| {
@@ -1174,6 +1242,9 @@ pub const Note = struct {
     // then casts it to u64, so a raw u64 (or negative i64) from the id's high
     // bytes would overflow and panic. Mask off the sign bit.
     id: i64 = 0,
+    // The full 32-byte event id, for the reaction's `e` tag and the engagement
+    // subscription's `#e` filter. The i64 above is only a render/dedup key.
+    event_id: [32]u8 = [_]u8{0} ** 32,
     created_at: i64 = 0,
     // The author's full pubkey, so the view can resolve a display name and an
     // avatar from the profile cache at render time (picking up a name or a
@@ -1319,6 +1390,9 @@ pub const Model = struct {
     // The remembered intent: the guest reached for the composer, so composing
     // opens by itself the moment an identity exists. The sheet says so.
     pending_compose: bool = false,
+    // The other remembered intent: the guest reached for a like. The note id is
+    // held here (0 = none) so the like completes the moment an identity exists.
+    pending_like: i64 = 0,
     // Whether the join sheet is on its focused bunker-input step (chose "Use
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
@@ -1359,7 +1433,7 @@ pub const Model = struct {
         "relay_health",          "relays_online", "scope_voices",           "is_guest",       "show_guest_strip",
         "guest_strip_dismissed", "joining",       "pending_compose",        "naming",         "name_buffer",
         "name_draft",            "name_empty",    "toast_buf",              "toast_len",      "toast_until",
-        "toast_text",            "backup_nudge",  "backup_nudge_dismissed", "bunker_mode",
+        "toast_text",            "backup_nudge",  "backup_nudge_dismissed", "bunker_mode",    "pending_like",
     };
 
     /// The name beat's current text.
@@ -2416,6 +2490,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         .created_at = ev.created_at,
         .pubkey = ev.pubkey,
         .id = noteIdOf(ev),
+        .event_id = ev.id,
     };
 
     // Avatar initials fallback: the first pubkey byte as two hex digits, stable
@@ -2729,12 +2804,15 @@ pub const Msg = union(enum) {
     expand_image: i64,
     /// Dismiss the expanded picture.
     close_image,
+    /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
+    /// deletion to un-like. A guest press is remembered and routed to the join.
+    like: i64,
     /// The reader reached the end of the feed: ask the store for another page.
     load_older,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2842,12 +2920,24 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
+/// The context line when a guest reached for a like: names whose note it was, so
+/// the sheet explains why it appeared. Falls back to a generic line if the note
+/// has scrolled out of the window.
+fn pendingLikeText(ui: *AppUi, model: *const Model) []const u8 {
+    if (model.noteById(model.pending_like)) |note| {
+        return std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{note.author()}) catch "Your like is waiting.";
+    }
+    return "Your like is waiting.";
+}
+
 /// The join ladder: three ways in, most confident first, always the way back.
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
         if (model.pending_compose)
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
+        else if (model.pending_like != 0)
+            ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.status_warning } }, pendingLikeText(ui, model))
         else
             ui.spacer(0),
         ui.paragraph(
@@ -3203,18 +3293,51 @@ fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
     }, note.initials());
 }
 
-/// The engagement row: reply, repost, like, zap, in that fixed order, as muted
-/// action glyphs. The counts are backend data the feed does not carry yet (the
-/// app ingests only kinds 0 and 1), so the row ships with actionable icons and
-/// no numbers, and the numbers arrive when the aggregation pipeline lands.
-fn engagementRow(ui: *AppUi) AppUi.Node {
+/// The engagement row: reply, repost, like, zap, in that fixed order. The like
+/// is pressable and carries an optimistic active state (a filled red heart plus
+/// a red count) the instant it is pressed. Reply, repost, and zap are still
+/// muted glyphs this pass; their crowd counts arrive with the aggregation.
+fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
     const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style_tokens = .{ .foreground = .text_muted } };
     return ui.row(.{ .gap = 30, .cross = .center, .opacity = 0.75 }, .{
         ui.appIcon(glyph, "reply"),
         ui.icon(glyph, "repeat"),
-        ui.appIcon(glyph, "like"),
+        likeAction(ui, note),
         ui.appIcon(glyph, "zap"),
     });
+}
+
+/// The like control: a pressable heart and its count. Liked is never colour
+/// alone (spec): the glyph fills red AND the count turns red together. The count
+/// is the user's own optimistic +1 this pass (nothing when not liked); the
+/// crowd count lands with the aggregation.
+fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
+    const liked = isLiked(note.id);
+    const count: u64 = if (liked) 1 else 0;
+    const tint = if (liked) theme.palette.status_like else theme.palette.text_muted;
+    return ui.el(.list_item, .{
+        .padding = 2,
+        .style = .{ .quiet_hover = true },
+        .on_press = Msg{ .like = note.id },
+        .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
+    }, .{
+        ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.appIcon(.{ .width = 15, .height = 15, .style = .{ .foreground = tint } }, "like"),
+            if (count > 0)
+                ui.text(.{ .size = .sm, .style = .{ .foreground = tint } }, formatCount(ui.arena, count))
+            else
+                ui.spacer(0),
+        }),
+    });
+}
+
+/// Formats an engagement count: the integer below 1000, one-decimal `k` above,
+/// and empty at zero so the caller draws the icon alone rather than a "0".
+pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
+    if (n == 0) return "";
+    if (n < 1000) return std.fmt.allocPrint(arena, "{d}", .{n}) catch "";
+    const k = @as(f64, @floatFromInt(n)) / 1000.0;
+    return std.fmt.allocPrint(arena, "{d:.1}k", .{k}) catch "";
 }
 
 /// One feed note: a bare row on the window, no card. Avatar column, then an
@@ -3251,7 +3374,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                     // shape whether or not it has loaded, so the feed never
                     // shifts as images arrive.
                     if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                    engagementRow(ui),
+                    engagementRow(ui, note),
                 }),
             }),
             // The only separation between rows: a hairline, so a real border
@@ -3420,6 +3543,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
                 scanNip05Fetches(fx);
+                // Complete a like a guest reached for, now that they have signed
+                // in and the feed above has rebuilt.
+                drivePendingLike(model, fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -3487,6 +3613,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.joining = false;
             model.bunker_mode = false;
             model.pending_compose = false;
+            model.pending_like = 0;
         },
         .join_create => {
             // Async: the daemon mints the key (the key never enters Plaza), the
@@ -3590,6 +3717,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_url => |url| openExternally(fx, url),
         .expand_image => |note_id| model.expanded_note = note_id,
         .close_image => model.expanded_note = null,
+        .like => |note_id| toggleLike(model, fx, note_id),
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
             // Load what just came into view without waiting for the next tick.
@@ -3665,7 +3793,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     const json = std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{clean}) catch return;
     if (g_signer_kind == .helper) {
         // The daemon signs the kind:0; the response seeds the cache.
-        requestHelperSign(fx, gpa, json, 0);
+        requestHelperSign(fx, gpa, nowSeconds(), 0, &.{}, json);
         model.name_buffer.clear();
         return;
     }
@@ -3745,12 +3873,138 @@ fn submitPost(model: *Model, fx: *Effects) void {
     // content slice rather than copying it, and the store write and either the
     // publisher or the NIP-46 round-trip read it after the draft is cleared.
     const owned = gpa.dupe(u8, text) catch return;
-    switch (g_signer_kind) {
-        .local => postLocally(gpa, owned),
-        .remote => requestRemoteSign(gpa, owned),
-        .helper => requestHelperSign(fx, gpa, owned, 1),
-    }
+    // A composer draft: kind:1, no tags, restorable to the composer if a remote
+    // signer never answers.
+    signAndPublish(fx, gpa, nowSeconds(), 1, &.{}, owned, true);
     model.draft_buffer.clear();
+}
+
+/// Signs `content_owned` as an event of `kind` with `tags`, stamped `created`,
+/// through whichever signer is active, then stores and publishes it. Takes
+/// ownership of `content_owned` and `tags` (process-lifetime: the local and
+/// remote paths reference them after this returns, and the write seam intends
+/// them to outlive the detached publish). `restorable` marks a composer draft,
+/// so only a lost post is put back in the composer, never a reaction.
+fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+    switch (g_signer_kind) {
+        .local => {
+            const signer = g_identity_signer orelse return;
+            const kp = g_identity_kp orelse return;
+            const ev = nostr.event.create(gpa, signer, kp, created, kind, tags, content_owned, null) catch return;
+            ingestAndPublish(gpa, ev, null);
+        },
+        .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
+        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned),
+    }
+}
+
+// ------------------------------------------------------------------------ likes
+//
+// A like is a NIP-25 kind:7 reaction with content "+", e/p/k-tagging the note.
+// It rides the same three sign paths as a post and is local-first and optimistic:
+// the heart fills the instant it is pressed (read from `g_my_likes` at render),
+// and the reaction publishes in the background. Un-like is a NIP-09 kind:5
+// deletion e-tagging our own reaction, since NIP-25 has no un-react. A guest
+// press cannot sign, so it is remembered and completed after sign-in.
+
+/// Lowercase-hex-encodes a 32-byte value into a fresh process-lifetime slice.
+fn hexAlloc(gpa: std.mem.Allocator, bytes: [32]u8) ?[]const u8 {
+    const out = gpa.alloc(u8, 64) catch return null;
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0x0f];
+    }
+    return out;
+}
+
+/// The NIP-25 like tags for a note: `["e", id]`, `["p", author]`, `["k", "1"]`.
+/// Process-lifetime (the sign paths reference them); null on OOM.
+fn buildLikeTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, note.event_id) orelse return null;
+    const author_hex = hexAlloc(gpa, note.pubkey) orelse return null;
+    const e = gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null;
+    const p = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return null;
+    const k = gpa.dupe([]const u8, &.{ "k", "1" }) catch return null;
+    const tags = gpa.alloc(nostr.event.Tag, 3) catch return null;
+    tags[0] = e;
+    tags[1] = p;
+    tags[2] = k;
+    return tags;
+}
+
+/// The NIP-09 deletion tags to un-like: `["e", reaction_id]`, `["k", "7"]`.
+fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, reaction_id) orelse return null;
+    const e = gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null;
+    const k = gpa.dupe([]const u8, &.{ "k", "7" }) catch return null;
+    const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
+    tags[0] = e;
+    tags[1] = k;
+    return tags;
+}
+
+/// Toggles a like on `note_id`. A guest cannot sign, so the like is remembered
+/// and the join sheet opens; it completes after sign-in (`drivePendingLike`).
+fn toggleLike(model: *Model, fx: *Effects, note_id: i64) void {
+    if (model.is_guest()) {
+        model.pending_like = note_id;
+        model.joining = true;
+        return;
+    }
+    if (isLiked(note_id)) unlike(fx, note_id) else like(model, fx, note_id);
+}
+
+/// Publishes a kind:7 like and fills the heart at once. The reaction id is
+/// deterministic in the unsigned fields, so it is computed here (with the same
+/// created/tags/content the sign path will use) and remembered, so an un-like
+/// can delete exactly this reaction.
+fn like(model: *const Model, fx: *Effects, note_id: i64) void {
+    const note = model.noteById(note_id) orelse return;
+    const gpa = std.heap.page_allocator;
+    const pk = activePubkey() orelse return;
+    const created = nowSeconds();
+    const tags = buildLikeTags(gpa, note) orelse return;
+    const content = gpa.dupe(u8, "+") catch return;
+    const id = nostr.event.computeId(gpa, pk, created, 7, tags, content) catch return;
+    rememberLike(note_id, id);
+    signAndPublish(fx, gpa, created, 7, tags, content, false);
+}
+
+/// Publishes a kind:5 deletion of our own reaction and empties the heart at once.
+fn unlike(fx: *Effects, note_id: i64) void {
+    const gpa = std.heap.page_allocator;
+    const reaction_id = forgetLike(note_id) orelse return;
+    const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
+    const content = gpa.dupe(u8, "") catch return;
+    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false);
+}
+
+/// After sign-in, completes a like a guest reached for: the welcome-in moment.
+/// Driven from the tick, where `fx` is in hand and the feed has just rebuilt.
+fn drivePendingLike(model: *Model, fx: *Effects) void {
+    if (model.pending_like == 0 or model.is_guest()) return;
+    const note_id = model.pending_like;
+    model.pending_like = 0;
+    if (isLiked(note_id)) return;
+    like(model, fx, note_id);
+    setToast(model, "Liked");
+}
+
+/// Deep-copies `tags` into process-lifetime memory so the detached publisher can
+/// read them after the parse arena is freed. Returns an empty set on OOM (posts
+/// are tagless, so nothing is lost there; a reaction that OOMs simply drops).
+fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) []const nostr.event.Tag {
+    if (tags.len == 0) return &.{};
+    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return &.{};
+    for (tags, 0..) |tag, i| {
+        const fields = gpa.alloc([]const u8, tag.len) catch return &.{};
+        for (tag, 0..) |field, j| {
+            fields[j] = gpa.dupe(u8, field) catch return &.{};
+        }
+        out[i] = fields;
+    }
+    return out;
 }
 
 /// The engine write seam: a note this process now holds, whether locally signed
@@ -3775,25 +4029,6 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     }
     const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch return;
     thread.detach();
-}
-
-/// Local path: sign with the local key, then hand the note to the write seam so
-/// it lands in the store (shown on the next tick) and reaches the pool.
-fn postLocally(gpa: std.mem.Allocator, owned: []const u8) void {
-    const ev = signNote(gpa, owned) orelse {
-        gpa.free(owned);
-        return;
-    };
-    ingestAndPublish(gpa, ev, null);
-}
-
-/// Signs a kind:1 note with the local key. `SignerKind` selects this or the
-/// remote path (`requestRemoteSign`). `content` must outlive the returned event
-/// (it is referenced, not copied). Null if no local identity is ready.
-fn signNote(gpa: std.mem.Allocator, content: []const u8) ?nostr.event.Event {
-    const signer = g_identity_signer orelse return null;
-    const kp = g_identity_kp orelse return null;
-    return nostr.event.create(gpa, signer, kp, nowSeconds(), 1, &.{}, content, null) catch null;
 }
 
 /// Publishes `ev` to every relay in the pool, each on a throwaway connection,
@@ -3896,20 +4131,21 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
-    if (!registerPending(req_id, .connect, null)) return;
+    if (!registerPending(req_id, .connect, null, false)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
 
-/// Remote path: build the unsigned kind:1 event and send a `sign_event` request.
-/// The signed event returns to the listener, which stores and publishes it.
-fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
+/// Remote path: build the unsigned event of `kind` (with `tags`, stamped
+/// `created_at`) and send a `sign_event` request. The signed event returns to
+/// the listener, which stores and publishes it. `restorable` is true only for a
+/// composer draft, so a failed reaction never lands "+"-text in the composer.
+fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
     // `content_owned` is handed to the pending slot (so a timeout can restore
     // it to the composer); it is freed here only on an early return.
-    const created_at = nowSeconds();
     // A canonical unsigned event (the bunker fills in the signature). The id is
     // computed against the user's pubkey so the bunker's result matches it.
-    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, 1, &.{}, content_owned) catch {
+    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, kind, tags, content_owned) catch {
         gpa.free(content_owned);
         return;
     };
@@ -3917,8 +4153,8 @@ fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
         .id = id,
         .pubkey = g_remote_pubkey,
         .created_at = created_at,
-        .kind = 1,
-        .tags = &.{},
+        .kind = kind,
+        .tags = tags,
         .content = content_owned,
         .sig = [_]u8{0} ** 64,
     };
@@ -3935,7 +4171,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, content_owned: []const u8) void {
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned)) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable)) {
         gpa.free(content_owned);
         return;
     }
@@ -4066,7 +4302,10 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             const owned = gpa.dupe(u8, parsed.value.content) catch return;
             var out = parsed.value;
             out.content = owned;
-            out.tags = &.{};
+            // Preserve the signed tags (a reaction carries e/p/k); forcing them
+            // empty would make the id not match, and the verify below would drop
+            // it. Deep-copied because `parsed` is freed on return.
+            out.tags = dupeTags(gpa, parsed.value.tags);
             ingestAndPublish(gpa, out, signer);
         },
     }
@@ -4094,6 +4333,7 @@ fn scanPendingRemote(model: *Model) void {
         if (!stale and !due) continue;
         const method = slot.method;
         const content = slot.content;
+        const slot_restorable = slot.restorable;
         slot.* = .{};
         if (stale) {
             if (content) |c| gpa.free(c);
@@ -4101,11 +4341,13 @@ fn scanPendingRemote(model: *Model) void {
         }
         switch (method) {
             .sign_event => {
-                // The composer holds one draft: keep the first, free the rest.
+                // The composer holds one draft: keep the first restorable one,
+                // free the rest. A reaction's content is not restorable, so it
+                // is freed and its failure stays silent.
                 if (content) |c| {
-                    if (restore == null) restore = c else gpa.free(c);
+                    if (slot_restorable and restore == null) restore = c else gpa.free(c);
                 }
-                sign_failed = true;
+                if (slot_restorable) sign_failed = true;
             },
             .connect => {
                 if (content) |c| gpa.free(c);
@@ -4245,7 +4487,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 // opens the welcome screen, and "Create your identity" generates and persists
 // it. This is the zero-config local signer; connecting an external signer
 // (Signet, over NIP-46) so the key never touches the client is the next
-// onboarding option, and swaps in at `signNote`.
+// onboarding option, and swaps in at `signAndPublish`.
 
 /// Opens (creating if needed) `$HOME/.plaza`, returning the directory handle.
 fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
