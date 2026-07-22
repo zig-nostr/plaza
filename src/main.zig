@@ -227,6 +227,125 @@ var g_remote_secret_len: usize = 0;
 var g_remote_status = std.atomic.Value(u8).init(0);
 // Monotonic source of unique NIP-46 request ids.
 var g_req_counter = std.atomic.Value(u64).init(0);
+
+// ------------------------------------------------- the isolated signer helper
+//
+// plaza-signer holds the key in a separate PROCESS, reached over loopback HTTP.
+// Plaza spawns it at launch, writes it a 0600 bearer token, and (for now)
+// health-checks it; routing the actual signing through it comes next. The port
+// is Plaza-specific (not signet's 8787), so a standalone Signet and the
+// built-in one never collide.
+const helper_port: u16 = 8790;
+const helper_spawn_key: u64 = 40;
+const helper_poll_key: u64 = 41;
+// The daemon binary (a sibling of Plaza's own executable) and the shared token,
+// resolved once in main and read by boot/tick.
+var g_helper_bin_buf: [1024]u8 = undefined;
+var g_helper_bin_len: usize = 0;
+var g_helper_token_buf: [64]u8 = undefined;
+var g_helper_token_len: usize = 0;
+var g_helper_state_dir_buf: [512]u8 = undefined;
+var g_helper_state_dir_len: usize = 0;
+var g_helper_token_path_buf: [512]u8 = undefined;
+var g_helper_token_path_len: usize = 0;
+// 0 starting, 1 uninitialized (reachable, no key yet), 2 ready (holds a key),
+// 3 unreachable. Reachable at all (1 or 2) is what proves the loopback IPC.
+var g_helper_state = std.atomic.Value(u8).init(0);
+
+fn helperBin() []const u8 {
+    return g_helper_bin_buf[0..g_helper_bin_len];
+}
+fn helperToken() []const u8 {
+    return g_helper_token_buf[0..g_helper_token_len];
+}
+
+/// Resolves the daemon path (a sibling of argv[0], so it works both from the
+/// dev tree and a packaged bundle), mints a fresh bearer token, and writes it
+/// 0600 under ~/.plaza. Best-effort: on any failure the helper simply never
+/// comes up and signing keeps to its current in-process path.
+fn resolveHelper(init: std.process.Init) void {
+    // The daemon lives beside Plaza's own executable.
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    const argv0 = args.next() orelse return;
+    const dir = std.fs.path.dirname(argv0) orelse ".";
+    const bin = std.fmt.bufPrint(&g_helper_bin_buf, "{s}/plaza-signer", .{dir}) catch return;
+    g_helper_bin_len = bin.len;
+
+    const home = init.environ_map.get("HOME") orelse ".";
+    const state_dir = std.fmt.bufPrint(&g_helper_state_dir_buf, "{s}/.plaza", .{home}) catch return;
+    g_helper_state_dir_len = state_dir.len;
+    const token_path = std.fmt.bufPrint(&g_helper_token_path_buf, "{s}/.plaza/signer.token", .{home}) catch return;
+    g_helper_token_path_len = token_path.len;
+
+    // A fresh 32-byte token, hex-encoded, so a stray process on the machine
+    // cannot drive the signer even if it guesses the port.
+    var raw: [32]u8 = undefined;
+    init.io.randomSecure(&raw) catch return;
+    var hexbuf: [64]u8 = undefined;
+    _ = hexLower(&hexbuf, raw);
+    @memcpy(g_helper_token_buf[0..64], &hexbuf);
+    g_helper_token_len = 64;
+
+    var d = plazaDir(init.io, init.environ_map) catch return;
+    defer d.close(init.io);
+    d.writeFile(init.io, .{
+        .sub_path = "signer.token",
+        .data = &hexbuf,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch return;
+}
+
+/// Spawns the keyholder daemon: keyless, it idles serving /pubkey and /setup.
+/// The parent-pid is Plaza's, so the daemon exits when Plaza does.
+fn spawnHelper(fx: *Effects) void {
+    if (g_helper_bin_len == 0 or g_helper_token_len == 0) return;
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{helper_port}) catch return;
+    var pid_buf: [16]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()}) catch return;
+    fx.spawn(.{
+        .key = helper_spawn_key,
+        .argv = &.{
+            helperBin(),    "--serve",
+            "--port",       port_str,
+            "--state-dir",  g_helper_state_dir_buf[0..g_helper_state_dir_len],
+            "--token-file", g_helper_token_path_buf[0..g_helper_token_path_len],
+            "--parent-pid", pid_str,
+        },
+        .on_exit = Effects.exitMsg(.helper_exited),
+        .output = .collect,
+    });
+}
+
+/// Health-checks the daemon: GET /pubkey with the bearer token. A 200 (in any
+/// state) proves the loopback IPC works; a connection error keeps it at
+/// unreachable and the tick tries again.
+fn pollHelper(fx: *Effects) void {
+    if (g_helper_token_len == 0) return;
+    if (g_helper_state.load(.acquire) >= 1) return; // already reachable
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{helper_port}) catch return;
+    var auth_buf: [96]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
+    fx.fetch(.{
+        .key = helper_poll_key,
+        .url = url,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.helper_pubkey),
+    });
+}
+
+/// Records the health-check result. A reachable daemon (200) tells us the IPC
+/// works; the body says whether it already holds a key.
+fn handleHelperPubkey(response: native_sdk.EffectResponse) void {
+    if (response.outcome != .ok or response.status != 200) {
+        g_helper_state.store(3, .release); // unreachable, keep retrying
+        return;
+    }
+    const ready = std.mem.indexOf(u8, response.body, "\"state\":\"ready\"") != null;
+    g_helper_state.store(if (ready) 2 else 1, .release);
+    std.debug.print("plaza: [helper] reachable, state={s}\n", .{if (ready) "ready" else "uninitialized"});
+}
 // The listener runs for one connection generation. A logout or a reconnect
 // bumps this; the detached listener and the in-flight workers see the change
 // and stop, so an old bunker's listener never processes into a new session (or
@@ -2143,6 +2262,10 @@ pub const Msg = union(enum) {
     logout_cancel,
     /// Confirm logout: wipe the session (and a local key) and return to onboarding.
     logout_confirm,
+    /// The signer daemon exited (logged; the watchdog and respawn are later).
+    helper_exited: native_sdk.EffectExit,
+    /// The signer daemon's /pubkey health-check answered.
+    helper_pubkey: native_sdk.EffectResponse,
     /// An avatar fetch finished: register the image or fall back to initials.
     avatar_fetched: native_sdk.EffectResponse,
     /// A media fetch finished: decode, downscale if needed, and register it.
@@ -2169,7 +2292,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2777,6 +2900,8 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.animate),
     });
+    // Bring up the isolated signer; the tick health-checks it until it answers.
+    spawnHelper(fx);
     // Background metadata fetching on its own cadence, off the view refresh.
     fx.startTimer(.{
         .key = profile_timer_key,
@@ -2798,6 +2923,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
+                // Health-check the signer daemon until the loopback IPC answers.
+                pollHelper(fx);
                 // A toast lives a few seconds, then the tick retires it.
                 if (model.toast_until != 0 and nowSeconds() >= model.toast_until) {
                     model.toast_until = 0;
@@ -2817,6 +2944,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 requestWantedProfiles();
             }
         },
+        .helper_exited => |e| {
+            if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
+        },
+        .helper_pubkey => |response| handleHelperPubkey(response),
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
@@ -3485,6 +3616,9 @@ pub fn main(init: std.process.Init) !void {
     // Best-effort: on failure the app still runs, as a guest.
     loadSettings(init.io, init.environ_map);
     _ = restoreSession(init.io, init.environ_map);
+    // Resolve the keyholder daemon (its path and a fresh bearer token); boot
+    // spawns it. Best-effort, and non-fatal: signing still works in-process.
+    resolveHelper(init);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
