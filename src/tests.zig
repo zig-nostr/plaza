@@ -894,3 +894,25 @@ test "a remembered intent replays once and only once" {
     main.replayPendingForTest(&model);
     try testing.expect(!model.composing);
 }
+
+// ---- C2: bunker connect states ----------------------------------------------
+
+test "the composer line tells the truth about the signer connection" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    defer {
+        main.setRemoteStateForTest(0, 0);
+        main.clearIdentityForTest();
+    }
+    var model = main.initialModel();
+
+    main.setRemoteStateForTest(1, 1);
+    try testing.expect(std.mem.startsWith(u8, model.identity(arena), "Reaching your signer · "));
+
+    main.setRemoteStateForTest(2, 1);
+    try testing.expect(std.mem.startsWith(u8, model.identity(arena), "Signing via your signer · npub1"));
+
+    main.setRemoteStateForTest(3, 1);
+    try testing.expectEqualStrings("Your signer is unreachable. Posts will not sign.", model.identity(arena));
+}
