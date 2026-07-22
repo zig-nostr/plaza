@@ -93,6 +93,18 @@ const State = struct {
         self.pubkey = kp.public_key;
     }
 
+    /// Forgets the key: wipes the in-memory secret, drops the pubkey, and
+    /// deletes the file. After this the daemon is uninitialized again, so a
+    /// logout is not silently undone by a client re-reading /pubkey.
+    fn reset(self: *State, io: std.Io) void {
+        self.lock();
+        defer self.unlock();
+        if (self.secret) |*sk| std.crypto.secureZero(u8, sk[0..]);
+        self.secret = null;
+        self.pubkey = null;
+        self.key_dir.deleteFile(io, self.key_path) catch {};
+    }
+
     /// Loads a persisted secret at startup, if any.
     fn load(self: *State, gpa: std.mem.Allocator, io: std.Io) void {
         // A plain read of the raw-hex key file: keystore.readKeyFile is for
@@ -442,6 +454,9 @@ fn handleConn(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream) !void {
         return handleCipher(gpa, io, w, body, .encrypt);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, ipc.path_nip44_decrypt)) {
         return handleCipher(gpa, io, w, body, .decrypt);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/reset")) {
+        g_state.reset(io);
+        return handlePubkey(gpa, w);
     }
     return respond(w, 404, "no such endpoint");
 }
