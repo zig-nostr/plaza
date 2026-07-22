@@ -24,7 +24,7 @@
         <card padding="16">
           <column gap="8">
             <text size="sm" foreground="text_muted">Your secret key</text>
-            <text wrap="true" foreground="text_muted">Back this up. It's the only way to restore this identity on another device, and Plaza never sends it anywhere.</text>
+            <text wrap="true" foreground="text_muted">Right now this key lives only on this Mac. Back it up so losing the Mac is not losing the account. Plaza never sends it anywhere.</text>
             <if test="{nsec_hidden}">
               <button size="sm" variant="ghost" on-press="toggle_nsec">Reveal secret key</button>
             </if>

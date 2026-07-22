@@ -869,6 +869,18 @@ pub const Model = struct {
     // The remembered intent: the guest reached for the composer, so composing
     // opens by itself the moment an identity exists. The sheet says so.
     pending_compose: bool = false,
+    // The name beat: after creating an identity, one optional, skippable ask
+    // so the account is not blank. Never for imported keys or signers.
+    naming: bool = false,
+    name_buffer: canvas.TextBuffer(64) = .{},
+    // A small confirming toast ("Posted", "Name set"), cleared by the tick.
+    toast_buf: [48]u8 = undefined,
+    toast_len: usize = 0,
+    toast_until: i64 = 0,
+    // The backup nudge after the first local-key post this session: calm,
+    // dismissible, stakes stated plainly.
+    backup_nudge: bool = false,
+    backup_nudge_dismissed: bool = false,
     // Where the feed is scrolled, so images load around the viewport instead of
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
@@ -886,14 +898,30 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                 "notes_len",     "live_relays",     "offline_relays", "draft_buffer",
-        "stage",                 "login_buffer",  "logout_pending",  "reveal_nsec",    "proxy_buffer",
-        "proxy_saved",           "feed_scroll",   "feed_limit",      "draft",          "draft_empty",
-        "identity",              "has_notes",     "empty",           "status",         "empty_text",
-        "footer",                "note_list",     "expanded_note",   "composing",      "caught_up",
-        "relay_health",          "relays_online", "scope_voices",    "is_guest",       "show_guest_strip",
-        "guest_strip_dismissed", "joining",       "pending_compose",
+        "notes",                 "notes_len",     "live_relays",            "offline_relays", "draft_buffer",
+        "stage",                 "login_buffer",  "logout_pending",         "reveal_nsec",    "proxy_buffer",
+        "proxy_saved",           "feed_scroll",   "feed_limit",             "draft",          "draft_empty",
+        "identity",              "has_notes",     "empty",                  "status",         "empty_text",
+        "footer",                "note_list",     "expanded_note",          "composing",      "caught_up",
+        "relay_health",          "relays_online", "scope_voices",           "is_guest",       "show_guest_strip",
+        "guest_strip_dismissed", "joining",       "pending_compose",        "naming",         "name_buffer",
+        "name_draft",            "name_empty",    "toast_buf",              "toast_len",      "toast_until",
+        "toast_text",            "backup_nudge",  "backup_nudge_dismissed",
     };
+
+    /// The name beat's current text.
+    pub fn name_draft(self: *const Model) []const u8 {
+        return self.name_buffer.text();
+    }
+    /// Whether the name field is blank, which disables Save.
+    pub fn name_empty(self: *const Model) bool {
+        return std.mem.trim(u8, self.name_buffer.text(), " \t\r\n").len == 0;
+    }
+    /// The live toast text, empty when none is showing.
+    pub fn toast_text(self: *const Model) []const u8 {
+        if (self.toast_until == 0) return "";
+        return self.toast_buf[0..self.toast_len];
+    }
 
     /// The composer's current text (what `text="{draft}"` binds).
     pub fn draft(self: *const Model) []const u8 {
@@ -2083,6 +2111,16 @@ pub const Msg = union(enum) {
     keep_browsing,
     /// Hide the guest strip for this session.
     dismiss_guest_strip,
+    /// A text edit in the name beat's field.
+    name_edit: canvas.TextInputEvent,
+    /// Publish the chosen name as the account's kind:0 and move on.
+    name_save,
+    /// Skip the name beat; the account stays nameless for now.
+    name_skip,
+    /// From the backup nudge: open Settings at the backup card.
+    backup_now,
+    /// Dismiss the backup nudge for this session.
+    backup_later,
     /// Onboarding: create a fresh local identity and enter the feed.
     create_identity,
     /// A text edit in the onboarding sign-in field.
@@ -2131,7 +2169,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2165,10 +2203,61 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.stage == .ready and model.joining) {
         return ui.stack(.{ .grow = 1 }, .{ base, joinSheet(ui, model) });
     }
+    if (model.stage == .ready and model.naming) {
+        return ui.stack(.{ .grow = 1 }, .{ base, nameSheet(ui, model) });
+    }
     if (model.stage == .ready and model.composing) {
         return ui.stack(.{ .grow = 1 }, .{ base, composeSheet(ui, model) });
     }
+    if (model.stage == .ready and model.toast_until != 0) {
+        return ui.stack(.{ .grow = 1 }, .{ base, toastOverlay(ui, model) });
+    }
     return base;
+}
+
+/// The name beat: one optional ask after creating an identity, so the account
+/// is not blank. Fully skippable; the remembered intent replays either way.
+fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .on_dismiss = .name_skip,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "Name" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = 1.3 }},
+                ),
+                ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Shown with your notes. Change it any time."),
+                ui.el(.textarea, .{
+                    .text = model.name_draft(),
+                    .placeholder = "A name people will see",
+                    .on_input = AppUi.inputMsg(.name_edit),
+                    .on_submit = .name_save,
+                    .height = 44,
+                }, .{}),
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .name_skip }, "Skip"),
+                    ui.spacer(1),
+                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.name_empty(), .on_press = .name_save }, "Save"),
+                }),
+            }),
+        }),
+    });
+}
+
+/// A small confirming toast, bottom center, retired by the tick.
+fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .padding = 24 }, .{
+        ui.row(.{ .padding = 10, .style = .{ .background = p.surface_toast, .border = p.border_modal, .radius = 10, .stroke_width = 1 } }, .{
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_body } }, model.toast_text()),
+        }),
+    });
 }
 
 /// The first-intent sheet: the join ladder over the dimmed feed. Three ways in,
@@ -2372,7 +2461,25 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
             // so the offset survives every rebuild (and the image viewer
             // opening over it) without the model mirroring it.
             ui.virtualList(options, window, .{rows}),
+        if (model.backup_nudge) backupNudge(ui) else ui.spacer(0),
         statusBar(ui, model),
+    });
+}
+
+/// The backup nudge: calm, dismissible, the stakes stated plainly. Rises once,
+/// after the first local-key post of a session.
+fn backupNudge(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .style = .{ .background = p.surface_subbar } }, .{
+        ui.column(.{ .height = 1, .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.row(.{ .cross = .center, .gap = 10, .padding = 10 }, .{
+            ui.text(
+                .{ .size = .sm, .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted_alt } },
+                "Right now this key lives on one Mac. Back it up so losing the Mac is not losing the account.",
+            ),
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .backup_now }, "Back up"),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .backup_later }, "Not now"),
+        }),
     });
 }
 
@@ -2691,6 +2798,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
+                // A toast lives a few seconds, then the tick retires it.
+                if (model.toast_until != 0 and nowSeconds() >= model.toast_until) {
+                    model.toast_until = 0;
+                    model.toast_len = 0;
+                }
             }
         },
         .animate => |t| {
@@ -2716,6 +2828,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Posting closes the sheet; the note is already local and will
             // appear on the next tick.
             model.composing = false;
+            setToast(model, if (g_signer_kind == .remote) "Sent to your signer" else "Posted");
+            // The first local post is the calm moment to suggest a backup.
+            if (g_signer_kind == .local and !model.backup_nudge_dismissed)
+                model.backup_nudge = true;
         },
         .open_compose => {
             // The gate is on press, not on sight: a guest reaching for the
@@ -2737,7 +2853,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!createLocalIdentity()) return;
             persistSession();
             enterFeed(model);
-            replayPending(model);
+            // The name beat first; the remembered intent replays after it.
+            model.naming = true;
         },
         .join_bring_key => {
             // The join screen's field handles both an nsec and a bunker link;
@@ -2750,12 +2867,32 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending_compose = false;
         },
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
+        .name_edit => |edit| model.name_buffer.apply(edit),
+        .name_save => {
+            publishName(model);
+            model.naming = false;
+            setToast(model, "Name set");
+            replayPending(model);
+        },
+        .name_skip => {
+            model.naming = false;
+            replayPending(model);
+        },
+        .backup_now => {
+            model.backup_nudge = false;
+            model.backup_nudge_dismissed = true;
+            model.stage = .settings;
+        },
+        .backup_later => {
+            model.backup_nudge = false;
+            model.backup_nudge_dismissed = true;
+        },
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
             persistSession();
             enterFeed(model);
-            replayPending(model);
+            model.naming = true;
         },
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
@@ -2846,6 +2983,46 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// already running. Shared by all sign-in paths (create, import, remote signer).
 /// A fresh identity means the feed's author filter changed, so force a rebuild
 /// on the next tick by invalidating the change guard.
+/// Shows a small confirming toast for a few seconds (the tick retires it).
+fn setToast(model: *Model, text: []const u8) void {
+    const n = @min(text.len, model.toast_buf.len);
+    @memcpy(model.toast_buf[0..n], text[0..n]);
+    model.toast_len = n;
+    model.toast_until = nowSeconds() + 3;
+}
+
+/// Publishes the name beat's text as the account's kind:0 metadata, and seeds
+/// the local profile cache so the app shows the name at once. Local keys only
+/// (the beat never runs for imports or signers). Quotes and backslashes are
+/// dropped rather than escaped: a display name is prose, not JSON.
+fn publishName(model: *Model) void {
+    const raw = std.mem.trim(u8, model.name_buffer.text(), " \t\r\n");
+    if (raw.len == 0) return;
+    const signer = g_identity_signer orelse return;
+    const kp = g_identity_kp orelse return;
+    const gpa = std.heap.page_allocator;
+
+    var clean_buf: [64]u8 = undefined;
+    var clean_len: usize = 0;
+    for (raw) |c| {
+        if (c == '"' or c == '\\') continue;
+        clean_buf[clean_len] = c;
+        clean_len += 1;
+    }
+    const clean = clean_buf[0..clean_len];
+    if (clean.len == 0) return;
+
+    const json = std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{clean}) catch return;
+    const ev = nostr.event.create(gpa, signer, kp, nowSeconds(), 0, &.{}, json, null) catch {
+        gpa.free(json);
+        return;
+    };
+    ingestAndPublish(gpa, ev, null);
+    // Seed the cache: the composer line and the feed show the name at once.
+    if (upsertProfile(kp.public_key)) |prof| parseMetadataInto(prof, json);
+    model.name_buffer.clear();
+}
+
 /// Completes the remembered first intent once an identity exists: the guest
 /// reached for the composer, so it opens by itself. The welcome-in moment.
 fn replayPending(model: *Model) void {
