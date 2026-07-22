@@ -43,6 +43,13 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src
 
+      - name: Signet window (check, build, format)
+        working-directory: signet-window
+        run: |
+          native check
+          native build
+          zig fmt --check src
+
   # Linux builds the whole stack (the library with its vendored secp256k1 and
   # LMDB, the stb codecs, and the app) and runs the test suite, so a portability
   # break surfaces on the pull request that causes it rather than months later.
