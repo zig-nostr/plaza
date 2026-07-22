@@ -682,26 +682,35 @@ test "one-process: a signed note round-trips through the local store" {
     try testing.expectEqualStrings("stored in-process", q.events[0].content);
 }
 
-test "the compose sheet renders a Post action and, without a key, an identity prompt" {
+test "the titlebar shows join CTAs for a guest, compose and settings when signed in" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var model = main.initialModel();
-    model.stage = .ready;
+    // A guest has no note to compose and no account to configure: the titlebar
+    // carries the always-present join CTAs instead.
+    main.clearIdentityForTest();
+    var guest = main.initialModel();
+    guest.stage = .ready;
+    const guest_tree = try buildTree(arena, &guest);
+    try testing.expect(findAnyText(guest_tree.root, "Create identity") != null);
+    try testing.expect(findAnyText(guest_tree.root, "Sign in") != null);
+    try testing.expect(findAnyText(guest_tree.root, "New note") == null);
+    try testing.expect(findAnyText(guest_tree.root, "Settings") == null);
 
-    // Compose is on demand now: the feed itself carries no composer, only the
-    // titlebar's New note button.
-    const feed_tree = try buildTree(arena, &model);
-    try testing.expect(findAnyText(feed_tree.root, "New note") != null);
-    try testing.expect(findAnyText(feed_tree.root, "Preparing your key…") == null);
+    // Signed in: New note and Settings return; the compose sheet posts.
+    main.setIdentityForTest([_]u8{71} ** 32);
+    defer main.clearIdentityForTest();
+    var user = main.initialModel();
+    user.stage = .ready;
+    const user_tree = try buildTree(arena, &user);
+    try testing.expect(findAnyText(user_tree.root, "New note") != null);
+    try testing.expect(findAnyText(user_tree.root, "Settings") != null);
+    try testing.expect(findAnyText(user_tree.root, "Create identity") == null);
 
-    // Open the sheet: the textarea, the Post action, and (with no identity
-    // loaded in the test process) the setup prompt all render.
-    model.composing = true;
-    const sheet_tree = try buildTree(arena, &model);
+    user.composing = true;
+    const sheet_tree = try buildTree(arena, &user);
     try testing.expect(findAnyText(sheet_tree.root, "Post") != null);
-    try testing.expect(findAnyText(sheet_tree.root, "Preparing your key…") != null);
 }
 
 test "a fresh draft is empty and disables Post" {

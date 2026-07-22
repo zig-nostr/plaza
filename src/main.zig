@@ -2819,7 +2819,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     g_visible_last = window.last_visible_index;
 
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        titleBar(ui),
+        titleBar(ui, model),
         if (model.show_guest_strip()) guestStrip(ui) else ui.spacer(0),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
@@ -2853,9 +2853,10 @@ fn backupNudge(ui: *AppUi) AppUi.Node {
     });
 }
 
-/// The chromeless titlebar: the mark and wordmark on the left, then the compose
-/// and settings actions. One bar, so the feed fills the rest of the window.
-fn titleBar(ui: *AppUi) AppUi.Node {
+/// The chromeless titlebar: the mark and wordmark on the left, then either the
+/// compose and settings actions (signed in) or the join CTAs (a guest). One
+/// bar, so the feed fills the rest of the window.
+fn titleBar(ui: *AppUi, model: *const Model) AppUi.Node {
     return ui.column(.{}, .{
         ui.row(.{ .height = 48, .cross = .center, .gap = 10, .padding = 14 }, .{
             ui.appIcon(.{ .width = 20, .height = 20, .style_tokens = .{ .foreground = .text } }, "mark"),
@@ -2864,8 +2865,19 @@ fn titleBar(ui: *AppUi) AppUi.Node {
                 &.{.{ .text = "Plaza", .weight = .bold }},
             ),
             ui.spacer(1),
-            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note"),
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
+            // A guest has no note to compose and no account to configure, so the
+            // titlebar carries the join CTAs instead, always present. Compose and
+            // settings belong to a signed-in user.
+            if (model.is_guest())
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Sign in"),
+                })
+            else
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note"),
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
+                }),
         }),
         ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
     });
@@ -2881,8 +2893,9 @@ fn guestStrip(ui: *AppUi) AppUi.Node {
                 .{ .size = .sm, .wrap = true, .grow = 1, .style = .{ .foreground = theme.palette.text_muted_alt } },
                 "Browsing as a guest. Reading is yours forever. Join in when something moves you.",
             ),
-            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
-            ui.button(.{ .size = .sm, .on_press = .open_join }, "Sign in"),
+            // The join CTAs live in the titlebar now, always present, so this
+            // strip is just the invitation and its dismiss is safe: closing it
+            // never removes the way in.
             // An icon press, not a text button: the built-in x glyph (the
             // U+2715 codepoint is outside Geist's coverage, rendered tofu).
             ui.el(.list_item, .{
