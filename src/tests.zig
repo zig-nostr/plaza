@@ -555,7 +555,7 @@ test "the logout confirmation replaces the log-out button" {
     try testing.expect(findAnyText(tree.root, "Log out") != null);
 }
 
-test "the empty feed renders the brand and a connecting header" {
+test "the empty feed renders the brand and a connecting body" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -564,8 +564,10 @@ test "the empty feed renders the brand and a connecting header" {
     model.stage = .ready;
     const tree = try buildTree(arena, &model);
 
-    try testing.expect(findByText(tree.root, .text, "Plaza") != null);
-    try testing.expect(findByText(tree.root, .text, "Connecting…") != null);
+    // The titlebar wordmark (a paragraph span now, beside the mark icon).
+    try testing.expect(findAnyText(tree.root, "Plaza") != null);
+    // With no notes yet, the body says what it is waiting for.
+    try testing.expect(findAnyText(tree.root, "Connecting to the relay pool…") != null);
 }
 
 test "a note becomes an npub-labelled card with a relative time" {
@@ -607,30 +609,33 @@ test "the feed renders a note card from the model" {
     model.notes_len = 1;
 
     const tree = try buildTree(arena, &model);
-    // The card shows the content, the npub author, and the count in the footer.
-    try testing.expect(findByText(tree.root, .text, "a note in the feed") != null);
-    try testing.expect(findByText(tree.root, .text, model.notes[0].author()) != null);
-    try testing.expect(findByText(tree.root, .status_bar, "1 notes") != null);
+    // The row shows the content and the npub author, and the status bar's
+    // caught-up line carries the count.
+    try testing.expect(findAnyText(tree.root, "a note in the feed") != null);
+    try testing.expect(findAnyText(tree.root, model.notes[0].author()) != null);
+    try testing.expect(findAnyText(tree.root, "Caught up · starter pack · 1 notes") != null);
 }
 
-test "the header summarises the relay pool" {
+test "the status bar summarises the relay pool" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Some relays live: the header shows the live count out of the pool.
+    // Some relays live: the status bar shows the live count out of the pool
+    // (the dot beside it carries the color; the text carries the fact).
     var live = main.initialModel();
     live.stage = .ready;
     live.live_relays = 3;
     const live_tree = try buildTree(arena, &live);
-    try testing.expect(findByText(live_tree.root, .text, "Live · 3/5 relays") != null);
+    try testing.expect(findAnyText(live_tree.root, "3/5 relays") != null);
 
-    // The whole pool down: the header says so.
+    // The whole pool down: the empty body says so while the bar keeps the count.
     var down = main.initialModel();
     down.stage = .ready;
     down.offline_relays = 5;
     const down_tree = try buildTree(arena, &down);
-    try testing.expect(findByText(down_tree.root, .text, "Offline, reconnecting…") != null);
+    try testing.expect(findAnyText(down_tree.root, "Can't reach any relay. Retrying…") != null);
+    try testing.expect(findAnyText(down_tree.root, "0/5 relays") != null);
 }
 
 test "the view lays out through the canvas engine" {
@@ -677,20 +682,26 @@ test "one-process: a signed note round-trips through the local store" {
     try testing.expectEqualStrings("stored in-process", q.events[0].content);
 }
 
-test "the composer renders a Post action and, without a key, an identity prompt" {
+test "the compose sheet renders a Post action and, without a key, an identity prompt" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var model = main.initialModel();
     model.stage = .ready;
-    const tree = try buildTree(arena, &model);
 
-    // Building the tree exercises the composer markup (input-group, textarea,
-    // button). The Post label renders, and with no identity loaded in the test
-    // process the "posting as" line shows the setup prompt.
-    try testing.expect(findAnyText(tree.root, "Post") != null);
-    try testing.expect(findAnyText(tree.root, "Preparing your key…") != null);
+    // Compose is on demand now: the feed itself carries no composer, only the
+    // titlebar's New note button.
+    const feed_tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(feed_tree.root, "New note") != null);
+    try testing.expect(findAnyText(feed_tree.root, "Preparing your key…") == null);
+
+    // Open the sheet: the textarea, the Post action, and (with no identity
+    // loaded in the test process) the setup prompt all render.
+    model.composing = true;
+    const sheet_tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(sheet_tree.root, "Post") != null);
+    try testing.expect(findAnyText(sheet_tree.root, "Preparing your key…") != null);
 }
 
 test "a fresh draft is empty and disables Post" {

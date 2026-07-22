@@ -13,9 +13,13 @@ const svg_icon = canvas.svg_icon;
 const reply_icon = svg_icon.parseComptime(@embedFile("icons/app-reply.svg"));
 const like_icon = svg_icon.parseComptime(@embedFile("icons/app-heart.svg"));
 const zap_icon = svg_icon.parseComptime(@embedFile("icons/app-zap.svg"));
+// The crossroads mark: four filled blocks framing the central void. Single
+// color, tinted by the foreground token, resized never redrawn.
+const mark_icon = svg_icon.parseComptime(@embedFile("icons/mark.svg"));
 
 pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "reply", .icon = &reply_icon },
     .{ .name = "like", .icon = &like_icon },
     .{ .name = "zap", .icon = &zap_icon },
+    .{ .name = "mark", .icon = &mark_icon },
 };
