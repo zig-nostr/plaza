@@ -322,7 +322,10 @@ fn spawnHelper(fx: *Effects) void {
 /// unreachable and the tick tries again.
 fn pollHelper(fx: *Effects) void {
     if (g_helper_token_len == 0) return;
-    if (g_helper_state.load(.acquire) >= 1) return; // already reachable
+    // Poll while signed out: this both proves the IPC at startup and detects a
+    // key appearing later (a terminal or window import), so Plaza adopts it
+    // live. Once signed in there is nothing to watch for.
+    if (activePubkey() != null) return;
     var url_buf: [48]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
@@ -337,14 +340,28 @@ fn pollHelper(fx: *Effects) void {
 
 /// Records the health-check result. A reachable daemon (200) tells us the IPC
 /// works; the body says whether it already holds a key.
-fn handleHelperPubkey(response: native_sdk.EffectResponse) void {
+fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     if (response.outcome != .ok or response.status != 200) {
         g_helper_state.store(3, .release); // unreachable, keep retrying
         return;
     }
-    const ready = std.mem.indexOf(u8, response.body, "\"state\":\"ready\"") != null;
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, response.body) catch return;
+    defer parsed.deinit();
+    const ready = std.mem.eql(u8, parsed.value.state, nostr.signer_ipc.state_ready);
     g_helper_state.store(if (ready) 2 else 1, .release);
-    std.debug.print("plaza: [helper] reachable, state={s}\n", .{if (ready) "ready" else "uninitialized"});
+    if (!ready) return;
+
+    // The daemon holds a key and Plaza is a guest: adopt it. This is how a
+    // terminal or window import (which Plaza did not initiate) signs the user
+    // in live. A Plaza-initiated setup is left to handleHelperSetup, which owns
+    // the name beat and the remembered intent.
+    if (activePubkey() != null) return;
+    if (g_helper_setup != .none or g_helper_pending_in_flight != .none) return;
+    if (!restoreHelperIdentity(parsed.value.pubkey)) return;
+    persistSession();
+    enterFeed(model);
+    replayPending(model);
 }
 
 // The signed-in helper identity: its pubkey lives here (the SECRET lives only in
@@ -3141,7 +3158,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
         .helper_pubkey => |response| {
-            handleHelperPubkey(response);
+            handleHelperPubkey(model, response);
             // A queued setup fires the moment the daemon is reachable.
             driveHelperSetup(fx);
         },
