@@ -1249,6 +1249,9 @@ pub const Model = struct {
     // The remembered intent: the guest reached for the composer, so composing
     // opens by itself the moment an identity exists. The sheet says so.
     pending_compose: bool = false,
+    // Whether the join sheet is on its focused bunker-input step (chose "Use
+    // your own signer") rather than the ladder.
+    bunker_mode: bool = false,
     // The name beat: after creating an identity, one optional, skippable ask
     // so the account is not blank. Never for imported keys or signers.
     naming: bool = false,
@@ -1286,7 +1289,7 @@ pub const Model = struct {
         "relay_health",          "relays_online", "scope_voices",           "is_guest",       "show_guest_strip",
         "guest_strip_dismissed", "joining",       "pending_compose",        "naming",         "name_buffer",
         "name_draft",            "name_empty",    "toast_buf",              "toast_len",      "toast_until",
-        "toast_text",            "backup_nudge",  "backup_nudge_dismissed",
+        "toast_text",            "backup_nudge",  "backup_nudge_dismissed", "bunker_mode",
     };
 
     /// The name beat's current text.
@@ -2489,11 +2492,12 @@ pub const Msg = union(enum) {
     /// The sheet's import path: open the Signet window (a separate process),
     /// so a pasted key never enters Plaza. The remembered intent survives.
     open_signet_import,
-    /// The sheet's other paths: the join screen's field takes a bunker link.
-    /// The remembered intent survives the trip.
-    join_bring_key,
     /// Leave the join screen back to the feed; reading never needs an identity.
     keep_browsing,
+    /// The join sheet's "Use your own signer": go to the focused bunker input.
+    open_bunker,
+    /// Back out of the bunker input to the ladder.
+    close_bunker,
     /// Hide the guest strip for this session.
     dismiss_guest_strip,
     /// A text edit in the name beat's field.
@@ -2562,7 +2566,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "join_bring_key", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2657,7 +2661,6 @@ fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
 /// most confident first, and always the way back to reading. When the guest
 /// reached for the composer, the sheet says the note is waiting.
 fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
     return ui.el(.dialog, .{
         .grow = 1,
         .padding = 16,
@@ -2666,37 +2669,70 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Join" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
-                if (model.pending_compose)
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
-                else
-                    ui.spacer(0),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = 1.3 }},
-                ),
-                ui.text(
-                    .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } },
-                    "Everything here is signed with a key of your own, not an account someone holds for you.",
-                ),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_faint_alt } },
-                    &.{.{ .text = "NEW HERE", .monospace = true, .scale = 0.85 }},
-                ),
-                ui.button(.{ .variant = .primary, .on_press = .join_create }, "Create your identity"),
-                ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Ready in seconds. Nothing to write down."),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_faint_alt } },
-                    &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
-                ),
-                ui.button(.{ .on_press = .open_signet_import }, "Bring your key"),
-                ui.button(.{ .on_press = .join_bring_key }, "Use your own signer"),
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
-                }),
-            }),
+            if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
         }),
+    });
+}
+
+/// The join ladder: three ways in, most confident first, always the way back.
+fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+        if (model.pending_compose)
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
+        else
+            ui.spacer(0),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_primary } },
+            &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = 1.3 }},
+        ),
+        ui.text(
+            .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } },
+            "Everything here is signed with a key of your own, not an account someone holds for you.",
+        ),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{ .text = "NEW HERE", .monospace = true, .scale = 0.85 }},
+        ),
+        ui.button(.{ .variant = .primary, .on_press = .join_create }, "Create your identity"),
+        ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Ready in seconds. Nothing to write down."),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
+        ),
+        ui.button(.{ .on_press = .open_signet_import }, "Bring your key"),
+        ui.button(.{ .on_press = .open_bunker }, "Use your own signer"),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
+        }),
+    });
+}
+
+/// The focused bunker step: the user already chose to use their own signer, so
+/// this is one field, not the whole ladder again. Paste the link, connect.
+fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+        ui.row(.{ .cross = .center, .gap = 6 }, .{
+            ui.el(.list_item, .{ .on_press = .close_bunker, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Back" } }, .{
+                ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+            }),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Connect your signer", .weight = .bold, .scale = 1.3 }},
+            ),
+        }),
+        ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Paste the bunker link your signer gave you. Your key stays in your signer, Plaza never sees it."),
+        ui.el(.textarea, .{
+            .text = model.login_draft(),
+            .placeholder = "bunker://…",
+            .on_input = AppUi.inputMsg(.login_edit),
+            .on_submit = .login_submit,
+            .height = 56,
+        }, .{}),
+        ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, model.login_status()),
+        ui.button(.{ .variant = .primary, .disabled = model.login_empty(), .on_press = .login_submit }, "Connect"),
     });
 }
 
@@ -3271,6 +3307,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_join => model.joining = true,
         .close_join => {
             model.joining = false;
+            model.bunker_mode = false;
             model.pending_compose = false;
         },
         .join_create => {
@@ -3287,15 +3324,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.joining = false;
             if (g_signet_win_len > 0) spawnSignetWindow(fx) else model.stage = .onboarding;
         },
-        .join_bring_key => {
-            // The bunker path: a bunker link is not a secret key, so Plaza's
-            // own field is fine. The remembered intent replays on entry.
-            model.joining = false;
-            model.stage = .onboarding;
-        },
         .keep_browsing => {
             model.stage = .ready;
             model.pending_compose = false;
+        },
+        .open_bunker => model.bunker_mode = true,
+        .close_bunker => {
+            model.bunker_mode = false;
+            model.login_buffer.clear();
+            g_login_error.store(@intFromEnum(LoginError.none), .release);
         },
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
         .name_edit => |edit| model.name_buffer.apply(edit),
@@ -3329,6 +3366,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .nsec => {
                     if (!importNsec(raw)) return;
                     persistSession();
+                    // Tolerate an nsec pasted into the bunker step: close the
+                    // sheet the same way the bunker success path does.
+                    model.joining = false;
+                    model.bunker_mode = false;
                     enterFeed(model);
                     replayPending(model);
                 },
@@ -3338,6 +3379,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .bunker => {
                     if (!connectRemoteSigner(raw)) return;
                     persistSession();
+                    // The connection is optimistic: land in the feed at once
+                    // (the composer line shows reaching/connected), close the
+                    // sheet, and reset the bunker step.
+                    model.joining = false;
+                    model.bunker_mode = false;
                     enterFeed(model);
                     replayPending(model);
                 },
