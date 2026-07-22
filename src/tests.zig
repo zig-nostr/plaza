@@ -916,3 +916,46 @@ test "the composer line tells the truth about the signer connection" {
     main.setRemoteStateForTest(3, 1);
     try testing.expectEqualStrings("Your signer is unreachable. Posts will not sign.", model.identity(arena));
 }
+
+// ---- C4-C6: name beat, toast, backup nudge ----------------------------------
+
+test "the name beat renders and skipping replays the intent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.naming = true;
+    model.pending_compose = true;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Want a name on it?") != null);
+    try testing.expect(findAnyText(tree.root, "Skip") != null);
+    try testing.expect(findAnyText(tree.root, "Save") != null);
+
+    // Skip ends the beat and the remembered intent still replays.
+    model.naming = false;
+    main.replayPendingForTest(&model);
+    try testing.expect(model.composing);
+}
+
+test "a toast shows its text and the backup nudge states the stakes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    @memcpy(model.toast_buf[0..6], "Posted");
+    model.toast_len = 6;
+    model.toast_until = 4_000_000_000;
+    model.backup_nudge = true;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Posted") != null);
+    try testing.expect(findAnyText(tree.root, "Right now this key lives on one Mac. Back it up so losing the Mac is not losing the account.") != null);
+    try testing.expect(findAnyText(tree.root, "Not now") != null);
+}
