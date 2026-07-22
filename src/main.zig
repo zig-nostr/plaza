@@ -858,6 +858,10 @@ pub const Model = struct {
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
     composing: bool = false,
+    // Whether the guest dismissed the join strip this session. Dismissal only
+    // hides the strip; the join surface stays reachable through every gated
+    // verb and the status bar's Guest chip.
+    guest_strip_dismissed: bool = false,
     // Where the feed is scrolled, so images load around the viewport instead of
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
@@ -875,12 +879,13 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",        "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
-        "stage",        "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
-        "proxy_saved",  "feed_scroll",   "feed_limit",     "draft",          "draft_empty",
-        "identity",     "has_notes",     "empty",          "status",         "empty_text",
-        "footer",       "note_list",     "expanded_note",  "composing",      "caught_up",
-        "relay_health", "relays_online", "scope_voices",
+        "notes",                 "notes_len",     "live_relays",    "offline_relays", "draft_buffer",
+        "stage",                 "login_buffer",  "logout_pending", "reveal_nsec",    "proxy_buffer",
+        "proxy_saved",           "feed_scroll",   "feed_limit",     "draft",          "draft_empty",
+        "identity",              "has_notes",     "empty",          "status",         "empty_text",
+        "footer",                "note_list",     "expanded_note",  "composing",      "caught_up",
+        "relay_health",          "relays_online", "scope_voices",   "is_guest",       "show_guest_strip",
+        "guest_strip_dismissed",
     };
 
     /// The composer's current text (what `text="{draft}"` binds).
@@ -1047,6 +1052,18 @@ pub const Model = struct {
     /// Whether at least one relay is connected (drives the status dot color).
     pub fn relays_online(self: *const Model) bool {
         return self.live_relays > 0;
+    }
+
+    /// Whether the reader is browsing without an identity. Reading never
+    /// needs one; the gated verbs ask at first intent.
+    pub fn is_guest(self: *const Model) bool {
+        _ = self;
+        return activePubkey() == null;
+    }
+
+    /// Whether the guest join strip is showing (guest, and not dismissed).
+    pub fn show_guest_strip(self: *const Model) bool {
+        return self.is_guest() and !self.guest_strip_dismissed;
     }
 
     /// The feed's scope line: how many hand-picked voices it is scoped to.
@@ -2033,10 +2050,16 @@ pub const Msg = union(enum) {
     draft_edit: canvas.TextInputEvent,
     /// Post the current draft: sign, store locally, and publish to the pool.
     post,
-    /// Open the compose sheet.
+    /// Open the compose sheet (a guest is routed to the join screen instead).
     open_compose,
     /// Dismiss the compose sheet.
     close_compose,
+    /// Open the join screen (create / bring a key / use a signer).
+    open_join,
+    /// Leave the join screen back to the feed; reading never needs an identity.
+    keep_browsing,
+    /// Hide the guest strip for this session.
+    dismiss_guest_strip,
     /// Onboarding: create a fresh local identity and enter the feed.
     create_identity,
     /// A text edit in the onboarding sign-in field.
@@ -2085,7 +2108,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "dismiss_guest_strip", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -2265,6 +2288,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
 
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         titleBar(ui),
+        if (model.show_guest_strip()) guestStrip(ui) else ui.spacer(0),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
@@ -2292,6 +2316,33 @@ fn titleBar(ui: *AppUi) AppUi.Node {
             ui.spacer(1),
             ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note"),
             ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
+        }),
+        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+    });
+}
+
+/// The guest join strip: one quiet, dismissible line under the titlebar. It
+/// invites, never blocks; reading is free forever and every path in stays
+/// reachable after dismissal (the gated verbs, the status bar's Guest chip).
+fn guestStrip(ui: *AppUi) AppUi.Node {
+    return ui.column(.{ .style = .{ .background = theme.palette.surface_subbar } }, .{
+        ui.row(.{ .cross = .center, .gap = 10, .padding = 10 }, .{
+            ui.text(
+                .{ .size = .sm, .wrap = true, .grow = 1, .style = .{ .foreground = theme.palette.text_muted_alt } },
+                "Browsing as a guest. Reading is yours forever. Join in when something moves you.",
+            ),
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
+            ui.button(.{ .size = .sm, .on_press = .open_join }, "Sign in"),
+            // An icon press, not a text button: the built-in x glyph (the
+            // U+2715 codepoint is outside Geist's coverage, rendered tofu).
+            ui.el(.list_item, .{
+                .on_press = .dismiss_guest_strip,
+                .padding = 6,
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .label = "Dismiss" },
+            }, .{
+                ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.text_faint_alt } }, "x"),
+            }),
         }),
         ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
     });
@@ -2328,6 +2379,10 @@ fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.spacer(1),
             ui.column(.{ .width = 6, .height = 6, .style = .{ .background = dot_color, .radius = 3 } }, .{}),
             ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.relay_health(ui.arena)),
+            if (model.is_guest())
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Guest")
+            else
+                ui.spacer(0),
         }),
     });
 }
@@ -2589,8 +2644,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appear on the next tick.
             model.composing = false;
         },
-        .open_compose => model.composing = true,
+        .open_compose => {
+            // The gate is on press, not on sight: a guest reaching for the
+            // composer is exactly first intent, so the join screen rises. The
+            // first-intent sheet (with the remembered action) replaces this
+            // jump in the milestone ahead.
+            if (model.is_guest()) model.stage = .onboarding else model.composing = true;
+        },
         .close_compose => model.composing = false,
+        .open_join => model.stage = .onboarding,
+        .keep_browsing => model.stage = .ready,
+        .dismiss_guest_strip => model.guest_strip_dismissed = true,
         .create_identity => {
             // Generate the local key, then bring the feed up and switch screens.
             if (!createLocalIdentity()) return;
@@ -3113,11 +3177,10 @@ pub fn main(init: std.process.Init) !void {
     canvas.icons.registerAppIcons(&plaza_icons.app_icons);
 
     // A returning user has a persisted session: restore it (load the local key,
-    // or silently reconnect the bunker) and skip onboarding. A newcomer starts
-    // at the welcome screen, and the feed comes up when they sign in (see
-    // `update`). Best-effort: on failure the app still runs, showing onboarding.
+    // or silently reconnect the bunker) so they are signed straight back in.
+    // Best-effort: on failure the app still runs, as a guest.
     loadSettings(init.io, init.environ_map);
-    const restored = restoreSession(init.io, init.environ_map);
+    _ = restoreSession(init.io, init.environ_map);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
@@ -3137,12 +3200,13 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModel();
-    if (restored) {
-        // Returning user: open the store and start the background ingest before
-        // the window appears. A newcomer's feed starts on sign-in.
-        app_state.model.stage = .ready;
-        startFeed(init.io, init.environ_map);
-    }
+    // Guest-first: the app opens INTO the feed, never a welcome wall. A
+    // restored session is signed straight back in; a newcomer browses as a
+    // guest (the feed reads fine without an identity) and is asked for one at
+    // first intent, not at launch. Either way the store and the pool start
+    // before the window appears, so the first frame renders from disk.
+    app_state.model.stage = .ready;
+    startFeed(init.io, init.environ_map);
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "plaza",
@@ -3513,7 +3577,9 @@ fn performLogout(model: *Model) void {
     model.logout_pending = false;
     model.reveal_nsec = false;
     model.notes_len = 0;
-    model.stage = .onboarding;
+    // Never a locked door: signing out lands on the guest feed, reading
+    // uninterrupted (the pool and store keep running), not a welcome wall.
+    model.stage = .ready;
 }
 
 // ----------------------------------------------------------- background ingest

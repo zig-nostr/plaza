@@ -1,6 +1,8 @@
-<!-- Plaza's first-run welcome: create a fresh identity, or sign in with an
-     existing nsec or a bunker link. Compiled into the Zig view (see
-     `onboardingView` in src/main.zig). Validate: native check -->
+<!-- The join screen: create a fresh identity, or sign in with an existing
+     nsec or a bunker link. Reached voluntarily (a gated verb, the guest
+     strip, the Guest chip), never as a wall, so it always offers the way
+     back to reading. Compiled into the Zig view (see `onboardingView` in
+     src/main.zig). Validate: native check -->
 <column gap="16" main="center" cross="center" grow="1" padding="32">
   <text size="display">Plaza</text>
   <text size="heading">Welcome to Nostr</text>
@@ -17,4 +19,6 @@
       <button size="sm" disabled="{login_empty}" on-press="login_submit">Continue</button>
     </input-group-actions>
   </input-group>
+  <button size="sm" variant="ghost" on-press="keep_browsing">Keep browsing</button>
+  <text size="sm" foreground="text_muted">Reading never needs an identity.</text>
 </column>
