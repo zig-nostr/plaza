@@ -155,6 +155,14 @@ pub fn main(init: std.process.Init) !void {
     var parent_pid: ?i32 = null;
     var serve = false;
 
+    {
+        var probe = std.process.Args.Iterator.init(init.minimal.args);
+        _ = probe.skip();
+        if (probe.next()) |sub| {
+            if (std.mem.eql(u8, sub, "import")) return runImport(init);
+        }
+    }
+
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
     while (args.next()) |arg| {
@@ -219,6 +227,126 @@ fn watchParent(pid: i32) void {
         io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
         if (kill(pid, 0) != 0) std.process.exit(0);
     }
+}
+
+// ---------------------------------------------------------------- import CLI
+//
+// `plaza-signer import`: the strongest import path. The nsec is read from the
+// terminal with echo off (or from stdin when piped), so it never touches
+// Plaza, the clipboard, or the screen. If Plaza's daemon is running it is
+// POSTed to /setup over loopback (so Plaza picks it up live); otherwise the key
+// is written to the keystore directly and the next launch adopts it. A key is
+// never accepted as an argument (it would leak into shell history and ps).
+
+fn runImport(init: std.process.Init) !void {
+    const gpa = std.heap.page_allocator;
+    const io = init.io;
+    const home = init.environ_map.get("HOME") orelse ".";
+    const port: u16 = 8790;
+
+    var input_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &input_buf);
+    const input = readSecret(io, "Paste your nsec (input hidden): ", &input_buf) orelse fail("no key read");
+    if (input.len == 0) fail("nothing pasted");
+    if (!std.mem.startsWith(u8, input, "nsec1") and !std.mem.startsWith(u8, input, "ncryptsec1")) {
+        fail("paste an nsec or an ncryptsec");
+    }
+
+    var pass_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &pass_buf);
+    var passphrase: []const u8 = "";
+    if (std.mem.startsWith(u8, input, "ncryptsec1")) {
+        passphrase = readSecret(io, "Passphrase for the key: ", &pass_buf) orelse fail("no passphrase");
+    }
+
+    // Decode to derive the npub (a confirmation the user can check) and to have
+    // the raw secret for the offline write.
+    var secret: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
+    if (std.mem.startsWith(u8, input, "ncryptsec1")) {
+        secret = keystore.decryptKey(gpa, input, passphrase) catch fail("could not decrypt that key (wrong passphrase?)");
+    } else {
+        secret = nostr.nip19.decodeNsec(gpa, input) catch fail("not a valid nsec");
+    }
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch fail("bad key");
+    const npub = nostr.nip19.encodeNpub(gpa, kp.public_key) catch fail("out of memory");
+    defer gpa.free(npub);
+
+    var token_path_buf: [512]u8 = undefined;
+    const token_path = std.fmt.bufPrint(&token_path_buf, "{s}/.plaza/signer.token", .{home}) catch fail("path too long");
+
+    if (postSetup(io, port, token_path, input, passphrase)) |ok| {
+        if (!ok) fail("a key is already set up (the signer holds one already)");
+        std.debug.print("Imported {s}\nYou're all set; Plaza picks it up automatically.\n", .{npub});
+        return;
+    }
+    // The daemon is not running: write the key for the next launch to adopt.
+    var state_buf: [512]u8 = undefined;
+    const state_dir = std.fmt.bufPrint(&state_buf, "{s}/.plaza", .{home}) catch fail("path too long");
+    var dir = std.Io.Dir.cwd().createDirPathOpen(io, state_dir, .{}) catch fail("cannot open the state dir");
+    defer dir.close(io);
+    var g = State{ .key_dir = dir, .key_path = key_file_name };
+    g.adopt(io, secret) catch |e| switch (e) {
+        error.AlreadyInitialized => fail("a key is already set up"),
+        else => fail("could not store the key"),
+    };
+    std.debug.print("Imported {s}\nStart Plaza to use it.\n", .{npub});
+}
+
+/// Reads one secret line. On a terminal, echo is disabled so nothing is shown;
+/// when stdin is a pipe, it just reads the line. The returned slice points into
+/// `buf` (which the caller zeroes).
+fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
+    _ = io;
+    const stdin_fd: std.posix.fd_t = 0;
+    // tcgetattr succeeds only on a terminal; a pipe returns an error, which is
+    // how this tells interactive from piped without a separate isatty.
+    const restore: ?std.posix.termios = std.posix.tcgetattr(stdin_fd) catch null;
+    if (restore) |base| {
+        std.debug.print("{s}", .{prompt});
+        var quiet = base;
+        quiet.lflag.ECHO = false;
+        std.posix.tcsetattr(stdin_fd, .NOW, quiet) catch {};
+    }
+    defer if (restore) |base| {
+        std.posix.tcsetattr(stdin_fd, .NOW, base) catch {};
+        std.debug.print("\n", .{});
+    };
+    const n = std.posix.read(stdin_fd, buf) catch return null;
+    if (n == 0) return null;
+    return std.mem.trim(u8, buf[0..n], " \t\r\n");
+}
+
+/// POSTs an import to a running daemon over loopback. Returns null when nothing
+/// is listening (so the caller writes the key directly), true on 200, false on
+/// a rejection (e.g. a key already set up).
+fn postSetup(io: std.Io, port: u16, token_path: []const u8, secret_input: []const u8, passphrase: []const u8) ?bool {
+    const gpa = std.heap.page_allocator;
+    const token = readTokenFile(gpa, io, token_path) orelse return null;
+    defer gpa.free(token);
+    const addr = net.IpAddress.parseIp4("127.0.0.1", port) catch return null;
+    var stream = addr.connect(io, .{ .mode = .stream }) catch return null;
+    defer stream.close(io);
+
+    var body_buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, &body_buf);
+    const body = std.fmt.bufPrint(&body_buf, "{{\"method\":\"import\",\"secret\":\"{s}\",\"passphrase\":\"{s}\"}}", .{ secret_input, passphrase }) catch return null;
+
+    var req_buf: [1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &req_buf);
+    const req = std.fmt.bufPrint(&req_buf, "POST /setup HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ token, body.len, body }) catch return null;
+
+    var wbuf: [128]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    sw.interface.writeAll(req) catch return null;
+    sw.interface.flush() catch return null;
+
+    var rbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    const n = sr.interface.readSliceShort(&rbuf) catch return null;
+    return std.mem.indexOf(u8, rbuf[0..n], " 200 ") != null;
 }
 
 // -------------------------------------------------------------- http server
