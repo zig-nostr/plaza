@@ -985,6 +985,43 @@ test "the rail and guest banner carry the right entry points by identity" {
     try testing.expect(findAnyText(sheet_tree.root, "Post") != null);
 }
 
+test "opening a thread shows it, and a guest reply routes to the join" {
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{44} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "root note");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    // Open the thread: viewing_thread is set and the thread screen shows.
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    try testing.expectEqual(id, model.viewing_thread);
+    const thread_tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(thread_tree.root, "Back") != null);
+    try testing.expect(findAnyText(thread_tree.root, "Thread") != null);
+
+    // A guest cannot sign: a reply attempt routes to the join, never publishes.
+    model.reply_buffer.set("hi");
+    main.update(&model, Msg.reply_submit, &fx);
+    try testing.expect(model.joining);
+
+    // Back returns to the feed.
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+}
+
 test "a fresh draft is empty and disables Post" {
     var model = main.initialModel();
     try testing.expect(model.draft_empty());
