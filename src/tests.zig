@@ -406,6 +406,135 @@ test "a signed-in like fills the heart, and pressing again clears it" {
     try testing.expect(!main.isLikedForTest(id));
 }
 
+// Builds a bare engagement event of `kind` e-tagging `target_hex`, with a
+// distinct id per `nonce` so the dedup set treats each as its own.
+fn engagementEvent(nonce: u8, kind: u16, content: []const u8, tags_extra: []const nostr.event.Tag) nostr.event.Event {
+    var id = [_]u8{0} ** 32;
+    // The dedup key is the id's first 8 bytes, so vary those per event.
+    id[0] = nonce;
+    id[1] = 0xEE;
+    return .{
+        .id = id,
+        .pubkey = [_]u8{nonce} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = kind,
+        .tags = tags_extra,
+        .content = content,
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+test "engagement folds replies, reposts, and plus-likes, and skips the rest" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    // A target note: its i64 key (as noteIdOf derives) and its hex e-tag.
+    var target_id = [_]u8{0} ** 32;
+    target_id[0] = 0x12;
+    target_id[1] = 0xAB;
+    target_id[7] = 0x34;
+    const target_i64: i64 = @intCast(std.mem.readInt(u64, target_id[0..8], .big) & std.math.maxInt(i64));
+    const target_hex = std.fmt.bytesToHex(target_id, .lower);
+    const e_tag = [_][]const u8{ "e", &target_hex };
+    const tags = [_]nostr.event.Tag{&e_tag};
+    const feed = [_]i64{target_i64};
+
+    main.countEngagementForTest(engagementEvent(1, 1, "a reply", &tags), &feed);
+    main.countEngagementForTest(engagementEvent(2, 6, "", &tags), &feed);
+    main.countEngagementForTest(engagementEvent(3, 7, "+", &tags), &feed);
+    main.countEngagementForTest(engagementEvent(4, 7, "", &tags), &feed); // empty counts as like
+    main.countEngagementForTest(engagementEvent(5, 7, "-", &tags), &feed); // dislike: skip
+    main.countEngagementForTest(engagementEvent(6, 7, "🔥", &tags), &feed); // emoji: skip
+
+    const c = main.engagementFor(target_i64);
+    try testing.expectEqual(@as(u32, 1), c.replies);
+    try testing.expectEqual(@as(u32, 1), c.reposts);
+    try testing.expectEqual(@as(u32, 2), c.likes);
+}
+
+test "engagement dedupes the same event and ignores unfollowed notes" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var target_id = [_]u8{0} ** 32;
+    target_id[0] = 0x77;
+    const target_i64: i64 = @intCast(std.mem.readInt(u64, target_id[0..8], .big) & std.math.maxInt(i64));
+    const target_hex = std.fmt.bytesToHex(target_id, .lower);
+    const e_tag = [_][]const u8{ "e", &target_hex };
+    const tags = [_]nostr.event.Tag{&e_tag};
+    const feed = [_]i64{target_i64};
+
+    const like = engagementEvent(9, 7, "+", &tags);
+    main.countEngagementForTest(like, &feed);
+    main.countEngagementForTest(like, &feed); // same id again (a second relay): no double count
+    try testing.expectEqual(@as(u32, 1), main.engagementFor(target_i64).likes);
+
+    // An event e-tagging a note not in the feed set is not counted at all.
+    const empty_feed = [_]i64{};
+    main.countEngagementForTest(engagementEvent(10, 7, "+", &tags), &empty_feed);
+    try testing.expectEqual(@as(u32, 1), main.engagementFor(target_i64).likes);
+}
+
+test "engagement counts one event against its single target, not every e-tag" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    // A thread: root R and its reply P, both loaded.
+    var root_id = [_]u8{0} ** 32;
+    root_id[0] = 0xC0;
+    var parent_id = [_]u8{0} ** 32;
+    parent_id[0] = 0x1B;
+    const root_i64: i64 = @intCast(std.mem.readInt(u64, root_id[0..8], .big) & std.math.maxInt(i64));
+    const parent_i64: i64 = @intCast(std.mem.readInt(u64, parent_id[0..8], .big) & std.math.maxInt(i64));
+    const root_hex = std.fmt.bytesToHex(root_id, .lower);
+    const parent_hex = std.fmt.bytesToHex(parent_id, .lower);
+    const feed = [_]i64{ root_i64, parent_i64 };
+
+    // A NIP-10 reply to P carrying [e, R, "", "root"] and [e, P, "", "reply"].
+    const root_tag = [_][]const u8{ "e", &root_hex, "", "root" };
+    const reply_tag = [_][]const u8{ "e", &parent_hex, "", "reply" };
+    const tags = [_]nostr.event.Tag{ &root_tag, &reply_tag };
+    main.countEngagementForTest(engagementEvent(20, 1, "a threaded reply", &tags), &feed);
+
+    // Only the direct parent P is credited; the root R is not inflated.
+    try testing.expectEqual(@as(u32, 1), main.engagementFor(parent_i64).replies);
+    try testing.expectEqual(@as(u32, 0), main.engagementFor(root_i64).replies);
+
+    // An event that lists the same target id in two e-tags counts it once.
+    const dup_a = [_][]const u8{ "e", &parent_hex };
+    const dup_b = [_][]const u8{ "e", &parent_hex };
+    const dup_tags = [_]nostr.event.Tag{ &dup_a, &dup_b };
+    main.countEngagementForTest(engagementEvent(21, 7, "+", &dup_tags), &feed);
+    try testing.expectEqual(@as(u32, 1), main.engagementFor(parent_i64).likes);
+}
+
+test "engagement sums zap sats from the bolt11 amount" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var target_id = [_]u8{0} ** 32;
+    target_id[0] = 0x5A;
+    const target_i64: i64 = @intCast(std.mem.readInt(u64, target_id[0..8], .big) & std.math.maxInt(i64));
+    const target_hex = std.fmt.bytesToHex(target_id, .lower);
+    const e_tag = [_][]const u8{ "e", &target_hex };
+    const bolt11 = [_][]const u8{ "bolt11", "lnbc210n1pjxxxxx" }; // 21000 msat = 21 sats
+    const tags = [_]nostr.event.Tag{ &e_tag, &bolt11 };
+    const feed = [_]i64{target_i64};
+
+    main.countEngagementForTest(engagementEvent(11, 9735, "", &tags), &feed);
+    try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+}
+
+test "bolt11 amounts parse across multipliers" {
+    try testing.expectEqual(@as(u64, 21_000), main.bolt11Msat("lnbc210n1pjxxx")); // 210 nano-BTC
+    try testing.expectEqual(@as(u64, 250_000_000), main.bolt11Msat("lnbc2500u1pxxx")); // 2500 micro-BTC
+    try testing.expectEqual(@as(u64, 1_000_000_000), main.bolt11Msat("lnbc10m1pxxx")); // 10 milli-BTC
+    try testing.expectEqual(@as(u64, 500_000_000_000), main.bolt11Msat("lnbc51pxxx")); // 5 whole BTC, no multiplier
+    try testing.expectEqual(@as(u64, 0), main.bolt11Msat("lnbc1pxxx")); // the "1" is the separator: amountless
+    try testing.expectEqual(@as(u64, 0), main.bolt11Msat("lntb1pxxx")); // amountless testnet
+    try testing.expectEqual(@as(u64, 0), main.bolt11Msat("not an invoice"));
+}
+
 test "note text splits into link, mention, and plain runs" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
