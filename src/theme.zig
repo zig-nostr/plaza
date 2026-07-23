@@ -146,6 +146,9 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             // Geist for prose, Geist Mono for the metadata voice.
             t.typography.font_id = geist_font_id;
             t.typography.mono_font_id = geist_mono_font_id;
+            // A touch larger than the house 14 for a more readable feed body,
+            // matching the redesign.
+            t.typography.body_size = 14.5;
 
             return t;
         }

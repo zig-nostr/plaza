@@ -3357,9 +3357,10 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     g_visible_first = window.first_visible_index;
     g_visible_last = window.last_visible_index;
 
-    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        titleBar(ui, model),
-        if (model.show_guest_strip()) guestStrip(ui) else ui.spacer(0),
+    // The content column, right of the rail: the guest banner, the scope line,
+    // the feed itself, and the status bar.
+    const content = ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
@@ -3373,6 +3374,101 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.backup_nudge) backupNudge(ui) else ui.spacer(0),
         statusBar(ui, model),
     });
+
+    // The window is the rail plus the content. The old titlebar of buttons is
+    // gone: home, compose, settings, and the account seat live on the rail, so
+    // the feed owns the full width below the OS titlebar.
+    return ui.row(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        railView(ui, model),
+        // A 1px vertical rule between the rail and the content. No `grow`: in a
+        // row that would stretch it along the WIDTH and eat the feed's space; it
+        // fills the height on its own via the row's cross-axis stretch.
+        ui.separator(.{ .width = 1, .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
+        content,
+    });
+}
+
+/// The 56px navigation rail: Home (the mark), Search, then the compose verb, the
+/// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
+/// titlebar of buttons — destinations on the edge, the feed owns the width. A
+/// guest's gated tiles (compose, settings, you) route to the join sheet.
+fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const guest = model.is_guest();
+    const compose_press: Msg = if (guest) .open_join else .open_compose;
+    const settings_press: Msg = if (guest) .open_join else .open_settings;
+    return ui.column(.{ .width = 56, .cross = .center, .gap = 8, .padding = 10, .style_tokens = .{ .background = .background } }, .{
+        // Home: the mark on a raised plate, the active destination.
+        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center, .style = .{ .background = p.surface_modal, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, .semantics = .{ .label = "Home" } }, .{
+            ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark"),
+        }),
+        // Search: a destination not yet built, shown quiet for the shape.
+        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center, .semantics = .{ .label = "Search" } }, .{
+            ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "search"),
+        }),
+        ui.spacer(1),
+        // Compose: the one bright tile.
+        railTile(ui, "edit", 15, compose_press, "New note", true),
+        // Settings.
+        railTile(ui, "settings", 16, settings_press, "Settings", false),
+        // The account seat: a dashed "you" as a guest, the account once signed in.
+        railYou(ui, guest),
+    });
+}
+
+/// One pressable rail tile: a 36px plate with a centered icon. `bright` paints
+/// the accent fill (the compose verb); the rest are quiet with a muted glyph.
+fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label: []const u8, bright: bool) AppUi.Node {
+    const p = theme.palette;
+    const tile_style: canvas.WidgetStyle = if (bright)
+        .{ .background = p.accent, .radius = 9 }
+    else
+        .{ .radius = 9 };
+    const tint = if (bright) p.on_accent else p.text_muted;
+    return ui.el(.list_item, .{
+        .on_press = press,
+        .padding = 0,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = true },
+    }, .{
+        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center, .style = tile_style }, .{
+            ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon),
+        }),
+    });
+}
+
+/// The account seat at the bottom of the rail. A guest gets a dashed circle
+/// marked "you" that opens the join sheet; a signed-in user gets a small tinted
+/// initials avatar that opens Settings.
+fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
+    const p = theme.palette;
+    const press: Msg = if (guest) .open_join else .open_settings;
+    return ui.el(.list_item, .{
+        .on_press = press,
+        .padding = 0,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .label = "You" },
+    }, .{
+        if (guest)
+            ui.column(.{ .width = 28, .height = 28, .main = .center, .cross = .center, .style = .{ .border = p.border_dashed, .radius = 14, .stroke_width = 1 } }, .{
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "you", .monospace = true, .scale = 0.72 }}),
+            })
+        else
+            youAvatar(ui),
+    });
+}
+
+/// The signed-in account avatar for the rail: a 28px tinted circle with the
+/// pubkey's initials (the same warm tint the feed uses for that key).
+fn youAvatar(ui: *AppUi) AppUi.Node {
+    const pk = activePubkey() orelse return ui.spacer(0);
+    const tint = avatarTint(pk);
+    const hexdigits = "0123456789abcdef";
+    return ui.avatar(.{
+        .width = 28,
+        .height = 28,
+        .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+    }, ui.fmt("{c}{c}", .{ hexdigits[pk[0] >> 4], hexdigits[pk[0] & 0x0f] }));
 }
 
 /// The backup nudge: calm, dismissible, the stakes stated plainly. Rises once,
@@ -3392,49 +3488,21 @@ fn backupNudge(ui: *AppUi) AppUi.Node {
     });
 }
 
-/// The chromeless titlebar: the mark and wordmark on the left, then either the
-/// compose and settings actions (signed in) or the join CTAs (a guest). One
-/// bar, so the feed fills the rest of the window.
-fn titleBar(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.column(.{}, .{
-        ui.row(.{ .height = 48, .cross = .center, .gap = 10, .padding = 14 }, .{
-            ui.appIcon(.{ .width = 20, .height = 20, .style_tokens = .{ .foreground = .text } }, "mark"),
-            ui.paragraph(
-                .{ .style = .{ .foreground = theme.palette.text_primary } },
-                &.{.{ .text = "Plaza", .weight = .bold }},
-            ),
-            ui.spacer(1),
-            // A guest has no note to compose and no account to configure, so the
-            // titlebar carries the join CTAs instead, always present. Compose and
-            // settings belong to a signed-in user.
-            if (model.is_guest())
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Sign in"),
-                })
-            else
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note"),
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
-                }),
-        }),
-        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
-    });
-}
-
-/// The guest join strip: one quiet, dismissible line under the titlebar. It
-/// invites, never blocks; reading is free forever and every path in stays
-/// reachable after dismissal (the gated verbs, the status bar's Guest chip).
-fn guestStrip(ui: *AppUi) AppUi.Node {
-    return ui.column(.{ .style = .{ .background = theme.palette.surface_subbar } }, .{
+/// The guest banner: a full-width top bar over the feed with the invitation and
+/// the two join CTAs, always present here so sign-in is never more than one bar
+/// away. Dismissible, and safely so: the rail's compose and account tiles and
+/// the status bar's Guest chip all keep a way in after it is closed.
+fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    return ui.column(.{ .style = .{ .background = p.surface_subbar } }, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 10 }, .{
             ui.text(
-                .{ .size = .sm, .wrap = true, .grow = 1, .style = .{ .foreground = theme.palette.text_muted_alt } },
+                .{ .size = .sm, .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted_alt } },
                 "Browsing as a guest. Reading is yours forever. Join in when something moves you.",
             ),
-            // The join CTAs live in the titlebar now, always present, so this
-            // strip is just the invitation and its dismiss is safe: closing it
-            // never removes the way in.
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Sign in"),
             // An icon press, not a text button: the built-in x glyph (the
             // U+2715 codepoint is outside Geist's coverage, rendered tofu).
             ui.el(.list_item, .{
@@ -3443,10 +3511,10 @@ fn guestStrip(ui: *AppUi) AppUi.Node {
                 .style = .{ .quiet_hover = true },
                 .semantics = .{ .label = "Dismiss" },
             }, .{
-                ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.text_faint_alt } }, "x"),
+                ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "x"),
             }),
         }),
-        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
+        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
 }
 

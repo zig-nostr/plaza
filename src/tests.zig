@@ -45,6 +45,16 @@ fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
     return null;
 }
 
+/// Finds a widget by its accessibility label (for icon-only controls like the
+/// rail tiles, which carry no text).
+fn findByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
+    if (std.mem.eql(u8, widget.semantics.label, label)) return widget;
+    for (widget.children) |child| {
+        if (findByLabel(child, label)) |found| return found;
+    }
+    return null;
+}
+
 /// A signed kind:1 note with the given timestamp and content.
 fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, created_at: i64, content: []const u8) !nostr.event.Event {
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
@@ -815,7 +825,7 @@ test "the logout confirmation replaces the log-out button" {
     try testing.expect(findAnyText(tree.root, "Log out") != null);
 }
 
-test "the empty feed renders the brand and a connecting body" {
+test "the empty feed renders the rail and a connecting body" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -824,8 +834,8 @@ test "the empty feed renders the brand and a connecting body" {
     model.stage = .ready;
     const tree = try buildTree(arena, &model);
 
-    // The titlebar wordmark (a paragraph span now, beside the mark icon).
-    try testing.expect(findAnyText(tree.root, "Plaza") != null);
+    // The nav rail's Home tile (the mark) stands in for the old wordmark.
+    try testing.expect(findByLabel(tree.root, "Home") != null);
     // With no notes yet, the body says what it is waiting for.
     try testing.expect(findAnyText(tree.root, "Connecting to the relay pool…") != null);
 }
@@ -942,30 +952,32 @@ test "one-process: a signed note round-trips through the local store" {
     try testing.expectEqualStrings("stored in-process", q.events[0].content);
 }
 
-test "the titlebar shows join CTAs for a guest, compose and settings when signed in" {
+test "the rail and guest banner carry the right entry points by identity" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A guest has no note to compose and no account to configure: the titlebar
-    // carries the always-present join CTAs instead.
+    // A guest: the banner carries the always-present join CTAs (as text), and
+    // the rail's compose/settings tiles (icons, labelled) route to join too.
     main.clearIdentityForTest();
     var guest = main.initialModel();
     guest.stage = .ready;
     const guest_tree = try buildTree(arena, &guest);
     try testing.expect(findAnyText(guest_tree.root, "Create identity") != null);
     try testing.expect(findAnyText(guest_tree.root, "Sign in") != null);
-    try testing.expect(findAnyText(guest_tree.root, "New note") == null);
-    try testing.expect(findAnyText(guest_tree.root, "Settings") == null);
+    // The rail is present in both states: Home, New note, Settings tiles.
+    try testing.expect(findByLabel(guest_tree.root, "New note") != null);
+    try testing.expect(findByLabel(guest_tree.root, "Settings") != null);
 
-    // Signed in: New note and Settings return; the compose sheet posts.
+    // Signed in: no join banner; the rail still carries compose and settings,
+    // and the compose sheet posts.
     main.setIdentityForTest([_]u8{71} ** 32);
     defer main.clearIdentityForTest();
     var user = main.initialModel();
     user.stage = .ready;
     const user_tree = try buildTree(arena, &user);
-    try testing.expect(findAnyText(user_tree.root, "New note") != null);
-    try testing.expect(findAnyText(user_tree.root, "Settings") != null);
+    try testing.expect(findByLabel(user_tree.root, "New note") != null);
+    try testing.expect(findByLabel(user_tree.root, "Settings") != null);
     try testing.expect(findAnyText(user_tree.root, "Create identity") == null);
 
     user.composing = true;
