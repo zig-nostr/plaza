@@ -3812,7 +3812,13 @@ pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
 fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
     var node = ui.row(.{ .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
-            ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+            // The row carries the press (opening the thread) directly, not through
+            // a wrapping list_item: a list_item sizes to its content, so it let the
+            // body paragraph run to its unwrapped width and overflow. On a plain
+            // row the fixed-width column still constrains the body, so it wraps,
+            // and the inner controls (like, reply, links, the picture) keep their
+            // own presses as the deeper hit targets.
+            ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
                 noteAvatar(ui, note),
                 ui.column(.{ .gap = 5, .grow = 1 }, .{
                     // Identity line: name, a verified check when (and only when)
@@ -3830,14 +3836,10 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         ui.text(.{ .grow = 1, .style = .{ .foreground = theme.palette.text_faint } }, note.handle(ui.arena)),
                         ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
                     }),
-                    // The body opens the thread on press; a link span inside
-                    // still follows its own URL (it is a separate hit target).
-                    ui.el(.list_item, .{ .on_press = Msg{ .open_thread = note.id }, .padding = 0, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
-                        ui.paragraph(
-                            .{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } },
-                            contentSpans(ui, note.content()),
-                        ),
-                    }),
+                    ui.paragraph(
+                        .{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } },
+                        contentSpans(ui, note.content()),
+                    ),
                     // The picture. The space is reserved at the picture's own
                     // shape whether or not it has loaded, so the feed never
                     // shifts as images arrive.
