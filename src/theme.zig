@@ -51,15 +51,19 @@ pub const palette = struct {
     // Surfaces (cool-grey family).
     pub const surface_window = hex("#0a0a0b");
     pub const surface_card = hex("#0d0d0f");
-    pub const surface_modal = hex("#141419");
+    // The elevated sheet surface. Clearly lighter than the window so a modal
+    // reads as a raised panel over the (now firmly dimmed) feed, not a floating
+    // cluster of controls.
+    pub const surface_modal = hex("#1c1c22");
     pub const surface_inset = hex("#17171b");
     pub const surface_subbar = hex("#121216");
     pub const surface_input = hex("#0f0f13");
     pub const surface_chip = hex("#1a1a1f");
     pub const surface_toast = hex("#232327");
 
-    // Borders and dividers.
-    pub const divider_feedrow = hex("#26262c");
+    // Borders and dividers. The feed-row hairline sits between notes on the
+    // near-black window; it needs real contrast to read as a line at 1px.
+    pub const divider_feedrow = hex("#34343d");
     pub const divider_chrome = hex("#1f1f24");
     pub const border_hairline = hex("#26262c");
     pub const border_window = hex("#2a2a30");
@@ -125,6 +129,12 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.accent_text = p.on_accent;
             t.colors.focus_ring = p.border_focus;
             t.colors.disabled = p.surface_inset;
+
+            // The default scrim is a 10% wash that leans on a backdrop blur for
+            // modality; on the real GPU renderer that leaves a sheet barely
+            // separated from the feed. Dim the backdrop firmly so every modal
+            // (join, compose, name) reads as a raised panel.
+            t.colors.scrim = canvas.Color.rgba8(0, 0, 0, 150);
 
             t.colors.success = p.status_success;
             t.colors.success_text = p.on_accent;

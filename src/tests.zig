@@ -272,7 +272,7 @@ test "an empty display_name falls through to the name" {
     try testing.expectEqualStrings("jb55", note.author());
 }
 
-test "the @handle is the kind:0 name, else a short npub" {
+test "the @handle is the NIP-05, and nothing without one" {
     main.resetProfilesForTest();
     defer main.resetProfilesForTest();
 
@@ -285,23 +285,20 @@ test "the @handle is the kind:0 name, else a short npub" {
     const kp = try signer.keyPairFromSecretKey([_]u8{21} ** 32);
     const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
 
-    // No profile yet: the handle is the short npub.
+    // No profile, or a profile with no nip05: no handle at all (never a bare npub).
     const bare = main.noteFrom(ev, 1_800_000_000);
-    try testing.expect(std.mem.startsWith(u8, bare.handle(arena), "@npub1"));
-
-    // display_name distinct from name: the handle is @name.
+    try testing.expectEqualStrings("", bare.handle(arena));
     const p = main.upsertProfile(kp.public_key).?;
     main.parseMetadataInto(p, "{\"display_name\":\"Satoshi\",\"name\":\"nakamoto\"}");
-    const named = main.noteFrom(ev, 1_800_000_000);
-    try testing.expectEqualStrings("Satoshi", named.author());
-    try testing.expectEqualStrings("@nakamoto", named.handle(arena));
+    try testing.expectEqualStrings("", main.noteFrom(ev, 1_800_000_000).handle(arena));
 
-    // Only a name, so it also becomes the display: the handle would just repeat
-    // it, so it falls back to the short npub instead of "alice @alice".
-    main.parseMetadataInto(p, "{\"name\":\"alice\"}");
-    const dup = main.noteFrom(ev, 1_800_000_000);
-    try testing.expectEqualStrings("alice", dup.author());
-    try testing.expect(std.mem.startsWith(u8, dup.handle(arena), "@npub1"));
+    // A user@domain nip05 shows as @user.
+    main.parseMetadataInto(p, "{\"name\":\"nakamoto\",\"nip05\":\"satoshi@bitcoin.org\"}");
+    try testing.expectEqualStrings("@satoshi", main.noteFrom(ev, 1_800_000_000).handle(arena));
+
+    // The root "_@domain" form shows as @domain, not @_.
+    main.parseMetadataInto(p, "{\"nip05\":\"_@dergigi.com\"}");
+    try testing.expectEqualStrings("@dergigi.com", main.noteFrom(ev, 1_800_000_000).handle(arena));
 }
 
 test "a NIP-05 check needs a real well-known name to pubkey match" {

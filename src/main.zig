@@ -1001,10 +1001,6 @@ const Profile = struct {
     pubkey: [32]u8 = [_]u8{0} ** 32,
     name_buf: [64]u8 = [_]u8{0} ** 64,
     name_len: u8 = 0,
-    // The kind:0 `name` (the @handle), kept apart from the resolved display
-    // name so the identity line can show "Display Name @handle".
-    handle_buf: [64]u8 = [_]u8{0} ** 64,
-    handle_len: u8 = 0,
     // The kind:0 `nip05` identifier (`name@domain`), and where its verification
     // stands. The check draws only on `.verified`: a well-known lookup that maps
     // the name back to this pubkey, never on mere presence of the string.
@@ -1029,9 +1025,6 @@ const Profile = struct {
 
     fn name(self: *const Profile) []const u8 {
         return self.name_buf[0..self.name_len];
-    }
-    fn handle(self: *const Profile) []const u8 {
-        return self.handle_buf[0..self.handle_len];
     }
     fn nip05(self: *const Profile) []const u8 {
         return self.nip05_buf[0..self.nip05_len];
@@ -1419,16 +1412,6 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
         }
     }
 
-    // The @handle is the kind:0 `name` verbatim, distinct from the resolved
-    // display name above.
-    profile.handle_len = 0;
-    if (md.name) |raw| {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        const n = utf8SafeLen(trimmed, profile.handle_buf.len);
-        @memcpy(profile.handle_buf[0..n], trimmed[0..n]);
-        profile.handle_len = @intCast(n);
-    }
-
     // NIP-05: keep the identifier and (re)arm verification when it is present
     // and changed. Absent or oversized means there is nothing to verify, so no
     // check ever draws.
@@ -1537,20 +1520,20 @@ pub const Note = struct {
         }
         return 0;
     }
-    /// The @handle for the identity line: the kind:0 `name` when it adds
-    /// something past the display name, else a short `@npub`. Allocated in the
-    /// caller's arena for the frame.
+    /// The @handle for the identity line: the author's NIP-05, shown as `@name`
+    /// (or `@domain` for the root `_@domain` form). Empty when they have no
+    /// NIP-05 — a bare npub is not a handle, so nothing is shown rather than
+    /// `@npub…`. Allocated in the caller's arena for the frame.
     pub fn handle(self: *const Note, arena: std.mem.Allocator) []const u8 {
-        if (lookupProfile(self.pubkey)) |p| {
-            if (p.handle_len > 0 and !std.ascii.eqlIgnoreCase(p.handle(), self.author())) {
-                return std.fmt.allocPrint(arena, "@{s}", .{p.handle()}) catch self.shortHandle(arena);
-            }
-        }
-        return self.shortHandle(arena);
-    }
-    /// `@` plus the abbreviated npub, the handle fallback when there is no name.
-    fn shortHandle(self: *const Note, arena: std.mem.Allocator) []const u8 {
-        return std.fmt.allocPrint(arena, "@{s}", .{self.author_buf[0..self.author_len]}) catch "@npub";
+        const p = lookupProfile(self.pubkey) orelse return "";
+        if (p.nip05_len == 0) return "";
+        const id = p.nip05();
+        const at = std.mem.indexOfScalar(u8, id, '@') orelse return "";
+        const local = id[0..at];
+        const domain = id[at + 1 ..];
+        const shown = if (std.mem.eql(u8, local, "_")) domain else local;
+        if (shown.len == 0) return "";
+        return std.fmt.allocPrint(arena, "@{s}", .{shown}) catch "";
     }
     /// Whether this author's NIP-05 has been verified (well-known JSON maps the
     /// name back to their pubkey). Only then does the identity line show a check.
@@ -3435,7 +3418,7 @@ fn titleBar(ui: *AppUi, model: *const Model) AppUi.Node {
                     ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_settings }, "Settings"),
                 }),
         }),
-        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
     });
 }
 
@@ -3463,7 +3446,7 @@ fn guestStrip(ui: *AppUi) AppUi.Node {
                 ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.text_faint_alt } }, "x"),
             }),
         }),
-        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
     });
 }
 
@@ -3483,7 +3466,7 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
                 &.{.{ .text = model.scope_voices(ui.arena), .monospace = true }},
             ),
         }),
-        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_feedrow } }, .{}),
+        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_feedrow, .background = theme.palette.divider_feedrow } }),
     });
 }
 
@@ -3492,7 +3475,7 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
 fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
     const dot_color = if (model.relays_online()) theme.palette.status_success else theme.palette.text_faint_alt;
     return ui.column(.{}, .{
-        ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_chrome } }, .{}),
+        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
         ui.row(.{ .height = 30, .cross = .center, .gap = 6, .padding = 10 }, .{
             ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.caught_up(ui.arena)),
             ui.spacer(1),
@@ -3625,9 +3608,10 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                     engagementRow(ui, note),
                 }),
             }),
-            // The only separation between rows: a hairline, so a real border
-            // can later mean something (a quote, a reply).
-            ui.column(.{ .height = 1, .style = .{ .background = theme.palette.divider_feedrow } }, .{}),
+            // The only separation between rows: a hairline. The `.separator`
+            // element paints a real line (an empty column with a background does
+            // not, which is why every divider was invisible before).
+            ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = theme.palette.divider_feedrow, .background = theme.palette.divider_feedrow } }),
         }),
     });
     // The note id is masked non-negative at build time, so this cast is safe.
