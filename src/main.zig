@@ -84,6 +84,9 @@ const starter_pack = blk: {
 // query grows a page at a time as the reader reaches the end.
 const feed_capacity = 300;
 const feed_page = 60;
+// How many loaded notes each relay watches for engagement. Bounded so the
+// `#e` filter stays a size relays accept; covers the feed's first screens.
+const engagement_watch_cap = 128;
 // The composer's fixed text capacity. Comfortably longer than a typical note;
 // the display buffer (`Note.content_buf`) truncates for rendering, but the
 // published event carries the full draft.
@@ -1115,6 +1118,239 @@ pub fn resetLikesForTest() void {
 /// Whether this session has liked the note (for tests and the view).
 pub fn isLikedForTest(note_id: i64) bool {
     return isLiked(note_id);
+}
+
+// ------------------------------------------------------------ engagement counts
+//
+// Reply / repost / like / zap tallies per feed note, aggregated client-side (no
+// NIP-45 COUNT, whose relay support is spotty). Each ingest thread opens a second
+// subscription, `{kinds:[1,6,7,9735], "#e":[the notes it loaded]}`, and folds the
+// arriving events into this in-memory table, deduped across relays by event id.
+// The view reads it at render time. Counts are per session: a relaunch refetches
+// them, so nothing here is persisted.
+
+// Above the displayed feed so the union of the relays' watched sets fits with
+// room to spare; a full table then only degrades gracefully (see ensureEngagement).
+const engagement_cap = 512;
+const Counts = struct {
+    replies: u32 = 0,
+    reposts: u32 = 0,
+    likes: u32 = 0,
+    zap_msat: u64 = 0,
+};
+const Engagement = struct {
+    used: bool = false,
+    note_id: i64 = 0,
+    counts: Counts = .{},
+};
+var g_engagement = [_]Engagement{.{}} ** engagement_cap;
+
+// Cross-relay dedup: a bounded open-addressing set of event-id prefixes (the
+// first 8 bytes as a u64; 0 marks an empty slot, so the ~1-in-2^64 all-zero
+// prefix is simply never deduped). When it fills, new ids stop being recorded
+// and a reaction seen on two relays can double-count; sized far above a starter
+// pack feed's traffic so that is only a theoretical tail.
+const seen_engagement_cap = 1 << 15;
+var g_seen = [_]u64{0} ** seen_engagement_cap;
+var g_seen_len: usize = 0;
+
+var g_engagement_lock = std.atomic.Value(bool).init(false);
+fn engagementLock() void {
+    while (g_engagement_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn engagementUnlock() void {
+    g_engagement_lock.store(false, .release);
+}
+
+/// The u64 dedup key for an event id (its first 8 bytes, big-endian).
+fn idPrefix(id: [32]u8) u64 {
+    return std.mem.readInt(u64, id[0..8], .big);
+}
+
+/// Whether `prefix` is already in the seen set. Caller holds the lock. The probe
+/// count is bounded by the table size so a full table cannot spin.
+fn seenContains(prefix: u64) bool {
+    if (prefix == 0) return false;
+    var i = prefix % seen_engagement_cap;
+    var probes: usize = 0;
+    while (g_seen[i] != 0 and probes < seen_engagement_cap) : ({
+        i = (i + 1) % seen_engagement_cap;
+        probes += 1;
+    }) {
+        if (g_seen[i] == prefix) return true;
+    }
+    return false;
+}
+
+/// Records `prefix` as seen and returns true if it was new (not a cross-relay
+/// duplicate). Caller holds the lock. A full set (or the ~1-in-2^64 zero prefix)
+/// reports NOT-new, so counting stops rather than double-counting: reporting new
+/// there would fold an event into the crowd total that `seenContains` can never
+/// confirm, breaking the own-like reconciliation. Sized far above a feed's
+/// traffic so this "stop counting" tail is only theoretical.
+fn markSeen(prefix: u64) bool {
+    if (prefix == 0 or g_seen_len >= seen_engagement_cap) return false;
+    var i = prefix % seen_engagement_cap;
+    while (g_seen[i] != 0) : (i = (i + 1) % seen_engagement_cap) {
+        if (g_seen[i] == prefix) return false;
+    }
+    g_seen[i] = prefix;
+    g_seen_len += 1;
+    return true;
+}
+
+/// The counts row for `note_id`, creating it if there is room. Caller holds the
+/// lock. Null only when the table is full of other notes.
+fn ensureEngagement(note_id: i64) ?*Engagement {
+    for (&g_engagement) |*e| {
+        if (e.used and e.note_id == note_id) return e;
+    }
+    for (&g_engagement) |*e| {
+        if (!e.used) {
+            e.* = .{ .used = true, .note_id = note_id };
+            return e;
+        }
+    }
+    return null;
+}
+
+/// The crowd counts for `note_id` (zeroes if none). Read at render time.
+pub fn engagementFor(note_id: i64) Counts {
+    engagementLock();
+    defer engagementUnlock();
+    for (&g_engagement) |*e| {
+        if (e.used and e.note_id == note_id) return e.counts;
+    }
+    return .{};
+}
+
+/// The like count to display for a note: the crowd's likes plus this session's
+/// own optimistic +1, dropped once our reaction (`my_reaction`) has come back
+/// through the subscription and is folded into the crowd total. Both reads
+/// happen under one lock hold, so the two never disagree across a concurrent
+/// count (which would flicker the number for a frame).
+pub fn likeCountFor(note_id: i64, my_reaction: ?[32]u8) u64 {
+    engagementLock();
+    defer engagementUnlock();
+    var crowd: u32 = 0;
+    for (&g_engagement) |*e| {
+        if (e.used and e.note_id == note_id) {
+            crowd = e.counts.likes;
+            break;
+        }
+    }
+    const mine: u64 = if (my_reaction) |rid| (if (seenContains(idPrefix(rid))) 0 else 1) else 0;
+    return @as(u64, crowd) + mine;
+}
+
+/// Whether a kind:7 reaction's content counts as a like: NIP-25 treats "+" and
+/// empty as a like, and "-" (a downvote) and emoji/shortcode as something else.
+fn isLikeReaction(content: []const u8) bool {
+    return content.len == 0 or std.mem.eql(u8, content, "+");
+}
+
+/// The millisats a bolt11 invoice encodes, or 0 when it carries no amount. The
+/// human-readable part is everything before the bech32 separator (the only '1',
+/// since the data charset excludes it); the amount is its digits times the
+/// optional multiplier, scaled to msat (1 BTC = 1e11 msat).
+pub fn bolt11Msat(invoice: []const u8) u64 {
+    if (!std.mem.startsWith(u8, invoice, "ln")) return 0;
+    const sep = std.mem.lastIndexOfScalar(u8, invoice, '1') orelse return 0;
+    const hrp = invoice[0..sep];
+    var i: usize = 2; // past "ln"
+    while (i < hrp.len and !std.ascii.isDigit(hrp[i])) i += 1; // past the currency
+    const start = i;
+    while (i < hrp.len and std.ascii.isDigit(hrp[i])) i += 1;
+    if (i == start) return 0; // an amountless "any amount" invoice
+    const num = std.fmt.parseInt(u64, hrp[start..i], 10) catch return 0;
+    const mult: u8 = if (i < hrp.len) hrp[i] else 0;
+    return switch (mult) {
+        'm' => num *| 100_000_000,
+        'u' => num *| 100_000,
+        'n' => num *| 100,
+        'p' => num / 10,
+        0 => num *| 100_000_000_000,
+        else => 0,
+    };
+}
+
+/// The sats a kind:9735 zap receipt is worth, from its bolt11 tag.
+fn zapMsat(ev: nostr.event.Event) u64 {
+    for (ev.tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "bolt11")) return bolt11Msat(tag[1]);
+    }
+    return 0;
+}
+
+/// The single note an engagement event is about: its `reply`-marked e tag if it
+/// has one (NIP-10), else its last e tag (NIP-25 says a reaction's target is the
+/// last e tag; the same positional convention names a reply's direct parent).
+/// Counting only this one, rather than every e tag, keeps a threaded reply from
+/// crediting the whole ancestor chain and dedupes an id repeated across tags.
+fn engagementTarget(ev: nostr.event.Event) ?[]const u8 {
+    var last_e: ?[]const u8 = null;
+    var reply_e: ?[]const u8 = null;
+    for (ev.tags) |tag| {
+        if (tag.len < 2 or tag[0].len != 1 or tag[0][0] != 'e') continue;
+        last_e = tag[1];
+        if (tag.len >= 4 and std.mem.eql(u8, tag[3], "reply")) reply_e = tag[1];
+    }
+    return reply_e orelse last_e;
+}
+
+/// Folds one engagement event into the count of the single note it targets, when
+/// that note is in this relay thread's loaded set. The cross-relay dedup
+/// (`markSeen`) happens only AFTER the target is confirmed present here and a row
+/// is in hand, so an event a thread cannot place does not consume the dedup slot
+/// (which would let its true owner drop it) and a full table cannot mark an event
+/// seen-but-uncounted (which would break the own-like reconciliation).
+fn countEngagement(ev: nostr.event.Event, feed_ids: []const i64) void {
+    // A reaction that is not a like ("+") adds nothing.
+    if (ev.kind == 7 and !isLikeReaction(ev.content)) return;
+    const target_hex = engagementTarget(ev) orelse return;
+    const target = noteIdFromHex(target_hex) orelse return;
+
+    engagementLock();
+    defer engagementUnlock();
+    var in_feed = false;
+    for (feed_ids) |fid| {
+        if (fid == target) {
+            in_feed = true;
+            break;
+        }
+    }
+    if (!in_feed) return;
+    const row = ensureEngagement(target) orelse return;
+    if (!markSeen(idPrefix(ev.id))) return;
+    switch (ev.kind) {
+        1 => row.counts.replies += 1,
+        6, 16 => row.counts.reposts += 1,
+        7 => row.counts.likes += 1,
+        9735 => row.counts.zap_msat +|= zapMsat(ev),
+        else => {},
+    }
+}
+
+/// Parses a 64-char hex event id's first 8 bytes into the same non-negative i64
+/// key `noteIdOf` derives, so an `e` tag maps onto a loaded note. Null when the
+/// value is not at least 16 hex digits.
+fn noteIdFromHex(hex: []const u8) ?i64 {
+    if (hex.len < 16) return null;
+    var bytes: [8]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex[0..16]) catch return null;
+    return @intCast(std.mem.readInt(u64, &bytes, .big) & std.math.maxInt(i64));
+}
+
+/// Clears the engagement table and dedup set. For tests.
+pub fn resetEngagementForTest() void {
+    g_engagement = [_]Engagement{.{}} ** engagement_cap;
+    g_seen = [_]u64{0} ** seen_engagement_cap;
+    g_seen_len = 0;
+}
+
+/// Folds an event into the counts, for tests (the ingest path without threads).
+pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void {
+    countEngagement(ev, feed_ids);
 }
 
 /// Finds the cached profile for `pubkey`, or null.
@@ -3293,27 +3529,42 @@ fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
     }, note.initials());
 }
 
-/// The engagement row: reply, repost, like, zap, in that fixed order. The like
-/// is pressable and carries an optimistic active state (a filled red heart plus
-/// a red count) the instant it is pressed. Reply, repost, and zap are still
-/// muted glyphs this pass; their crowd counts arrive with the aggregation.
+/// The engagement row: reply, repost, like, zap, in that fixed order, each an
+/// icon and its crowd count (the count omitted at zero). Only the like is
+/// pressable and only it carries an active state; reply, repost, and zap show
+/// their tallies but stay non-actionable this pass.
 fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
     const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style_tokens = .{ .foreground = .text_muted } };
+    const c = engagementFor(note.id);
     return ui.row(.{ .gap = 30, .cross = .center, .opacity = 0.75 }, .{
-        ui.appIcon(glyph, "reply"),
-        ui.icon(glyph, "repeat"),
+        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "reply"), countLabel(ui, c.replies, p.text_muted) }),
+        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.icon(glyph, "repeat"), countLabel(ui, c.reposts, p.text_muted) }),
         likeAction(ui, note),
-        ui.appIcon(glyph, "zap"),
+        // The zap count is summed sats (msat / 1000); the action itself waits
+        // on a wallet.
+        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "zap"), countLabel(ui, @intCast(c.zap_msat / 1000), p.text_muted) }),
     });
+}
+
+/// A count beside an action icon, or nothing at zero (so the icon stands alone
+/// rather than showing a "0").
+fn countLabel(ui: *AppUi, n: u64, color: canvas.Color) AppUi.Node {
+    if (n == 0) return ui.spacer(0);
+    return ui.text(.{ .size = .sm, .style = .{ .foreground = color } }, formatCount(ui.arena, n));
 }
 
 /// The like control: a pressable heart and its count. Liked is never colour
 /// alone (spec): the glyph fills red AND the count turns red together. The count
-/// is the user's own optimistic +1 this pass (nothing when not liked); the
-/// crowd count lands with the aggregation.
+/// is the crowd's likes plus this session's own optimistic +1, which is dropped
+/// once our own reaction comes back through the subscription (so it is not
+/// counted twice).
 fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
-    const liked = isLiked(note.id);
-    const count: u64 = if (liked) 1 else 0;
+    // Our own reaction id (if we liked this note), so the count can retire the
+    // optimistic +1 once the reaction is folded into the crowd total.
+    const my_reaction: ?[32]u8 = if (likeEntry(note.id)) |e| e.reaction_id else null;
+    const liked = my_reaction != null;
+    const count = likeCountFor(note.id, my_reaction);
     const tint = if (liked) theme.palette.status_like else theme.palette.text_muted;
     return ui.el(.list_item, .{
         .padding = 2,
@@ -3323,10 +3574,7 @@ fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
     }, .{
         ui.row(.{ .gap = 6, .cross = .center }, .{
             ui.appIcon(.{ .width = 15, .height = 15, .style = .{ .foreground = tint } }, "like"),
-            if (count > 0)
-                ui.text(.{ .size = .sm, .style = .{ .foreground = tint } }, formatCount(ui.arena, count))
-            else
-                ui.spacer(0),
+            countLabel(ui, count, tint),
         }),
     });
 }
@@ -4871,14 +5119,57 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     };
     try relay.subscribe("plaza-feed", &filters);
 
+    // The loaded notes' ids (and their hex), collected from the feed as it
+    // arrives. On the feed's EOSE a second subscription opens for their
+    // engagement, so counts fold in alongside the feed on the same connection.
+    var feed_ids: [engagement_watch_cap]i64 = undefined;
+    var feed_id_hex: [engagement_watch_cap][64]u8 = undefined;
+    var feed_ids_len: usize = 0;
+    var engagement_open = false;
+
     while (true) {
         var msg = (try relay.receive()) orelse break;
         defer msg.deinit();
         switch (msg.value) {
             .event => |e| {
-                const store = g_store orelse continue;
-                // Verify (secp256k1) before storing; silently drop a bad event.
-                _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                if (std.mem.eql(u8, e.subscription_id, "plaza-feed")) {
+                    const store = g_store orelse continue;
+                    // Verify (secp256k1) before storing; silently drop a bad event.
+                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                    // Note this feed post so its engagement can be watched. Bounded
+                    // to keep the `#e` filter a size relays accept.
+                    if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {
+                        const nid = noteIdOf(e.event);
+                        var known = false;
+                        for (feed_ids[0..feed_ids_len]) |fid| {
+                            if (fid == nid) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            feed_ids[feed_ids_len] = nid;
+                            hexLower(&feed_id_hex[feed_ids_len], e.event.id);
+                            feed_ids_len += 1;
+                        }
+                    }
+                } else {
+                    // The engagement subscription: fold into the counts, verified
+                    // so a forged reaction cannot inflate a tally.
+                    if (nostr.event.verify(gpa, signer, e.event) catch false) countEngagement(e.event, feed_ids[0..feed_ids_len]);
+                }
+            },
+            .eose => |eo| {
+                // Stored feed drained: now watch those notes' engagement.
+                if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                    engagement_open = true;
+                    var evals: [engagement_watch_cap][]const u8 = undefined;
+                    for (0..feed_ids_len) |i| evals[i] = &feed_id_hex[i];
+                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
+                    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..feed_ids_len] }};
+                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags }};
+                    relay.subscribe("plaza-engagement", &eng_filters) catch {};
+                }
             },
             else => {},
         }
