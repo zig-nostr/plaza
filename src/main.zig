@@ -89,6 +89,11 @@ const feed_page = 60;
 // open-as-a-sub-thread back-stack.
 const thread_reply_cap = 100;
 const thread_depth_max = 8;
+// How much of a note's text is stored. A long note is collapsed in the feed to
+// `note_collapse_chars` with a "Show more" that reveals the rest, up to this cap
+// (a kind:1 past it is truncated: long-form is kind:30023, not a note).
+const note_content_cap = 1024;
+const note_collapse_chars = 300;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
 const engagement_watch_cap = 128;
@@ -1491,7 +1496,7 @@ pub const Note = struct {
     author_len: u8 = 0,
     time_buf: [12]u8 = [_]u8{0} ** 12,
     time_len: u8 = 0,
-    content_buf: [220]u8 = [_]u8{0} ** 220,
+    content_buf: [note_content_cap]u8 = [_]u8{0} ** note_content_cap,
     content_len: u16 = 0,
     // The first image URL in the note, lifted out of the text and rendered as a
     // picture instead (see `renderContent`'s `omit`).
@@ -3160,12 +3165,14 @@ pub const Msg = union(enum) {
     reply_edit: canvas.TextInputEvent,
     /// Publish the reply composer's text as a reply to the open thread's note.
     reply_submit,
+    /// Toggle a long note's body (by id) between the collapsed fold and full.
+    toggle_expand: i64,
     /// The reader reached the end of the feed: ask the store for another page.
     load_older,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "close_thread", "reply_edit", "reply_submit", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -3478,9 +3485,12 @@ fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     if (i >= model.notes_len) return chrome + line_height;
     const note = &model.notes[i];
 
-    const chars: f32 = @floatFromInt(note.content_len);
-    const lines = @max(1, @ceil(chars / chars_per_line));
+    // A collapsed long note shows only the fold, plus a line for "Show more".
+    const collapsed = noteIsLong(note) and !isExpanded(note.id);
+    const shown_chars: f32 = @floatFromInt(if (collapsed) collapsedLen(note.content(), note_collapse_chars) else note.content_len);
+    const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
+    if (collapsed) extent += line_height;
     if (note.hasImage()) extent += pictureHeight(note) + 4;
     return extent;
 }
@@ -3635,7 +3645,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                     identityHandle(ui, note, true),
                     ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
                 }),
-                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
+                noteBody(ui, note, true),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
                 engagementRow(ui, note),
             }),
@@ -4009,6 +4019,81 @@ pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
     return std.fmt.allocPrint(arena, "{d:.1}k", .{k}) catch "";
 }
 
+// Which long notes the reader has expanded past the "Show more" fold, by note
+// id. Session-only and small: few notes are open at once, so a linear set with
+// LRU-ish eviction is plenty. Id 0 marks an empty slot (a note's id is masked
+// non-negative and never 0 in practice, the same sentinel `viewing_thread` uses).
+const expanded_cap = 64;
+var g_expanded = [_]i64{0} ** expanded_cap;
+
+fn isExpanded(note_id: i64) bool {
+    for (g_expanded) |e| {
+        if (e == note_id) return true;
+    }
+    return false;
+}
+
+/// Toggles whether `note_id`'s long body is expanded. Evicts the oldest slot
+/// when the (generous) set is full rather than refusing to expand.
+fn toggleExpanded(note_id: i64) void {
+    for (&g_expanded) |*e| {
+        if (e.* == note_id) {
+            e.* = 0;
+            return;
+        }
+    }
+    for (&g_expanded) |*e| {
+        if (e.* == 0) {
+            e.* = note_id;
+            return;
+        }
+    }
+    g_expanded[0] = note_id;
+}
+
+/// The byte length of `text` to show collapsed: the whole thing when it is not
+/// long, else a prefix near `max` that ends on a codepoint boundary and, when
+/// one is close, a word boundary, so the fold never cuts mid-word or mid-glyph.
+fn collapsedLen(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
+    var end = max;
+    // Back to the start of a codepoint (never mid-sequence).
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    // Prefer the last space/newline in the final quarter, so a word stays whole.
+    const floor = (max * 3) / 4;
+    var w = end;
+    while (w > floor and text[w - 1] != ' ' and text[w - 1] != '\n') w -= 1;
+    if (w > floor) end = w;
+    return end;
+}
+
+/// Whether a note is long enough to collapse: comfortably past the fold, so a
+/// note only a line or two over is shown whole rather than hiding a few words.
+fn noteIsLong(note: *const Note) bool {
+    return note.content_len > note_collapse_chars + 80;
+}
+
+/// A note's body: the styled text, collapsed with a "Show more" affordance when
+/// it is long (unless the reader has expanded it, or `collapsible` is false, as
+/// for a thread's focused root, which always shows in full).
+fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
+    const p = theme.palette;
+    const full = note.content();
+    const long = collapsible and noteIsLong(note);
+    const expanded = long and isExpanded(note.id);
+    const shown = if (long and !expanded) full[0..collapsedLen(full, note_collapse_chars)] else full;
+    const body = ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, shown));
+    if (!long) return body;
+    return ui.column(.{ .gap = 5 }, .{
+        body,
+        // A quiet inline control, a deeper hit target than the row's open-thread
+        // press, so tapping it toggles the fold rather than opening the thread.
+        ui.el(.list_item, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_secondary } }, if (expanded) "Show less" else "Show more"),
+        }),
+    });
+}
+
 /// One feed note: a bare row on the window, no card. Avatar column, then an
 /// identity line (name, and the time hung to the right), the body, any image,
 /// and the engagement row. The content is a fixed reading column centered in
@@ -4041,10 +4126,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         identityHandle(ui, note, true),
                         ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
                     }),
-                    ui.paragraph(
-                        .{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } },
-                        contentSpans(ui, note.content()),
-                    ),
+                    noteBody(ui, note, true),
                     // The picture. The space is reserved at the picture's own
                     // shape whether or not it has loaded, so the feed never
                     // shifts as images arrive.
@@ -4402,6 +4484,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_thread => closeThread(model),
         .reply_edit => |edit| model.reply_buffer.apply(edit),
         .reply_submit => publishReply(model, fx),
+        .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
             // Load what just came into view without waiting for the next tick.
