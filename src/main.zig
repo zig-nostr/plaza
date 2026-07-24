@@ -3111,7 +3111,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Name" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+            modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_primary } },
                     &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = 1.3 }},
@@ -3129,7 +3129,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     ui.spacer(1),
                     ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.name_empty(), .on_press = .name_save }, "Save"),
                 }),
-            }),
+            })),
         }),
     });
 }
@@ -3172,9 +3172,17 @@ fn pendingLikeText(ui: *AppUi, model: *const Model) []const u8 {
 }
 
 /// The join ladder: three ways in, most confident first, always the way back.
+/// The shared modal card: the SDK `.card` element paints the rounded, bordered
+/// surface (a plain column does not paint its background at all), holding a
+/// single content column so the sheet reads as a raised, bordered panel.
+fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.card, .{ .width = width, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{inner});
+}
+
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+    return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
         if (model.pending_compose)
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
         else if (model.pending_like != 0)
@@ -3205,14 +3213,14 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
         }),
-    });
+    }));
 }
 
 /// The focused bunker step: the user already chose to use their own signer, so
 /// this is one field, not the whole ladder again. Paste the link, connect.
 fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.column(.{ .width = 372, .gap = 12, .padding = 20, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+    return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
         ui.row(.{ .cross = .center, .gap = 6 }, .{
             ui.el(.list_item, .{ .on_press = .close_bunker, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Back" } }, .{
                 ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
@@ -3232,7 +3240,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
         }, .{}),
         ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, model.login_status()),
         ui.button(.{ .variant = .primary, .disabled = model.login_empty(), .on_press = .login_submit }, "Connect"),
-    });
+    }));
 }
 
 /// The compose sheet: a modal over the feed with the note field and the actions.
@@ -3247,19 +3255,21 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "New note" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.column(.{ .width = 520, .gap = 10, .padding = 16, .style = .{ .background = theme.palette.surface_modal, .border = theme.palette.border_modal, .radius = 14, .stroke_width = 1 } }, .{
-                ui.el(.textarea, .{
-                    .text = model.draft(),
-                    .placeholder = "Share something with the network…",
-                    .on_input = AppUi.inputMsg(.draft_edit),
-                    .on_submit = .post,
-                    .height = 140,
-                }, .{}),
-                ui.row(.{ .cross = .center, .gap = 8 }, .{
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = theme.palette.text_muted } }, model.identity(ui.arena)),
-                    ui.spacer(1),
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
-                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+            ui.el(.card, .{ .width = 520, .style = .{ .background = theme.palette.surface_modal, .border = theme.palette.border_modal, .radius = 14, .stroke_width = 1 } }, .{
+                ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
+                    ui.el(.textarea, .{
+                        .text = model.draft(),
+                        .placeholder = "Share something with the network…",
+                        .on_input = AppUi.inputMsg(.draft_edit),
+                        .on_submit = .post,
+                        .height = 140,
+                    }, .{}),
+                    ui.row(.{ .cross = .center, .gap = 8 }, .{
+                        ui.text(.{ .size = .sm, .style = .{ .foreground = theme.palette.text_muted } }, model.identity(ui.arena)),
+                        ui.spacer(1),
+                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+                    }),
                 }),
             }),
         }),
@@ -3326,7 +3336,10 @@ fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
         // so a border can mean something (a quote, a reply) and rows do not
         // float apart with the divider lost in the space.
         .gap = 0,
-        .padding = 12,
+        // No list inset: the row inset was narrower than the reading column, so
+        // the column overflowed it on the right (flush) while the left inset read
+        // as a gap. At 0 the centered reading column sits symmetric in the feed.
+        .padding = 0,
         .overscan = 3,
         .grow = 1,
         // Only bare builds (tests, previews) read this: under the app the
@@ -3413,7 +3426,7 @@ fn threadHeader(ui: *AppUi, reply_count: usize) AppUi.Node {
 fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const tint = avatarTint(note.pubkey);
-    return ui.row(.{ .main = .center }, .{
+    return ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
             ui.row(.{ .gap = 12, .cross = .start, .padding = 16 }, .{
                 ui.avatar(.{ .image = note.avatar_id(), .width = 48, .height = 48, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, note.initials()),
@@ -3443,7 +3456,7 @@ fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
 fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const p = theme.palette;
     const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
-    var node = ui.row(.{ .main = .center }, .{
+    var node = ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
             ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
                 noteAvatar(ui, note),
@@ -3478,16 +3491,24 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
     const p = theme.palette;
     return ui.column(.{ .style = .{ .background = p.surface_subbar } }, .{
         ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
-        ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
-            ui.el(.textarea, .{
-                .grow = 1,
-                .text = model.reply_draft(),
-                .placeholder = ui.fmt("Reply to {s}…", .{root.author()}),
-                .on_input = AppUi.inputMsg(.reply_edit),
-                .on_submit = .reply_submit,
-                .height = 44,
-            }, .{}),
-            ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.reply_empty(), .on_press = .reply_submit }, "Reply"),
+        ui.row(.{ .cross = .center, .padding = 12 }, .{
+            // The house input-group: one bordered field wrapping the entry and
+            // the send button in its own bottom-right accessory slot, so the
+            // button reads as part of the field rather than a stray control.
+            ui.inputGroup(
+                .{ .grow = 1 },
+                ui.el(.textarea, .{
+                    .text = model.reply_draft(),
+                    .placeholder = ui.fmt("Reply to {s}…", .{root.author()}),
+                    .on_input = AppUi.inputMsg(.reply_edit),
+                    .on_submit = .reply_submit,
+                    .height = 36,
+                }, .{}),
+                ui.inputGroupActions(.{}, .{
+                    ui.spacer(1),
+                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.reply_empty(), .on_press = .reply_submit }, "Reply"),
+                }),
+            ),
         }),
     });
 }
@@ -3550,10 +3571,11 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The 56px navigation rail: Home (the mark), Search, then the compose verb, the
+/// The 56px navigation rail: Home (the mark) up top, then the compose verb, the
 /// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
 /// titlebar of buttons — destinations on the edge, the feed owns the width. A
-/// guest's gated tiles (compose, settings, you) route to the join sheet.
+/// guest's gated tiles (compose, settings, you) route to the join sheet. Search
+/// is not shown until the feature exists.
 fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const guest = model.is_guest();
@@ -3563,10 +3585,6 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
         // Home: the mark on a raised plate, the active destination.
         ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center, .style = .{ .background = p.surface_modal, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, .semantics = .{ .label = "Home" } }, .{
             ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark"),
-        }),
-        // Search: a destination not yet built, shown quiet for the shape.
-        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center, .semantics = .{ .label = "Search" } }, .{
-            ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "search"),
         }),
         ui.spacer(1),
         // Compose: the one bright tile.
@@ -3683,20 +3701,33 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The feed's scope line: which feed this is (the starter pack) and how wide it
 /// reaches. A property of the feed, not a destination to choose between.
 fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 8, .padding = 12 }, .{
             ui.paragraph(
-                .{ .style = .{ .foreground = theme.palette.text_primary } },
+                .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Starter pack", .weight = .bold }},
             ),
-            ui.spacer(1),
             // Geist Mono: the metadata voice, via a monospace span.
             ui.paragraph(
-                .{ .style = .{ .foreground = theme.palette.text_faint_alt } },
+                .{ .style = .{ .foreground = p.text_faint_alt } },
                 &.{.{ .text = model.scope_voices(ui.arena), .monospace = true }},
             ),
+            ui.spacer(1),
+            // A permanent action here, so it is always in reach: New note when
+            // signed in, and the join CTAs for a guest who has dismissed the
+            // banner (so dismissing it never removes the only way in).
+            if (!model.is_guest())
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_compose }, "New note")
+            else if (model.guest_strip_dismissed)
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = .open_join }, "Create identity"),
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Sign in"),
+                })
+            else
+                ui.spacer(0),
         }),
-        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_feedrow, .background = theme.palette.divider_feedrow } }),
+        ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
 }
 
@@ -3810,7 +3841,7 @@ pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
 /// the window, with a hairline under each row as the only separation. Keyed by
 /// the note id so the list diff holds scroll position across reconciles.
 fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
-    var node = ui.row(.{ .main = .center }, .{
+    var node = ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
             // The row carries the press (opening the thread) directly, not through
             // a wrapping list_item: a list_item sizes to its content, so it let the
