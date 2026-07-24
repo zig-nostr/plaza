@@ -84,6 +84,11 @@ const starter_pack = blk: {
 // query grows a page at a time as the reader reaches the end.
 const feed_capacity = 300;
 const feed_page = 60;
+// A thread's replies are cached in the model (pressable, their pictures
+// fetched), so this bounds that buffer. `thread_depth_max` bounds the
+// open-as-a-sub-thread back-stack.
+const thread_reply_cap = 100;
+const thread_depth_max = 8;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
 const engagement_watch_cap = 128;
@@ -922,6 +927,18 @@ fn wantProfile(pubkey: [32]u8) void {
     }
 }
 
+/// Whether `pubkey`'s profile is still being fetched: no profile in hand yet, and
+/// the wanted-set is still trying (attempts left). This distinguishes "loading"
+/// (show a skeleton) from "gave up, or never on the relays" (show nothing), so a
+/// handle placeholder does not linger forever for an author with no metadata.
+fn profileLoading(pubkey: [32]u8) bool {
+    if (lookupProfile(pubkey) != null) return false;
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.attempts < max_profile_attempts;
+    }
+    return false;
+}
+
 /// Profile-timer rounds between re-asking for metadata that has not arrived
 /// (about 20s at the profile interval).
 const profile_rearm_rounds: u64 = 10;
@@ -1616,8 +1633,25 @@ pub const Model = struct {
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
     // The open thread: the focused note's id (0 = the feed, not a thread). When
-    // set, the thread screen replaces the feed with the note and its replies.
+    // set, the thread is layered OVER the feed (which stays mounted, so its
+    // scroll offset survives) with the note and its replies.
     viewing_thread: i64 = 0,
+    // The open thread's root, snapshotted so it survives a store rebuild and a
+    // reply can be opened as its own thread. Valid while viewing_thread != 0.
+    thread_root: Note = .{},
+    // The open thread's replies, cached from the store so they are pressable
+    // (open as a sub-thread), get their pictures fetched, and hold across
+    // rebuilds. Rebuilt each tick, oldest first.
+    thread_notes: [thread_reply_cap]Note = [_]Note{.{}} ** thread_reply_cap,
+    thread_notes_len: usize = 0,
+    // The back-stack of thread roots: opening a reply as a sub-thread pushes the
+    // current root, so Back returns to it, and only the last Back returns to the
+    // feed.
+    thread_stack: [thread_depth_max]Note = [_]Note{.{}} ** thread_depth_max,
+    thread_stack_len: usize = 0,
+    // Whether the first reply fetch is still out with nothing in hand, so the
+    // thread shows skeleton rows rather than looking empty under the root.
+    thread_loading: bool = false,
     // The reply composer's edit state, bound through `reply_draft`.
     reply_buffer: canvas.TextBuffer(compose_capacity) = .{},
     // The name beat: after creating an identity, one optional, skippable ask
@@ -1649,16 +1683,17 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                 "notes_len",     "live_relays",            "offline_relays", "draft_buffer",
-        "stage",                 "login_buffer",  "logout_pending",         "reveal_nsec",    "proxy_buffer",
-        "proxy_saved",           "feed_scroll",   "feed_limit",             "draft",          "draft_empty",
-        "identity",              "has_notes",     "empty",                  "status",         "empty_text",
-        "footer",                "note_list",     "expanded_note",          "composing",      "caught_up",
-        "relay_health",          "relays_online", "scope_voices",           "is_guest",       "show_guest_strip",
-        "guest_strip_dismissed", "joining",       "pending_compose",        "naming",         "name_buffer",
-        "name_draft",            "name_empty",    "toast_buf",              "toast_len",      "toast_until",
-        "toast_text",            "backup_nudge",  "backup_nudge_dismissed", "bunker_mode",    "pending_like",
-        "viewing_thread",        "reply_buffer",  "reply_draft",            "reply_empty",
+        "notes",                 "notes_len",        "live_relays",            "offline_relays",   "draft_buffer",
+        "stage",                 "login_buffer",     "logout_pending",         "reveal_nsec",      "proxy_buffer",
+        "proxy_saved",           "feed_scroll",      "feed_limit",             "draft",            "draft_empty",
+        "identity",              "has_notes",        "empty",                  "status",           "empty_text",
+        "footer",                "note_list",        "expanded_note",          "composing",        "caught_up",
+        "relay_health",          "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip",
+        "guest_strip_dismissed", "joining",          "pending_compose",        "naming",           "name_buffer",
+        "name_draft",            "name_empty",       "toast_buf",              "toast_len",        "toast_until",
+        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_like",
+        "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
+        "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
     };
 
     /// The name beat's current text.
@@ -1878,12 +1913,64 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{starter_pack.len}) catch "hand-picked";
     }
 
-    /// The note with this id, if it is still in the feed.
+    /// The note with this id, if it is still in the feed or the open thread. A
+    /// thread's root and replies are not in the feed window but are still
+    /// pressable (like, image, open-as-thread), so they resolve here too.
     pub fn noteById(self: *const Model, note_id: i64) ?*const Note {
         for (self.notes[0..self.notes_len]) |*note| {
             if (note.id == note_id) return note;
         }
+        if (self.viewing_thread != 0) {
+            if (self.thread_root.id == note_id) return &self.thread_root;
+            for (self.thread_notes[0..self.thread_notes_len]) |*note| {
+                if (note.id == note_id) return note;
+            }
+        }
         return null;
+    }
+
+    /// Rebuilds the open thread's replies from the store: every kind:1 that
+    /// e-tags the root, oldest first, into the `thread_notes` cache. Local-first,
+    /// the same path the feed uses; cheap enough to run each tick so
+    /// late-arriving replies appear and relative times stay fresh.
+    fn refreshThreadNotes(self: *Model, now_s: i64) void {
+        if (self.viewing_thread == 0) return;
+        const store = g_store orelse return;
+        var hex: [64]u8 = undefined;
+        hexLower(&hex, self.thread_root.event_id);
+        const evals = [_][]const u8{&hex};
+        const kinds = [_]u16{1};
+        const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
+        var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = thread_reply_cap }) catch return;
+        defer result.deinit();
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= self.thread_notes.len) break;
+            // The store's `#e` set includes the root's own descendants; drop the
+            // root itself so it is not listed under its own replies.
+            if (std.mem.eql(u8, &ev.id, &self.thread_root.event_id)) continue;
+            self.thread_notes[n] = noteFrom(ev, now_s);
+            // Queue the replier's profile so a name, avatar, and handle resolve
+            // for a reply from someone outside the follow set.
+            wantProfile(ev.pubkey);
+            n += 1;
+        }
+        std.mem.sort(Note, self.thread_notes[0..n], {}, struct {
+            fn lt(_: void, a: Note, b: Note) bool {
+                return a.created_at < b.created_at;
+            }
+        }.lt);
+        self.thread_notes_len = n;
+        if (n > 0) self.thread_loading = false;
+    }
+
+    /// The reply count for the thread breadcrumb: the crowd count the feed's
+    /// engagement subscription already knows (so it reads right the instant a
+    /// thread opens, before the replies are fetched), or the fetched count once
+    /// that is higher.
+    fn threadReplyCount(self: *const Model) usize {
+        const crowd: usize = engagementFor(self.thread_root.id).replies;
+        return @max(crowd, self.thread_notes_len);
     }
 
     /// The span of notes at or near the viewport, which is what gets pictures.
@@ -2598,11 +2685,24 @@ fn advanceAnimations(fx: *Effects, model: *const Model) void {
 
 /// Loads the pictures for the notes around the viewport: the cached ones
 /// straight from disk, the rest over the network a few per tick. Notes outside
-/// the window keep their slot only until something on screen needs it.
+/// the window keep their slot only until something on screen needs it. While a
+/// thread is open the feed under it is hidden, so the budget goes to the thread's
+/// pictures instead (the feed's reload from the disk cache when it returns).
 fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     const per_tick = 6;
     var fired: usize = 0;
     g_media_clock += 1;
+
+    if (model.viewing_thread != 0) {
+        // Mark, then fetch: marking every thread picture wanted first means the
+        // claim pass can only evict the (now hidden) feed's slots, never a
+        // thread picture needed later in this same pass.
+        markMediaWanted(model.thread_root.id);
+        for (model.thread_notes[0..model.thread_notes_len]) |*note| markMediaWanted(note.id);
+        fireMedia(fx, &model.thread_root, &fired, per_tick);
+        for (model.thread_notes[0..model.thread_notes_len]) |*note| fireMedia(fx, note, &fired, per_tick);
+        return;
+    }
 
     const window = model.visibleRange();
 
@@ -2612,39 +2712,51 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     // a slot needed later in this very pass, endlessly.
     var touch = window.first;
     while (touch <= window.last and touch < model.notes_len) : (touch += 1) {
-        if (mediaSlotFor(model.notes[touch].id)) |m| m.last_used = g_media_clock;
+        markMediaWanted(model.notes[touch].id);
     }
 
     var index = window.first;
     while (index <= window.last and index < model.notes_len) : (index += 1) {
-        const note = &model.notes[index];
-        if (!note.hasImage()) continue;
-        const slot = claimMediaSlot(fx, note.id) orelse continue;
-        slot.last_used = g_media_clock;
-        if (slot.state != .idle) continue;
-
-        var url_buf: [1024]u8 = undefined;
-        const gif = isGifUrl(note.imageUrl());
-        const url = if (gif)
-            mediaUrl(&url_buf, note.imageUrl(), gif_target_px, .animation)
-        else
-            mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
-        const n = @min(url.len, slot.url_buf.len);
-        @memcpy(slot.url_buf[0..n], url[0..n]);
-        slot.url_len = @intCast(n);
-
-        // Local-first: a picture we already have appears with the note, with no
-        // network round-trip at all.
-        if (loadCachedMedia(fx, slot, gif)) continue;
-        if (fired >= per_tick) continue;
-        slot.state = .fetching;
-        fx.fetch(.{
-            .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
-            .url = slot.url(),
-            .on_response = Effects.responseMsg(.media_fetched),
-        });
-        fired += 1;
+        fireMedia(fx, &model.notes[index], &fired, per_tick);
     }
+}
+
+/// Marks the picture slot for `note_id` wanted this pass (if it has one), so the
+/// claim pass does not evict a picture still on screen.
+fn markMediaWanted(note_id: i64) void {
+    if (mediaSlotFor(note_id)) |m| m.last_used = g_media_clock;
+}
+
+/// Loads one note's picture: claims a slot, serves it from the disk cache, or
+/// fetches it over the network (up to `per_tick` fetches a pass). A note with no
+/// picture, or one whose slot is already loading or done, is a no-op.
+fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) void {
+    if (!note.hasImage()) return;
+    const slot = claimMediaSlot(fx, note.id) orelse return;
+    slot.last_used = g_media_clock;
+    if (slot.state != .idle) return;
+
+    var url_buf: [1024]u8 = undefined;
+    const gif = isGifUrl(note.imageUrl());
+    const url = if (gif)
+        mediaUrl(&url_buf, note.imageUrl(), gif_target_px, .animation)
+    else
+        mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
+    const n = @min(url.len, slot.url_buf.len);
+    @memcpy(slot.url_buf[0..n], url[0..n]);
+    slot.url_len = @intCast(n);
+
+    // Local-first: a picture we already have appears with the note, with no
+    // network round-trip at all.
+    if (loadCachedMedia(fx, slot, gif)) return;
+    if (fired.* >= per_tick) return;
+    slot.state = .fetching;
+    fx.fetch(.{
+        .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
+        .url = slot.url(),
+        .on_response = Effects.responseMsg(.media_fetched),
+    });
+    fired.* += 1;
 }
 
 /// Handles a feed-image fetch response, mirroring the avatar path.
@@ -3374,51 +3486,96 @@ fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
 }
 
 /// The thread screen's content column: a header, the scrolling root note and its
-/// replies, and the pinned reply composer.
+/// replies, and the pinned reply composer. Reads the snapshotted root and the
+/// cached replies from the model, so a reply survives a store rebuild and can be
+/// opened as its own thread.
 fn threadContent(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
-    const root = model.noteById(model.viewing_thread) orelse {
-        // The note scrolled out of the loaded window: offer the way back.
-        return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-            threadHeader(ui, 0),
-            ui.column(.{ .grow = 1, .main = .center, .cross = .center }, .{
-                ui.text(.{ .style = .{ .foreground = p.text_muted } }, "This note is no longer loaded."),
-            }),
-        });
-    };
-    const replies = threadReplies(ui, root);
-    const items = ui.arena.alloc(AppUi.Node, 1 + replies.len) catch return ui.column(.{}, .{});
+    const root = &model.thread_root;
+    const replies = model.thread_notes[0..model.thread_notes_len];
+    // While the first fetch is out with nothing in hand, a few skeleton rows say
+    // "replies are coming" rather than showing a lone root that looks final.
+    const skeletons: usize = if (replies.len == 0 and model.thread_loading) 3 else 0;
+    const items = ui.arena.alloc(AppUi.Node, 1 + replies.len + skeletons) catch return ui.column(.{}, .{});
     items[0] = threadRoot(ui, root);
     for (replies, 0..) |*reply, i| items[i + 1] = replyRow(ui, reply, root.pubkey);
+    for (0..skeletons) |i| items[1 + replies.len + i] = replySkeleton(ui);
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        threadHeader(ui, replies.len),
+        threadHeader(ui, model),
         // The scroll viewport holds ONE child: a column that stacks the root and
         // the replies (multiple children of a scroll would layer, not flow).
+        // `cross = .center` centres each fixed-width row horizontally; the rows
+        // must NOT grow (a `grow` child in a column grows on the VERTICAL axis,
+        // which under the scroll's height makes them overlap).
         ui.scroll(.{ .grow = 1 }, .{
-            ui.column(.{}, .{items}),
+            ui.column(.{ .cross = .center }, .{items}),
         }),
         replyComposer(ui, model, root),
     });
 }
 
-/// The thread header: a Back affordance to the feed, the "Thread" label, and the
-/// reply count.
-fn threadHeader(ui: *AppUi, reply_count: usize) AppUi.Node {
+/// The thread header: a Back affordance (to the parent thread, or the feed), the
+/// "Thread" label, and the reply count (known from the crowd count up front, so
+/// it reads right before the replies are fetched).
+fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
+    // Back returns to the thread this one was opened from when nested, else to
+    // the feed; the label says which.
+    const back_label = if (model.thread_stack_len > 0) "Thread" else "Following";
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
             ui.el(.list_item, .{ .on_press = .close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
                 ui.row(.{ .cross = .center, .gap = 3 }, .{
                     ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Following"),
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, back_label),
                 }),
             }),
             ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = "Thread", .weight = .bold }}),
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} replies", .{reply_count})),
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} replies", .{model.threadReplyCount()})),
             ui.spacer(1),
         }),
         ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
+}
+
+/// A placeholder reply row shown while the first fetch is still out: a skeleton
+/// avatar and lines the same shape a real reply takes, so the thread reads as
+/// "loading" rather than "empty".
+fn replySkeleton(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .width = feed_column_width }, .{
+        ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+            ui.el(.skeleton, .{ .width = 40, .height = 40 }, .{}),
+            ui.column(.{ .gap = 8, .grow = 1, .padding = 3 }, .{
+                ui.el(.skeleton, .{ .width = 130, .height = 10 }, .{}),
+                ui.el(.skeleton, .{ .height = 10 }, .{}),
+                ui.el(.skeleton, .{ .width = 220, .height = 10 }, .{}),
+            }),
+        }),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+    });
+}
+
+/// The @handle for an identity line: the resolved handle text, a thin skeleton
+/// while the author's profile is still loading (so the line does not visibly
+/// fill in a beat later), or nothing once it is known the author has no NIP-05.
+/// `fill` grows the element to hang the time to the far right (feed and reply
+/// rows); the root note puts the handle on its own line, so it does not.
+fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
+    const p = theme.palette;
+    const h = note.handle(ui.arena);
+    if (h.len > 0) {
+        return if (fill)
+            ui.text(.{ .grow = 1, .style = .{ .foreground = p.text_faint } }, h)
+        else
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint } }, h);
+    }
+    // Profile still being fetched: a placeholder rather than an empty gap. Once
+    // it resolves (handle or none) or we give up, this stops showing.
+    if (profileLoading(note.pubkey)) {
+        const bar = ui.el(.skeleton, .{ .width = 72, .height = 9 }, .{});
+        return if (fill) ui.row(.{ .grow = 1, .cross = .center }, .{bar}) else bar;
+    }
+    return if (fill) ui.spacer(1) else ui.spacer(0);
 }
 
 /// The focused root note, drawn larger than a feed row: a 48px avatar, the name
@@ -3426,60 +3583,64 @@ fn threadHeader(ui: *AppUi, reply_count: usize) AppUi.Node {
 fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const tint = avatarTint(note.pubkey);
-    return ui.row(.{ .grow = 1, .main = .center }, .{
-        ui.column(.{ .width = feed_column_width }, .{
-            ui.row(.{ .gap = 12, .cross = .start, .padding = 16 }, .{
-                ui.avatar(.{ .image = note.avatar_id(), .width = 48, .height = 48, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, note.initials()),
-                ui.column(.{ .gap = 10, .grow = 1 }, .{
-                    ui.row(.{ .cross = .start, .gap = 6 }, .{
-                        ui.column(.{ .gap = 1, .grow = 1 }, .{
-                            ui.row(.{ .cross = .center, .gap = 6 }, .{
-                                ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = 1.15 }}),
-                                if (note.verified()) ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                            }),
-                            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint } }, note.handle(ui.arena)),
+    // A fixed-width column, centred by the scroll column's `cross = .center`. No
+    // outer growing row: a `grow` child in the scroll's column grows vertically
+    // and would overlap the next row.
+    return ui.column(.{ .width = feed_column_width }, .{
+        ui.row(.{ .gap = 12, .cross = .start, .padding = 16 }, .{
+            ui.avatar(.{ .image = note.avatar_id(), .width = 48, .height = 48, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, note.initials()),
+            ui.column(.{ .gap = 10, .grow = 1 }, .{
+                ui.row(.{ .cross = .start, .gap = 6 }, .{
+                    ui.column(.{ .gap = 1, .grow = 1 }, .{
+                        ui.row(.{ .cross = .center, .gap = 6 }, .{
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = 1.15 }}),
+                            if (note.verified()) ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
                         }),
-                        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+                        identityHandle(ui, note, false),
                     }),
-                    ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
-                    if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                    engagementRow(ui, note),
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
                 }),
+                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
+                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                engagementRow(ui, note),
             }),
-            ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
         }),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
 }
 
 /// One reply in the thread: a feed-style row, with an "author" chip when the
-/// replier is the thread's original author.
+/// replier is the thread's original author. The content row carries the press to
+/// open this reply as its own thread (like a feed row), while the picture and the
+/// engagement controls keep their own presses as the deeper hit targets.
 fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const p = theme.palette;
     const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
-    var node = ui.row(.{ .grow = 1, .main = .center }, .{
-        ui.column(.{ .width = feed_column_width }, .{
-            ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
-                noteAvatar(ui, note),
-                ui.column(.{ .gap = 5, .grow = 1 }, .{
-                    ui.row(.{ .gap = 6, .cross = .center }, .{
-                        ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
-                        if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                        if (is_author)
-                            ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                                ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "author", .monospace = true, .scale = 0.82 }}),
-                            })
-                        else
-                            ui.spacer(0),
-                        ui.text(.{ .grow = 1, .style = .{ .foreground = p.text_faint } }, note.handle(ui.arena)),
-                        ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
-                    }),
-                    ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
-                    if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                    engagementRow(ui, note),
+    // A fixed-width column, centred by the scroll column's `cross = .center`. The
+    // content row carries the press; the row must not `grow` (that would grow it
+    // vertically in the scroll's column and overlap the next reply).
+    var node = ui.column(.{ .width = feed_column_width }, .{
+        ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
+            noteAvatar(ui, note),
+            ui.column(.{ .gap = 5, .grow = 1 }, .{
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
+                    if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
+                    if (is_author)
+                        ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "author", .monospace = true, .scale = 0.82 }}),
+                        })
+                    else
+                        ui.spacer(0),
+                    identityHandle(ui, note, true),
+                    ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
                 }),
+                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
+                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                engagementRow(ui, note),
             }),
-            ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
         }),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
     node.key = .{ .int = @intCast(note.id) };
     return node;
@@ -3513,13 +3674,26 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
     });
 }
 
-/// The feed screen: the rail, then the content — the feed, or a thread when one
-/// is open.
+/// The feed screen: the rail, then the content — the feed, with a thread layered
+/// over it when one is open.
 fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    // The feed is always built (so it is always mounted): a thread is layered
+    // OVER it, not swapped in, so the feed's scroll offset survives and closing
+    // a thread returns the reader to where they were, not the top.
+    const feed = feedContent(ui, model);
     const content = if (model.viewing_thread != 0)
-        threadContent(ui, model)
+        ui.stack(.{ .grow = 1 }, .{
+            feed,
+            // A full-bleed opaque panel occludes the feed underneath. A bare
+            // column does not reliably paint its background; the `.card` element
+            // does, so it is the occluder (no border, no radius).
+            ui.el(.card, .{ .grow = 1, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{
+                threadContent(ui, model),
+            }),
+        })
     else
-        feedContent(ui, model);
+        feed;
 
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
@@ -3529,7 +3703,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
         // A 1px vertical rule between the rail and the content. No `grow`: in a
         // row that would stretch it along the WIDTH and eat the feed's space; it
         // fills the height on its own via the row's cross-axis stretch.
-        ui.separator(.{ .width = 1, .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
+        ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
         content,
     });
 }
@@ -3864,7 +4038,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                             ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.status_success } }, "check-circle")
                         else
                             ui.spacer(0),
-                        ui.text(.{ .grow = 1, .style = .{ .foreground = theme.palette.text_faint } }, note.handle(ui.arena)),
+                        identityHandle(ui, note, true),
                         ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
                     }),
                     ui.paragraph(
@@ -4039,7 +4213,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .tick => |t| {
             if (t.outcome == .fired) {
-                model.refresh(nowSeconds());
+                const now = nowSeconds();
+                model.refresh(now);
+                // Keep the open thread's replies current: late replies appear and
+                // relative times stay fresh, the same cadence as the feed.
+                model.refreshThreadNotes(now);
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
                 scanAvatarFetches(fx);
@@ -4220,17 +4398,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .expand_image => |note_id| model.expanded_note = note_id,
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
-        .open_thread => |note_id| {
-            model.viewing_thread = note_id;
-            model.reply_buffer.clear();
-            // Fetch the note's replies into the store; the thread view reads
-            // them back at render time.
-            if (model.noteById(note_id)) |note| fetchThreadReplies(note.event_id);
-        },
-        .close_thread => {
-            model.viewing_thread = 0;
-            model.reply_buffer.clear();
-        },
+        .open_thread => |note_id| openThread(model, note_id),
+        .close_thread => closeThread(model),
         .reply_edit => |edit| model.reply_buffer.apply(edit),
         .reply_submit => publishReply(model, fx),
         .feed_scrolled => |scroll| {
@@ -4595,14 +4764,56 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
 
 // ------------------------------------------------------------------------ threads
 //
-// A thread is the focused note plus the kind:1 replies that e-tag it. Opening one
-// fires a one-shot fetch of those replies into the local store (they are not part
-// of the follow feed, so they are not there yet); the thread view then reads them
-// back from the store at render time, the same local-first path the feed uses.
+// A thread is the focused note plus the kind:1 replies that e-tag it. It is
+// layered OVER the feed, which stays mounted so its scroll offset survives.
+// Opening one snapshots the root, reads any replies already in the store, and
+// fires a one-shot fetch of the rest (with their engagement) into the store; the
+// replies are cached in the model so they are pressable (open as a sub-thread)
+// and get their pictures fetched, the same local-first path the feed uses.
 
-/// Fetches a note's replies into the store, on a detached thread. One dial per
-/// relay: opening a thread is a rare, human-paced action, so a throwaway
-/// connection keeps the ingest loops untouched, exactly like publishing.
+/// Opens `note_id` as a thread. The target may live in the feed or the current
+/// thread; it is snapshotted as the new root so it survives store rebuilds. When
+/// a thread is already open, the current root is pushed so Back returns to it.
+fn openThread(model: *Model, note_id: i64) void {
+    const target = model.noteById(note_id) orelse return;
+    const root = target.*;
+    if (model.viewing_thread != 0 and model.thread_stack_len < model.thread_stack.len) {
+        model.thread_stack[model.thread_stack_len] = model.thread_root;
+        model.thread_stack_len += 1;
+    }
+    model.viewing_thread = note_id;
+    model.thread_root = root;
+    model.thread_notes_len = 0;
+    model.reply_buffer.clear();
+    wantProfile(root.pubkey);
+    model.refreshThreadNotes(nowSeconds());
+    model.thread_loading = model.thread_notes_len == 0;
+    fetchThreadReplies(root.event_id);
+}
+
+/// Closes the open thread: pops the back-stack to the thread it was opened from,
+/// or returns to the feed (which kept its scroll offset) when the stack is empty.
+fn closeThread(model: *Model) void {
+    model.reply_buffer.clear();
+    model.thread_notes_len = 0;
+    if (model.thread_stack_len > 0) {
+        model.thread_stack_len -= 1;
+        const prev = model.thread_stack[model.thread_stack_len];
+        model.viewing_thread = prev.id;
+        model.thread_root = prev;
+        model.refreshThreadNotes(nowSeconds());
+        model.thread_loading = model.thread_notes_len == 0;
+        fetchThreadReplies(prev.event_id);
+    } else {
+        model.viewing_thread = 0;
+        model.thread_loading = false;
+    }
+}
+
+/// Fetches a note's replies (and their engagement) into the store, on a detached
+/// thread. One dial per relay: opening a thread is a rare, human-paced action, so
+/// a throwaway connection keeps the ingest loops untouched, exactly like
+/// publishing.
 fn fetchThreadReplies(root_id: [32]u8) void {
     // Nowhere to put the replies without a store; the guard also keeps tests,
     // which have no store, from dialing relays.
@@ -4619,17 +4830,27 @@ fn fetchRepliesWorker(root_id: [32]u8) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
-    var hex: [64]u8 = undefined;
-    hexLower(&hex, root_id);
-    const evals = [_][]const u8{&hex};
-    const kinds = [_]u16{1};
-    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
-    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .tags = &tag_filters, .limit = 200 }};
+    var root_hex: [64]u8 = undefined;
+    hexLower(&root_hex, root_id);
 
     for (relays) |url| {
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
-        relay.subscribe("plaza-thread", &filters) catch continue;
+
+        // Phase 1: the replies themselves (kind:1 e-tagging the root). Collect
+        // their ids as they arrive so phase 2 can watch their engagement too.
+        var id_hex: [thread_reply_cap][64]u8 = undefined;
+        var watch_ids: [thread_reply_cap + 1]i64 = undefined;
+        var id_count: usize = 0;
+        // The root is watched from the start, so its own counts refresh.
+        watch_ids[0] = @intCast(std.mem.readInt(u64, root_id[0..8], .big) & std.math.maxInt(i64));
+        var watch_len: usize = 1;
+
+        const reply_kinds = [_]u16{1};
+        const root_evals = [_][]const u8{&root_hex};
+        const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &root_evals }};
+        const reply_filters = [_]nostr.filter.Filter{.{ .kinds = &reply_kinds, .tags = &reply_tags, .limit = thread_reply_cap }};
+        relay.subscribe("plaza-thread", &reply_filters) catch continue;
         while (true) {
             var msg = (relay.receive() catch break) orelse break;
             defer msg.deinit();
@@ -4639,40 +4860,45 @@ fn fetchRepliesWorker(root_id: [32]u8) void {
                     _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
                     // Queue the replier's profile so a name and face resolve.
                     wantProfile(e.event.pubkey);
+                    if (id_count < thread_reply_cap) {
+                        hexLower(&id_hex[id_count], e.event.id);
+                        id_count += 1;
+                        watch_ids[watch_len] = noteIdOf(e.event);
+                        watch_len += 1;
+                    }
+                },
+                .eose => break,
+                else => {},
+            }
+        }
+
+        // Phase 2: engagement on the root and every reply (replies, reposts,
+        // likes, zaps), folded into the shared table so the thread shows real
+        // metrics on each row, the same counts the feed shows.
+        var evals: [thread_reply_cap + 1][]const u8 = undefined;
+        evals[0] = &root_hex;
+        var eval_len: usize = 1;
+        for (0..id_count) |i| {
+            evals[eval_len] = &id_hex[i];
+            eval_len += 1;
+        }
+        const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
+        const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..eval_len] }};
+        const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+        relay.subscribe("plaza-thread-eng", &eng_filters) catch continue;
+        while (true) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    if (nostr.event.verify(gpa, signer, e.event) catch false)
+                        countEngagement(e.event, watch_ids[0..watch_len]);
                 },
                 .eose => break,
                 else => {},
             }
         }
     }
-}
-
-/// The open thread's replies, read from the store: every kind:1 that e-tags the
-/// root, oldest first (conversation order), built into self-contained Notes in
-/// the caller's arena. The root itself is filtered out.
-fn threadReplies(ui: *AppUi, root: *const Note) []Note {
-    const store = g_store orelse return &.{};
-    var hex: [64]u8 = undefined;
-    hexLower(&hex, root.event_id);
-    const evals = [_][]const u8{&hex};
-    const kinds = [_]u16{1};
-    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
-    var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = 100 }) catch return &.{};
-    defer result.deinit();
-    const now = nowSeconds();
-    const notes = ui.arena.alloc(Note, result.events.len) catch return &.{};
-    var n: usize = 0;
-    for (result.events) |ev| {
-        if (std.mem.eql(u8, &ev.id, &root.event_id)) continue;
-        notes[n] = noteFrom(ev, now);
-        n += 1;
-    }
-    std.mem.sort(Note, notes[0..n], {}, struct {
-        fn lt(_: void, a: Note, b: Note) bool {
-            return a.created_at < b.created_at;
-        }
-    }.lt);
-    return notes[0..n];
 }
 
 // ------------------------------------------------------- remote signer (NIP-46)
