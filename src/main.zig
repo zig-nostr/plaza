@@ -3930,14 +3930,17 @@ fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
 /// replies, and the pinned reply composer. Reads the snapshotted root and the
 /// cached replies from the model, so a reply survives a store rebuild and can be
 /// opened as its own thread.
-fn threadContent(ui: *AppUi, model: *const Model) AppUi.Node {
-    const root = &model.thread_root;
-    const replies = model.thread_notes[0..model.thread_notes_len];
+/// One thread level's panel: header, the scrolling root and its replies, and the
+/// reply composer. Rendered for the open thread AND every ancestor still on the
+/// back-stack (occluded beneath it), so each level's scroll region stays mounted
+/// and keeps its offset. The scroll's `global_key` is the level's root id, so a
+/// level's scroll identity is stable as it moves between current and ancestor.
+fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []const Note, thread_loading: bool, level_key: u64) AppUi.Node {
     // While the first fetch is out with nothing in hand, a few skeleton rows say
     // "replies are coming"; once it has come back empty, a quiet line instead of
     // a lone root over blank space.
-    const loading = replies.len == 0 and model.thread_loading;
-    const empty = replies.len == 0 and !model.thread_loading;
+    const loading = replies.len == 0 and thread_loading;
+    const empty = replies.len == 0 and !thread_loading;
     const skeletons: usize = if (loading) 3 else 0;
     const tail: usize = if (empty) 1 else 0;
     const items = ui.arena.alloc(AppUi.Node, 1 + replies.len + skeletons + tail) catch return ui.column(.{}, .{});
@@ -3951,12 +3954,44 @@ fn threadContent(ui: *AppUi, model: *const Model) AppUi.Node {
         // the replies (multiple children of a scroll would layer, not flow).
         // `cross = .center` centres each fixed-width row horizontally; the rows
         // must NOT grow (a `grow` child in a column grows on the VERTICAL axis,
-        // which under the scroll's height makes them overlap).
-        ui.scroll(.{ .grow = 1 }, .{
+        // which under the scroll's height makes them overlap). The `global_key`
+        // is the level's position (stable across pushes/pops above it, and never
+        // colliding even if the same note appears at two levels), so the scroll
+        // offset survives while occluded.
+        ui.scroll(.{ .grow = 1, .global_key = .{ .int = level_key } }, .{
             ui.column(.{ .cross = .center }, .{items}),
         }),
         replyComposer(ui, model, root),
     });
+}
+
+/// The open thread's replies read from the store at render time, into the arena,
+/// oldest first. Used for the ANCESTOR levels (the current level reads its cached
+/// `thread_notes` instead): they are occluded, so a per-frame read is cheap and
+/// keeps their scroll content stable without a second reply cache.
+fn threadRepliesFromStore(ui: *AppUi, root_event_id: [32]u8) []const Note {
+    const store = g_store orelse return &.{};
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, root_event_id);
+    const evals = [_][]const u8{&hex};
+    const kinds = [_]u16{1};
+    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
+    var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = thread_reply_cap }) catch return &.{};
+    defer result.deinit();
+    const now = nowSeconds();
+    const notes = ui.arena.alloc(Note, result.events.len) catch return &.{};
+    var n: usize = 0;
+    for (result.events) |ev| {
+        if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
+        notes[n] = noteFrom(ev, now);
+        n += 1;
+    }
+    std.mem.sort(Note, notes[0..n], {}, struct {
+        fn lt(_: void, a: Note, b: Note) bool {
+            return a.created_at < b.created_at;
+        }
+    }.lt);
+    return notes[0..n];
 }
 
 /// The quiet line under a note that has no replies, so an empty thread reads as
@@ -4140,24 +4175,51 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
 
 /// The feed screen: the rail, then the content — the feed, with a thread layered
 /// over it when one is open.
+/// Wraps a thread level's panel in a full-bleed opaque panel that occludes
+/// whatever is beneath it (a bare column does not reliably paint its background;
+/// the `.card` element does). Keyed by the level's root id so the whole level
+/// keeps its identity, and its scroll offset, as levels push and pop above it.
+fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.card, .{ .grow = 1, .global_key = .{ .int = level_key }, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{panel});
+}
+
+/// A stable, collision-free scroll identity for a thread level: the level index
+/// in the high bits (distinct per position, so an ancestor keeps its key and
+/// offset while deeper levels push and pop, and two levels never collide even if
+/// the same note appears twice) and the root note id in the low bits (so when
+/// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
+/// top root in place, the new level gets a fresh key and opens at the top rather
+/// than inheriting the dropped thread's offset).
+fn threadLevelKey(level: usize, root_id: i64) u64 {
+    const hi = @as(u64, level) << 59;
+    const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
+    return hi | lo;
+}
+
 fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // The feed is always built (so it is always mounted): a thread is layered
     // OVER it, not swapped in, so the feed's scroll offset survives and closing
-    // a thread returns the reader to where they were, not the top.
+    // a thread returns the reader to where they were, not the top. EACH open
+    // thread level is layered too (occluded ancestors under the current one), so
+    // every level keeps its own scroll offset and Back never lands a parent
+    // thread at the top.
     const feed = feedContent(ui, model);
-    const content = if (model.viewing_thread != 0)
-        ui.stack(.{ .grow = 1 }, .{
-            feed,
-            // A full-bleed opaque panel occludes the feed underneath. A bare
-            // column does not reliably paint its background; the `.card` element
-            // does, so it is the occluder (no border, no radius).
-            ui.el(.card, .{ .grow = 1, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{
-                threadContent(ui, model),
-            }),
-        })
-    else
-        feed;
+    const content = if (model.viewing_thread != 0) blk: {
+        // feed + one panel per level: the back-stacked ancestors (oldest first),
+        // then the current thread on top.
+        const kids = ui.arena.alloc(AppUi.Node, 2 + model.thread_stack_len) catch break :blk feed;
+        kids[0] = feed;
+        for (0..model.thread_stack_len) |d| {
+            const root = &model.thread_stack[d];
+            const lk = threadLevelKey(d, root.id);
+            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, root.event_id), false, lk));
+        }
+        const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
+        kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk));
+        break :blk ui.stack(.{ .grow = 1 }, .{kids});
+    } else feed;
 
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
