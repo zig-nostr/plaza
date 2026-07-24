@@ -41,6 +41,11 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 680;
 const window_height: f32 = 820;
 const feed_column_width: f32 = 620;
+// The thread's reading column is a touch narrower than the feed's: the feed's
+// virtualList reserves a scrollbar gutter, but a thread's plain `ui.scroll` does
+// not, so a full-width centred row would slide under the overlay scrollbar and
+// clip the timestamp at a narrow window. This clears it at the 680 minimum.
+const thread_column_width: f32 = 588;
 
 // The relay pool this milestone dials, and how many recent notes to keep on
 // screen. Each relay runs on its own thread and ingests into the one shared
@@ -89,6 +94,10 @@ const feed_page = 60;
 // open-as-a-sub-thread back-stack.
 const thread_reply_cap = 100;
 const thread_depth_max = 8;
+// How long a thread shows loading skeletons before giving up if the reply fetch
+// never signals completion (a relay that never sends EOSE), so a reply-less note
+// never stalls under skeletons forever.
+const thread_loading_grace_s = 6;
 // How much of a note's text is stored. A long note is collapsed in the feed to
 // `note_collapse_chars` with a "Show more" that reveals the rest, up to this cap
 // (a kind:1 past it is truncated: long-form is kind:30023, not a note).
@@ -1657,6 +1666,11 @@ pub const Model = struct {
     // Whether the first reply fetch is still out with nothing in hand, so the
     // thread shows skeleton rows rather than looking empty under the root.
     thread_loading: bool = false,
+    // The open thread's fetch generation and when it opened, so the loading
+    // skeletons retire the moment THIS thread's fetch reports back (or a grace
+    // period elapses), never on a stale earlier thread's completion.
+    thread_seq: u64 = 0,
+    thread_open_at: i64 = 0,
     // The reply composer's edit state, bound through `reply_draft`.
     reply_buffer: canvas.TextBuffer(compose_capacity) = .{},
     // The name beat: after creating an identity, one optional, skippable ask
@@ -1699,6 +1713,7 @@ pub const Model = struct {
         "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_like",
         "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
         "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
+        "thread_seq",            "thread_open_at",
     };
 
     /// The name beat's current text.
@@ -1966,7 +1981,16 @@ pub const Model = struct {
             }
         }.lt);
         self.thread_notes_len = n;
-        if (n > 0) self.thread_loading = false;
+        // Stop the loading skeletons once replies are in hand, OR once this
+        // thread's own fetch has asked every relay and come back empty (a
+        // genuinely reply-less note), OR after a grace period in case a relay
+        // never sends its EOSE. Otherwise skeletons would stall forever under a
+        // note that simply has no replies.
+        if (self.thread_loading) {
+            const done = g_thread_done_seq.load(.acquire) == self.thread_seq;
+            const timed_out = now_s - self.thread_open_at > thread_loading_grace_s;
+            if (n > 0 or done or timed_out) self.thread_loading = false;
+        }
     }
 
     /// The reply count for the thread breadcrumb: the crowd count the feed's
@@ -3503,12 +3527,17 @@ fn threadContent(ui: *AppUi, model: *const Model) AppUi.Node {
     const root = &model.thread_root;
     const replies = model.thread_notes[0..model.thread_notes_len];
     // While the first fetch is out with nothing in hand, a few skeleton rows say
-    // "replies are coming" rather than showing a lone root that looks final.
-    const skeletons: usize = if (replies.len == 0 and model.thread_loading) 3 else 0;
-    const items = ui.arena.alloc(AppUi.Node, 1 + replies.len + skeletons) catch return ui.column(.{}, .{});
+    // "replies are coming"; once it has come back empty, a quiet line instead of
+    // a lone root over blank space.
+    const loading = replies.len == 0 and model.thread_loading;
+    const empty = replies.len == 0 and !model.thread_loading;
+    const skeletons: usize = if (loading) 3 else 0;
+    const tail: usize = if (empty) 1 else 0;
+    const items = ui.arena.alloc(AppUi.Node, 1 + replies.len + skeletons + tail) catch return ui.column(.{}, .{});
     items[0] = threadRoot(ui, root);
     for (replies, 0..) |*reply, i| items[i + 1] = replyRow(ui, reply, root.pubkey);
     for (0..skeletons) |i| items[1 + replies.len + i] = replySkeleton(ui);
+    if (empty) items[items.len - 1] = threadEmptyNote(ui);
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         threadHeader(ui, model),
         // The scroll viewport holds ONE child: a column that stacks the root and
@@ -3523,14 +3552,27 @@ fn threadContent(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
+/// The quiet line under a note that has no replies, so an empty thread reads as
+/// "nothing here yet" rather than a lone post over a wall of blank space.
+fn threadEmptyNote(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .padding = 24, .main = .center }, .{
+        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint } }, "No replies yet. Be the first."),
+    });
+}
+
 /// The thread header: a Back affordance (to the parent thread, or the feed), the
 /// "Thread" label, and the reply count (known from the crowd count up front, so
 /// it reads right before the replies are fetched).
 fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    // Back returns to the thread this one was opened from when nested, else to
-    // the feed; the label says which.
-    const back_label = if (model.thread_stack_len > 0) "Thread" else "Following";
+    // Back names WHERE it goes, never a bare "Thread" beside the "Thread" title:
+    // the feed ("Following") at the root, else the parent post's author.
+    const back_label = if (model.thread_stack_len > 0)
+        model.thread_stack[model.thread_stack_len - 1].author()
+    else
+        "Following";
+    const count = model.threadReplyCount();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
             ui.el(.list_item, .{ .on_press = .close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
@@ -3540,7 +3582,12 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
                 }),
             }),
             ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = "Thread", .weight = .bold }}),
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} replies", .{model.threadReplyCount()})),
+            // The count reads once replies are known; before then it says nothing
+            // rather than a misleading "0 replies" on a note that has some.
+            if (count > 0)
+                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} replies", .{count}))
+            else
+                ui.spacer(0),
             ui.spacer(1),
         }),
         ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
@@ -3552,7 +3599,7 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
 /// "loading" rather than "empty".
 fn replySkeleton(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    return ui.column(.{ .width = feed_column_width }, .{
+    return ui.column(.{ .width = thread_column_width }, .{
         ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
             ui.el(.skeleton, .{ .width = 40, .height = 40 }, .{}),
             ui.column(.{ .gap = 8, .grow = 1, .padding = 3 }, .{
@@ -3561,7 +3608,7 @@ fn replySkeleton(ui: *AppUi) AppUi.Node {
                 ui.el(.skeleton, .{ .width = 220, .height = 10 }, .{}),
             }),
         }),
-        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
 }
 
@@ -3588,34 +3635,34 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
     return if (fill) ui.spacer(1) else ui.spacer(0);
 }
 
-/// The focused root note, drawn larger than a feed row: a 48px avatar, the name
-/// over the handle, the body at reading size, and the engagement row.
+/// The focused root note: the same 40px avatar and 14px inset as the feed and
+/// the replies (so every row's avatar and text share one left edge), set apart
+/// by a slightly larger name, the name-over-handle stack, and the composer below.
 fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    const tint = avatarTint(note.pubkey);
     // A fixed-width column, centred by the scroll column's `cross = .center`. No
     // outer growing row: a `grow` child in the scroll's column grows vertically
     // and would overlap the next row.
-    return ui.column(.{ .width = feed_column_width }, .{
-        ui.row(.{ .gap = 12, .cross = .start, .padding = 16 }, .{
-            ui.avatar(.{ .image = note.avatar_id(), .width = 48, .height = 48, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, note.initials()),
-            ui.column(.{ .gap = 10, .grow = 1 }, .{
+    return ui.column(.{ .width = thread_column_width }, .{
+        ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+            noteAvatar(ui, note),
+            ui.column(.{ .gap = 8, .grow = 1 }, .{
                 ui.row(.{ .cross = .start, .gap = 6 }, .{
                     ui.column(.{ .gap = 1, .grow = 1 }, .{
                         ui.row(.{ .cross = .center, .gap = 6 }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = 1.15 }}),
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = 1.1 }}),
                             if (note.verified()) ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
                         }),
                         identityHandle(ui, note, false),
                     }),
                     ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
                 }),
-                ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, note.content())),
+                noteBody(ui, note, false),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
                 engagementRow(ui, note),
             }),
         }),
-        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
 }
 
@@ -3629,7 +3676,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     // A fixed-width column, centred by the scroll column's `cross = .center`. The
     // content row carries the press; the row must not `grow` (that would grow it
     // vertically in the scroll's column and overlap the next reply).
-    var node = ui.column(.{ .width = feed_column_width }, .{
+    var node = ui.column(.{ .width = thread_column_width }, .{
         ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
             noteAvatar(ui, note),
             ui.column(.{ .gap = 5, .grow = 1 }, .{
@@ -3650,7 +3697,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                 engagementRow(ui, note),
             }),
         }),
-        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
     node.key = .{ .int = @intCast(note.id) };
     return node;
@@ -3888,14 +3935,15 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 8, .padding = 12 }, .{
+            // ONE paragraph, so the bold label and the mono metadata share a
+            // single baseline (two separate paragraphs sat on mismatched line
+            // boxes and read as vertically misaligned).
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = "Starter pack", .weight = .bold }},
-            ),
-            // Geist Mono: the metadata voice, via a monospace span.
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_faint_alt } },
-                &.{.{ .text = model.scope_voices(ui.arena), .monospace = true }},
+                &.{
+                    .{ .text = "Starter pack", .weight = .bold },
+                    .{ .text = ui.fmt("  {s}", .{model.scope_voices(ui.arena)}), .monospace = true, .color = .text_muted },
+                },
             ),
             ui.spacer(1),
             // A permanent action here, so it is always in reach: New note when
@@ -4869,9 +4917,13 @@ fn openThread(model: *Model, note_id: i64) void {
     model.thread_notes_len = 0;
     model.reply_buffer.clear();
     wantProfile(root.pubkey);
-    model.refreshThreadNotes(nowSeconds());
+    const now = nowSeconds();
+    model.refreshThreadNotes(now);
+    model.thread_open_at = now;
     model.thread_loading = model.thread_notes_len == 0;
-    fetchThreadReplies(root.event_id);
+    const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+    model.thread_seq = seq;
+    fetchThreadReplies(root.event_id, seq);
 }
 
 /// Closes the open thread: pops the back-stack to the thread it was opened from,
@@ -4884,28 +4936,48 @@ fn closeThread(model: *Model) void {
         const prev = model.thread_stack[model.thread_stack_len];
         model.viewing_thread = prev.id;
         model.thread_root = prev;
-        model.refreshThreadNotes(nowSeconds());
+        const now = nowSeconds();
+        model.refreshThreadNotes(now);
+        model.thread_open_at = now;
         model.thread_loading = model.thread_notes_len == 0;
-        fetchThreadReplies(prev.event_id);
+        const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+        model.thread_seq = seq;
+        fetchThreadReplies(prev.event_id, seq);
     } else {
         model.viewing_thread = 0;
         model.thread_loading = false;
     }
 }
 
+// The open-thread generation, so a reply fetch can report completion for the
+// thread it was launched for and not a later one. `g_thread_seq` is bumped on
+// each open; the worker copies its seq and, when it has asked every relay,
+// stores it into `g_thread_done_seq`. The UI thread clears the loading skeletons
+// only when the CURRENT thread's fetch is the one that finished (so a genuinely
+// empty thread stops loading, but a stale late worker never clears a new thread).
+var g_thread_seq = std.atomic.Value(u64).init(0);
+var g_thread_done_seq = std.atomic.Value(u64).init(0);
+
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so
 /// a throwaway connection keeps the ingest loops untouched, exactly like
-/// publishing.
-fn fetchThreadReplies(root_id: [32]u8) void {
+/// publishing. `seq` tags the fetch so its completion is attributable.
+fn fetchThreadReplies(root_id: [32]u8, seq: u64) void {
     // Nowhere to put the replies without a store; the guard also keeps tests,
-    // which have no store, from dialing relays.
-    if (g_store == null) return;
-    const thread = std.Thread.spawn(.{}, fetchRepliesWorker, .{root_id}) catch return;
+    // which have no store, from dialing relays. Mark it done at once so the UI
+    // does not wait on a fetch that never ran.
+    if (g_store == null) {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, fetchRepliesWorker, .{ root_id, seq }) catch {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    };
     thread.detach();
 }
 
-fn fetchRepliesWorker(root_id: [32]u8) void {
+fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -4982,6 +5054,9 @@ fn fetchRepliesWorker(root_id: [32]u8) void {
             }
         }
     }
+    // Every relay has been asked: the reply set is as complete as it will get, so
+    // the UI can stop showing loading skeletons even if nothing came back.
+    g_thread_done_seq.store(seq, .release);
 }
 
 // ------------------------------------------------------- remote signer (NIP-46)
