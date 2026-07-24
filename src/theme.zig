@@ -54,7 +54,7 @@ pub const palette = struct {
     // The elevated sheet surface. Clearly lighter than the window so a modal
     // reads as a raised panel over the (now firmly dimmed) feed, not a floating
     // cluster of controls.
-    pub const surface_modal = hex("#1c1c22");
+    pub const surface_modal = hex("#202028");
     pub const surface_inset = hex("#17171b");
     pub const surface_subbar = hex("#121216");
     pub const surface_input = hex("#0f0f13");
@@ -68,7 +68,9 @@ pub const palette = struct {
     pub const border_hairline = hex("#26262c");
     pub const border_window = hex("#2a2a30");
     pub const border_control = hex("#2c2c33");
-    pub const border_modal = hex("#33333c");
+    // The sheet outline. Deliberately a clear step above the surface so a modal
+    // reads as a bordered, rounded panel, not an edgeless dark shape.
+    pub const border_modal = hex("#43434f");
     pub const border_focus = hex("#4a4a56");
     pub const border_dashed = hex("#3a3a44");
 
