@@ -1048,6 +1048,175 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
     }
 }
 
+// ------------------------------------------------------------------ quotes
+//
+// A note can quote another event (NIP-27 `nostr:nevent`/`note`). The quoted
+// event's id is decoded once at parse time (Note.quote); this cache holds the
+// resolved quoted note (author + a truncated body) keyed by that id, filled from
+// the store as it grows and fetched from the pool when absent, mirroring the
+// profile cache. The render side reads it to draw an embedded quote card.
+const quote_cache_cap = 64;
+const max_quote_attempts = 3;
+const quote_fetch_batch = 16;
+const quote_text_cap = 192;
+const QuoteEntry = struct {
+    used: bool = false,
+    id: [32]u8 = [_]u8{0} ** 32,
+    state: enum { idle, fetching, loaded, missing } = .idle,
+    attempts: u8 = 0,
+    requested: bool = false,
+    pubkey: [32]u8 = [_]u8{0} ** 32,
+    created_at: i64 = 0,
+    text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
+    text_len: u8 = 0,
+    last_used: u64 = 0,
+};
+var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
+var g_quote_clock: u64 = 0;
+
+/// Records that a quoted event `id` needs resolving, deduping and (when full)
+/// evicting the least-recently-drawn entry that is not mid-fetch.
+fn wantQuote(id: [32]u8) void {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) return;
+    }
+    for (&g_quotes) |*q| {
+        if (!q.used) {
+            q.* = .{ .used = true, .id = id };
+            return;
+        }
+    }
+    var victim: ?*QuoteEntry = null;
+    for (&g_quotes) |*q| {
+        if (q.state == .fetching) continue;
+        if (victim == null or q.last_used < victim.?.last_used) victim = q;
+    }
+    // Every slot mid-fetch: still record the newcomer over the overall LRU. The
+    // evicted entry's fetch merely ingests into the store, so nothing is lost by
+    // dropping its slot, and the new quote is never silently forgotten.
+    if (victim == null) {
+        for (&g_quotes) |*q| {
+            if (victim == null or q.last_used < victim.?.last_used) victim = q;
+        }
+    }
+    if (victim) |v| v.* = .{ .used = true, .id = id };
+}
+
+/// The cache entry for a quoted event `id` (marking it drawn this frame so the
+/// LRU keeps it), or null when it is not cached.
+fn quoteFor(id: [32]u8) ?*QuoteEntry {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) {
+            g_quote_clock += 1;
+            q.last_used = g_quote_clock;
+            return q;
+        }
+    }
+    return null;
+}
+
+/// Fills any unresolved quote from the store (it grew, so the fetch may have
+/// landed): copies the quoted author and a truncated body, and asks for the
+/// author's name. Gives up (marks missing) once every relay has been tried.
+fn refreshQuotes(store: *nostr.store.Store) void {
+    for (&g_quotes) |*q| {
+        if (!q.used or q.state == .loaded or q.state == .missing) continue;
+        var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
+            if (q.attempts >= max_quote_attempts) q.state = .missing;
+            continue;
+        };
+        defer se.deinit();
+        q.pubkey = se.event.pubkey;
+        q.created_at = se.event.created_at;
+        var tmp: [note_content_cap]u8 = undefined;
+        const omit = firstImageUrl(se.event.content) orelse "";
+        const wrote = renderContent(&tmp, se.event.content, omit);
+        const keep = utf8SafeLen(tmp[0..wrote], q.text_buf.len);
+        @memcpy(q.text_buf[0..keep], tmp[0..keep]);
+        q.text_len = @intCast(keep);
+        q.state = .loaded;
+        wantProfile(q.pubkey);
+    }
+}
+
+/// Lets the still-unresolved quotes be asked for again on the next round.
+fn rearmWantedQuotes() void {
+    for (&g_quotes) |*q| {
+        if (q.used and q.state != .loaded and q.state != .missing and q.attempts < max_quote_attempts) q.requested = false;
+    }
+}
+
+/// Asks the pool for any quoted events not yet in the store, one batch on a
+/// throwaway connection, bounded like the mention fetch.
+fn requestWantedQuotes() void {
+    var batch: [quote_fetch_batch][32]u8 = undefined;
+    var n: usize = 0;
+    for (&g_quotes) |*q| {
+        if (!q.used or q.state == .loaded or q.state == .missing) continue;
+        if (q.requested or q.attempts >= max_quote_attempts) continue;
+        batch[n] = q.id;
+        n += 1;
+        q.requested = true;
+        q.attempts += 1;
+        q.state = .fetching;
+        if (n == batch.len) break;
+    }
+    if (n == 0) return;
+    const thread = std.Thread.spawn(.{}, fetchQuotesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
+    thread.detach();
+}
+
+/// Fetches the quoted events in `batch` by id and ingests them, then closes.
+/// The next store-growth tick flips them to `.loaded` via `refreshQuotes`.
+fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len: usize) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const filters = [_]nostr.filter.Filter{.{ .ids = batch[0..len], .limit = @intCast(len) }};
+    for (relays) |url| {
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        relay.subscribe("plaza-quotes", &filters) catch continue;
+        while (true) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const store = g_store orelse continue;
+                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                },
+                .eose => break,
+                else => {},
+            }
+        }
+    }
+}
+
+/// Clears the quote cache. For tests, which share the process globals.
+pub fn resetQuotesForTest() void {
+    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
+    g_quote_clock = 0;
+}
+
+/// Builds a Note over `content` and runs the quote-reference scan, so a test can
+/// assert what `findQuoteRef` captured (id/off/len) without a live event.
+pub fn findQuoteRefForTest(content: []const u8) Note {
+    var note = Note{};
+    const n = @min(content.len, note.content_buf.len);
+    @memcpy(note.content_buf[0..n], content[0..n]);
+    note.content_len = @intCast(n);
+    findQuoteRef(&note);
+    return note;
+}
+
+/// Whether the note captured an event quote (for tests).
+pub fn noteHasEventQuote(note: *const Note) bool {
+    return note.quote.kind == .event;
+}
+
 /// A cached author profile.
 const Profile = struct {
     used: bool = false,
@@ -1549,6 +1718,17 @@ fn activePubkey() ?[32]u8 {
 
 // ------------------------------------------------------------------ model
 
+/// A `nostr:nevent`/`note` quote a note carries: the decoded event id (the
+/// fetch, open, and cache key) and the byte span of its raw token within the
+/// note's `content_buf`, so the body can be split around it at render time
+/// without ever mutating the stored text.
+const QuoteRef = struct {
+    kind: enum(u8) { none, event } = .none,
+    id: [32]u8 = [_]u8{0} ** 32,
+    off: u16 = 0,
+    len: u16 = 0,
+};
+
 /// One note as the feed renders it: a two-letter avatar, the author's
 /// abbreviated npub, a relative timestamp, and the (truncated) content. Strings
 /// are copied into fixed buffers so a card never aliases the query arena it was
@@ -1582,6 +1762,11 @@ pub const Note = struct {
     // what lets the card reserve exactly the right space, so nothing shifts
     // when the image arrives (or is evicted and comes back).
     image_aspect: f32 = 0,
+    // The first `nostr:nevent`/`note` reference in the content, decoded once at
+    // parse time: the quoted event id, and the byte span of its raw token in
+    // `content_buf` so the body can split around it and render an embedded quote
+    // card. `.none` when the note quotes nothing.
+    quote: QuoteRef = .{},
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
@@ -2108,6 +2293,8 @@ pub const Model = struct {
             // Profiles first, so a note's mentions resolve to names as it builds.
             refreshProfiles(store);
             rebuildNotes(self, store, now_s);
+            // A grown store may hold quoted events the feed references now.
+            refreshQuotes(store);
         }
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
     }
@@ -3039,8 +3226,53 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
     note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
 
+    // The first quoted event (nevent/note), decoded once into a byte span the
+    // body splits on, and queued for resolving.
+    findQuoteRef(&note);
+    if (note.quote.kind == .event) wantQuote(note.quote.id);
+
     note.setTime(now_s);
     return note;
+}
+
+/// Records the FIRST `nostr:nevent`/`note` reference in `note`'s rendered
+/// content as a decoded event id plus the byte span of its raw token, so the
+/// body can split around it and draw an embedded quote card. A second reference,
+/// an `naddr`, or an undecodable token is left as plain text (`.none`).
+fn findQuoteRef(note: *Note) void {
+    const text = note.content();
+    var scratch: [16 * 1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        // The token starts at a `nostr:` prefix, or a bare `nevent1`/`note1`, but
+        // only at a word boundary, so one embedded in a URL (`…/nostr:nevent…`)
+        // or a longer token is left alone rather than split into a spurious card.
+        var body_start = i;
+        if (std.mem.startsWith(u8, text[i..], "nostr:")) {
+            if (!refPrecededByBoundary(text, i)) continue;
+            body_start = i + "nostr:".len;
+        } else if (std.mem.startsWith(u8, text[i..], "nevent1") or std.mem.startsWith(u8, text[i..], "note1")) {
+            if (!refPrecededByBoundary(text, i)) continue;
+        } else continue;
+
+        const rest = text[body_start..];
+        if (!std.mem.startsWith(u8, rest, "nevent1") and !std.mem.startsWith(u8, rest, "note1")) continue;
+        var j: usize = 0;
+        while (j < rest.len and isBech32Char(rest[j])) j += 1;
+        const token = rest[0..j];
+
+        var fba = std.heap.FixedBufferAllocator.init(&scratch);
+        const arena = fba.allocator();
+        const id: ?[32]u8 = if (std.mem.startsWith(u8, token, "nevent1")) blk: {
+            const ptr = nostr.nip19.decodeNevent(arena, token) catch break :blk null;
+            break :blk ptr.id;
+        } else (nostr.nip19.decodeNote(arena, token) catch null);
+
+        if (id) |event_id| {
+            note.quote = .{ .kind = .event, .id = event_id, .off = @intCast(i), .len = @intCast((body_start - i) + j) };
+            return;
+        }
+    }
 }
 
 /// The aspect (height over width) the note's own NIP-92 `imeta` tag declares for
@@ -3192,6 +3424,30 @@ fn isBech32Char(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
+/// Whether `c` continues a hashtag word (letters, digits, or underscore).
+fn isHashtagChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Whether an event reference (`nostr:nevent1…`/`note1…`/`naddr1…`, or a bare one
+/// at a word boundary) begins at `text[i]`, so a run can be accent-styled. Only
+/// at a word boundary, so a `nostr:` or bare token embedded in a URL is skipped.
+fn isEventRefStart(text: []const u8, i: usize) bool {
+    if (!refPrecededByBoundary(text, i)) return false;
+    var s = text[i..];
+    if (std.mem.startsWith(u8, s, "nostr:")) s = s["nostr:".len..];
+    return std.mem.startsWith(u8, s, "nevent1") or std.mem.startsWith(u8, s, "note1") or std.mem.startsWith(u8, s, "naddr1");
+}
+
+/// Whether `text[i]` sits at a word boundary for a nostr reference: the start, or
+/// after a character that could not be part of a URL or bech32 run. Keeps a
+/// `nostr:nevent…`/bare token embedded in a URL from being matched.
+fn refPrecededByBoundary(text: []const u8, i: usize) bool {
+    if (i == 0) return true;
+    const c = text[i - 1];
+    return !(std.ascii.isAlphanumeric(c) or c == '/' or c == ':' or c == '.' or c == '-' or c == '_' or c == '@');
+}
+
 fn setAuthor(note: *Note, pubkey: [32]u8) void {
     const s = abbreviateNpub(&note.author_buf, pubkey);
     note.author_len = @intCast(s.len);
@@ -3332,6 +3588,8 @@ pub const Msg = union(enum) {
     like: i64,
     /// Open a note's thread (by id): the focused note and its replies.
     open_thread: i64,
+    /// Open a quoted event as a thread (by its full 32-byte id).
+    open_quote: [32]u8,
     /// Leave the thread back to the feed.
     close_thread,
     /// A text edit in the thread's reply composer.
@@ -3345,7 +3603,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "open_quote", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -4270,25 +4528,117 @@ fn noteIsLong(note: *const Note) bool {
     return note.content_len > note_collapse_chars + 80;
 }
 
-/// A note's body: the styled text, collapsed with a "Show more" affordance when
-/// it is long (unless the reader has expanded it, or `collapsible` is false, as
-/// for a thread's focused root, which always shows in full).
+/// A styled body paragraph, the same shape everywhere text is rendered.
+fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
+    return ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } }, spans);
+}
+
+/// A note's body: the styled text, an embedded quote card where the note quotes
+/// another event, and a "Show more" affordance when it is long (unless the reader
+/// has expanded it, or `collapsible` is false, as for a thread's focused root).
+/// The body splits around the quoted event's raw token (its byte span), never
+/// cutting the card; a quote at or past the fold appears only once expanded.
 fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
     const p = theme.palette;
     const full = note.content();
     const long = collapsible and noteIsLong(note);
     const expanded = long and isExpanded(note.id);
-    const shown = if (long and !expanded) full[0..collapsedLen(full, note_collapse_chars)] else full;
-    const body = ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_body } }, contentSpans(ui, shown));
-    if (!long) return body;
-    return ui.column(.{ .gap = 5 }, .{
-        body,
-        // A quiet inline control, a deeper hit target than the row's open-thread
-        // press, so tapping it toggles the fold rather than opening the thread.
-        ui.el(.list_item, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
+    const cut: usize = if (long and !expanded) collapsedLen(full, note_collapse_chars) else full.len;
+    const q = note.quote;
+    const card_end = @as(usize, q.off) + @as(usize, q.len);
+    const has_card = q.kind == .event and card_end <= cut;
+
+    // Fast path unchanged: a plain note with no fold is exactly one paragraph.
+    if (!has_card and !long) return textPara(ui, contentSpans(ui, full[0..cut]));
+
+    var kids: [5]AppUi.Node = undefined;
+    var n: usize = 0;
+    if (has_card) {
+        const head = std.mem.trim(u8, full[0..q.off], " \t\r\n");
+        if (head.len > 0) {
+            kids[n] = textPara(ui, contentSpans(ui, head));
+            n += 1;
+        }
+        kids[n] = quoteCard(ui, q.id);
+        n += 1;
+        const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
+        if (tail.len > 0) {
+            kids[n] = textPara(ui, contentSpans(ui, tail));
+            n += 1;
+        }
+    } else {
+        kids[n] = textPara(ui, contentSpans(ui, full[0..cut]));
+        n += 1;
+    }
+    if (long) {
+        // A deeper hit target than the row's open-thread press, so tapping it
+        // toggles the fold rather than opening the thread.
+        kids[n] = ui.el(.list_item, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_secondary } }, if (expanded) "Show less" else "Show more"),
+        });
+        n += 1;
+    }
+    return ui.column(.{ .gap = 8 }, .{kids[0..n]});
+}
+
+/// An embedded quote card for a quoted event `id`: a bordered inset showing the
+/// quoted author and a truncated body, tappable to open it. Loading and
+/// unavailable states are non-pressable and hold the same height, so the feed
+/// never reflows as the quote resolves. The author is drawn as initials-on-tint
+/// (`image = 0`), so a quote card never competes for the scarce avatar ids.
+fn quoteCard(ui: *AppUi, id: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const card_style: canvas.WidgetStyle = .{ .background = p.surface_inset, .border = p.divider_feedrow, .radius = 10, .stroke_width = 1 };
+    const e = quoteFor(id);
+    if (e == null or e.?.state == .idle or e.?.state == .fetching) {
+        // A reused feed note (never re-parsed) whose quote slot was reclaimed by
+        // a newer quote lands here with no cache entry; re-queue it so the next
+        // tick resolves it again instead of showing a skeleton forever.
+        if (e == null) wantQuote(id);
+        return ui.el(.card, .{ .style = card_style }, .{
+            ui.column(.{ .padding = 10 }, .{ui.el(.skeleton, .{ .height = 34 }, .{})}),
+        });
+    }
+    const q = e.?;
+    if (q.state == .missing) {
+        return ui.el(.card, .{ .style = card_style }, .{
+            ui.column(.{ .padding = 12 }, .{ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Quoted note unavailable")}),
+        });
+    }
+    const tint = avatarTint(q.pubkey);
+    const hexdigits = "0123456789abcdef";
+    var pressable = card_style;
+    pressable.quiet_hover = true;
+    return ui.el(.card, .{ .on_press = Msg{ .open_quote = id }, .style = pressable, .semantics = .{ .role = .button, .label = "Quoted note" } }, .{
+        ui.column(.{ .gap = 6, .padding = 12 }, .{
+            ui.row(.{ .gap = 6, .cross = .center }, .{
+                ui.avatar(.{ .image = 0, .width = 18, .height = 18, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, ui.fmt("{c}{c}", .{ hexdigits[q.pubkey[0] >> 4], hexdigits[q.pubkey[0] & 0x0f] })),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = quoteAuthorName(ui, q.pubkey), .weight = .medium }}),
+                ui.spacer(1),
+                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, quoteTime(ui, q.created_at)),
+            }),
+            textPara(ui, contentSpans(ui, q.text_buf[0..q.text_len])),
         }),
     });
+}
+
+/// The quoted author's display name (from the profile cache) or a short npub.
+fn quoteAuthorName(ui: *AppUi, pubkey: [32]u8) []const u8 {
+    if (lookupProfile(pubkey)) |pr| {
+        if (pr.name_len > 0) return pr.name();
+    }
+    const buf = ui.arena.alloc(u8, 24) catch return "";
+    return abbreviateNpub(buf, pubkey);
+}
+
+/// The quoted note's relative timestamp, computed for the frame.
+fn quoteTime(ui: *AppUi, created_at: i64) []const u8 {
+    const dt = nowSeconds() - created_at;
+    if (dt < 60) return "now";
+    if (dt < 3600) return ui.fmt("{d}m", .{@divTrunc(dt, 60)});
+    if (dt < 86_400) return ui.fmt("{d}h", .{@divTrunc(dt, 3600)});
+    if (dt < 604_800) return ui.fmt("{d}d", .{@divTrunc(dt, 86_400)});
+    return ui.fmt("{d}w", .{@divTrunc(dt, 604_800)});
 }
 
 /// One feed note: a bare row on the window, no card. Avatar column, then an
@@ -4358,7 +4708,15 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
     while (i < text.len) {
         const is_url = std.mem.startsWith(u8, text[i..], "https://") or std.mem.startsWith(u8, text[i..], "http://");
         const is_mention = text[i] == '@' and i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1]);
-        if (!is_url and !is_mention) {
+        // A hashtag is `#` + word characters at a word boundary, so `C#` and a
+        // URL fragment (`…#section`) are left as plain text.
+        const is_hashtag = text[i] == '#' and i + 1 < text.len and isHashtagChar(text[i + 1]) and (i == 0 or !std.ascii.isAlphanumeric(text[i - 1]));
+        // A `nostr:nevent`/`note`/`naddr` reference (the first is usually lifted
+        // into a quote card upstream; a second one, or one inside a quoted body,
+        // still reads as a reference here). No link: there is no in-app target
+        // for a bare extra ref yet.
+        const is_eventref = isEventRefStart(text, i);
+        if (!is_url and !is_mention and !is_hashtag and !is_eventref) {
             i += 1;
             continue;
         }
@@ -4369,8 +4727,17 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
             n += 1;
         }
         var j = i;
-        while (j < text.len and !std.ascii.isWhitespace(text[j])) j += 1;
+        if (is_hashtag) {
+            // Just the tag word: trailing punctuation (`#nostr!`) stays plain.
+            j = i + 1;
+            while (j < text.len and isHashtagChar(text[j])) j += 1;
+        } else {
+            while (j < text.len and !std.ascii.isWhitespace(text[j])) j += 1;
+        }
         const run = text[i..j];
+        // The monochrome design has one working accent (porcelain white), so
+        // every interactive run reads as accent; a URL is additionally
+        // underlined and carries its link payload.
         spans[n] = if (is_url)
             .{ .text = run, .color = .accent, .underline = true, .link = run }
         else
@@ -4529,8 +4896,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Re-arm the still-unnamed every so often: a relay that had
                 // nothing a moment ago may have it now.
                 g_profile_round +%= 1;
-                if (g_profile_round % profile_rearm_rounds == 0) rearmWantedProfiles();
+                if (g_profile_round % profile_rearm_rounds == 0) {
+                    rearmWantedProfiles();
+                    rearmWantedQuotes();
+                }
                 requestWantedProfiles();
+                requestWantedQuotes();
             }
         },
         .helper_exited => |e| {
@@ -4680,6 +5051,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
+        .open_quote => |id| openQuote(model, id),
         .close_thread => closeThread(model),
         .reply_edit => |edit| model.reply_buffer.apply(edit),
         .reply_submit => publishReply(model, fx),
@@ -5062,12 +5434,18 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
 /// a thread is already open, the current root is pushed so Back returns to it.
 fn openThread(model: *Model, note_id: i64) void {
     const target = model.noteById(note_id) orelse return;
-    const root = target.*;
+    enterThread(model, target.*);
+}
+
+/// Focuses `root` as the open thread: pushes the current thread (if any) onto
+/// the back-stack, snapshots the new root, and fires its reply fetch. Shared by
+/// open-a-feed-note, open-a-reply, and open-a-quoted-note.
+fn enterThread(model: *Model, root: Note) void {
     if (model.viewing_thread != 0 and model.thread_stack_len < model.thread_stack.len) {
         model.thread_stack[model.thread_stack_len] = model.thread_root;
         model.thread_stack_len += 1;
     }
-    model.viewing_thread = note_id;
+    model.viewing_thread = root.id;
     model.thread_root = root;
     model.thread_notes_len = 0;
     model.reply_buffer.clear();
@@ -5079,6 +5457,17 @@ fn openThread(model: *Model, note_id: i64) void {
     const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
     model.thread_seq = seq;
     fetchThreadReplies(root.event_id, seq);
+}
+
+/// Opens a quoted event (by its full id) as a thread. The quoted note may be in
+/// neither the feed nor the open thread, so it is read straight from the store
+/// (a non-loaded quote card is not pressable, so this only ever fires for an
+/// event already ingested).
+fn openQuote(model: *Model, id: [32]u8) void {
+    const store = g_store orelse return;
+    var se = (store.getEvent(std.heap.page_allocator, id) catch return) orelse return;
+    defer se.deinit();
+    enterThread(model, noteFrom(se.event, nowSeconds()));
 }
 
 /// Closes the open thread: pops the back-stack to the thread it was opened from,

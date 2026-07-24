@@ -559,6 +559,79 @@ test "note text splits into link, mention, and plain runs" {
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
 }
 
+test "hashtags are accented at a word boundary, but C# and trailing punctuation are not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const spans = main.contentSpans(&ui, "gm #nostr build C# code #zig!");
+    try testing.expectEqual(@as(usize, 5), spans.len);
+    try testing.expectEqualStrings("#nostr", spans[1].text);
+    try testing.expect(spans[1].color != null and spans[1].color.? == .accent);
+    try testing.expectEqual(@as(usize, 0), spans[1].link.len); // styled, not a link
+    try testing.expectEqualStrings(" build C# code ", spans[2].text); // C# is not a tag
+    try testing.expectEqualStrings("#zig", spans[3].text);
+    try testing.expectEqualStrings("!", spans[4].text); // trailing punctuation stays plain
+}
+
+test "findQuoteRef captures the first note/nevent ref and ignores others" {
+    var id = [_]u8{0xab} ** 32;
+    const note1 = try nostr.nip19.encodeNote(testing.allocator, id);
+    defer testing.allocator.free(note1);
+
+    // A `nostr:`-prefixed reference is captured: id decoded, span covers the
+    // whole `nostr:note1…` token.
+    {
+        const content = try std.fmt.allocPrint(testing.allocator, "gm nostr:{s} enjoy", .{note1});
+        defer testing.allocator.free(content);
+        const note = main.findQuoteRefForTest(content);
+        try testing.expect(main.noteHasEventQuote(&note));
+        try testing.expectEqualSlices(u8, &id, &note.quote.id);
+        const tok = content[note.quote.off..][0..note.quote.len];
+        const want = try std.fmt.allocPrint(testing.allocator, "nostr:{s}", .{note1});
+        defer testing.allocator.free(want);
+        try testing.expectEqualStrings(want, tok);
+    }
+    // A bare reference at a word boundary is captured too.
+    {
+        const content = try std.fmt.allocPrint(testing.allocator, "look {s}", .{note1});
+        defer testing.allocator.free(content);
+        const note = main.findQuoteRefForTest(content);
+        try testing.expect(main.noteHasEventQuote(&note));
+        try testing.expectEqualStrings(note1, content[note.quote.off..][0..note.quote.len]);
+    }
+    // Glued inside a URL (not a word boundary) is left as plain text, whether
+    // bare or `nostr:`-prefixed.
+    {
+        const content = try std.fmt.allocPrint(testing.allocator, "https://x/{s}", .{note1});
+        defer testing.allocator.free(content);
+        try testing.expect(!main.noteHasEventQuote(&main.findQuoteRefForTest(content)));
+    }
+    {
+        const content = try std.fmt.allocPrint(testing.allocator, "https://njump.me/nostr:{s}", .{note1});
+        defer testing.allocator.free(content);
+        try testing.expect(!main.noteHasEventQuote(&main.findQuoteRefForTest(content)));
+    }
+    // A malformed token decodes to nothing.
+    {
+        const note = main.findQuoteRefForTest("hi nostr:note1notvalidbech32!!! bye");
+        try testing.expect(!main.noteHasEventQuote(&note));
+    }
+}
+
+test "a bare event reference is accent-colored without a link" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const spans = main.contentSpans(&ui, "see nostr:nevent1qqs example");
+    // "see ", then the ref run, then " example".
+    try testing.expectEqualStrings("nostr:nevent1qqs", spans[1].text);
+    try testing.expect(spans[1].color != null and spans[1].color.? == .accent);
+    try testing.expectEqual(@as(usize, 0), spans[1].link.len);
+    try testing.expect(!spans[1].underline);
+}
+
 test "only plain http(s) links are handed to the opener" {
     try testing.expect(main.isSafeExternalUrl("https://example.com/a"));
     try testing.expect(main.isSafeExternalUrl("http://example.com"));
