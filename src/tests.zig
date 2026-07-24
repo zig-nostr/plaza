@@ -810,6 +810,51 @@ test "a slot wanted on screen is never evicted for another visible picture" {
     try testing.expect(main.claimMediaSlotForTest(&fx, 7) == null);
 }
 
+test "avatar ids go to the top of a thread and never exceed the registry cap" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+
+    // 15 distinct authors, each with a picture: the root plus 14 replies. More
+    // than the registry can hold, so the cap and the reading-order preference
+    // both come into play.
+    const count = 15;
+    var keys: [count][32]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = [_]u8{0} ** 32;
+        k.*[0] = @intCast(i + 1); // distinct, non-zero
+        main.setProfilePictureForTest(k.*, true);
+    }
+    model.thread_root.pubkey = keys[0];
+    for (1..count) |i| model.thread_notes[i - 1].pubkey = keys[i];
+    model.thread_notes_len = count - 1;
+
+    var fx: main.EffectsForTest = undefined;
+    main.assignAvatarSlotsForTest(&fx, &model);
+
+    const cap = main.max_avatar_images;
+    var seen = [_]bool{false} ** (cap + 1);
+    var lent: usize = 0;
+    for (keys, 0..) |k, i| {
+        const id = main.avatarImageIdForTest(k);
+        if (i < cap) {
+            // The first `cap` authors in reading order each hold a distinct id.
+            try testing.expect(id >= 1 and id <= cap);
+            try testing.expect(!seen[@intCast(id)]);
+            seen[@intCast(id)] = true;
+            lent += 1;
+        } else {
+            // The overflow is starved gracefully (initials), never crashed and
+            // never given a duplicate id.
+            try testing.expectEqual(@as(u64, 0), id);
+        }
+    }
+    try testing.expectEqual(cap, lent);
+}
+
 test "the logout confirmation replaces the log-out button" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
