@@ -138,15 +138,27 @@ const media_fetch_key_base: u64 = 2000;
 const nip05_fetch_key_base: u64 = 3000;
 const open_url_key: u64 = 102;
 
-// The profile cache holds display names and avatars keyed by pubkey. It is
-// larger than the feed's author set so a mention can resolve to a name too.
-const profile_cap = 32;
+// The profile cache holds display names and avatars keyed by pubkey. It must be
+// larger than the biggest on-screen author set marked in a single avatar pass
+// (a full thread: the active user + the root + up to `thread_reply_cap` replies)
+// with headroom for recently-seen authors, so the mark pass never has to evict
+// an author it just marked. Names are cheap; only avatars are slot-bound.
+const profile_cap = thread_reply_cap + 60;
+
+comptime {
+    // The avatar pass marks the whole on-screen author set (active user + a
+    // thread's root and every reply) before lending ids, so the cache MUST hold
+    // that set at once; otherwise the mark loop evicts an author it just marked
+    // and the cache thrashes every tick (an avatar-review finding). Keep the
+    // headroom generous so recently-seen authors survive too.
+    if (profile_cap < thread_reply_cap + 2) @compileError("profile_cap must exceed a thread's author set");
+}
 // The canvas image registry has 16 slots for the whole app, so avatars and feed
 // media split it. The avatar share covers every author the follow feed can show
 // (the starter pack plus the user), so nobody in the feed is stuck on initials;
 // feed images take the rest through a small LRU. A mention-only cache entry,
 // past the avatar budget, renders initials.
-const max_avatar_images = 10;
+pub const max_avatar_images = 10;
 const max_media_images = 6;
 const media_image_id_base: u64 = max_avatar_images + 1;
 // What each image is requested at. Avatars draw at 40pt, so asking for more
@@ -912,7 +924,7 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 // to the follow set's metadata, so a mention of anyone else would render as a
 // bare npub forever; these are fetched separately, once each, and then resolve
 // like any other name.
-const wanted_profiles_cap = 24;
+const wanted_profiles_cap = 48;
 const WantedProfile = struct {
     used: bool = false,
     requested: bool = false,
@@ -935,6 +947,16 @@ fn wantProfile(pubkey: [32]u8) void {
     }
     for (&g_wanted) |*w| {
         if (!w.used) {
+            w.* = .{ .used = true, .pubkey = pubkey };
+            return;
+        }
+    }
+    // The set is full. Reclaim a slot from someone we have already asked for the
+    // maximum times (no metadata anywhere), so a fresh thread's authors are never
+    // starved by a backlog of dead entries. Without this the table fills up once
+    // and every later reply author renders as a bare npub forever.
+    for (&g_wanted) |*w| {
+        if (w.attempts >= max_profile_attempts) {
             w.* = .{ .used = true, .pubkey = pubkey };
             return;
         }
@@ -1050,9 +1072,14 @@ const Profile = struct {
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
-    // The registered canvas-image id for this profile's avatar (0 = none). Fixed
-    // per cache slot, so a re-fetch replaces the same id.
+    // The registered canvas-image id for this profile's avatar (0 = none). NOT
+    // fixed per cache slot: there are only `max_avatar_images` registry ids for
+    // far more cached authors, so ids are lent to whoever is on screen now and
+    // reclaimed from whoever scrolled away (see `assignAvatarSlots`).
     image_id: u64 = 0,
+    // The last avatar pass this author was on screen, so the id LRU evicts the
+    // least-recently-seen author when it needs a slot for a new one.
+    avatar_clock: u64 = 0,
 
     fn name(self: *const Profile) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -1070,6 +1097,10 @@ const Profile = struct {
 
 var g_profiles = [_]Profile{.{}} ** profile_cap;
 
+// The avatar-id LRU clock (see `assignAvatarSlots`): bumped once per avatar
+// pass; a profile's `avatar_clock` records the last pass it was on screen.
+var g_avatar_clock: u64 = 0;
+
 // Bumped whenever a profile gains or changes a display name. Mention labels are
 // baked into note text at parse time, so the feed re-parses (rather than
 // reuses) its notes when this moves; author lines resolve live and never need it.
@@ -1080,6 +1111,27 @@ pub fn resetProfilesForTest() void {
     g_profiles = [_]Profile{.{}} ** profile_cap;
     g_names_generation = 0;
     g_notes_names_generation = 0;
+    g_avatar_clock = 0;
+}
+
+/// Marks `pubkey`'s profile as having (or not having) a kind:0 picture, so a
+/// test can exercise the avatar-id LRU without a real fetch.
+pub fn setProfilePictureForTest(pubkey: [32]u8, present: bool) void {
+    const p = upsertProfile(pubkey) orelse return;
+    p.picture_len = if (present) 8 else 0;
+    if (present) @memcpy(p.picture_buf[0..8], "http://x");
+}
+
+/// The registry image id currently lent to `pubkey`'s avatar (0 = none). For
+/// tests of the id LRU.
+pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
+    const p = lookupProfile(pubkey) orelse return 0;
+    return p.image_id;
+}
+
+/// Runs one avatar-id assignment pass, for tests.
+pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
+    assignAvatarSlots(fx, model);
 }
 
 // The notes this session has liked, so the heart renders filled and an un-like
@@ -1385,20 +1437,34 @@ fn lookupProfile(pubkey: [32]u8) ?*Profile {
     return null;
 }
 
-/// The cache slot for `pubkey`, allocating a free one on first sight. Null only
-/// when the cache is full (then that author renders from its npub and initials).
+/// The cache slot for `pubkey`, allocating a free one on first sight, else
+/// reusing the least-recently-seen slot. Avatar image ids are NOT tied to the
+/// slot here (see `assignAvatarSlots`); a new slot starts with none and earns
+/// one only while on screen.
 pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     if (lookupProfile(pubkey)) |p| return p;
-    for (&g_profiles, 0..) |*p, i| {
+    for (&g_profiles) |*p| {
         if (!p.used) {
             p.* = .{ .used = true, .pubkey = pubkey };
-            // The first slots own an avatar image id; beyond the registry's
-            // budget, an entry is name-only (initials avatar).
-            if (i < max_avatar_images) p.image_id = @intCast(i + 1);
             return p;
         }
     }
-    return null;
+    // Cache full: evict the author least-recently on screen. Never evict one
+    // marked on screen THIS pass (an over-full pass would otherwise wipe an
+    // author it just marked and thrash every tick), nor one with an index-keyed
+    // fetch in flight (avatar OR NIP-05): those responses re-derive the profile
+    // from its slot, so reusing it would apply a result to the wrong pubkey. An
+    // over-full pass simply leaves the newcomer slotless (npub + initials) until
+    // a slot frees, rather than churning. A reused id is freed for the newcomer.
+    var victim: ?*Profile = null;
+    for (&g_profiles) |*p| {
+        if (p.avatar_state == .fetching or p.nip05_state == .fetching) continue;
+        if (p.avatar_clock == g_avatar_clock) continue;
+        if (victim == null or p.avatar_clock < victim.?.avatar_clock) victim = p;
+    }
+    const v = victim orelse return null;
+    v.* = .{ .used = true, .pubkey = pubkey };
+    return v;
 }
 
 /// Parses a kind:0 metadata JSON content into `profile`'s name and picture.
@@ -2187,6 +2253,89 @@ fn refreshProfiles(store: *nostr.store.Store) void {
             g_names_generation +%= 1;
         }
     }
+}
+
+/// Marks `pubkey`'s profile as on screen this pass (creating the slot if new),
+/// so the id LRU keeps its avatar and evicts someone off screen instead.
+fn markAvatarWanted(pubkey: [32]u8) void {
+    if (upsertProfile(pubkey)) |p| p.avatar_clock = g_avatar_clock;
+}
+
+/// Lends the `max_avatar_images` registry ids to the authors on screen right
+/// now (the feed's visible window, or the open thread), reclaiming ids from
+/// authors who scrolled away. There are far more cached authors than ids, so
+/// without this only the first handful ever seen could hold a face and a
+/// thread of strangers showed initials for everyone. Runs each tick before
+/// `scanAvatarFetches`, which then fetches the faces for whoever just gained an
+/// id. `fx` is needed to free a reclaimed id's registered image.
+fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
+    g_avatar_clock += 1;
+
+    // Collect the on-screen authors in READING ORDER (the active user, then the
+    // thread's root and replies top-down, or the feed's visible window). Order
+    // matters: there are far fewer ids than a long thread has authors, so the
+    // ids are lent to the top of what is being read, not to an arbitrary cache
+    // slot. Bounded to the largest set a single pass can hold.
+    var onscreen: [thread_reply_cap + 4][32]u8 = undefined;
+    var n: usize = 0;
+    const push = struct {
+        fn f(list: [][32]u8, len: *usize, pk: [32]u8) void {
+            if (len.* < list.len) {
+                list[len.*] = pk;
+                len.* += 1;
+            }
+        }
+    }.f;
+    if (activePubkey()) |pk| push(&onscreen, &n, pk);
+    if (model.viewing_thread != 0) {
+        // A thread occludes the feed, so its authors own the ids while it is up.
+        push(&onscreen, &n, model.thread_root.pubkey);
+        for (model.thread_notes[0..model.thread_notes_len]) |*note| push(&onscreen, &n, note.pubkey);
+    } else {
+        const w = model.visibleRange();
+        var i = w.first;
+        while (i <= w.last and i < model.notes_len) : (i += 1) push(&onscreen, &n, model.notes[i].pubkey);
+    }
+
+    // Mark every one wanted FIRST, so the claim pass below never evicts a
+    // sibling that is also on screen this pass. Then lend an id to each in order,
+    // so the earliest-read authors win the scarce ids.
+    for (onscreen[0..n]) |pk| markAvatarWanted(pk);
+    for (onscreen[0..n]) |pk| {
+        const p = lookupProfile(pk) orelse continue;
+        if (p.image_id == 0 and p.picture_len > 0) claimAvatarSlot(fx, p);
+    }
+}
+
+/// Assigns `p` a free registry id, or the id of the author least-recently on
+/// screen (never one mid-fetch, never one on screen this pass, so a just-lent id
+/// is safe). A no-op when every id is held by an on-screen author (that author
+/// keeps initials this frame). A reclaimed id's old image is unregistered and its
+/// former owner reset to reload from cache when it returns.
+fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
+    var held = [_]bool{false} ** (max_avatar_images + 1);
+    for (&g_profiles) |*q| {
+        if (q.used and q.image_id >= 1 and q.image_id <= max_avatar_images) held[@intCast(q.image_id)] = true;
+    }
+    var id: usize = 1;
+    while (id <= max_avatar_images) : (id += 1) {
+        if (!held[id]) {
+            p.image_id = @intCast(id);
+            return;
+        }
+    }
+    var victim: ?*Profile = null;
+    for (&g_profiles) |*q| {
+        if (!q.used or q.image_id == 0) continue;
+        if (q.avatar_clock == g_avatar_clock or q.avatar_state == .fetching) continue;
+        if (victim == null or q.avatar_clock < victim.?.avatar_clock) victim = q;
+    }
+    const v = victim orelse return;
+    const reclaimed = v.image_id;
+    _ = fx.unregisterImage(reclaimed);
+    v.image_id = 0;
+    v.avatar_state = .idle;
+    p.image_id = reclaimed;
 }
 
 /// Fires avatar fetches for cached profiles that have a picture and an image
@@ -4312,6 +4461,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // are registered here, so a returning user gets faces WITH the notes rather
     // than a tick later. Only what is on disk resolves now; the rest is fetched
     // from the first tick onward.
+    assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
     scanNip05Fetches(fx);
@@ -4350,6 +4500,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.refreshThreadNotes(now);
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
+                assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
                 scanNip05Fetches(fx);
@@ -4535,7 +4686,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
-            // Load what just came into view without waiting for the next tick.
+            // Load what just came into view without waiting for the next tick:
+            // hand avatar ids to the newly-visible authors, then their faces and
+            // pictures.
+            assignAvatarSlots(fx, model);
+            scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
         },
         .load_older => {
