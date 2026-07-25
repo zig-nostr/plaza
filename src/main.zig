@@ -1769,6 +1769,16 @@ pub const Note = struct {
     // `content_buf` so the body can split around it and render an embedded quote
     // card. `.none` when the note quotes nothing.
     quote: QuoteRef = .{},
+    // The NIP-10 parent this note answers (the `e` tag marked `reply`, or the
+    // thread root for a direct reply), extracted once at parse time so a thread
+    // can seat each reply under the note it answers. Zero when it answers
+    // nothing; the flag disambiguates a genuine all-zero id.
+    reply_parent: [32]u8 = [_]u8{0} ** 32,
+    has_reply_parent: bool = false,
+    // Thread placement, stamped by `arrangeThread`: how deep this reply sits
+    // under the root (1 = a direct reply). Meaningless outside an arranged
+    // thread.
+    depth: u8 = 0,
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
@@ -2233,6 +2243,8 @@ pub const Model = struct {
                 return a.created_at < b.created_at;
             }
         }.lt);
+        // Chronological in hand, seat each reply under the note it answers.
+        arrangeThread(self.thread_notes[0..n], self.thread_root.event_id);
         self.thread_notes_len = n;
         // Stop the loading skeletons once replies are in hand, OR once this
         // thread's own fetch has asked every relay and come back empty (a
@@ -3233,9 +3245,122 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     findQuoteRef(&note);
     if (note.quote.kind == .event) wantQuote(note.quote.id);
 
+    // Which note this one answers, for thread nesting.
+    if (nip10Parent(ev.tags)) |parent_id| {
+        note.reply_parent = parent_id;
+        note.has_reply_parent = true;
+    }
+
     note.setTime(now_s);
     return note;
 }
+
+/// The NIP-10 parent of a reply: the `e` tag marked `reply` wins; with only a
+/// `root` marker the note answers the root directly; with no markers at all the
+/// LAST `e` tag is the parent (the deprecated positional convention, still
+/// common in the wild). `mention` tags never make a note a reply — a quote is
+/// not an answer. Null for a note that answers nothing.
+pub fn nip10Parent(tags: []const nostr.event.Tag) ?[32]u8 {
+    var reply: ?[32]u8 = null;
+    var root: ?[32]u8 = null;
+    var last_plain: ?[32]u8 = null;
+    for (tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "e")) continue;
+        if (tag[1].len != 64) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, tag[1]) catch continue;
+        const marker = if (tag.len >= 4) tag[3] else "";
+        if (std.mem.eql(u8, marker, "reply")) {
+            reply = id;
+        } else if (std.mem.eql(u8, marker, "root")) {
+            root = id;
+        } else if (std.mem.eql(u8, marker, "mention")) {
+            // A quoted note, not an ancestor.
+        } else {
+            last_plain = id;
+        }
+    }
+    return reply orelse root orelse last_plain;
+}
+
+/// Orders a fetched reply set into conversation order — each reply directly
+/// under the note it answers, siblings oldest-first — and stamps every note's
+/// nesting depth (1 = a direct reply to the root). Expects `notes` already
+/// sorted oldest-first, which is what makes sibling order chronological.
+///
+/// A reply whose parent is the root, is missing from the set (past the fetch
+/// cap, deleted, or never seen), or answers nothing sits at the top level in
+/// its chronological place. A parent cycle (malformed events) cannot loop: the
+/// visited set admits each note once, and whatever a cycle strands is appended
+/// at the top level.
+pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
+    const n = notes.len;
+    if (n < 2) {
+        if (n == 1) notes[0].depth = 1;
+        return;
+    }
+    std.debug.assert(n <= thread_reply_cap);
+    // Each note's parent INDEX within the set, or `n` for "top level". The
+    // scan is O(n^2) over 32-byte compares, which at the 100-reply cap is
+    // trivia next to the store query that produced the set.
+    var parent: [thread_reply_cap]u16 = undefined;
+    for (notes[0..n], 0..) |*note, i| {
+        parent[i] = @intCast(n);
+        if (!note.has_reply_parent) continue;
+        if (std.mem.eql(u8, &note.reply_parent, &root_event_id)) continue;
+        for (notes[0..n], 0..) |*cand, j| {
+            if (i != j and std.mem.eql(u8, &cand.event_id, &note.reply_parent)) {
+                parent[i] = @intCast(j);
+                break;
+            }
+        }
+    }
+    // The DFS emits a PERMUTATION (conversation order over current indices),
+    // so ordering is one O(n) gather through the scratch below — never a sort,
+    // which would move the ~1.5KB Note structs O(n log n) times for an order
+    // the walk already knows.
+    var visited = [_]bool{false} ** thread_reply_cap;
+    var order: [thread_reply_cap]u16 = undefined;
+    var count: usize = 0;
+    const Dfs = struct {
+        notes: []Note,
+        parent: []const u16,
+        visited: []bool,
+        order: []u16,
+        count: *usize,
+        fn visit(self: *const @This(), i: usize, depth: u8) void {
+            if (self.visited[i]) return;
+            self.visited[i] = true;
+            self.notes[i].depth = depth;
+            self.order[self.count.*] = @intCast(i);
+            self.count.* += 1;
+            for (self.parent, 0..) |p, j| {
+                if (p == i) self.visit(j, depth +| 1);
+            }
+        }
+    };
+    const dfs = Dfs{ .notes = notes, .parent = parent[0..n], .visited = visited[0..n], .order = order[0..n], .count = &count };
+    for (0..n) |i| {
+        if (parent[i] == n) dfs.visit(i, 1);
+    }
+    // A cycle's strands: no member ever reached the top level, so seat them
+    // there, still oldest-first.
+    for (0..n) |i| {
+        if (!visited[i]) {
+            notes[i].depth = 1;
+            order[count] = @intCast(i);
+            count += 1;
+        }
+    }
+    for (order[0..n], 0..) |src, dst| g_arrange_scratch[dst] = notes[src];
+    @memcpy(notes[0..n], g_arrange_scratch[0..n]);
+}
+
+// The gather scratch for `arrangeThread`'s permutation apply. File-scope (not
+// stack: ~150KB of Note at the cap) and safe unsynchronized because every
+// caller runs on the UI thread — refreshThreadNotes from `update`, and
+// threadRepliesFromStore from the view build.
+var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 
 /// Records the FIRST `nostr:nevent`/`note` reference in `note`'s rendered
 /// content as a decoded event id plus the byte span of its raw token, so the
@@ -3993,6 +4118,8 @@ fn threadRepliesFromStore(ui: *AppUi, root_event_id: [32]u8) []const Note {
             return a.created_at < b.created_at;
         }
     }.lt);
+    // Chronological in hand, seat each reply under the note it answers.
+    arrangeThread(notes[0..n], root_event_id);
     return notes[0..n];
 }
 
@@ -4110,40 +4237,81 @@ fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
     });
 }
 
-/// One reply in the thread: a feed-style row, with an "author" chip when the
-/// replier is the thread's original author. The content row carries the press to
-/// open this reply as its own thread (like a feed row), while the picture and the
-/// engagement controls keep their own presses as the deeper hit targets.
+/// How many indent steps a reply at `depth` shows. Direct replies (depth 1)
+/// sit flush; each further level steps in once, capped so a long back-and-forth
+/// never squeezes the text to a sliver — past the cap, deeper replies share the
+/// cap's inset (the convention every threaded reader settles on).
+const thread_indent_cap = 3;
+const thread_indent_step: f32 = 24;
+
+pub fn threadIndentLevels(depth: u8) usize {
+    if (depth <= 1) return 0;
+    return @min(@as(usize, depth - 1), thread_indent_cap);
+}
+
+/// The nesting gutter to the left of an indented reply: one fixed-width cell
+/// per ancestor level, each carrying a hairline rail, so siblings at a depth
+/// visibly hang off the same line. Empty (and costless) at the top level.
+fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
+    if (levels == 0) return ui.spacer(0);
+    const p = theme.palette;
+    const cells = ui.arena.alloc(AppUi.Node, levels) catch return ui.spacer(0);
+    for (cells) |*cell| {
+        // The rail fills the row's height on its own via cross-axis stretch.
+        cell.* = ui.row(.{ .width = thread_indent_step, .main = .center }, .{
+            ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        });
+    }
+    return ui.row(.{}, .{cells});
+}
+
+/// One reply in the thread: a feed-style row, with an "OP" chip when the
+/// replier is the thread's original author, seated under the note it answers by
+/// the nesting gutter. The WRAPPER row carries the press and the hover wash, so
+/// every horizontal pixel of the row — gutter included — opens this reply as
+/// its own thread and washes as one unit; the picture and the engagement
+/// controls keep their own presses as the deeper hit targets. The bottom
+/// hairline lives INSIDE the content column: it starts after the gutter (so it
+/// aligns with the content it separates) and the gutter's rails span the
+/// wrapper's full height across it, keeping a sibling run's rail continuous.
 fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const p = theme.palette;
     const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
-    // A fixed-width column, centred by the scroll column's `cross = .center`. The
-    // content row carries the press; the row must not `grow` (that would grow it
-    // vertically in the scroll's column and overlap the next reply).
+    const levels = threadIndentLevels(note.depth);
+    // A fixed-width column, centred by the scroll column's `cross = .center`.
+    // Neither wrapper may `grow` (that would grow it vertically in the scroll's
+    // column and overlap the next reply) — inside the wrapper ROW, though,
+    // `grow` spreads WIDTH, which is how the content column takes whatever the
+    // gutter leaves.
     var node = ui.column(.{ .width = thread_column_width }, .{
-        ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
-            noteAvatar(ui, note),
-            ui.column(.{ .gap = 5, .grow = 1 }, .{
-                ui.row(.{ .gap = 6, .cross = .center }, .{
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
-                    if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                    if (is_author)
-                        // "OP" in the house sans, not a lowercase mono "author":
-                        // the mono run read like a code token beside the name.
-                        ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
-                        })
-                    else
-                        ui.spacer(0),
-                    identityHandle(ui, note, true),
-                    ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+        ui.row(.{ .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
+            threadGutter(ui, levels),
+            ui.column(.{ .grow = 1 }, .{
+                ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+                    noteAvatar(ui, note),
+                    ui.column(.{ .gap = 5, .grow = 1 }, .{
+                        ui.row(.{ .gap = 6, .cross = .center }, .{
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
+                            if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
+                            if (is_author)
+                                // "OP" in the house sans, not a lowercase mono "author":
+                                // the mono run read like a code token beside the name.
+                                ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
+                                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
+                                })
+                            else
+                                ui.spacer(0),
+                            identityHandle(ui, note, true),
+                            ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+                        }),
+                        noteBody(ui, note, true),
+                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        engagementRow(ui, note),
+                    }),
                 }),
-                noteBody(ui, note, true),
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                engagementRow(ui, note),
+                ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
             }),
         }),
-        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
     node.key = .{ .int = @intCast(note.id) };
     return node;
