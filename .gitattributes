@@ -8,8 +8,7 @@
 src/stb_image.h linguist-vendored
 src/stb_image_resize2.h linguist-vendored
 
-# Geist and Geist Mono are bundled verbatim (SIL OFL) so the app renders in its
-# own type on every platform rather than the host system face. Third-party
-# assets carried in-tree, excluded from language stats.
-src/fonts/Geist-Regular.ttf linguist-vendored
-src/fonts/GeistMono-Regular.ttf linguist-vendored
+# Geist and Geist Mono are bundled verbatim (SIL OFL, src/fonts/OFL.txt) so the
+# app renders in its own type, in real weights. Third-party assets carried
+# in-tree, excluded from language stats.
+src/fonts/*.ttf linguist-vendored

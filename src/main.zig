@@ -6167,9 +6167,49 @@ fn hexLower(out: *[64]u8, bytes: [32]u8) void {
 
 // -------------------------------------------------------------------- app run
 
+// CoreText/CoreGraphics, for registering the bundled faces process-wide by
+// PostScript name. Already linked: the SDK's AppKit host uses CTFontManager.
+const ct = if (builtin.os.tag == .macos) struct {
+    const CGDataProviderRef = ?*anyopaque;
+    const CGFontRef = ?*anyopaque;
+    const CFTypeRef = ?*anyopaque;
+    extern "c" fn CGDataProviderCreateWithData(info: ?*anyopaque, data: [*]const u8, size: usize, release: ?*anyopaque) CGDataProviderRef;
+    extern "c" fn CGDataProviderRelease(provider: CGDataProviderRef) void;
+    extern "c" fn CGFontCreateWithDataProvider(provider: CGDataProviderRef) CGFontRef;
+    extern "c" fn CGFontRelease(font: CGFontRef) void;
+    extern "c" fn CTFontManagerRegisterGraphicsFont(font: CGFontRef, err: ?*CFTypeRef) bool;
+    extern "c" fn CFRelease(ref: CFTypeRef) void;
+} else struct {};
+
+/// Registers the bundled Geist faces (theme.zig) with CoreText from the
+/// binary's own bytes, process scope, so the host's by-name resolution of the
+/// default sans/mono ids — and the reserved medium/bold span ids — finds them
+/// on EVERY launch path: the live window, a dev run from any working
+/// directory, and headless session replay. Best-effort per face: a face that
+/// is already registered (a system-installed Geist, a second call) fails
+/// quietly, and by-name lookup still resolves — either copy is the same OFL
+/// family.
+fn registerFontFaces() void {
+    if (comptime builtin.os.tag != .macos) return;
+    const faces = [_][]const u8{ theme.geist_ttf, theme.geist_medium_ttf, theme.geist_bold_ttf, theme.geist_mono_ttf };
+    for (faces) |ttf| {
+        const provider = ct.CGDataProviderCreateWithData(null, ttf.ptr, ttf.len, null) orelse continue;
+        defer ct.CGDataProviderRelease(provider);
+        const font = ct.CGFontCreateWithDataProvider(provider) orelse continue;
+        defer ct.CGFontRelease(font);
+        var err: ct.CFTypeRef = null;
+        _ = ct.CTFontManagerRegisterGraphicsFont(font, &err);
+        if (err) |e| ct.CFRelease(e);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     g_environ = init.environ_map;
+
+    // The bundled Geist faces, registered with CoreText before the platform
+    // host exists, so every later font lookup resolves them (see theme.zig).
+    registerFontFaces();
 
     // The action glyphs the feed draws (reply/like/zap) that the built-in set
     // does not carry. Registered before the first view build.
@@ -6192,12 +6232,11 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .view = appView,
-        // The app renders in its own type on every platform: Geist for prose,
-        // Geist Mono for metadata, registered on the installing frame.
-        .fonts = &.{
-            .{ .id = theme.geist_font_id, .name = "Geist-Regular.ttf", .ttf = theme.geist_ttf },
-            .{ .id = theme.geist_mono_font_id, .name = "GeistMono-Regular.ttf", .ttf = theme.geist_mono_ttf },
-        },
+        // No canvas-registered fonts: the typography tokens sit on the
+        // BUILT-IN ids (the SDK's default sans IS Geist), which is the only
+        // routing that gives span weights real medium/bold faces — a
+        // custom-registered id pins every span to its one face. The faces are
+        // registered with CoreText in `registerFontFaces` instead (theme.zig).
         // The dark, cool-grey, white-accent look (see theme.zig).
         .tokens_fn = theme.tokens(Model),
     });
