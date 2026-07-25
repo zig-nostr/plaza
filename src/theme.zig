@@ -10,12 +10,12 @@
 //!   - The type is Geist (prose) and Geist Mono (metadata, labels, code), in
 //!     REAL weights. The SDK's default sans IS Geist, and span weights route
 //!     to the reserved medium/bold font ids ONLY on the default ids (a
-//!     custom-registered canvas id pins every span to its one face — which is
+//!     custom-registered canvas id pins every span to its one face, which is
 //!     why the app no longer registers Geist with the canvas registry). The
 //!     typography tokens therefore stay on the built-in ids, and `main.zig`
 //!     registers the faces below with CoreText from these embedded bytes at
 //!     startup, so the macOS host resolves the reserved medium/bold ids by
-//!     PostScript name ("Geist-Medium", "Geist-Bold") on every launch path —
+//!     PostScript name ("Geist-Medium", "Geist-Bold") on every launch path:
 //!     live window, dev run from any directory, and headless session replay
 //!     alike, with no working-directory dependence.
 //!
@@ -161,7 +161,7 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.warning = p.status_warning;
             t.colors.warning_text = p.on_accent;
 
-            // Geist for prose, Geist Mono for the metadata voice — on the
+            // Geist for prose, Geist Mono for the metadata voice, on the
             // BUILT-IN ids, which is what keeps span weights routing to the
             // reserved medium/bold ids (see the module doc). The faces are
             // registered with CoreText from the embedded bytes at startup.
