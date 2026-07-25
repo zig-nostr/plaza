@@ -92,9 +92,13 @@ const feed_capacity = 300;
 const feed_page = 60;
 // A thread's replies are cached in the model (pressable, their pictures
 // fetched), so this bounds that buffer. `thread_depth_max` bounds the
-// open-as-a-sub-thread back-stack.
+// open-as-a-sub-thread back-stack, and its ceiling is the SDK's virtual-window
+// budget: every mounted level is a virtualList and the SDK tracks at most 8
+// virtual windows per build (excess lists are silently dropped, and the LAST
+// built — the visible thread — is the one that breaks). The feed plus six
+// ancestors plus the current level is exactly eight.
 const thread_reply_cap = 100;
-const thread_depth_max = 8;
+const thread_depth_max = 6;
 // How long a thread shows loading skeletons before giving up if the reply fetch
 // never signals completion (a relay that never sends EOSE), so a reply-less note
 // never stalls under skeletons forever.
@@ -3358,6 +3362,30 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
 // threadRepliesFromStore from the view build.
 var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 
+/// Whether the tags carry a NON-mention `e` reference to `id`: a root, reply,
+/// or positional ancestor pointer. A mention-marked tag is a quote, not an
+/// ancestor tie.
+pub fn nip10References(tags: []const nostr.event.Tag, id: [32]u8) bool {
+    for (tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "e")) continue;
+        if (tag[1].len != 64) continue;
+        var tid: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&tid, tag[1]) catch continue;
+        if (!std.mem.eql(u8, &tid, &id)) continue;
+        const marker = if (tag.len >= 4) tag[3] else "";
+        if (!std.mem.eql(u8, marker, "mention")) return true;
+    }
+    return false;
+}
+
+// How many candidates one walk round asks the store for: a multiple of the
+// display cap, so the events the gates reject (quotes, foreign repliers,
+// cross-round duplicates) do not consume the window genuine replies needed.
+// The store answers newest-first, so a round referenced by MORE events than
+// this can still cut old ones; the pool just makes that take four hundred
+// referers in one round rather than one hundred.
+const thread_walk_limit = thread_reply_cap * 4;
+
 /// Collects the ids of every store-resident reply in `root_event_id`'s thread:
 /// a breadth-first walk of the `#e` graph out from the root. The walk is what
 /// makes SUB-threads whole — a NIP-10 reply tags only the true thread root and
@@ -3365,16 +3393,19 @@ var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 /// direct children of a mid-thread note while its deeper descendants (already
 /// ingested by the top level's fetch) go unseen.
 ///
-/// Two properties fall out of the breadth-first order:
-///   - A kept note's parents are always kept: parents are collected in an
-///     earlier round than their children, so hitting the cap drops subtree
-///     tails, never the interior parents later replies hang from (which would
-///     flatten them to misplaced top-level rows).
-///   - Membership requires ANSWERING something (`nip10Parent` != null): an
-///     event whose only tie to the thread is a `mention`-marked tag is a
-///     quote OF the thread, not a voice in it, and is left out.
-fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *[thread_reply_cap][32]u8) usize {
-    const kinds = [_]u16{1};
+/// Membership is CONNECTIVITY, not co-mention: a candidate joins only when the
+/// note it answers (`nip10Parent`) is the level root or already a member — or
+/// when it carries a non-mention `e` reference to the level root itself, which
+/// keeps a reply whose interior parent never reached the store visible as a
+/// top-level row instead of vanishing. A mere `nip10Parent != null` would
+/// admit a foreign thread's reply that only QUOTES ours, and then import that
+/// thread's whole subtree through the next round's frontier.
+///
+/// The breadth-first order collects parents in an earlier round than their
+/// children, so overflowing the display cap drops subtree tails rather than
+/// interior parents. Within one round the store's newest-first `limit` can
+/// still cut old referers (see `thread_walk_limit`).
+pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *[thread_reply_cap][32]u8) usize {
     // Hex forms of the frontier ids, referenced by the query's tag filter:
     // slot 0 is the root, slot 1+i mirrors out[i].
     var hexes: [thread_reply_cap + 1][64]u8 = undefined;
@@ -3397,23 +3428,53 @@ fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *[thr
         }
         if (nvals == 0) break;
         const round_start = count;
+        // A tags-ONLY filter: with a kind in the filter the store's index
+        // ladder prefers the kind index and streams every kind:1 ever stored,
+        // post-filtering on the tag — the whole feed history, per round. The
+        // tag index streams just the frontier's referers; the kind gate is
+        // cheap and ours.
         const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = values[0..nvals] }};
-        var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = thread_reply_cap }) catch break;
+        var result = store.query(std.heap.page_allocator, .{ .tags = &tag_filters, .limit = thread_walk_limit }) catch break;
         defer result.deinit();
-        for (result.events) |ev| {
-            if (count >= out.len) break;
-            if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
-            if (nip10Parent(ev.tags) == null) continue;
-            var dup = false;
-            for (out[0..count]) |*seen| {
-                if (std.mem.eql(u8, seen, &ev.id)) {
-                    dup = true;
-                    break;
+        // Round-local fixpoint, admitting OLDEST first (the store answers
+        // newest-first): a parent is older than its children, so oldest-first
+        // usually connects everything in one pass, and overflowing the cap
+        // keeps the conversation's beginning — the parents everything hangs
+        // from — rather than its newest tail. Whatever stays unconnected
+        // after the fixpoint does not belong to this thread.
+        while (count < out.len) {
+            var admitted = false;
+            var idx: usize = result.events.len;
+            while (idx > 0) {
+                idx -= 1;
+                const ev = result.events[idx];
+                if (count >= out.len) break;
+                if (ev.kind != 1) continue;
+                if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
+                const parent = nip10Parent(ev.tags) orelse continue;
+                var connected = std.mem.eql(u8, &parent, &root_event_id) or nip10References(ev.tags, root_event_id);
+                if (!connected) {
+                    for (out[0..count]) |*member| {
+                        if (std.mem.eql(u8, member, &parent)) {
+                            connected = true;
+                            break;
+                        }
+                    }
                 }
+                if (!connected) continue;
+                var dup = false;
+                for (out[0..count]) |*seen| {
+                    if (std.mem.eql(u8, seen, &ev.id)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                out[count] = ev.id;
+                count += 1;
+                admitted = true;
             }
-            if (dup) continue;
-            out[count] = ev.id;
-            count += 1;
+            if (!admitted) break;
         }
         // The next frontier is exactly this round's finds; none means the
         // closure is complete.
