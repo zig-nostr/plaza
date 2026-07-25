@@ -10,15 +10,21 @@
 //!   - The type is Geist (prose) and Geist Mono (metadata, labels, code), in
 //!     REAL weights. The SDK's default sans IS Geist, and span weights route
 //!     to the reserved medium/bold font ids ONLY on the default ids (a
-//!     custom-registered id pins every span to its one face — which is why
-//!     the app no longer registers Geist itself). The typography tokens
-//!     therefore stay on the built-in ids, and the faces ship as files in
-//!     `assets/fonts/`: the macOS host registers every face it finds there
-//!     with CoreText at launch (process scope) and resolves the reserved
-//!     medium/bold ids by name ("Geist-Medium", "Geist-Bold" — the statics'
-//!     PostScript names). One caveat rides along: in a dev run the host
-//!     scans `assets/fonts/` relative to the process working directory, so
-//!     launch from the project root; the packaged app scans its Resources.
+//!     custom-registered canvas id pins every span to its one face — which is
+//!     why the app no longer registers Geist with the canvas registry). The
+//!     typography tokens therefore stay on the built-in ids, and `main.zig`
+//!     registers the faces below with CoreText from these embedded bytes at
+//!     startup, so the macOS host resolves the reserved medium/bold ids by
+//!     PostScript name ("Geist-Medium", "Geist-Bold") on every launch path —
+//!     live window, dev run from any directory, and headless session replay
+//!     alike, with no working-directory dependence.
+//!
+//!     The regular faces are byte-identical to the ones the SDK embeds for
+//!     its estimator and CPU reference renderer, so regular-run measurement
+//!     matches across every platform exactly as it did before. The weighted
+//!     faces are real only where text resolves host-side (macOS): the CPU
+//!     reference (portability builds, automation screenshots) inks the
+//!     reserved weight ids with the regular outlines, by SDK design.
 //!
 //! Purple is a reserved brand-signal token (the app icon, the mark) and never
 //! a fill in the running UI, so it is not among the working tokens here.
@@ -26,6 +32,16 @@
 const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const Color = canvas.Color;
+
+/// The bundled faces (SIL OFL, see src/fonts/OFL.txt): the regulars are the
+/// SDK's own bytes (measurement parity, see the module doc), the medium and
+/// bold are the matching v1.4.01 statics. Registered with CoreText by
+/// `main.zig` at startup; never registered with the canvas font registry
+/// (that would pin spans to one face and kill weight routing).
+pub const geist_ttf = @embedFile("fonts/Geist-Regular.ttf");
+pub const geist_medium_ttf = @embedFile("fonts/Geist-Medium.ttf");
+pub const geist_bold_ttf = @embedFile("fonts/Geist-Bold.ttf");
+pub const geist_mono_ttf = @embedFile("fonts/GeistMono-Regular.ttf");
 
 fn hex(comptime s: []const u8) Color {
     // #rrggbb -> Color. Comptime so a bad literal is a compile error.
@@ -147,8 +163,8 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
 
             // Geist for prose, Geist Mono for the metadata voice — on the
             // BUILT-IN ids, which is what keeps span weights routing to the
-            // reserved medium/bold ids (see the module doc). The faces
-            // themselves come from `assets/fonts/`, host-registered at launch.
+            // reserved medium/bold ids (see the module doc). The faces are
+            // registered with CoreText from the embedded bytes at startup.
             t.typography.font_id = canvas.default_sans_font_id;
             t.typography.mono_font_id = canvas.default_mono_font_id;
             // A touch larger than the house 14 for a more readable feed body,
