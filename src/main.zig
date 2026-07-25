@@ -4131,7 +4131,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                         // "OP" in the house sans, not a lowercase mono "author":
                         // the mono run read like a code token beside the name.
                         ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .weight = .medium, .scale = 0.78 }}),
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
                         })
                     else
                         ui.spacer(0),
