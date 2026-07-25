@@ -43,11 +43,10 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 760;
 const window_height: f32 = 540;
 const feed_column_width: f32 = 620;
-// The thread's reading column is a touch narrower than the feed's: the feed's
-// virtualList reserves a scrollbar gutter, but a thread's plain `ui.scroll` does
-// not, so a full-width centred row would slide under the overlay scrollbar and
-// clip the timestamp at a narrow window. This clears it at the 680 minimum.
-const thread_column_width: f32 = 588;
+// The thread's reading column matches the feed's: both are virtualLists now,
+// which reserve the same scrollbar gutter, so the two screens share one column
+// width and one left edge.
+const thread_column_width: f32 = feed_column_width;
 
 // The relay pool this milestone dials, and how many recent notes to keep on
 // screen. Each relay runs on its own thread and ingests into the one shared
@@ -93,9 +92,13 @@ const feed_capacity = 300;
 const feed_page = 60;
 // A thread's replies are cached in the model (pressable, their pictures
 // fetched), so this bounds that buffer. `thread_depth_max` bounds the
-// open-as-a-sub-thread back-stack.
+// open-as-a-sub-thread back-stack, and its ceiling is the SDK's virtual-window
+// budget: every mounted level is a virtualList and the SDK tracks at most 8
+// virtual windows per build (excess lists are silently dropped, and the LAST
+// built — the visible thread — is the one that breaks). The feed plus six
+// ancestors plus the current level is exactly eight.
 const thread_reply_cap = 100;
-const thread_depth_max = 8;
+const thread_depth_max = 6;
 // How long a thread shows loading skeletons before giving up if the reply fetch
 // never signals completion (a relay that never sends EOSE), so a reply-less note
 // never stalls under skeletons forever.
@@ -2219,23 +2222,20 @@ pub const Model = struct {
     fn refreshThreadNotes(self: *Model, now_s: i64) void {
         if (self.viewing_thread == 0) return;
         const store = g_store orelse return;
-        var hex: [64]u8 = undefined;
-        hexLower(&hex, self.thread_root.event_id);
-        const evals = [_][]const u8{&hex};
-        const kinds = [_]u16{1};
-        const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
-        var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = thread_reply_cap }) catch return;
-        defer result.deinit();
+        // The whole subtree, not just the direct children: the closure walk is
+        // what keeps a SUB-thread's deep replies visible (they tag the true
+        // root and their direct parent, never a mid-thread note).
+        var ids: [thread_reply_cap][32]u8 = undefined;
+        const id_count = collectThreadIds(store, self.thread_root.event_id, &ids);
         var n: usize = 0;
-        for (result.events) |ev| {
+        for (ids[0..id_count]) |id| {
             if (n >= self.thread_notes.len) break;
-            // The store's `#e` set includes the root's own descendants; drop the
-            // root itself so it is not listed under its own replies.
-            if (std.mem.eql(u8, &ev.id, &self.thread_root.event_id)) continue;
-            self.thread_notes[n] = noteFrom(ev, now_s);
+            var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
+            defer se.deinit();
+            self.thread_notes[n] = noteFrom(se.event, now_s);
             // Queue the replier's profile so a name, avatar, and handle resolve
             // for a reply from someone outside the follow set.
-            wantProfile(ev.pubkey);
+            wantProfile(se.event.pubkey);
             n += 1;
         }
         std.mem.sort(Note, self.thread_notes[0..n], {}, struct {
@@ -3362,6 +3362,141 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
 // threadRepliesFromStore from the view build.
 var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 
+/// Whether the tags carry a NON-mention `e` reference to `id`: a root, reply,
+/// or positional ancestor pointer. A mention-marked tag is a quote, not an
+/// ancestor tie.
+pub fn nip10References(tags: []const nostr.event.Tag, id: [32]u8) bool {
+    for (tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "e")) continue;
+        if (tag[1].len != 64) continue;
+        var tid: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&tid, tag[1]) catch continue;
+        if (!std.mem.eql(u8, &tid, &id)) continue;
+        const marker = if (tag.len >= 4) tag[3] else "";
+        if (!std.mem.eql(u8, marker, "mention")) return true;
+    }
+    return false;
+}
+
+// How many candidates one walk round asks the store for: a multiple of the
+// display cap, so the events the gates reject (quotes, foreign repliers,
+// cross-round duplicates) do not consume the window genuine replies needed.
+// The store answers newest-first, so a round referenced by MORE events than
+// this can still cut old ones; the pool just makes that take four hundred
+// referers in one round rather than one hundred.
+const thread_walk_limit = thread_reply_cap * 4;
+
+/// Collects the ids of every store-resident reply in `root_event_id`'s thread:
+/// a breadth-first walk of the `#e` graph out from the root. The walk is what
+/// makes SUB-threads whole — a NIP-10 reply tags only the true thread root and
+/// its direct parent, so a single `#e = sub-root` query returns just the
+/// direct children of a mid-thread note while its deeper descendants (already
+/// ingested by the top level's fetch) go unseen.
+///
+/// Membership is CONNECTIVITY, not co-mention: a candidate joins only when the
+/// note it answers (`nip10Parent`) is the level root or already a member — or
+/// when it carries a non-mention `e` reference to the level root itself, which
+/// keeps a reply whose interior parent never reached the store visible as a
+/// top-level row instead of vanishing. A mere `nip10Parent != null` would
+/// admit a foreign thread's reply that only QUOTES ours, and then import that
+/// thread's whole subtree through the next round's frontier.
+///
+/// The breadth-first order collects parents in an earlier round than their
+/// children, so overflowing the display cap drops subtree tails rather than
+/// interior parents. Within one round the store's newest-first `limit` can
+/// still cut old referers (see `thread_walk_limit`).
+pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *[thread_reply_cap][32]u8) usize {
+    // Hex forms of the frontier ids, referenced by the query's tag filter:
+    // slot 0 is the root, slot 1+i mirrors out[i].
+    var hexes: [thread_reply_cap + 1][64]u8 = undefined;
+    var values: [thread_reply_cap][]const u8 = undefined;
+    hexLower(&hexes[0], root_event_id);
+    var count: usize = 0;
+    var frontier_start: usize = 0;
+    var first_round = true;
+    while (count < out.len) {
+        var nvals: usize = 0;
+        if (first_round) {
+            values[0] = &hexes[0];
+            nvals = 1;
+        } else {
+            for (frontier_start..count) |i| {
+                hexLower(&hexes[1 + i], out[i]);
+                values[nvals] = &hexes[1 + i];
+                nvals += 1;
+            }
+        }
+        if (nvals == 0) break;
+        const round_start = count;
+        // A tags-ONLY filter: with a kind in the filter the store's index
+        // ladder prefers the kind index and streams every kind:1 ever stored,
+        // post-filtering on the tag — the whole feed history, per round. The
+        // tag index streams just the frontier's referers; the kind gate is
+        // cheap and ours.
+        const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = values[0..nvals] }};
+        var result = store.query(std.heap.page_allocator, .{ .tags = &tag_filters, .limit = thread_walk_limit }) catch break;
+        defer result.deinit();
+        // Round-local fixpoint, admitting OLDEST first (the store answers
+        // newest-first): a parent is older than its children, so oldest-first
+        // usually connects everything in one pass, and overflowing the cap
+        // keeps the conversation's beginning — the parents everything hangs
+        // from — rather than its newest tail. Whatever stays unconnected
+        // after the fixpoint does not belong to this thread.
+        while (count < out.len) {
+            var admitted = false;
+            var idx: usize = result.events.len;
+            while (idx > 0) {
+                idx -= 1;
+                const ev = result.events[idx];
+                if (count >= out.len) break;
+                if (ev.kind != 1) continue;
+                if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
+                const parent = nip10Parent(ev.tags) orelse continue;
+                var connected = std.mem.eql(u8, &parent, &root_event_id) or nip10References(ev.tags, root_event_id);
+                if (!connected) {
+                    for (out[0..count]) |*member| {
+                        if (std.mem.eql(u8, member, &parent)) {
+                            connected = true;
+                            break;
+                        }
+                    }
+                }
+                if (!connected) continue;
+                var dup = false;
+                for (out[0..count]) |*seen| {
+                    if (std.mem.eql(u8, seen, &ev.id)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                out[count] = ev.id;
+                count += 1;
+                admitted = true;
+            }
+            if (!admitted) break;
+        }
+        // The next frontier is exactly this round's finds; none means the
+        // closure is complete.
+        if (count == round_start) break;
+        frontier_start = round_start;
+        first_round = false;
+    }
+    return count;
+}
+
+/// One ancestor level's collected reply ids, stamped with the store's event
+/// count, so the per-frame render of an OCCLUDED level re-walks the `#e`
+/// closure only when the store actually grew — not every frame. UI-thread
+/// only, like the arrange scratch above.
+const LevelReplies = struct {
+    root: [32]u8 = [_]u8{0} ** 32,
+    stamp: usize = std.math.maxInt(usize),
+    ids: [thread_reply_cap][32]u8 = undefined,
+    len: usize = 0,
+};
+var g_level_replies: [thread_depth_max]LevelReplies = [_]LevelReplies{.{}} ** thread_depth_max;
+
 /// Records the FIRST `nostr:nevent`/`note` reference in `note`'s rendered
 /// content as a decoded event id plus the byte span of its raw token, so the
 /// body can split around it and draw an embedded quote card. A second reference,
@@ -4031,18 +4166,19 @@ fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
 /// A cheap height estimate for the note at `index`, from model facts only
 /// (never layout): the card's chrome, its wrapped lines, and its picture.
 fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
-    // Re-derived for the redesign row (B1): 14px top and bottom padding, the
-    // identity line, the body gaps, the engagement row, and the hairline, with
-    // the body wrapping in the ~540px text column beside the 40px avatar.
-    const chrome: f32 = 74;
+    const model: *const Model = @ptrCast(@alignCast(context orelse return 96));
+    const i: usize = @intCast(index);
+    if (i >= model.notes_len) return 96;
+    return noteRowEstimate(&model.notes[i], 74);
+}
+
+/// The shared card-height math behind the feed's and the thread's estimates.
+/// Re-derived for the redesign row (B1): `chrome` covers the paddings, the
+/// identity line, the body gaps, the engagement row, and the hairline; the body
+/// wraps in the ~540px text column beside the 40px avatar.
+fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     const line_height: f32 = 22;
     const chars_per_line: f32 = 70;
-
-    const model: *const Model = @ptrCast(@alignCast(context orelse return chrome + line_height));
-    const i: usize = @intCast(index);
-    if (i >= model.notes_len) return chrome + line_height;
-    const note = &model.notes[i];
-
     // A collapsed long note shows only the fold, plus a line for "Show more".
     const collapsed = noteIsLong(note) and !isExpanded(note.id);
     const shown_chars: f32 = @floatFromInt(if (collapsed) collapsedLen(note.content(), note_collapse_chars) else note.content_len);
@@ -4053,64 +4189,124 @@ fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     return extent;
 }
 
-/// The thread screen's content column: a header, the scrolling root note and its
-/// replies, and the pinned reply composer. Reads the snapshotted root and the
-/// cached replies from the model, so a reply survives a store rebuild and can be
-/// opened as its own thread.
-/// One thread level's panel: header, the scrolling root and its replies, and the
-/// reply composer. Rendered for the open thread AND every ancestor still on the
-/// back-stack (occluded beneath it), so each level's scroll region stays mounted
-/// and keeps its offset. The scroll's `global_key` is the level's root id, so a
-/// level's scroll identity is stable as it moves between current and ancestor.
+/// One thread level's row plan: row 0 is the root note, rows 1..n the replies
+/// in conversation order, with skeleton rows (first fetch still out) or the
+/// quiet empty line appended. Arena-allocated per frame so the virtual list's
+/// estimate callback can price unbuilt rows from model facts.
+const ThreadRows = struct {
+    root: *const Note,
+    replies: []const Note,
+    skeletons: usize,
+    empty: bool,
+
+    fn count(self: *const ThreadRows) usize {
+        return 1 + self.replies.len + self.skeletons + @intFromBool(self.empty);
+    }
+};
+
+/// A cheap height estimate for one thread row, sharing the feed's note math.
+fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
+    const fallback: f32 = 96;
+    const rows: *const ThreadRows = @ptrCast(@alignCast(context orelse return fallback));
+    const i: usize = @intCast(index);
+    // The root: the same card math with taller chrome (the name-over-handle
+    // stack and the slightly larger name).
+    if (i == 0) return noteRowEstimate(rows.root, 96);
+    const ri = i - 1;
+    if (ri < rows.replies.len) return noteRowEstimate(&rows.replies[ri], 74);
+    // A skeleton or the empty line: one fixed-shape row.
+    return 76;
+}
+
+/// One thread level's panel: header, the windowed root-and-replies list, and
+/// the reply composer. Rendered for the open thread AND every ancestor still on
+/// the back-stack (occluded beneath it), so each level's list stays mounted and
+/// keeps its scroll offset. The list is a virtualList — only the rows in the
+/// viewport are built, so a busy thread, or a stack of occluded ancestor
+/// levels, stays far under the per-view widget budget (a plain scroll built
+/// every reply of every level and blew straight through it). The list id is
+/// the level key, so a level's scroll identity is stable as it moves between
+/// current and ancestor.
 fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []const Note, thread_loading: bool, level_key: u64) AppUi.Node {
     // While the first fetch is out with nothing in hand, a few skeleton rows say
     // "replies are coming"; once it has come back empty, a quiet line instead of
     // a lone root over blank space.
     const loading = replies.len == 0 and thread_loading;
     const empty = replies.len == 0 and !thread_loading;
-    const skeletons: usize = if (loading) 3 else 0;
-    const tail: usize = if (empty) 1 else 0;
-    const items = ui.arena.alloc(AppUi.Node, 1 + replies.len + skeletons + tail) catch return ui.column(.{}, .{});
-    items[0] = threadRoot(ui, root);
-    for (replies, 0..) |*reply, i| items[i + 1] = replyRow(ui, reply, root.pubkey);
-    for (0..skeletons) |i| items[1 + replies.len + i] = replySkeleton(ui);
-    if (empty) items[items.len - 1] = threadEmptyNote(ui);
+    const rows_ctx = ui.arena.create(ThreadRows) catch return ui.column(.{}, .{});
+    rows_ctx.* = .{ .root = root, .replies = replies, .skeletons = if (loading) 3 else 0, .empty = empty };
+    const options: AppUi.VirtualListOptions = .{
+        .id = ui.fmt("thread-{d}", .{level_key}),
+        .item_count = rows_ctx.count(),
+        .item_extent = 0,
+        .extent_estimate = threadExtentEstimate,
+        .extent_context = rows_ctx,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 3,
+        .grow = 1,
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Thread" },
+    };
+    const window = ui.virtualWindow(options);
+    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.column(.{}, .{});
+    for (rows, 0..) |*row, offset| row.* = threadRowAt(ui, rows_ctx, window.start_index + offset);
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         threadHeader(ui, model),
-        // The scroll viewport holds ONE child: a column that stacks the root and
-        // the replies (multiple children of a scroll would layer, not flow).
-        // `cross = .center` centres each fixed-width row horizontally; the rows
-        // must NOT grow (a `grow` child in a column grows on the VERTICAL axis,
-        // which under the scroll's height makes them overlap). The `global_key`
-        // is the level's position (stable across pushes/pops above it, and never
-        // colliding even if the same note appears at two levels), so the scroll
-        // offset survives while occluded.
-        ui.scroll(.{ .grow = 1, .global_key = .{ .int = level_key } }, .{
-            ui.column(.{ .cross = .center }, .{items}),
-        }),
+        ui.virtualList(options, window, .{rows}),
         replyComposer(ui, model, root),
     });
 }
 
+/// Builds the thread row at `index` (see `ThreadRows` for the plan), centred
+/// like a feed row. `grow` on the wrapper is safe here: the virtual list
+/// positions rows absolutely, so a growing row spreads WIDTH, exactly like the
+/// feed's cards (the old plain-scroll column grew rows VERTICALLY instead,
+/// which is why these wrappers were once forbidden).
+fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node {
+    const inner = blk: {
+        if (index == 0) break :blk threadRoot(ui, rows_ctx.root);
+        const ri = index - 1;
+        if (ri < rows_ctx.replies.len) break :blk replyRow(ui, &rows_ctx.replies[ri], rows_ctx.root.pubkey);
+        if (rows_ctx.empty) break :blk threadEmptyNote(ui);
+        break :blk replySkeleton(ui);
+    };
+    var node = ui.row(.{ .grow = 1, .main = .center }, .{inner});
+    // Stable row identity for the windowed reconciler: the note's own id, or a
+    // synthetic high-bit key for the placeholder rows (their bit sits above the
+    // masked 63-bit note-id space, so no collision).
+    node.key = .{ .int = blk: {
+        if (index == 0) break :blk @intCast(rows_ctx.root.id);
+        const ri = index - 1;
+        if (ri < rows_ctx.replies.len) break :blk @intCast(rows_ctx.replies[ri].id);
+        break :blk (@as(u64, 1) << 63) | @as(u64, index);
+    } };
+    return node;
+}
+
 /// The open thread's replies read from the store at render time, into the arena,
 /// oldest first. Used for the ANCESTOR levels (the current level reads its cached
-/// `thread_notes` instead): they are occluded, so a per-frame read is cheap and
-/// keeps their scroll content stable without a second reply cache.
-fn threadRepliesFromStore(ui: *AppUi, root_event_id: [32]u8) []const Note {
+/// `thread_notes` instead): they are occluded, so a per-frame read keeps their
+/// scroll content stable without a second full reply cache. The `#e` closure
+/// walk is the costly part, so its RESULT (the id set) is cached per level and
+/// re-walked only when the store's event count moves; the notes themselves are
+/// rebuilt into the frame arena from cheap point reads.
+fn threadRepliesFromStore(ui: *AppUi, level: usize, root_event_id: [32]u8) []const Note {
     const store = g_store orelse return &.{};
-    var hex: [64]u8 = undefined;
-    hexLower(&hex, root_event_id);
-    const evals = [_][]const u8{&hex};
-    const kinds = [_]u16{1};
-    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &evals }};
-    var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .tags = &tag_filters, .limit = thread_reply_cap }) catch return &.{};
-    defer result.deinit();
+    const cache = &g_level_replies[level];
+    const stamp = store.eventCount() catch std.math.maxInt(usize);
+    if (stamp == std.math.maxInt(usize) or cache.stamp != stamp or !std.mem.eql(u8, &cache.root, &root_event_id)) {
+        cache.root = root_event_id;
+        cache.stamp = stamp;
+        cache.len = collectThreadIds(store, root_event_id, &cache.ids);
+    }
     const now = nowSeconds();
-    const notes = ui.arena.alloc(Note, result.events.len) catch return &.{};
+    const notes = ui.arena.alloc(Note, cache.len) catch return &.{};
     var n: usize = 0;
-    for (result.events) |ev| {
-        if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
-        notes[n] = noteFrom(ev, now);
+    for (cache.ids[0..cache.len]) |id| {
+        var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
+        defer se.deinit();
+        notes[n] = noteFrom(se.event, now);
         n += 1;
     }
     std.mem.sort(Note, notes[0..n], {}, struct {
@@ -4390,7 +4586,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
         for (0..model.thread_stack_len) |d| {
             const root = &model.thread_stack[d];
             const lk = threadLevelKey(d, root.id);
-            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, root.event_id), false, lk));
+            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk));
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
         kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk));

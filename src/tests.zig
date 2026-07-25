@@ -1568,3 +1568,56 @@ test "threadIndentLevels caps the visual indent" {
     try testing.expectEqual(@as(usize, 3), main.threadIndentLevels(4));
     try testing.expectEqual(@as(usize, 3), main.threadIndentLevels(255));
 }
+
+fn threadEvent(id_byte: u8, created_at: i64, tags: []const nostr.event.Tag) nostr.event.Event {
+    return .{
+        .id = [_]u8{id_byte} ** 32,
+        .pubkey = [_]u8{0x11} ** 32,
+        .created_at = created_at,
+        .kind = 1,
+        .tags = tags,
+        .content = "note",
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+test "collectThreadIds keeps the thread, anchors orphans, rejects quotes and foreign replies" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/thread.mdb", .{dir_buf[0..dir_len]});
+    var store = try nostr.store.Store.open(path.ptr, .{});
+    defer store.deinit();
+
+    const root_hex = "aa" ** 32;
+    const gpa = testing.allocator;
+    // The root itself, then a small thread: A answers the root, B answers A,
+    // F answers B; E answers a parent that never reached the store but also
+    // carries the usual root tag; C only QUOTES the root (mention); D is a
+    // reply in a FOREIGN thread that quotes our root in passing.
+    _ = try store.ingest(gpa, threadEvent(0xAA, 100, &.{}), .{});
+    _ = try store.ingest(gpa, threadEvent(0x01, 110, &.{&.{ "e", root_hex, "", "root" }}), .{});
+    _ = try store.ingest(gpa, threadEvent(0x02, 120, &.{ &.{ "e", root_hex, "", "root" }, &.{ "e", "01" ** 32, "", "reply" } }), .{});
+    _ = try store.ingest(gpa, threadEvent(0x06, 130, &.{ &.{ "e", root_hex, "", "root" }, &.{ "e", "02" ** 32, "", "reply" } }), .{});
+    _ = try store.ingest(gpa, threadEvent(0x05, 140, &.{ &.{ "e", root_hex, "", "root" }, &.{ "e", "99" ** 32, "", "reply" } }), .{});
+    _ = try store.ingest(gpa, threadEvent(0x03, 150, &.{&.{ "e", root_hex, "", "mention" }}), .{});
+    _ = try store.ingest(gpa, threadEvent(0x04, 160, &.{ &.{ "e", root_hex, "", "mention" }, &.{ "e", "ee" ** 32, "", "root" }, &.{ "e", "dd" ** 32, "", "reply" } }), .{});
+
+    var ids: [100][32]u8 = undefined;
+    const n = main.collectThreadIds(&store, [_]u8{0xAA} ** 32, &ids);
+    // A, B, F, and the anchored orphan E; never the quote or the foreign reply.
+    try testing.expectEqual(@as(usize, 4), n);
+    const want = [_]u8{ 0x01, 0x02, 0x06, 0x05 };
+    for (want, 0..) |b, i| try testing.expectEqual(b, ids[i][0]);
+}
+
+test "nip10References sees ancestor ties, never mentions" {
+    const root_hex = "aa" ** 32;
+    const root_id = [_]u8{0xAA} ** 32;
+    try testing.expect(main.nip10References(&.{&.{ "e", root_hex, "", "root" }}, root_id));
+    try testing.expect(main.nip10References(&.{&.{ "e", root_hex }}, root_id));
+    try testing.expect(!main.nip10References(&.{&.{ "e", root_hex, "", "mention" }}, root_id));
+    try testing.expect(!main.nip10References(&.{&.{ "e", "bb" ** 32, "", "root" }}, root_id));
+}
