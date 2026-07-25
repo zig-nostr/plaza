@@ -1776,10 +1776,9 @@ pub const Note = struct {
     reply_parent: [32]u8 = [_]u8{0} ** 32,
     has_reply_parent: bool = false,
     // Thread placement, stamped by `arrangeThread`: how deep this reply sits
-    // under the root (1 = a direct reply) and its position in conversation
-    // order. Both are meaningless outside an arranged thread.
+    // under the root (1 = a direct reply). Meaningless outside an arranged
+    // thread.
     depth: u8 = 0,
-    thread_rank: u16 = 0,
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
@@ -3316,25 +3315,31 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
             }
         }
     }
+    // The DFS emits a PERMUTATION (conversation order over current indices),
+    // so ordering is one O(n) gather through the scratch below — never a sort,
+    // which would move the ~1.5KB Note structs O(n log n) times for an order
+    // the walk already knows.
     var visited = [_]bool{false} ** thread_reply_cap;
-    var rank: u16 = 0;
+    var order: [thread_reply_cap]u16 = undefined;
+    var count: usize = 0;
     const Dfs = struct {
         notes: []Note,
         parent: []const u16,
         visited: []bool,
-        rank: *u16,
+        order: []u16,
+        count: *usize,
         fn visit(self: *const @This(), i: usize, depth: u8) void {
             if (self.visited[i]) return;
             self.visited[i] = true;
             self.notes[i].depth = depth;
-            self.notes[i].thread_rank = self.rank.*;
-            self.rank.* += 1;
+            self.order[self.count.*] = @intCast(i);
+            self.count.* += 1;
             for (self.parent, 0..) |p, j| {
-                if (j < self.notes.len and p == i) self.visit(j, depth +| 1);
+                if (p == i) self.visit(j, depth +| 1);
             }
         }
     };
-    const dfs = Dfs{ .notes = notes, .parent = parent[0..n], .visited = visited[0..n], .rank = &rank };
+    const dfs = Dfs{ .notes = notes, .parent = parent[0..n], .visited = visited[0..n], .order = order[0..n], .count = &count };
     for (0..n) |i| {
         if (parent[i] == n) dfs.visit(i, 1);
     }
@@ -3343,16 +3348,19 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
     for (0..n) |i| {
         if (!visited[i]) {
             notes[i].depth = 1;
-            notes[i].thread_rank = rank;
-            rank += 1;
+            order[count] = @intCast(i);
+            count += 1;
         }
     }
-    std.mem.sort(Note, notes, {}, struct {
-        fn lt(_: void, a: Note, b: Note) bool {
-            return a.thread_rank < b.thread_rank;
-        }
-    }.lt);
+    for (order[0..n], 0..) |src, dst| g_arrange_scratch[dst] = notes[src];
+    @memcpy(notes[0..n], g_arrange_scratch[0..n]);
 }
+
+// The gather scratch for `arrangeThread`'s permutation apply. File-scope (not
+// stack: ~150KB of Note at the cap) and safe unsynchronized because every
+// caller runs on the UI thread — refreshThreadNotes from `update`, and
+// threadRepliesFromStore from the view build.
+var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 
 /// Records the FIRST `nostr:nevent`/`note` reference in `note`'s rendered
 /// content as a decoded event id plus the byte span of its raw token, so the
@@ -4259,45 +4267,51 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
 
 /// One reply in the thread: a feed-style row, with an "OP" chip when the
 /// replier is the thread's original author, seated under the note it answers by
-/// the nesting gutter. The content row carries the press to open this reply as
-/// its own thread (like a feed row), while the picture and the engagement
-/// controls keep their own presses as the deeper hit targets.
+/// the nesting gutter. The WRAPPER row carries the press and the hover wash, so
+/// every horizontal pixel of the row — gutter included — opens this reply as
+/// its own thread and washes as one unit; the picture and the engagement
+/// controls keep their own presses as the deeper hit targets. The bottom
+/// hairline lives INSIDE the content column: it starts after the gutter (so it
+/// aligns with the content it separates) and the gutter's rails span the
+/// wrapper's full height across it, keeping a sibling run's rail continuous.
 fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const p = theme.palette;
     const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
     const levels = threadIndentLevels(note.depth);
-    // A fixed-width column, centred by the scroll column's `cross = .center`. The
-    // content row carries the press; neither wrapper may `grow` (that would grow
-    // it vertically in the scroll's column and overlap the next reply) — inside
-    // the inner ROW, though, `grow` spreads WIDTH, which is how the content row
-    // takes whatever the gutter leaves.
+    // A fixed-width column, centred by the scroll column's `cross = .center`.
+    // Neither wrapper may `grow` (that would grow it vertically in the scroll's
+    // column and overlap the next reply) — inside the wrapper ROW, though,
+    // `grow` spreads WIDTH, which is how the content column takes whatever the
+    // gutter leaves.
     var node = ui.column(.{ .width = thread_column_width }, .{
-        ui.row(.{}, .{
+        ui.row(.{ .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
             threadGutter(ui, levels),
-            ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .grow = 1, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
-                noteAvatar(ui, note),
-                ui.column(.{ .gap = 5, .grow = 1 }, .{
-                    ui.row(.{ .gap = 6, .cross = .center }, .{
-                        ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
-                        if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                        if (is_author)
-                            // "OP" in the house sans, not a lowercase mono "author":
-                            // the mono run read like a code token beside the name.
-                            ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                                ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
-                            })
-                        else
-                            ui.spacer(0),
-                        identityHandle(ui, note, true),
-                        ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+            ui.column(.{ .grow = 1 }, .{
+                ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+                    noteAvatar(ui, note),
+                    ui.column(.{ .gap = 5, .grow = 1 }, .{
+                        ui.row(.{ .gap = 6, .cross = .center }, .{
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
+                            if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
+                            if (is_author)
+                                // "OP" in the house sans, not a lowercase mono "author":
+                                // the mono run read like a code token beside the name.
+                                ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
+                                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
+                                })
+                            else
+                                ui.spacer(0),
+                            identityHandle(ui, note, true),
+                            ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+                        }),
+                        noteBody(ui, note, true),
+                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        engagementRow(ui, note),
                     }),
-                    noteBody(ui, note, true),
-                    if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                    engagementRow(ui, note),
                 }),
+                ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
             }),
         }),
-        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
     });
     node.key = .{ .int = @intCast(note.id) };
     return node;

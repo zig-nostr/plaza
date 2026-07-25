@@ -1460,15 +1460,42 @@ test "nip10Parent picks the marked reply, root, or positional parent" {
         };
         try testing.expectEqualSlices(u8, &deep_id, &(main.nip10Parent(&tags).?));
     }
+    // The commonest deprecated form in the wild: ONE unmarked `e` tag, which
+    // is both the root and the parent.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", root_hex }};
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Parent(&tags).?));
+    }
+    // A marked root beside an unmarked tag, no reply marker: the root wins
+    // (the middle of the reply-orelse-root-orelse-positional chain).
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", root_hex, "", "root" },
+            &.{ "e", deep_hex },
+        };
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Parent(&tags).?));
+    }
     // A lone `mention` never makes the note a reply.
     {
         const tags = [_]nostr.event.Tag{&.{ "e", root_hex, "", "mention" }};
         try testing.expect(main.nip10Parent(&tags) == null);
     }
-    // Malformed hex is skipped, not a parent.
+    // A short id is rejected by the length guard, not a parent.
     {
         const tags = [_]nostr.event.Tag{&.{ "e", "zz", "", "reply" }};
         try testing.expect(main.nip10Parent(&tags) == null);
+    }
+    // A 64-char NON-hex id passes the length guard and must be rejected by the
+    // decode itself.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", "zz" ** 32, "", "reply" }};
+        try testing.expect(main.nip10Parent(&tags) == null);
+    }
+    // Uppercase hex decodes: the wire has both casings, and parents match on
+    // decoded bytes, not on the raw string.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", "AB" ** 32, "", "reply" }};
+        try testing.expectEqualSlices(u8, &([_]u8{0xAB} ** 32), &(main.nip10Parent(&tags).?));
     }
     // No e tags at all.
     try testing.expect(main.nip10Parent(&.{}) == null);
@@ -1515,11 +1542,23 @@ test "arrangeThread never loops on a parent cycle" {
         threadNote(3, 300, 0xAA),
     };
     main.arrangeThread(&notes, root);
-    // The cycle strands x and y; both surface at the top level after z.
+    // The cycle strands x and y; both surface at the top level after z,
+    // still oldest-first (x before y).
     try testing.expectEqual(@as(u8, 3), notes[0].event_id[0]);
+    try testing.expectEqual(@as(u8, 1), notes[1].event_id[0]);
+    try testing.expectEqual(@as(u8, 2), notes[2].event_id[0]);
     try testing.expectEqual(@as(u8, 1), notes[0].depth);
     try testing.expectEqual(@as(u8, 1), notes[1].depth);
     try testing.expectEqual(@as(u8, 1), notes[2].depth);
+}
+
+test "arrangeThread stamps a lone reply without a full pass" {
+    const root = [_]u8{0xAA} ** 32;
+    var one = [_]main.Note{threadNote(1, 100, 0xAA)};
+    main.arrangeThread(&one, root);
+    try testing.expectEqual(@as(u8, 1), one[0].depth);
+    var none = [_]main.Note{};
+    main.arrangeThread(&none, root);
 }
 
 test "threadIndentLevels caps the visual indent" {
