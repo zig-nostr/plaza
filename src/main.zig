@@ -6192,12 +6192,11 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .view = appView,
-        // The app renders in its own type on every platform: Geist for prose,
-        // Geist Mono for metadata, registered on the installing frame.
-        .fonts = &.{
-            .{ .id = theme.geist_font_id, .name = "Geist-Regular.ttf", .ttf = theme.geist_ttf },
-            .{ .id = theme.geist_mono_font_id, .name = "GeistMono-Regular.ttf", .ttf = theme.geist_mono_ttf },
-        },
+        // No app-registered fonts: the typography tokens sit on the BUILT-IN
+        // ids (the SDK's default sans IS Geist), which is the only routing
+        // that gives span weights real medium/bold faces — a custom-registered
+        // id pins every span to its one face. The weighted faces ship in
+        // `assets/fonts/`, host-registered with CoreText at launch (theme.zig).
         // The dark, cool-grey, white-accent look (see theme.zig).
         .tokens_fn = theme.tokens(Model),
     });

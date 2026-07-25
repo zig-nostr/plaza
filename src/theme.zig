@@ -7,9 +7,18 @@
 //!   - There is NO colored primary anywhere. The one working accent is a
 //!     porcelain white (`accent`) on near-black (`on_accent`). The interface
 //!     lives on typography and spacing, not on color.
-//!   - The type is Geist (prose) and Geist Mono (metadata, labels, code),
-//!     bundled and registered, so the app renders in its own face on every
-//!     platform rather than the host system font.
+//!   - The type is Geist (prose) and Geist Mono (metadata, labels, code), in
+//!     REAL weights. The SDK's default sans IS Geist, and span weights route
+//!     to the reserved medium/bold font ids ONLY on the default ids (a
+//!     custom-registered id pins every span to its one face — which is why
+//!     the app no longer registers Geist itself). The typography tokens
+//!     therefore stay on the built-in ids, and the faces ship as files in
+//!     `assets/fonts/`: the macOS host registers every face it finds there
+//!     with CoreText at launch (process scope) and resolves the reserved
+//!     medium/bold ids by name ("Geist-Medium", "Geist-Bold" — the statics'
+//!     PostScript names). One caveat rides along: in a dev run the host
+//!     scans `assets/fonts/` relative to the process working directory, so
+//!     launch from the project root; the packaged app scans its Resources.
 //!
 //! Purple is a reserved brand-signal token (the app icon, the mark) and never
 //! a fill in the running UI, so it is not among the working tokens here.
@@ -17,15 +26,6 @@
 const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const Color = canvas.Color;
-
-/// The registered face ids. `native_sdk.canvas.min_registered_font_id` is the
-/// first id an app may claim; the built-in ids sit below it.
-pub const geist_font_id: canvas.FontId = canvas.min_registered_font_id;
-pub const geist_mono_font_id: canvas.FontId = canvas.min_registered_font_id + 1;
-
-/// Raw face bytes, registered on the installing frame (see `main.zig`).
-pub const geist_ttf = @embedFile("fonts/Geist-Regular.ttf");
-pub const geist_mono_ttf = @embedFile("fonts/GeistMono-Regular.ttf");
 
 fn hex(comptime s: []const u8) Color {
     // #rrggbb -> Color. Comptime so a bad literal is a compile error.
@@ -145,9 +145,12 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.warning = p.status_warning;
             t.colors.warning_text = p.on_accent;
 
-            // Geist for prose, Geist Mono for the metadata voice.
-            t.typography.font_id = geist_font_id;
-            t.typography.mono_font_id = geist_mono_font_id;
+            // Geist for prose, Geist Mono for the metadata voice — on the
+            // BUILT-IN ids, which is what keeps span weights routing to the
+            // reserved medium/bold ids (see the module doc). The faces
+            // themselves come from `assets/fonts/`, host-registered at launch.
+            t.typography.font_id = canvas.default_sans_font_id;
+            t.typography.mono_font_id = canvas.default_mono_font_id;
             // A touch larger than the house 14 for a more readable feed body,
             // matching the redesign.
             t.typography.body_size = 14.5;
