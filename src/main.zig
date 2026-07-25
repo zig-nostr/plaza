@@ -95,7 +95,7 @@ const feed_page = 60;
 // open-as-a-sub-thread back-stack, and its ceiling is the SDK's virtual-window
 // budget: every mounted level is a virtualList and the SDK tracks at most 8
 // virtual windows per build (excess lists are silently dropped, and the LAST
-// built — the visible thread — is the one that breaks). The feed plus six
+// built (the visible thread) is the one that breaks). The feed plus six
 // ancestors plus the current level is exactly eight.
 const thread_reply_cap = 100;
 const thread_depth_max = 6;
@@ -1819,7 +1819,7 @@ pub const Note = struct {
     }
     /// The @handle for the identity line: the author's NIP-05, shown as `@name`
     /// (or `@domain` for the root `_@domain` form). Empty when they have no
-    /// NIP-05 — a bare npub is not a handle, so nothing is shown rather than
+    /// NIP-05 (a bare npub is not a handle, so nothing is shown rather than
     /// `@npub…`. Allocated in the caller's arena for the frame.
     pub fn handle(self: *const Note, arena: std.mem.Allocator) []const u8 {
         const p = lookupProfile(self.pubkey) orelse return "";
@@ -3258,7 +3258,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 /// The NIP-10 parent of a reply: the `e` tag marked `reply` wins; with only a
 /// `root` marker the note answers the root directly; with no markers at all the
 /// LAST `e` tag is the parent (the deprecated positional convention, still
-/// common in the wild). `mention` tags never make a note a reply — a quote is
+/// common in the wild). `mention` tags never make a note a reply; a quote is
 /// not an answer. Null for a note that answers nothing.
 pub fn nip10Parent(tags: []const nostr.event.Tag) ?[32]u8 {
     var reply: ?[32]u8 = null;
@@ -3283,8 +3283,8 @@ pub fn nip10Parent(tags: []const nostr.event.Tag) ?[32]u8 {
     return reply orelse root orelse last_plain;
 }
 
-/// Orders a fetched reply set into conversation order — each reply directly
-/// under the note it answers, siblings oldest-first — and stamps every note's
+/// Orders a fetched reply set into conversation order (each reply directly
+/// under the note it answers, siblings oldest-first) and stamps every note's
 /// nesting depth (1 = a direct reply to the root). Expects `notes` already
 /// sorted oldest-first, which is what makes sibling order chronological.
 ///
@@ -3316,7 +3316,7 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
         }
     }
     // The DFS emits a PERMUTATION (conversation order over current indices),
-    // so ordering is one O(n) gather through the scratch below — never a sort,
+    // so ordering is one O(n) gather through the scratch below, never a sort,
     // which would move the ~1.5KB Note structs O(n log n) times for an order
     // the walk already knows.
     var visited = [_]bool{false} ** thread_reply_cap;
@@ -3358,7 +3358,7 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
 
 // The gather scratch for `arrangeThread`'s permutation apply. File-scope (not
 // stack: ~150KB of Note at the cap) and safe unsynchronized because every
-// caller runs on the UI thread — refreshThreadNotes from `update`, and
+// caller runs on the UI thread: refreshThreadNotes from `update`, and
 // threadRepliesFromStore from the view build.
 var g_arrange_scratch: [thread_reply_cap]Note = undefined;
 
@@ -3388,13 +3388,13 @@ const thread_walk_limit = thread_reply_cap * 4;
 
 /// Collects the ids of every store-resident reply in `root_event_id`'s thread:
 /// a breadth-first walk of the `#e` graph out from the root. The walk is what
-/// makes SUB-threads whole — a NIP-10 reply tags only the true thread root and
+/// makes SUB-threads whole: a NIP-10 reply tags only the true thread root and
 /// its direct parent, so a single `#e = sub-root` query returns just the
 /// direct children of a mid-thread note while its deeper descendants (already
 /// ingested by the top level's fetch) go unseen.
 ///
 /// Membership is CONNECTIVITY, not co-mention: a candidate joins only when the
-/// note it answers (`nip10Parent`) is the level root or already a member — or
+/// note it answers (`nip10Parent`) is the level root or already a member, or
 /// when it carries a non-mention `e` reference to the level root itself, which
 /// keeps a reply whose interior parent never reached the store visible as a
 /// top-level row instead of vanishing. A mere `nip10Parent != null` would
@@ -3430,7 +3430,7 @@ pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *
         const round_start = count;
         // A tags-ONLY filter: with a kind in the filter the store's index
         // ladder prefers the kind index and streams every kind:1 ever stored,
-        // post-filtering on the tag — the whole feed history, per round. The
+        // post-filtering on the tag, which is the whole feed history, per round. The
         // tag index streams just the frontier's referers; the kind gate is
         // cheap and ours.
         const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = values[0..nvals] }};
@@ -3439,8 +3439,8 @@ pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *
         // Round-local fixpoint, admitting OLDEST first (the store answers
         // newest-first): a parent is older than its children, so oldest-first
         // usually connects everything in one pass, and overflowing the cap
-        // keeps the conversation's beginning — the parents everything hangs
-        // from — rather than its newest tail. Whatever stays unconnected
+        // keeps the conversation's beginning (the parents everything hangs
+        // from) rather than its newest tail. Whatever stays unconnected
         // after the fixpoint does not belong to this thread.
         while (count < out.len) {
             var admitted = false;
@@ -3487,7 +3487,7 @@ pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *
 
 /// One ancestor level's collected reply ids, stamped with the store's event
 /// count, so the per-frame render of an OCCLUDED level re-walks the `#e`
-/// closure only when the store actually grew — not every frame. UI-thread
+/// closure only when the store actually grew, not every frame. UI-thread
 /// only, like the arrange scratch above.
 const LevelReplies = struct {
     root: [32]u8 = [_]u8{0} ** 32,
@@ -4221,7 +4221,7 @@ fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
 /// One thread level's panel: header, the windowed root-and-replies list, and
 /// the reply composer. Rendered for the open thread AND every ancestor still on
 /// the back-stack (occluded beneath it), so each level's list stays mounted and
-/// keeps its scroll offset. The list is a virtualList — only the rows in the
+/// keeps its scroll offset. The list is a virtualList: only the rows in the
 /// viewport are built, so a busy thread, or a stack of occluded ancestor
 /// levels, stays far under the per-view widget budget (a plain scroll built
 /// every reply of every level and blew straight through it). The list id is
@@ -4435,7 +4435,7 @@ fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
 
 /// How many indent steps a reply at `depth` shows. Direct replies (depth 1)
 /// sit flush; each further level steps in once, capped so a long back-and-forth
-/// never squeezes the text to a sliver — past the cap, deeper replies share the
+/// never squeezes the text to a sliver; past the cap, deeper replies share the
 /// cap's inset (the convention every threaded reader settles on).
 const thread_indent_cap = 3;
 const thread_indent_step: f32 = 24;
@@ -4464,7 +4464,7 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
 /// One reply in the thread: a feed-style row, with an "OP" chip when the
 /// replier is the thread's original author, seated under the note it answers by
 /// the nesting gutter. The WRAPPER row carries the press and the hover wash, so
-/// every horizontal pixel of the row — gutter included — opens this reply as
+/// every horizontal pixel of the row (gutter included) opens this reply as
 /// its own thread and washes as one unit; the picture and the engagement
 /// controls keep their own presses as the deeper hit targets. The bottom
 /// hairline lives INSIDE the content column: it starts after the gutter (so it
@@ -4476,7 +4476,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const levels = threadIndentLevels(note.depth);
     // A fixed-width column, centred by the scroll column's `cross = .center`.
     // Neither wrapper may `grow` (that would grow it vertically in the scroll's
-    // column and overlap the next reply) — inside the wrapper ROW, though,
+    // column and overlap the next reply); inside the wrapper ROW, though,
     // `grow` spreads WIDTH, which is how the content column takes whatever the
     // gutter leaves.
     var node = ui.column(.{ .width = thread_column_width }, .{
@@ -4541,7 +4541,7 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
     });
 }
 
-/// The feed screen: the rail, then the content — the feed, with a thread layered
+/// The feed screen: the rail, then the content, the feed, with a thread layered
 /// over it when one is open.
 /// Wraps a thread level's panel in a full-bleed opaque panel that occludes
 /// whatever is beneath it (a bare column does not reliably paint its background;
@@ -4645,7 +4645,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The 56px navigation rail: Home (the mark) up top, then the compose verb, the
 /// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
-/// titlebar of buttons — destinations on the edge, the feed owns the width. A
+/// titlebar of buttons: destinations on the edge, the feed owns the width. A
 /// guest's gated tiles (compose, settings, you) route to the join sheet. Search
 /// is not shown until the feature exists.
 fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
@@ -6379,11 +6379,11 @@ const ct = if (builtin.os.tag == .macos) struct {
 
 /// Registers the bundled Geist faces (theme.zig) with CoreText from the
 /// binary's own bytes, process scope, so the host's by-name resolution of the
-/// default sans/mono ids — and the reserved medium/bold span ids — finds them
+/// default sans/mono ids (and the reserved medium/bold span ids) finds them
 /// on EVERY launch path: the live window, a dev run from any working
 /// directory, and headless session replay. Best-effort per face: a face that
 /// is already registered (a system-installed Geist, a second call) fails
-/// quietly, and by-name lookup still resolves — either copy is the same OFL
+/// quietly, and by-name lookup still resolves; either copy is the same OFL
 /// family.
 fn registerFontFaces() void {
     if (comptime builtin.os.tag != .macos) return;
@@ -6430,7 +6430,7 @@ pub fn main(init: std.process.Init) !void {
         .view = appView,
         // No canvas-registered fonts: the typography tokens sit on the
         // BUILT-IN ids (the SDK's default sans IS Geist), which is the only
-        // routing that gives span weights real medium/bold faces — a
+        // routing that gives span weights real medium/bold faces; a
         // custom-registered id pins every span to its one face. The faces are
         // registered with CoreText in `registerFontFaces` instead (theme.zig).
         // The dark, cool-grey, white-accent look (see theme.zig).
