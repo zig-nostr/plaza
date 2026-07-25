@@ -37,9 +37,11 @@ const geometry = native_sdk.geometry;
 const canvas_label = "main-canvas";
 // A desktop window sized for the redesign's centered reading column: the feed
 // content is a fixed 620px column, so the window opens wide enough to seat it
-// with margin, and extra width past that becomes margin, never a longer line.
-const window_width: f32 = 680;
-const window_height: f32 = 820;
+// with real margin on either side, and extra width past that becomes margin,
+// never a longer line. Wider than tall: a reading column wants breathing room,
+// not a tower.
+const window_width: f32 = 760;
+const window_height: f32 = 540;
 const feed_column_width: f32 = 620;
 // The thread's reading column is a touch narrower than the feed's: the feed's
 // virtualList reserves a scrollbar gutter, but a thread's plain `ui.scroll` does
@@ -3809,7 +3811,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
                     ui.el(.textarea, .{
                         .text = model.draft(),
-                        .placeholder = "Share something with the network…",
+                        .placeholder = "What's on your mind?",
                         .on_input = AppUi.inputMsg(.draft_edit),
                         .on_submit = .post,
                         .height = 140,
@@ -4126,8 +4128,10 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                     ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
                     if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
                     if (is_author)
+                        // "OP" in the house sans, not a lowercase mono "author":
+                        // the mono run read like a code token beside the name.
                         ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "author", .monospace = true, .scale = 0.82 }}),
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
                         })
                     else
                         ui.spacer(0),
@@ -4181,7 +4185,11 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
 /// keeps its identity, and its scroll offset, as levels push and pop above it.
 fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.card, .{ .grow = 1, .global_key = .{ .int = level_key }, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{panel});
+    // A bare `.card` injects the house 24px content padding whenever `padding`
+    // is left at zero (zero IS the unset sentinel), which framed the whole
+    // thread page in a margin the feed does not have. A hair above zero opts
+    // out while staying invisibly small, so the thread sits flush like the feed.
+    return ui.el(.card, .{ .grow = 1, .padding = 0.01, .global_key = .{ .int = level_key }, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{panel});
 }
 
 /// A stable, collision-free scroll identity for a thread level: the level index
@@ -4404,14 +4412,16 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 8, .padding = 12 }, .{
-            // ONE paragraph, so the bold label and the mono metadata share a
-            // single baseline (two separate paragraphs sat on mismatched line
-            // boxes and read as vertically misaligned).
+            // ONE paragraph, so the bold label and the metadata share a single
+            // baseline (two separate paragraphs sat on mismatched line boxes and
+            // read as vertically misaligned). Same face for both spans: a mono
+            // run beside the sans label carried different vertical metrics and
+            // still read as off-baseline, and as a second typeface for no reason.
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{
                     .{ .text = "Starter pack", .weight = .bold },
-                    .{ .text = ui.fmt("  {s}", .{model.scope_voices(ui.arena)}), .monospace = true, .color = .text_muted },
+                    .{ .text = ui.fmt("  {s}", .{model.scope_voices(ui.arena)}), .color = .text_muted, .scale = 0.95 },
                 },
             ),
             ui.spacer(1),
