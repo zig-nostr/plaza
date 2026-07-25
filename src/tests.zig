@@ -1429,3 +1429,103 @@ test "a helper session restores the identity from its pubkey, no key in process"
     try testing.expect(!main.restoreHelperForTest(""));
     try testing.expect(!main.restoreHelperForTest("abcd"));
 }
+
+test "nip10Parent picks the marked reply, root, or positional parent" {
+    const root_hex = "01" ** 32;
+    const mid_hex = "02" ** 32;
+    const deep_hex = "03" ** 32;
+    const root_id = [_]u8{0x01} ** 32;
+    const mid_id = [_]u8{0x02} ** 32;
+    const deep_id = [_]u8{0x03} ** 32;
+
+    // A marked `reply` wins over the marked root and any unmarked tag.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", root_hex, "", "root" },
+            &.{ "e", deep_hex, "" },
+            &.{ "e", mid_hex, "", "reply" },
+        };
+        try testing.expectEqualSlices(u8, &mid_id, &(main.nip10Parent(&tags).?));
+    }
+    // Only a `root` marker: the note answers the root directly.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", root_hex, "wss://r", "root" }};
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Parent(&tags).?));
+    }
+    // No markers (deprecated positional): the LAST `e` tag is the parent.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", root_hex },
+            &.{ "e", deep_hex },
+        };
+        try testing.expectEqualSlices(u8, &deep_id, &(main.nip10Parent(&tags).?));
+    }
+    // A lone `mention` never makes the note a reply.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", root_hex, "", "mention" }};
+        try testing.expect(main.nip10Parent(&tags) == null);
+    }
+    // Malformed hex is skipped, not a parent.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", "zz", "", "reply" }};
+        try testing.expect(main.nip10Parent(&tags) == null);
+    }
+    // No e tags at all.
+    try testing.expect(main.nip10Parent(&.{}) == null);
+}
+
+fn threadNote(event_byte: u8, created_at: i64, parent_byte: u8) main.Note {
+    var note = main.Note{ .created_at = created_at };
+    note.event_id = [_]u8{event_byte} ** 32;
+    if (parent_byte != 0) {
+        note.reply_parent = [_]u8{parent_byte} ** 32;
+        note.has_reply_parent = true;
+    }
+    return note;
+}
+
+test "arrangeThread seats replies under their parents, siblings oldest-first" {
+    const root = [_]u8{0xAA} ** 32;
+    // Chronological input: a (to root), b (to root), c (to a), d (to c),
+    // e (to root), f (orphan parent never fetched).
+    var notes = [_]main.Note{
+        threadNote(1, 100, 0xAA),
+        threadNote(2, 200, 0xAA),
+        threadNote(3, 300, 1),
+        threadNote(4, 400, 3),
+        threadNote(5, 500, 0xAA),
+        threadNote(6, 600, 0x77),
+    };
+    main.arrangeThread(&notes, root);
+    // Conversation order: a, then a's subtree (c, then d), then b, e, f.
+    const want_order = [_]u8{ 1, 3, 4, 2, 5, 6 };
+    const want_depth = [_]u8{ 1, 2, 3, 1, 1, 1 };
+    for (notes, 0..) |note, i| {
+        try testing.expectEqual(want_order[i], note.event_id[0]);
+        try testing.expectEqual(want_depth[i], note.depth);
+    }
+}
+
+test "arrangeThread never loops on a parent cycle" {
+    const root = [_]u8{0xAA} ** 32;
+    // x and y answer each other; z answers the root.
+    var notes = [_]main.Note{
+        threadNote(1, 100, 2),
+        threadNote(2, 200, 1),
+        threadNote(3, 300, 0xAA),
+    };
+    main.arrangeThread(&notes, root);
+    // The cycle strands x and y; both surface at the top level after z.
+    try testing.expectEqual(@as(u8, 3), notes[0].event_id[0]);
+    try testing.expectEqual(@as(u8, 1), notes[0].depth);
+    try testing.expectEqual(@as(u8, 1), notes[1].depth);
+    try testing.expectEqual(@as(u8, 1), notes[2].depth);
+}
+
+test "threadIndentLevels caps the visual indent" {
+    try testing.expectEqual(@as(usize, 0), main.threadIndentLevels(0));
+    try testing.expectEqual(@as(usize, 0), main.threadIndentLevels(1));
+    try testing.expectEqual(@as(usize, 1), main.threadIndentLevels(2));
+    try testing.expectEqual(@as(usize, 3), main.threadIndentLevels(4));
+    try testing.expectEqual(@as(usize, 3), main.threadIndentLevels(255));
+}
