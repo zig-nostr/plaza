@@ -4827,10 +4827,14 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// the layout kinds (stack, row, column and friends), which is why every rail tile
 /// had been painting as bare window, the bright compose tile included. A `.card`
 /// paints but carries a 240x120 intrinsic size that blew the rail apart; `.panel`
-/// paints AND sizes to its children. The 0.01 padding turns off the house-padding
-/// sentinel (zero reads as unset), and the panel layers its children, so the
-/// sizing column inside does the centring.
+/// paints AND sizes to its children. It layers its children, so the sizing column
+/// inside does the centring, and the 0.01 padding is belt and braces: the house
+/// padding substitution only reaches kinds that declare a default layout, which a
+/// panel does not, so the plate sits flush either way.
 fn tilePlate(ui: *AppUi, style: canvas.WidgetStyle, label: []const u8, glyph: AppUi.Node) AppUi.Node {
+    // An empty label leaves the plate anonymous, which is what a plate inside a
+    // named pressable row wants: two nodes with one name read as two controls.
+    // The unpressed Home plate passes its own name, since nothing else carries it.
     return ui.el(.panel, .{ .padding = 0.01, .style = style, .semantics = .{ .label = label } }, .{
         ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{glyph}),
     });
@@ -4852,7 +4856,7 @@ fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label:
         // background falls back to the house card fill and would draw a plate the
         // redesign does not have.
         if (bright)
-            tilePlate(ui, .{ .background = p.accent, .radius = 9 }, label, glyph)
+            tilePlate(ui, .{ .background = p.accent, .radius = 9, .stroke_width = 0 }, "", glyph)
         else
             ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{glyph}),
     });
@@ -4923,32 +4927,39 @@ fn backupNudge(ui: *AppUi) AppUi.Node {
 fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
     _ = model;
     const p = theme.palette;
-    return ui.column(.{ .gap = 0, .style = .{ .background = p.surface_subbar } }, .{
-        vgap(ui, 8),
-        ui.row(.{ .cross = .center, .gap = 0 }, .{
-            hgap(ui, chrome_inset),
-            ui.paragraph(
-                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted_alt } },
-                &.{.{ .text = "Browsing as a guest. Reading is yours forever. Join in when something moves you.", .scale = meta_scale }},
-            ),
-            hgap(ui, 10),
-            pillButton(ui, "Create identity", .open_join, true, p.surface_subbar),
-            hgap(ui, 10),
-            pillButton(ui, "Sign in", .open_join, false, p.surface_subbar),
-            hgap(ui, 10),
-            // An icon press, not a text button: the built-in x glyph (the
-            // U+2715 codepoint is outside Geist's coverage, rendered tofu).
-            ui.row(.{
-                .on_press = .dismiss_guest_strip,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Dismiss" },
-            }, .{
-                ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "x"),
+    // On a `.panel`, not a column: a column paints no background at all, so the
+    // banner had been reading as plain window behind its own copy.
+    return ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = p.surface_subbar, .stroke_width = 0, .radius = 0 } }, .{
+        ui.column(.{ .gap = 0 }, .{
+            vgap(ui, 8),
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, chrome_inset),
+                ui.paragraph(
+                    .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted_alt } },
+                    &.{.{ .text = "Browsing as a guest. Reading is yours forever. Join in when something moves you.", .scale = meta_scale }},
+                ),
+                hgap(ui, 10),
+                pillButton(ui, "Create identity", .open_join, true, p.surface_subbar),
+                hgap(ui, 10),
+                pillButton(ui, "Sign in", .open_join, false, p.surface_subbar),
+                hgap(ui, 10),
+                // An icon press, not a text button: the built-in x glyph (the
+                // U+2715 codepoint is outside Geist's coverage, rendered tofu).
+                // Padded well past the 12px glyph: the target is the press, not the
+                // drawing.
+                ui.row(.{
+                    .padding = 6,
+                    .on_press = .dismiss_guest_strip,
+                    .style = .{ .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Dismiss" },
+                }, .{
+                    ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "x"),
+                }),
+                hgap(ui, chrome_inset),
             }),
-            hgap(ui, chrome_inset),
+            vgap(ui, 8),
+            ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
         }),
-        vgap(ui, 8),
-        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
 }
 
@@ -4963,7 +4974,11 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     // No action lives here any more. Compose is the rail's bright tile, and a
     // guest reaches the join sheet from the banner or the rail's seat, so the
     // scope line is what it says it is: a label.
-    return ui.column(.{ .gap = 0 }, .{
+    // Centred WITHOUT grow: a row that is a child of a column grows on the
+    // column's axis, so `.grow` here would stretch the header down the window and
+    // shove the feed with it. A row already stretches across, which is all the
+    // centring needs.
+    return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
         vgap(ui, 11),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, chrome_inset),
@@ -4984,8 +4999,8 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             hgap(ui, chrome_inset),
         }),
         vgap(ui, 9),
-        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
-    });
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    })});
 }
 
 /// The status bar: the caught-up line on the left (there is no spinner, the feed
@@ -5027,11 +5042,13 @@ fn pillButton(ui: *AppUi, label: []const u8, press: Msg, filled: bool, on_surfac
     // with no stated background falls back to the house card fill, which would
     // draw a plate the redesign's ghost button does not have.
     const style: canvas.WidgetStyle = if (filled)
-        .{ .background = p.accent, .radius = 7 }
+        .{ .background = p.accent, .radius = 7, .stroke_width = 0 }
     else
         .{ .background = on_surface, .border = p.border_control, .radius = 7, .stroke_width = 1 };
     const ink = if (filled) p.on_accent else p.text_secondary;
-    const weight: canvas.TextSpanWeight = if (filled) .medium else .regular;
+    // The shot sets the filled label at 600 and the ghost at 500; the bundled
+    // family steps 400 / 500 / 700, so both land on medium.
+    const weight: canvas.TextSpanWeight = .medium;
     // The fill and the outline live on a `.panel`: a row paints no background at
     // all (the renderer draws nothing for the layout kinds), which is why the
     // filled pill was reading as dark-on-dark text with no button under it.
