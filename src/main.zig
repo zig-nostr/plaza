@@ -40,8 +40,8 @@ const canvas_label = "main-canvas";
 // with real margin on either side, and extra width past that becomes margin,
 // never a longer line. Wider than tall: a reading column wants breathing room,
 // not a tower.
-const window_width: f32 = 760;
-const window_height: f32 = 540;
+pub const window_width: f32 = 760;
+pub const window_height: f32 = 540;
 const feed_column_width: f32 = 620;
 // The thread's reading column matches the feed's: both are virtualLists now,
 // which reserve the same scrollbar gutter, so the two screens share one column

@@ -2,6 +2,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const main = @import("main.zig");
+const painted = @import("painted.zig");
 const theme = @import("theme.zig");
 
 const canvas = native_sdk.canvas;
@@ -1694,4 +1695,109 @@ test "a feed row's estimated height is the sum of its measured parts" {
     // The metadata register is exactly 12px. `.size = .sm` would be 13.5, since
     // the size enum steps by one from the 14.5 body.
     try testing.expectApproxEqAbs(@as(f32, 12), main.meta_size, 0.001);
+}
+
+// -------------------------------------------------------- painted surfaces
+//
+// These assert the COLOUR the renderer emits, not the widget tree. Four features
+// of this redesign shipped invisible while their trees looked perfect (see
+// painted.zig), so every surface that must show its own fill is pinned here.
+
+test "every chrome surface actually paints its fill" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+    const pal = theme.palette;
+
+    // The rail's home plate. This is the assertion that would have caught the
+    // rail painting as bare window for the whole life of the rail.
+    try painted.expectFillAt(p, 28, 28, pal.surface_rail_tile);
+
+    // A quiet rail tile paints NOTHING, so the window shows through. Worth
+    // asserting: a panel with no stated background falls back to the house card
+    // fill, which would draw a plate the design does not have. (The window's own
+    // colour is cleared by the host, not the canvas, so there is no fill here to
+    // compare against.)
+    try painted.expectNothingPaintedAt(p, 28, 506);
+}
+
+test "the compose tile is the one bright surface in the window" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+
+    // 11a's whole point about the rail: compose is the single bright tile. It had
+    // never once painted.
+    const fill = p.fillAtCenterOf("New note") orelse return error.NoComposeTile;
+    try testing.expect(painted.sameColor(fill, theme.palette.accent));
+
+    // And it wears no border. A panel strokes its frame whether or not one was
+    // asked for, falling back to the house hairline, which put a #26262c ring
+    // around the bright tile until it was told not to.
+    const frame = p.frameOf("New note") orelse return error.NoComposeTile;
+    try testing.expect(!p.hasStrokeAt(frame.x, frame.y + frame.height / 2, theme.palette.border_hairline));
+}
+
+test "the guest banner paints behind its own copy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    // The banner only exists for a guest, which `initialModel` already is (no
+    // active pubkey), and only until it is dismissed.
+    try testing.expect(model.is_guest() and model.show_guest_strip());
+
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+    const pal = theme.palette;
+
+    // Inside the banner, left of its copy: the banner's own surface, which was
+    // stated on a column and therefore never drawn.
+    try painted.expectFillAt(p, 300, 20, pal.surface_subbar);
+
+    // The filled pill, and the fact that it carries no borrowed hairline.
+    const pill = p.frameOf("Create identity") orelse return error.NoPill;
+    const pill_fill = p.fillAt(pill.x + pill.width / 2, pill.y + pill.height / 2) orelse return error.PillNotPainted;
+    try testing.expect(painted.sameColor(pill_fill, pal.accent));
+    try testing.expect(!p.hasStrokeAt(pill.x, pill.y + pill.height / 2, pal.border_hairline));
+}
+
+test "a note row's separator paints at the reading column's width" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{7} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a row that needs a line under it");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const p = try painted.Painted.render(arena, &model);
+
+    // Round 3 spent a PR on separators that were never drawn at all (an empty
+    // column with a background paints nothing, so the fix was the `.separator`
+    // element). This holds that line: SOMETHING of the divider ink is painted.
+    var found = false;
+    for (p.commands) |command| {
+        switch (command) {
+            .fill_rect => |v| {
+                if (painted.sameColor(switch (v.fill) {
+                    .color => |c| c,
+                    else => continue,
+                }, theme.palette.divider_row) and v.rect.width > 400) found = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(found);
 }
