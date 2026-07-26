@@ -2,6 +2,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const main = @import("main.zig");
+const theme = @import("theme.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -13,6 +14,9 @@ const Msg = main.Msg;
 /// Builds the real view for `model`: the same root the app runs, so a test sees
 /// the markup screens (compiled in) and the hand-written feed exactly as shipped.
 fn buildTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
+    // The app's own icon table, installed the same way `main` installs it, so a
+    // test tree draws Plaza's glyphs rather than the missing-icon fallback.
+    main.registerIcons();
     var ui = AppUi.init(arena);
     const node = main.appView(&ui, model);
     if (ui.failed) return error.ViewBuild;
@@ -542,24 +546,31 @@ test "bolt11 amounts parse across multipliers" {
     try testing.expectEqual(@as(u64, 0), main.bolt11Msat("not an invoice"));
 }
 
-test "note text splits into link, mention, and plain runs" {
+test "note text splits into link, mention, and plain runs, colored by the identity token" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = main.AppUi.init(arena_state.allocator());
 
     const spans = main.contentSpans(&ui, "hi @alice see https://example.com/x ok");
     try testing.expectEqual(@as(usize, 5), spans.len);
-    // The mention and the link are accented; only the link is pressable.
+    // Content runs take the identity violet through the `info` token; only the
+    // link is pressable, and a mention additionally sits one weight up.
     try testing.expectEqualStrings("@alice", spans[1].text);
+    try testing.expect(spans[1].color != null and spans[1].color.? == .info);
+    try testing.expectEqual(canvas.TextSpanWeight.medium, spans[1].weight);
     try testing.expectEqual(@as(usize, 0), spans[1].link.len);
     try testing.expectEqualStrings("https://example.com/x", spans[3].text);
     try testing.expectEqualStrings("https://example.com/x", spans[3].link);
-    try testing.expect(spans[3].underline);
+    try testing.expect(spans[3].color != null and spans[3].color.? == .info);
+    // We ask for no underline (the redesign's in-text URL is colored and
+    // nothing more). The renderer still draws one under any span carrying a
+    // link payload, which is why this asserts the REQUEST, not the pixels.
+    try testing.expect(!spans[3].underline);
     // Plain text has no link payload.
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
 }
 
-test "hashtags are accented at a word boundary, but C# and trailing punctuation are not" {
+test "hashtags are colored at a word boundary, but C# and trailing punctuation are not" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = main.AppUi.init(arena_state.allocator());
@@ -567,7 +578,7 @@ test "hashtags are accented at a word boundary, but C# and trailing punctuation 
     const spans = main.contentSpans(&ui, "gm #nostr build C# code #zig!");
     try testing.expectEqual(@as(usize, 5), spans.len);
     try testing.expectEqualStrings("#nostr", spans[1].text);
-    try testing.expect(spans[1].color != null and spans[1].color.? == .accent);
+    try testing.expect(spans[1].color != null and spans[1].color.? == .info);
     try testing.expectEqual(@as(usize, 0), spans[1].link.len); // styled, not a link
     try testing.expectEqualStrings(" build C# code ", spans[2].text); // C# is not a tag
     try testing.expectEqualStrings("#zig", spans[3].text);
@@ -619,7 +630,7 @@ test "findQuoteRef captures the first note/nevent ref and ignores others" {
     }
 }
 
-test "a bare event reference is accent-colored without a link" {
+test "a bare event reference is identity-colored without a link" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = main.AppUi.init(arena_state.allocator());
@@ -627,7 +638,7 @@ test "a bare event reference is accent-colored without a link" {
     const spans = main.contentSpans(&ui, "see nostr:nevent1qqs example");
     // "see ", then the ref run, then " example".
     try testing.expectEqualStrings("nostr:nevent1qqs", spans[1].text);
-    try testing.expect(spans[1].color != null and spans[1].color.? == .accent);
+    try testing.expect(spans[1].color != null and spans[1].color.? == .info);
     try testing.expectEqual(@as(usize, 0), spans[1].link.len);
     try testing.expect(!spans[1].underline);
 }
@@ -1620,4 +1631,40 @@ test "nip10References sees ancestor ties, never mentions" {
     try testing.expect(main.nip10References(&.{&.{ "e", root_hex }}, root_id));
     try testing.expect(!main.nip10References(&.{&.{ "e", root_hex, "", "mention" }}, root_id));
     try testing.expect(!main.nip10References(&.{&.{ "e", "bb" ** 32, "", "root" }}, root_id));
+}
+
+test "every registered app icon resolves, so no view draws the missing glyph" {
+    main.registerIcons();
+    // The names Plaza's views ask for by `ui.appIcon`. A typo or a dropped
+    // registration would silently draw the slashed-circle fallback in the app,
+    // so the resolution is asserted here instead.
+    for ([_][]const u8{ "reply", "like", "zap", "signet", "bell", "mark" }) |name| {
+        try testing.expect(canvas.icons.resolve(name) != null);
+    }
+    // The built-in names the Working set reuses (the redesign's icon set is the
+    // SDK's own set), so a future SDK bump that renames one fails here.
+    for ([_][]const u8{
+        "alert",        "archive",      "arrow-right",   "arrow-up",   "check",         "check-circle",
+        "chevron-down", "chevron-left", "chevron-right", "chevron-up", "circle-dot",    "clock",
+        "copy",         "download",     "edit",          "ellipsis",   "external-link", "eye",
+        "plus",         "repeat",       "search",        "settings",   "terminal",      "volume",
+        "x",            "x-circle",
+    }) |name| {
+        try testing.expect(canvas.icons.find(name) != null);
+    }
+    // An unregistered name must NOT resolve, or the assertions above prove nothing.
+    try testing.expect(canvas.icons.resolve("plaza-no-such-icon") == null);
+}
+
+test "the identity violet is what the info token actually resolves to" {
+    // The views name the violet two ways: element foregrounds take
+    // `palette.accent_identity` directly, and text spans reference the `info`
+    // token (a span names a token field, not a Color). Both must land on the same
+    // color, or a handle and a mention in the same row would disagree.
+    const model = Model{};
+    const tokens = theme.tokens(Model)(&model);
+    try testing.expectEqual(theme.palette.accent_identity, tokens.colors.info);
+    // And the violet is a violet: blue-dominant, with red above green.
+    const v = theme.palette.accent_identity;
+    try testing.expect(v.b > v.r and v.r > v.g);
 }

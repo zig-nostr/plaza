@@ -163,8 +163,53 @@ comptime {
 // (the starter pack plus the user), so nobody in the feed is stuck on initials;
 // feed images take the rest through a small LRU. A mention-only cache entry,
 // past the avatar budget, renders initials.
+//
+// THE WHOLE-APP IMAGE BUDGET. The registry is hard-capped at
+// `image_registry_slots` registrations of at most 1 MiB of DECODED pixels each
+// (exactly 512x512 RGBA8); an oversized registration fails with
+// `error.ImageTooLarge` and a 17th with `error.ImageRegistryFull`. It is the
+// tightest resource in the app, so the target architecture is stated here before
+// the consumers that need it arrive:
+//
+//   ONE LRU over all 16 slots, serving every image kind (avatars, feed media,
+//   profile banners) from a single mark-then-lend pass: mark the whole on-screen
+//   image set in READING ORDER, then lend a free slot or evict the
+//   least-recently-seen one. Consumers differ only in their DECODE ceiling
+//   (an avatar at `avatar_px`, feed media inside the `media_px` box, a banner
+//   downscaled under the 1 MiB cap), never in a reserved share of the slots.
+//   Reserved shares are what strand capacity: a profile screen wants a banner
+//   and many avatars and no feed media at all, and a fixed media share would
+//   sit idle while authors fall back to initials.
+//
+// Two rules hold under any allocation:
+//   - Anything larger than an avatar is downscaled through the vendored stb path
+//     before registration, bounded as a BOX and not just a width (a 512-wide
+//     image that happens to be tall still blows the decoded cap). A profile
+//     banner at its drawn 660x132 is 1.39 MB of RGBA at 2x, so it must come down
+//     first, the way feed media already does.
+//   - A placeholder and the image it stands in for SHARE one slot: a blurhash
+//     preview registers into the very slot its full image overwrites in place, so
+//     a screen of loading rows can never double-claim capacity. Peak media
+//     consumption stays at `max_media_images` as a POLICY cap inside the shared
+//     pool, not as a reservation.
+//   - Link previews use letter tiles, drawn as text, so they cost no slots.
+//
+// WHAT THE CODE DOES TODAY, and the deviation: the two fixed pools below predate
+// this note and still stand, because unifying them now would mean writing the
+// allocator against imagined callers. The unification lands with the first
+// consumer that actually crosses the pools (the blurhash placeholder, then the
+// profile banner), and the assertion below keeps the interim split honest.
+pub const image_registry_slots = native_sdk.max_registered_canvas_images;
 pub const max_avatar_images = 10;
 const max_media_images = 6;
+comptime {
+    // The split may never promise more ids than the registry owns: overshooting
+    // shows up as a silent `error.ImageRegistryFull` at the 17th registration,
+    // which reads as "this author has no avatar" rather than as a budget bug.
+    if (max_avatar_images + max_media_images > image_registry_slots) {
+        @compileError("the image budget oversubscribes the canvas registry");
+    }
+}
 const media_image_id_base: u64 = max_avatar_images + 1;
 // What each image is requested at. Avatars draw at 40pt, so asking for more
 // than a couple of hundred pixels is pure waste. Feed images are bounded as a
@@ -4357,7 +4402,7 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.spacer(0),
             ui.spacer(1),
         }),
-        ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
 }
 
@@ -4375,7 +4420,7 @@ fn replySkeleton(ui: *AppUi) AppUi.Node {
                 ui.el(.skeleton, .{ .width = 220, .height = 10 }, .{}),
             }),
         }),
-        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
     });
 }
 
@@ -4389,9 +4434,9 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
     const h = note.handle(ui.arena);
     if (h.len > 0) {
         return if (fill)
-            ui.text(.{ .grow = 1, .style = .{ .foreground = p.text_faint } }, h)
+            ui.text(.{ .grow = 1, .style = .{ .foreground = p.accent_identity } }, h)
         else
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint } }, h);
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.accent_identity } }, h);
     }
     // Profile still being fetched: a placeholder rather than an empty gap. Once
     // it resolves (handle or none) or we give up, this stops showing.
@@ -4429,7 +4474,7 @@ fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
                 engagementRow(ui, note),
             }),
         }),
-        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
     });
 }
 
@@ -4455,7 +4500,7 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
     for (cells) |*cell| {
         // The rail fills the row's height on its own via cross-axis stretch.
         cell.* = ui.row(.{ .width = thread_indent_step, .main = .center }, .{
-            ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+            ui.separator(.{ .width = 1, .style = .{ .foreground = p.border_hairline, .background = p.border_hairline } }),
         });
     }
     return ui.row(.{}, .{cells});
@@ -4505,7 +4550,7 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                         engagementRow(ui, note),
                     }),
                 }),
-                ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+                ui.separator(.{ .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
             }),
         }),
     });
@@ -4802,7 +4847,7 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             else
                 ui.spacer(0),
         }),
-        ui.separator(.{ .style = .{ .foreground = p.divider_feedrow, .background = p.divider_feedrow } }),
+        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
 }
 
@@ -5024,7 +5069,7 @@ fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
 /// (`image = 0`), so a quote card never competes for the scarce avatar ids.
 fn quoteCard(ui: *AppUi, id: [32]u8) AppUi.Node {
     const p = theme.palette;
-    const card_style: canvas.WidgetStyle = .{ .background = p.surface_inset, .border = p.divider_feedrow, .radius = 10, .stroke_width = 1 };
+    const card_style: canvas.WidgetStyle = .{ .background = p.surface_inset, .border = p.divider_reply, .radius = 10, .stroke_width = 1 };
     const e = quoteFor(id);
     if (e == null or e.?.state == .idle or e.?.state == .fetching) {
         // A reused feed note (never re-parsed) whose quote slot was reclaimed by
@@ -5120,7 +5165,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // The only separation between rows: a hairline. The `.separator`
             // element paints a real line (an empty column with a background does
             // not, which is why every divider was invisible before).
-            ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = theme.palette.divider_feedrow, .background = theme.palette.divider_feedrow } }),
+            ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = theme.palette.divider_row, .background = theme.palette.divider_row } }),
         }),
     });
     // The note id is masked non-negative at build time, so this cast is safe.
@@ -5128,8 +5173,13 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
     return node;
 }
 
-/// Splits rendered note text into styled runs so a note reads like a note: web
-/// links are accented, underlined, and pressable, and `@mentions` are accented.
+/// Splits rendered note text into styled runs so a note reads like a note.
+/// Every interactive run takes the identity violet, because each one names a
+/// person or something they wrote: an `@mention` (one weight up, the way a name
+/// is set), a `#hashtag`, a bare `nostr:` event reference, and a web link, which
+/// alone carries a pressable payload. The design shows no hashtag, so their
+/// color follows the redesign's stated rule ("violet for identity and content")
+/// rather than a shot.
 /// Every span's text is a subslice of the note's own content, so nothing is
 /// copied. A paragraph holds at most 32 runs, so a link-heavy note keeps its
 /// tail as one plain run rather than losing it.
@@ -5171,13 +5221,21 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
             while (j < text.len and !std.ascii.isWhitespace(text[j])) j += 1;
         }
         const run = text[i..j];
-        // The monochrome design has one working accent (porcelain white), so
-        // every interactive run reads as accent; a URL is additionally
-        // underlined and carries its link payload.
+        // Content color is the identity violet, reached through the `info`
+        // token (a span names a token field, not a Color). A @mention
+        // additionally sits one weight up, the way a name does.
+        //
+        // The redesign draws an in-text URL colored and NOTHING more, but the
+        // renderer underlines every span that carries a link payload
+        // (`span.underline or is_link`), so a clickable URL is always underlined.
+        // Clickability wins over the hairline: `underline` stays unset here to
+        // say what we asked for, and the extra rule is the renderer's.
         spans[n] = if (is_url)
-            .{ .text = run, .color = .accent, .underline = true, .link = run }
+            .{ .text = run, .color = .info, .link = run }
+        else if (is_mention)
+            .{ .text = run, .color = .info, .weight = .medium }
         else
-            .{ .text = run, .color = .accent };
+            .{ .text = run, .color = .info };
         n += 1;
         i = j;
         plain_start = j;
@@ -6377,6 +6435,14 @@ const ct = if (builtin.os.tag == .macos) struct {
     extern "c" fn CFRelease(ref: CFTypeRef) void;
 } else struct {};
 
+/// Installs Plaza's own vector icons (plaza_icons.zig) so `ui.appIcon` names
+/// resolve like built-ins. Idempotent: it just publishes a static table. The
+/// tests call it too, so a view built in a test draws the real glyphs instead of
+/// the missing-icon fallback (and an icon regression can actually fail a test).
+pub fn registerIcons() void {
+    canvas.icons.registerAppIcons(&plaza_icons.app_icons);
+}
+
 /// Registers the bundled Geist faces (theme.zig) with CoreText from the
 /// binary's own bytes, process scope, so the host's by-name resolution of the
 /// default sans/mono ids (and the reserved medium/bold span ids) finds them
@@ -6407,9 +6473,9 @@ pub fn main(init: std.process.Init) !void {
     // host exists, so every later font lookup resolves them (see theme.zig).
     registerFontFaces();
 
-    // The action glyphs the feed draws (reply/like/zap) that the built-in set
-    // does not carry. Registered before the first view build.
-    canvas.icons.registerAppIcons(&plaza_icons.app_icons);
+    // The glyphs the built-in set does not carry. Registered before the first
+    // view build.
+    registerIcons();
 
     // A returning user has a persisted session: restore it (load the local key,
     // or silently reconnect the bunker) so they are signed straight back in.
