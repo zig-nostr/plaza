@@ -1045,8 +1045,14 @@ test "the view lays out through the canvas engine" {
     model.stage = .ready;
     const tree = try buildTree(arena_state.allocator(), &model);
 
-    var nodes: [64]canvas.WidgetLayoutNode = undefined;
-    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, 440, 680), &nodes);
+    // Sized from the runtime's own per-view ceiling, not a literal. A view past
+    // the cap is REFUSED, not truncated (error.WidgetNodeLimitReached from the
+    // runtime, error.WidgetLayoutListFull from the layout call), and a buffer
+    // that merely fits today would fail this smoke test on the next row of
+    // chrome instead of on a real bug. Arena-allocated: a thousand nodes is more
+    // than a test stack should carry.
+    const nodes = try arena_state.allocator().alloc(canvas.WidgetLayoutNode, native_sdk.runtime.max_canvas_widget_nodes_per_view);
+    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, 440, 680), nodes);
     try testing.expect(layout.nodes.len > 0);
 }
 

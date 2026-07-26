@@ -86,6 +86,9 @@ pub const palette = struct {
     // name sheets), and from the notifications sheet, which the redesign draws on
     // the window's own near-black.
     pub const surface_sheet = hex("#101012");
+    // The rail's home plate: a tile just above the window, so the mark reads as
+    // seated rather than floating.
+    pub const surface_rail_tile = hex("#1c1c22");
     // A menu or popover: the relay popover, the repost and overflow menus, the
     // mention picker. `surface_toast` happens to share the hex today; the
     // intents differ, so moving one must never drag the other.

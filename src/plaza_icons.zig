@@ -27,6 +27,9 @@ const zap_icon = svg_icon.parseComptime(@embedFile("icons/app-zap.svg"));
 const signet_icon = svg_icon.parseComptime(@embedFile("icons/app-signet.svg"));
 // The notifications bell.
 const bell_icon = svg_icon.parseComptime(@embedFile("icons/app-bell.svg"));
+// The empty seat's ring. The icon dialect has no stroke-dasharray and the canvas
+// has no dashed strokes at all, so the dashes are baked in as separate arcs.
+const dashed_ring_icon = svg_icon.parseComptime(@embedFile("icons/dashed-ring.svg"));
 // The crossroads mark: four filled blocks framing the central void. Single
 // color, tinted by the foreground token, resized never redrawn.
 const mark_icon = svg_icon.parseComptime(@embedFile("icons/mark.svg"));
@@ -37,5 +40,6 @@ pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "zap", .icon = &zap_icon },
     .{ .name = "signet", .icon = &signet_icon },
     .{ .name = "bell", .icon = &bell_icon },
+    .{ .name = "dashed-ring", .icon = &dashed_ring_icon },
     .{ .name = "mark", .icon = &mark_icon },
 };
