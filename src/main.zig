@@ -200,6 +200,43 @@ comptime {
 // consumer that actually crosses the pools (the blurhash placeholder, then the
 // profile banner), and the assertion below keeps the interim split honest.
 pub const image_registry_slots = native_sdk.max_registered_canvas_images;
+/// The redesign's note-row metrics. The avatar size is load-bearing: the
+/// identity block beside it is pinned to the same height, so the name and handle
+/// sit against the disc's top and bottom edges.
+pub const avatar_size: f32 = 36;
+pub const row_pad_top: f32 = 12;
+pub const row_pad_side: f32 = 16;
+pub const row_pad_bottom: f32 = 14;
+pub const avatar_to_text_gap: f32 = 12;
+/// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
+/// 14.5 body). Measured live, and the estimator's unit.
+pub const body_line_height: f32 = 18.125;
+/// The redesign's metadata register: 12px for handles, timestamps and counts.
+/// `.size = .sm` cannot say it (the size enum steps by exactly one from the 14.5
+/// body, giving 13.5), so these runs are scaled spans, which take an exact
+/// multiplier.
+pub const meta_size: f32 = 12;
+/// A thread reply row minus its body, in the same terms as the feed's. The thread
+/// keeps its own 14px inset and a single-line identity beside the disc until PR-5
+/// rebuilds those rows to the 11k spec, at which point these are re-measured the
+/// way the feed's were.
+const thread_row_pad: f32 = 14;
+const thread_reply_chrome: f32 = thread_row_pad + avatar_size + 5 + 5 + engagement_row_height + thread_row_pad + 1;
+const thread_skeleton_extent: f32 = 76;
+const meta_scale: f32 = meta_size / 14.5;
+/// The name: 14px, one step under the body, in the medium face. The mock asks for
+/// 600 and the bundled family steps 400 / 500 / 700, so medium is the nearer rung.
+const name_scale: f32 = 14.0 / 14.5;
+/// The engagement strip's measured height: the count's line box, which is taller
+/// than the 15px glyphs beside it. It was 28 while the verbs were `.list_item`s,
+/// a kind that carries an intrinsic 28px row-height floor; they are plain
+/// pressable rows now, so the strip measures what it draws.
+pub const engagement_row_height: f32 = 18.125;
+/// A feed row minus its body: the insets, the identity block pinned to the disc,
+/// the two vertical steps, the verbs, and the hairline. Every term is the
+/// redesign's own number, so the estimate cannot drift from the layout.
+pub const feed_row_chrome: f32 = row_pad_top + avatar_size + 5 + 10 + engagement_row_height + row_pad_bottom + 1;
+
 pub const max_avatar_images = 10;
 const max_media_images = 6;
 comptime {
@@ -1272,6 +1309,10 @@ const Profile = struct {
     used: bool = false,
     pubkey: [32]u8 = [_]u8{0} ** 32,
     name_buf: [64]u8 = [_]u8{0} ** 64,
+    /// kind:0 `name`: the username, kept even when `display_name` wins the line
+    /// above it, because it is what the handle line shows without a NIP-05.
+    username_buf: [64]u8 = [_]u8{0} ** 64,
+    username_len: u8 = 0,
     name_len: u8 = 0,
     // The kind:0 `nip05` identifier (`name@domain`), and where its verification
     // stands. The check draws only on `.verified`: a well-known lookup that maps
@@ -1302,6 +1343,9 @@ const Profile = struct {
 
     fn name(self: *const Profile) []const u8 {
         return self.name_buf[0..self.name_len];
+    }
+    pub fn username(self: *const Profile) []const u8 {
+        return self.username_buf[0..self.username_len];
     }
     fn nip05(self: *const Profile) []const u8 {
         return self.nip05_buf[0..self.nip05_len];
@@ -1715,6 +1759,17 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
         profile.name_len = @intCast(n);
         break;
     }
+    // The username is kept separately: it is the handle line under a display
+    // name, and collapsing the two fields into one left that line empty for every
+    // author without a NIP-05.
+    if (md.name) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) {
+            const n = utf8SafeLen(trimmed, profile.username_buf.len);
+            @memcpy(profile.username_buf[0..n], trimmed[0..n]);
+            profile.username_len = @intCast(n);
+        }
+    }
     if (md.picture) |pic| {
         const trimmed = std.mem.trim(u8, pic, " \t\r\n");
         if (trimmed.len <= profile.picture_buf.len and (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://"))) {
@@ -1866,6 +1921,40 @@ pub const Note = struct {
     /// (or `@domain` for the root `_@domain` form). Empty when they have no
     /// NIP-05 (a bare npub is not a handle, so nothing is shown rather than
     /// `@npub…`. Allocated in the caller's arena for the frame.
+    /// The handle shown under the name, and whether it is a NIP-05 identity.
+    ///
+    /// A NIP-05 is the real thing and reads in the identity violet: `@user`, or
+    /// `@domain` for the root `_@domain` form. Without one there is still a
+    /// second line, because the identity block is pinned to the disc's height and
+    /// an empty half looks like a loading bug: the kind:0 name stands in, and
+    /// failing that a short npub, both MUTED so the violet keeps meaning "this
+    /// name is attested somewhere".
+    pub fn handleLabel(self: *const Note, arena: std.mem.Allocator) struct { text: []const u8, nip05: bool } {
+        if (lookupProfile(self.pubkey)) |p| {
+            if (p.nip05_len > 0) {
+                const id = p.nip05();
+                if (std.mem.indexOfScalar(u8, id, '@')) |at| {
+                    const local = id[0..at];
+                    const domain = id[at + 1 ..];
+                    const shown = if (std.mem.eql(u8, local, "_")) domain else local;
+                    if (shown.len > 0) {
+                        return .{ .text = std.fmt.allocPrint(arena, "@{s}", .{shown}) catch "", .nip05 = true };
+                    }
+                }
+            }
+            // No NIP-05, so the kind:0 username stands in, muted: violet is
+            // reserved for an identity attested somewhere. It is skipped when it
+            // would only echo the name line above it (a profile whose display
+            // name IS its username), because the same string twice reads as a
+            // rendering bug rather than as a handle.
+            const user = p.username();
+            if (user.len > 0 and !std.mem.eql(u8, user, p.name())) {
+                return .{ .text = std.fmt.allocPrint(arena, "@{s}", .{user}) catch "", .nip05 = false };
+            }
+        }
+        return .{ .text = "", .nip05 = false };
+    }
+
     pub fn handle(self: *const Note, arena: std.mem.Allocator) []const u8 {
         const p = lookupProfile(self.pubkey) orelse return "";
         if (p.nip05_len == 0) return "";
@@ -4213,16 +4302,20 @@ fn feedOptions(model: *const Model) AppUi.VirtualListOptions {
 fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     const model: *const Model = @ptrCast(@alignCast(context orelse return 96));
     const i: usize = @intCast(index);
-    if (i >= model.notes_len) return 96;
-    return noteRowEstimate(&model.notes[i], 74);
+    if (i >= model.notes_len) return feed_row_chrome;
+    return noteRowEstimate(&model.notes[i], feed_row_chrome);
 }
 
 /// The shared card-height math behind the feed's and the thread's estimates.
-/// Re-derived for the redesign row (B1): `chrome` covers the paddings, the
-/// identity line, the body gaps, the engagement row, and the hairline; the body
-/// wraps in the ~540px text column beside the 40px avatar.
+/// `chrome` covers everything except the body's wrapped lines; the body wraps in
+/// the 540px text column beside the 36px disc.
+///
+/// The line height is MEASURED, not the redesign's ratio. The mock sets the body
+/// at 14.5/1.55 (22.475), but `widgetLineHeight` is `size * 1.25` with no token
+/// and no per-element override anywhere in the SDK, so a body line is 18.125 here
+/// and the feed reads tighter than the mock. Recorded as a wall in the plan.
 fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
-    const line_height: f32 = 22;
+    const line_height: f32 = body_line_height;
     const chars_per_line: f32 = 70;
     // A collapsed long note shows only the fold, plus a line for "Show more".
     const collapsed = noteIsLong(note) and !isExpanded(note.id);
@@ -4230,7 +4323,7 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
-    if (note.hasImage()) extent += pictureHeight(note) + 4;
+    if (note.hasImage()) extent += pictureHeight(note) + 8;
     return extent;
 }
 
@@ -4251,16 +4344,15 @@ const ThreadRows = struct {
 
 /// A cheap height estimate for one thread row, sharing the feed's note math.
 fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
-    const fallback: f32 = 96;
-    const rows: *const ThreadRows = @ptrCast(@alignCast(context orelse return fallback));
+    const rows: *const ThreadRows = @ptrCast(@alignCast(context orelse return thread_reply_chrome));
     const i: usize = @intCast(index);
-    // The root: the same card math with taller chrome (the name-over-handle
-    // stack and the slightly larger name).
-    if (i == 0) return noteRowEstimate(rows.root, 96);
+    // The root carries one extra line of chrome: its name and handle stack rather
+    // than sharing a line.
+    if (i == 0) return noteRowEstimate(rows.root, thread_reply_chrome + body_line_height);
     const ri = i - 1;
-    if (ri < rows.replies.len) return noteRowEstimate(&rows.replies[ri], 74);
+    if (ri < rows.replies.len) return noteRowEstimate(&rows.replies[ri], thread_reply_chrome);
     // A skeleton or the empty line: one fixed-shape row.
-    return 76;
+    return thread_skeleton_extent;
 }
 
 /// One thread level's panel: header, the windowed root-and-replies list, and
@@ -4413,7 +4505,7 @@ fn replySkeleton(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .width = thread_column_width }, .{
         ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
-            ui.el(.skeleton, .{ .width = 40, .height = 40 }, .{}),
+            ui.el(.skeleton, .{ .width = avatar_size, .height = avatar_size }, .{}),
             ui.column(.{ .gap = 8, .grow = 1, .padding = 3 }, .{
                 ui.el(.skeleton, .{ .width = 130, .height = 10 }, .{}),
                 ui.el(.skeleton, .{ .height = 10 }, .{}),
@@ -4424,19 +4516,22 @@ fn replySkeleton(ui: *AppUi) AppUi.Node {
     });
 }
 
-/// The @handle for an identity line: the resolved handle text, a thin skeleton
-/// while the author's profile is still loading (so the line does not visibly
-/// fill in a beat later), or nothing once it is known the author has no NIP-05.
-/// `fill` grows the element to hang the time to the far right (feed and reply
-/// rows); the root note puts the handle on its own line, so it does not.
+/// The @handle for a thread identity line: the same label and the same ink rule
+/// the feed's identity block uses (violet for a NIP-05, muted for a kind:0 name
+/// or a short npub), or a thin skeleton while the profile is still loading, so the
+/// line does not visibly fill in a beat later. `fill` grows the element to hang
+/// the time to the far right (reply rows); the root note puts the handle on its
+/// own line, so it does not.
 fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
     const p = theme.palette;
-    const h = note.handle(ui.arena);
+    const label = note.handleLabel(ui.arena);
+    const h = label.text;
+    const ink = if (label.nip05) p.accent_identity else p.text_faint;
     if (h.len > 0) {
         return if (fill)
-            ui.text(.{ .grow = 1, .style = .{ .foreground = p.accent_identity } }, h)
+            ui.text(.{ .grow = 1, .style = .{ .foreground = ink } }, h)
         else
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.accent_identity } }, h);
+            ui.text(.{ .size = .sm, .style = .{ .foreground = ink } }, h);
     }
     // Profile still being fetched: a placeholder rather than an empty gap. Once
     // it resolves (handle or none) or we give up, this stops showing.
@@ -4881,16 +4976,89 @@ fn avatarTint(pubkey: [32]u8) theme.palette.Tint {
     return theme.palette.avatar_tints[key % theme.palette.avatar_tints.len];
 }
 
-/// The 40px feed avatar: the fetched picture clipped to the circle when it has
-/// loaded, else the author's initials on their warm tint.
+/// A metadata run: the 12px register, in the ink the caller names.
+fn metaText(ui: *AppUi, text: []const u8, color: canvas.Color) AppUi.Node {
+    return ui.paragraph(.{ .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
+}
+
+/// Fixed empty space along ONE axis. `ui.spacer(n)` takes a GROW factor, not a
+/// size, so it cannot express an inset; these are the sized counterparts, used
+/// wherever the redesign asks for a step that a uniform `padding` or `gap` cannot
+/// state (a row inset of 12 top, 16 sides and 14 bottom; a column whose steps are
+/// 5, 8 and 10). One axis each, so a spacer in a row never claims height and one
+/// in a column never claims width.
+fn hgap(ui: *AppUi, size: f32) AppUi.Node {
+    return ui.el(.stack, .{ .width = size }, .{});
+}
+
+fn vgap(ui: *AppUi, size: f32) AppUi.Node {
+    return ui.el(.stack, .{ .height = size }, .{});
+}
+
+/// The author disc: 36px, the tint keyed off the pubkey, initials when no
+/// picture has been registered. The size is the redesign's, and it is what the
+/// identity block beside it is pinned to.
 fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
+    return avatarDisc(ui, note, avatar_size);
+}
+
+/// The same disc at an explicit size, for the surfaces that draw a smaller or
+/// larger one (a nested thread child, a quote pill, a profile header).
+fn avatarDisc(ui: *AppUi, note: *const Note, size: f32) AppUi.Node {
     const tint = avatarTint(note.pubkey);
     return ui.avatar(.{
         .image = note.avatar_id(),
-        .width = 40,
-        .height = 40,
+        .width = size,
+        .height = size,
         .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
     }, note.initials());
+}
+
+/// The identity block: the name over the handle, in a box pinned to the avatar's
+/// height so the two lines sit against the disc's top and bottom edges. The
+/// second line carries the verified check only when the author's NIP-05 actually
+/// resolves to their pubkey; without a handle at all the block is just the name,
+/// and the box still holds its height so a row never changes shape.
+///
+/// The redesign insets the two lines by 1px top and bottom. Padding is uniform
+/// on this engine, and a 1px horizontal inset would push the name off the body's
+/// left edge, so the box takes no padding: the name sits 1px higher and the
+/// handle 1px lower than the mock, and every text run stays on one rail.
+fn identityBlock(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    // `grow` so the block owns the width left over after the timestamp: the name
+    // is a single line (no `wrap`), so a long display name ellipsizes inside the
+    // block instead of pushing the time off the row. The mock leaves the block
+    // hugging its text with a flexible spacer beside it, which has the same effect
+    // for short names and loses the time for long ones.
+    return ui.column(.{ .height = avatar_size, .grow = 1, .main = .space_between }, .{
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_primary } },
+            &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
+        ),
+        handleLine(ui, note),
+    });
+}
+
+/// The identity block's second line: the verified check, then the handle. The
+/// check appears only when the author's NIP-05 resolved back to their pubkey, so
+/// a claimed identity never wears a mark it has not earned.
+fn handleLine(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    // Checked BEFORE the label: a profile in flight shows the bar, never a
+    // placeholder handle that swaps a beat later.
+    if (profileLoading(note.pubkey)) return ui.el(.skeleton, .{ .width = 72, .height = 9 }, .{});
+    const label = note.handleLabel(ui.arena);
+    if (label.text.len == 0) return ui.spacer(0);
+    const handle = metaText(ui, label.text, if (label.nip05) p.accent_identity else p.text_faint);
+    // The check and its 5px gap exist only when there IS a check. A row gap is
+    // charged for every flow child, so substituting a zero-width spacer for the
+    // glyph would still indent the handle 5px past the name's rail.
+    if (!note.verified()) return handle;
+    return ui.row(.{ .gap = 5, .cross = .center }, .{
+        ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle"),
+        handle,
+    });
 }
 
 /// The engagement row: reply, repost, like, zap, in that fixed order, each an
@@ -4899,26 +5067,32 @@ fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
 /// their tallies but stay non-actionable this pass.
 fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style_tokens = .{ .foreground = .text_muted } };
+    const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style = .{ .foreground = theme.palette.text_metric } };
     const c = engagementFor(note.id);
-    return ui.row(.{ .gap = 30, .cross = .center, .opacity = 0.75 }, .{
+    return ui.row(.{ .gap = 30, .cross = .center }, .{
         // Reply opens the note's thread, where the pinned composer answers it.
-        ui.el(.list_item, .{ .on_press = Msg{ .open_thread = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Reply" } }, .{
-            ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "reply"), countLabel(ui, c.replies, p.text_muted) }),
+        // A plain pressable row, never a `.list_item`: that kind carries a 28px
+        // intrinsic height floor and its padding walks the cluster off the rail
+        // the disc, name and body share.
+        ui.row(.{ .gap = 6, .cross = .center, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Reply" } }, .{
+            ui.appIcon(glyph, "reply"),
+            countLabel(ui, c.replies, p.text_metric),
         }),
-        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.icon(glyph, "repeat"), countLabel(ui, c.reposts, p.text_muted) }),
+        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.icon(glyph, "repeat"), countLabel(ui, c.reposts, p.text_metric) }),
         likeAction(ui, note),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "zap"), countLabel(ui, @intCast(c.zap_msat / 1000), p.text_muted) }),
+        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "zap"), countLabel(ui, @intCast(c.zap_msat / 1000), p.text_metric) }),
     });
 }
 
 /// A count beside an action icon, or nothing at zero (so the icon stands alone
 /// rather than showing a "0").
 fn countLabel(ui: *AppUi, n: u64, color: canvas.Color) AppUi.Node {
-    if (n == 0) return ui.spacer(0);
-    return ui.text(.{ .size = .sm, .style = .{ .foreground = color } }, formatCount(ui.arena, n));
+    // `ui.spacer(0)` would still be charged the row's 6px gap, leaving a hole
+    // where the count is not, so a zero count collapses the gap too.
+    if (n == 0) return ui.el(.stack, .{ .width = 0, .height = 0 }, .{});
+    return metaText(ui, formatCount(ui.arena, n), color);
 }
 
 /// The like control: a pressable heart and its count. Liked is never colour
@@ -4932,17 +5106,16 @@ fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
     const my_reaction: ?[32]u8 = if (likeEntry(note.id)) |e| e.reaction_id else null;
     const liked = my_reaction != null;
     const count = likeCountFor(note.id, my_reaction);
-    const tint = if (liked) theme.palette.status_like else theme.palette.text_muted;
-    return ui.el(.list_item, .{
-        .padding = 2,
+    const tint = if (liked) theme.palette.status_like else theme.palette.text_metric;
+    return ui.row(.{
+        .gap = 6,
+        .cross = .center,
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
     }, .{
-        ui.row(.{ .gap = 6, .cross = .center }, .{
-            ui.appIcon(.{ .width = 15, .height = 15, .style = .{ .foreground = tint } }, "like"),
-            countLabel(ui, count, tint),
-        }),
+        ui.appIcon(.{ .width = 15, .height = 15, .style = .{ .foreground = tint } }, "like"),
+        countLabel(ui, count, tint),
     });
 }
 
@@ -5136,31 +5309,40 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // row the fixed-width column still constrains the body, so it wraps,
             // and the inner controls (like, reply, links, the picture) keep their
             // own presses as the deeper hit targets.
-            ui.row(.{ .gap = 12, .cross = .start, .padding = 14, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
-                noteAvatar(ui, note),
-                ui.column(.{ .gap = 5, .grow = 1 }, .{
-                    // Identity line: name, a verified check when (and only when)
-                    // the author's NIP-05 resolves to their pubkey, the @handle,
-                    // then the relative time hung to the far right.
-                    ui.row(.{ .gap = 6, .cross = .center }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = theme.palette.text_primary } },
-                            &.{.{ .text = note.author(), .weight = .medium }},
-                        ),
-                        if (note.verified())
-                            ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = theme.palette.status_success } }, "check-circle")
-                        else
-                            ui.spacer(0),
-                        identityHandle(ui, note, true),
-                        ui.text(.{ .style = .{ .foreground = theme.palette.text_faint_alt } }, note.time()),
+            //
+            // Every inset is stated once, on the axis that owns it: this column
+            // carries the redesign's 12 above and 14 below, the row inside it
+            // carries 16 on each side and the 12 between disc and text, and the
+            // content column's own steps are 5, 8 and 10. A uniform `padding`
+            // cannot express any of that, and a `gap` on the row would also apply
+            // around each inset box, which is what threw the first attempt 12px
+            // off the reading rail.
+            ui.column(.{ .gap = 0, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
+                vgap(ui, row_pad_top),
+                ui.row(.{ .gap = 0, .cross = .start }, .{
+                    hgap(ui, row_pad_side),
+                    noteAvatar(ui, note),
+                    hgap(ui, avatar_to_text_gap),
+                    ui.column(.{ .gap = 0, .grow = 1 }, .{
+                        // The identity header: the name over the handle in a box
+                        // the avatar's height, with the time hung top-right.
+                        ui.row(.{ .gap = 6, .cross = .start }, .{
+                            identityBlock(ui, note),
+                            metaText(ui, note.time(), theme.palette.text_faint_alt),
+                        }),
+                        vgap(ui, 5),
+                        noteBody(ui, note, true),
+                        // The picture. The space is reserved at the picture's own
+                        // shape whether or not it has loaded, so the feed never
+                        // shifts as images arrive.
+                        if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
+                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        vgap(ui, 10),
+                        engagementRow(ui, note),
                     }),
-                    noteBody(ui, note, true),
-                    // The picture. The space is reserved at the picture's own
-                    // shape whether or not it has loaded, so the feed never
-                    // shifts as images arrive.
-                    if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                    engagementRow(ui, note),
+                    hgap(ui, row_pad_side),
                 }),
+                vgap(ui, row_pad_bottom),
             }),
             // The only separation between rows: a hairline. The `.separator`
             // element paints a real line (an empty column with a background does

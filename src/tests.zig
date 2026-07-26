@@ -1668,3 +1668,24 @@ test "the identity violet is what the info token actually resolves to" {
     const v = theme.palette.accent_identity;
     try testing.expect(v.b > v.r and v.r > v.g);
 }
+
+test "a feed row's estimated height is the sum of its measured parts" {
+    // The virtual list prices unbuilt rows from this estimate, so it has to agree
+    // with what the engine lays out. The literals are MEASURED from the running
+    // app through the automation harness; the constants are the redesign's own
+    // terms. Changing a term without re-measuring fails here, which is the drift
+    // this pins. (It cannot catch the engine itself changing a metric: that shows
+    // up as a live measurement mismatch, not a test failure.)
+    const one_line = main.feed_row_chrome + main.body_line_height;
+    try testing.expectApproxEqAbs(@as(f32, 114.25), one_line, 0.001);
+    // The chrome is 12 above, the 36px identity block, 5 to the body, 10 to the
+    // verbs, the verb strip, 14 below, and the hairline.
+    try testing.expectApproxEqAbs(@as(f32, 96.125), main.feed_row_chrome, 0.001);
+    // The verb strip is the count's line box. It was 28 while the verbs were
+    // list_items, a kind with an intrinsic row-height floor that pushed every row
+    // 10px past the mock.
+    try testing.expectApproxEqAbs(@as(f32, 18.125), main.engagement_row_height, 0.001);
+    // The metadata register is exactly 12px. `.size = .sm` would be 13.5, since
+    // the size enum steps by one from the 14.5 body.
+    try testing.expectApproxEqAbs(@as(f32, 12), main.meta_size, 0.001);
+}

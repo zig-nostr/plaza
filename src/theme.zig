@@ -171,6 +171,12 @@ pub const palette = struct {
     pub const text_dim_on_light = hex("#55555e");
     pub const text_offline = hex("#c9b285");
 
+    // The idle engagement metric. The redesign dims the verb cluster with an
+    // opacity layer over #8f8f99, but an opacity layer also fades the states that
+    // must stay saturated (a liked heart, a zapped bolt), so the dimming is baked
+    // into the ink instead: this is #8f8f99 at 75%% over the window.
+    pub const text_metric = hex("#6e6e76");
+
     // Status.
     pub const status_success = hex("#45c168");
     pub const status_like = hex("#e57373");
