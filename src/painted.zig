@@ -70,6 +70,36 @@ pub const Painted = struct {
         return .{ .commands = commands[0..builder.len], .layout = layout };
     }
 
+    /// The same, for ONE piece of the view rather than the whole window: the
+    /// caller builds a node and it is laid out in a `w` by `h` box. For a row
+    /// whose correctness is about how it fills the space it is given (a rail that
+    /// grows to the row's height, say), which is awkward to reach through a whole
+    /// app view because it needs a live store behind it.
+    pub fn renderPiece(
+        arena: std.mem.Allocator,
+        model: *const main.Model,
+        build: *const fn (*main.AppUi) main.AppUi.Node,
+        w: f32,
+        h: f32,
+    ) !Painted {
+        main.registerIcons();
+
+        var ui = main.AppUi.init(arena);
+        const node = build(&ui);
+        if (ui.failed) return error.ViewBuild;
+        const tree = try ui.finalize(node);
+        const tokens = theme.tokens(main.Model)(model);
+
+        const nodes = try arena.alloc(canvas.WidgetLayoutNode, native_sdk.runtime.max_canvas_widget_nodes_per_view);
+        const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, geometry.RectF.init(0, 0, w, h), tokens, nodes);
+
+        const commands = try arena.alloc(canvas.CanvasCommand, native_sdk.runtime.max_canvas_commands_per_view);
+        var builder = canvas.Builder.init(commands);
+        try canvas.emitWidgetLayout(&builder, layout, tokens);
+
+        return .{ .commands = commands[0..builder.len], .layout = layout };
+    }
+
     /// The colour covering (`x`, `y`), or null where nothing paints. The LAST
     /// covering fill wins, which is how the painter's algorithm resolves overlap
     /// on screen, so this is the same answer sampling that pixel would give.
