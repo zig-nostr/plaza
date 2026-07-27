@@ -7404,8 +7404,25 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
     const text = q.text_buf[0..q.text_len];
     @memcpy(note.content_buf[0..text.len], text);
     note.content_len = @intCast(text.len);
+    // The quoted note's OWN reference is drawn as the pill below, so it comes
+    // out of the body: left in, it is a hundred characters of bech32 that no
+    // line break can split, which runs straight out of the reading column.
+    findQuoteRef(note);
+    if (note.quote.kind == .event) {
+        const cut_start = @as(usize, note.quote.off);
+        const cut_end = cut_start + @as(usize, note.quote.len);
+        if (cut_end <= note.content_len) {
+            const tail = note.content_buf[cut_end..note.content_len];
+            std.mem.copyForwards(u8, note.content_buf[cut_start..], tail);
+            note.content_len = @intCast(cut_start + tail.len);
+            const trimmed = std.mem.trimEnd(u8, note.content_buf[0..note.content_len], " \n\r\t");
+            note.content_len = @intCast(trimmed.len);
+        }
+    }
 
-    return quoteAside(ui, id, ui.column(.{ .gap = 4 }, .{
+    // `grow` so the quote fills the column beside the rule: hugging its content,
+    // the body wrapped at about half the width the shot gives it.
+    return quoteAside(ui, id, ui.column(.{ .grow = 1, .gap = 4 }, .{
         ui.row(.{ .gap = 10, .cross = .start }, .{
             avatarDisc(ui, note, avatar_size),
             identityBlock(ui, note),
@@ -7413,11 +7430,22 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         }),
         // Four lines of the quoted note, and no more: a quote is an aside, and
         // its height has to be known where the outer row is priced.
-        textParaAt(ui, clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines), nested_body_scale, p.text_secondary_alt),
+        quoteBody(ui, note),
         // A quote of a quote stops here. One more body would be a third voice in
         // a row, so the second hop is a pill that says where it goes.
         if (q.has_quote_of) quotingPill(ui, q.quote_of) else ui.spacer(0),
     }));
+}
+
+/// The quoted note's own words, four lines of them. Labelled, because the one
+/// thing worth asserting about it is how WIDE it is: hugging its content instead
+/// of filling the column beside the rule, it wrapped at about half the width the
+/// shot gives it and read as a column of its own rather than an aside.
+fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
+    const spans = clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines);
+    var node = textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
+    node.widget.semantics.label = "Quoted note body";
+    return node;
 }
 
 /// 11g's pill: where the quoted note's own quote goes, one hop, as a line rather
@@ -7461,6 +7489,33 @@ fn quotingPill(ui: *AppUi, id: [32]u8) AppUi.Node {
     });
 }
 
+/// `text` with its line breaks folded into spaces, for a control that is one
+/// line by construction. A widget that measures single-line still PAINTS the
+/// newlines its text carries, so an unfolded label draws its second line over
+/// whatever is under the row.
+fn oneLine(ui: *AppUi, text: []const u8) []const u8 {
+    if (std.mem.indexOfAny(u8, text, "\r\n") == null) return text;
+    const out = ui.arena.alloc(u8, text.len) catch return text;
+    var n: usize = 0;
+    var last_space = false;
+    for (text) |c| {
+        const space = c == '\n' or c == '\r' or c == ' ' or c == '\t';
+        if (space) {
+            if (last_space or n == 0) continue;
+            out[n] = ' ';
+        } else {
+            out[n] = c;
+        }
+        last_space = space;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+pub fn oneLineForTest(ui: *AppUi, text: []const u8) []const u8 {
+    return oneLine(ui, text);
+}
+
 /// Whose note the pill walks to, once that note is resolved; a zero key until
 /// then, which tints the disc neutrally rather than guessing.
 fn quotingPillAuthor(id: [32]u8) [32]u8 {
@@ -7478,7 +7533,7 @@ fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
         // Whose note, and the start of what it says: the shot's own pill reads
         // "Quoting @edith · Shipping it: the feed renders…", so the reader can
         // tell whether the hop is worth taking before taking it.
-        .loaded => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), e.text_buf[0..e.text_len] }),
+        .loaded => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), oneLine(ui, e.text_buf[0..e.text_len]) }),
         .missing => "Quotes a note no relay has",
         else => "Quoting a note",
     };

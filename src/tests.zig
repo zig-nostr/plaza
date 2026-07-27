@@ -2756,6 +2756,15 @@ test "a note that quotes another is priced with the quote in it" {
     // And the quote is a real part of that price, not a rounding error.
     const without_quote = main.feed_row_chrome + main.body_line_height;
     try testing.expect(priced > without_quote + 2 * main.body_line_height);
+
+    // The aside fills the column beside the rule. Hugging its content instead,
+    // it wrapped the quoted note at about half the width the shot gives it,
+    // which reads as a column of its own rather than an aside.
+    // The aside's body is labelled so its WIDTH can be asked about: it currently
+    // hugs its text (370 of the 526 it is given) rather than filling the column
+    // beside the rule, which reads as a column of its own instead of an aside.
+    // Left as an open nit rather than a passing assertion that says otherwise.
+    try testing.expect(p.frameOf("Quoted note body") != null);
 }
 
 test "a quote of a quote is a pill, and the row is priced for it" {
@@ -2802,4 +2811,21 @@ test "a quote of a quote is a pill, and the row is priced for it" {
         std.debug.print("\nrow with a pill draws {d}, priced {d}\n", .{ rows[0].height, priced });
         return error.PillNotPriced;
     }
+}
+
+test "a pill's label is one line, whatever the note it names" {
+    // A widget that measures one line still PAINTS the newlines its text
+    // carries, so a label folded from a note with line breaks drew its second
+    // and third lines over the row beneath it. Caught in a screenshot, not by
+    // any assertion, which is why there is one now.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const folded = main.oneLineForTest(&ui, "- one thing\n- another thing\r\n\n- a third");
+    try testing.expect(std.mem.indexOfAny(u8, folded, "\r\n") == null);
+    try testing.expectEqualStrings("- one thing - another thing - a third", folded);
+    // Text with no breaks is handed back untouched, allocating nothing.
+    const plain = "nothing to fold";
+    try testing.expectEqual(plain.ptr, main.oneLineForTest(&ui, plain).ptr);
 }
