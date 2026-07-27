@@ -2714,3 +2714,46 @@ test "a row's own frame holds everything it draws" {
     // And the row below starts after this one ends, rather than under its tail.
     try testing.expect(rows[1].y >= rows[0].y + rows[0].height - 0.5);
 }
+
+test "a note that quotes another is priced with the quote in it" {
+    // The bordered card this replaces was never priced at all, so a feed of
+    // quoting notes reported less than it drew and the scrollbar lied. The
+    // four-line clamp is what makes the height knowable, which is the reason the
+    // design gives for clamping.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const quoted_id = [_]u8{0x5e} ** 32;
+    main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "A quoted note, two lines of it, which is what the aside beside the rule draws before the clamp cuts the rest of it away.");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    // Within a line and a half. Every estimate here counts CHARACTERS against a
+    // column width where the engine measures glyphs and breaks at words, so a
+    // line either way is the standing slack, and it costs a little scroll jitter
+    // on rows not yet built, never an overlap (a built row is positioned by what
+    // it measures). What the estimate may not be is short by the whole quote,
+    // which is what it was: a bordered card priced at nothing.
+    const slack = 1.5 * main.body_line_height;
+    if (@abs(rows[0].height - priced) > slack) {
+        const qf = p.frameOf("Quoted note") orelse rows[0];
+        std.debug.print("\nquoting row draws {d}, priced {d}; quote block {d}\n", .{ rows[0].height, priced, qf.height });
+        return error.QuoteNotPriced;
+    }
+    // And the quote is a real part of that price, not a rounding error.
+    const without_quote = main.feed_row_chrome + main.body_line_height;
+    try testing.expect(priced > without_quote + 2 * main.body_line_height);
+}

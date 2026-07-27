@@ -261,6 +261,12 @@ const ancestor_identity_gap: f32 = 4;
 /// before they are laid out. The column is the estimator's own 70 characters per
 /// line at the 14.5 body, held to the 13.5 register.
 const ancestor_body_lines: usize = 2;
+/// A quote is an aside, so it shows four lines of the note it quotes and stops
+/// (11f). Its height is then known where the row around it is priced.
+const quote_body_lines: usize = 4;
+/// What a quote still resolving reserves, so the row keeps its height when the
+/// note lands.
+const quote_skeleton_height: f32 = 34;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
 /// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
 /// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
@@ -1447,7 +1453,10 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
 const quote_cache_cap = 64;
 const max_quote_attempts = 3;
 const quote_fetch_batch = 16;
-const quote_text_cap = 192;
+/// Enough of a quoted note to fill the four lines 11f gives it (about 75
+/// characters a line at the quote's register), so the clamp decides where the
+/// text ends rather than the cache. 64 entries, so the whole table is ~20 KiB.
+const quote_text_cap = 320;
 const QuoteEntry = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
@@ -1457,7 +1466,7 @@ const QuoteEntry = struct {
     pubkey: [32]u8 = [_]u8{0} ** 32,
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
-    text_len: u8 = 0,
+    text_len: u16 = 0,
     last_used: u64 = 0,
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
@@ -4860,7 +4869,49 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
     if (note.hasImage()) extent += pictureHeight(note) + 8;
+    // The quote, which is only now a knowable height: the clamp is what makes it
+    // one (the shot's own note beside 11f says quote rows clamp "so their height
+    // is known at insert"). The bordered card it replaces was never priced at
+    // all, so a feed of quoting notes reported less than it drew.
+    // The card sits at its own byte span in the body, so a collapsed note shows
+    // it only when the fold reaches past it, exactly as `noteBodyAt` decides.
+    const quote_end = @as(usize, note.quote.off) + @as(usize, note.quote.len);
+    const quote_shown = note.quote.kind == .event and
+        (!collapsed or quote_end <= collapsedLen(note.content(), note_collapse_chars));
+    if (quote_shown) {
+        extent += quoteAsideExtent(note.quote.id);
+    }
     return extent;
+}
+
+/// How tall a quote's aside draws: its margin, the identity block (the disc sets
+/// it), and up to `quote_body_lines` lines of the quoted note. A quote still
+/// resolving is priced at the skeleton it shows, so the row does not jump when
+/// it lands.
+fn quoteAsideExtent(id: [32]u8) f32 {
+    const chrome: f32 = 5 + 2 + avatar_size + 4 + 2;
+    const e = quoteFor(id) orelse return chrome + quote_skeleton_height;
+    return switch (e.state) {
+        .idle, .fetching => chrome + quote_skeleton_height,
+        .missing => chrome + body_line_height,
+        .loaded => chrome + quoteBodyLines(e) * body_line_height,
+    };
+}
+
+/// The lines a cached quote's body draws, counted the way the clamp cuts them.
+fn quoteBodyLines(e: *const QuoteEntry) f32 {
+    var lines: usize = 1;
+    var column: usize = 0;
+    for (e.text_buf[0..e.text_len]) |c| {
+        if ((c & 0xc0) == 0x80) continue;
+        if (c == '\n' or column >= ancestor_chars_per_line - 1) {
+            lines += 1;
+            column = 0;
+            if (lines >= quote_body_lines) break;
+        }
+        if (c != '\n') column += 1;
+    }
+    return @floatFromInt(@min(lines, quote_body_lines));
 }
 
 /// One thread level's row plan: row 0 is the root note, rows 1..n the replies
@@ -7263,7 +7314,7 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
             kids[n] = textParaAt(ui, contentSpans(ui, head), scale, ink);
             n += 1;
         }
-        kids[n] = quoteCard(ui, q.id);
+        kids[n] = quoteRule(ui, q.id);
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
         if (tail.len > 0) {
@@ -7290,40 +7341,114 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
 /// unavailable states are non-pressable and hold the same height, so the feed
 /// never reflows as the quote resolves. The author is drawn as initials-on-tint
 /// (`image = 0`), so a quote card never competes for the scarce avatar ids.
-fn quoteCard(ui: *AppUi, id: [32]u8) AppUi.Node {
+fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
     const p = theme.palette;
-    const card_style: canvas.WidgetStyle = .{ .background = p.surface_inset, .border = p.divider_reply, .radius = 10, .stroke_width = 1 };
     const e = quoteFor(id);
     if (e == null or e.?.state == .idle or e.?.state == .fetching) {
         // A reused feed note (never re-parsed) whose quote slot was reclaimed by
         // a newer quote lands here with no cache entry; re-queue it so the next
         // tick resolves it again instead of showing a skeleton forever.
         if (e == null) wantQuote(id);
-        return ui.el(.card, .{ .style = card_style }, .{
-            ui.column(.{ .padding = 10 }, .{ui.el(.skeleton, .{ .height = 34 }, .{})}),
-        });
+        return quoteAside(ui, null, ui.el(.skeleton, .{ .height = 34 }, .{}));
     }
     const q = e.?;
     if (q.state == .missing) {
-        return ui.el(.card, .{ .style = card_style }, .{
-            ui.column(.{ .padding = 12 }, .{ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Quoted note unavailable")}),
-        });
+        return quoteAside(ui, null, ui.paragraph(
+            .{ .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = "Quoted note unavailable", .scale = nested_body_scale }},
+        ));
     }
-    const tint = avatarTint(q.pubkey);
+
+    // A synthetic note, so the quote wears the SAME identity recipe as every
+    // other row instead of a second one built from the cache's parts. Writing a
+    // parallel builder is what cost the focal note its quote card once already.
+    const note = ui.arena.create(Note) catch return ui.spacer(0);
+    note.* = .{ .pubkey = q.pubkey, .created_at = q.created_at };
     const hexdigits = "0123456789abcdef";
-    var pressable = card_style;
-    pressable.quiet_hover = true;
-    return ui.el(.card, .{ .on_press = Msg{ .open_event = id }, .style = pressable, .semantics = .{ .role = .button, .label = "Quoted note" } }, .{
-        ui.column(.{ .gap = 6, .padding = 12 }, .{
-            ui.row(.{ .gap = 6, .cross = .center }, .{
-                ui.avatar(.{ .image = 0, .width = 18, .height = 18, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, ui.fmt("{c}{c}", .{ hexdigits[q.pubkey[0] >> 4], hexdigits[q.pubkey[0] & 0x0f] })),
-                ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = quoteAuthorName(ui, q.pubkey), .weight = .medium }}),
-                ui.spacer(1),
-                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, quoteTime(ui, q.created_at)),
-            }),
-            textPara(ui, contentSpans(ui, q.text_buf[0..q.text_len])),
+    note.initials_buf = .{ hexdigits[q.pubkey[0] >> 4], hexdigits[q.pubkey[0] & 0x0f] };
+    setAuthor(note, q.pubkey);
+    note.setTime(nowSeconds());
+    const text = q.text_buf[0..q.text_len];
+    @memcpy(note.content_buf[0..text.len], text);
+    note.content_len = @intCast(text.len);
+
+    return quoteAside(ui, id, ui.column(.{ .gap = 4 }, .{
+        ui.row(.{ .gap = 10, .cross = .start }, .{
+            avatarDisc(ui, note, avatar_size),
+            identityBlock(ui, note),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = meta_scale }}),
+        }),
+        // Four lines of the quoted note, and no more: a quote is an aside, and
+        // its height has to be known where the outer row is priced.
+        textParaAt(ui, clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines), nested_body_scale, p.text_secondary_alt),
+    }));
+}
+
+/// The rule down the left of a quote, and whatever sits beside it. The redesign
+/// replaces the bordered card with this: a card inside a row reads as a second
+/// surface competing with the note, where the rule reads as an aside, which is
+/// what a quote is.
+///
+/// `id` non-null makes the block open that note. The rule brightening on hover
+/// (11f) is not expressible: hover is a background wash on one widget, and a
+/// wash here would be a state the design does not draw.
+fn quoteAside(ui: *AppUi, id: ?[32]u8, body: AppUi.Node) AppUi.Node {
+    const p = theme.palette;
+    const inner = ui.row(.{ .gap = 0 }, .{
+        // The rule, filling the block's height: the same construct as a thread's
+        // rail, and the same trap, it draws nothing unless the row stretches it.
+        ui.separator(.{ .width = 2, .grow = 1, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
+        hgap(ui, 12),
+        ui.column(.{ .grow = 1, .gap = 0 }, .{
+            vgap(ui, 2),
+            body,
+            vgap(ui, 2),
         }),
     });
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 5),
+        if (id) |event_id|
+            // A plain row: it paints nothing, which is right, because 11f gives a
+            // quote no hover state (its rule brightening is not expressible) and
+            // a wash here would invent one. It also MEASURES, which `list_item`
+            // does not: the width-aware measurer has no case for that kind, so a
+            // wrapping quote body would measure one line tall and draw over the
+            // verbs under it.
+            ui.row(.{
+                .grow = 1,
+                // By EVENT id, read straight from the store: a quoted note is in
+                // neither the feed nor the open thread's replies.
+                .on_press = Msg{ .open_event = event_id },
+                .semantics = .{ .role = .button, .label = "Quoted note" },
+            }, .{inner})
+        else
+            inner,
+    });
+}
+
+/// Seeds a resolved quote, so a test can render the aside and price it without a
+/// relay. Returns the id it was filed under.
+pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []const u8) void {
+    wantQuote(id);
+    const e = quoteFor(id) orelse return;
+    e.pubkey = pubkey;
+    e.created_at = created_at;
+    const keep = @min(text.len, e.text_buf.len);
+    @memcpy(e.text_buf[0..keep], text[0..keep]);
+    e.text_len = @intCast(keep);
+    e.state = .loaded;
+}
+
+pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
+    return quoteFor(id);
+}
+
+pub fn quoteBodyLinesForTest(e: *const QuoteEntry) f32 {
+    return quoteBodyLines(e);
+}
+
+pub fn noteRowEstimateForTest(note: *const Note, chrome: f32) f32 {
+    return noteRowEstimate(note, chrome);
 }
 
 /// The quoted author's display name (from the profile cache) or a short npub.
