@@ -1914,3 +1914,36 @@ test "only one chrome menu is open at a time" {
     main.update(&model, Msg{ .toggle_menu = .account }, &fx);
     try testing.expectEqual(main.ChromeMenu.none, model.menu);
 }
+
+test "the relay chip goes green at four fifths, the way the design's bar does" {
+    // The redesign's at-rest bar reads "4/5 relays" in green while its working
+    // bar reads "3/5" in amber, so the healthy line sits at four fifths, not at
+    // every relay. A bar that goes amber for one straggler is a bar nobody reads.
+    try testing.expect(main.poolIsHealthyForTest(5));
+    try testing.expect(main.poolIsHealthyForTest(4));
+    try testing.expect(!main.poolIsHealthyForTest(3));
+    try testing.expect(!main.poolIsHealthyForTest(0));
+}
+
+test "a latency reading survives only as long as its connection" {
+    main.clearRelayRttForTest(0);
+    try testing.expectEqual(@as(?u16, null), main.relayRttMs(0));
+
+    // Sub-millisecond answers are readings, not holes: a warm relay that replies
+    // in under a millisecond truncates to zero, which must not read as "never
+    // answered".
+    main.recordRelayRttForTest(0, 0);
+    try testing.expectEqual(@as(?u16, 0), main.relayRttMs(0));
+
+    // An even number of samples takes the middle of the two middles, so a reading
+    // is not silently the slower one.
+    main.clearRelayRttForTest(0);
+    main.recordRelayRttForTest(0, 10);
+    main.recordRelayRttForTest(0, 20);
+    try testing.expectEqual(@as(?u16, 15), main.relayRttMs(0));
+
+    // And a relay that drops forgets: the bar must never show a number measured
+    // on a connection that no longer exists.
+    main.clearRelayRttForTest(0);
+    try testing.expectEqual(@as(?u16, null), main.relayRttMs(0));
+}

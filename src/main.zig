@@ -338,15 +338,36 @@ pub fn relaysPaused() bool {
 /// small ring so the bar can show a median rather than the last spike. Zero means
 /// no sample yet.
 const rtt_samples = 8;
+/// The latency probe: a one-event query whose round trip is the number the status
+/// bar shows, and how often each relay is asked for it.
+const probe_sub = "plaza-ping";
+const probe_interval_ms: i64 = 20_000;
 var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** relays.len;
 var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** relays.len;
 
-/// Records one round trip for relay `index`.
+/// Records one round trip for relay `index`. Stored as milliseconds PLUS ONE, so
+/// a sub-millisecond answer (a warm or local relay, truncated to 0) is a reading
+/// rather than an empty slot.
+pub fn recordRelayRttForTest(index: usize, ms: u64) void {
+    recordRelayRtt(index, ms);
+}
+
+pub fn clearRelayRttForTest(index: usize) void {
+    clearRelayRtt(index);
+}
+
 fn recordRelayRtt(index: usize, ms: u64) void {
     if (index >= relays.len) return;
     const slot = g_relay_rtt_at[index].load(.monotonic) % rtt_samples;
-    g_relay_rtt[index][slot].store(@intCast(@min(ms, std.math.maxInt(u16))), .monotonic);
+    g_relay_rtt[index][slot].store(@intCast(@min(ms, std.math.maxInt(u16) - 1) + 1), .monotonic);
     g_relay_rtt_at[index].store(slot +% 1, .monotonic);
+}
+
+/// Forgets relay `index`'s samples. Called when it drops, so the bar never shows
+/// a number measured on a connection that no longer exists.
+fn clearRelayRtt(index: usize) void {
+    if (index >= relays.len) return;
+    for (&g_relay_rtt[index]) |*sample| sample.store(0, .monotonic);
 }
 
 /// Relay `index`'s median round trip, or null when it has never answered.
@@ -357,13 +378,21 @@ pub fn relayRttMs(index: usize) ?u16 {
     for (&g_relay_rtt[index]) |*sample| {
         const v = sample.load(.monotonic);
         if (v != 0) {
-            seen[n] = v;
+            seen[n] = v - 1;
             n += 1;
         }
     }
     if (n == 0) return null;
     std.mem.sort(u16, seen[0..n], {}, std.sort.asc(u16));
-    return seen[n / 2];
+    return median(seen[0..n]);
+}
+
+/// The middle of a sorted run, averaging the two middles for an even count so a
+/// four-sample reading is not silently the third-fastest.
+fn median(sorted: []const u16) u16 {
+    const mid = sorted.len / 2;
+    if (sorted.len % 2 == 1) return sorted[mid];
+    return @intCast((@as(u32, sorted[mid - 1]) + @as(u32, sorted[mid])) / 2);
 }
 
 /// The pool's latency: the median across every relay that has answered. The
@@ -374,6 +403,10 @@ pub fn poolLatencyMs() ?u16 {
     var seen: [relays.len]u16 = undefined;
     var n: usize = 0;
     for (0..relays.len) |i| {
+        // Connected relays only: a number measured before a relay dropped says
+        // nothing about how fast the pool answers now.
+        const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
+        if (state != .connected) continue;
         if (relayRttMs(i)) |ms| {
             seen[n] = ms;
             n += 1;
@@ -381,7 +414,7 @@ pub fn poolLatencyMs() ?u16 {
     }
     if (n == 0) return null;
     std.mem.sort(u16, seen[0..n], {}, std.sort.asc(u16));
-    return seen[n / 2];
+    return median(seen[0..n]);
 }
 // The UI thread's Io, for wall-clock time when rendering relative timestamps
 // (set once in `main`, read only on the UI thread).
@@ -451,6 +484,11 @@ var g_helper_token_path_len: usize = 0;
 // 0 starting, 1 uninitialized (reachable, no key yet), 2 ready (holds a key),
 // 3 unreachable. Reachable at all (1 or 2) is what proves the loopback IPC.
 var g_helper_state = std.atomic.Value(u8).init(0);
+/// When the signed-in health check last ran, and how often it may run. The
+/// signed-out poll is every tick (it is waiting for a key to appear); this is the
+/// quieter beat that keeps the status bar honest afterwards.
+var g_helper_polled_at: i64 = 0;
+const helper_health_interval_s: i64 = 5;
 
 fn helperBin() []const u8 {
     return g_helper_bin_buf[0..g_helper_bin_len];
@@ -579,10 +617,18 @@ fn spawnHelper(fx: *Effects) void {
 /// unreachable and the tick tries again.
 fn pollHelper(fx: *Effects) void {
     if (g_helper_token_len == 0) return;
-    // Poll while signed out: this both proves the IPC at startup and detects a
-    // key appearing later (a terminal or window import), so Plaza adopts it
-    // live. Once signed in there is nothing to watch for.
-    if (activePubkey() != null) return;
+    // Signed OUT, this proves the IPC at startup and catches a key appearing
+    // later (a terminal or window import), so Plaza adopts it live: poll every
+    // tick. Signed IN, the status bar now reports whether Signet can actually
+    // sign, and a stale flag there would be a chip that lies, so keep polling,
+    // slowly. Only for a Signet identity: a local key or a bunker has nothing on
+    // the other end of this socket.
+    if (activePubkey() != null) {
+        if (g_signer_kind != .helper) return;
+        const now = nowSeconds();
+        if (now - g_helper_polled_at < helper_health_interval_s) return;
+        g_helper_polled_at = now;
+    }
     var url_buf: [48]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
@@ -4013,6 +4059,9 @@ pub const Msg = union(enum) {
     toggle_relays_paused,
     /// Jump the feed to its newest note.
     jump_to_newest,
+    /// Sign out, asked for from the account menu: opens Settings with the
+    /// confirmation showing, so the menu never signs anyone out on one press.
+    open_settings_logout,
     /// A text edit in the name beat's field.
     name_edit: canvas.TextInputEvent,
     /// Publish the chosen name as the account's kind:0 and move on.
@@ -5115,7 +5164,7 @@ fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
             statusChip(ui, .{
                 .press = .jump_to_newest,
                 .label = model.caught_up(ui.arena),
-                .semantics = "Jump to newest",
+                .semantics = "Refresh the feed",
             }),
             ui.spacer(1),
             relayZone(ui, model),
@@ -5232,8 +5281,11 @@ fn relayPopover(ui: *AppUi, model: *const Model) AppUi.Node {
 fn relayRow(ui: *AppUi, url: []const u8, index: usize, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const state: Conn = @enumFromInt(g_relay_status[index].load(.monotonic));
-    const paused = model.relays_paused;
-    const connected = state == .connected and !paused;
+    // A relay leaves at its next message, so during a pause some rows are still
+    // genuinely connected. Each row reports ITSELF: claiming the whole list is
+    // paused while notes are still arriving on it is the dishonesty this is for.
+    const connected = state == .connected;
+    const paused = model.relays_paused and !connected;
     const dot = if (paused)
         p.text_faint_alt
     else if (connected)
@@ -5333,7 +5385,7 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     });
     rows[1] = menuSeparator(ui);
     rows[2] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
-    rows[3] = menuRow(ui, "Sign out", null, null, .logout_request);
+    rows[3] = menuRow(ui, "Sign out", null, null, .open_settings_logout);
     return menuSurface(ui, 240, rows);
 }
 
@@ -5344,21 +5396,28 @@ fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const paused = model.relays_paused;
     const live = model.live_relays;
+    // A paused pool that still has a socket open is PAUSING, not paused: a relay
+    // leaves at its next message, and the bar refuses to claim otherwise.
+    const settling = paused and live > 0;
     const dot = if (paused)
         p.text_faint_alt
     else if (live == 0)
         p.status_offline
-    else if (live < relays.len)
+    else if (!poolIsHealthy(live))
         p.status_warning
     else
         p.status_success;
-    const label = if (paused)
+    const label = if (settling)
+        ui.fmt("pausing · {d}/{d} relays", .{ live, relays.len })
+    else if (paused)
         ui.fmt("paused · 0/{d} relays", .{relays.len})
     else if (poolLatencyMs()) |ms|
         ui.fmt("{d}/{d} relays · {d} ms", .{ live, relays.len, ms })
     else
         ui.fmt("{d}/{d} relays", .{ live, relays.len });
-    const healthy = !paused and live == relays.len;
+    // The chip carries its plate when the pool is healthy AND when it is paused:
+    // a deliberate pause is a state worth reading at a glance, not a fault.
+    const plated = paused or poolIsHealthy(live);
     // The trigger and its floating surface are siblings in a stack: that is the
     // sanctioned shape, and the anchored surface takes no space in the row.
     return ui.stack(.{}, .{
@@ -5368,8 +5427,8 @@ fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
             .semantics = "Relays",
             .dot = dot,
             .chevron = true,
-            .highlighted = healthy,
-            .ink = if (healthy) p.text_secondary else p.text_muted,
+            .highlighted = plated,
+            .ink = if (plated) p.text_secondary else p.text_muted,
         }),
         if (model.menu == .relays) relayPopover(ui, model) else ui.spacer(0),
     });
@@ -5379,16 +5438,57 @@ fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
 fn signerZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const guest = model.is_guest();
+    // Name the signer that is actually in use, and say whether it can sign right
+    // now. Claiming "Signet ready" for a local key or an unreachable bunker would
+    // be a chip that lies about where the reader's key lives.
+    const signer = signerStatus();
     return ui.stack(.{}, .{
         statusChip(ui, .{
             .press = if (guest) .open_join else Msg{ .toggle_menu = .account },
-            .label = if (guest) "Guest" else "Signet ready",
+            .label = if (guest) "Guest" else signer.label,
             .semantics = if (guest) "Join" else "Account",
-            .glyph = if (guest) "plus" else "signet",
-            .glyph_color = if (guest) p.text_faint_alt else p.status_success,
+            .glyph = if (guest) "plus" else signer.glyph,
+            .glyph_color = if (guest) p.text_faint_alt else signer.color,
         }),
         if (model.menu == .account) accountMenu(ui) else ui.spacer(0),
     });
+}
+
+/// Whether the pool counts as healthy: MOST of it answering, not all of it. The
+/// redesign's at-rest bar reads "4/5 relays" in green while its working bar reads
+/// "3/5" in amber, so the line sits at four fifths. A relay pool always has a
+/// straggler, and a bar that goes amber for one is a bar nobody reads.
+pub fn poolIsHealthyForTest(live: usize) bool {
+    return poolIsHealthy(live);
+}
+
+fn poolIsHealthy(live: usize) bool {
+    return live * 5 >= relays.len * 4;
+}
+
+/// What the status bar says about signing: which signer holds the key, and
+/// whether it can be reached.
+const SignerStatus = struct { label: []const u8, glyph: []const u8, color: canvas.Color };
+
+fn signerStatus() SignerStatus {
+    const p = theme.palette;
+    return switch (g_signer_kind) {
+        // Signet: a separate process, so its health is a real question.
+        .helper => switch (g_helper_state.load(.monotonic)) {
+            2 => .{ .label = "Signet ready", .glyph = "signet", .color = p.status_success },
+            1 => .{ .label = "Signet has no key", .glyph = "signet", .color = p.status_warning },
+            3 => .{ .label = "Signet unreachable", .glyph = "signet", .color = p.text_faint_alt },
+            else => .{ .label = "Signet starting", .glyph = "signet", .color = p.status_warning },
+        },
+        // A remote bunker: reachable is the whole question, and the remote path
+        // already tracks a failed round trip.
+        .remote => if (g_remote_sign_notice.load(.acquire))
+            .{ .label = "Signer unreachable", .glyph = "signet", .color = p.status_warning }
+        else
+            .{ .label = "Signer connected", .glyph = "signet", .color = p.status_success },
+        // A key in this process: always able to sign, and honest about being local.
+        .local => .{ .label = "Local key", .glyph = "signet", .color = p.status_success },
+    };
 }
 
 /// One status-bar zone: a quiet pressable chip, highlighted only when it is
@@ -5410,18 +5510,23 @@ const StatusChip = struct {
 
 fn statusChip(ui: *AppUi, chip: StatusChip) AppUi.Node {
     const p = theme.palette;
-    const body = ui.row(.{ .cross = .center, .gap = 6 }, .{
+    // Gap 0 and explicit steps: a `gap` would space around the absent parts too,
+    // so a chip with no dot and no chevron would carry their spacing anyway.
+    const body = ui.row(.{ .cross = .center, .gap = 0 }, .{
         if (chip.dot) |color|
             ui.el(.panel, .{ .width = 6, .height = 6, .padding = 0.01, .style = .{ .background = color, .radius = 3, .stroke_width = 0 } }, .{})
         else
             ui.spacer(0),
+        if (chip.dot != null) hgap(ui, 6) else ui.spacer(0),
         if (chip.glyph) |name|
             // `appIcon` takes a RUNTIME name and resolves built-ins first, then
             // the app table, so one call serves both vocabularies.
             ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = chip.glyph_color } }, name)
         else
             ui.spacer(0),
+        if (chip.glyph != null) hgap(ui, 6) else ui.spacer(0),
         ui.paragraph(.{ .style = .{ .foreground = chip.ink } }, &.{.{ .text = chip.label, .scale = status_scale }}),
+        if (chip.chevron) hgap(ui, 6) else ui.spacer(0),
         if (chip.chevron)
             ui.icon(.{ .width = 10, .height = 10, .style = .{ .foreground = p.text_muted } }, "chevron-up")
         else
@@ -6172,9 +6277,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // The feed's own list holds the scroll, and there is no API to set an
         // offset, so "newest" is the reconcile that puts the newest note back at
         // the top: the same thing the tick does, asked for on purpose.
+        // There is no API to set a list's scroll offset, so this cannot scroll
+        // the feed. What it CAN do is make sure nothing is stale before the
+        // reader looks: force the next tick to rebuild from the store.
         .jump_to_newest => {
             g_last_count = std.math.maxInt(usize);
             model.menu = .none;
+        },
+        .open_settings_logout => {
+            model.menu = .none;
+            model.logout_pending = true;
+            update(model, .open_settings, fx);
         },
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
@@ -6232,6 +6345,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .open_settings => {
+            model.menu = .none;
             // Seed the proxy field from the live setting so it edits in place.
             model.proxy_buffer.set(mediaProxy());
             model.proxy_saved = false;
@@ -7652,6 +7766,7 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
             std.debug.print("plaza: [{s}] {s}\n", .{ relays[index], @errorName(err) });
         };
         setRelayStatus(index, .offline);
+        clearRelayRtt(index);
         io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
     }
 }
@@ -7678,13 +7793,16 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         .{ .authors = &starter_pack, .kinds = &feed_kinds, .limit = feed_capacity },
         .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
     };
-    // The clock for this relay's round trip: from the REQ going out to its EOSE
-    // coming back. That pair is the honest "how fast does this relay answer"
-    // number, and it is the one the status bar shows.
-    // The AWAKE clock, not the wall clock: a latency reading must not swing
-    // because the system clock stepped between the REQ and its EOSE.
-    var req_at: i64 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try relay.subscribe("plaza-feed", &filters);
+
+    // Latency is measured with a PROBE, never with the subscriptions above: the
+    // feed REQ asks for a 300-note backlog plus profiles, so timing it measures
+    // how much this relay had to send, not how fast it answers. The probe is a
+    // one-event query whose REQ-to-EOSE is the round trip the reader cares about,
+    // re-sent periodically so the number stays live. The AWAKE clock, so a system
+    // clock step cannot swing a reading.
+    var probe_at: i64 = 0;
+    var probed_at: i64 = 0;
 
     // The loaded notes' ids (and their hex), collected from the feed as it
     // arrives. On the feed's EOSE a second subscription opens for their
@@ -7695,8 +7813,26 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     var engagement_open = false;
 
     while (true) {
+        // A pause takes effect at the next message this relay sends: the thread
+        // returns, `defer relay.deinit()` closes the socket, and the reconnect
+        // loop parks. A silent relay therefore holds its socket until it speaks,
+        // which is why the chip says "pausing" until every thread has actually
+        // left rather than claiming a pause it has not achieved.
+        if (relaysPaused()) return;
         var msg = (try relay.receive()) orelse break;
         defer msg.deinit();
+
+        // Time to re-probe? `receive()` blocks with no deadline, so the probe
+        // rides the next message rather than a timer; a relay too quiet to carry
+        // one is also a relay whose latency nobody is waiting on.
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (probe_at == 0 and (probed_at == 0 or now_ms - probed_at > probe_interval_ms)) {
+            const probe_filters = [_]nostr.filter.Filter{.{ .kinds = &feed_kinds, .limit = 1 }};
+            if (relay.subscribe(probe_sub, &probe_filters)) |_| {
+                probe_at = now_ms;
+                probed_at = now_ms;
+            } else |_| {}
+        }
         switch (msg.value) {
             .event => |e| {
                 if (std.mem.eql(u8, e.subscription_id, "plaza-feed")) {
@@ -7727,10 +7863,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 }
             },
             .eose => |eo| {
-                if (std.mem.eql(u8, eo.subscription_id, "plaza-feed") and req_at != 0) {
-                    const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - req_at;
-                    if (elapsed >= 0) recordRelayRtt(index, @intCast(elapsed));
-                    req_at = 0;
+                if (std.mem.eql(u8, eo.subscription_id, probe_sub) and probe_at != 0) {
+                    const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - probe_at;
+                    if (elapsed >= 0) recordRelayRtt(index, @intCast(@min(elapsed, std.math.maxInt(u16))));
+                    probe_at = 0;
                 }
                 // Stored feed drained: now watch those notes' engagement.
                 if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
