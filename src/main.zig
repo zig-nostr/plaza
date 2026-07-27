@@ -135,6 +135,7 @@ else
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
+const copy_nevent_key: u64 = 103;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
@@ -222,6 +223,17 @@ const menu_scale: f32 = 12.5 / 14.5;
 const mono_row_scale: f32 = 11.5 / 14.5;
 const mono_hint_scale: f32 = 11.0 / 14.5;
 const mono_badge_scale: f32 = 9.5 / 14.5;
+/// The focal note's own register (16.5 against the 14.5 body), the stats line's
+/// 12.5, and the 4px each thread block sits in from the reading column's edge.
+const focal_body_scale: f32 = 16.5 / 14.5;
+const stat_scale: f32 = 12.5 / 14.5;
+const thread_inset: f32 = 4;
+/// The focal note minus its body: the 16 above, the identity block, the two 9px
+/// steps, the exact-time line, the stats row and the verb row. Calibrated against
+/// the running app, like the feed's own chrome.
+const focal_row_chrome: f32 = 16 + avatar_size + 9 + 9 + 20 + 12 + 34 + 40;
+/// The reply field's row, which does not change shape with the thread.
+const reply_row_extent: f32 = 62;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
@@ -1604,6 +1616,11 @@ const Engagement = struct {
     used: bool = false,
     note_id: i64 = 0,
     counts: Counts = .{},
+    /// Which relays in the pool have delivered this note, one bit each. The
+    /// thread's focal line reports the count, so the claim "seen on 4 relays" is
+    /// a measurement rather than a guess. A pool wider than the mask simply stops
+    /// counting past bit 63, which no configuration reaches today.
+    relays_seen: u64 = 0,
 };
 var g_engagement = [_]Engagement{.{}} ** engagement_cap;
 
@@ -1615,6 +1632,29 @@ var g_engagement = [_]Engagement{.{}} ** engagement_cap;
 const seen_engagement_cap = 1 << 15;
 var g_seen = [_]u64{0} ** seen_engagement_cap;
 var g_seen_len: usize = 0;
+
+/// Notes that this relay has now delivered. Called from each relay's ingest
+/// thread as the event lands, so the count is of relays that ACTUALLY sent it.
+fn markRelaySeen(note_id: i64, relay_index: usize) void {
+    if (relay_index >= 64) return;
+    const bit = @as(u64, 1) << @intCast(relay_index);
+    engagementLock();
+    defer engagementUnlock();
+    const row = ensureEngagement(note_id) orelse return;
+    row.relays_seen |= bit;
+}
+
+/// How many relays have delivered `note_id`, or 0 when it has not been tracked
+/// (a note read straight from the store on a cold start was delivered by nobody
+/// this session, and the focal line says nothing rather than "seen on 0 relays").
+pub fn relaysSeenFor(note_id: i64) usize {
+    engagementLock();
+    defer engagementUnlock();
+    for (&g_engagement) |*e| {
+        if (e.used and e.note_id == note_id) return @popCount(e.relays_seen);
+    }
+    return 0;
+}
 
 var g_engagement_lock = std.atomic.Value(bool).init(false);
 fn engagementLock() void {
@@ -2130,6 +2170,9 @@ pub const Model = struct {
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
+    /// The reply verb was pressed, so the field under the focal note should take
+    /// the caret on the next build.
+    reply_focus: bool = false,
     /// Whether the reader has paused the pool. Reading keeps working: the store
     /// is the app, so a pause stops the sockets, not the feed.
     relays_paused: bool = false,
@@ -4062,6 +4105,12 @@ pub const Msg = union(enum) {
     /// Sign out, asked for from the account menu: opens Settings with the
     /// confirmation showing, so the menu never signs anyone out on one press.
     open_settings_logout,
+    /// Put the caret in the thread's reply field.
+    focus_reply: i64,
+    /// Copy a note's nevent address to the clipboard.
+    copy_nevent: i64,
+    /// Open a note on the web (njump), for sharing it outside nostr.
+    open_web: i64,
     /// A text edit in the name beat's field.
     name_edit: canvas.TextInputEvent,
     /// Publish the chosen name as the account's kind:0 and move on.
@@ -4478,13 +4527,19 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
 /// quiet empty line appended. Arena-allocated per frame so the virtual list's
 /// estimate callback can price unbuilt rows from model facts.
 const ThreadRows = struct {
+    /// The model, so the composer row can read the draft and the signer state.
+    model: *const Model,
     root: *const Note,
     replies: []const Note,
     skeletons: usize,
     empty: bool,
 
+    /// Row 0 is the focal note, row 1 the reply field, then the replies and any
+    /// placeholder. The field is a ROW rather than a pinned footer because the
+    /// design puts it under the note being answered, where it scrolls with the
+    /// conversation instead of hovering over it.
     fn count(self: *const ThreadRows) usize {
-        return 1 + self.replies.len + self.skeletons + @intFromBool(self.empty);
+        return 2 + self.replies.len + self.skeletons + @intFromBool(self.empty);
     }
 };
 
@@ -4492,10 +4547,12 @@ const ThreadRows = struct {
 fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     const rows: *const ThreadRows = @ptrCast(@alignCast(context orelse return thread_reply_chrome));
     const i: usize = @intCast(index);
-    // The root carries one extra line of chrome: its name and handle stack rather
-    // than sharing a line.
-    if (i == 0) return noteRowEstimate(rows.root, thread_reply_chrome + body_line_height);
-    const ri = i - 1;
+    // The focal note carries the identity block, its exact-time line, the stats
+    // row and the verb row on top of a body set one register up.
+    if (i == 0) return noteRowEstimate(rows.root, focal_row_chrome);
+    // The reply field: a fixed shape whatever the thread holds.
+    if (i == 1) return reply_row_extent;
+    const ri = i - 2;
     if (ri < rows.replies.len) return noteRowEstimate(&rows.replies[ri], thread_reply_chrome);
     // A skeleton or the empty line: one fixed-shape row.
     return thread_skeleton_extent;
@@ -4517,7 +4574,7 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
     const loading = replies.len == 0 and thread_loading;
     const empty = replies.len == 0 and !thread_loading;
     const rows_ctx = ui.arena.create(ThreadRows) catch return ui.column(.{}, .{});
-    rows_ctx.* = .{ .root = root, .replies = replies, .skeletons = if (loading) 3 else 0, .empty = empty };
+    rows_ctx.* = .{ .model = model, .root = root, .replies = replies, .skeletons = if (loading) 3 else 0, .empty = empty };
     const options: AppUi.VirtualListOptions = .{
         .id = ui.fmt("thread-{d}", .{level_key}),
         .item_count = rows_ctx.count(),
@@ -4537,7 +4594,6 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         threadHeader(ui, model),
         ui.virtualList(options, window, .{rows}),
-        replyComposer(ui, model, root),
     });
 }
 
@@ -4549,7 +4605,8 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
 fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node {
     const inner = blk: {
         if (index == 0) break :blk threadRoot(ui, rows_ctx.root);
-        const ri = index - 1;
+        if (index == 1) break :blk replyComposer(ui, rows_ctx.model, rows_ctx.root);
+        const ri = index - 2;
         if (ri < rows_ctx.replies.len) break :blk replyRow(ui, &rows_ctx.replies[ri], rows_ctx.root.pubkey);
         if (rows_ctx.empty) break :blk threadEmptyNote(ui);
         break :blk replySkeleton(ui);
@@ -4560,8 +4617,10 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
     // masked 63-bit note-id space, so no collision).
     node.key = .{ .int = blk: {
         if (index == 0) break :blk @intCast(rows_ctx.root.id);
-        const ri = index - 1;
-        if (ri < rows_ctx.replies.len) break :blk @intCast(rows_ctx.replies[ri].id);
+        if (index >= 2) {
+            const ri = index - 2;
+            if (ri < rows_ctx.replies.len) break :blk @intCast(rows_ctx.replies[ri].id);
+        }
         break :blk (@as(u64, 1) << 63) | @as(u64, index);
     } };
     return node;
@@ -4606,8 +4665,25 @@ fn threadRepliesFromStore(ui: *AppUi, level: usize, root_event_id: [32]u8) []con
 /// "nothing here yet" rather than a lone post over a wall of blank space.
 fn threadEmptyNote(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    return ui.row(.{ .padding = 24, .main = .center }, .{
-        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint } }, "No replies yet. Be the first."),
+    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .main = .center }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "No replies yet. Yours would be the first.", .scale = stat_scale }}),
+        }),
+        vgap(ui, 12),
+        // What the thread is doing about it, rather than a dead end: the
+        // subscription is open and a reply will appear when one lands.
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        vgap(ui, 10),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, thread_inset),
+            ui.el(.panel, .{ .width = 6, .height = 6, .padding = 0.01, .style = .{ .background = p.status_success, .radius = 3, .stroke_width = 0 } }, .{}),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = ui.fmt("listening on {d} relays", .{relays.len}), .monospace = true, .scale = mono_meta_scale }},
+            ),
+        }),
     });
 }
 
@@ -4635,7 +4711,7 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             // The count reads once replies are known; before then it says nothing
             // rather than a misleading "0 replies" on a note that has some.
             if (count > 0)
-                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} replies", .{count}))
+                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} {s}", .{ count, if (count == 1) "reply" else "replies" }))
             else
                 ui.spacer(0),
             ui.spacer(1),
@@ -4693,29 +4769,160 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
 /// by a slightly larger name, the name-over-handle stack, and the composer below.
 fn threadRoot(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
+    const c = engagementFor(note.id);
     // A fixed-width column, centred by the scroll column's `cross = .center`. No
     // outer growing row: a `grow` child in the scroll's column grows vertically
-    // and would overlap the next row.
-    return ui.column(.{ .width = thread_column_width }, .{
-        ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
+    // and would overlap the next row. Every block inside sits 4px in, which is
+    // the focal note's own inset within the reading column.
+    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        vgap(ui, 16),
+        // The identity line, at the disc's height, with the overflow menu at the
+        // far end. No timestamp here: the focal note states its time in full
+        // below, where there is room to be exact.
+        ui.row(.{ .gap = 0, .cross = .center }, .{
+            hgap(ui, thread_inset),
             noteAvatar(ui, note),
-            ui.column(.{ .gap = 8, .grow = 1 }, .{
-                ui.row(.{ .cross = .start, .gap = 6 }, .{
-                    ui.column(.{ .gap = 1, .grow = 1 }, .{
-                        ui.row(.{ .cross = .center, .gap = 6 }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = 1.1 }}),
-                            if (note.verified()) ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                        }),
-                        identityHandle(ui, note, false),
-                    }),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
-                }),
-                noteBody(ui, note, false),
+            hgap(ui, avatar_to_text_gap),
+            identityBlock(ui, note),
+            ui.spacer(1),
+            // Drawn, not wired: the overflow menu (mute, report, copy link) lands
+            // with the safety work. A pressable glyph that does nothing is the
+            // same lie the status bar was just cured of, so it stays inert until
+            // there is something behind it.
+            ui.row(.{ .padding = 4 }, .{
+                ui.icon(.{ .width = 15, .height = 15, .style = .{ .foreground = p.text_faint_alt } }, "ellipsis"),
+            }),
+            hgap(ui, thread_inset),
+        }),
+        vgap(ui, 9),
+        // One register up from a feed row: this is the note being read.
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, thread_inset),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                focalBody(ui, note),
+                if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                engagementRow(ui, note),
+                vgap(ui, 9),
+                focalMeta(ui, note),
+            }),
+            hgap(ui, thread_inset),
+        }),
+        vgap(ui, 12),
+        focalStats(ui, c),
+        focalVerbs(ui, note),
+    });
+}
+
+/// The focal note's body: the SAME builder every other note uses, one register up.
+/// Writing a second paragraph path here cost the embedded quote card, which is
+/// exactly the kind of quiet loss a parallel implementation buys.
+fn focalBody(ui: *AppUi, note: *const Note) AppUi.Node {
+    return noteBodyAt(ui, note, false, focal_body_scale, theme.palette.text_focal);
+}
+
+/// When the focal note was written, how widely it is held, and its nevent.
+fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const seen = relaysSeenFor(note.id);
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{
+                .text = if (seen > 0)
+                    ui.fmt("{s} · seen on {d} relays", .{ absoluteNoteTime(ui.arena, note.created_at), seen })
+                else
+                    // Nothing delivered it this session (it came off disk), so the
+                    // line says when it was written and stops there.
+                    absoluteNoteTime(ui.arena, note.created_at),
+                .monospace = true,
+                .scale = mono_row_scale,
+            }},
+        ),
+        ui.spacer(1),
+        neventPill(ui, note),
+    });
+}
+
+/// The copyable nevent: the note's own address, for sharing it anywhere.
+fn neventPill(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{
+        .cross = .center,
+        .gap = 0,
+        .on_press = Msg{ .copy_nevent = note.id },
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Copy nevent" },
+    }, .{
+        ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = p.surface_chip, .border = p.border_chip, .radius = 999, .stroke_width = 1 } }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 9),
+                vgap(ui, 20),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = shortNevent(ui, note), .monospace = true, .scale = mono_meta_scale }}),
+                hgap(ui, 6),
+                ui.icon(.{ .width = 10, .height = 10, .style = .{ .foreground = p.text_faint } }, "copy"),
+                hgap(ui, 9),
             }),
         }),
-        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
+    });
+}
+
+/// The focal note's tallies, as words rather than icons: the verbs below carry
+/// the actions, so these are the numbers, stated plainly.
+fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, thread_inset + 2),
+            vgap(ui, 33),
+            statCount(ui, c.replies, "reply", "replies"),
+            hgap(ui, 18),
+            statCount(ui, c.reposts, "repost", "reposts"),
+            hgap(ui, 18),
+            statCount(ui, c.likes, "like", "likes"),
+            hgap(ui, 18),
+            statCount(ui, c.zap_msat / 1000, "sat", "sats"),
+            ui.spacer(1),
+        }),
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    });
+}
+
+fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{
+        .{ .text = ui.fmt("{d}", .{n}), .weight = .medium, .color = .text, .scale = stat_scale },
+        .{ .text = ui.fmt(" {s}", .{if (n == 1) singular else plural}), .scale = stat_scale },
+    });
+}
+
+/// The focal note's verbs: five glyphs, evenly spread, no counts. The numbers are
+/// the stats row above; these are the things a reader can do.
+fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const liked = likeEntry(note.id) != null;
+    return ui.row(.{ .cross = .center, .gap = 0, .main = .space_between }, .{
+        hgap(ui, 40),
+        focalVerb(ui, "reply", "Reply", Msg{ .focus_reply = note.id }, p.text_secondary_alt),
+        // Repost becomes a two-item menu with the repost work; inert until then.
+        focalVerb(ui, "repeat", "Repost", null, p.text_secondary_alt),
+        focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_secondary_alt),
+        // Zap waits on a wallet; it draws at rest and does nothing.
+        focalVerb(ui, "zap", "Zap", null, p.text_secondary_alt),
+        focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_secondary_alt),
+        hgap(ui, 40),
+    });
+}
+
+fn focalVerb(ui: *AppUi, glyph: []const u8, label: []const u8, press: ?Msg, tint: canvas.Color) AppUi.Node {
+    return ui.row(.{
+        .padding = 6,
+        .cross = .center,
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = press != null },
+    }, .{
+        ui.appIcon(.{ .width = 17, .height = 17, .style = .{ .foreground = tint } }, glyph),
     });
 }
 
@@ -4803,27 +5010,56 @@ fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
 /// to the root note. Pre-filled with whom you are answering.
 fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node {
     const p = theme.palette;
-    return ui.column(.{ .style = .{ .background = p.surface_subbar } }, .{
-        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
-        ui.row(.{ .cross = .center, .padding = 12 }, .{
-            // The house input-group: one bordered field wrapping the entry and
-            // the send button in its own bottom-right accessory slot, so the
-            // button reads as part of the field rather than a stray control.
-            ui.inputGroup(
-                .{ .grow = 1 },
-                ui.el(.textarea, .{
-                    .text = model.reply_draft(),
-                    .placeholder = ui.fmt("Reply to {s}…", .{root.author()}),
-                    .on_input = AppUi.inputMsg(.reply_edit),
-                    .on_submit = .reply_submit,
-                    .height = 36,
-                }, .{}),
-                ui.inputGroupActions(.{}, .{
-                    ui.spacer(1),
-                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.reply_empty(), .on_press = .reply_submit }, "Reply"),
+    const ready = !model.reply_empty();
+    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        vgap(ui, 10),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, thread_inset),
+            youAvatar(ui),
+            hgap(ui, avatar_to_text_gap),
+            // The field is a pill: the thread's one place to write, shaped so it
+            // reads as an invitation rather than a form.
+            ui.el(.panel, .{ .grow = 1, .padding = 0.01, .style = .{ .background = p.surface_input, .border = p.border_chip, .radius = 999, .stroke_width = 1 } }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 14),
+                    ui.el(.text_field, .{
+                        .grow = 1,
+                        .height = 34,
+                        .text = model.reply_draft(),
+                        .placeholder = ui.fmt("Reply to {s}…", .{root.author()}),
+                        .on_input = AppUi.inputMsg(.reply_edit),
+                        .on_submit = .reply_submit,
+                        .style = .{ .background = p.surface_input, .stroke_width = 0 },
+                    }, .{}),
+                    hgap(ui, 14),
                 }),
-            ),
+            }),
+            hgap(ui, 10),
+            // The verb sits beside the field, quiet until there is something to
+            // send: an empty reply has nothing to confirm.
+            ui.row(.{
+                .cross = .center,
+                .gap = 0,
+                .on_press = if (ready) Msg.reply_submit else null,
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Reply", .focusable = ready },
+            }, .{
+                ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = if (ready) p.accent else p.surface_rail_tile, .radius = 8, .stroke_width = 0 } }, .{
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        hgap(ui, 14),
+                        vgap(ui, 30),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = if (ready) p.on_accent else p.text_muted } },
+                            &.{.{ .text = "Reply", .weight = .medium, .scale = stat_scale }},
+                        ),
+                        hgap(ui, 14),
+                    }),
+                }),
+            }),
+            hgap(ui, thread_inset),
         }),
+        vgap(ui, 10),
     });
 }
 
@@ -5801,7 +6037,23 @@ fn noteIsLong(note: *const Note) bool {
 
 /// A styled body paragraph, the same shape everywhere text is rendered.
 fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
-    return ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = theme.palette.text_body } }, spans);
+    return textParaAt(ui, spans, 1, theme.palette.text_body);
+}
+
+/// The same paragraph at a stated register and ink: the thread's focal note reads
+/// one step up from a feed row, and a shade brighter.
+fn textParaAt(ui: *AppUi, spans: []const canvas.TextSpan, scale: f32, ink: canvas.Color) AppUi.Node {
+    const sized = if (scale == 1) spans else blk: {
+        const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch break :blk spans;
+        for (spans, out) |src, *dst| {
+            dst.* = src;
+            // A span that already states its own scale keeps its ratio to the
+            // body around it.
+            dst.scale = (if (src.scale == 0) 1 else src.scale) * scale;
+        }
+        break :blk out;
+    };
+    return ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = ink } }, sized);
 }
 
 /// A note's body: the styled text, an embedded quote card where the note quotes
@@ -5810,6 +6062,12 @@ fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
 /// The body splits around the quoted event's raw token (its byte span), never
 /// cutting the card; a quote at or past the fold appears only once expanded.
 fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
+    return noteBodyAt(ui, note, collapsible, 1, theme.palette.text_body);
+}
+
+/// The body at a stated register: everything above, one step larger, for the note
+/// a thread is about.
+fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink: canvas.Color) AppUi.Node {
     const p = theme.palette;
     const full = note.content();
     const long = collapsible and noteIsLong(note);
@@ -5820,25 +6078,25 @@ fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
     const has_card = q.kind == .event and card_end <= cut;
 
     // Fast path unchanged: a plain note with no fold is exactly one paragraph.
-    if (!has_card and !long) return textPara(ui, contentSpans(ui, full[0..cut]));
+    if (!has_card and !long) return textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
 
     var kids: [5]AppUi.Node = undefined;
     var n: usize = 0;
     if (has_card) {
         const head = std.mem.trim(u8, full[0..q.off], " \t\r\n");
         if (head.len > 0) {
-            kids[n] = textPara(ui, contentSpans(ui, head));
+            kids[n] = textParaAt(ui, contentSpans(ui, head), scale, ink);
             n += 1;
         }
         kids[n] = quoteCard(ui, q.id);
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
         if (tail.len > 0) {
-            kids[n] = textPara(ui, contentSpans(ui, tail));
+            kids[n] = textParaAt(ui, contentSpans(ui, tail), scale, ink);
             n += 1;
         }
     } else {
-        kids[n] = textPara(ui, contentSpans(ui, full[0..cut]));
+        kids[n] = textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
         n += 1;
     }
     if (long) {
@@ -5900,6 +6158,45 @@ fn quoteAuthorName(ui: *AppUi, pubkey: [32]u8) []const u8 {
     }
     const buf = ui.arena.alloc(u8, 24) catch return "";
     return abbreviateNpub(buf, pubkey);
+}
+
+/// The focal note's timestamp in full: the time and the date, since a note being
+/// read deserves to say exactly when it was written rather than "3h".
+fn absoluteNoteTime(arena: std.mem.Allocator, created_at: i64) []const u8 {
+    const secs: u64 = @intCast(@max(created_at, 0));
+    const days = secs / 86_400;
+    const day_secs = secs % 86_400;
+    const hour24 = day_secs / 3600;
+    const minute = (day_secs % 3600) / 60;
+    const pm = hour24 >= 12;
+    const hour12 = if (hour24 % 12 == 0) 12 else hour24 % 12;
+    // Civil date from the Unix epoch, by Howard Hinnant's algorithm: exact, and
+    // no dependency on a timezone database the app does not carry.
+    const z = @as(i64, @intCast(days)) + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36_524) - @divTrunc(doe, 146_096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp = @divTrunc(5 * doy + 2, 153);
+    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const year = if (m <= 2) y + 1 else y;
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const month_name = months[@intCast(@min(@max(m - 1, 0), 11))];
+    return std.fmt.allocPrint(arena, "{d}:{d:0>2} {s} · {s} {d}, {d}", .{
+        hour12, minute, if (pm) "PM" else "AM", month_name, d, year,
+    }) catch "";
+}
+
+/// A note's nevent, abbreviated for a chip: enough to recognise, short enough to
+/// sit beside a timestamp.
+fn shortNevent(ui: *AppUi, note: *const Note) []const u8 {
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return "nevent";
+    if (addr.len <= 18) return ui.fmt("{s}", .{addr});
+    return ui.fmt("{s}…{s}", .{ addr[0..10], addr[addr.len - 4 ..] });
 }
 
 /// The quoted note's relative timestamp, computed for the frame.
@@ -6283,6 +6580,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .jump_to_newest => {
             g_last_count = std.math.maxInt(usize);
             model.menu = .none;
+        },
+        // The reply field is already on screen under the focal note, so this is
+        // about the caret, not about opening anything.
+        .focus_reply => model.reply_focus = true,
+        .copy_nevent => |id| {
+            const note = model.noteById(id) orelse return;
+            var scratch: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            fx.writeClipboard(.{ .key = copy_nevent_key, .text = addr });
+            setToast(model, "Address copied");
+        },
+        // njump renders any nostr event as a web page, which is how a note is
+        // shared with someone who is not on nostr yet.
+        .open_web => |id| {
+            const note = model.noteById(id) orelse return;
+            var scratch: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            var url_buf: [256]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://njump.me/{s}", .{addr}) catch return;
+            openExternally(fx, url);
         },
         .open_settings_logout => {
             model.menu = .none;
@@ -7839,6 +8158,9 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     const store = g_store orelse continue;
                     // Verify (secp256k1) before storing; silently drop a bad event.
                     _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                    // Note which relay carried it, so a thread can say how widely
+                    // a note is held rather than guess.
+                    if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);
                     // Note this feed post so its engagement can be watched. Bounded
                     // to keep the `#e` filter a size relays accept.
                     if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {
