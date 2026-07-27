@@ -1947,3 +1947,39 @@ test "a latency reading survives only as long as its connection" {
     main.clearRelayRttForTest(0);
     try testing.expectEqual(@as(?u16, null), main.relayRttMs(0));
 }
+
+test "ZZ measure focal note layout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = main.findQuoteRefForTest("Shipping it: the feed renders from disk before the window finishes opening. No spinner, because there is nothing to wait for.");
+    model.thread_root.id = 1;
+    model.thread_root.created_at = 1_800_000_000;
+    // two replies so the empty state does not show
+    model.thread_notes[0] = main.findQuoteRefForTest("Exactly the constraint that makes it fast.");
+    model.thread_notes[0].id = 2;
+    model.thread_notes[1] = main.findQuoteRefForTest("Does the arithmetic still hold when a row embeds a quote card?");
+    model.thread_notes[1].id = 3;
+    model.thread_notes_len = 2;
+
+    const p = try painted.Painted.render(arena, &model);
+    std.debug.print("\n--- nodes width==640 ---\n", .{});
+    for (p.layout.nodes) |node| {
+        const f = node.widget.frame;
+        if (@abs(f.width - 620) < 0.5 or @abs(f.width - 612) < 0.5) {
+            std.debug.print("kind={s:<12} x={d:.2} y={d:.2} w={d:.2} h={d:.2} label={s}\n", .{ @tagName(node.widget.kind), f.x, f.y, f.width, f.height, node.widget.semantics.label });
+        }
+    }
+    std.debug.print("--- labelled nodes ---\n", .{});
+    for (p.layout.nodes) |node| {
+        const f = node.widget.frame;
+        const l = node.widget.semantics.label;
+        if (l.len > 0) {
+            std.debug.print("kind={s:<12} x={d:.2} y={d:.2} w={d:.2} h={d:.2} label={s}\n", .{ @tagName(node.widget.kind), f.x, f.y, f.width, f.height, l });
+        }
+    }
+}

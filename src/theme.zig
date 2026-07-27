@@ -180,6 +180,10 @@ pub const palette = struct {
     // into the ink instead: this is #8f8f99 at 75%% over the window.
     pub const text_metric = hex("#6e6e76");
 
+    // The thread's focal verbs: brighter than a feed row's metrics, because these
+    // are the actions on the note being read.
+    pub const text_verb = hex("#a5a5af");
+
     // Status.
     pub const status_success = hex("#45c168");
     pub const status_like = hex("#e57373");
