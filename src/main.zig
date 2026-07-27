@@ -231,7 +231,7 @@ const thread_inset: f32 = 4;
 /// The focal note minus its body: the 16 above, the identity block, the two 9px
 /// steps, the exact-time line, the stats row and the verb row. Calibrated against
 /// the running app, like the feed's own chrome.
-const focal_row_chrome: f32 = 16 + avatar_size + 9 + 9 + 20 + 12 + 34 + 40;
+const focal_row_chrome: f32 = 16 + avatar_size + 9 + 9 + 20 + 12 + 34 + 35;
 /// The reply field's row, which does not change shape with the thread.
 const reply_row_extent: f32 = 62;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
@@ -4916,16 +4916,28 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
 fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const liked = likeEntry(note.id) != null;
-    return ui.row(.{ .cross = .center, .gap = 0, .padding = 40 }, .{
-        // Repost becomes a two-item menu with the repost work; inert until then.
-        focalVerb(ui, "repeat", "Repost", null, p.text_verb),
-        ui.spacer(1),
-        focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
-        ui.spacer(1),
-        // Zap waits on a wallet; it draws at rest and does nothing.
-        focalVerb(ui, "zap", "Zap", null, p.text_verb),
-        ui.spacer(1),
-        focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
+    // The mock's insets are 2 above, 40 each side, 4 below, and padding on this
+    // engine is ONE number for all four edges, so each axis is stated where it
+    // belongs: this column carries the 2 and the 4, the row carries the 40s as
+    // fixed inset boxes, and the grow spacers between the verbs take the rest.
+    // Reaching for `padding = 40` to fix the sides, as the previous shape did, put
+    // 40px of dead air above and below the icons too.
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 2),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, 40),
+            // Repost becomes a two-item menu with the repost work; inert until then.
+            focalVerb(ui, "repeat", "Repost", null, p.text_verb),
+            ui.spacer(1),
+            focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
+            ui.spacer(1),
+            // Zap waits on a wallet; it draws at rest and does nothing.
+            focalVerb(ui, "zap", "Zap", null, p.text_verb),
+            ui.spacer(1),
+            focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
+            hgap(ui, 40),
+        }),
+        vgap(ui, 4),
     });
 }
 
