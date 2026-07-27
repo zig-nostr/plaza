@@ -246,6 +246,7 @@ const op_chip_scale: f32 = 9.0 / 14.5;
 const nested_reply_chrome: f32 = 8 + 20 + 3;
 const branch_more_extent: f32 = 6 + 22;
 const show_more_extent: f32 = 12 + 22 + 10;
+const outside_row_extent: f32 = 2 + 22 + 12;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
@@ -339,6 +340,53 @@ var g_store: ?*nostr.store.Store = null;
 // One connection state per relay in the pool, flipped by that relay's ingest
 // thread and read by the UI thread to summarise the pool.
 var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** relays.len;
+
+/// Arrival order inside the OPEN thread: the build a reply first appeared in, so a
+/// late arrival lands after what has already been read instead of jumping into the
+/// middle of it. The redesign is explicit about this ("appended, never reordered"),
+/// and a reply that arrives late is often OLDER than replies already on screen, so
+/// created_at alone would move the ground under the reader.
+///
+/// Reset whenever a thread is entered or left.
+const ThreadArrival = struct {
+    used: bool = false,
+    id: [32]u8 = [_]u8{0} ** 32,
+    batch: u32 = 0,
+};
+var g_thread_arrival = [_]ThreadArrival{.{}} ** thread_reply_cap;
+var g_thread_batch: u32 = 0;
+/// Whether the open thread has been built at all yet. The first build is one
+/// batch, however many replies the store already held.
+var g_thread_arrival_started = false;
+
+fn resetThreadArrival() void {
+    for (&g_thread_arrival) |*e| e.* = .{};
+    g_thread_batch = 0;
+    g_thread_arrival_started = false;
+}
+
+fn arrivalKnown(id: [32]u8) bool {
+    for (&g_thread_arrival) |*e| {
+        if (e.used and std.mem.eql(u8, &e.id, &id)) return true;
+    }
+    return false;
+}
+
+/// The batch `id` belongs to, claiming a slot at the current batch the first time
+/// it is seen. A full table hands everything the current batch, which degrades to
+/// chronological order rather than to nonsense.
+fn arrivalBatch(id: [32]u8) u32 {
+    for (&g_thread_arrival) |*e| {
+        if (e.used and std.mem.eql(u8, &e.id, &id)) return e.batch;
+    }
+    for (&g_thread_arrival) |*e| {
+        if (!e.used) {
+            e.* = .{ .used = true, .id = id, .batch = g_thread_batch };
+            return e.batch;
+        }
+    }
+    return g_thread_batch;
+}
 
 /// Sets relay `index`'s live connection state.
 fn setRelayStatus(index: usize, state: Conn) void {
@@ -2065,6 +2113,10 @@ pub const Note = struct {
     // under the root (1 = a direct reply). Meaningless outside an arranged
     // thread.
     depth: u8 = 0,
+    // Which build of the open thread this reply first appeared in, so a late
+    // arrival sorts after what is already on screen instead of jumping into the
+    // middle of it. Only meaningful for a thread's replies.
+    arrival: u32 = 0,
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
@@ -2190,6 +2242,9 @@ pub const Model = struct {
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
+    /// Whether the open thread is showing the replies from outside the follow
+    /// graph. Closed again whenever a thread is entered or left.
+    thread_outside_open: bool = false,
     /// How many pages of replies the open thread has revealed. Reset whenever a
     /// thread is entered or left, so a new thread starts at the top of its list.
     thread_page: usize = 1,
@@ -2553,12 +2608,26 @@ pub const Model = struct {
         // root and their direct parent, never a mid-thread note).
         var ids: [thread_reply_cap][32]u8 = undefined;
         const id_count = collectThreadIds(store, self.thread_root.event_id, &ids);
+        // Anything not seen before belongs to a NEW batch, so it sorts after what
+        // is already on screen. The first build of a thread is one batch however
+        // many replies the store already held.
+        var any_new = false;
+        for (ids[0..id_count]) |id| {
+            if (!arrivalKnown(id)) {
+                any_new = true;
+                break;
+            }
+        }
+        if (any_new and g_thread_arrival_started) g_thread_batch += 1;
+        g_thread_arrival_started = true;
+
         var n: usize = 0;
         for (ids[0..id_count]) |id| {
             if (n >= self.thread_notes.len) break;
             var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
             defer se.deinit();
             self.thread_notes[n] = noteFrom(se.event, now_s);
+            self.thread_notes[n].arrival = arrivalBatch(id);
             // Queue the replier's profile so a name, avatar, and handle resolve
             // for a reply from someone outside the follow set.
             wantProfile(se.event.pubkey);
@@ -2566,6 +2635,10 @@ pub const Model = struct {
         }
         std.mem.sort(Note, self.thread_notes[0..n], {}, struct {
             fn lt(_: void, a: Note, b: Note) bool {
+                // Arrival first, then chronological within a batch: a reply that
+                // showed up later sits after the ones already read, even when it
+                // was written earlier.
+                if (a.arrival != b.arrival) return a.arrival < b.arrival;
                 return a.created_at < b.created_at;
             }
         }.lt);
@@ -4124,6 +4197,8 @@ pub const Msg = union(enum) {
     jump_to_newest,
     /// Reveal the next page of a thread's replies.
     show_more_replies,
+    /// Show or re-hide the replies from outside the follow graph.
+    toggle_outside_replies,
     /// Sign out, asked for from the account menu: opens Settings with the
     /// confirmation showing, so the menu never signs anyone out on one press.
     open_settings_logout,
@@ -4553,9 +4628,14 @@ const ThreadRows = struct {
     /// Top-level replies with their own replies folded in, so ONE row is one
     /// conversation rather than one note.
     blocks: []const ThreadBlock,
-    /// How many blocks this page shows, and how many wait behind the line.
+    /// How many of the in-graph blocks this page shows, and how many wait behind
+    /// the line.
     shown: usize,
     hidden: usize,
+    /// Replies from outside the follow graph, held below the rest. They are never
+    /// dropped: the row says how many there are and opens them.
+    outside: []const ThreadBlock,
+    outside_open: bool,
     skeletons: bool,
     empty: bool,
 
@@ -4565,7 +4645,14 @@ const ThreadRows = struct {
     /// answered, where it scrolls with the conversation instead of hovering.
     fn count(self: *const ThreadRows) usize {
         return 2 + self.shown + @intFromBool(self.hidden > 0) +
+            @intFromBool(self.outside.len > 0) + (if (self.outside_open) self.outside.len else 0) +
             (if (self.skeletons) thread_skeleton_rows else 0) + @intFromBool(self.empty);
+    }
+
+    /// The row index where the out-of-graph section begins (its own line, then the
+    /// blocks when they are open).
+    fn outsideStart(self: *const ThreadRows) usize {
+        return 2 + self.shown + @intFromBool(self.hidden > 0);
     }
 };
 
@@ -4597,6 +4684,20 @@ fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
         return extent;
     }
     if (ri == rows.shown and rows.hidden > 0) return show_more_extent;
+    const os = rows.outsideStart();
+    if (rows.outside.len > 0 and i == os) return outside_row_extent;
+    if (rows.outside_open and i > os) {
+        const oi = i - os - 1;
+        if (oi < rows.outside.len) {
+            const block = &rows.outside[oi];
+            var extent = noteRowEstimate(block.parent, thread_reply_chrome);
+            for (block.children, block.deeper) |*child, deeper| {
+                extent += noteRowEstimate(child, nested_reply_chrome) * nested_body_scale;
+                if (deeper > 0) extent += branch_more_extent;
+            }
+            return extent;
+        }
+    }
     // A skeleton or the empty line: one fixed-shape row.
     return thread_skeleton_extent;
 }
@@ -4619,14 +4720,20 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
     const rows_ctx = ui.arena.create(ThreadRows) catch return ui.column(.{}, .{});
     // Group first, then page: a page is twenty CONVERSATIONS, not twenty notes, so
     // a reply with a busy branch counts once.
-    const blocks = groupThreadBlocks(ui, replies);
-    const shown = @min(blocks.len, model.thread_page * thread_page_size);
+    const grouped = groupThreadBlocks(ui, replies);
+    // Replies from people the reader follows rank first; strangers are held below
+    // one quiet line, never dropped. The partition is stable, so it preserves the
+    // arrival and chronological order inside each tier.
+    const split = splitByFollowGraph(ui, grouped);
+    const shown = @min(split.inside.len, model.thread_page * thread_page_size);
     rows_ctx.* = .{
         .model = model,
         .root = root,
-        .blocks = blocks,
+        .blocks = split.inside,
         .shown = shown,
-        .hidden = blocks.len - shown,
+        .hidden = split.inside.len - shown,
+        .outside = split.outside,
+        .outside_open = model.thread_outside_open,
         .skeletons = loading,
         .empty = empty,
     };
@@ -4662,8 +4769,16 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         if (index == 0) break :blk threadRoot(ui, rows_ctx.root);
         if (index == 1) break :blk replyComposer(ui, rows_ctx.model, rows_ctx.root);
         const ri = index - 2;
-        if (ri < rows_ctx.shown) break :blk replyBlock(ui, &rows_ctx.blocks[ri], rows_ctx.root.pubkey, ri == 0, ri + 1 == rows_ctx.shown and rows_ctx.hidden == 0);
+        if (ri < rows_ctx.shown) break :blk replyBlock(ui, &rows_ctx.blocks[ri], rows_ctx.root.pubkey, ri == 0, false);
         if (ri == rows_ctx.shown and rows_ctx.hidden > 0) break :blk showMoreReplies(ui, rows_ctx.hidden);
+        const os = rows_ctx.outsideStart();
+        if (rows_ctx.outside.len > 0 and index == os) break :blk outsideGraphRow(ui, rows_ctx.outside.len, rows_ctx.outside_open);
+        if (rows_ctx.outside_open and index > os) {
+            const oi = index - os - 1;
+            if (oi < rows_ctx.outside.len) {
+                break :blk replyBlock(ui, &rows_ctx.outside[oi], rows_ctx.root.pubkey, false, oi + 1 == rows_ctx.outside.len);
+            }
+        }
         if (rows_ctx.empty) break :blk threadEmptyNote(ui);
         break :blk replySkeleton(ui);
     };
@@ -4676,6 +4791,11 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         if (index >= 2) {
             const ri = index - 2;
             if (ri < rows_ctx.shown) break :blk @intCast(rows_ctx.blocks[ri].parent.id);
+            const os = rows_ctx.outsideStart();
+            if (rows_ctx.outside_open and index > os) {
+                const oi = index - os - 1;
+                if (oi < rows_ctx.outside.len) break :blk @intCast(rows_ctx.outside[oi].parent.id);
+            }
         }
         break :blk (@as(u64, 1) << 63) | @as(u64, index);
     } };
@@ -5019,6 +5139,61 @@ pub const ThreadBlock = struct {
     deeper: []const usize,
 };
 
+/// The reply sort the open thread uses, exposed so a test drives the real
+/// comparison rather than a copy of it.
+pub fn sortThreadNotesForTest(notes: []Note) void {
+    std.mem.sort(Note, notes, {}, struct {
+        fn lt(_: void, a: Note, b: Note) bool {
+            if (a.arrival != b.arrival) return a.arrival < b.arrival;
+            return a.created_at < b.created_at;
+        }
+    }.lt);
+}
+
+pub fn splitByFollowGraphForTest(ui: *AppUi, blocks: []const ThreadBlock) GraphSplit {
+    return splitByFollowGraph(ui, blocks);
+}
+
+pub fn starterPackForTest() []const [32]u8 {
+    return &starter_pack;
+}
+
+/// The two tiers of a thread's replies, in their original order.
+pub const GraphSplit = struct { inside: []const ThreadBlock, outside: []const ThreadBlock };
+
+fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock) GraphSplit {
+    if (blocks.len == 0) return .{ .inside = &.{}, .outside = &.{} };
+    const inside = ui.arena.alloc(ThreadBlock, blocks.len) catch return .{ .inside = blocks, .outside = &.{} };
+    const outside = ui.arena.alloc(ThreadBlock, blocks.len) catch return .{ .inside = blocks, .outside = &.{} };
+    var ni: usize = 0;
+    var no: usize = 0;
+    for (blocks) |block| {
+        // The conversation is placed by whoever opened it: a stranger's reply is
+        // held below even when someone followed answers inside it.
+        if (inFollowGraph(block.parent.pubkey)) {
+            inside[ni] = block;
+            ni += 1;
+        } else {
+            outside[no] = block;
+            no += 1;
+        }
+    }
+    return .{ .inside = inside[0..ni], .outside = outside[0..no] };
+}
+
+/// Whether a pubkey is inside the reader's follow graph: the accounts whose
+/// replies rank first in a thread. That is the live follow list, which is the
+/// starter pack until following writes a contact list of its own, plus the reader.
+pub fn inFollowGraph(pubkey: [32]u8) bool {
+    if (activePubkey()) |me| {
+        if (std.mem.eql(u8, &me, &pubkey)) return true;
+    }
+    for (starter_pack) |followed| {
+        if (std.mem.eql(u8, &followed, &pubkey)) return true;
+    }
+    return false;
+}
+
 /// Groups the arranged (depth-stamped, conversation-ordered) replies into blocks.
 /// The arrangement is a DFS, so a parent's subtree is contiguous: everything at
 /// depth 2 until the next top-level reply is a child, and anything deeper counts
@@ -5229,6 +5404,39 @@ fn nestedHandle(ui: *AppUi, note: *const Note) AppUi.Node {
         .{ .style = .{ .foreground = theme.palette.accent_identity } },
         &.{.{ .text = handle, .scale = nested_meta_scale }},
     );
+}
+
+/// The line that holds the strangers: how many replies came from outside the
+/// follow graph, and a press that shows them. They are never deleted, only held,
+/// which is what the line says.
+fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        vgap(ui, 2),
+        ui.row(.{
+            .cross = .center,
+            .gap = 0,
+            .on_press = .toggle_outside_replies,
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "Replies from outside your graph", .focusable = true },
+        }, .{
+            hgap(ui, 52),
+            // A runtime choice of glyph, so  (which resolves built-ins by
+            // name) rather than the comptime-checked .
+            ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_dim } }, if (open) "chevron-up" else "eye"),
+            hgap(ui, 6),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = pluralize(ui, count, "{d} reply from outside your graph", "{d} replies from outside your graph"), .scale = stat_scale }},
+            ),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = "held below, never deleted", .monospace = true, .scale = mono_meta_scale }},
+            ),
+        }),
+        vgap(ui, 12),
+    });
 }
 
 /// The line under a page of replies: how many conversations are still folded, and
@@ -6916,6 +7124,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // the feed. What it CAN do is make sure nothing is stale before the
         // reader looks: force the next tick to rebuild from the store.
         .show_more_replies => model.thread_page += 1,
+        .toggle_outside_replies => model.thread_outside_open = !model.thread_outside_open,
         .jump_to_newest => {
             g_last_count = std.math.maxInt(usize);
             model.menu = .none;
@@ -7415,6 +7624,8 @@ fn openThread(model: *Model, note_id: i64) void {
 /// open-a-feed-note, open-a-reply, and open-a-quoted-note.
 fn enterThread(model: *Model, root: Note) void {
     model.thread_page = 1;
+    model.thread_outside_open = false;
+    resetThreadArrival();
     if (model.viewing_thread != 0 and model.thread_stack_len < model.thread_stack.len) {
         model.thread_stack[model.thread_stack_len] = model.thread_root;
         model.thread_stack_len += 1;
@@ -7448,6 +7659,8 @@ fn openQuote(model: *Model, id: [32]u8) void {
 /// or returns to the feed (which kept its scroll offset) when the stack is empty.
 fn closeThread(model: *Model) void {
     model.thread_page = 1;
+    model.thread_outside_open = false;
+    resetThreadArrival();
     model.reply_buffer.clear();
     model.thread_notes_len = 0;
     if (model.thread_stack_len > 0) {

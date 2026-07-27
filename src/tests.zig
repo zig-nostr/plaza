@@ -2027,3 +2027,56 @@ test "two children of one reply each keep their own branch count" {
     try testing.expectEqual(@as(usize, 0), blocks[0].deeper[0]);
     try testing.expectEqual(@as(usize, 1), blocks[0].deeper[1]);
 }
+
+test "a late reply lands after what is already read, however old it is" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // Two replies read in the first batch, then one that arrives later but was
+    // WRITTEN before both. Chronology alone would slot it at the top, moving the
+    // ground under a reader mid-thread; arrival order appends it.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 200, 0xAA),
+        threadNote(0xB1, 300, 0xAA),
+        threadNote(0xC1, 100, 0xAA),
+    };
+    notes[0].arrival = 0;
+    notes[1].arrival = 0;
+    notes[2].arrival = 1;
+    main.sortThreadNotesForTest(&notes);
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    try testing.expectEqual(@as(usize, 3), blocks.len);
+    // The first batch keeps its chronological order, and the straggler is last.
+    try testing.expectEqualSlices(u8, &[_]u8{0xA1} ** 32, &blocks[0].parent.event_id);
+    try testing.expectEqualSlices(u8, &[_]u8{0xB1} ** 32, &blocks[1].parent.event_id);
+    try testing.expectEqualSlices(u8, &[_]u8{0xC1} ** 32, &blocks[2].parent.event_id);
+}
+
+test "replies from outside the follow graph are held below, not dropped" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // One reply from a followed account, one from a stranger.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 100, 0xAA),
+        threadNote(0xB1, 110, 0xAA),
+    };
+    notes[0].pubkey = main.starterPackForTest()[0];
+    notes[1].pubkey = [_]u8{0x77} ** 32; // nobody followed
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    const split = main.splitByFollowGraphForTest(&ui, blocks);
+    try testing.expectEqual(@as(usize, 1), split.inside.len);
+    try testing.expectEqual(@as(usize, 1), split.outside.len);
+    // Nothing is lost: every reply is in one tier or the other.
+    try testing.expectEqual(blocks.len, split.inside.len + split.outside.len);
+    try testing.expect(main.inFollowGraph(split.inside[0].parent.pubkey));
+    try testing.expect(!main.inFollowGraph(split.outside[0].parent.pubkey));
+}
