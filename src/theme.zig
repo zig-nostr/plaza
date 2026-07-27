@@ -223,6 +223,12 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.surface = p.surface_card;
             t.colors.surface_subtle = p.surface_subbar;
             t.colors.surface_pressed = p.surface_chip;
+            // The ONE hover state the redesign has (11e, and locked decision 2):
+            // a wash under the whole row, nothing else. It is a control token,
+            // not a colour token, and only the row kinds read it. `menu_item`
+            // falls back to this one when it states nothing of its own, which is
+            // harmless while the menu rows are plain rows (see `menuRow`).
+            t.controls.list_item.hover_background = p.surface_hover;
             t.colors.text = p.text_primary;
             t.colors.text_muted = p.text_muted;
             t.colors.border = p.border_hairline;

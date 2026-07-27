@@ -100,6 +100,34 @@ pub const Painted = struct {
         return .{ .commands = commands[0..builder.len], .layout = layout };
     }
 
+    /// The same view with the widget labelled `label` HOVERED, so a test can ask
+    /// what the pointer resting on a row actually paints. Hover is renderer
+    /// state, not something the view can declare, so it is set on the laid-out
+    /// node and the display list re-emitted from there: the same path the
+    /// runtime takes when the pointer moves.
+    pub fn renderHovered(arena: std.mem.Allocator, model: *const main.Model, label: []const u8) !Painted {
+        var p = try render(arena, model);
+        var hovered = false;
+        // The layout hands back a const view of its nodes; the wash is a
+        // property of the node, so take a mutable slice over the same storage.
+        const nodes = @constCast(p.layout.nodes);
+        for (nodes) |*node| {
+            const name = node.widget.semantics.label;
+            if (name.len == 0 or !std.mem.eql(u8, name, label)) continue;
+            node.widget.state.hovered = true;
+            hovered = true;
+            break;
+        }
+        if (!hovered) return error.NoSuchWidget;
+
+        const tokens = theme.tokens(main.Model)(model);
+        const commands = try arena.alloc(canvas.CanvasCommand, native_sdk.runtime.max_canvas_commands_per_view);
+        var builder = canvas.Builder.init(commands);
+        try canvas.emitWidgetLayout(&builder, p.layout, tokens);
+        p.commands = commands[0..builder.len];
+        return p;
+    }
+
     /// The colour covering (`x`, `y`), or null where nothing paints. The LAST
     /// covering fill wins, which is how the painter's algorithm resolves overlap
     /// on screen, so this is the same answer sampling that pixel would give.

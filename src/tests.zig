@@ -2553,3 +2553,78 @@ test "one level's arrival order does not disturb another's" {
     // The late reply is still last, not back in its written place.
     try testing.expectEqualSlices(u8, &[_]u8{0xA3} ** 32, &a_again[2].event_id);
 }
+
+test "a hovered note row washes, and only when hovered" {
+    // The redesign has exactly one hover state: a wash under the whole row
+    // (11e, locked decision 2). It shipped nowhere. The token was defined and
+    // unused, the pressable rows were layout kinds the renderer paints nothing
+    // for, and the ones that were list items set `quiet_hover`, which the SDK
+    // reads as "no hover fill". None of that is visible in a widget tree.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    model.notes_len = 1;
+
+    // At rest the row paints the window, not a wash.
+    const rest = try painted.Painted.render(arena, &model);
+    const frame = rest.frameOf("Open thread") orelse return error.NoRow;
+    const x = frame.x + frame.width / 2;
+    const y = frame.y + frame.height / 2;
+    try testing.expect(!rest.hasFillAt(x, y, theme.palette.surface_hover));
+
+    // Under the pointer it washes.
+    const hovered = try painted.Painted.renderHovered(arena, &model, "Open thread");
+    try painted.expectFillAt(hovered, x, y, theme.palette.surface_hover);
+}
+
+test "every pressable row in a thread washes under the pointer" {
+    // One row washing proves the token is bound; this proves each row that got
+    // converted actually reads it, since the conversion is per call site and a
+    // row left as a layout kind paints nothing at all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    const author = [_]u8{0x55} ** 32;
+    model.thread_root.pubkey = author;
+    // Two conversations, one with a nested child, so a reply block, a nested
+    // reply and a branch line are all on screen.
+    model.thread_notes[0] = threadNote(0x10, 200, 0xAA);
+    model.thread_notes[0].pubkey = author;
+    model.thread_notes[0].id = 10;
+    model.thread_notes[1] = threadNote(0x11, 300, 0x10);
+    model.thread_notes[1].pubkey = author;
+    model.thread_notes[1].id = 11;
+    model.thread_notes_len = 2;
+
+    // The row washes.
+    const row = try painted.Painted.renderHovered(arena, &model, "Open thread");
+    const frame = row.frameOf("Open thread") orelse return error.NoRow;
+    // Somewhere inside it: the centre can be covered by a child (an avatar, a
+    // picture), and the wash is what sits underneath.
+    if (!row.hasFillAt(frame.x + 4, frame.y + frame.height / 2, theme.palette.surface_hover)) {
+        return error.NoHoverWash;
+    }
+
+    // A verb inside it does NOT: the redesign washes the row, not the control
+    // the pointer happens to be over (locked decision 2, and 11e draws the
+    // engagement strip at its resting state under a hovered row). An inner
+    // control that washed on its own would put two highlights on one row.
+    const verb = try painted.Painted.renderHovered(arena, &model, "Reply");
+    const verb_frame = verb.frameOf("Reply") orelse return error.NoVerb;
+    try testing.expect(!verb.hasFillAt(
+        verb_frame.x + verb_frame.width / 2,
+        verb_frame.y + verb_frame.height / 2,
+        theme.palette.surface_hover,
+    ));
+}
