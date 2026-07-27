@@ -2271,3 +2271,93 @@ test "the rail between two discs actually paints" {
     const top = main.ancestor_top_pad + main.avatar_size + 4;
     try testing.expect(p.hasFillAt(x, top + 6, theme.palette.border_hairline));
 }
+
+test "nip10Root names what the ghost row is missing" {
+    // The ghost row says "Root note not on your relays yet" only when the id the
+    // chain stops below IS the thread's root, so the claim is only as good as
+    // this.
+    const root_hex = "01" ** 32;
+    const mid_hex = "02" ** 32;
+    const quote_hex = "03" ** 32;
+    const root_id = [_]u8{0x01} ** 32;
+
+    // A marked root wins wherever it sits, and a marked reply is never the root.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", mid_hex, "", "reply" },
+            &.{ "e", root_hex, "wss://r", "root" },
+        };
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Root(&tags).?));
+    }
+    // Positional (the deprecated scheme): the FIRST e tag is the root, which is
+    // the opposite end from the parent.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", root_hex, "" },
+            &.{ "e", mid_hex, "" },
+        };
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Root(&tags).?));
+    }
+    // A quoted note is not an ancestor, so it never stands in for the root.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", quote_hex, "", "mention" }};
+        try testing.expect(main.nip10Root(&tags) == null);
+    }
+    // A root's own tags name no root, which is how the walk knows it arrived.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "p", "ab" ** 32 }};
+        try testing.expect(main.nip10Root(&tags) == null);
+    }
+}
+
+test "a deep back-stack still lays out" {
+    // The SDK REFUSES a view past `max_canvas_widget_nodes_per_view`, whole: not
+    // a truncated frame, no frame at all. Every mounted level used to build its
+    // own rows, so six levels of a busy thread crossed the ceiling and the window
+    // went blank. Occluded levels build nothing now, and this is the guard.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    const author = [_]u8{0x55} ** 32;
+    model.thread_root.pubkey = author;
+
+    // A page of conversation: twenty replies with two nested children each, all
+    // by the thread's own author so none of them are held below the graph line.
+    var n: usize = 0;
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        model.thread_notes[n] = threadNote(0x10 + i, 200 + @as(i64, i), 0xAA);
+        model.thread_notes[n].pubkey = author;
+        model.thread_notes[n].id = @as(i64, i) + 10;
+        n += 1;
+        var k: u8 = 0;
+        while (k < 2) : (k += 1) {
+            model.thread_notes[n] = threadNote(0x60 + i * 2 + k, 300 + @as(i64, i), 0x10 + i);
+            model.thread_notes[n].pubkey = author;
+            model.thread_notes[n].id = 1000 + @as(i64, i) * 2 + @as(i64, k);
+            n += 1;
+        }
+    }
+    model.thread_notes_len = n;
+
+    for (0..main.thread_depth_max) |d| {
+        model.thread_stack[d] = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0);
+        model.thread_stack[d].id = 500 + @as(i64, @intCast(d));
+        model.thread_stack[d].pubkey = author;
+    }
+    // Every depth the stack can reach, including full.
+    for (0..main.thread_depth_max + 1) |depth| {
+        model.thread_stack_len = depth;
+        const p = painted.Painted.render(arena, &model) catch |err| {
+            std.debug.print("back-stack depth {d} refused: {s}\n", .{ depth, @errorName(err) });
+            return err;
+        };
+        try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
+    }
+}

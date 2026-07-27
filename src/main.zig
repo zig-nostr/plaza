@@ -98,7 +98,7 @@ const feed_page = 60;
 // built (the visible thread) is the one that breaks). The feed plus six
 // ancestors plus the current level is exactly eight.
 const thread_reply_cap = 100;
-const thread_depth_max = 6;
+pub const thread_depth_max = 6;
 // How long a thread shows loading skeletons before giving up if the reply fetch
 // never signals completion (a relay that never sends EOSE), so a reply-less note
 // never stalls under skeletons forever.
@@ -4484,7 +4484,7 @@ pub const Msg = union(enum) {
     /// Open a note's thread (by id): the focused note and its replies.
     open_thread: i64,
     /// Open a quoted event as a thread (by its full 32-byte id).
-    open_quote: [32]u8,
+    open_event: [32]u8,
     /// Leave the thread back to the feed.
     close_thread,
     /// A text edit in the thread's reply composer.
@@ -4498,7 +4498,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "open_quote", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -4995,7 +4995,7 @@ fn ancestorBodyLines(note: *const Note) f32 {
 /// every reply of every level and blew straight through it). The list id is
 /// the level key, so a level's scroll identity is stable as it moves between
 /// current and ancestor.
-fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []const Note, thread_loading: bool, level_key: u64, level: usize) AppUi.Node {
+fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []const Note, thread_loading: bool, level_key: u64, level: usize, occluded: bool) AppUi.Node {
     // While the first fetch is out with nothing in hand, a few skeleton rows say
     // "replies are coming"; once it has come back empty, a quiet line instead of
     // a lone root over blank space.
@@ -5040,10 +5040,22 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
         .semantics = .{ .label = "Thread" },
     };
     const window = ui.virtualWindow(options);
-    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.column(.{}, .{});
-    for (rows, 0..) |*row, offset| row.* = threadRowAt(ui, rows_ctx, window.start_index + offset);
+    // An OCCLUDED level is behind an opaque panel: it is mounted to keep its
+    // scroll offset, and nothing it builds can be seen. So it builds nothing.
+    // The offset survives on the list's id and its content height, which comes
+    // from the row COUNT and the estimates, not from the rows, so the walk back
+    // still lands where the reader left. This is not only cheaper, it is what
+    // keeps a deep back-stack inside the 1024-node ceiling: a view past it is
+    // REFUSED whole, and six mounted levels of a busy thread crossed it.
+    const rows = if (occluded)
+        &[_]AppUi.Node{}
+    else blk: {
+        const built = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.column(.{}, .{});
+        for (built, 0..) |*row, offset| row.* = threadRowAt(ui, rows_ctx, window.start_index + offset);
+        break :blk built;
+    };
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        threadHeader(ui, model),
+        if (occluded) ui.spacer(0) else threadHeader(ui, model),
         ui.virtualList(options, window, .{rows}),
     });
 }
@@ -5704,9 +5716,12 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
         // would draw nothing.
         ui.row(.{
             .gap = 0,
-            .on_press = Msg{ .open_thread = note.id },
+            // By EVENT id: an ancestor is neither in the feed nor in the open
+            // thread's replies, so the render key `open_thread` resolves through
+            // would find nothing and the press would quietly do nothing.
+            .on_press = Msg{ .open_event = note.event_id },
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .label = "Open thread" },
+            .semantics = .{ .role = .button, .label = "Focus this note" },
         }, .{
             hgap(ui, thread_inset),
             ui.column(.{ .cross = .center, .gap = 0 }, .{
@@ -5958,9 +5973,12 @@ fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
                 &.{.{ .text = pluralize(ui, count, "{d} reply from outside your graph", "{d} replies from outside your graph"), .scale = meta_scale }},
             ),
             hgap(ui, 7),
+            // What the line is doing right now: holding them, or having shown
+            // them. Saying "held below" under replies that are on screen would
+            // be the same kind of stale label the round keeps finding.
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_dim } },
-                &.{.{ .text = "held below, never deleted", .monospace = true, .scale = mono_meta_scale }},
+                &.{.{ .text = if (open) "shown, below your graph" else "held below, never deleted", .monospace = true, .scale = mono_meta_scale }},
             ),
         }),
         vgap(ui, 12),
@@ -6118,10 +6136,10 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
         for (0..model.thread_stack_len) |d| {
             const root = &model.thread_stack[d];
             const lk = threadLevelKey(d, root.id);
-            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d));
+            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
-        kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len));
+        kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
         break :blk ui.stack(.{ .grow = 1 }, .{kids});
     } else feed;
 
@@ -7154,7 +7172,7 @@ fn quoteCard(ui: *AppUi, id: [32]u8) AppUi.Node {
     const hexdigits = "0123456789abcdef";
     var pressable = card_style;
     pressable.quiet_hover = true;
-    return ui.el(.card, .{ .on_press = Msg{ .open_quote = id }, .style = pressable, .semantics = .{ .role = .button, .label = "Quoted note" } }, .{
+    return ui.el(.card, .{ .on_press = Msg{ .open_event = id }, .style = pressable, .semantics = .{ .role = .button, .label = "Quoted note" } }, .{
         ui.column(.{ .gap = 6, .padding = 12 }, .{
             ui.row(.{ .gap = 6, .cross = .center }, .{
                 ui.avatar(.{ .image = 0, .width = 18, .height = 18, .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 } }, ui.fmt("{c}{c}", .{ hexdigits[q.pubkey[0] >> 4], hexdigits[q.pubkey[0] & 0x0f] })),
@@ -7764,7 +7782,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
-        .open_quote => |id| openQuote(model, id),
+        .open_event => |id| openEvent(model, id),
         .close_thread => closeThread(model),
         .reply_edit => |edit| model.reply_buffer.apply(edit),
         .reply_submit => publishReply(model, fx),
@@ -8178,11 +8196,13 @@ fn enterThread(model: *Model, root: Note) void {
     fetchThreadReplies(root.event_id, seq);
 }
 
-/// Opens a quoted event (by its full id) as a thread. The quoted note may be in
-/// neither the feed nor the open thread, so it is read straight from the store
-/// (a non-loaded quote card is not pressable, so this only ever fires for an
-/// event already ingested).
-fn openQuote(model: *Model, id: [32]u8) void {
+/// Opens an event (by its full id) as a thread, reading it straight from the
+/// store. `openThread` cannot: it resolves the render key through the feed and
+/// the open thread, and a quoted note or an ANCESTOR is in neither. Both press
+/// this instead, and both only ever fire for an event already ingested (an
+/// unresolved quote card is not pressable, and an ancestor row exists because
+/// the walk found the event).
+fn openEvent(model: *Model, id: [32]u8) void {
     const store = g_store orelse return;
     var se = (store.getEvent(std.heap.page_allocator, id) catch return) orelse return;
     defer se.deinit();
