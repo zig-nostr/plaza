@@ -1948,38 +1948,82 @@ test "a latency reading survives only as long as its connection" {
     try testing.expectEqual(@as(?u16, null), main.relayRttMs(0));
 }
 
-test "ZZ measure focal note layout" {
+test "a thread groups into one block per conversation, with the branch counted" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena_state.allocator());
 
-    var model = main.initialModel();
-    model.stage = .ready;
-    model.viewing_thread = 1;
-    model.thread_root = main.findQuoteRefForTest("Shipping it: the feed renders from disk before the window finishes opening. No spinner, because there is nothing to wait for.");
-    model.thread_root.id = 1;
-    model.thread_root.created_at = 1_800_000_000;
-    // two replies so the empty state does not show
-    model.thread_notes[0] = main.findQuoteRefForTest("Exactly the constraint that makes it fast.");
-    model.thread_notes[0].id = 2;
-    model.thread_notes[1] = main.findQuoteRefForTest("Does the arithmetic still hold when a row embeds a quote card?");
-    model.thread_notes[1].id = 3;
-    model.thread_notes_len = 2;
+    // root
+    //  +- a          (depth 1)  a conversation
+    //  |   +- c      (depth 2)  shown in place under a
+    //  |       +- d  (depth 3)  out of sight, counted against c
+    //  +- b          (depth 1)  a second conversation, nothing under it
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 100, 0xAA),
+        threadNote(0xB1, 110, 0xAA),
+        threadNote(0xC1, 120, 0xA1),
+        threadNote(0xD1, 130, 0xC1),
+    };
+    main.arrangeThread(&notes, root);
 
-    const p = try painted.Painted.render(arena, &model);
-    std.debug.print("\n--- nodes width==640 ---\n", .{});
-    for (p.layout.nodes) |node| {
-        const f = node.widget.frame;
-        if (@abs(f.width - 620) < 0.5 or @abs(f.width - 612) < 0.5) {
-            std.debug.print("kind={s:<12} x={d:.2} y={d:.2} w={d:.2} h={d:.2} label={s}\n", .{ @tagName(node.widget.kind), f.x, f.y, f.width, f.height, node.widget.semantics.label });
-        }
-    }
-    std.debug.print("--- labelled nodes ---\n", .{});
-    for (p.layout.nodes) |node| {
-        const f = node.widget.frame;
-        const l = node.widget.semantics.label;
-        if (l.len > 0) {
-            std.debug.print("kind={s:<12} x={d:.2} y={d:.2} w={d:.2} h={d:.2} label={s}\n", .{ @tagName(node.widget.kind), f.x, f.y, f.width, f.height, l });
-        }
-    }
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    // Two conversations, not four notes: that is what a page of a thread counts.
+    try testing.expectEqual(@as(usize, 2), blocks.len);
+
+    // The first carries its one visible child, and the child reports the reply
+    // hanging below it that the block does not draw.
+    try testing.expectEqual(@as(usize, 1), blocks[0].children.len);
+    try testing.expectEqualSlices(u8, &[_]u8{0xC1} ** 32, &blocks[0].children[0].event_id);
+    try testing.expectEqual(@as(usize, 1), blocks[0].deeper[0]);
+
+    // The second is a leaf: no children, nothing counted.
+    try testing.expectEqual(@as(usize, 0), blocks[1].children.len);
+    try testing.expectEqual(@as(usize, 0), blocks[1].deeper.len);
+}
+
+test "a branch several levels deep counts every hidden reply against the child it hangs from" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // One conversation, five levels down. Only the first child shows; the three
+    // below it are the branch.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 100, 0xAA),
+        threadNote(0xC1, 110, 0xA1),
+        threadNote(0xD1, 120, 0xC1),
+        threadNote(0xE1, 130, 0xD1),
+        threadNote(0xF1, 140, 0xE1),
+    };
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    try testing.expectEqual(@as(usize, 1), blocks.len);
+    try testing.expectEqual(@as(usize, 1), blocks[0].children.len);
+    try testing.expectEqual(@as(usize, 3), blocks[0].deeper[0]);
+}
+
+test "two children of one reply each keep their own branch count" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // a has two replies; only the second continues.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 100, 0xAA),
+        threadNote(0xC1, 110, 0xA1),
+        threadNote(0xC2, 120, 0xA1),
+        threadNote(0xD1, 130, 0xC2),
+    };
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    try testing.expectEqual(@as(usize, 1), blocks.len);
+    try testing.expectEqual(@as(usize, 2), blocks[0].children.len);
+    // The count follows the child it belongs to, not the block.
+    try testing.expectEqual(@as(usize, 0), blocks[0].deeper[0]);
+    try testing.expectEqual(@as(usize, 1), blocks[0].deeper[1]);
 }

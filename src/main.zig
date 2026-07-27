@@ -234,6 +234,18 @@ const thread_inset: f32 = 4;
 const focal_row_chrome: f32 = 16 + avatar_size + 9 + 9 + 20 + 12 + 34 + 35;
 /// The reply field's row, which does not change shape with the thread.
 const reply_row_extent: f32 = 62;
+/// A nested reply's register: a smaller disc, a 13px name, a 13.5 body and 11.5
+/// metadata, all one step under the reply it answers.
+const nested_avatar_size: f32 = 28;
+const nested_name_scale: f32 = 13.0 / 14.5;
+const nested_body_scale: f32 = 13.5 / 14.5;
+const nested_meta_scale: f32 = 11.5 / 14.5;
+const op_chip_scale: f32 = 9.0 / 14.5;
+/// A nested reply minus its body, the branch line, and the show-more line, all
+/// measured in the running app.
+const nested_reply_chrome: f32 = 8 + 20 + 3;
+const branch_more_extent: f32 = 6 + 22;
+const show_more_extent: f32 = 12 + 22 + 10;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
@@ -2178,6 +2190,9 @@ pub const Model = struct {
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
+    /// How many pages of replies the open thread has revealed. Reset whenever a
+    /// thread is entered or left, so a new thread starts at the top of its list.
+    thread_page: usize = 1,
     /// Whether the reader has paused the pool. Reading keeps working: the store
     /// is the app, so a pause stops the sockets, not the feed.
     relays_paused: bool = false,
@@ -4107,6 +4122,8 @@ pub const Msg = union(enum) {
     toggle_relays_paused,
     /// Jump the feed to its newest note.
     jump_to_newest,
+    /// Reveal the next page of a thread's replies.
+    show_more_replies,
     /// Sign out, asked for from the account menu: opens Settings with the
     /// confirmation showing, so the menu never signs anyone out on one press.
     open_settings_logout,
@@ -4533,18 +4550,30 @@ const ThreadRows = struct {
     /// The model, so the composer row can read the draft and the signer state.
     model: *const Model,
     root: *const Note,
-    replies: []const Note,
-    skeletons: usize,
+    /// Top-level replies with their own replies folded in, so ONE row is one
+    /// conversation rather than one note.
+    blocks: []const ThreadBlock,
+    /// How many blocks this page shows, and how many wait behind the line.
+    shown: usize,
+    hidden: usize,
+    skeletons: bool,
     empty: bool,
 
-    /// Row 0 is the focal note, row 1 the reply field, then the replies and any
-    /// placeholder. The field is a ROW rather than a pinned footer because the
-    /// design puts it under the note being answered, where it scrolls with the
-    /// conversation instead of hovering over it.
+    /// Row 0 is the focal note, row 1 the reply field, then one row per shown
+    /// block, then the "show more" line and any placeholder. The field is a ROW
+    /// rather than a pinned footer because the design puts it under the note being
+    /// answered, where it scrolls with the conversation instead of hovering.
     fn count(self: *const ThreadRows) usize {
-        return 2 + self.replies.len + self.skeletons + @intFromBool(self.empty);
+        return 2 + self.shown + @intFromBool(self.hidden > 0) +
+            (if (self.skeletons) thread_skeleton_rows else 0) + @intFromBool(self.empty);
     }
 };
+
+/// How many top-level replies a page of a thread shows, and how many more each
+/// press of the line reveals. No shot states a number; twenty is a long read
+/// already, and the line says exactly how many are behind it.
+const thread_page_size: usize = 20;
+const thread_skeleton_rows: usize = 3;
 
 /// A cheap height estimate for one thread row, sharing the feed's note math.
 fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
@@ -4556,7 +4585,18 @@ fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     // The reply field: a fixed shape whatever the thread holds.
     if (i == 1) return reply_row_extent;
     const ri = i - 2;
-    if (ri < rows.replies.len) return noteRowEstimate(&rows.replies[ri], thread_reply_chrome);
+    // A block is its top-level reply plus the level of conversation under it, so
+    // it is priced as the sum: one reply's chrome and body, then each child's.
+    if (ri < rows.shown) {
+        const block = &rows.blocks[ri];
+        var extent = noteRowEstimate(block.parent, thread_reply_chrome);
+        for (block.children, block.deeper) |*child, deeper| {
+            extent += noteRowEstimate(child, nested_reply_chrome) * nested_body_scale;
+            if (deeper > 0) extent += branch_more_extent;
+        }
+        return extent;
+    }
+    if (ri == rows.shown and rows.hidden > 0) return show_more_extent;
     // A skeleton or the empty line: one fixed-shape row.
     return thread_skeleton_extent;
 }
@@ -4577,7 +4617,19 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
     const loading = replies.len == 0 and thread_loading;
     const empty = replies.len == 0 and !thread_loading;
     const rows_ctx = ui.arena.create(ThreadRows) catch return ui.column(.{}, .{});
-    rows_ctx.* = .{ .model = model, .root = root, .replies = replies, .skeletons = if (loading) 3 else 0, .empty = empty };
+    // Group first, then page: a page is twenty CONVERSATIONS, not twenty notes, so
+    // a reply with a busy branch counts once.
+    const blocks = groupThreadBlocks(ui, replies);
+    const shown = @min(blocks.len, model.thread_page * thread_page_size);
+    rows_ctx.* = .{
+        .model = model,
+        .root = root,
+        .blocks = blocks,
+        .shown = shown,
+        .hidden = blocks.len - shown,
+        .skeletons = loading,
+        .empty = empty,
+    };
     const options: AppUi.VirtualListOptions = .{
         .id = ui.fmt("thread-{d}", .{level_key}),
         .item_count = rows_ctx.count(),
@@ -4610,7 +4662,8 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         if (index == 0) break :blk threadRoot(ui, rows_ctx.root);
         if (index == 1) break :blk replyComposer(ui, rows_ctx.model, rows_ctx.root);
         const ri = index - 2;
-        if (ri < rows_ctx.replies.len) break :blk replyRow(ui, &rows_ctx.replies[ri], rows_ctx.root.pubkey);
+        if (ri < rows_ctx.shown) break :blk replyBlock(ui, &rows_ctx.blocks[ri], rows_ctx.root.pubkey, ri == 0, ri + 1 == rows_ctx.shown and rows_ctx.hidden == 0);
+        if (ri == rows_ctx.shown and rows_ctx.hidden > 0) break :blk showMoreReplies(ui, rows_ctx.hidden);
         if (rows_ctx.empty) break :blk threadEmptyNote(ui);
         break :blk replySkeleton(ui);
     };
@@ -4622,7 +4675,7 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         if (index == 0) break :blk @intCast(rows_ctx.root.id);
         if (index >= 2) {
             const ri = index - 2;
-            if (ri < rows_ctx.replies.len) break :blk @intCast(rows_ctx.replies[ri].id);
+            if (ri < rows_ctx.shown) break :blk @intCast(rows_ctx.blocks[ri].parent.id);
         }
         break :blk (@as(u64, 1) << 63) | @as(u64, index);
     } };
@@ -4953,6 +5006,57 @@ fn focalVerb(ui: *AppUi, glyph: []const u8, label: []const u8, press: ?Msg, tint
     });
 }
 
+/// One top-level reply and what hangs off it. The redesign shows exactly one
+/// level of nesting in place: a reply, the replies to THAT reply, and then a line
+/// saying how much of the branch continues out of sight. Deeper than that is a
+/// thread of its own, which is what pressing the line opens.
+pub const ThreadBlock = struct {
+    parent: *const Note,
+    /// The parent's direct replies, contiguous in the arranged order.
+    children: []const Note,
+    /// Per child, how many of ITS descendants are not drawn. Parallel to
+    /// `children`, so a branch says so under the reply it continues from.
+    deeper: []const usize,
+};
+
+/// Groups the arranged (depth-stamped, conversation-ordered) replies into blocks.
+/// The arrangement is a DFS, so a parent's subtree is contiguous: everything at
+/// depth 2 until the next top-level reply is a child, and anything deeper counts
+/// against the child it hangs beneath.
+pub fn groupThreadBlocks(ui: *AppUi, notes: []const Note) []const ThreadBlock {
+    if (notes.len == 0) return &.{};
+    const blocks = ui.arena.alloc(ThreadBlock, notes.len) catch return &.{};
+    const deeper_pool = ui.arena.alloc(usize, notes.len) catch return &.{};
+    var block_count: usize = 0;
+    var pool_used: usize = 0;
+    var i: usize = 0;
+    while (i < notes.len) {
+        const parent = &notes[i];
+        i += 1;
+        const child_start = i;
+        var child_count: usize = 0;
+        while (i < notes.len and notes[i].depth >= 2) {
+            if (notes[i].depth == 2) {
+                deeper_pool[pool_used + child_count] = 0;
+                child_count += 1;
+            } else if (child_count > 0) {
+                // Deeper than the one level shown: counted against the child whose
+                // branch it continues.
+                deeper_pool[pool_used + child_count - 1] += 1;
+            }
+            i += 1;
+        }
+        blocks[block_count] = .{
+            .parent = parent,
+            .children = notes[child_start..][0..child_count],
+            .deeper = deeper_pool[pool_used..][0..child_count],
+        };
+        block_count += 1;
+        pool_used += child_count;
+    }
+    return blocks[0..block_count];
+}
+
 /// How many indent steps a reply at `depth` shows. Direct replies (depth 1)
 /// sit flush; each further level steps in once, capped so a long back-and-forth
 /// never squeezes the text to a sliver; past the cap, deeper replies share the
@@ -4990,47 +5094,192 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
 /// hairline lives INSIDE the content column: it starts after the gutter (so it
 /// aligns with the content it separates) and the gutter's rails span the
 /// wrapper's full height across it, keeping a sibling run's rail continuous.
-fn replyRow(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
+/// One top-level reply and the level of conversation under it. The block draws
+/// the reply at note size against a rail, then each of its own replies at a
+/// smaller register hanging off that rail, then a line for whatever the branch
+/// continues into.
+///
+/// The rail replaces the round-4 indent gutter: the redesign nests ONE level in
+/// place and sends the rest to their own thread, rather than stepping every reply
+/// further right until the text runs out of room.
+fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
     const p = theme.palette;
-    const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
-    const levels = threadIndentLevels(note.depth);
-    // A fixed-width column, centred by the scroll column's `cross = .center`.
-    // Neither wrapper may `grow` (that would grow it vertically in the scroll's
-    // column and overlap the next reply); inside the wrapper ROW, though,
-    // `grow` spreads WIDTH, which is how the content column takes whatever the
-    // gutter leaves.
-    var node = ui.column(.{ .width = thread_column_width }, .{
-        ui.row(.{ .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Open thread" } }, .{
-            threadGutter(ui, levels),
-            ui.column(.{ .grow = 1 }, .{
-                ui.row(.{ .gap = 12, .cross = .start, .padding = 14 }, .{
-                    noteAvatar(ui, note),
-                    ui.column(.{ .gap = 5, .grow = 1 }, .{
-                        ui.row(.{ .gap = 6, .cross = .center }, .{
-                            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium }}),
-                            if (note.verified()) ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.status_success } }, "check-circle") else ui.spacer(0),
-                            if (is_author)
-                                // "OP" in the house sans, not a lowercase mono "author":
-                                // the mono run read like a code token beside the name.
-                                ui.row(.{ .padding = 3, .style = .{ .background = p.surface_chip, .radius = 5 } }, .{
-                                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "OP", .scale = 0.78 }}),
-                                })
-                            else
-                                ui.spacer(0),
-                            identityHandle(ui, note, true),
-                            ui.text(.{ .style = .{ .foreground = p.text_faint_alt } }, note.time()),
-                        }),
-                        noteBody(ui, note, true),
-                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
-                        engagementRow(ui, note),
-                    }),
-                }),
-                ui.separator(.{ .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
+    const note = block.parent;
+    const kids = ui.arena.alloc(AppUi.Node, block.children.len * 2) catch return ui.spacer(0);
+    var n: usize = 0;
+    for (block.children, block.deeper) |*child, deeper| {
+        kids[n] = nestedReply(ui, child, root_author);
+        n += 1;
+        if (deeper > 0) {
+            kids[n] = branchMore(ui, child, deeper);
+            n += 1;
+        }
+    }
+
+    var node = ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        // The first block takes the full-width rule that separates the replies
+        // from the note they answer; between blocks the rule is inset to the text,
+        // so the rails run unbroken down the gutter.
+        if (first)
+            ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } })
+        else
+            ui.spacer(0),
+        vgap(ui, 12),
+        ui.row(.{
+            .gap = 0,
+            .cross = .start,
+            .on_press = Msg{ .open_thread = note.id },
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .label = "Open thread" },
+        }, .{
+            hgap(ui, thread_inset),
+            // The disc, with the rail below it: the line a reply's own replies
+            // hang from, drawn by the column stretching to the block's height.
+            ui.column(.{ .cross = .center, .gap = 0 }, .{
+                noteAvatar(ui, note),
+                vgap(ui, 4),
+                ui.separator(.{ .width = 2, .grow = 1, .style = .{ .foreground = p.border_hairline, .background = p.border_hairline } }),
             }),
+            hgap(ui, avatar_to_text_gap),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                ui.row(.{ .gap = 6, .cross = .start }, .{
+                    identityBlock(ui, note),
+                    ui.spacer(1),
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+                }),
+                vgap(ui, 5),
+                noteBody(ui, note, true),
+                if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
+                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                vgap(ui, 8),
+                engagementRow(ui, note),
+                ui.column(.{ .gap = 0 }, .{kids[0..n]}),
+                vgap(ui, if (last) 4 else 12),
+                // The rule between blocks starts at the text, not the window edge,
+                // so the rail crosses it without a break. The last block draws
+                // none: a rule with nothing under it is a dangling line, and its
+                // trailing space is what tips a thread that fits into reporting
+                // more content than it draws.
+                if (last)
+                    ui.spacer(0)
+                else
+                    ui.separator(.{ .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
+            }),
+            hgap(ui, thread_inset),
         }),
     });
     node.key = .{ .int = @intCast(note.id) };
     return node;
+}
+
+/// A reply to a reply: the one level of nesting the redesign draws in place, at a
+/// smaller disc and a smaller register than the reply it answers.
+fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{
+            .gap = 0,
+            .cross = .start,
+            .on_press = Msg{ .open_thread = note.id },
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .label = "Open thread" },
+        }, .{
+            avatarDisc(ui, note, nested_avatar_size),
+            hgap(ui, 10),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = note.author(), .weight = .medium, .scale = nested_name_scale }}),
+                    // The original poster, marked in their own thread. In the
+                    // author's avatar tint, so the chip reads as them.
+                    if (is_author) opChip(ui, note.pubkey) else ui.spacer(0),
+                    if (note.verified())
+                        ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.status_success } }, "check-circle")
+                    else
+                        ui.spacer(0),
+                    nestedHandle(ui, note),
+                    ui.spacer(1),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = nested_meta_scale }}),
+                }),
+                vgap(ui, 3),
+                noteBodyAt(ui, note, true, nested_body_scale, p.text_nested),
+            }),
+        }),
+    });
+}
+
+/// The OP chip: the thread's author, marked where they answer inside it.
+fn opChip(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
+    const tint = avatarTint(pubkey);
+    return ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = tint.bg, .border = tint.border, .radius = 4, .stroke_width = 1 } }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, 5),
+            ui.paragraph(.{ .style = .{ .foreground = tint.glyph } }, &.{.{ .text = "OP", .weight = .medium, .monospace = true, .scale = op_chip_scale }}),
+            hgap(ui, 5),
+        }),
+    });
+}
+
+/// A nested reply's handle, one register below the reply it answers.
+fn nestedHandle(ui: *AppUi, note: *const Note) AppUi.Node {
+    const handle = note.handle(ui.arena);
+    if (handle.len == 0) return ui.spacer(0);
+    return ui.paragraph(
+        .{ .style = .{ .foreground = theme.palette.accent_identity } },
+        &.{.{ .text = handle, .scale = nested_meta_scale }},
+    );
+}
+
+/// The line under a page of replies: how many conversations are still folded, and
+/// a press that reveals the next page.
+fn showMoreReplies(ui: *AppUi, hidden: usize) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+        vgap(ui, 12),
+        ui.row(.{
+            .cross = .center,
+            .gap = 0,
+            .on_press = .show_more_replies,
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "Show more replies", .focusable = true },
+        }, .{
+            hgap(ui, 52),
+            ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_muted } }, "chevron-down"),
+            hgap(ui, 7),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = pluralize(ui, hidden, "Show {d} more reply", "Show {d} more replies"), .weight = .medium, .scale = stat_scale }},
+            ),
+        }),
+        vgap(ui, 10),
+    });
+}
+
+/// What a branch continues into: how many replies hang below the level shown, and
+/// a press that opens that reply as its own thread, where they all fit.
+fn branchMore(ui: *AppUi, child: *const Note, deeper: usize) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 6),
+        ui.row(.{
+            .cross = .center,
+            .gap = 0,
+            .on_press = Msg{ .open_thread = child.id },
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "More in this branch", .focusable = true },
+        }, .{
+            // Indented to the nested rail, so the line reads as part of the branch
+            // it belongs to.
+            hgap(ui, nested_avatar_size + 10),
+            ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_muted } }, "arrow-right"),
+            hgap(ui, 6),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = ui.fmt("More in this branch · {d}", .{deeper}), .weight = .medium, .scale = stat_scale }},
+            ),
+        }),
+    });
 }
 
 /// The pinned reply composer at the bottom of a thread: type a reply and send it
@@ -6666,6 +6915,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // There is no API to set a list's scroll offset, so this cannot scroll
         // the feed. What it CAN do is make sure nothing is stale before the
         // reader looks: force the next tick to rebuild from the store.
+        .show_more_replies => model.thread_page += 1,
         .jump_to_newest => {
             g_last_count = std.math.maxInt(usize);
             model.menu = .none;
@@ -7164,6 +7414,7 @@ fn openThread(model: *Model, note_id: i64) void {
 /// the back-stack, snapshots the new root, and fires its reply fetch. Shared by
 /// open-a-feed-note, open-a-reply, and open-a-quoted-note.
 fn enterThread(model: *Model, root: Note) void {
+    model.thread_page = 1;
     if (model.viewing_thread != 0 and model.thread_stack_len < model.thread_stack.len) {
         model.thread_stack[model.thread_stack_len] = model.thread_root;
         model.thread_stack_len += 1;
@@ -7196,6 +7447,7 @@ fn openQuote(model: *Model, id: [32]u8) void {
 /// Closes the open thread: pops the back-stack to the thread it was opened from,
 /// or returns to the feed (which kept its scroll offset) when the stack is empty.
 fn closeThread(model: *Model) void {
+    model.thread_page = 1;
     model.reply_buffer.clear();
     model.thread_notes_len = 0;
     if (model.thread_stack_len > 0) {
