@@ -216,6 +216,12 @@ const rail_gap: f32 = 8;
 /// of the 14.5 body, since the size enum only steps by one.
 const scope_title_scale: f32 = 13.5 / 14.5;
 const mono_meta_scale: f32 = 10.5 / 14.5;
+/// The status bar's 11.5px register, and the menus' 12 / 12.5 / 11 / 9.5.
+const status_scale: f32 = 11.5 / 14.5;
+const menu_scale: f32 = 12.5 / 14.5;
+const mono_row_scale: f32 = 11.5 / 14.5;
+const mono_hint_scale: f32 = 11.0 / 14.5;
+const mono_badge_scale: f32 = 9.5 / 14.5;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
@@ -313,6 +319,69 @@ var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromE
 /// Sets relay `index`'s live connection state.
 fn setRelayStatus(index: usize, state: Conn) void {
     g_relay_status[index].store(@intFromEnum(state), .monotonic);
+}
+
+/// Whether the reader has paused the pool. Read by every relay thread between
+/// reconnect attempts, so a pause takes hold without tearing a socket down
+/// mid-message.
+var g_relays_paused = std.atomic.Value(bool).init(false);
+
+fn setRelaysPaused(paused: bool) void {
+    g_relays_paused.store(paused, .monotonic);
+}
+
+pub fn relaysPaused() bool {
+    return g_relays_paused.load(.monotonic);
+}
+
+/// A relay's round-trip time in milliseconds, sampled REQ to EOSE and kept as a
+/// small ring so the bar can show a median rather than the last spike. Zero means
+/// no sample yet.
+const rtt_samples = 8;
+var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** relays.len;
+var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** relays.len;
+
+/// Records one round trip for relay `index`.
+fn recordRelayRtt(index: usize, ms: u64) void {
+    if (index >= relays.len) return;
+    const slot = g_relay_rtt_at[index].load(.monotonic) % rtt_samples;
+    g_relay_rtt[index][slot].store(@intCast(@min(ms, std.math.maxInt(u16))), .monotonic);
+    g_relay_rtt_at[index].store(slot +% 1, .monotonic);
+}
+
+/// Relay `index`'s median round trip, or null when it has never answered.
+pub fn relayRttMs(index: usize) ?u16 {
+    if (index >= relays.len) return null;
+    var seen: [rtt_samples]u16 = undefined;
+    var n: usize = 0;
+    for (&g_relay_rtt[index]) |*sample| {
+        const v = sample.load(.monotonic);
+        if (v != 0) {
+            seen[n] = v;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    std.mem.sort(u16, seen[0..n], {}, std.sort.asc(u16));
+    return seen[n / 2];
+}
+
+/// The pool's latency: the median across every relay that has answered. The
+/// redesign asks for the median WRITE relay, the number that predicts how fast a
+/// post lands; until a relay list with read/write markers exists, every relay in
+/// the pool is both, so this is that number.
+pub fn poolLatencyMs() ?u16 {
+    var seen: [relays.len]u16 = undefined;
+    var n: usize = 0;
+    for (0..relays.len) |i| {
+        if (relayRttMs(i)) |ms| {
+            seen[n] = ms;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    std.mem.sort(u16, seen[0..n], {}, std.sort.asc(u16));
+    return seen[n / 2];
 }
 // The UI thread's Io, for wall-clock time when rendering relative timestamps
 // (set once in `main`, read only on the UI thread).
@@ -2012,6 +2081,12 @@ pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
     notes_len: usize = 0,
     live_relays: usize = 0,
+    /// Which chrome menu is open, if any. One at a time: opening one closes the
+    /// rest, and Escape or a press outside closes whatever is open.
+    menu: ChromeMenu = .none,
+    /// Whether the reader has paused the pool. Reading keeps working: the store
+    /// is the app, so a pause stops the sockets, not the feed.
+    relays_paused: bool = false,
     offline_relays: usize = 0,
     // The composer's edit state (text + caret + selection). The view binds the
     // text through `draft()`, never the buffer itself, and every edit event is
@@ -3896,6 +3971,11 @@ fn utf8SafeLen(s: []const u8, max: usize) usize {
 
 // -------------------------------------------------------------------- msg
 
+/// The chrome's anchored menus. These are floating surfaces positioned against
+/// their trigger, so each one is drawn as the trigger's sibling inside a stack
+/// and rendered only while it is the open one.
+pub const ChromeMenu = enum { none, scope, relays, account };
+
 pub const Msg = union(enum) {
     /// The repeating refresh timer fired: reconcile the feed with the store.
     tick: native_sdk.EffectTimer,
@@ -3924,6 +4004,15 @@ pub const Msg = union(enum) {
     close_bunker,
     /// Hide the guest strip for this session.
     dismiss_guest_strip,
+    /// Open one of the chrome's anchored menus (or close it, when it is already
+    /// the open one, so a trigger toggles).
+    toggle_menu: ChromeMenu,
+    /// Close whatever chrome menu is open (Escape, or a press outside it).
+    close_menu,
+    /// Stop talking to the relays until resumed, or start again.
+    toggle_relays_paused,
+    /// Jump the feed to its newest note.
+    jump_to_newest,
     /// A text edit in the name beat's field.
     name_edit: canvas.TextInputEvent,
     /// Publish the chosen name as the account's kind:0 and move on.
@@ -4982,15 +5071,24 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
         vgap(ui, 11),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, chrome_inset),
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = "Starter pack", .weight = .bold, .scale = scope_title_scale }},
-            ),
-            hgap(ui, 7),
-            // The scope is a menu affordance. The menu itself arrives with the
-            // anchored-surface machinery in the status-bar PR; the chevron is
-            // drawn now so the label reads as the control it will be.
-            ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_muted } }, "chevron-down"),
+            // The name AND its chevron are the trigger, so the menu opens under
+            // the word it names rather than off a 11px glyph.
+            ui.stack(.{}, .{
+                ui.row(.{
+                    .cross = .center,
+                    .gap = 7,
+                    .on_press = Msg{ .toggle_menu = .scope },
+                    .style = .{ .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Choose feed", .focusable = true },
+                }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_primary } },
+                        &.{.{ .text = "Starter pack", .weight = .bold, .scale = scope_title_scale }},
+                    ),
+                    ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_muted } }, "chevron-down"),
+                }),
+                if (model.menu == .scope) scopeMenu(ui) else ui.spacer(0),
+            }),
             ui.spacer(1),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_faint_alt } },
@@ -5006,20 +5104,343 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The status bar: the caught-up line on the left (there is no spinner, the feed
 /// renders from disk), relay health on the right after an online dot.
 fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
-    const dot_color = if (model.relays_online()) theme.palette.status_success else theme.palette.text_faint_alt;
-    return ui.column(.{}, .{
-        ui.separator(.{ .style = .{ .foreground = theme.palette.divider_chrome, .background = theme.palette.divider_chrome } }),
-        ui.row(.{ .height = 30, .cross = .center, .gap = 6, .padding = 10 }, .{
-            ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.caught_up(ui.arena)),
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        // Four zones, every one pressable, and colour only where something needs
+        // the reader. The chip row's own inset is 8, and the chips space at 4.
+        ui.row(.{ .height = 30, .cross = .center, .gap = 0 }, .{
+            hgap(ui, 8),
+            // Feed state. Pressing it brings the newest note back to the top.
+            statusChip(ui, .{
+                .press = .jump_to_newest,
+                .label = model.caught_up(ui.arena),
+                .semantics = "Jump to newest",
+            }),
             ui.spacer(1),
-            ui.column(.{ .width = 6, .height = 6, .style = .{ .background = dot_color, .radius = 3 } }, .{}),
-            ui.text(.{ .style = .{ .foreground = theme.palette.text_muted } }, model.relay_health(ui.arena)),
-            if (model.is_guest())
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .open_join }, "Guest")
+            relayZone(ui, model),
+            hgap(ui, 4),
+            signerZone(ui, model),
+            hgap(ui, 8),
+        }),
+    });
+}
+
+/// The scope menu. One entry today, and it is the current one, so this exists to
+/// say what the chevron means rather than to offer a choice: the reader learns
+/// where scopes live before there is a second one to pick.
+fn scopeMenu(ui: *AppUi) AppUi.Node {
+    const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
+    rows[0] = menuRow(ui, "Starter pack", "check", null, .close_menu);
+    // The scope line sits at the top of the window, so its menu drops down.
+    return menuSurfacePlaced(ui, 200, .below, .start, rows);
+}
+
+/// The chrome's floating surface: a menu anchored to the trigger it hangs off.
+///
+/// Anchoring makes the surface leave its parent's flow entirely: it takes no
+/// space in the row, paints in a late window-level pass above everything, and
+/// escapes every ancestor clip, which is what lets a 30px status bar open a
+/// 340px panel. It opens ABOVE, since the bar sits on the floor of the window,
+/// and the runtime flips it if there is no room.
+///
+/// `on_dismiss` is what makes Escape and a press outside close it, so the model
+/// never needs to hear about the click that landed elsewhere.
+fn menuSurface(ui: *AppUi, width: f32, children: []const AppUi.Node) AppUi.Node {
+    // A status-bar menu hangs off the right end of its chip, above the bar.
+    return menuSurfacePlaced(ui, width, .above, .end, children);
+}
+
+/// The same surface with its placement stated, for a trigger that is not on the
+/// floor of the window.
+fn menuSurfacePlaced(ui: *AppUi, width: f32, placement: canvas.WidgetAnchorPlacement, alignment: canvas.WidgetAnchorAlignment, children: []const AppUi.Node) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dropdown_menu, .{
+        .width = width,
+        .anchor = placement,
+        .anchor_alignment = alignment,
+        .anchor_offset = 6,
+        .padding = 5,
+        .on_dismiss = .close_menu,
+        .style = .{ .background = p.surface_menu, .border = p.border_menu, .radius = 9, .stroke_width = 1 },
+    }, .{
+        ui.column(.{ .gap = 0 }, .{children}),
+    });
+}
+
+/// One row in a chrome menu: a label, an optional glyph and an optional trailing
+/// hint, at the redesign's 6 by 9 padding.
+fn menuRow(ui: *AppUi, label: []const u8, glyph: ?[]const u8, hint: ?[]const u8, press: ?Msg) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{
+        .cross = .center,
+        .gap = 0,
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = press != null },
+    }, .{
+        hgap(ui, 9),
+        vgap(ui, 25),
+        if (glyph) |name| ui.appIcon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.text_secondary } }, name) else ui.spacer(0),
+        if (glyph != null) hgap(ui, 9) else ui.spacer(0),
+        ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = label, .scale = menu_scale }}),
+        ui.spacer(1),
+        if (hint) |text|
+            ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = text, .monospace = true, .scale = mono_hint_scale }})
+        else
+            ui.spacer(0),
+        hgap(ui, 9),
+    });
+}
+
+/// A rule between groups of menu rows.
+fn menuSeparator(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 4),
+        ui.row(.{ .gap = 0 }, .{ hgap(ui, 7), ui.separator(.{ .grow = 1, .style = .{ .foreground = p.border_menu, .background = p.border_menu } }), hgap(ui, 7) }),
+        vgap(ui, 4),
+    });
+}
+
+/// The relay popover: every relay in the pool, what it is doing, and how fast it
+/// answers, then the two things a reader can do about it.
+fn relayPopover(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const rows = ui.arena.alloc(AppUi.Node, relays.len + 4) catch return ui.spacer(0);
+    // The header says what the list means, so nobody reads it as a picker.
+    rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+        hgap(ui, 9),
+        vgap(ui, 24),
+        ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = "Relays", .weight = .medium, .scale = menu_scale }}),
+        hgap(ui, 8),
+        ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "reads & writes route automatically", .monospace = true, .scale = mono_meta_scale }}),
+        ui.spacer(1),
+        hgap(ui, 9),
+    });
+    for (relays, 0..) |url, i| {
+        rows[1 + i] = relayRow(ui, url, i, model);
+    }
+    rows[relays.len + 1] = menuSeparator(ui);
+    rows[relays.len + 2] = menuRow(ui, if (model.relays_paused) "Resume Relays" else "Pause Relays", null, null, .toggle_relays_paused);
+    rows[relays.len + 3] = menuRow(ui, "Relay Settings…", null, "Cmd+,", .open_settings);
+    return menuSurface(ui, 340, rows);
+}
+
+/// One relay in the popover: its state as a dot, its host, what it is for, and
+/// how long it took to answer.
+fn relayRow(ui: *AppUi, url: []const u8, index: usize, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const state: Conn = @enumFromInt(g_relay_status[index].load(.monotonic));
+    const paused = model.relays_paused;
+    const connected = state == .connected and !paused;
+    const dot = if (paused)
+        p.text_faint_alt
+    else if (connected)
+        p.status_success
+    else if (state == .connecting)
+        p.status_warning
+    else
+        p.status_offline;
+    // The host alone: the scheme is the same on every row and carries no news.
+    const host = if (std.mem.startsWith(u8, url, "wss://")) url["wss://".len..] else url;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        hgap(ui, 9),
+        vgap(ui, 21),
+        ui.el(.panel, .{ .width = 6, .height = 6, .padding = 0.01, .style = .{ .background = dot, .radius = 3, .stroke_width = 0 } }, .{}),
+        hgap(ui, 8),
+        ui.paragraph(.{ .style = .{ .foreground = if (connected) p.text_body else p.text_muted_alt } }, &.{.{ .text = host, .monospace = true, .scale = mono_row_scale }}),
+        ui.spacer(1),
+        if (connected) relayBadge(ui, "R·W") else ui.spacer(0),
+        if (connected) hgap(ui, 8) else ui.spacer(0),
+        // A connected relay reports its round trip; one that is still dialling or
+        // has dropped says so in words instead of showing a stale number.
+        ui.paragraph(
+            .{ .style = .{ .foreground = if (connected) p.text_muted_alt else p.status_warning_text } },
+            &.{.{
+                .text = if (paused)
+                    "paused"
+                else if (connected)
+                    (if (relayRttMs(index)) |ms| ui.fmt("{d}ms", .{ms}) else "…")
+                else if (state == .connecting)
+                    "connecting"
+                else
+                    "offline",
+                .monospace = true,
+                .scale = mono_meta_scale,
+            }},
+        ),
+        hgap(ui, 9),
+    });
+}
+
+/// The R·W chip on a relay row: what the relay is used for.
+fn relayBadge(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = p.surface_menu, .border = p.border_dashed, .radius = 4, .stroke_width = 1 } }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, 5),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = text, .monospace = true, .scale = mono_badge_scale }}),
+            hgap(ui, 5),
+        }),
+    });
+}
+
+/// The signed-in account's display name, or its npub until a kind:0 arrives.
+fn accountName() []const u8 {
+    if (activePubkey()) |pk| {
+        if (lookupProfile(pk)) |profile| {
+            if (profile.name_len > 0) return profile.name();
+        }
+    }
+    return npubShort();
+}
+
+/// Whether a kind:0 name is known, so the npub is worth showing beneath it.
+fn accountHasName() bool {
+    if (activePubkey()) |pk| {
+        if (lookupProfile(pk)) |profile| return profile.name_len > 0;
+    }
+    return false;
+}
+
+fn npubShort() []const u8 {
+    return g_identity_npub_buf[0..g_identity_npub_len];
+}
+
+/// The account menu: who you are, and the two things to do about it. No mock
+/// draws this, so it is the menu recipe with the identity row on top; flagged in
+/// the PR for review.
+fn accountMenu(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const rows = ui.arena.alloc(AppUi.Node, 4) catch return ui.spacer(0);
+    rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+        hgap(ui, 9),
+        vgap(ui, 34),
+        youAvatar(ui),
+        hgap(ui, 9),
+        ui.column(.{ .gap = 0 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = accountName(), .weight = .medium, .scale = menu_scale }}),
+            // The npub only when it is not already the name above it: an account
+            // with no kind:0 yet would otherwise read its own key twice.
+            if (accountHasName())
+                ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = npubShort(), .monospace = true, .scale = mono_meta_scale }})
             else
                 ui.spacer(0),
         }),
+        ui.spacer(1),
+        hgap(ui, 9),
     });
+    rows[1] = menuSeparator(ui);
+    rows[2] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
+    rows[3] = menuRow(ui, "Sign out", null, null, .logout_request);
+    return menuSurface(ui, 240, rows);
+}
+
+/// The relay zone: the pool's health, and the popover that explains it. The chip
+/// is highlighted while the pool is healthy, because that is when the number is
+/// worth reading at a glance; a degraded pool speaks through its dot instead.
+fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const paused = model.relays_paused;
+    const live = model.live_relays;
+    const dot = if (paused)
+        p.text_faint_alt
+    else if (live == 0)
+        p.status_offline
+    else if (live < relays.len)
+        p.status_warning
+    else
+        p.status_success;
+    const label = if (paused)
+        ui.fmt("paused · 0/{d} relays", .{relays.len})
+    else if (poolLatencyMs()) |ms|
+        ui.fmt("{d}/{d} relays · {d} ms", .{ live, relays.len, ms })
+    else
+        ui.fmt("{d}/{d} relays", .{ live, relays.len });
+    const healthy = !paused and live == relays.len;
+    // The trigger and its floating surface are siblings in a stack: that is the
+    // sanctioned shape, and the anchored surface takes no space in the row.
+    return ui.stack(.{}, .{
+        statusChip(ui, .{
+            .press = Msg{ .toggle_menu = .relays },
+            .label = label,
+            .semantics = "Relays",
+            .dot = dot,
+            .chevron = true,
+            .highlighted = healthy,
+            .ink = if (healthy) p.text_secondary else p.text_muted,
+        }),
+        if (model.menu == .relays) relayPopover(ui, model) else ui.spacer(0),
+    });
+}
+
+/// The signer zone: whether Plaza can sign right now, and the account menu.
+fn signerZone(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const guest = model.is_guest();
+    return ui.stack(.{}, .{
+        statusChip(ui, .{
+            .press = if (guest) .open_join else Msg{ .toggle_menu = .account },
+            .label = if (guest) "Guest" else "Signet ready",
+            .semantics = if (guest) "Join" else "Account",
+            .glyph = if (guest) "plus" else "signet",
+            .glyph_color = if (guest) p.text_faint_alt else p.status_success,
+        }),
+        if (model.menu == .account) accountMenu(ui) else ui.spacer(0),
+    });
+}
+
+/// One status-bar zone: a quiet pressable chip, highlighted only when it is
+/// carrying live state the reader should look at.
+const StatusChip = struct {
+    press: Msg,
+    label: []const u8,
+    semantics: []const u8,
+    /// A leading dot, for the relay zone's health.
+    dot: ?canvas.Color = null,
+    /// A leading glyph, for the signer zone and the offline warning.
+    glyph: ?[]const u8 = null,
+    glyph_color: canvas.Color = theme.palette.text_muted,
+    /// A trailing chevron, for a chip that opens a menu.
+    chevron: bool = false,
+    highlighted: bool = false,
+    ink: canvas.Color = theme.palette.text_muted,
+};
+
+fn statusChip(ui: *AppUi, chip: StatusChip) AppUi.Node {
+    const p = theme.palette;
+    const body = ui.row(.{ .cross = .center, .gap = 6 }, .{
+        if (chip.dot) |color|
+            ui.el(.panel, .{ .width = 6, .height = 6, .padding = 0.01, .style = .{ .background = color, .radius = 3, .stroke_width = 0 } }, .{})
+        else
+            ui.spacer(0),
+        if (chip.glyph) |name|
+            // `appIcon` takes a RUNTIME name and resolves built-ins first, then
+            // the app table, so one call serves both vocabularies.
+            ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = chip.glyph_color } }, name)
+        else
+            ui.spacer(0),
+        ui.paragraph(.{ .style = .{ .foreground = chip.ink } }, &.{.{ .text = chip.label, .scale = status_scale }}),
+        if (chip.chevron)
+            ui.icon(.{ .width = 10, .height = 10, .style = .{ .foreground = p.text_muted } }, "chevron-up")
+        else
+            ui.spacer(0),
+    });
+    // A highlighted chip carries a plate, so it needs a surface that paints; a
+    // quiet one is text on the bar.
+    const inner = if (chip.highlighted)
+        ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = p.surface_chip, .radius = 6, .stroke_width = 0 } }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{ hgap(ui, 8), vgap(ui, 22), body, hgap(ui, 8) }),
+        })
+    else
+        ui.row(.{ .cross = .center, .gap = 0 }, .{ hgap(ui, 8), body, hgap(ui, 8) });
+    return ui.row(.{
+        .cross = .center,
+        .on_press = chip.press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = chip.semantics, .focusable = true },
+    }, .{inner});
 }
 
 /// One note: avatar, author line, content, and any inline image. Keyed by the
@@ -5739,6 +6160,22 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
         },
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
+        // A trigger toggles its own menu and replaces any other, so the chrome
+        // never shows two floating surfaces at once.
+        .toggle_menu => |which| model.menu = if (model.menu == which) .none else which,
+        .close_menu => model.menu = .none,
+        .toggle_relays_paused => {
+            model.relays_paused = !model.relays_paused;
+            setRelaysPaused(model.relays_paused);
+            model.menu = .none;
+        },
+        // The feed's own list holds the scroll, and there is no API to set an
+        // offset, so "newest" is the reconcile that puts the newest note back at
+        // the top: the same thing the tick does, asked for on purpose.
+        .jump_to_newest => {
+            g_last_count = std.math.maxInt(usize);
+            model.menu = .none;
+        },
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
             publishName(model, fx);
@@ -7203,6 +7640,13 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     defer signer.deinit();
 
     while (true) {
+        // A paused pool never dials. The reader still has the whole store, so
+        // pausing costs them nothing but the live tail.
+        if (relaysPaused()) {
+            setRelayStatus(index, .offline);
+            io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
+            continue;
+        }
         setRelayStatus(index, .connecting);
         ingestOnce(gpa, io, signer, index) catch |err| {
             std.debug.print("plaza: [{s}] {s}\n", .{ relays[index], @errorName(err) });
@@ -7234,6 +7678,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         .{ .authors = &starter_pack, .kinds = &feed_kinds, .limit = feed_capacity },
         .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
     };
+    // The clock for this relay's round trip: from the REQ going out to its EOSE
+    // coming back. That pair is the honest "how fast does this relay answer"
+    // number, and it is the one the status bar shows.
+    // The AWAKE clock, not the wall clock: a latency reading must not swing
+    // because the system clock stepped between the REQ and its EOSE.
+    var req_at: i64 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try relay.subscribe("plaza-feed", &filters);
 
     // The loaded notes' ids (and their hex), collected from the feed as it
@@ -7277,6 +7727,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 }
             },
             .eose => |eo| {
+                if (std.mem.eql(u8, eo.subscription_id, "plaza-feed") and req_at != 0) {
+                    const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - req_at;
+                    if (elapsed >= 0) recordRelayRtt(index, @intCast(elapsed));
+                    req_at = 0;
+                }
                 // Stored feed drained: now watch those notes' engagement.
                 if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
                     engagement_open = true;

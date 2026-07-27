@@ -1801,3 +1801,116 @@ test "a note row's separator paints at the reading column's width" {
     }
     try testing.expect(found);
 }
+
+/// Every codepoint in a widget's own text, and in each of its paragraph spans,
+/// checked against `ok`. Returns the first character that fails, with the string
+/// it came from, so a failure names the copy rather than a number.
+const BadGlyph = struct { codepoint: u21, in: []const u8 };
+
+fn firstUnrenderable(widget: canvas.Widget) ?BadGlyph {
+    if (scanRun(widget.text)) |bad| return bad;
+    for (widget.spans) |span| {
+        if (scanRun(span.text)) |bad| return bad;
+    }
+    for (widget.children) |child| {
+        if (firstUnrenderable(child)) |bad| return bad;
+    }
+    return null;
+}
+
+fn scanRun(text: []const u8) ?BadGlyph {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch return .{ .codepoint = text[i], .in = text };
+        if (i + len > text.len) return .{ .codepoint = text[i], .in = text };
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch return .{ .codepoint = text[i], .in = text };
+        if (!chromeGlyphIsSafe(cp)) return .{ .codepoint = cp, .in = text };
+        i += len;
+    }
+    return null;
+}
+
+/// The characters Plaza's own chrome may use. ASCII, plus the typographic marks
+/// the bundled Geist faces carry and the redesign's copy actually asks for.
+///
+/// The bar is deliberately an ALLOWLIST rather than a list of known-bad glyphs:
+/// the SDK ships a coverage table naming ⌘, ✓ and friends as the recurring tofu
+/// class, but it is private to the canvas module and only warns at debug level in
+/// Debug builds, so an uncovered character reaches a release window as a silent
+/// box. (It did: the relay menu's ⌘ hint drew as tofu until this test.)
+fn chromeGlyphIsSafe(cp: u21) bool {
+    if (cp >= 0x20 and cp < 0x7F) return true; // printable ASCII
+    return switch (cp) {
+        0x00B7, // · the metadata separator
+        0x2026, // … an elision
+        0x2018,
+        0x2019,
+        0x201C,
+        0x201D, // curly quotes
+        0x2013, // en dash
+        => true,
+        else => false,
+    };
+}
+
+test "the chrome never asks for a glyph the bundled faces cannot draw" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Chrome only: an empty feed, so no note content (which is the user's, may be
+    // any language or emoji, and is not ours to constrain) is in the tree.
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // Each chrome menu in turn, since a closed menu builds nothing.
+    for ([_]main.ChromeMenu{ .none, .scope, .relays, .account }) |menu| {
+        model.menu = menu;
+        const tree = try buildTree(arena, &model);
+        if (firstUnrenderable(tree.root)) |bad| {
+            std.debug.print(
+                "\n  chrome text contains U+{X:0>4} in \"{s}\" (menu: {s}). The bundled faces do not" ++
+                    " carry it, so it draws as a tofu box. Use a vector icon or plain words.\n",
+                .{ bad.codepoint, bad.in, @tagName(menu) },
+            );
+            return error.UnrenderableChromeGlyph;
+        }
+    }
+}
+
+test "an open chrome menu paints a real surface above the bar" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.menu = .relays;
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+
+    // The popover is anchored, so it leaves the row's flow entirely and paints in
+    // a late window-level pass. Both halves matter: it must PAINT (a menu that
+    // renders nothing is the rail bug again) and it must sit ABOVE the 30px bar
+    // it hangs off rather than being clipped into it.
+    const pause = p.frameOf("Pause Relays") orelse return error.NoPopover;
+    try testing.expect(pause.y + pause.height < main.window_height - 30);
+
+    const fill = p.fillAt(pause.x + pause.width / 2, pause.y + pause.height / 2) orelse return error.PopoverNotPainted;
+    try testing.expect(painted.sameColor(fill, theme.palette.surface_menu));
+}
+
+test "only one chrome menu is open at a time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // A trigger toggles its own menu and replaces any other, so two floating
+    // surfaces can never overlap in the chrome.
+    var fx: main.EffectsForTest = undefined;
+    model.menu = .relays;
+    main.update(&model, Msg{ .toggle_menu = .account }, &fx);
+    try testing.expectEqual(main.ChromeMenu.account, model.menu);
+    main.update(&model, Msg{ .toggle_menu = .account }, &fx);
+    try testing.expectEqual(main.ChromeMenu.none, model.menu);
+}
