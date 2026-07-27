@@ -2170,9 +2170,6 @@ pub const Model = struct {
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
-    /// The reply verb was pressed, so the field under the focal note should take
-    /// the caret on the next build.
-    reply_focus: bool = false,
     /// Whether the reader has paused the pool. Reading keeps working: the store
     /// is the app, so a pause stops the sockets, not the feed.
     relays_paused: bool = false,
@@ -4105,8 +4102,6 @@ pub const Msg = union(enum) {
     /// Sign out, asked for from the account menu: opens Settings with the
     /// confirmation showing, so the menu never signs anyone out on one press.
     open_settings_logout,
-    /// Put the caret in the thread's reply field.
-    focus_reply: i64,
     /// Copy a note's nevent address to the clipboard.
     copy_nevent: i64,
     /// Open a note on the web (njump), for sharing it outside nostr.
@@ -4903,7 +4898,12 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
     const liked = likeEntry(note.id) != null;
     return ui.row(.{ .cross = .center, .gap = 0, .main = .space_between }, .{
         hgap(ui, 40),
-        focalVerb(ui, "reply", "Reply", Msg{ .focus_reply = note.id }, p.text_secondary_alt),
+        // Drawn at rest, like repost and zap. The caret cannot be moved here: the
+        // only app-facing focus channel is `autofocus`, whose false-to-true edge
+        // does not survive a widget rebuilt every frame inside a windowed list,
+        // and there is no per-widget focus effect. The field is directly below
+        // this row, so the verb would only be repeating it.
+        focalVerb(ui, "reply", "Reply", null, p.text_secondary_alt),
         // Repost becomes a two-item menu with the repost work; inert until then.
         focalVerb(ui, "repeat", "Repost", null, p.text_secondary_alt),
         focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_secondary_alt),
@@ -6581,9 +6581,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_last_count = std.math.maxInt(usize);
             model.menu = .none;
         },
-        // The reply field is already on screen under the focal note, so this is
-        // about the caret, not about opening anything.
-        .focus_reply => model.reply_focus = true,
         .copy_nevent => |id| {
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
