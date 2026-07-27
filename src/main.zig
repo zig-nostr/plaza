@@ -1640,8 +1640,16 @@ fn markRelaySeen(note_id: i64, relay_index: usize) void {
     const bit = @as(u64, 1) << @intCast(relay_index);
     engagementLock();
     defer engagementUnlock();
-    const row = ensureEngagement(note_id) orelse return;
-    row.relays_seen |= bit;
+    // Only a note the table ALREADY tracks. Creating a row here would spend the
+    // 512-row budget on every note the pool delivers, crowding out the counts the
+    // rows exist for; the engagement subscription creates the rows for the notes
+    // on screen, which are the only ones whose spread can be read.
+    for (&g_engagement) |*e| {
+        if (e.used and e.note_id == note_id) {
+            e.relays_seen |= bit;
+            return;
+        }
+    }
 }
 
 /// How many relays have delivered `note_id`, or 0 when it has not been tracked
@@ -4676,7 +4684,7 @@ fn threadEmptyNote(ui: *AppUi) AppUi.Node {
             hgap(ui, 8),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_dim } },
-                &.{.{ .text = ui.fmt("listening on {d} relays", .{relays.len}), .monospace = true, .scale = mono_meta_scale }},
+                &.{.{ .text = pluralize(ui, liveRelayCount(), "listening on {d} relay", "listening on {d} relays"), .monospace = true, .scale = mono_meta_scale }},
             ),
         }),
     });
@@ -4824,13 +4832,13 @@ fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
             .{ .style = .{ .foreground = p.text_faint_alt } },
             &.{.{
                 .text = if (seen > 0)
-                    ui.fmt("{s} · seen on {d} relays", .{ absoluteNoteTime(ui.arena, note.created_at), seen })
+                    ui.fmt("{s} · {s}", .{ absoluteNoteTime(ui.arena, note.created_at), pluralize(ui, seen, "seen on {d} relay", "seen on {d} relays") })
                 else
                     // Nothing delivered it this session (it came off disk), so the
                     // line says when it was written and stops there.
                     absoluteNoteTime(ui.arena, note.created_at),
                 .monospace = true,
-                .scale = mono_row_scale,
+                .scale = mono_hint_scale,
             }},
         ),
         ui.spacer(1),
@@ -4886,7 +4894,7 @@ fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
 fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi.Node {
     const p = theme.palette;
     return ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{
-        .{ .text = ui.fmt("{d}", .{n}), .weight = .medium, .color = .text, .scale = stat_scale },
+        .{ .text = if (n == 0) "0" else formatCount(ui.arena, n), .weight = .medium, .color = .text, .scale = stat_scale },
         .{ .text = ui.fmt(" {s}", .{if (n == 1) singular else plural}), .scale = stat_scale },
     });
 }
@@ -4903,14 +4911,13 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
         // does not survive a widget rebuilt every frame inside a windowed list,
         // and there is no per-widget focus effect. The field is directly below
         // this row, so the verb would only be repeating it.
-        focalVerb(ui, "reply", "Reply", null, p.text_secondary_alt),
+        focalVerb(ui, "reply", "Reply", null, p.text_verb),
         // Repost becomes a two-item menu with the repost work; inert until then.
-        focalVerb(ui, "repeat", "Repost", null, p.text_secondary_alt),
-        focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_secondary_alt),
+        focalVerb(ui, "repeat", "Repost", null, p.text_verb),
+        focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
         // Zap waits on a wallet; it draws at rest and does nothing.
-        focalVerb(ui, "zap", "Zap", null, p.text_secondary_alt),
-        focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_secondary_alt),
-        hgap(ui, 40),
+        focalVerb(ui, "zap", "Zap", null, p.text_verb),
+        focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
     });
 }
 
@@ -5016,7 +5023,7 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
         vgap(ui, 10),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, thread_inset),
-            youAvatar(ui),
+            meAvatar(ui, avatar_size),
             hgap(ui, avatar_to_text_gap),
             // The field is a pill: the thread's one place to write, shaped so it
             // reads as an invitation rather than a form.
@@ -5027,7 +5034,9 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                         .grow = 1,
                         .height = 34,
                         .text = model.reply_draft(),
-                        .placeholder = ui.fmt("Reply to {s}…", .{root.author()}),
+                        // By handle, as the shot addresses them: a reply is to an account, and
+                        // the name above already said who that is.
+                        .placeholder = ui.fmt("Reply to {s}…", .{replyTarget(ui, root)}),
                         .on_input = AppUi.inputMsg(.reply_edit),
                         .on_submit = .reply_submit,
                         .style = .{ .background = p.surface_input, .stroke_width = 0 },
@@ -5267,12 +5276,18 @@ fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
 /// The signed-in account avatar for the rail: a 28px tinted circle with the
 /// pubkey's initials (the same warm tint the feed uses for that key).
 fn youAvatar(ui: *AppUi) AppUi.Node {
+    return meAvatar(ui, 28);
+}
+
+/// The signed-in reader's own disc at a stated size: the rail seats a 28, the
+/// thread's reply row a 36 to match the note it answers.
+fn meAvatar(ui: *AppUi, size: f32) AppUi.Node {
     const pk = activePubkey() orelse return ui.spacer(0);
     const tint = avatarTint(pk);
     const hexdigits = "0123456789abcdef";
     return ui.avatar(.{
-        .width = 28,
-        .height = 28,
+        .width = size,
+        .height = size,
         .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
     }, ui.fmt("{c}{c}", .{ hexdigits[pk[0] >> 4], hexdigits[pk[0] & 0x0f] }));
 }
@@ -6163,7 +6178,13 @@ fn quoteAuthorName(ui: *AppUi, pubkey: [32]u8) []const u8 {
 /// The focal note's timestamp in full: the time and the date, since a note being
 /// read deserves to say exactly when it was written rather than "3h".
 fn absoluteNoteTime(arena: std.mem.Allocator, created_at: i64) []const u8 {
-    const secs: u64 = @intCast(@max(created_at, 0));
+    // LOCAL time, because a reader reads a clock, not an offset. Neither the SDK
+    // nor the standard library carries a timezone database, so the offset comes
+    // from libc, which knows the zone and the daylight rule. Off macOS (the
+    // portability build) there is no such call wired, and the line says UTC
+    // rather than pretending.
+    const shifted = created_at + localOffsetSeconds(created_at);
+    const secs: u64 = @intCast(@max(shifted, 0));
     const days = secs / 86_400;
     const day_secs = secs % 86_400;
     const hour24 = day_secs / 3600;
@@ -6184,9 +6205,61 @@ fn absoluteNoteTime(arena: std.mem.Allocator, created_at: i64) []const u8 {
     const year = if (m <= 2) y + 1 else y;
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     const month_name = months[@intCast(@min(@max(m - 1, 0), 11))];
-    return std.fmt.allocPrint(arena, "{d}:{d:0>2} {s} · {s} {d}, {d}", .{
-        hour12, minute, if (pm) "PM" else "AM", month_name, d, year,
+    return std.fmt.allocPrint(arena, "{d}:{d:0>2} {s}{s} · {s} {d}, {d}", .{
+        hour12, minute, if (pm) "PM" else "AM", if (comptime builtin.os.tag == .macos) "" else " UTC", month_name, d, year,
     }) catch "";
+}
+
+/// Seconds to add to a Unix timestamp to get local wall-clock time, from libc's
+/// own zone handling (so daylight saving is right, and right for the DATE in
+/// question rather than for today).
+fn localOffsetSeconds(unix_seconds: i64) i64 {
+    if (comptime builtin.os.tag != .macos) return 0;
+    var tm: c_tm = std.mem.zeroes(c_tm);
+    const t: i64 = unix_seconds;
+    if (localtime_r(&t, &tm) == null) return 0;
+    return tm.tm_gmtoff;
+}
+
+/// The fields of `struct tm` this needs, in libc's order. Only `tm_gmtoff` is
+/// read; the rest are here so the struct is the right size for libc to fill.
+const c_tm = extern struct {
+    tm_sec: c_int = 0,
+    tm_min: c_int = 0,
+    tm_hour: c_int = 0,
+    tm_mday: c_int = 0,
+    tm_mon: c_int = 0,
+    tm_year: c_int = 0,
+    tm_wday: c_int = 0,
+    tm_yday: c_int = 0,
+    tm_isdst: c_int = 0,
+    tm_gmtoff: c_long = 0,
+    tm_zone: ?[*:0]const u8 = null,
+};
+
+extern "c" fn localtime_r(timer: *const i64, result: *c_tm) ?*c_tm;
+
+/// Who a reply is addressed to: the handle when one is known, else the display
+/// name, which is all a profile without a nip05 offers.
+fn replyTarget(ui: *AppUi, note: *const Note) []const u8 {
+    const handle = note.handle(ui.arena);
+    return if (handle.len > 0) handle else note.author();
+}
+
+/// One phrase or the other, by count. English, and the only two shapes the
+/// chrome needs.
+fn pluralize(ui: *AppUi, n: usize, comptime one: []const u8, comptime many: []const u8) []const u8 {
+    return if (n == 1) ui.fmt(one, .{n}) else ui.fmt(many, .{n});
+}
+
+/// How many relays are connected right now.
+fn liveRelayCount() usize {
+    var n: usize = 0;
+    for (0..relays.len) |i| {
+        const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
+        if (state == .connected) n += 1;
+    }
+    return n;
 }
 
 /// A note's nevent, abbreviated for a chip: enough to recognise, short enough to
