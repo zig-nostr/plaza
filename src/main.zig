@@ -4899,24 +4899,32 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
     });
 }
 
-/// The focal note's verbs: five glyphs, evenly spread, no counts. The numbers are
-/// the stats row above; these are the things a reader can do.
+/// The focal note's verbs: evenly spread, no counts. The numbers are the stats row
+/// above; these are the things a reader can do.
+///
+/// Spread by GROW spacers between the pairs, with the 40px insets as the row's own
+/// padding. Two earlier shapes were wrong: an inset BOX is a flow child, so it
+/// takes a share of the free space and the whole stack drifts (this measured 67px
+/// of slack on the left against 28 on the right), and `main = .space_between` left
+/// the stack flush against the right edge instead of balancing it.
+///
+/// Four verbs, not the mock's five. The fifth is Reply, whose job in the mock is
+/// to reach the reply field: here that field is already on screen immediately
+/// below, and the caret cannot be moved to it from the model anyway (see the round
+/// plan's SDK walls). A glyph that does nothing is worse than an absent one, so it
+/// returns when the composer sheet learns to open in reply mode.
 fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const liked = likeEntry(note.id) != null;
-    return ui.row(.{ .cross = .center, .gap = 0, .main = .space_between }, .{
-        hgap(ui, 40),
-        // Drawn at rest, like repost and zap. The caret cannot be moved here: the
-        // only app-facing focus channel is `autofocus`, whose false-to-true edge
-        // does not survive a widget rebuilt every frame inside a windowed list,
-        // and there is no per-widget focus effect. The field is directly below
-        // this row, so the verb would only be repeating it.
-        focalVerb(ui, "reply", "Reply", null, p.text_verb),
+    return ui.row(.{ .cross = .center, .gap = 0, .padding = 40 }, .{
         // Repost becomes a two-item menu with the repost work; inert until then.
         focalVerb(ui, "repeat", "Repost", null, p.text_verb),
+        ui.spacer(1),
         focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
+        ui.spacer(1),
         // Zap waits on a wallet; it draws at rest and does nothing.
         focalVerb(ui, "zap", "Zap", null, p.text_verb),
+        ui.spacer(1),
         focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
     });
 }
@@ -5025,25 +5033,21 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
             hgap(ui, thread_inset),
             meAvatar(ui, avatar_size),
             hgap(ui, avatar_to_text_gap),
-            // The field is a pill: the thread's one place to write, shaped so it
-            // reads as an invitation rather than a form.
-            ui.el(.panel, .{ .grow = 1, .padding = 0.01, .style = .{ .background = p.surface_input, .border = p.border_chip, .radius = 999, .stroke_width = 1 } }, .{
-                ui.row(.{ .cross = .center, .gap = 0 }, .{
-                    hgap(ui, 14),
-                    ui.el(.text_field, .{
-                        .grow = 1,
-                        .height = 34,
-                        .text = model.reply_draft(),
-                        // By handle, as the shot addresses them: a reply is to an account, and
-                        // the name above already said who that is.
-                        .placeholder = ui.fmt("Reply to {s}…", .{replyTarget(ui, root)}),
-                        .on_input = AppUi.inputMsg(.reply_edit),
-                        .on_submit = .reply_submit,
-                        .style = .{ .background = p.surface_input, .stroke_width = 0 },
-                    }, .{}),
-                    hgap(ui, 14),
-                }),
-            }),
+            // The field IS the pill. A text_field paints its own surface, so
+            // wrapping one in a rounded panel drew a rectangle inside a capsule:
+            // the shape belongs on the control itself.
+            ui.el(.text_field, .{
+                .grow = 1,
+                .height = 34,
+                .padding = 14,
+                .text = model.reply_draft(),
+                // By handle, as the shot addresses them: a reply is to an account,
+                // and the name above already said who that is.
+                .placeholder = ui.fmt("Reply to {s}…", .{replyTarget(ui, root)}),
+                .on_input = AppUi.inputMsg(.reply_edit),
+                .on_submit = .reply_submit,
+                .style = .{ .background = p.surface_input, .border = p.border_chip, .radius = 999, .stroke_width = 1 },
+            }, .{}),
             hgap(ui, 10),
             // The verb sits beside the field, quiet until there is something to
             // send: an empty reply has nothing to confirm.
