@@ -137,7 +137,7 @@ pub const Painted = struct {
         for (self.commands) |command| {
             const hit = switch (command) {
                 .fill_rect => |v| if (contains(v.rect, x, y)) fillColor(v.fill) else null,
-                .fill_rounded_rect => |v| if (contains(v.rect, x, y)) fillColor(v.fill) else null,
+                .fill_rounded_rect => |v| if (containsRounded(v.rect, v.radius, x, y)) fillColor(v.fill) else null,
                 else => null,
             };
             if (hit) |color| found = color;
@@ -152,7 +152,7 @@ pub const Painted = struct {
         for (self.commands) |command| {
             const hit = switch (command) {
                 .fill_rect => |v| if (contains(v.rect, x, y)) fillColor(v.fill) else null,
-                .fill_rounded_rect => |v| if (contains(v.rect, x, y)) fillColor(v.fill) else null,
+                .fill_rounded_rect => |v| if (containsRounded(v.rect, v.radius, x, y)) fillColor(v.fill) else null,
                 else => null,
             };
             if (hit) |c| {
@@ -201,6 +201,28 @@ pub const Painted = struct {
         return self.fillAt(frame.x + frame.width / 2, frame.y + frame.height / 2);
     }
 };
+
+/// Whether a ROUNDED fill covers the point, corners included. A rounded rect
+/// treated as a plain one is exactly how a corner-rounded wash passes for the
+/// square band the design draws, so the corners are modelled: inside the corner's
+/// box, the point has to be inside its arc.
+fn containsRounded(rect: geometry.RectF, radius: canvas.Radius, x: f32, y: f32) bool {
+    if (!contains(rect, x, y)) return false;
+    const r = rect.normalized();
+    const corners = [_]struct { cx: f32, cy: f32, r: f32, inside_x: bool, inside_y: bool }{
+        .{ .cx = r.x + radius.top_left, .cy = r.y + radius.top_left, .r = radius.top_left, .inside_x = x < r.x + radius.top_left, .inside_y = y < r.y + radius.top_left },
+        .{ .cx = r.x + r.width - radius.top_right, .cy = r.y + radius.top_right, .r = radius.top_right, .inside_x = x > r.x + r.width - radius.top_right, .inside_y = y < r.y + radius.top_right },
+        .{ .cx = r.x + r.width - radius.bottom_right, .cy = r.y + r.height - radius.bottom_right, .r = radius.bottom_right, .inside_x = x > r.x + r.width - radius.bottom_right, .inside_y = y > r.y + r.height - radius.bottom_right },
+        .{ .cx = r.x + radius.bottom_left, .cy = r.y + r.height - radius.bottom_left, .r = radius.bottom_left, .inside_x = x < r.x + radius.bottom_left, .inside_y = y > r.y + r.height - radius.bottom_left },
+    };
+    for (corners) |c| {
+        if (c.r <= 0 or !c.inside_x or !c.inside_y) continue;
+        const dx = x - c.cx;
+        const dy = y - c.cy;
+        if (dx * dx + dy * dy > c.r * c.r) return false;
+    }
+    return true;
+}
 
 fn contains(rect: geometry.RectF, x: f32, y: f32) bool {
     const r = rect.normalized();

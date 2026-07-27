@@ -5721,6 +5721,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
         ui.el(.list_item, .{
             .width = thread_column_width,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             .on_press = Msg{ .open_thread = note.id },
             .semantics = .{ .label = "Open thread" },
         }, .{
@@ -5788,6 +5789,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
         ui.el(.list_item, .{
             .width = thread_column_width,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             // By EVENT id: an ancestor is neither in the feed nor in the open
             // thread's replies, so the render key `open_thread` resolves through
             // would find nothing and the press would quietly do nothing.
@@ -6008,6 +6010,7 @@ fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
         ui.el(.list_item, .{
             .grow = 1,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             .cross = .start,
             .on_press = Msg{ .open_thread = note.id },
             .semantics = .{ .label = "Open thread" },
@@ -6071,6 +6074,7 @@ fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
             .width = thread_column_width,
             .height = outside_row_extent - 2 - 12,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = .toggle_outside_replies,
             // The row is a disclosure, so it says which way it is pointing: the
@@ -6112,6 +6116,7 @@ fn showMoreReplies(ui: *AppUi, hidden: usize) AppUi.Node {
             .width = thread_column_width,
             .height = show_more_extent - 12 - 10,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = .show_more_replies,
             .semantics = .{ .role = .button, .label = "Show more replies", .focusable = true },
@@ -6138,6 +6143,7 @@ fn branchMore(ui: *AppUi, child: *const Note, deeper: usize) AppUi.Node {
             .grow = 1,
             .height = branch_more_extent - 6,
             .padding = 0.01,
+            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = Msg{ .open_thread = child.id },
             .semantics = .{ .role = .button, .label = "More in this branch", .focusable = true },
@@ -7448,7 +7454,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // cannot express any of that, and a `gap` on the row would also apply
             // around each inset box, which is what threw the first attempt 12px
             // off the reading rail.
-            ui.el(.list_item, .{ .width = feed_column_width, .padding = 0.01, .on_press = Msg{ .open_thread = note.id }, .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
+            ui.el(.list_item, .{ .width = feed_column_width, .padding = 0.01, .style = .{ .radius = 0 }, .on_press = Msg{ .open_thread = note.id }, .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
                 vgap(ui, row_pad_top),
                 ui.row(.{ .gap = 0, .cross = .start }, .{
                     hgap(ui, row_pad_side),

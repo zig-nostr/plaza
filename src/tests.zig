@@ -2580,6 +2580,12 @@ test "a hovered note row washes, and only when hovered" {
     // Under the pointer it washes.
     const hovered = try painted.Painted.renderHovered(arena, &model, "Open thread");
     try painted.expectFillAt(hovered, x, y, theme.palette.surface_hover);
+
+    // Corner to corner, square: 11e's wash is the row's whole band, and a
+    // `list_item` rounds its fill to the control radius unless the row says
+    // otherwise. A rounded wash inside a square band shows at the corners.
+    try painted.expectFillAt(hovered, frame.x + 1, frame.y + 1, theme.palette.surface_hover);
+    try painted.expectFillAt(hovered, frame.x + frame.width - 1, frame.y + frame.height - 1, theme.palette.surface_hover);
 }
 
 test "every pressable row in a thread washes under the pointer" {
