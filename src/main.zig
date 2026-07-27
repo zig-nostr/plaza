@@ -247,8 +247,8 @@ const op_chip_scale: f32 = 9.0 / 14.5;
 /// measured in the running app.
 const nested_reply_chrome: f32 = 8 + 20 + 3;
 const branch_more_extent: f32 = 6 + 22;
-const show_more_extent: f32 = 12 + 22 + 10;
-const outside_row_extent: f32 = 2 + 22 + 12;
+const show_more_extent: f32 = 12 + body_line_height + 10;
+const outside_row_extent: f32 = 2 + body_line_height + 12;
 /// The chain above the focal note: one compact row per ancestor, each hanging
 /// off the rail that runs down to the note being read. The bottom pad IS the
 /// rail's segment between two discs, so it is a layout number and an estimate
@@ -262,14 +262,19 @@ const ancestor_identity_gap: f32 = 4;
 /// line at the 14.5 body, held to the 13.5 register.
 const ancestor_body_lines: usize = 2;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
-const ancestor_line_height: f32 = 13.5 * 1.25;
+/// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
+/// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
+/// DOWN still gets `14.5 * 1.25`. Scale shrinks glyphs, never the line box, and
+/// every term here that priced a scaled run at its own size was short.
+const ancestor_line_height: f32 = body_line_height;
 const ancestor_row_chrome: f32 = avatar_size + ancestor_identity_gap + ancestor_bottom_pad;
-/// A ghost row: the dashed disc sets the height, since its two quiet lines fit
-/// inside it.
-const ghost_row_extent: f32 = 2 + avatar_size + ancestor_bottom_pad;
+/// A ghost row: its two quiet lines set the height, not the dashed disc. Both are
+/// scaled down and both still take a full body line box (see
+/// `ancestor_line_height`), which puts the text column past the 36px disc.
+const ghost_row_extent: f32 = 2 + body_line_height + 3 + body_line_height + ancestor_bottom_pad;
 /// The listening footer, and the focal note's own leading space when it is the
 /// first row (an ancestor's bottom pad provides it otherwise).
-const listening_row_extent: f32 = 8 + 1 + 10 + 13.125 + 10;
+const listening_row_extent: f32 = 8 + 1 + 10 + body_line_height + 10;
 const focal_leading_pad: f32 = 16;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
@@ -4032,6 +4037,12 @@ const AncestorChain = struct {
     stamp: usize = std.math.maxInt(usize),
     /// Oldest first, which is the order they are drawn in.
     ids: [thread_ancestor_max][32]u8 = undefined,
+    /// How many body lines each of those notes draws, cached with the walk so an
+    /// OCCLUDED level can price its rows without building a single Note. That is
+    /// the only thing such a level needs from the chain, and reading eight events
+    /// per level per frame to learn it was most of the cost the walk cache set
+    /// out to remove.
+    lines: [thread_ancestor_max]u8 = [_]u8{0} ** thread_ancestor_max,
     len: usize = 0,
     gap: AncestorGap = .none,
     /// Whether the id the chain stops below is the thread's declared root, which
@@ -4061,8 +4072,13 @@ fn refreshAncestorChain(chain: *AncestorChain, store: *nostr.store.Store, focal:
 
     // Newest first while walking, reversed into the cache at the end.
     var up: [thread_ancestor_max][32]u8 = undefined;
+    var up_lines: [thread_ancestor_max]u8 = undefined;
     var n: usize = 0;
+    const now = nowSeconds();
     var want = focal.reply_parent;
+    // A note that tags ITSELF as its parent would otherwise be walked as its own
+    // ancestor and drawn twice in one list, under the same row key.
+    if (std.mem.eql(u8, &want, &focal.event_id)) return;
     while (true) {
         if (n == thread_ancestor_max) {
             chain.gap = .capped;
@@ -4070,26 +4086,44 @@ fn refreshAncestorChain(chain: *AncestorChain, store: *nostr.store.Store, focal:
         }
         var se = (store.getEvent(std.heap.page_allocator, want) catch null) orelse {
             chain.gap = .missing;
+            // The ghost row says the relays are being asked for this, so ask
+            // them: the thread's own subscription only covers what answers the
+            // focal note, never what it answers.
+            wantQuote(want);
             break;
         };
         defer se.deinit();
         up[n] = want;
+        // Stamped here, where the event is already in hand.
+        up_lines[n] = @intFromFloat(ancestorBodyLines(&noteFrom(se.event, now)));
         n += 1;
         if (declared_root == null) declared_root = nip10Root(se.event.tags);
         const parent = nip10Parent(se.event.tags) orelse break;
-        // A malformed cycle (a note tagging one of its own descendants) would
-        // walk forever, so a repeat ends the chain where it repeats.
+        // A malformed cycle (a note tagging one of its own descendants, or its
+        // own id) would walk forever, so a repeat ends the chain where it
+        // repeats. It has NOT reached the thread's opening note, and the row
+        // says so rather than claiming the chain is whole.
+        if (std.mem.eql(u8, &parent, &focal.event_id)) {
+            chain.gap = .missing;
+            return finishChain(chain, up[0..n], up_lines[0..n], declared_root, parent);
+        }
         for (up[0..n]) |seen| {
-            if (std.mem.eql(u8, &seen, &parent)) return finishChain(chain, up[0..n], declared_root, want);
+            if (std.mem.eql(u8, &seen, &parent)) {
+                chain.gap = .missing;
+                return finishChain(chain, up[0..n], up_lines[0..n], declared_root, parent);
+            }
         }
         want = parent;
     }
-    finishChain(chain, up[0..n], declared_root, want);
+    finishChain(chain, up[0..n], up_lines[0..n], declared_root, want);
 }
 
 /// Reverses the walk into drawing order and names the gap, if there is one.
-fn finishChain(chain: *AncestorChain, up: []const [32]u8, declared_root: ?[32]u8, stopped_at: [32]u8) void {
-    for (up, 0..) |id, i| chain.ids[up.len - 1 - i] = id;
+fn finishChain(chain: *AncestorChain, up: []const [32]u8, up_lines: []const u8, declared_root: ?[32]u8, stopped_at: [32]u8) void {
+    for (up, 0..) |id, i| {
+        chain.ids[up.len - 1 - i] = id;
+        chain.lines[up.len - 1 - i] = up_lines[i];
+    }
     chain.len = up.len;
     chain.gap_is_root = chain.gap == .missing and declared_root != null and
         std.mem.eql(u8, &declared_root.?, &stopped_at);
@@ -4099,6 +4133,9 @@ fn finishChain(chain: *AncestorChain, up: []const [32]u8, declared_root: ?[32]u8
 /// or the gap where the chain stops.
 pub const Ancestor = struct {
     note: Note = .{},
+    /// How many body lines this row draws. Carried on the row because an
+    /// occluded level has no `note` to measure.
+    lines: u8 = 0,
     /// `.none` for a real ancestor; anything else makes this row a ghost.
     ghost: AncestorGap = .none,
     /// For a ghost: whether what is missing is the thread's opening note.
@@ -4841,9 +4878,11 @@ pub const ThreadRows = struct {
     /// conversation rather than one note.
     blocks: []const ThreadBlock,
     /// How many of the in-graph blocks this page shows, and how many wait behind
-    /// the line.
+    /// the line. `hidden` counts CONVERSATIONS, which is the row arithmetic;
+    /// `hidden_held` counts the replies inside them, which is what the line says.
     shown: usize,
     hidden: usize,
+    hidden_held: usize,
     /// Replies from outside the follow graph, held below the rest. They are never
     /// dropped: the row says how many there are and opens them.
     outside: []const ThreadBlock,
@@ -4936,7 +4975,7 @@ fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
             const a = &rows.ancestors[ai];
             const lead: f32 = if (ai == 0) ancestor_top_pad else 0;
             if (a.ghost != .none) break :blk lead + ghost_row_extent;
-            break :blk lead + ancestor_row_chrome + ancestorBodyLines(&a.note) * ancestor_line_height;
+            break :blk lead + ancestor_row_chrome + @as(f32, @floatFromInt(a.lines)) * ancestor_line_height;
         },
         // The focal note carries the identity block, its exact-time line, the
         // stats row and the verb row on top of a body set one register up. Its
@@ -4972,11 +5011,15 @@ fn blockExtent(block: *const ThreadBlock) f32 {
 /// How many lines an ancestor's clamped body wraps to: one or two, the clamp's
 /// whole point.
 fn ancestorBodyLines(note: *const Note) f32 {
+    // No body, no line. An image-only reply is a common shape, and its content
+    // is empty because the URL is lifted out of the text: pricing it at a line
+    // the row never draws is space the level reports and does not fill.
+    if (note.content_len == 0) return 0;
     var lines: usize = 1;
     var column: usize = 0;
     for (note.content()) |c| {
         if ((c & 0xc0) == 0x80) continue;
-        if (c == '\n' or column >= ancestor_chars_per_line) {
+        if (c == '\n' or column >= ancestor_chars_per_line - 1) {
             lines += 1;
             column = 0;
             if (lines >= ancestor_body_lines) break;
@@ -5013,10 +5056,11 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
     rows_ctx.* = .{
         .model = model,
         .root = root,
-        .ancestors = ancestorsFor(ui, level, root),
+        .ancestors = ancestorsFor(ui, level, root, occluded),
         .blocks = split.inside,
         .shown = shown,
         .hidden = split.inside.len - shown,
+        .hidden_held = heldReplies(split.inside[shown..]),
         .outside = split.outside,
         .outside_held = heldReplies(split.outside),
         .outside_open = model.thread_outside_open[@min(level, model.thread_outside_open.len - 1)],
@@ -5078,7 +5122,7 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         // is ACTUALLY above and below the block, held replies included.
         .block => |bi| replyBlock(ui, &rows_ctx.blocks[bi], rows_ctx.root.pubkey, bi == 0, bi + 1 == rows_ctx.shown and rows_ctx.hidden == 0 and rows_ctx.outside.len == 0),
         .outside_block => |oi| replyBlock(ui, &rows_ctx.outside[oi], rows_ctx.root.pubkey, oi == 0 and rows_ctx.shown == 0, oi + 1 == rows_ctx.outside.len),
-        .show_more => showMoreReplies(ui, rows_ctx.hidden),
+        .show_more => showMoreReplies(ui, rows_ctx.hidden_held),
         .outside_line => outsideGraphRow(ui, rows_ctx.outside_held, rows_ctx.outside_open),
         .footer => listeningFooter(ui),
         .empty => threadEmptyNote(ui),
@@ -5088,21 +5132,35 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
     // Stable row identity for the windowed reconciler: the note's own id, or a
     // synthetic high-bit key for the placeholder rows (their bit sits above the
     // masked 63-bit note-id space, so no collision).
+    // A row with no note of its own is keyed by WHAT IT IS, not by where it sits:
+    // a key folds into every descendant's identity, so keying the composer by
+    // index would hand it a new identity, and drop the caret mid-typing, the
+    // moment a missing ancestor resolves and every row below it shifts down.
     node.key = .{
         .int = switch (plan) {
             .focal => @intCast(rows_ctx.root.id),
             .block => |bi| @intCast(rows_ctx.blocks[bi].parent.id),
             .outside_block => |oi| @intCast(rows_ctx.outside[oi].parent.id),
-            // A ghost row has no note behind it, so it takes a synthetic key like the
-            // other placeholders.
+            // A ghost row has no note behind it, so it takes a synthetic key like
+            // the other placeholders, folding in its seat in the chain.
             .ancestor => |ai| if (rows_ctx.ancestors[ai].ghost == .none)
                 @intCast(rows_ctx.ancestors[ai].note.id)
             else
-                (@as(u64, 1) << 63) | @as(u64, index),
-            else => (@as(u64, 1) << 63) | @as(u64, index),
+                placeholderKey(@intFromEnum(std.meta.activeTag(plan)), ai),
+            // Skeletons repeat, so they keep their position; every other
+            // placeholder appears at most once in a level.
+            .skeleton => placeholderKey(@intFromEnum(std.meta.activeTag(plan)), index),
+            else => placeholderKey(@intFromEnum(std.meta.activeTag(plan)), 0),
         },
     };
     return node;
+}
+
+/// A key for a row with no note behind it: its kind, plus a discriminator for the
+/// kinds that can repeat. The high bit sits above the masked 63-bit note-id
+/// space, so it can never collide with a real note.
+fn placeholderKey(kind: u64, nth: usize) u64 {
+    return (@as(u64, 1) << 63) | (kind << 32) | @as(u64, @intCast(nth));
 }
 
 /// The open thread's replies read from the store at render time, into the arena,
@@ -5150,7 +5208,7 @@ fn threadRepliesFromStore(ui: *AppUi, level: usize, root_event_id: [32]u8) []con
 /// level's row plan has to be the same when it is beneath the current thread as
 /// when it is the current thread, or its restored scroll offset would land
 /// somewhere else on the way back.
-fn ancestorsFor(ui: *AppUi, level: usize, focal: *const Note) []const Ancestor {
+fn ancestorsFor(ui: *AppUi, level: usize, focal: *const Note, occluded: bool) []const Ancestor {
     if (!focal.has_reply_parent) return &.{};
     const store = g_store orelse return &.{};
     if (level >= g_ancestor_chains.len) return &.{};
@@ -5164,12 +5222,23 @@ fn ancestorsFor(ui: *AppUi, level: usize, focal: *const Note) []const Ancestor {
     const ghost = @intFromBool(chain.gap != .none);
     const rows = ui.arena.alloc(Ancestor, chain.len + ghost) catch return &.{};
     if (ghost == 1) rows[0] = .{ .ghost = chain.gap, .is_root = chain.gap_is_root };
-    const now = nowSeconds();
     var n: usize = ghost;
-    for (chain.ids[0..chain.len]) |id| {
+    // An occluded level draws nothing, so it reads nothing: the row count and
+    // the cached line counts are the whole of what its estimates need, and its
+    // content height (which is what its restored scroll offset is measured
+    // against) comes out identical either way.
+    if (occluded) {
+        for (chain.lines[0..chain.len]) |lines| {
+            rows[n] = .{ .lines = lines };
+            n += 1;
+        }
+        return rows[0..n];
+    }
+    const now = nowSeconds();
+    for (chain.ids[0..chain.len], chain.lines[0..chain.len]) |id, lines| {
         var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
         defer se.deinit();
-        rows[n] = .{ .note = noteFrom(se.event, now) };
+        rows[n] = .{ .note = noteFrom(se.event, now), .lines = lines };
         n += 1;
     }
     return rows[0..n];
@@ -5738,8 +5807,11 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
                     ui.spacer(1),
                     ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = meta_scale }}),
                 }),
+                // The gap stays whatever the body is: it is a term of the row's
+                // chrome, and dropping it would make the estimate wrong by 4px
+                // for exactly the rows nothing measures.
                 vgap(ui, ancestor_identity_gap),
-                ancestorBody(ui, note),
+                if (note.content_len == 0) ui.spacer(0) else ancestorBody(ui, note),
                 vgap(ui, ancestor_bottom_pad),
             }),
             hgap(ui, thread_inset),
@@ -5763,6 +5835,10 @@ fn ancestorBody(ui: *AppUi, note: *const Note) AppUi.Node {
 /// is a common shape (a note that ends in a `nostr:` reference on its own line).
 fn clampSpansToLines(ui: *AppUi, spans: []const canvas.TextSpan, lines: usize) []const canvas.TextSpan {
     const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch return spans;
+    // One column of the last line belongs to the ellipsis. Cutting at the full
+    // budget and THEN appending it wrapped one character onto a third line,
+    // which is a line the estimator does not price and the design does not have.
+    const budget = ancestor_chars_per_line - 1;
     var n: usize = 0;
     var line: usize = 1;
     var column: usize = 0;
@@ -5771,7 +5847,7 @@ fn clampSpansToLines(ui: *AppUi, spans: []const canvas.TextSpan, lines: usize) [
         for (span.text, 0..) |c, i| {
             // A continuation byte is the middle of a character, not another one.
             if ((c & 0xc0) == 0x80) continue;
-            if (c == '\n' or column >= ancestor_chars_per_line) {
+            if (c == '\n' or column >= budget) {
                 line += 1;
                 column = 0;
                 if (line > lines) {
@@ -5783,7 +5859,10 @@ fn clampSpansToLines(ui: *AppUi, spans: []const canvas.TextSpan, lines: usize) [
         }
         if (cut) |at| {
             // Back off to a word boundary, so the ellipsis follows a whole word.
-            const end = collapsedLen(span.text[0..at], at);
+            // The budget is the WHOLE span, not `at`: `collapsedLen` returns the
+            // length unchanged when the text already fits, so cutting a slice at
+            // its own length backs off nowhere.
+            const end = collapsedLen(span.text, at);
             if (end > 0) {
                 out[n] = span;
                 out[n].text = ui.fmt("{s}…", .{std.mem.trimEnd(u8, span.text[0..end], " \n")});
@@ -5806,8 +5885,38 @@ pub fn ancestorRowForTest(ui: *AppUi, ancestor: *const Ancestor, first: bool) Ap
     return ancestorRow(ui, ancestor, first);
 }
 
-pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8) AppUi.Node {
-    return replyBlock(ui, block, root_author, true, true);
+pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+    return replyBlock(ui, block, root_author, first, last);
+}
+
+/// The rows a level can hold whose height is a fixed constant, so a test can
+/// measure each one and hold its estimate to what it actually draws. Every
+/// constant here was hand-calibrated once and then drifted.
+pub fn ghostRowForTest(ui: *AppUi, capped: bool) AppUi.Node {
+    const ancestor: Ancestor = .{ .ghost = if (capped) .capped else .missing };
+    return ghostRow(ui, &ancestor, true);
+}
+
+pub fn listeningFooterForTest(ui: *AppUi) AppUi.Node {
+    return listeningFooter(ui);
+}
+
+pub fn outsideGraphRowForTest(ui: *AppUi, open: bool) AppUi.Node {
+    return outsideGraphRow(ui, 2, open);
+}
+
+pub fn showMoreRepliesForTest(ui: *AppUi) AppUi.Node {
+    return showMoreReplies(ui, 3);
+}
+
+pub const ghost_row_extent_for_test = ghost_row_extent;
+pub const listening_row_extent_for_test = listening_row_extent;
+pub const outside_row_extent_for_test = outside_row_extent;
+pub const show_more_extent_for_test = show_more_extent;
+pub const ancestor_row_chrome_for_test = ancestor_row_chrome;
+
+pub fn ancestorBodyLinesForTest(note: *const Note) f32 {
+    return ancestorBodyLines(note);
 }
 
 /// The gap at the top of the chain: a dashed seat where a note would be, saying
@@ -5823,7 +5932,7 @@ fn ghostRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
     else
         "The note this answers is not on your relays yet";
     const detail: []const u8 = if (capped)
-        ui.fmt("showing the {d} notes above this one", .{thread_ancestor_max})
+        ui.fmt("showing the {d} nearest below", .{thread_ancestor_max})
     else
         pluralize(ui, liveRelayCount(), "asking {d} relay · fills in when one answers", "asking {d} relays · fills in when one answers");
     return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
@@ -8187,13 +8296,28 @@ fn enterThread(model: *Model, root: Note) void {
     model.thread_page[model.currentLevel()] = 1;
     model.thread_outside_open[model.currentLevel()] = false;
     wantProfile(root.pubkey);
+    // The fetch is claimed BEFORE the first build, because that build asks
+    // whether this level's fetch has settled: against the previous level's
+    // sequence it would answer yes, mark the table settled before a single
+    // reply had landed, and put the whole opening read back into relay-answer
+    // order, which is the thing arrival batching exists to prevent.
     const now = nowSeconds();
-    model.refreshThreadNotes(now);
-    model.thread_open_at = now;
-    model.thread_loading = model.thread_notes_len == 0;
     const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
     model.thread_seq = seq;
+    model.thread_open_at = now;
+    model.refreshThreadNotes(now);
+    model.thread_loading = model.thread_notes_len == 0;
     fetchThreadReplies(root.event_id, seq);
+}
+
+/// The level bookkeeping, for a test that walks a stack up and down. Both take
+/// the same paths the app does, so what they assert is what a reader gets.
+pub fn enterThreadForTest(model: *Model, root: Note) void {
+    enterThread(model, root);
+}
+
+pub fn closeThreadForTest(model: *Model) void {
+    closeThread(model);
 }
 
 /// Opens an event (by its full id) as a thread, reading it straight from the
@@ -8224,12 +8348,13 @@ fn closeThread(model: *Model) void {
         const prev = model.thread_stack[model.thread_stack_len];
         model.viewing_thread = prev.id;
         model.thread_root = prev;
+        // Same ordering as `enterThread`, and for the same reason.
         const now = nowSeconds();
-        model.refreshThreadNotes(now);
-        model.thread_open_at = now;
-        model.thread_loading = model.thread_notes_len == 0;
         const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
         model.thread_seq = seq;
+        model.thread_open_at = now;
+        model.refreshThreadNotes(now);
+        model.thread_loading = model.thread_notes_len == 0;
         fetchThreadReplies(prev.event_id, seq);
     } else {
         model.viewing_thread = 0;
