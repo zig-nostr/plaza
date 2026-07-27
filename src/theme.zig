@@ -221,14 +221,19 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
 
             t.colors.background = p.surface_window;
             t.colors.surface = p.surface_card;
-            t.colors.surface_subtle = p.surface_subbar;
             t.colors.surface_pressed = p.surface_chip;
             // The ONE hover state the redesign has (11e, and locked decision 2):
-            // a wash under the whole row, nothing else. It is a control token,
-            // not a colour token, and only the row kinds read it. `menu_item`
-            // falls back to this one when it states nothing of its own, which is
-            // harmless while the menu rows are plain rows (see `menuRow`).
-            t.controls.list_item.hover_background = p.surface_hover;
+            // a wash under the whole row, nothing else. The rows that wear it are
+            // `data_row`s, and a data row's wash reads THIS token with no control
+            // channel of its own, so the wash colour is stated here.
+            //
+            // It replaces #121216 with #111115, one unit per channel, so every
+            // other surface that falls back to it (secondary and ghost buttons,
+            // toggles) is unchanged to the eye. Going through the `list_item`
+            // control token instead would have been worse than it looks: the
+            // press fill resolves as `active orelse HOVER orelse background`, so
+            // binding hover there silently repaints every pressed row too.
+            t.colors.surface_subtle = p.surface_hover;
             t.colors.text = p.text_primary;
             t.colors.text_muted = p.text_muted;
             t.colors.border = p.border_hairline;

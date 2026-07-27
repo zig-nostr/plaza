@@ -2612,20 +2612,30 @@ test "every pressable row in a thread washes under the pointer" {
     model.thread_notes[1].pubkey = author;
     model.thread_notes[1].id = 11;
     model.thread_notes_len = 2;
+    // Seat the second under the first, which is what makes one of them a NESTED
+    // reply rather than a second conversation.
+    main.arrangeThread(model.thread_notes[0..2], model.thread_root.event_id);
+    try testing.expectEqual(@as(u8, 2), model.thread_notes[1].depth);
 
-    // The row washes.
+    // A hovered reply washes ITS OWN row and stops. The reply nested under it is
+    // a row of its own with its own wash; one band over both is one highlight
+    // over two rows, which is the mirror of the two-highlights-on-one-row the
+    // design rules out.
     const row = try painted.Painted.renderHovered(arena, &model, "Open thread");
-    const frame = row.frameOf("Open thread") orelse return error.NoRow;
-    // Somewhere inside it: the centre can be covered by a child (an avatar, a
-    // picture), and the wash is what sits underneath.
-    if (!row.hasFillAt(frame.x + 4, frame.y + frame.height / 2, theme.palette.surface_hover)) {
-        return error.NoHoverWash;
-    }
+    const frames = row.framesOf("Open thread");
+    if (frames.len < 2) return error.ExpectedNestedReply;
+    const parent = frames[0];
+    const nested = frames[1];
+    const wash = row.fillRectOf(theme.palette.surface_hover) orelse return error.NoHoverWash;
+    try testing.expectApproxEqAbs(parent.y, wash.y, 0.5);
+    // The snap grid rounds the fill up by a pixel.
+    try testing.expectApproxEqAbs(parent.width, wash.width, 1.5);
+    // It ends before the reply under it begins.
+    try testing.expect(wash.y + wash.height <= nested.y + 0.5);
 
-    // A verb inside it does NOT: the redesign washes the row, not the control
-    // the pointer happens to be over (locked decision 2, and 11e draws the
-    // engagement strip at its resting state under a hovered row). An inner
-    // control that washed on its own would put two highlights on one row.
+    // A verb inside it does NOT wash: the redesign washes the row, not the
+    // control the pointer happens to be over (locked decision 2, and 11e draws
+    // the engagement strip at its resting state under a hovered row).
     const verb = try painted.Painted.renderHovered(arena, &model, "Reply");
     const verb_frame = verb.frameOf("Reply") orelse return error.NoVerb;
     try testing.expect(!verb.hasFillAt(
@@ -2633,4 +2643,74 @@ test "every pressable row in a thread washes under the pointer" {
         verb_frame.y + verb_frame.height / 2,
         theme.palette.surface_hover,
     ));
+    // And NEITHER DOES THE ROW, which is a limit rather than a choice: the
+    // runtime hovers exactly one widget, the nearest that claims a press, so
+    // while the pointer is over a verb the row it belongs to is not hovered at
+    // all. 11e washes the row with its actions at full strength. Only
+    // `data_cell` hands its hover up to `data_row` today, so there is no way to
+    // lift it app-side without giving up the verbs' own presses. Asserted so the
+    // gap is a recorded state and not a surprise.
+    try testing.expect(verb.fillRectOf(theme.palette.surface_hover) == null);
+}
+
+test "a pressed row reads deeper than a hovered one" {
+    // Binding the hover colour alone silently repaints the PRESS too: the fill
+    // resolves as `active orelse hover orelse background`, so a press with no
+    // channel of its own becomes the hover colour, and every row whose only
+    // painted state was the press (the rail seat, both Back rows, the fold, the
+    // picture tile) loses its feedback. Nothing about that is visible in a
+    // widget tree or in a hover test.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    model.notes_len = 1;
+
+    const pressed = try painted.Painted.renderPressed(arena, &model, "Open thread");
+    const frame = pressed.frameOf("Open thread") orelse return error.NoRow;
+    const x = frame.x + frame.width / 2;
+    const y = frame.y + frame.height / 2;
+    try painted.expectFillAt(pressed, x, y, theme.palette.surface_chip);
+    // And it is a different colour from the hover, or the press says nothing.
+    try testing.expect(!pressed.hasFillAt(x, y, theme.palette.surface_hover));
+}
+
+test "a row's own frame holds everything it draws" {
+    // The kind a pressable row is matters more than it looks. `wrappedVerticalExtentForWidth`
+    // (the width-aware measurer) has branches for `row`, `column`, `card` and
+    // friends and falls back to the CLASSIC intrinsic for everything else, where
+    // a wrapping paragraph measures as a single line. So a row whose body wraps
+    // measures one line tall whatever it draws: its content spills into the row
+    // below, the hairline cuts through the text, and a press near the bottom of a
+    // long note opens the note under it.
+    //
+    // Nothing else here catches it. The estimator test measures the deepest
+    // DESCENDANT, which is right either way; only the row's own frame is wrong.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const body = "A note long enough to wrap onto three full lines of the reading column, which is the shape the measurement has to handle, and it keeps going for a while so there is no doubt about it at all.";
+    for (0..2) |i| {
+        model.notes[i] = threadNote(0xA1 + @as(u8, @intCast(i)), 100, 0);
+        model.notes[i].id = @intCast(7 + i);
+        @memcpy(model.notes[i].content_buf[0..body.len], body);
+        model.notes[i].content_len = @intCast(body.len);
+    }
+    model.notes_len = 2;
+
+    const p = try painted.Painted.render(arena, &model);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 2) return error.ExpectedTwoRows;
+    // Three body lines, so the row is a good deal taller than the one-line
+    // measurement the wrong kind would give it.
+    try testing.expect(rows[0].height > main.feed_row_chrome + 2 * main.body_line_height);
+    // And the row below starts after this one ends, rather than under its tail.
+    try testing.expect(rows[1].y >= rows[0].y + rows[0].height - 0.5);
 }

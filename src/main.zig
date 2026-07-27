@@ -4704,7 +4704,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
         ui.row(.{ .cross = .center, .gap = 6 }, .{
-            ui.el(.list_item, .{ .on_press = .close_bunker, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Back" } }, .{
+            ui.el(.data_row, .{ .on_press = .close_bunker, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Back" } }, .{
                 ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
             }),
             ui.paragraph(
@@ -5284,7 +5284,7 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const count = model.threadReplyCount();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
-            ui.el(.list_item, .{ .on_press = .close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
+            ui.el(.data_row, .{ .on_press = .close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
                 ui.row(.{ .cross = .center, .gap = 3 }, .{
                     ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
                     ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, back_label),
@@ -5718,16 +5718,19 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
         // gives the rail a height to grow into. Pinned to the top, the disc's
         // column would be exactly as tall as the disc and the rail would draw
         // nothing at all, which is how it shipped invisible.
-        ui.el(.list_item, .{
+        // The reply's OWN row, and only it: the wash belongs to the row under the
+        // pointer, and a band covering this reply plus everything nested under it
+        // is one highlight over three rows.
+        ui.el(.data_row, .{
             .width = thread_column_width,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             .on_press = Msg{ .open_thread = note.id },
             .semantics = .{ .label = "Open thread" },
         }, .{
             hgap(ui, thread_inset),
             // The disc, with the rail below it: the line a reply's own replies
-            // hang from, drawn by the column stretching to the block's height.
+            // hang from. It runs to the bottom of this row and the children's
+            // section picks it up from there, so the line reads as one.
             ui.column(.{ .cross = .center, .gap = 0 }, .{
                 noteAvatar(ui, note),
                 vgap(ui, 4),
@@ -5746,6 +5749,18 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, note),
+            }),
+            hgap(ui, thread_inset),
+        }),
+        // What hangs off this reply: its own replies and the line into whatever
+        // the branch continues into, in the same gutter so the rail runs on.
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, thread_inset),
+            ui.row(.{ .width = avatar_size, .main = .center }, .{
+                ui.separator(.{ .width = 2, .style = .{ .foreground = p.border_hairline, .background = p.border_hairline } }),
+            }),
+            hgap(ui, avatar_to_text_gap),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
                 ui.column(.{ .gap = 0 }, .{kids[0..n]}),
                 vgap(ui, if (last) 4 else 12),
                 // The rule between blocks starts at the text, not the window edge,
@@ -5786,10 +5801,9 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
         // would draw nothing.
         // A `list_item`, which is the kind the renderer washes on hover, given an
         // explicit width so it constrains the body instead of sizing to it.
-        ui.el(.list_item, .{
+        ui.el(.data_row, .{
             .width = thread_column_width,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             // By EVENT id: an ancestor is neither in the feed nor in the open
             // thread's replies, so the render key `open_thread` resolves through
             // would find nothing and the press would quietly do nothing.
@@ -6007,10 +6021,9 @@ fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
     const is_author = std.mem.eql(u8, &note.pubkey, &root_author);
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 8),
-        ui.el(.list_item, .{
+        ui.el(.data_row, .{
             .grow = 1,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             .cross = .start,
             .on_press = Msg{ .open_thread = note.id },
             .semantics = .{ .label = "Open thread" },
@@ -6065,23 +6078,25 @@ fn nestedHandle(ui: *AppUi, note: *const Note) AppUi.Node {
 /// which is what the line says.
 fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
     const p = theme.palette;
-    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
-        vgap(ui, 2),
-        // The height is stated, because a `list_item` carries a 28px intrinsic
-        // row floor and this line is a single 18px text line: without it the
-        // quiet line grows ten pixels looser than the shot.
-        ui.el(.list_item, .{
+    // The row's own padding sits INSIDE it, so the wash covers the band the shot
+    // pads rather than a stripe through the middle of it. The height is stated
+    // because a `list_item` carries a 28px intrinsic row floor, and this line is
+    // a single 18px text line: without it the quiet line grows ten pixels looser
+    // than the shot.
+    return ui.el(
+        .data_row,
+        .{
             .width = thread_column_width,
-            .height = outside_row_extent - 2 - 12,
+            .height = outside_row_extent,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = .toggle_outside_replies,
             // The row is a disclosure, so it says which way it is pointing: the
             // glyph, the verb in the label, and the accessible expanded state.
             .expanded = open,
             .semantics = .{ .role = .button, .label = if (open) "Hide replies from outside your graph" else "Show replies from outside your graph", .focusable = true },
-        }, .{
+        },
+        .{
             hgap(ui, 52),
             // The glyph is chosen at runtime, so `appIcon` (which resolves the
             // built-in names too) rather than the comptime-checked `icon`.
@@ -6099,9 +6114,8 @@ fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
                 .{ .style = .{ .foreground = p.text_dim } },
                 &.{.{ .text = if (open) "shown, below your graph" else "held below, never deleted", .monospace = true, .scale = mono_meta_scale }},
             ),
-        }),
-        vgap(ui, 12),
-    });
+        },
+    );
 }
 
 /// The line under a page of replies: how many conversations are still folded, and
@@ -6112,11 +6126,10 @@ fn showMoreReplies(ui: *AppUi, hidden: usize) AppUi.Node {
         vgap(ui, 12),
         // Height stated for the same reason as the held line: a `list_item` (the
         // kind that washes) carries a 28px intrinsic floor.
-        ui.el(.list_item, .{
+        ui.el(.data_row, .{
             .width = thread_column_width,
             .height = show_more_extent - 12 - 10,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = .show_more_replies,
             .semantics = .{ .role = .button, .label = "Show more replies", .focusable = true },
@@ -6139,11 +6152,10 @@ fn branchMore(ui: *AppUi, child: *const Note, deeper: usize) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 6),
-        ui.el(.list_item, .{
+        ui.el(.data_row, .{
             .grow = 1,
             .height = branch_more_extent - 6,
             .padding = 0.01,
-            .style = .{ .radius = 0 },
             .cross = .center,
             .on_press = Msg{ .open_thread = child.id },
             .semantics = .{ .role = .button, .label = "More in this branch", .focusable = true },
@@ -6395,7 +6407,7 @@ fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label:
 fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
     const p = theme.palette;
     const press: Msg = if (guest) .open_join else .open_settings;
-    return ui.el(.list_item, .{
+    return ui.el(.data_row, .{
         .on_press = press,
         .padding = 0,
         .style = .{ .quiet_hover = true },
@@ -7265,7 +7277,7 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
     if (long) {
         // A deeper hit target than the row's open-thread press, so tapping it
         // toggles the fold rather than opening the thread.
-        kids[n] = ui.el(.list_item, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
+        kids[n] = ui.el(.data_row, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_secondary } }, if (expanded) "Show less" else "Show more"),
         });
         n += 1;
@@ -7454,7 +7466,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // cannot express any of that, and a `gap` on the row would also apply
             // around each inset box, which is what threw the first attempt 12px
             // off the reading rail.
-            ui.el(.list_item, .{ .width = feed_column_width, .padding = 0.01, .style = .{ .radius = 0 }, .on_press = Msg{ .open_thread = note.id }, .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
+            ui.el(.data_row, .{ .width = feed_column_width, .padding = 0.01, .on_press = Msg{ .open_thread = note.id }, .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
                 vgap(ui, row_pad_top),
                 ui.row(.{ .gap = 0, .cross = .start }, .{
                     hgap(ui, row_pad_side),
@@ -7604,7 +7616,7 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // The link role is what puts the pointing hand over it: the engine follows
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
-    return ui.el(.list_item, .{
+    return ui.el(.data_row, .{
         .width = pictureWidth(note),
         .height = height,
         .padding = 0,

@@ -85,7 +85,11 @@ pub const Painted = struct {
         main.registerIcons();
 
         var ui = main.AppUi.init(arena);
-        const node = build(&ui);
+        // Wrapped in a column, because a ROOT is laid out into the whole box: a
+        // row measured as the root stretches to the box height and says nothing
+        // about how tall it is. As a child it takes its natural height, which is
+        // what it does in the app.
+        const node = ui.column(.{}, .{build(&ui)});
         if (ui.failed) return error.ViewBuild;
         const tree = try ui.finalize(node);
         const tokens = theme.tokens(main.Model)(model);
@@ -100,25 +104,45 @@ pub const Painted = struct {
         return .{ .commands = commands[0..builder.len], .layout = layout };
     }
 
+    /// The same view with the widget labelled `label` PRESSED. Binding the hover
+    /// colour alone quietly repaints this state too (the press fill resolves
+    /// through the hover channel when nothing states it), so it is worth asking
+    /// about directly.
+    pub fn renderPressed(arena: std.mem.Allocator, model: *const main.Model, label: []const u8) !Painted {
+        return renderWithState(arena, model, label, .{ .pressed = true });
+    }
+
     /// The same view with the widget labelled `label` HOVERED, so a test can ask
     /// what the pointer resting on a row actually paints. Hover is renderer
     /// state, not something the view can declare, so it is set on the laid-out
     /// node and the display list re-emitted from there: the same path the
     /// runtime takes when the pointer moves.
     pub fn renderHovered(arena: std.mem.Allocator, model: *const main.Model, label: []const u8) !Painted {
+        return renderWithState(arena, model, label, .{ .hovered = true });
+    }
+
+    /// One widget put into a pointer state, and the display list re-emitted from
+    /// there: the same path the runtime takes when the pointer moves or presses.
+    fn renderWithState(
+        arena: std.mem.Allocator,
+        model: *const main.Model,
+        label: []const u8,
+        state: struct { hovered: bool = false, pressed: bool = false },
+    ) !Painted {
         var p = try render(arena, model);
-        var hovered = false;
-        // The layout hands back a const view of its nodes; the wash is a
+        var found = false;
+        // The layout hands back a const view of its nodes; the state is a
         // property of the node, so take a mutable slice over the same storage.
         const nodes = @constCast(p.layout.nodes);
         for (nodes) |*node| {
             const name = node.widget.semantics.label;
             if (name.len == 0 or !std.mem.eql(u8, name, label)) continue;
-            node.widget.state.hovered = true;
-            hovered = true;
+            node.widget.state.hovered = state.hovered;
+            node.widget.state.pressed = state.pressed;
+            found = true;
             break;
         }
-        if (!hovered) return error.NoSuchWidget;
+        if (!found) return error.NoSuchWidget;
 
         const tokens = theme.tokens(main.Model)(model);
         const commands = try arena.alloc(canvas.CanvasCommand, native_sdk.runtime.max_canvas_commands_per_view);
@@ -185,6 +209,26 @@ pub const Painted = struct {
         return false;
     }
 
+    /// The rect of the LAST fill painted in `color`, for asking how far a surface
+    /// actually reaches rather than whether it covers one point. A wash that
+    /// spills over its row, or covers only a stripe of it, is invisible to a
+    /// point sample and obvious here.
+    pub fn fillRectOf(self: Painted, color: canvas.Color) ?geometry.RectF {
+        var found: ?geometry.RectF = null;
+        for (self.commands) |command| {
+            switch (command) {
+                .fill_rect => |v| {
+                    if (sameColor(fillColor(v.fill), color)) found = v.rect;
+                },
+                .fill_rounded_rect => |v| {
+                    if (sameColor(fillColor(v.fill), color)) found = v.rect;
+                },
+                else => {},
+            }
+        }
+        return found;
+    }
+
     /// The frame of the first widget the layout labels `label`, for tests that
     /// want to sample a control's centre without hardcoding a coordinate.
     pub fn frameOf(self: Painted, label: []const u8) ?geometry.RectF {
@@ -193,6 +237,23 @@ pub const Painted = struct {
             if (name.len != 0 and std.mem.eql(u8, name, label)) return node.widget.frame;
         }
         return null;
+    }
+
+    /// Every frame the layout labels `label`, in tree order: a thread draws the
+    /// same label on a reply and on the reply nested under it, and the question
+    /// is often about the relationship between the two.
+    pub fn framesOf(self: Painted, label: []const u8) []const geometry.RectF {
+        var out: [16]geometry.RectF = undefined;
+        var n: usize = 0;
+        for (self.layout.nodes) |node| {
+            const name = node.widget.semantics.label;
+            if (name.len == 0 or !std.mem.eql(u8, name, label)) continue;
+            if (n == out.len) break;
+            out[n] = node.widget.frame;
+            n += 1;
+        }
+        frames_scratch = out;
+        return frames_scratch[0..n];
     }
 
     /// The colour at the centre of the widget labelled `label`.
@@ -223,6 +284,10 @@ fn containsRounded(rect: geometry.RectF, radius: canvas.Radius, x: f32, y: f32) 
     }
     return true;
 }
+
+/// Scratch for `framesOf`, which hands back a slice rather than an array. Test
+/// code only, and single-threaded like everything else here.
+var frames_scratch: [16]geometry.RectF = undefined;
 
 fn contains(rect: geometry.RectF, x: f32, y: f32) bool {
     const r = rect.normalized();
