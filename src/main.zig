@@ -269,6 +269,9 @@ const quote_body_lines: usize = 4;
 const quote_skeleton_height: f32 = 34;
 /// The depth-1 pill's own height, stated because a `list_item` floors at 28.
 const quote_pill_height: f32 = 22;
+/// How wide the pill's one line may run before it elides, so a quoted note with
+/// a lot to say cannot push the pill across the row.
+const quote_pill_label_width: f32 = 190;
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
 /// children. MEASURED in the running layout rather than summed from those parts,
@@ -7441,10 +7444,16 @@ fn quotingPill(ui: *AppUi, id: [32]u8) AppUi.Node {
                 .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
             }, ui.fmt("{c}{c}", .{ hexdigits[author[0] >> 4], hexdigits[author[0] & 0x0f] })),
             hgap(ui, 6),
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_muted_alt } },
-                &.{.{ .text = quotingPillLabel(ui, id), .scale = mono_row_scale }},
-            ),
+            // ONE line, elided at the tail: the pill says where the hop goes and
+            // begins what it says, and a long note may not push the row wider.
+            // `wrap = false` is what makes the single-line overflow policy apply.
+            ui.text(.{
+                .width = quote_pill_label_width,
+                .wrap = false,
+                .overflow = .ellipsis,
+                .size = .sm,
+                .style = .{ .foreground = p.text_muted_alt },
+            }, quotingPillLabel(ui, id)),
             hgap(ui, 9),
         }),
         // Hugging its content, so the pill is a pill and not a bar.
@@ -7466,10 +7475,32 @@ fn quotingPillAuthor(id: [32]u8) [32]u8 {
 fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
     const e = quoteFor(id) orelse return "Quoting a note";
     return switch (e.state) {
-        .loaded => ui.fmt("Quoting {s}", .{quoteAuthorName(ui, e.pubkey)}),
+        // Whose note, and the start of what it says: the shot's own pill reads
+        // "Quoting @edith · Shipping it: the feed renders…", so the reader can
+        // tell whether the hop is worth taking before taking it.
+        .loaded => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), e.text_buf[0..e.text_len] }),
         .missing => "Quotes a note no relay has",
         else => "Quoting a note",
     };
+}
+
+/// The handle for a pill: `@name` when the author has one, else their display
+/// name, else a short npub. The pill is one line, so it names them the shortest
+/// true way rather than the fullest.
+fn quotePillHandle(ui: *AppUi, pubkey: [32]u8) []const u8 {
+    if (lookupProfile(pubkey)) |pr| {
+        if (pr.nip05_len > 0) {
+            const nip05 = pr.nip05();
+            if (std.mem.indexOfScalar(u8, nip05, '@')) |at| {
+                const local = nip05[0..at];
+                const shown = if (std.mem.eql(u8, local, "_")) nip05[at + 1 ..] else local;
+                if (shown.len > 0) return std.fmt.allocPrint(ui.arena, "@{s}", .{shown}) catch "";
+            }
+        }
+        const user = pr.username();
+        if (user.len > 0) return std.fmt.allocPrint(ui.arena, "@{s}", .{user}) catch "";
+    }
+    return quoteAuthorName(ui, pubkey);
 }
 
 /// The rule down the left of a quote, and whatever sits beside it. The redesign
