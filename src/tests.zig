@@ -2027,3 +2027,529 @@ test "two children of one reply each keep their own branch count" {
     try testing.expectEqual(@as(usize, 0), blocks[0].deeper[0]);
     try testing.expectEqual(@as(usize, 1), blocks[0].deeper[1]);
 }
+
+test "a late reply lands after what is already read, however old it is" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // Two replies read in the first batch, then one that arrives later but was
+    // WRITTEN before both. Chronology alone would slot it at the top, moving the
+    // ground under a reader mid-thread; arrival order appends it.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 200, 0xAA),
+        threadNote(0xB1, 300, 0xAA),
+        threadNote(0xC1, 100, 0xAA),
+    };
+    // Stamped by the REAL stamper, in the order the app would see them: the
+    // first two while the thread was still settling, the third afterwards.
+    var table = main.arrivalTableForTest();
+    main.stampArrivalForTest(&table, notes[0..2], true);
+    main.stampArrivalForTest(&table, &notes, true);
+    try testing.expectEqual(notes[0].arrival, notes[1].arrival);
+    try testing.expect(notes[2].arrival > notes[0].arrival);
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    try testing.expectEqual(@as(usize, 3), blocks.len);
+    // The first batch keeps its chronological order, and the straggler is last.
+    try testing.expectEqualSlices(u8, &[_]u8{0xA1} ** 32, &blocks[0].parent.event_id);
+    try testing.expectEqualSlices(u8, &[_]u8{0xB1} ** 32, &blocks[1].parent.event_id);
+    try testing.expectEqualSlices(u8, &[_]u8{0xC1} ** 32, &blocks[2].parent.event_id);
+}
+
+test "replies from outside the follow graph are held below, not dropped" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // One reply from a followed account, one from a stranger.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xA1, 100, 0xAA),
+        threadNote(0xB1, 110, 0xAA),
+    };
+    notes[0].pubkey = main.starterPackForTest()[0];
+    notes[1].pubkey = [_]u8{0x77} ** 32; // nobody followed
+    // Whoever wrote the note being read: nobody followed here either, so the
+    // test also pins that the split never holds a third party by accident.
+    const root_author = [_]u8{0x66} ** 32;
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    const split = main.splitByFollowGraphForTest(&ui, blocks, root_author);
+    try testing.expectEqual(@as(usize, 1), split.inside.len);
+    try testing.expectEqual(@as(usize, 1), split.outside.len);
+    // Nothing is lost: every reply is in one tier or the other.
+    try testing.expectEqual(blocks.len, split.inside.len + split.outside.len);
+    try testing.expect(main.inFollowGraph(split.inside[0].parent.pubkey));
+    try testing.expect(!main.inFollowGraph(split.outside[0].parent.pubkey));
+}
+
+test "a thread still loading is one batch, however the relays interleave it" {
+    // The bug this pins: batching from the first build split a thread's OPENING
+    // read into one batch per tick, so the conversation froze into the order the
+    // relays happened to answer in rather than the order it was written.
+    var table = main.arrivalTableForTest();
+    var first = [_]main.Note{threadNote(0xA1, 300, 0xAA)};
+    main.stampArrivalForTest(&table, &first, false);
+
+    // A second relay answers with an OLDER reply while the fetch is still out.
+    var both = [_]main.Note{
+        threadNote(0xA1, 300, 0xAA),
+        threadNote(0xB1, 100, 0xAA),
+    };
+    main.stampArrivalForTest(&table, &both, false);
+    // Same batch, so the sort put the older one first.
+    try testing.expectEqual(both[0].arrival, both[1].arrival);
+    try testing.expectEqualSlices(u8, &[_]u8{0xB1} ** 32, &both[0].event_id);
+
+    // The build that settles is still the last build of the opening read, so
+    // what it brings is chronological too: the oldest reply leads.
+    var settling = [_]main.Note{
+        threadNote(0xA1, 300, 0xAA),
+        threadNote(0xB1, 100, 0xAA),
+        threadNote(0xC1, 50, 0xAA),
+    };
+    main.stampArrivalForTest(&table, &settling, true);
+    try testing.expectEqualSlices(u8, &[_]u8{0xC1} ** 32, &settling[0].event_id);
+    try testing.expectEqualSlices(u8, &[_]u8{0xA1} ** 32, &settling[2].event_id);
+
+    // NOW a reply that turns up lands after everything already read, however
+    // long ago it was written.
+    var late = [_]main.Note{
+        threadNote(0xA1, 300, 0xAA),
+        threadNote(0xB1, 100, 0xAA),
+        threadNote(0xC1, 50, 0xAA),
+        threadNote(0xD1, 10, 0xAA),
+    };
+    main.stampArrivalForTest(&table, &late, true);
+    try testing.expectEqualSlices(u8, &[_]u8{0xD1} ** 32, &late[3].event_id);
+    // And re-seeing the same set does not move it back.
+    main.stampArrivalForTest(&table, &late, true);
+    try testing.expectEqualSlices(u8, &[_]u8{0xD1} ** 32, &late[3].event_id);
+}
+
+test "the held line counts replies, not conversations" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // One stranger's reply with two answers under it: ONE conversation, THREE
+    // replies. The line says "N replies", so N is three.
+    const root = [_]u8{0xAA} ** 32;
+    var notes = [_]main.Note{
+        threadNote(0xB1, 100, 0xAA),
+        threadNote(0xB2, 110, 0xB1),
+        threadNote(0xB3, 120, 0xB1),
+    };
+    for (&notes) |*note| note.pubkey = [_]u8{0x77} ** 32;
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    try testing.expectEqual(@as(usize, 1), blocks.len);
+    try testing.expectEqual(@as(usize, 3), main.heldReplies(blocks));
+}
+
+test "the thread's own author is never held below their own thread" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    // Opening a stranger's reply as a thread: their continuation of it must read
+    // inline, not behind a collapsed line, or the thread opens with no body.
+    const root = [_]u8{0xAA} ** 32;
+    const author = [_]u8{0x77} ** 32;
+    var notes = [_]main.Note{threadNote(0xB1, 100, 0xAA)};
+    notes[0].pubkey = author;
+    main.arrangeThread(&notes, root);
+
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    const split = main.splitByFollowGraphForTest(&ui, blocks, author);
+    try testing.expectEqual(@as(usize, 1), split.inside.len);
+    try testing.expectEqual(@as(usize, 0), split.outside.len);
+}
+
+test "every thread row is planned exactly once" {
+    // The row plan is one function so the builder and the estimator cannot drift,
+    // and this walks every shape it can take: with and without ancestors, a
+    // hidden tail, a held tier open and closed, skeletons, and the empty line.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    var note = threadNote(0xA1, 100, 0);
+    var notes = [_]main.Note{
+        threadNote(0xB1, 110, 0xA1),
+        threadNote(0xB2, 120, 0xA1),
+        threadNote(0xB3, 130, 0xA1),
+    };
+    main.arrangeThread(&notes, [_]u8{0xA1} ** 32);
+    const blocks = main.groupThreadBlocks(&ui, &notes);
+    const ancestors = [_]main.Ancestor{ .{ .ghost = .missing }, .{} };
+    var model = main.Model{};
+
+    const shapes = [_]main.ThreadRows{
+        .{ .model = &model, .root = &note, .ancestors = &.{}, .blocks = blocks, .shown = blocks.len, .hidden = 0, .hidden_held = 0, .outside = &.{}, .outside_held = 0, .outside_open = false, .skeletons = false, .empty = false, .footer = true },
+        .{ .model = &model, .root = &note, .ancestors = &ancestors, .blocks = blocks, .shown = 1, .hidden = blocks.len - 1, .hidden_held = blocks.len - 1, .outside = blocks[0..1], .outside_held = 1, .outside_open = false, .skeletons = false, .empty = false, .footer = true },
+        .{ .model = &model, .root = &note, .ancestors = &ancestors, .blocks = blocks, .shown = 1, .hidden = blocks.len - 1, .hidden_held = blocks.len - 1, .outside = blocks[0..2], .outside_held = 2, .outside_open = true, .skeletons = false, .empty = false, .footer = true },
+        .{ .model = &model, .root = &note, .ancestors = &.{}, .blocks = &.{}, .shown = 0, .hidden = 0, .hidden_held = 0, .outside = &.{}, .outside_held = 0, .outside_open = false, .skeletons = true, .empty = false, .footer = true },
+        .{ .model = &model, .root = &note, .ancestors = &.{}, .blocks = &.{}, .shown = 0, .hidden = 0, .hidden_held = 0, .outside = &.{}, .outside_held = 0, .outside_open = false, .skeletons = false, .empty = true, .footer = false },
+    };
+
+    for (shapes, 0..) |rows, shape| {
+        var seen_focal: usize = 0;
+        var seen_composer: usize = 0;
+        var seen_footer: usize = 0;
+        var ancestors_seen: usize = 0;
+        var blocks_seen: usize = 0;
+        var outside_seen: usize = 0;
+        for (0..rows.count()) |i| {
+            switch (rows.rowAt(i)) {
+                // Each index into a slice must be in range, and each must appear
+                // exactly once and in order.
+                .ancestor => |ai| {
+                    try testing.expectEqual(ancestors_seen, ai);
+                    ancestors_seen += 1;
+                },
+                .focal => seen_focal += 1,
+                .composer => seen_composer += 1,
+                .block => |bi| {
+                    try testing.expectEqual(blocks_seen, bi);
+                    blocks_seen += 1;
+                },
+                .outside_block => |oi| {
+                    try testing.expectEqual(outside_seen, oi);
+                    outside_seen += 1;
+                },
+                .footer => seen_footer += 1,
+                .show_more, .outside_line, .skeleton, .empty => {},
+            }
+        }
+        errdefer std.debug.print("shape {d}\n", .{shape});
+        try testing.expectEqual(@as(usize, 1), seen_focal);
+        try testing.expectEqual(@as(usize, 1), seen_composer);
+        try testing.expectEqual(@as(usize, @intFromBool(rows.footer)), seen_footer);
+        try testing.expectEqual(rows.ancestors.len, ancestors_seen);
+        try testing.expectEqual(rows.shown, blocks_seen);
+        try testing.expectEqual(if (rows.outside_open) rows.outside.len else 0, outside_seen);
+    }
+}
+
+// A note's body, so a row under test has something to wrap.
+fn ancestorNote(text: []const u8) main.Note {
+    var note = threadNote(0xA1, 100, 0xAA);
+    @memcpy(note.content_buf[0..text.len], text);
+    note.content_len = @intCast(text.len);
+    return note;
+}
+
+test "the rail between two discs actually paints" {
+    // It did not, for as long as the nesting existed: the row pinned its
+    // children to the top, so the disc's column was exactly as tall as the disc
+    // and the rail, which grows into whatever is left, got nothing. A widget-tree
+    // assertion cannot see that; the display list can.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = main.Model{};
+
+    const Build = struct {
+        var note: main.Note = undefined;
+        var ancestor: main.Ancestor = undefined;
+        fn ancestorRow(ui: *main.AppUi) main.AppUi.Node {
+            return main.ancestorRowForTest(ui, &ancestor, true);
+        }
+    };
+    Build.note = ancestorNote("Two lines of an ancestor, enough to make the row taller than its own disc so the rail has somewhere to run.");
+    Build.ancestor = .{ .note = Build.note };
+
+    const p = try painted.Painted.renderPiece(arena, &model, Build.ancestorRow, main.window_width, 300);
+    // The rail hangs under the disc, on the disc's centre line.
+    const x = main.thread_inset_for_test + main.avatar_size / 2;
+    const top = main.ancestor_top_pad + main.avatar_size + 4;
+    try testing.expect(p.hasFillAt(x, top + 6, theme.palette.border_hairline));
+}
+
+test "nip10Root names what the ghost row is missing" {
+    // The ghost row says "Root note not on your relays yet" only when the id the
+    // chain stops below IS the thread's root, so the claim is only as good as
+    // this.
+    const root_hex = "01" ** 32;
+    const mid_hex = "02" ** 32;
+    const quote_hex = "03" ** 32;
+    const root_id = [_]u8{0x01} ** 32;
+
+    // A marked root wins wherever it sits, and a marked reply is never the root.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", mid_hex, "", "reply" },
+            &.{ "e", root_hex, "wss://r", "root" },
+        };
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Root(&tags).?));
+    }
+    // Positional (the deprecated scheme): the FIRST e tag is the root, which is
+    // the opposite end from the parent.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "e", root_hex, "" },
+            &.{ "e", mid_hex, "" },
+        };
+        try testing.expectEqualSlices(u8, &root_id, &(main.nip10Root(&tags).?));
+    }
+    // A quoted note is not an ancestor, so it never stands in for the root.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "e", quote_hex, "", "mention" }};
+        try testing.expect(main.nip10Root(&tags) == null);
+    }
+    // A root's own tags name no root, which is how the walk knows it arrived.
+    {
+        const tags = [_]nostr.event.Tag{&.{ "p", "ab" ** 32 }};
+        try testing.expect(main.nip10Root(&tags) == null);
+    }
+}
+
+test "a deep back-stack still lays out" {
+    // The SDK REFUSES a view past `max_canvas_widget_nodes_per_view`, whole: not
+    // a truncated frame, no frame at all. Every mounted level used to build its
+    // own rows, so six levels of a busy thread crossed the ceiling and the window
+    // went blank. Occluded levels build nothing now, and this is the guard.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    const author = [_]u8{0x55} ** 32;
+    model.thread_root.pubkey = author;
+
+    // A page of conversation: twenty replies with two nested children each, all
+    // by the thread's own author so none of them are held below the graph line.
+    var n: usize = 0;
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        model.thread_notes[n] = threadNote(0x10 + i, 200 + @as(i64, i), 0xAA);
+        model.thread_notes[n].pubkey = author;
+        model.thread_notes[n].id = @as(i64, i) + 10;
+        n += 1;
+        var k: u8 = 0;
+        while (k < 2) : (k += 1) {
+            model.thread_notes[n] = threadNote(0x60 + i * 2 + k, 300 + @as(i64, i), 0x10 + i);
+            model.thread_notes[n].pubkey = author;
+            model.thread_notes[n].id = 1000 + @as(i64, i) * 2 + @as(i64, k);
+            n += 1;
+        }
+    }
+    model.thread_notes_len = n;
+
+    for (0..main.thread_depth_max) |d| {
+        model.thread_stack[d] = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0);
+        model.thread_stack[d].id = 500 + @as(i64, @intCast(d));
+        model.thread_stack[d].pubkey = author;
+    }
+    // Every depth the stack can reach, including full.
+    for (0..main.thread_depth_max + 1) |depth| {
+        model.thread_stack_len = depth;
+        const p = painted.Painted.render(arena, &model) catch |err| {
+            std.debug.print("back-stack depth {d} refused: {s}\n", .{ depth, @errorName(err) });
+            return err;
+        };
+        try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
+    }
+}
+
+/// How tall a row actually lays out, and how many widgets it costs. The rows of
+/// a windowed list are priced by constants, and a constant that says more than
+/// the row draws is a scrollbar over nothing; one that says less is a list that
+/// jumps as the reader scrolls into it.
+fn measuredHeight(arena: std.mem.Allocator, model: *const main.Model, build: *const fn (*main.AppUi) main.AppUi.Node) !f32 {
+    const p = try painted.Painted.renderPiece(arena, model, build, main.window_width, 4000);
+    var bottom: f32 = 0;
+    for (p.layout.nodes) |node| {
+        // The root fills the box it was given, so it says nothing about the row.
+        if (node.depth == 0) continue;
+        const b = node.widget.frame.y + node.widget.frame.height;
+        if (b > bottom) bottom = b;
+    }
+    return bottom;
+}
+
+test "every fixed-height thread row is priced at what it draws" {
+    // Each of these was calibrated by hand and then drifted, which a windowed
+    // list hides until the scrollbar is over nothing. An OCCLUDED level makes it
+    // worse: it builds no rows, so its estimates are never corrected by a
+    // measurement, and its restored scroll offset is measured against them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = main.Model{};
+
+    const Rows = struct {
+        fn ghost(ui: *main.AppUi) main.AppUi.Node {
+            return main.ghostRowForTest(ui, false);
+        }
+        fn ghostCapped(ui: *main.AppUi) main.AppUi.Node {
+            return main.ghostRowForTest(ui, true);
+        }
+        fn footer(ui: *main.AppUi) main.AppUi.Node {
+            return main.listeningFooterForTest(ui);
+        }
+        fn outsideClosed(ui: *main.AppUi) main.AppUi.Node {
+            return main.outsideGraphRowForTest(ui, false);
+        }
+        fn outsideOpen(ui: *main.AppUi) main.AppUi.Node {
+            return main.outsideGraphRowForTest(ui, true);
+        }
+        fn showMore(ui: *main.AppUi) main.AppUi.Node {
+            return main.showMoreRepliesForTest(ui);
+        }
+    };
+
+    const cases = [_]struct { name: []const u8, build: *const fn (*main.AppUi) main.AppUi.Node, estimate: f32, lead: f32 }{
+        .{ .name = "ghost", .build = Rows.ghost, .estimate = main.ghost_row_extent_for_test, .lead = main.ancestor_top_pad },
+        .{ .name = "ghost capped", .build = Rows.ghostCapped, .estimate = main.ghost_row_extent_for_test, .lead = main.ancestor_top_pad },
+        .{ .name = "listening footer", .build = Rows.footer, .estimate = main.listening_row_extent_for_test, .lead = 0 },
+        .{ .name = "outside line closed", .build = Rows.outsideClosed, .estimate = main.outside_row_extent_for_test, .lead = 0 },
+        .{ .name = "outside line open", .build = Rows.outsideOpen, .estimate = main.outside_row_extent_for_test, .lead = 0 },
+        .{ .name = "show more", .build = Rows.showMore, .estimate = main.show_more_extent_for_test, .lead = 0 },
+    };
+    for (cases) |c| {
+        const measured = try measuredHeight(arena, &model, c.build);
+        const priced = c.estimate + c.lead;
+        if (@abs(measured - priced) > 0.5) {
+            std.debug.print("\n{s}: draws {d}, priced {d}\n", .{ c.name, measured, priced });
+            return error.EstimateDisagreesWithLayout;
+        }
+    }
+}
+
+test "an ancestor row is priced at what it draws, one line and two" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = main.Model{};
+
+    const One = struct {
+        var a: main.Ancestor = .{};
+        fn row(ui: *main.AppUi) main.AppUi.Node {
+            return main.ancestorRowForTest(ui, &a, true);
+        }
+    };
+
+    const bodies = [_][]const u8{
+        "One line.",
+        // Comfortably over one line of the reading column, so the clamp fires.
+        "Two lines of an ancestor, long enough that it wraps well past the width of the column it is drawn in, and then keeps going so the clamp has something to cut.",
+    };
+    for (bodies) |body| {
+        var note = threadNote(0xA1, 100, 0xAA);
+        @memcpy(note.content_buf[0..body.len], body);
+        note.content_len = @intCast(body.len);
+        // The same field the estimator prices from, filled the way the chain
+        // walk fills it, so this measures the real path and not a parallel one.
+        One.a = .{ .note = note, .lines = @intFromFloat(main.ancestorBodyLinesForTest(&note)) };
+
+        const measured = try measuredHeight(arena, &model, One.row);
+        const priced = main.ancestor_top_pad + main.ancestor_row_chrome_for_test +
+            @as(f32, @floatFromInt(One.a.lines)) * main.body_line_height;
+        if (@abs(measured - priced) > 0.5) {
+            std.debug.print("\nancestor ({d} chars): draws {d}, priced {d}, lines {d}\n", .{ body.len, measured, priced, main.ancestorBodyLinesForTest(&One.a.note) });
+            return error.EstimateDisagreesWithLayout;
+        }
+    }
+}
+
+test "a reply block's rail paints too" {
+    // The ancestor row's rail has its own test, but the row that ACTUALLY
+    // shipped without a rail is this one, and it is a different call site with
+    // its own alignment. Guarding only the new code would have left the old bug
+    // free to come back.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = main.Model{};
+
+    const Build = struct {
+        var block: main.ThreadBlock = undefined;
+        var parent: main.Note = undefined;
+        fn row(ui: *main.AppUi) main.AppUi.Node {
+            return main.replyBlockForTest(ui, &block, [_]u8{0} ** 32, true, true);
+        }
+    };
+    const body = "A reply long enough to wrap past its own disc, so the rail below that disc has somewhere to run.";
+    Build.parent = threadNote(0xB1, 200, 0xA1);
+    @memcpy(Build.parent.content_buf[0..body.len], body);
+    Build.parent.content_len = @intCast(body.len);
+    Build.block = .{ .parent = &Build.parent, .children = &.{}, .deeper = &.{} };
+
+    const p = try painted.Painted.renderPiece(arena, &model, Build.row, main.window_width, 600);
+    const x = main.thread_inset_for_test + main.avatar_size / 2;
+    // Below the disc, inside the block: the rail's own run.
+    const y = 12 + main.avatar_size + 8;
+    try testing.expect(p.hasFillAt(x, y, theme.palette.border_hairline));
+}
+
+test "each thread level keeps its own page and its own held section" {
+    // One shared page and one shared flag meant walking into a reply and back
+    // collapsed the thread underneath, which is the opposite of why the stack
+    // stays mounted at all.
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    var first = threadNote(0xA1, 100, 0);
+    first.id = 11;
+    var second = threadNote(0xB1, 200, 0xA1);
+    second.id = 22;
+    main.enterThreadForTest(&model, first);
+    try testing.expectEqual(@as(usize, 0), model.currentLevel());
+
+    // The reader pages through the first level and opens its held tier.
+    model.thread_page[0] = 3;
+    model.thread_outside_open[0] = true;
+
+    main.enterThreadForTest(&model, second);
+    try testing.expectEqual(@as(usize, 1), model.currentLevel());
+    // The new level starts fresh, and the one underneath is untouched.
+    try testing.expectEqual(@as(usize, 1), model.thread_page[1]);
+    try testing.expect(!model.thread_outside_open[1]);
+    try testing.expectEqual(@as(usize, 3), model.thread_page[0]);
+    try testing.expect(model.thread_outside_open[0]);
+
+    model.thread_page[1] = 2;
+    model.thread_outside_open[1] = true;
+    main.closeThreadForTest(&model);
+    // Back on the first level, exactly as it was left.
+    try testing.expectEqual(@as(usize, 0), model.currentLevel());
+    try testing.expectEqual(@as(usize, 3), model.thread_page[0]);
+    try testing.expect(model.thread_outside_open[0]);
+    // And the level just left is reset for its next visit.
+    try testing.expectEqual(@as(usize, 1), model.thread_page[1]);
+    try testing.expect(!model.thread_outside_open[1]);
+}
+
+test "one level's arrival order does not disturb another's" {
+    // The table was per-app, so opening a reply wiped the order of the thread
+    // underneath and it came back reshuffled.
+    var a = main.arrivalTableForTest();
+    var b = main.arrivalTableForTest();
+
+    // Level A reads two replies, then a late one arrives.
+    var a_first = [_]main.Note{ threadNote(0xA1, 100, 0), threadNote(0xA2, 200, 0) };
+    main.stampArrivalForTest(&a, &a_first, true);
+    var a_late = [_]main.Note{ threadNote(0xA1, 100, 0), threadNote(0xA2, 200, 0), threadNote(0xA3, 50, 0) };
+    main.stampArrivalForTest(&a, &a_late, true);
+    try testing.expectEqualSlices(u8, &[_]u8{0xA3} ** 32, &a_late[2].event_id);
+
+    // Level B runs its own opening read in between, which must not move A.
+    var b_notes = [_]main.Note{ threadNote(0xB1, 10, 0), threadNote(0xB2, 20, 0) };
+    main.stampArrivalForTest(&b, &b_notes, false);
+
+    var a_again = [_]main.Note{ threadNote(0xA1, 100, 0), threadNote(0xA2, 200, 0), threadNote(0xA3, 50, 0) };
+    main.stampArrivalForTest(&a, &a_again, true);
+    // The late reply is still last, not back in its written place.
+    try testing.expectEqualSlices(u8, &[_]u8{0xA3} ** 32, &a_again[2].event_id);
+}
