@@ -133,6 +133,10 @@ pub const palette = struct {
     pub const border_control = hex("#2c2c33");
     // A copyable badge pill (npub, nevent) and a settings card outline.
     pub const border_chip = hex("#232329");
+    /// 11g's depth-1 pill: the seat a quote-of-a-quote gets instead of a third
+    /// nested body.
+    pub const surface_pill = hex("#17171b");
+    pub const border_pill = hex("#2c2c33");
     pub const border_menu = hex("#333338");
     pub const border_offline = hex("#3d3320");
     // The sheet outline. Deliberately a clear step above the surface so a modal

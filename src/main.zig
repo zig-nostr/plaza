@@ -267,6 +267,14 @@ const quote_body_lines: usize = 4;
 /// What a quote still resolving reserves, so the row keeps its height when the
 /// note lands.
 const quote_skeleton_height: f32 = 34;
+/// The depth-1 pill's own height, stated because a `list_item` floors at 28.
+const quote_pill_height: f32 = 22;
+/// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
+/// identity block beside the disc and the gaps between the column's three
+/// children. MEASURED in the running layout rather than summed from those parts,
+/// the way every other row constant here now is, because summing them was wrong
+/// by a line and a half and nothing said so.
+const quote_aside_chrome: f32 = 62.125;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
 /// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
 /// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
@@ -1467,6 +1475,12 @@ const QuoteEntry = struct {
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
+    /// What the quoted note itself quotes, if anything. Depth stops here (11g):
+    /// one hop is a pill saying where it goes, never a third nested body. The
+    /// reference is decoded from the event's own content at fill time, because
+    /// the stored text is rendered and clamped and can drop the token entirely.
+    quote_of: [32]u8 = [_]u8{0} ** 32,
+    has_quote_of: bool = false,
     last_used: u64 = 0,
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
@@ -1532,6 +1546,19 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         const keep = utf8SafeLen(tmp[0..wrote], q.text_buf.len);
         @memcpy(q.text_buf[0..keep], tmp[0..keep]);
         q.text_len = @intCast(keep);
+        // Decoded from the ORIGINAL content, not the stored text: the stored
+        // text is rendered and capped, so the token can be gone from it.
+        var probe = Note{};
+        const probe_len = @min(se.event.content.len, probe.content_buf.len);
+        @memcpy(probe.content_buf[0..probe_len], se.event.content[0..probe_len]);
+        probe.content_len = @intCast(probe_len);
+        findQuoteRef(&probe);
+        q.has_quote_of = probe.quote.kind == .event;
+        if (q.has_quote_of) {
+            q.quote_of = probe.quote.id;
+            // Resolve it too, so the pill can say whose note it walks to.
+            wantQuote(q.quote_of);
+        }
         q.state = .loaded;
         wantProfile(q.pubkey);
     }
@@ -4889,12 +4916,15 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
 /// resolving is priced at the skeleton it shows, so the row does not jump when
 /// it lands.
 fn quoteAsideExtent(id: [32]u8) f32 {
-    const chrome: f32 = 5 + 2 + avatar_size + 4 + 2;
+    const chrome: f32 = quote_aside_chrome;
     const e = quoteFor(id) orelse return chrome + quote_skeleton_height;
     return switch (e.state) {
         .idle, .fetching => chrome + quote_skeleton_height,
         .missing => chrome + body_line_height,
-        .loaded => chrome + quoteBodyLines(e) * body_line_height,
+        // The depth-1 pill, when the quoted note quotes something itself: it is
+        // a row of its own under the body, and the row around it is priced.
+        .loaded => chrome + quoteBodyLines(e) * body_line_height +
+            (if (e.has_quote_of) quote_pill_height + 4 else 0),
     };
 }
 
@@ -7381,7 +7411,65 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // Four lines of the quoted note, and no more: a quote is an aside, and
         // its height has to be known where the outer row is priced.
         textParaAt(ui, clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines), nested_body_scale, p.text_secondary_alt),
+        // A quote of a quote stops here. One more body would be a third voice in
+        // a row, so the second hop is a pill that says where it goes.
+        if (q.has_quote_of) quotingPill(ui, q.quote_of) else ui.spacer(0),
     }));
+}
+
+/// 11g's pill: where the quoted note's own quote goes, one hop, as a line rather
+/// than a third nested body. Pressing it walks that hop.
+fn quotingPill(ui: *AppUi, id: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const tint = avatarTint(quotingPillAuthor(id));
+    const hexdigits = "0123456789abcdef";
+    const author = quotingPillAuthor(id);
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = quote_pill_height,
+            .cross = .center,
+            .on_press = Msg{ .open_event = id },
+            .style = .{ .background = p.surface_pill, .border = p.border_pill, .radius = 999, .stroke_width = 1 },
+            .semantics = .{ .role = .button, .label = "Quoted note inside it", .focusable = true },
+        }, .{
+            hgap(ui, 4),
+            ui.avatar(.{
+                .image = 0,
+                .width = 14,
+                .height = 14,
+                .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+            }, ui.fmt("{c}{c}", .{ hexdigits[author[0] >> 4], hexdigits[author[0] & 0x0f] })),
+            hgap(ui, 6),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_muted_alt } },
+                &.{.{ .text = quotingPillLabel(ui, id), .scale = mono_row_scale }},
+            ),
+            hgap(ui, 9),
+        }),
+        // Hugging its content, so the pill is a pill and not a bar.
+        ui.spacer(1),
+    });
+}
+
+/// Whose note the pill walks to, once that note is resolved; a zero key until
+/// then, which tints the disc neutrally rather than guessing.
+fn quotingPillAuthor(id: [32]u8) [32]u8 {
+    const e = quoteFor(id) orelse return [_]u8{0} ** 32;
+    if (e.state != .loaded) return [_]u8{0} ** 32;
+    return e.pubkey;
+}
+
+/// What the pill says. It names the author once that note has arrived, and says
+/// plainly that it is still coming until then, rather than showing a name it
+/// does not have.
+fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
+    const e = quoteFor(id) orelse return "Quoting a note";
+    return switch (e.state) {
+        .loaded => ui.fmt("Quoting {s}", .{quoteAuthorName(ui, e.pubkey)}),
+        .missing => "Quotes a note no relay has",
+        else => "Quoting a note",
+    };
 }
 
 /// The rule down the left of a quote, and whatever sits beside it. The redesign

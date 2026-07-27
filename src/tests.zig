@@ -2757,3 +2757,49 @@ test "a note that quotes another is priced with the quote in it" {
     const without_quote = main.feed_row_chrome + main.body_line_height;
     try testing.expect(priced > without_quote + 2 * main.body_line_height);
 }
+
+test "a quote of a quote is a pill, and the row is priced for it" {
+    // Depth stops at one (11g). A second nested body would be a third voice in
+    // one row, so the hop becomes a line that says where it goes, and the row
+    // has to count it or the list reports less than it draws.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inner_id = [_]u8{0x3c} ** 32;
+    const quoted_id = [_]u8{0x5e} ** 32;
+    main.seedQuoteForTest(inner_id, [_]u8{0x9b} ** 32, 50, "The note at the end of the hop.");
+    main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "A quoted note that quotes another.");
+    // What the fill path learns from the event's own content.
+    const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+    e.quote_of = inner_id;
+    e.has_quote_of = true;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    // The pill is drawn, and it names whose note it walks to.
+    try testing.expect(p.frameOf("Quoted note inside it") != null);
+    // The pill names whose note it walks to, which is only true once that note
+    // has arrived; here it has.
+    const pill = p.frameOf("Quoted note inside it").?;
+    try testing.expect(pill.width > 0 and pill.height > 0);
+    // No third body: exactly one quote aside in the row.
+    try testing.expectEqual(@as(usize, 1), p.framesOf("Quoted note").len);
+
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+        std.debug.print("\nrow with a pill draws {d}, priced {d}\n", .{ rows[0].height, priced });
+        return error.PillNotPriced;
+    }
+}
