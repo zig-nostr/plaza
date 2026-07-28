@@ -294,6 +294,8 @@ const picture_default_aspect: f32 = 0.66;
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
 /// that refuses the whole view when it is crossed.
 const picture_stripe_cap: usize = 24;
+/// The off-state chip's own height.
+const picture_ask_height: f32 = 24;
 const picture_alt_width: f32 = 180;
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
@@ -1253,6 +1255,19 @@ pub fn classifyLogin(text: []const u8) LoginTarget {
 // straight from their host, which still works for anything small enough.
 
 const default_media_proxy = "https://wsrv.nl/";
+/// Whether pictures and link previews load on sight. On by default: a feed of
+/// grey boxes is not the app. Off, nothing is fetched until the reader asks for
+/// that one picture, which is also the only way to read the feed without every
+/// host in it learning that you did.
+var g_media_previews: bool = true;
+
+pub fn mediaPreviews() bool {
+    return g_media_previews;
+}
+
+pub fn setMediaPreviews(on: bool) void {
+    g_media_previews = on;
+}
 var g_media_proxy_buf: [200]u8 = undefined;
 var g_media_proxy_len: usize = 0;
 
@@ -3713,6 +3728,10 @@ fn markMediaWanted(note_id: i64) void {
 /// picture, or one whose slot is already loading or done, is a no-op.
 fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) void {
     if (!note.hasImage()) return;
+    // With previews off, nothing leaves the machine until the reader asks for
+    // this one picture. That is the point of the setting: not bandwidth, but
+    // that reading a feed should not tell every host in it that you did.
+    if (!g_media_previews and !isMediaAsked(note.id)) return;
     const slot = claimMediaSlot(fx, note.id) orelse return;
     slot.last_used = g_media_clock;
     if (slot.state != .idle) return;
@@ -4691,6 +4710,8 @@ pub const Msg = union(enum) {
     profiles: native_sdk.EffectTimer,
     /// Expand a note's picture to fill the window.
     expand_image: i64,
+    /// One picture, asked for by the reader while previews are off.
+    load_image: i64,
     /// Dismiss the expanded picture.
     close_image,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
@@ -4713,7 +4734,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -5037,7 +5058,11 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
-    if (note.hasImage()) extent += pictureHeight(note) + 8;
+    // A picture nobody asked for is one quiet chip, not a reserved box.
+    if (note.hasImage()) {
+        const shown = g_media_previews or isMediaAsked(note.id) or note.media_id() != 0;
+        extent += (if (shown) pictureHeight(note) else picture_ask_height) + 8;
+    }
     // The quote, which is only now a knowable height: the clamp is what makes it
     // one (the shot's own note beside 11f says quote rows clamp "so their height
     // is known at insert"). The bordered card it replaces was never priced at
@@ -7387,6 +7412,40 @@ pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
 // LRU-ish eviction is plenty. Id 0 marks an empty slot (a note's id is masked
 // non-negative and never 0 in practice, the same sentinel `viewing_thread` uses).
 const expanded_cap = 64;
+/// The pictures the reader has asked for while previews are off. A per-note UI
+/// fact, so it lives beside the reader rather than on the Note, which is rebuilt
+/// from the store on every refresh. Oldest asked is dropped when it fills, the
+/// same shape as the expanded-notes ring.
+const asked_cap = 32;
+var g_media_asked = [_]i64{0} ** asked_cap;
+
+pub fn isMediaAsked(note_id: i64) bool {
+    for (g_media_asked) |a| {
+        if (a == note_id) return true;
+    }
+    return false;
+}
+
+fn askForMedia(note_id: i64) void {
+    if (isMediaAsked(note_id)) return;
+    for (&g_media_asked) |*a| {
+        if (a.* == 0) {
+            a.* = note_id;
+            return;
+        }
+    }
+    std.mem.copyForwards(i64, g_media_asked[0 .. asked_cap - 1], g_media_asked[1..]);
+    g_media_asked[asked_cap - 1] = note_id;
+}
+
+pub fn askForMediaForTest(note_id: i64) void {
+    askForMedia(note_id);
+}
+
+pub fn forgetAskedMediaForTest() void {
+    g_media_asked = [_]i64{0} ** asked_cap;
+}
+
 var g_expanded = [_]i64{0} ** expanded_cap;
 
 fn isExpanded(note_id: i64) bool {
@@ -8077,6 +8136,10 @@ fn pictureAspect(note: *const Note) f32 {
 fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     const height = pictureHeight(note);
     const image_id = note.media_id();
+    // Previews off and this one not asked for: a quiet line saying what is there
+    // and what pressing it costs, not a box of reserved space for a picture that
+    // is not coming.
+    if (!g_media_previews and !isMediaAsked(note.id) and image_id == 0) return pictureAskChip(ui, note);
     if (image_id == 0) {
         // The same box the picture will fill, striped: reserved space, not an
         // empty frame, and not a skeleton either, which reads as a row of text
@@ -8116,6 +8179,35 @@ fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) A
             content,
             pictureChips(ui, note),
         }),
+    });
+}
+
+/// What a picture is while previews are off: one quiet chip naming it and its
+/// weight, which loads that one when pressed. The weight is the note's own claim
+/// and may be missing, in which case the chip does not invent one.
+fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const label = if (note.image_bytes > 0)
+        ui.fmt("image · {s} · load", .{byteSize(ui.arena, note.image_bytes)})
+    else
+        "image · load";
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = picture_ask_height,
+            .cross = .center,
+            .on_press = Msg{ .load_image = note.id },
+            .style = .{ .background = p.surface_inset, .border = p.border_chip, .radius = 6, .stroke_width = 1 },
+            .semantics = .{ .role = .button, .label = "Load this image", .focusable = true },
+        }, .{
+            hgap(ui, 9),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }},
+            ),
+            hgap(ui, 9),
+        }),
+        ui.spacer(1),
     });
 }
 
@@ -8486,6 +8578,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .nip05_verified => |response| handleNip05Fetched(response),
         .open_url => |url| openExternally(fx, url),
         .expand_image => |note_id| model.expanded_note = note_id,
+        .load_image => |note_id| {
+            askForMedia(note_id);
+            scanMediaFetches(fx, model);
+        },
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
@@ -9800,6 +9896,7 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
 /// starting from the default so a fresh install proxies out of the box.
 fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
+    g_media_previews = true;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
@@ -9810,6 +9907,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         // An empty value is meaningful: the user chose to load originals.
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
+        if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
     }
 }
 
@@ -9820,7 +9918,10 @@ fn saveSettings() void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     var buf: [512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\n", .{mediaProxy()}) catch return;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\n", .{
+        mediaProxy(),
+        if (g_media_previews) "on" else "off",
+    }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
         .data = data,

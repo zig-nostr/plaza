@@ -2894,3 +2894,42 @@ test "the pill asks again when its note falls out of the cache" {
     // Asked for again, so it can come back.
     try testing.expect(main.quoteForTest(evicted) != null);
 }
+
+test "with previews off a picture is one chip, and asking for it loads that one" {
+    // The setting is not about bandwidth. Reading a feed should not tell every
+    // host in it that you did, so nothing leaves the machine until the reader
+    // asks for a particular picture.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const url = "https://host.example/a.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = @intCast(url.len);
+    model.notes[0].image_w = 1600;
+    model.notes[0].image_h = 900;
+    model.notes[0].image_bytes = 240_000;
+    model.notes_len = 1;
+
+    main.setMediaPreviews(false);
+    defer main.setMediaPreviews(true);
+
+    const off = try painted.Painted.render(arena, &model);
+    try testing.expect(off.frameOf("Load this image") != null);
+    // No reserved box: the row is priced for the chip, not for a picture that is
+    // not coming.
+    try testing.expect(off.frameOf("Attached image, press to enlarge") == null);
+    const chip_priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+
+    // Asked for: the box comes back, and so does its price.
+    main.askForMediaForTest(model.notes[0].id);
+    defer main.forgetAskedMediaForTest();
+    const on = try painted.Painted.render(arena, &model);
+    try testing.expect(on.frameOf("Attached image, press to enlarge") != null);
+    const box_priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    try testing.expect(box_priced > chip_priced + 100);
+}
