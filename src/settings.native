@@ -41,6 +41,17 @@
       </if>
       <card padding="16">
         <column gap="8">
+          <text size="sm" foreground="text_muted">Load media previews</text>
+          <text wrap="true" foreground="text_muted">{previews_explainer}</text>
+          <row cross="center" gap="8">
+            <text size="sm" foreground="text_muted">{previews_state}</text>
+            <spacer grow="1"/>
+            <button size="sm" on-press="previews_toggle">{previews_action}</button>
+          </row>
+        </column>
+      </card>
+      <card padding="16">
+        <column gap="8">
           <text size="sm" foreground="text_muted">Media proxy</text>
           <text wrap="true" foreground="text_muted">Images are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.</text>
           <input-group>

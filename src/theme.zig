@@ -136,6 +136,16 @@ pub const palette = struct {
     /// 11g's depth-1 pill: the seat a quote-of-a-quote gets instead of a third
     /// nested body.
     pub const surface_pill = hex("#17171b");
+    /// The scrim a chip laid over a photograph sits on, dark enough to read
+    /// against anything under it, and the hairline around it.
+    pub const scrim_chip = canvas.Color.rgba8(10, 10, 11, 179);
+    pub const border_chip_alt = hex("#2c2c33");
+    /// The two bands of a loading picture's stripe.
+    /// 11o's link preview card and the letter tile on it.
+    pub const surface_link_card = hex("#101013");
+    pub const surface_link_tile = hex("#1f1f25");
+    pub const surface_stripe_a = hex("#17171c");
+    pub const surface_stripe_b = hex("#1b1b21");
     pub const border_pill = hex("#2c2c33");
     pub const border_menu = hex("#333338");
     pub const border_offline = hex("#3d3320");
@@ -168,6 +178,8 @@ pub const palette = struct {
     pub const text_sheet_title = hex("#d6d6dc");
     pub const text_secondary = hex("#c9c9d1");
     pub const text_secondary_alt = hex("#b9b9c2");
+    /// A link card's title, a step brighter than the body around it.
+    pub const text_link_title = hex("#e4e4e8");
     pub const text_muted = hex("#8f8f99");
     pub const text_muted_alt = hex("#9a9aa4");
     pub const text_faint = hex("#7c7c86");

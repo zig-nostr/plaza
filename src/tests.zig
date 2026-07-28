@@ -722,10 +722,20 @@ test "a picture reserves the same space loaded or not" {
     const note = main.noteFrom(ev, 1_800_000_000);
 
     try testing.expect(note.hasImage());
-    // 2:1 tall against the nominal 300pt width would be 600, clamped to 320.
-    try testing.expectApproxEqAbs(@as(f32, 320), main.pictureHeight(&note), 0.5);
+    // The box is the reading column, so a 2:1 picture would be twice that tall;
+    // the aspect is capped instead, and the cap is what it draws at. Capping the
+    // ASPECT rather than the pixels is what keeps the reservation exact: the
+    // height is stated, not clamped after the fact.
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * 1.25, main.pictureHeight(&note), 0.5);
     // Nothing is loaded, yet the reserved height is already the final one.
     try testing.expectEqual(@as(u64, 0), note.media_id());
+
+    // A landscape picture takes exactly the height its declared shape implies.
+    const wide_url = "https://host.example/wide.jpg";
+    const wide_tags = [_]nostr.event.Tag{&.{ "imeta", "url " ++ wide_url, "dim 1600x900" }};
+    const wide_ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &wide_tags, "look " ++ wide_url, null);
+    const wide = main.noteFrom(wide_ev, 1_800_000_000);
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * (900.0 / 1600.0), main.pictureHeight(&wide), 0.5);
 }
 
 test "imeta dimensions parse, including float forms" {
@@ -2883,4 +2893,250 @@ test "the pill asks again when its note falls out of the cache" {
     _ = main.quotingPillLabelForTest(&ui, evicted);
     // Asked for again, so it can come back.
     try testing.expect(main.quoteForTest(evicted) != null);
+}
+
+test "with previews off a picture is one chip, and asking for it loads that one" {
+    // The setting is not about bandwidth. Reading a feed should not tell every
+    // host in it that you did, so nothing leaves the machine until the reader
+    // asks for a particular picture.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const url = "https://host.example/a.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = @intCast(url.len);
+    model.notes[0].image_w = 1600;
+    model.notes[0].image_h = 900;
+    model.notes[0].image_bytes = 240_000;
+    model.notes_len = 1;
+
+    main.setMediaPreviews(false);
+    defer main.setMediaPreviews(true);
+
+    const off = try painted.Painted.render(arena, &model);
+    try testing.expect(off.frameOf("Load this image") != null);
+    // No reserved box: the row is priced for the chip, not for a picture that is
+    // not coming.
+    try testing.expect(off.frameOf("Attached image, press to enlarge") == null);
+    const chip_priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+
+    // Asked for: the box comes back, and so does its price.
+    main.askForMediaForTest(model.notes[0].id);
+    defer main.forgetAskedMediaForTest();
+    const on = try painted.Painted.render(arena, &model);
+    try testing.expect(on.frameOf("Attached image, press to enlarge") != null);
+    const box_priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    try testing.expect(box_priced > chip_priced + 100);
+}
+
+test "a page's own words come out of its head" {
+    // Open Graph first, then the plain fallbacks, which is the order every other
+    // reader uses. The parser is deliberately small: the body arrives capped at
+    // 256 KiB, which is where the head lives, and what it cannot make sense of
+    // leaves the card without that line rather than guessing.
+    const og =
+        "<html><head><title>Fallback</title>" ++
+        "<meta property=\"og:title\" content=\"The real title\">" ++
+        "<meta property=\"og:description\" content=\"What it says about itself.\">" ++
+        "</head><body>ignored</body></html>";
+    const meta = main.parsePageMeta(og);
+    try testing.expectEqualStrings("The real title", meta.heading());
+    try testing.expectEqualStrings("What it says about itself.", meta.description);
+
+    // No Open Graph: the title tag and the description meta stand in.
+    const plain = "<html><head><title>Just a title</title><meta name='description' content='Plain words.'></head></html>";
+    const fallback = main.parsePageMeta(plain);
+    try testing.expectEqualStrings("Just a title", fallback.heading());
+    try testing.expectEqualStrings("Plain words.", fallback.description);
+
+    // Nothing to say, and nothing invented.
+    const bare = main.parsePageMeta("<html><body>no head at all</body></html>");
+    try testing.expectEqual(@as(usize, 0), bare.heading().len);
+    try testing.expectEqual(@as(usize, 0), bare.description.len);
+
+    // An attribute whose name merely ENDS with one we want is not that one.
+    const tricky = "<meta data-og:title=\"nope\" property=\"og:title\" content=\"yes\">";
+    try testing.expectEqualStrings("yes", main.parsePageMeta(tricky).heading());
+
+    // An empty Open Graph title is not an answer: the page's own title stands.
+    const empty_og = "<html><head><title>Real title</title><meta property='og:title' content=''></head></html>";
+    try testing.expectEqualStrings("Real title", main.parsePageMeta(empty_og).heading());
+}
+
+test "the domain a card shows is the host, without its www" {
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://www.example.com/a/b?c=d"));
+    try testing.expectEqualStrings("news.ycombinator.com", main.urlDomain("https://news.ycombinator.com/item?id=1"));
+    try testing.expectEqualStrings("example.com", main.urlDomain("http://example.com"));
+}
+
+test "the link a card previews is the first plain one" {
+    // The picture's own URL is not a link to preview, and neither is any other
+    // image: those are drawn, not summarised.
+    const image = "https://host.example/a.jpg";
+    const content = "look " ++ image ++ " and read https://example.com/post, then " ++ "https://other.example/b.png";
+    const link = main.firstLinkUrl(content, image) orelse return error.NoLink;
+    // The trailing comma is punctuation, not part of the address.
+    try testing.expectEqualStrings("https://example.com/post", link);
+
+    // A note with nothing but its picture has no link to preview.
+    try testing.expect(main.firstLinkUrl("here " ++ image, image) == null);
+}
+
+test "a blurhash decodes to the picture's own colours" {
+    // The reference hash from the format's own README, which encodes a warm
+    // photograph. Decoding is what lets a picture that has not arrived show its
+    // palette instead of a grey box.
+    const blur = main.decodeBlurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj");
+    try testing.expect(blur.ok);
+    // Every cell is opaque and inside the gamut.
+    for (blur.cells) |c| {
+        try testing.expect(c.a > 0.99);
+        try testing.expect(c.r >= 0 and c.r <= 1);
+    }
+    // The corners differ: a hash that decoded to one flat colour would be a
+    // decoder that dropped its AC components.
+    const first = blur.cells[0];
+    const last = blur.cells[blur.cells.len - 1];
+    try testing.expect(@abs(first.r - last.r) + @abs(first.g - last.g) + @abs(first.b - last.b) > 0.02);
+
+    // Rubbish in, nothing out: a malformed hash draws stripes, never a guess.
+    try testing.expect(!main.decodeBlurhash("").ok);
+    try testing.expect(!main.decodeBlurhash("not a hash").ok);
+    try testing.expect(!main.decodeBlurhash("LEHV6nWB2yk8pyo0adR*.7kCMdn").ok);
+}
+
+test "a picture with a blurhash shows its colours before its bytes" {
+    // The placeholder is flat cells, not an image: all sixteen image slots are
+    // spent on faces and photographs, and a placeholder must never evict the
+    // thing it stands in for.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const url = "https://host.example/a.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = @intCast(url.len);
+    model.notes[0].image_aspect = 0.5;
+    const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
+    @memcpy(model.notes[0].image_blur_buf[0..hash.len], hash);
+    model.notes[0].image_blur_len = @intCast(hash.len);
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const box = p.frameOf("Attached image, press to enlarge") orelse return error.NoBox;
+    // The box paints a colour from the hash, not the striped fallback.
+    const blur = main.decodeBlurhash(hash);
+    const sample = p.fillAt(box.x + box.width / 2, box.y + box.height / 2) orelse return error.NothingPainted;
+    var matched = false;
+    for (blur.cells) |c| {
+        if (@abs(c.r - sample.r) < 0.01 and @abs(c.g - sample.g) < 0.01 and @abs(c.b - sample.b) < 0.01) matched = true;
+    }
+    if (!matched) {
+        std.debug.print("\npainted {any}, not a blurhash cell\n", .{sample});
+        return error.NotTheBlurhash;
+    }
+}
+
+test "a link is only previewed when it is safe to ask" {
+    // This is the one place the app reaches out to an address a STRANGER chose,
+    // unattended, because a note scrolled into view. Every rejection here is a
+    // thing a note must not be able to make every reader's machine do.
+    try testing.expect(main.previewableUrl("https://example.com/post"));
+    try testing.expect(main.previewableUrl("https://news.ycombinator.com/item?id=1"));
+
+    // Plaintext puts the reader's IP and the exact URL on the wire.
+    try testing.expect(!main.previewableUrl("http://example.com/"));
+    // Userinfo becomes an authorization header on a host of the author's choice.
+    try testing.expect(!main.previewableUrl("https://admin:admin@example.com/"));
+    try testing.expect(!main.previewableUrl("https://wirth.ch@evil.tld/x"));
+    // The reader's own machine and their own network.
+    try testing.expect(!main.previewableUrl("https://127.0.0.1/x"));
+    try testing.expect(!main.previewableUrl("https://10.1.2.3/x"));
+    try testing.expect(!main.previewableUrl("https://192.168.1.1/admin"));
+    try testing.expect(!main.previewableUrl("https://172.16.0.1/"));
+    try testing.expect(!main.previewableUrl("https://169.254.169.254/latest/meta-data/"));
+    try testing.expect(!main.previewableUrl("https://100.64.0.1/"));
+    try testing.expect(!main.previewableUrl("https://[::1]/"));
+    // A service, not a site.
+    try testing.expect(!main.previewableUrl("https://example.com:8787/approve"));
+    // Names that are not public sites.
+    try testing.expect(!main.previewableUrl("https://localhost/"));
+    try testing.expect(!main.previewableUrl("https://printer.local/"));
+    try testing.expect(!main.previewableUrl("https://vault.internal/"));
+    // A public address that merely starts with a private-looking octet is fine.
+    try testing.expect(main.previewableUrl("https://172.32.0.1/"));
+}
+
+test "the domain on a card is the host, not what precedes an at sign" {
+    // The oldest phishing shape there is. A card showing `wirth.ch@evil.tld`
+    // would be lending its credibility to whoever wrote the note.
+    try testing.expectEqualStrings("evil.tld", main.urlDomain("https://wirth.ch@evil.tld/x"));
+    try testing.expectEqualStrings("evil.tld", main.urlDomain("https://a@b@evil.tld/x"));
+    // The port is not part of the name a reader recognises.
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://example.com:8443/x"));
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://www.example.com/a"));
+}
+
+test "a link card is priced at what it draws, with a description and without" {
+    // The card's height comes from its text column, not from its 30px tile:
+    // every line takes a full body line box whatever register it is set in. The
+    // constant is measured for the same reason the others are.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = "https://example.com/post";
+    for ([_][]const u8{ "What it says about itself.", "" }) |desc| {
+        main.seedLinkForTest(url, "The page's title", desc);
+
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = threadNote(0xA1, 100, 0);
+        model.notes[0].id = 7;
+        const body = "Read this.";
+        @memcpy(model.notes[0].content_buf[0..body.len], body);
+        model.notes[0].content_len = @intCast(body.len);
+        @memcpy(model.notes[0].link_url_buf[0..url.len], url);
+        model.notes[0].link_url_len = @intCast(url.len);
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        const card = p.frameOf("Open link") orelse return error.NoCard;
+        const priced = if (desc.len > 0) main.link_card_height_for_test else main.link_card_height_bare_for_test;
+        if (@abs(card.height - priced) > 0.5) {
+            std.debug.print("\ncard with desc={d} draws {d}, priced {d}\n", .{ desc.len, card.height, priced });
+            return error.CardMispriced;
+        }
+    }
+}
+
+test "the pressable box is the picture, not the space around it" {
+    // A portrait taller than the aspect cap is drawn contained at the reserved
+    // height. If the box stayed column-wide, the bare window either side of it
+    // would be inside the border and pressable, and pressing it would open the
+    // viewer for a picture the reader was not pointing at.
+    var note = threadNote(0xA1, 100, 0);
+    const url = "https://host.example/tall.jpg";
+    @memcpy(note.image_url_buf[0..url.len], url);
+    note.image_url_len = @intCast(url.len);
+    note.image_aspect = 2.0;
+
+    const height = main.pictureHeight(&note);
+    const width = main.pictureWidth(&note);
+    // Reserved at the cap, drawn at its own shape.
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * 1.25, height, 0.5);
+    try testing.expectApproxEqAbs(height / 2.0, width, 0.5);
+
+    // A landscape picture fills the column.
+    note.image_aspect = 0.5625;
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test, main.pictureWidth(&note), 0.5);
 }

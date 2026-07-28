@@ -142,6 +142,7 @@ const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
 // NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
 const nip05_fetch_key_base: u64 = 3000;
+const link_fetch_key_base: u64 = 4000;
 const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It must be
@@ -272,6 +273,43 @@ const quote_pill_height: f32 = 22;
 /// How wide the pill's one line may run before it elides, so a quoted note with
 /// a lot to say cannot push the pill across the row.
 const quote_pill_label_width: f32 = 190;
+/// A picture and the chips over it (11o): the corner inset, the chip's own
+/// height, and how much of each label may run before it elides. The alt chip is
+/// given room for a phrase, the dimensions chip for `4032x3024`.
+const picture_radius: f32 = 10;
+const picture_chip_inset: f32 = 8;
+const picture_chip_height: f32 = 18;
+/// The chips' own 10px mono register, a rung below the metadata mono.
+const mono_chip_scale: f32 = 10.0 / 14.5;
+/// The picture's box: the reading column it spans, the aspect past which a very
+/// tall picture is contained rather than taking over the feed, and the shape to
+/// assume when the note says nothing and nothing has been decoded yet.
+const picture_column_width: f32 = feed_column_width - row_pad_side * 2 - avatar_size - avatar_to_text_gap;
+pub const picture_column_width_for_test: f32 = picture_column_width;
+const picture_max_aspect: f32 = 1.25;
+const picture_default_aspect: f32 = 0.66;
+/// How many bands a striped placeholder may draw. A tall picture would otherwise
+/// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
+/// that refuses the whole view when it is crossed.
+const picture_stripe_cap: usize = 24;
+/// The off-state chip's own height.
+const picture_ask_height: f32 = 24;
+/// A link card, with and without a description. Its TEXT column sets the height,
+/// not its 30px tile: the domain, title and description each take a full body
+/// line box whatever register they are set in (a span scaled down keeps the line
+/// it is given). MEASURED, like every other row constant here, because summing
+/// the parts is what got the last three wrong.
+const link_card_height: f32 = 77.125;
+const link_card_height_bare: f32 = 57;
+pub const link_card_height_for_test: f32 = link_card_height;
+pub const link_card_height_bare_for_test: f32 = link_card_height_bare;
+
+/// Files a preview as if a page had answered, for a test that renders the card.
+pub fn seedLinkForTest(url: []const u8, title: []const u8, desc: []const u8) void {
+    const slot = wantLink(url) orelse return;
+    storeLinkMeta(slot, .{ .title = title, .description = desc });
+    slot.state = .loaded;
+}
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
 /// children. MEASURED in the running layout rather than summed from those parts,
@@ -1230,6 +1268,25 @@ pub fn classifyLogin(text: []const u8) LoginTarget {
 // straight from their host, which still works for anything small enough.
 
 const default_media_proxy = "https://wsrv.nl/";
+/// Whether the app reaches out for the things a note POINTS AT: its picture, the
+/// faces of the people in the feed, the page a link goes to, and the domain a
+/// NIP-05 name claims. On by default, because a feed of grey boxes is not the
+/// app. Off, none of that leaves the machine until the reader asks for a
+/// particular picture, and the only hosts that learn anything are the relays,
+/// which are the ones the reader chose.
+///
+/// It covers every unattended fetch, deliberately: gating only the pictures
+/// would leave each author's own domain and every avatar host still learning
+/// that you are reading, which is exactly what the switch is for.
+var g_media_previews: bool = true;
+
+pub fn mediaPreviews() bool {
+    return g_media_previews;
+}
+
+pub fn setMediaPreviews(on: bool) void {
+    g_media_previews = on;
+}
 var g_media_proxy_buf: [200]u8 = undefined;
 var g_media_proxy_len: usize = 0;
 
@@ -1496,6 +1553,432 @@ const QuoteEntry = struct {
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
 var g_quote_clock: u64 = 0;
+
+/// A link preview: what a page says about itself, for the card 11o draws under a
+/// note that links out. Small and fixed, like every other cache here.
+const link_title_cap = 96;
+const link_desc_cap = 140;
+const link_domain_cap = 48;
+const link_cache_cap = 32;
+/// How many previews may be in flight at once. The SDK has 16 effect slots for
+/// everything the app does, so previews take a small, fixed share and wait their
+/// turn rather than starving avatars and pictures.
+const max_link_fetches = 2;
+const max_link_attempts = 2;
+/// How far down a thread the link scan reaches. The thread list has no visible
+/// range of its own to consult, so it takes the first screenful and stops.
+const thread_link_scan_cap: usize = 12;
+
+const LinkPreview = struct {
+    used: bool = false,
+    /// The URL as written in the note, which is both the key and what a press
+    /// opens.
+    url_buf: [300]u8 = [_]u8{0} ** 300,
+    url_len: u16 = 0,
+    state: enum { idle, fetching, loaded, missing } = .idle,
+    attempts: u8 = 0,
+    requested: bool = false,
+    title_buf: [link_title_cap]u8 = [_]u8{0} ** link_title_cap,
+    title_len: u8 = 0,
+    desc_buf: [link_desc_cap]u8 = [_]u8{0} ** link_desc_cap,
+    desc_len: u8 = 0,
+    domain_buf: [link_domain_cap]u8 = [_]u8{0} ** link_domain_cap,
+    domain_len: u8 = 0,
+    last_used: u64 = 0,
+
+    pub fn url(self: *const LinkPreview) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+    pub fn title(self: *const LinkPreview) []const u8 {
+        return self.title_buf[0..self.title_len];
+    }
+    pub fn description(self: *const LinkPreview) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+    pub fn domain(self: *const LinkPreview) []const u8 {
+        return self.domain_buf[0..self.domain_len];
+    }
+};
+var g_links = [_]LinkPreview{.{}} ** link_cache_cap;
+var g_link_clock: u64 = 0;
+
+/// The host of a URL, without its `www.`: what the card shows above the title,
+/// and what a reader actually checks before pressing.
+///
+/// The userinfo is CUT, at the last `@`, which is the whole point: a browser
+/// does the same, because `https://wirth.ch@evil.tld/` is the oldest phishing
+/// shape there is and a card that showed `wirth.ch@evil.tld` would be lending
+/// its credibility to whoever wrote the note.
+pub fn urlDomain(url: []const u8) []const u8 {
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    var authority = rest[0..end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    // The port is not part of the name a reader recognises.
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, authority, ']') == null) authority = authority[0..colon];
+    }
+    if (std.mem.startsWith(u8, authority, "www.")) authority = authority["www.".len..];
+    return authority;
+}
+
+/// Whether a link named in a note may be fetched to preview it.
+///
+/// This is the one place in the app that reaches out to an address a STRANGER
+/// chose, unattended, simply because a note scrolled into view. So it is narrow
+/// on purpose:
+///
+///   - https only. Plaintext would put the reader's IP and the exact URL on the
+///     wire for anyone on the path, to fetch something nobody asked for.
+///   - No userinfo. `std.http.Client` turns it into an `authorization` header,
+///     so `http://admin:admin@10.0.0.1/` would have Plaza posting credentials
+///     to a host of the note author's choosing.
+///   - No private, loopback or link-local address, and no name without a dot.
+///     A note must not be able to make every reader's machine probe their own
+///     network. Signet's approval API listens on 127.0.0.1 in this very session.
+///   - The default port only, so a note cannot aim the reader at a service.
+///
+/// It cannot stop a redirect INTO one of those (the runtime follows up to
+/// three), which is worth knowing and is why the fetch stays unauthenticated and
+/// its body is only ever read for two meta tags.
+pub fn previewableUrl(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "https://")) return false;
+    if (url.len > 300) return false;
+    const rest = url["https://".len..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..end];
+    if (authority.len == 0) return false;
+    // Userinfo, in any form.
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    var host = authority;
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, host, ']') == null) {
+            // A port at all means a service, not a site.
+            if (colon + 1 < host.len) return false;
+            host = host[0..colon];
+        } else {
+            return false; // a bracketed IPv6 literal is never a site to preview
+        }
+    }
+    for (host) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') return false;
+    }
+    // A bare name (`localhost`, a machine on the LAN) is not a public site.
+    const dot = std.mem.lastIndexOfScalar(u8, host, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= host.len) return false;
+    if (std.ascii.endsWithIgnoreCase(host, ".local") or
+        std.ascii.endsWithIgnoreCase(host, ".internal") or
+        std.ascii.endsWithIgnoreCase(host, ".localhost")) return false;
+    return !isPrivateAddress(host);
+}
+
+/// Whether a host is a literal address inside a range that belongs to the
+/// reader's own machine or network.
+fn isPrivateAddress(host: []const u8) bool {
+    var parts: [4]u16 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        if (n == 4) return false;
+        parts[n] = std.fmt.parseInt(u16, part, 10) catch return false;
+        if (parts[n] > 255) return false;
+        n += 1;
+    }
+    if (n != 4) return false; // not an IPv4 literal at all
+    return switch (parts[0]) {
+        0, 10, 127 => true,
+        169 => parts[1] == 254, // link-local
+        172 => parts[1] >= 16 and parts[1] <= 31,
+        192 => parts[1] == 168,
+        100 => parts[1] >= 64 and parts[1] <= 127, // carrier-grade NAT
+        else => false,
+    };
+}
+
+/// The first plain link in a note's content: the one the card previews. An image
+/// URL is not one (it is drawn as the picture), and neither is anything inside a
+/// `nostr:` token.
+pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (!std.mem.startsWith(u8, content[i..], "https://") and !std.mem.startsWith(u8, content[i..], "http://")) continue;
+        if (i > 0 and !std.ascii.isWhitespace(content[i - 1])) continue;
+        var j = i;
+        while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+        // A trailing sentence mark is punctuation, not part of the address.
+        var end = j;
+        while (end > i and (content[end - 1] == '.' or content[end - 1] == ',' or content[end - 1] == ')')) end -= 1;
+        const candidate = content[i..end];
+        if (candidate.len > 300) {
+            i = j;
+            continue;
+        }
+        if (image_url.len > 0 and std.mem.eql(u8, candidate, image_url)) {
+            i = j;
+            continue;
+        }
+        if (looksLikeImageUrl(candidate)) {
+            i = j;
+            continue;
+        }
+        return candidate;
+    }
+    return null;
+}
+
+/// The cache entry for `url`, claimed if it is not already there. Evicts the
+/// least recently drawn entry that is not mid-fetch, like the other caches.
+fn wantLink(url: []const u8) ?*LinkPreview {
+    if (url.len == 0 or url.len > 300) return null;
+    for (&g_links) |*l| {
+        if (l.used and std.mem.eql(u8, l.url(), url)) return l;
+    }
+    var victim: ?*LinkPreview = null;
+    for (&g_links) |*l| {
+        if (!l.used) {
+            victim = l;
+            break;
+        }
+        if (l.state == .fetching) continue;
+        // Nor one already wanted in THIS pass: a screen with more links than
+        // slots would otherwise evict an entry it needs a moment later, reset
+        // its state and its attempt count, and re-fetch the same pages from the
+        // same strangers' servers on every tick, forever. The media scan learned
+        // this the same way.
+        if (l.last_used == g_link_clock) continue;
+        if (victim == null or l.last_used < victim.?.last_used) victim = l;
+    }
+    // Nothing free and nothing spare: this link simply goes unpreviewed rather
+    // than taking a slot off something on screen.
+    const slot = victim orelse return null;
+    slot.* = .{ .used = true };
+    @memcpy(slot.url_buf[0..url.len], url);
+    slot.url_len = @intCast(url.len);
+    const host = urlDomain(url);
+    const host_len = @min(host.len, slot.domain_buf.len);
+    @memcpy(slot.domain_buf[0..host_len], host[0..host_len]);
+    slot.domain_len = @intCast(host_len);
+    return slot;
+}
+
+fn linkFor(url: []const u8) ?*LinkPreview {
+    for (&g_links) |*l| {
+        if (l.used and std.mem.eql(u8, l.url(), url)) return l;
+    }
+    return null;
+}
+
+/// Asks for the pages the reader can actually see. Gated by the previews
+/// setting, like pictures: with it off, no page learns it was linked to.
+fn scanLinkFetches(fx: *Effects, model: *const Model) void {
+    if (!g_media_previews) return;
+    g_link_clock += 1;
+    var fired: usize = 0;
+    if (model.viewing_thread != 0) {
+        // The note being read, and the first screenful under it. Walking the
+        // whole conversation would reach out to every host linked anywhere in
+        // it, including replies the reader never scrolls to.
+        fireLink(fx, &model.thread_root, &fired);
+        const shown = @min(model.thread_notes_len, thread_link_scan_cap);
+        for (model.thread_notes[0..shown]) |*note| fireLink(fx, note, &fired);
+        return;
+    }
+    const range = model.visibleRange();
+    var i = range.first;
+    while (i <= range.last and i < model.notes_len) : (i += 1) fireLink(fx, &model.notes[i], &fired);
+}
+
+fn fireLink(fx: *Effects, note: *const Note, fired: *usize) void {
+    if (!note.hasLink()) return;
+    if (!previewableUrl(note.linkUrl())) return;
+    const slot = wantLink(note.linkUrl()) orelse return;
+    // Stamped first, so the eviction guard above counts this entry as wanted in
+    // this pass whatever happens next.
+    slot.last_used = g_link_clock;
+    if (slot.state != .idle) return;
+    if (slot.attempts >= max_link_attempts) {
+        slot.state = .missing;
+        return;
+    }
+    if (loadCachedLink(slot)) return;
+    if (fired.* >= max_link_fetches) return;
+    fired.* += 1;
+    slot.state = .fetching;
+    slot.attempts += 1;
+    const index = (@intFromPtr(slot) - @intFromPtr(&g_links[0])) / @sizeOf(LinkPreview);
+    fx.fetch(.{
+        .key = link_fetch_key_base + index,
+        .url = slot.url(),
+        .on_response = Effects.responseMsg(.link_fetched),
+    });
+}
+
+/// Files what a page said about itself. The body is TRUNCATED at 256 KiB by the
+/// runtime and that is fine here, unlike an image: `og:` tags live in the head,
+/// so a cut tail costs nothing. Every other handler in this app rejects a
+/// truncated body, correctly, because half a picture is garbage.
+fn handleLinkFetched(response: native_sdk.EffectResponse) void {
+    const index = response.key - link_fetch_key_base;
+    if (index >= g_links.len) return;
+    const slot = &g_links[index];
+    if (!slot.used or slot.state != .fetching) return;
+    if (response.outcome == .rejected) {
+        // Every effect slot was busy. Not a failure of the page: try again.
+        slot.state = .idle;
+        slot.attempts -|= 1;
+        return;
+    }
+    if (response.outcome != .ok or response.status < 200 or response.status >= 300) {
+        slot.state = if (slot.attempts >= max_link_attempts) .missing else .idle;
+        return;
+    }
+    const meta = parsePageMeta(response.body);
+    storeLinkMeta(slot, .{ .title = meta.heading(), .description = meta.description });
+    slot.state = if (slot.title_len == 0) .missing else .loaded;
+    if (slot.state == .loaded) cacheLink(slot);
+}
+
+/// Copies what the page said into the entry's own buffers: the response body is
+/// recycled the moment this returns.
+fn storeLinkMeta(slot: *LinkPreview, meta: PageMeta) void {
+    const title = std.mem.trim(u8, meta.title, " \t\r\n");
+    const desc = std.mem.trim(u8, meta.description, " \t\r\n");
+    const t = @min(utf8SafeLen(title, slot.title_buf.len), slot.title_buf.len);
+    @memcpy(slot.title_buf[0..t], title[0..t]);
+    slot.title_len = @intCast(t);
+    const d = @min(utf8SafeLen(desc, slot.desc_buf.len), slot.desc_buf.len);
+    @memcpy(slot.desc_buf[0..d], desc[0..d]);
+    slot.desc_len = @intCast(d);
+}
+
+/// `$HOME/.plaza/links/<sha256 of the url>`, holding the three lines the card
+/// draws. A preview is worth keeping: the page rarely changes, and a feed
+/// re-read from disk should not re-ask the whole web what it said.
+fn linkCacheDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
+    const home = environ.get("HOME") orelse ".";
+    var dir_buf: [512]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza/links", .{home});
+    return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+}
+
+fn loadCachedLink(slot: *LinkPreview) bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+    var dir = linkCacheDir(io, environ) catch return false;
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, slot.url());
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(1024)) catch return false;
+    defer gpa.free(raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    const title = lines.next() orelse return false;
+    const desc = lines.next() orelse "";
+    if (title.len == 0) return false;
+    storeLinkMeta(slot, .{ .title = title, .description = desc });
+    slot.state = .loaded;
+    return true;
+}
+
+fn cacheLink(slot: *const LinkPreview) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = linkCacheDir(io, environ) catch return;
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, slot.url());
+    var buf: [link_title_cap + link_desc_cap + 4]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "{s}\n{s}\n", .{ slot.title(), slot.description() }) catch return;
+    dir.writeFile(io, .{ .sub_path = name, .data = data }) catch return;
+}
+
+/// What a page says about itself, read out of its head. Open Graph first, then
+/// the plain HTML fallbacks, which is the order every other reader uses.
+pub const PageMeta = struct {
+    /// The `<title>` tag, kept separately so an Open Graph title can take
+    /// precedence without erasing it when it turns out to be empty.
+    title: []const u8 = "",
+    og_title: []const u8 = "",
+    description: []const u8 = "",
+
+    /// What the card shows: the page's chosen title, else the document's.
+    pub fn heading(self: PageMeta) []const u8 {
+        return if (self.og_title.len > 0) self.og_title else self.title;
+    }
+};
+
+/// Pulls `og:title`/`og:description` (falling back to `<title>` and
+/// `meta name="description"`) out of `html`.
+///
+/// A deliberately small parser: it walks tags, and inside a `meta` tag it reads
+/// the attributes it knows. It does NOT try to be an HTML parser, because it does
+/// not have to be: the body arrives capped at 256 KiB, which is where the head
+/// lives, and anything it cannot make sense of simply leaves the card without
+/// that line rather than guessing.
+pub fn parsePageMeta(html: []const u8) PageMeta {
+    var out: PageMeta = .{};
+    var i: usize = 0;
+    while (i < html.len) : (i += 1) {
+        if (html[i] != '<') continue;
+        const rest = html[i + 1 ..];
+        if (std.ascii.startsWithIgnoreCase(rest, "title>")) {
+            const start = i + 1 + "title>".len;
+            const end = std.mem.indexOfPos(u8, html, start, "<") orelse html.len;
+            if (out.title.len == 0) out.title = std.mem.trim(u8, html[start..end], " \t\r\n");
+            i = end;
+            continue;
+        }
+        if (!std.ascii.startsWithIgnoreCase(rest, "meta")) continue;
+        const tag_end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+        const tag = html[i..tag_end];
+        const key = metaAttr(tag, "property") orelse metaAttr(tag, "name") orelse {
+            i = tag_end;
+            continue;
+        };
+        const content = metaAttr(tag, "content") orelse {
+            i = tag_end;
+            continue;
+        };
+        // An EMPTY value is not an answer: a template that renders
+        // `content=""` when its Open Graph field is unset must not wipe the
+        // page's own title. And the FIRST one wins, so a stray tag in the body
+        // cannot override the head.
+        if (content.len == 0) {
+            i = tag_end;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "og:title")) {
+            if (out.og_title.len == 0) out.og_title = content;
+        } else if (std.ascii.eqlIgnoreCase(key, "og:description")) {
+            if (out.description.len == 0) out.description = content;
+        } else if (std.ascii.eqlIgnoreCase(key, "description") and out.description.len == 0) {
+            out.description = content;
+        }
+        i = tag_end;
+    }
+    return out;
+}
+
+/// One attribute's value out of a tag, single or double quoted.
+fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(tag, i, name)) |at| {
+        i = at + name.len;
+        // A whole attribute name, not a suffix of another one.
+        if (at > 0 and (std.ascii.isAlphanumeric(tag[at - 1]) or tag[at - 1] == '-' or tag[at - 1] == ':')) continue;
+        var j = i;
+        while (j < tag.len and (tag[j] == ' ' or tag[j] == '=')) j += 1;
+        if (j >= tag.len) return null;
+        const quote = tag[j];
+        if (quote != '"' and quote != '\'') continue;
+        j += 1;
+        const end = std.mem.indexOfScalarPos(u8, tag, j, quote) orelse return null;
+        return tag[j..end];
+    }
+    return null;
+}
 
 /// Records that a quoted event `id` needs resolving, deduping and (when full)
 /// evicting the least-recently-drawn entry that is not mid-fetch.
@@ -2265,6 +2748,26 @@ pub const Note = struct {
     // what lets the card reserve exactly the right space, so nothing shifts
     // when the image arrives (or is evicted and comes back).
     image_aspect: f32 = 0,
+    /// What the picture's own chrome says: its pixel dimensions, from the same
+    /// `imeta` tag the aspect comes from, and its alt text. Both are the note
+    /// author's claim about the file, which is the only thing available before
+    /// the bytes are, and the chips read at rest rather than on hover (the
+    /// design's hover-expand is not expressible).
+    image_w: u16 = 0,
+    image_h: u16 = 0,
+    image_bytes: u32 = 0,
+    /// The picture's blurhash, when the note carries one: its colour before its
+    /// bytes. Fixed buffer, because the tag's memory is the event's.
+    image_blur_buf: [40]u8 = [_]u8{0} ** 40,
+    image_blur_len: u8 = 0,
+    /// The first plain link in the note, previewed as a card under the body. One
+    /// per note, which is what 11o draws; the URL stays in the text as well.
+    link_url_buf: [300]u8 = [_]u8{0} ** 300,
+    link_url_len: u16 = 0,
+    /// Whether the note described its picture. The chip is the marker the shot
+    /// draws, one word: the description itself would need a hover expand, which
+    /// is not expressible.
+    image_has_alt: bool = false,
     // The first `nostr:nevent`/`note` reference in the content, decoded once at
     // parse time: the quoted event id, and the byte span of its raw token in
     // `content_buf` so the body can split around it and render an embedded quote
@@ -2288,9 +2791,34 @@ pub const Note = struct {
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
     }
+    /// The picture's blurhash, empty when the note carries none.
+    pub fn imageBlurhash(self: *const Note) []const u8 {
+        return self.image_blur_buf[0..self.image_blur_len];
+    }
+    /// The link this note previews, empty when it has none.
+    pub fn linkUrl(self: *const Note) []const u8 {
+        return self.link_url_buf[0..self.link_url_len];
+    }
+    pub fn hasLink(self: *const Note) bool {
+        return self.link_url_len > 0;
+    }
     /// Whether this note carries an image to render.
     pub fn hasImage(self: *const Note) bool {
         return self.image_url_len > 0;
+    }
+    /// What the picture's chip says: its dimensions and its weight, as the note
+    /// claims them, in the shot's own form (`1600x900 · 240 KB`). Either half may
+    /// be missing, and the chip is empty when both are. Never taken from the
+    /// decoded bytes, which are the proxy's 480px box and would be a lie about
+    /// the file, and never from the response, which carries no headers.
+    pub fn imageChipLabel(self: *const Note, arena: std.mem.Allocator) []const u8 {
+        const has_dims = self.image_w > 0 and self.image_h > 0;
+        if (has_dims and self.image_bytes > 0) {
+            return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ self.image_w, self.image_h, byteSize(arena, self.image_bytes) }) catch "";
+        }
+        if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ self.image_w, self.image_h }) catch "";
+        if (self.image_bytes > 0) return byteSize(arena, self.image_bytes);
+        return "";
     }
     /// The note's image URL (empty when it has none).
     pub fn imageUrl(self: *const Note) []const u8 {
@@ -2676,6 +3204,20 @@ pub const Model = struct {
     pub fn proxy_status(self: *const Model) []const u8 {
         if (!self.proxy_saved) return "";
         return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
+    }
+    /// What the previews switch is, in the terms that matter: not bandwidth.
+    pub fn previews_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return "Pictures, faces, link previews and NIP-05 checks are fetched from the hosts a note names. " ++
+            "Off, none of that is asked for until you press a picture, and only your relays learn you are reading.";
+    }
+    pub fn previews_state(self: *const Model) []const u8 {
+        _ = self;
+        return if (g_media_previews) "On" else "Off. Press a picture to load that one.";
+    }
+    pub fn previews_action(self: *const Model) []const u8 {
+        _ = self;
+        return if (g_media_previews) "Turn off" else "Turn on";
     }
     /// The app version line for the Settings footer.
     pub fn version_line(self: *const Model) []const u8 {
@@ -3096,6 +3638,8 @@ fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
 /// slot but no avatar yet, a few per tick to stay well inside the effect budget.
 /// The response lands on `avatar_fetched`.
 fn scanAvatarFetches(fx: *Effects) void {
+    // A face is something the note points at, like its picture.
+    if (!g_media_previews) return;
     const per_tick = 8;
     var fired: usize = 0;
     for (&g_profiles, 0..) |*p, i| {
@@ -3180,6 +3724,11 @@ pub fn validNip05Domain(domain: []const u8) bool {
 /// `nip05_verified`; only a match flips the profile to `.verified`, and only
 /// then does the identity line draw its check.
 fn scanNip05Fetches(fx: *Effects) void {
+    // Verifying a NIP-05 means asking a domain a stranger wrote whether it knows
+    // this key, from the reader's own address. That is the same disclosure the
+    // switch exists to stop, so it stops here too, and unverified names simply
+    // show without a check.
+    if (!g_media_previews) return;
     const per_tick = 4;
     var fired: usize = 0;
     for (&g_profiles, 0..) |*p, i| {
@@ -3664,6 +4213,10 @@ fn markMediaWanted(note_id: i64) void {
 /// picture, or one whose slot is already loading or done, is a no-op.
 fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) void {
     if (!note.hasImage()) return;
+    // With previews off, nothing leaves the machine until the reader asks for
+    // this one picture. That is the point of the setting: not bandwidth, but
+    // that reading a feed should not tell every host in it that you did.
+    if (!g_media_previews and !isMediaAsked(note.id)) return;
     const slot = claimMediaSlot(fx, note.id) orelse return;
     slot.last_used = g_media_clock;
     if (slot.state != .idle) return;
@@ -3785,13 +4338,30 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             @memcpy(note.image_url_buf[0..url.len], url);
             note.image_url_len = @intCast(url.len);
             image_url = note.imageUrl();
-            note.image_aspect = imetaAspect(ev.tags, url);
+            const meta = imetaFor(ev.tags, url);
+            note.image_aspect = meta.aspect();
+            note.image_w = meta.width;
+            note.image_h = meta.height;
+            note.image_bytes = meta.size;
+            const blur_len = @min(meta.blurhash.len, note.image_blur_buf.len);
+            @memcpy(note.image_blur_buf[0..blur_len], meta.blurhash[0..blur_len]);
+            note.image_blur_len = @intCast(blur_len);
+            note.image_has_alt = meta.alt.len > 0;
         }
     }
 
     // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
     note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
+
+    // The first plain link, for the preview card. Read from the ORIGINAL content:
+    // the rendered copy has mentions rewritten and may be capped.
+    if (firstLinkUrl(ev.content, image_url)) |link| {
+        if (link.len <= note.link_url_buf.len) {
+            @memcpy(note.link_url_buf[0..link.len], link);
+            note.link_url_len = @intCast(link.len);
+        }
+    }
 
     // The first quoted event (nevent/note), decoded once into a byte span the
     // body splits on, and queued for resolving.
@@ -4246,6 +4816,70 @@ fn findQuoteRef(note: *Note) void {
 /// `url`, or 0 when it says nothing. An `imeta` tag reads
 /// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
 /// written as floats, so both forms parse.
+/// A byte count as a reader reads it: `240 KB`, `1.4 MB`. Decimal units, because
+/// that is what the file's own host quotes and what the note author copied.
+fn byteSize(arena: std.mem.Allocator, bytes: u32) []const u8 {
+    if (bytes < 1000) return std.fmt.allocPrint(arena, "{d} B", .{bytes}) catch "";
+    if (bytes < 1_000_000) return std.fmt.allocPrint(arena, "{d} KB", .{bytes / 1000}) catch "";
+    const mb = @as(f32, @floatFromInt(bytes)) / 1_000_000.0;
+    return std.fmt.allocPrint(arena, "{d:.1} MB", .{mb}) catch "";
+}
+
+/// What a note's NIP-92 `imeta` tag says about `url`: its pixel dimensions, its
+/// alt text and its blurhash. One walk, because the picture's chrome wants all
+/// three and the tag is one place.
+pub const Imeta = struct {
+    width: u16 = 0,
+    height: u16 = 0,
+    /// A slice of the EVENT's memory, so it lives as long as the event does. The
+    /// caller copies what it wants to keep.
+    alt: []const u8 = "",
+    blurhash: []const u8 = "",
+    /// The file's size in bytes, as the note claims it. The only source there is:
+    /// the SDK's fetch response carries no headers, so there is no Content-Length
+    /// to read, and with previews off nothing is fetched at all.
+    size: u32 = 0,
+
+    /// Height over width, or 0 when the tag says nothing. Knowing the shape
+    /// before the bytes arrive is what lets a row reserve exactly the right
+    /// space, so nothing shifts when the picture lands.
+    pub fn aspect(self: Imeta) f32 {
+        if (self.width == 0 or self.height == 0) return 0;
+        return @as(f32, @floatFromInt(self.height)) / @as(f32, @floatFromInt(self.width));
+    }
+};
+
+pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
+    for (tags) |tag| {
+        if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
+        var matches_url = false;
+        var found: Imeta = .{};
+        for (tag[1..]) |field| {
+            if (std.mem.startsWith(u8, field, "url ")) {
+                matches_url = std.mem.eql(u8, std.mem.trim(u8, field[4..], " "), url);
+            } else if (std.mem.startsWith(u8, field, "dim ")) {
+                const dim = std.mem.trim(u8, field[4..], " ");
+                const x = std.mem.indexOfScalar(u8, dim, 'x') orelse continue;
+                // Written as floats by some clients, so parse wide and narrow.
+                const w = std.fmt.parseFloat(f32, dim[0..x]) catch continue;
+                const h = std.fmt.parseFloat(f32, dim[x + 1 ..]) catch continue;
+                if (w > 0 and h > 0 and w < 65536 and h < 65536) {
+                    found.width = @intFromFloat(w);
+                    found.height = @intFromFloat(h);
+                }
+            } else if (std.mem.startsWith(u8, field, "alt ")) {
+                found.alt = std.mem.trim(u8, field[4..], " ");
+            } else if (std.mem.startsWith(u8, field, "size ")) {
+                found.size = std.fmt.parseInt(u32, std.mem.trim(u8, field[5..], " "), 10) catch 0;
+            } else if (std.mem.startsWith(u8, field, "blurhash ")) {
+                found.blurhash = std.mem.trim(u8, field["blurhash ".len..], " ");
+            }
+        }
+        if (matches_url) return found;
+    }
+    return .{};
+}
+
 pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
     for (tags) |tag| {
         if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
@@ -4265,6 +4899,18 @@ pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
         if (matches_url and aspect > 0) return aspect;
     }
     return 0;
+}
+
+/// Whether a URL names an image file. By extension, which is what Nostr media
+/// hosts serve; a link without one is an ordinary link.
+pub fn looksLikeImageUrl(url: []const u8) bool {
+    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+    const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+    const path = url[0..path_end];
+    for (exts) |ext| {
+        if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
+    }
+    return false;
 }
 
 /// The first image URL in `content`, or null. Recognised by extension, which is
@@ -4558,10 +5204,14 @@ pub const Msg = union(enum) {
     media_fetched: native_sdk.EffectResponse,
     /// A NIP-05 well-known lookup finished: mark the author verified on a match.
     nip05_verified: native_sdk.EffectResponse,
+    /// A page that was asked what it says about itself.
+    link_fetched: native_sdk.EffectResponse,
     /// A text edit in the Settings media-proxy field.
     proxy_edit: canvas.TextInputEvent,
     /// Save the media-proxy setting.
     proxy_save,
+    /// Flips whether the app reaches out for what notes point at.
+    previews_toggle,
     /// The feed scrolled: remember where, so images load around the viewport.
     feed_scrolled: canvas.ScrollState,
     /// A link in a note was pressed: open it in the browser.
@@ -4573,6 +5223,8 @@ pub const Msg = union(enum) {
     profiles: native_sdk.EffectTimer,
     /// Expand a note's picture to fill the window.
     expand_image: i64,
+    /// One picture, asked for by the reader while previews are off.
+    load_image: i64,
     /// Dismiss the expanded picture.
     close_image,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
@@ -4595,7 +5247,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -4911,6 +5563,17 @@ fn noteExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
 /// and no per-element override anywhere in the SDK, so a body line is 18.125 here
 /// and the feed reads tighter than the mock. Recorded as a wall in the plan.
 fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
+    return noteRowEstimateWith(note, chrome, true);
+}
+
+/// The same, for a row that draws the body and NOTHING under it. A nested reply
+/// is one: it builds an identity row and a body and stops, so pricing it for a
+/// picture and a link card reported hundreds of pixels per reply it never drew.
+fn noteRowEstimateBody(note: *const Note, chrome: f32) f32 {
+    return noteRowEstimateWith(note, chrome, false);
+}
+
+fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     const line_height: f32 = body_line_height;
     const chars_per_line: f32 = 70;
     // A collapsed long note shows only the fold, plus a line for "Show more".
@@ -4919,7 +5582,20 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
-    if (note.hasImage()) extent += pictureHeight(note) + 8;
+    if (!media) return extent;
+    // A link card, once the page has answered; nothing before that.
+    if (note.hasLink()) {
+        if (linkFor(note.linkUrl())) |l| {
+            if (l.state == .loaded) {
+                extent += 3 + (if (l.description().len > 0) link_card_height else link_card_height_bare);
+            }
+        }
+    }
+    // A picture nobody asked for is one quiet chip, not a reserved box.
+    if (note.hasImage()) {
+        const shown = g_media_previews or isMediaAsked(note.id) or note.media_id() != 0;
+        extent += (if (shown) pictureHeight(note) else picture_ask_height) + 8;
+    }
     // The quote, which is only now a knowable height: the clamp is what makes it
     // one (the shot's own note beside 11f says quote rows clamp "so their height
     // is known at insert"). The bordered card it replaces was never priced at
@@ -5110,7 +5786,7 @@ fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
 fn blockExtent(block: *const ThreadBlock) f32 {
     var extent = noteRowEstimate(block.parent, thread_reply_chrome);
     for (block.children, block.deeper) |*child, deeper| {
-        extent += noteRowEstimate(child, nested_reply_chrome) * nested_body_scale;
+        extent += noteRowEstimateBody(child, nested_reply_chrome) * nested_body_scale;
         if (deeper > 0) extent += branch_more_extent;
     }
     return extent;
@@ -5496,6 +6172,7 @@ fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
                 focalBody(ui, note),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
             }),
@@ -5855,6 +6532,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 noteBody(ui, note, true),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, note),
             }),
@@ -7269,6 +7947,40 @@ pub fn formatCount(arena: std.mem.Allocator, n: u64) []const u8 {
 // LRU-ish eviction is plenty. Id 0 marks an empty slot (a note's id is masked
 // non-negative and never 0 in practice, the same sentinel `viewing_thread` uses).
 const expanded_cap = 64;
+/// The pictures the reader has asked for while previews are off. A per-note UI
+/// fact, so it lives beside the reader rather than on the Note, which is rebuilt
+/// from the store on every refresh. Oldest asked is dropped when it fills, the
+/// same shape as the expanded-notes ring.
+const asked_cap = 32;
+var g_media_asked = [_]i64{0} ** asked_cap;
+
+pub fn isMediaAsked(note_id: i64) bool {
+    for (g_media_asked) |a| {
+        if (a == note_id) return true;
+    }
+    return false;
+}
+
+fn askForMedia(note_id: i64) void {
+    if (isMediaAsked(note_id)) return;
+    for (&g_media_asked) |*a| {
+        if (a.* == 0) {
+            a.* = note_id;
+            return;
+        }
+    }
+    std.mem.copyForwards(i64, g_media_asked[0 .. asked_cap - 1], g_media_asked[1..]);
+    g_media_asked[asked_cap - 1] = note_id;
+}
+
+pub fn askForMediaForTest(note_id: i64) void {
+    askForMedia(note_id);
+}
+
+pub fn forgetAskedMediaForTest() void {
+    g_media_asked = [_]i64{0} ** asked_cap;
+}
+
 var g_expanded = [_]i64{0} ** expanded_cap;
 
 fn isExpanded(note_id: i64) bool {
@@ -7835,6 +8547,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         // shifts as images arrive.
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                         if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                         vgap(ui, 10),
                         engagementRow(ui, note),
                     }),
@@ -7932,13 +8645,24 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
 /// last time it was decoded, else a gentle default. Clamped so one very tall
 /// image cannot take over the feed.
 pub fn pictureHeight(note: *const Note) f32 {
-    const nominal_width: f32 = 300;
-    const default_aspect: f32 = 0.66;
-    const aspect = if (note.image_aspect > 0)
-        note.image_aspect
-    else
-        recalledAspect(note.id) orelse default_aspect;
-    return std.math.clamp(nominal_width * aspect, 80, 320);
+    // The picture spans the reading column, which is what 11o draws, and takes
+    // exactly the height the note's own `imeta` implies at that width. It was
+    // based on a 300px box and clamped at 320px, so a tall picture was reserved
+    // at a height it never drew and the row shifted when the bytes arrived, which
+    // is the whole thing a declared shape exists to prevent.
+    //
+    // The cap is on the ASPECT, not the pixels: a very tall picture is contained
+    // rather than allowed to take over the feed, and contained at a height the
+    // estimate can state exactly.
+    return picture_column_width * @min(pictureAspect(note), picture_max_aspect);
+}
+
+/// The shape to draw at: what the note declares, else what this picture measured
+/// when it was last decoded (remembered past its slot, so an evicted picture does
+/// not shrink and shift the feed), else a landscape guess.
+fn pictureAspect(note: *const Note) f32 {
+    if (note.image_aspect > 0) return note.image_aspect;
+    return recalledAspect(note.id) orelse picture_default_aspect;
 }
 
 /// A note's picture: the image once registered, or a placeholder holding the
@@ -7948,9 +8672,15 @@ pub fn pictureHeight(note: *const Note) f32 {
 fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     const height = pictureHeight(note);
     const image_id = note.media_id();
+    // Previews off and this one not asked for: a quiet line saying what is there
+    // and what pressing it costs, not a box of reserved space for a picture that
+    // is not coming.
+    if (!g_media_previews and !isMediaAsked(note.id) and image_id == 0) return pictureAskChip(ui, note);
     if (image_id == 0) {
-        // Reserved space, not an empty frame: same height the picture will take.
-        return ui.el(.skeleton, .{ .height = height, .semantics = .{ .label = "Loading image" } }, .{});
+        // The same box the picture will fill, striped: reserved space, not an
+        // empty frame, and not a skeleton either, which reads as a row of text
+        // still loading rather than as a photograph.
+        return pictureBox(ui, note, height, pictureBlur(ui, note, height));
     }
     var picture = ui.image(.{ .image = image_id, .grow = 1 });
     // `ui.image` leaves the fit at `stretch`, which distorts the picture into
@@ -7965,28 +8695,365 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // The link role is what puts the pointing hand over it: the engine follows
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
+    return pictureBox(ui, note, height, picture);
+}
+
+/// The picture's frame: the reading column at the declared height, with the
+/// radius and hairline 11o gives it, whatever is inside it, and the chips laid
+/// over the corners. A `data_row` lays children out horizontally, so the chips
+/// ride a stack: there is no way to place a child at a point.
+fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) AppUi.Node {
     return ui.el(.data_row, .{
         .width = pictureWidth(note),
         .height = height,
         .padding = 0,
-        .style = .{ .quiet_hover = true },
+        .style = .{ .quiet_hover = true, .radius = picture_radius, .border = theme.palette.border_hairline, .stroke_width = 1 },
         .on_press = Msg{ .expand_image = note.id },
         .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
-    }, .{picture});
+    }, .{
+        ui.stack(.{ .grow = 1 }, .{
+            content,
+            pictureChips(ui, note),
+        }),
+    });
+}
+
+/// What a picture is while previews are off: one quiet chip naming it and its
+/// weight, which loads that one when pressed. The weight is the note's own claim
+/// and may be missing, in which case the chip does not invent one.
+fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const label = if (note.image_bytes > 0)
+        ui.fmt("image · {s} · load", .{byteSize(ui.arena, note.image_bytes)})
+    else
+        "image · load";
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = picture_ask_height,
+            .cross = .center,
+            .on_press = Msg{ .load_image = note.id },
+            .style = .{ .background = p.surface_inset, .border = p.border_chip, .radius = 6, .stroke_width = 1 },
+            .semantics = .{ .role = .button, .label = "Load this image", .focusable = true },
+        }, .{
+            hgap(ui, 9),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }},
+            ),
+            hgap(ui, 9),
+        }),
+        ui.spacer(1),
+    });
+}
+
+/// A decoded blurhash: the low-frequency colour of a picture, which is all a
+/// blurhash carries. Drawn as a grid of flat cells rather than an image, because
+/// every one of the runtime's sixteen image slots is already spent on faces and
+/// photographs, and a placeholder must not evict the thing it is standing in for.
+pub const Blur = struct {
+    /// Row-major, `cells_x * cells_y` colours.
+    cells: [blur_cells_x * blur_cells_y]canvas.Color = undefined,
+    ok: bool = false,
+};
+
+/// Deliberately coarse. Every cell is a widget node, and a view past 1024 nodes
+/// is REFUSED WHOLE, not degraded: six loading pictures at 8x6 came to 797 nodes
+/// on their own, and a wider window mounting nine rows crossed the ceiling and
+/// blanked the feed. A blurhash carries only low frequencies, so 4x3 shows what
+/// it has for 19 nodes instead of 55.
+const blur_cells_x = 4;
+const blur_cells_y = 3;
+
+/// blurhash's own alphabet.
+fn base83(c: u8) ?f32 {
+    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~";
+    const i = std.mem.indexOfScalar(u8, alphabet, c) orelse return null;
+    return @floatFromInt(i);
+}
+
+fn base83Value(hash: []const u8, from: usize, len: usize) ?f32 {
+    if (from + len > hash.len) return null;
+    var value: f32 = 0;
+    for (hash[from .. from + len]) |c| {
+        const digit = base83(c) orelse return null;
+        value = value * 83 + digit;
+    }
+    return value;
+}
+
+/// sRGB companding, the two halves of it the format needs.
+fn srgbToLinear(v: f32) f32 {
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(v: f32) f32 {
+    const c = std.math.clamp(v, 0, 1);
+    return if (c <= 0.0031308) c * 12.92 else 1.055 * std.math.pow(f32, c, 1.0 / 2.4) - 0.055;
+}
+
+/// Decodes a blurhash into a small grid of colours. The format is a handful of
+/// cosine components; sampling them at each cell's centre is the same sum the
+/// reference decoder runs per pixel, at the resolution the eye gets from a
+/// placeholder anyway.
+pub fn decodeBlurhash(hash: []const u8) Blur {
+    var out: Blur = .{};
+    if (hash.len < 6) return out;
+    const size_flag = base83Value(hash, 0, 1) orelse return out;
+    const comp_x: usize = @intFromFloat(@mod(size_flag, 9) + 1);
+    const comp_y: usize = @intFromFloat(@floor(size_flag / 9) + 1);
+    if (hash.len != 4 + 2 * comp_x * comp_y) return out;
+
+    const quant_max = base83Value(hash, 1, 1) orelse return out;
+    const max_ac = (quant_max + 1) / 166.0;
+
+    // The DC term is the average colour, straight sRGB bytes.
+    const dc = base83Value(hash, 2, 4) orelse return out;
+    const dc_int: u32 = @intFromFloat(dc);
+    var colours: [9 * 9][3]f32 = undefined;
+    colours[0] = .{
+        srgbToLinear(@as(f32, @floatFromInt((dc_int >> 16) & 255)) / 255.0),
+        srgbToLinear(@as(f32, @floatFromInt((dc_int >> 8) & 255)) / 255.0),
+        srgbToLinear(@as(f32, @floatFromInt(dc_int & 255)) / 255.0),
+    };
+
+    var i: usize = 1;
+    while (i < comp_x * comp_y) : (i += 1) {
+        const ac = base83Value(hash, 4 + i * 2, 2) orelse return out;
+        const ac_int: u32 = @intFromFloat(ac);
+        colours[i] = .{
+            signPow((@as(f32, @floatFromInt(ac_int / (19 * 19))) - 9) / 9, 2.0) * max_ac,
+            signPow((@as(f32, @floatFromInt((ac_int / 19) % 19)) - 9) / 9, 2.0) * max_ac,
+            signPow((@as(f32, @floatFromInt(ac_int % 19)) - 9) / 9, 2.0) * max_ac,
+        };
+    }
+
+    for (0..blur_cells_y) |cy| {
+        for (0..blur_cells_x) |cx| {
+            // The centre of the cell, in the 0..1 the basis is defined over.
+            const x = (@as(f32, @floatFromInt(cx)) + 0.5) / @as(f32, @floatFromInt(blur_cells_x));
+            const y = (@as(f32, @floatFromInt(cy)) + 0.5) / @as(f32, @floatFromInt(blur_cells_y));
+            var r: f32 = 0;
+            var g: f32 = 0;
+            var b: f32 = 0;
+            for (0..comp_y) |j| {
+                for (0..comp_x) |k| {
+                    const basis = @cos(std.math.pi * x * @as(f32, @floatFromInt(k))) *
+                        @cos(std.math.pi * y * @as(f32, @floatFromInt(j)));
+                    const c = colours[j * comp_x + k];
+                    r += c[0] * basis;
+                    g += c[1] * basis;
+                    b += c[2] * basis;
+                }
+            }
+            out.cells[cy * blur_cells_x + cx] = canvas.Color.rgba8(
+                @intFromFloat(linearToSrgb(r) * 255 + 0.5),
+                @intFromFloat(linearToSrgb(g) * 255 + 0.5),
+                @intFromFloat(linearToSrgb(b) * 255 + 0.5),
+                255,
+            );
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+fn signPow(value: f32, exp: f32) f32 {
+    const magnitude = std.math.pow(f32, @abs(value), exp);
+    return if (value < 0) -magnitude else magnitude;
+}
+
+/// What a picture that has not arrived looks like: its own colours when the note
+/// carries a blurhash, stripes when it does not.
+fn pictureBlur(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
+    const hash = note.imageBlurhash();
+    if (hash.len == 0) return pictureStripes(ui, height);
+    const blur = decodeBlurhash(hash);
+    if (!blur.ok) return pictureStripes(ui, height);
+
+    // Flat cells, not an image: the runtime has sixteen image slots and they are
+    // all spent on faces and photographs, so a placeholder must not evict the
+    // thing it stands in for. A blurhash carries only low frequencies anyway,
+    // which is what a grid of them shows.
+    const rows = ui.arena.alloc(AppUi.Node, blur_cells_y) catch return pictureStripes(ui, height);
+    for (rows, 0..) |*row, y| {
+        const cells = ui.arena.alloc(AppUi.Node, blur_cells_x) catch return pictureStripes(ui, height);
+        for (cells, 0..) |*cell, x| {
+            cell.* = ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = blur.cells[y * blur_cells_x + x], .radius = 0, .stroke_width = 0 },
+            }, .{});
+        }
+        row.* = ui.row(.{ .grow = 1, .gap = 0 }, .{cells});
+    }
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{rows});
+}
+
+/// The fill under a picture that has not arrived. The shot draws 45 degree
+/// stripes; the canvas has no gradients at the widget level and no rotation, so
+/// they run flat, which keeps what the stripes are FOR (this is a photograph
+/// arriving, not a paragraph) without pretending to an angle.
+fn pictureStripes(ui: *AppUi, height: f32) AppUi.Node {
+    const p = theme.palette;
+    // The band count is capped, so the BANDS grow instead: a stated height that
+    // stopped at the cap left the bottom of a tall box as bare window inside its
+    // own border.
+    const count: usize = @min(@max(1, @as(usize, @intFromFloat(@ceil(height / 14)))), picture_stripe_cap);
+    const bands = ui.arena.alloc(AppUi.Node, count) catch return ui.spacer(0);
+    for (bands, 0..) |*b, i| {
+        b.* = ui.el(.panel, .{
+            .grow = 1,
+            .padding = 0.01,
+            .style = .{ .background = if (i % 2 == 0) p.surface_stripe_a else p.surface_stripe_b, .radius = 0, .stroke_width = 0 },
+        }, .{});
+    }
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{bands});
+}
+
+/// 11o's link preview: what the page on the other end says it is. One per note,
+/// under the body, and the URL stays in the text as well, because the card is a
+/// courtesy and the address is the fact.
+///
+/// The tile is a letter, never a favicon: a favicon would want one of the
+/// sixteen image slots the whole runtime has, and those belong to faces and
+/// photographs.
+fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const url = note.linkUrl();
+    const entry = linkFor(url);
+    // Nothing to show until the page has answered. No skeleton: a card that
+    // might never come is worse than a link that reads as a link.
+    if (entry == null or entry.?.state != .loaded) return ui.spacer(0);
+    const link = entry.?;
+    const initial = std.ascii.toUpper(if (link.domain().len > 0) link.domain()[0] else '?');
+
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 3),
+        ui.el(.list_item, .{
+            .width = picture_column_width,
+            .padding = 0.01,
+            // The URL slice lives in the note, which lives in the model, and the
+            // opener copies it before it runs.
+            .on_press = Msg{ .open_url = url },
+            .style = .{ .background = p.surface_link_card, .border = p.border_chip_alt, .radius = 10, .stroke_width = 1 },
+            .semantics = .{ .role = .link, .label = "Open link", .focusable = true },
+        }, .{
+            hgap(ui, 12),
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.el(.panel, .{
+                    .width = 30,
+                    .height = 30,
+                    .padding = 0.01,
+                    .style = .{ .background = p.surface_link_tile, .radius = 7, .stroke_width = 0 },
+                }, .{
+                    ui.column(.{ .width = 30, .height = 30, .main = .center, .cross = .center }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = ui.fmt("{c}", .{initial}), .monospace = true, .weight = .medium, .scale = meta_scale }},
+                        ),
+                    }),
+                }),
+            }),
+            hgap(ui, 10),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = link.domain(), .monospace = true, .scale = mono_chip_scale }},
+                ),
+                vgap(ui, 2),
+                ui.text(.{
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .grow = 1,
+                    .size = .sm,
+                    .style = .{ .foreground = p.text_link_title },
+                }, link.title()),
+                if (link.description().len == 0) ui.spacer(0) else vgap(ui, 2),
+                if (link.description().len == 0) ui.spacer(0) else ui.paragraph(.{
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .grow = 1,
+                    .style = .{ .foreground = p.text_muted },
+                }, &.{.{ .text = link.description(), .scale = mono_row_scale }}),
+                vgap(ui, 10),
+            }),
+            hgap(ui, 12),
+        }),
+    });
+}
+
+/// The two chips 11o lays over a picture: its declared size at the top right and
+/// its alt text at the bottom left. Both read at rest, because hover cannot
+/// restyle or reveal a child.
+fn pictureChips(ui: *AppUi, note: *const Note) AppUi.Node {
+    const dims = note.imageChipLabel(ui.arena);
+    const alt = note.image_has_alt;
+    if (dims.len == 0 and !alt) return ui.spacer(0);
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{
+        ui.row(.{ .grow = 1, .main = .end, .cross = .start, .gap = 0 }, .{
+            if (dims.len == 0) ui.spacer(0) else pictureChip(ui, dims, false),
+            hgap(ui, picture_chip_inset),
+        }),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, picture_chip_inset),
+            if (!alt) ui.spacer(0) else pictureChip(ui, "ALT", true),
+            ui.spacer(1),
+        }),
+        vgap(ui, picture_chip_inset),
+    });
+}
+
+/// One chip over a picture: mono, small, on a scrim dark enough to read against
+/// any photograph.
+fn pictureChip(ui: *AppUi, label: []const u8, emphatic: bool) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, picture_chip_inset),
+        ui.el(.panel, .{
+            .padding = 0.01,
+            .height = picture_chip_height,
+            .style = .{ .background = p.scrim_chip, .border = p.border_chip_alt, .radius = 5, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 7),
+                // A scaled span, because the 10px mono register has no size enum
+                // rung. No stated width: 11o draws both of these as pills hugging
+                // their text, and a fixed one made "ALT" a 194px bar across the
+                // bottom of every described picture. Both labels are bounded by
+                // construction, the longest being `1600×900 · 240 KB`.
+                ui.paragraph(.{
+                    .wrap = false,
+                    .style = .{ .foreground = if (emphatic) p.text_secondary else p.text_muted_alt },
+                }, &.{.{
+                    .text = label,
+                    .monospace = true,
+                    .weight = if (emphatic) .medium else .regular,
+                    .scale = mono_chip_scale,
+                }}),
+                hgap(ui, 7),
+            }),
+        }),
+    });
 }
 
 /// How wide the drawn picture is: its own shape at the reserved height, never
 /// wider than the card. `contain` centres a narrow picture in its box, so
 /// matching the box to the picture is what keeps the press on the picture.
 pub fn pictureWidth(note: *const Note) f32 {
-    const nominal_width: f32 = 300;
-    const height = pictureHeight(note);
-    const aspect = if (note.image_aspect > 0)
-        note.image_aspect
-    else
-        recalledAspect(note.id) orelse 0.66;
-    if (aspect <= 0) return nominal_width;
-    return @min(nominal_width, height / aspect);
+    // The TRUE aspect, not the capped one: a picture taller than the cap is
+    // drawn `contain`ed at the reserved height, so its drawn width is what the
+    // shape says, and the box must be that or the gutters either side are bare
+    // window inside the border, and pressable.
+    const aspect = pictureAspect(note);
+    if (aspect <= 0) return picture_column_width;
+    // The box IS the picture: a portrait photo drawn `contain`ed inside a
+    // column-wide box would leave bare window either side, inside the border,
+    // and all of it pressable. Matching the box to what is drawn keeps the press
+    // on the picture and the chips on its corners.
+    return @min(picture_column_width, pictureHeight(note) / aspect);
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
@@ -8005,6 +9072,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
+    scanLinkFetches(fx, model);
     scanNip05Fetches(fx);
     fx.startTimer(.{
         .key = refresh_timer_key,
@@ -8044,6 +9112,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
@@ -8267,10 +9336,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Retry anything that failed to load under the previous setting.
             retryFailedImages();
         },
+        .previews_toggle => {
+            setMediaPreviews(!mediaPreviews());
+            saveSettings();
+            // Turning it back on should fill the feed in without a restart.
+            if (mediaPreviews()) {
+                retryFailedImages();
+                scanAvatarFetches(fx);
+                scanMediaFetches(fx, model);
+                scanLinkFetches(fx, model);
+            }
+        },
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
+        .link_fetched => |response| handleLinkFetched(response),
         .open_url => |url| openExternally(fx, url),
         .expand_image => |note_id| model.expanded_note = note_id,
+        .load_image => |note_id| {
+            askForMedia(note_id);
+            scanMediaFetches(fx, model);
+        },
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
@@ -8287,6 +9372,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             assignAvatarSlots(fx, model);
             scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
+            scanLinkFetches(fx, model);
         },
         .load_older => {
             // One more page from the store, up to what the feed can hold.
@@ -9585,6 +10671,7 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
 /// starting from the default so a fresh install proxies out of the box.
 fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
+    g_media_previews = true;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
@@ -9595,6 +10682,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         // An empty value is meaningful: the user chose to load originals.
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
+        if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
     }
 }
 
@@ -9605,7 +10693,10 @@ fn saveSettings() void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     var buf: [512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\n", .{mediaProxy()}) catch return;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\n", .{
+        mediaProxy(),
+        if (g_media_previews) "on" else "off",
+    }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
         .data = data,
