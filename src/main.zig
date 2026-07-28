@@ -826,6 +826,14 @@ const rail_gap: f32 = 8;
 /// The scope title (13.5) and the mono metadata register (10.5), as multipliers
 /// of the 14.5 body, since the size enum only steps by one.
 const scope_title_scale: f32 = 13.5 / 14.5;
+// 11c's Settings geometry: a 440 column, a 38px header band, and the section
+// rhythm (16 between sections, 8 from a label to its card).
+const settings_column_width: f32 = 440;
+const settings_header_height: f32 = 38;
+const settings_section_gap: f32 = 16;
+const settings_label_gap: f32 = 8;
+const settings_card_radius: f32 = 11;
+const settings_title_scale: f32 = 13.0 / 14.5;
 const mono_meta_scale: f32 = 10.5 / 14.5;
 /// The status bar's 11.5px register, and the menus' 12 / 12.5 / 11 / 9.5.
 const status_scale: f32 = 11.5 / 14.5;
@@ -3610,6 +3618,13 @@ pub const Model = struct {
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
+    // The Edit profile sheet: whether it is open, what is in its fields, and
+    // whether the app has the reader's current profile to merge into.
+    editing_profile: bool = false,
+    profile_stage: ProfileStage = .fetching,
+    profile_name_buffer: canvas.TextBuffer(64) = .{},
+    profile_about_buffer: canvas.TextBuffer(280) = .{},
+    profile_picture_buffer: canvas.TextBuffer(200) = .{},
     // The add-a-relay field, and why the last press did nothing.
     relay_buffer: canvas.TextBuffer(96) = .{},
     relay_error: bool = false,
@@ -3851,6 +3866,54 @@ pub const Model = struct {
     pub fn proxy_status(self: *const Model) []const u8 {
         if (!self.proxy_saved) return "";
         return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
+    }
+    /// What signs for this account, as a sentence rather than a badge.
+    pub fn signer_line(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_signer_kind) {
+            .local => "Signing with a local key",
+            .remote => "Signing via a remote signer",
+            .helper => "Signing via Signet",
+        };
+    }
+    /// Where the key actually is, which is the part worth knowing.
+    pub fn signer_sub(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_signer_kind) {
+            .local => "The key is on this Mac, in this app.",
+            .remote => "The key never leaves your signer. Plaza asks it to sign.",
+            .helper => "The key is held by Signet on this Mac, not by Plaza.",
+        };
+    }
+    /// Whether the app is allowed to fetch what a note names.
+    pub fn previews_on(self: *const Model) bool {
+        _ = self;
+        return g_media_previews;
+    }
+    pub fn profile_name(self: *const Model) []const u8 {
+        return self.profile_name_buffer.text();
+    }
+    pub fn profile_about(self: *const Model) []const u8 {
+        return self.profile_about_buffer.text();
+    }
+    pub fn profile_picture(self: *const Model) []const u8 {
+        return self.profile_picture_buffer.text();
+    }
+    /// What the sheet is able to do right now, said in the sheet.
+    pub fn profile_status(self: *const Model) []const u8 {
+        return switch (self.profile_stage) {
+            .fetching => "Reading your current profile from your relays…",
+            .absent => "You have no profile yet. Saving publishes your first one.",
+            .have => "",
+            .saving => "Signing and publishing…",
+            .saved => "Published. Other clients will show it as your relays pass it on.",
+            .failed => "Could not sign this. Nothing was published, and your profile is unchanged.",
+        };
+    }
+    /// Saving is refused until the app HAS the profile it would be merging into.
+    /// Publishing a merge of nothing is how a lightning address disappears.
+    pub fn profile_can_save(self: *const Model) bool {
+        return self.profile_stage == .have or self.profile_stage == .absent or self.profile_stage == .failed;
     }
     /// The add-a-relay field's text.
     pub fn relay_draft(self: *const Model) []const u8 {
@@ -5819,6 +5882,13 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// Opens the Edit profile sheet, and the three fields in it.
+    open_profile_edit,
+    close_profile_edit,
+    profile_name_edit: canvas.TextInputEvent,
+    profile_about_edit: canvas.TextInputEvent,
+    profile_picture_edit: canvas.TextInputEvent,
+    profile_save,
     /// Walks a relay through what it is for: both, read, write.
     relay_cycle: u8,
     /// Drops a relay from the pool.
@@ -5955,37 +6025,195 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 /// the screen does.
 fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    var cards: [8]AppUi.Node = undefined;
+    var sections: [6]AppUi.Node = undefined;
     var n: usize = 0;
 
-    cards[n] = settingsCard(ui, .{
-        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Signed in as"),
-        vgap(ui, 8),
-        ui.text(.{ .wrap = true }, model.active_npub()),
-        vgap(ui, 8),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.accent } }, model.identity_kind_label()),
-            ui.spacer(1),
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.copy_npub }, "Copy npub"),
-        }),
+    sections[n] = identitySection(ui, model);
+    n += 1;
+    sections[n] = settingsSection(
+        ui,
+        "RELAYS",
+        "reads & writes route automatically · NIP-65",
+        relayCard(ui, model),
+    );
+    n += 1;
+    sections[n] = settingsSection(ui, "APPEARANCE", "", appearanceCard(ui));
+    n += 1;
+    sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
+    n += 1;
+    sections[n] = logoutSection(ui, model);
+    n += 1;
+    sections[n] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = model.version_line(), .scale = mono_hint_scale }}),
     });
     n += 1;
 
-    if (model.is_local_key()) {
-        cards[n] = settingsCard(ui, .{
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Your secret key"),
-            vgap(ui, 8),
-            ui.text(
-                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                "Right now this key lives only on this Mac. Back it up so losing the Mac is not losing the account. Plaza never sends it anywhere.",
-            ),
-            vgap(ui, 8),
-            if (model.nsec_hidden())
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Reveal secret key")
+    // The screen is a COLUMN of a stated width, centred: at 440 the sections read
+    // as one document rather than as cards stretched across a 760px window.
+    return ui.column(.{ .gap = 0, .grow = 1, .style = .{ .background = p.surface_window } }, .{
+        settingsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.spacer(1),
+                ui.el(.panel, .{
+                    .width = settings_column_width,
+                    .padding = 0.01,
+                    .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .radius = 0, .stroke_width = 0 },
+                }, .{
+                    ui.column(.{ .gap = settings_section_gap, .padding = 0.01 }, .{
+                        vgap(ui, 16),
+                        ui.row(.{ .gap = 0 }, .{
+                            hgap(ui, 18),
+                            ui.column(.{ .gap = settings_section_gap, .grow = 1 }, .{sections[0..n]}),
+                            hgap(ui, 18),
+                        }),
+                        vgap(ui, 18),
+                    }),
+                }),
+                ui.spacer(1),
+            }),
+        }),
+    });
+}
+
+/// The 38px header band. "Settings" sits centred in it, with Back on the left,
+/// so the title belongs to the window rather than to the column beneath it.
+fn settingsHeader(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0, .height = settings_header_height, .padding = 0.01 }, .{
+        hgap(ui, 10),
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Back"),
+        ui.spacer(1),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_sheet_title } },
+            &.{.{ .text = "Settings", .weight = .medium, .scale = settings_title_scale }},
+        ),
+        ui.spacer(1),
+        // The same width the Back button takes, so the title is centred in the
+        // band rather than in what is left of it.
+        hgap(ui, 62),
+    });
+}
+
+/// A labelled section: the mono label, an optional caption beside it, then the
+/// card. The label is mono per the design; the engine draws mono at one weight,
+/// so it carries its emphasis through colour and size rather than through w600.
+fn settingsSection(ui: *AppUi, label: []const u8, caption: []const u8, card: AppUi.Node) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }}),
+            if (caption.len > 0) hgap(ui, 8) else ui.spacer(0),
+            if (caption.len > 0)
+                ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = caption, .scale = mono_hint_scale }})
             else
-                ui.column(.{ .gap = 8 }, .{
-                    ui.text(.{ .wrap = true }, model.revealed_nsec(ui.arena)),
-                    ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.spacer(0),
+        }),
+        vgap(ui, settings_label_gap),
+        card,
+    });
+}
+
+/// One settings card: the house card chrome, so every section on the screen
+/// wears the same edge.
+fn settingsCard(ui: *AppUi, children: anytype) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.card, .{ .padding = 0.01, .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 } }, .{
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 12),
+            ui.column(.{ .gap = 0, .grow = 1 }, .{
+                vgap(ui, 11),
+                ui.column(.{ .gap = 0, .grow = 1 }, children),
+                vgap(ui, 11),
+            }),
+            hgap(ui, 12),
+        }),
+    });
+}
+
+/// A card's internal rule: what separates who you are from what signs for you.
+fn cardDivider(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 10),
+        ui.el(.panel, .{ .height = 1, .padding = 0.01, .style = .{ .background = p.divider_card, .radius = 0, .stroke_width = 0 } }, .{}),
+        vgap(ui, 10),
+    });
+}
+
+/// The identity section: who you are, what signs for you, and, when the key is
+/// on this machine, how to take a copy of it away with you.
+fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    var rows: [5]AppUi.Node = undefined;
+    var n: usize = 0;
+
+    rows[n] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+        meAvatar(ui, 38),
+        hgap(ui, 10),
+        ui.column(.{ .gap = 0, .grow = 1 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = accountName(), .weight = .medium, .scale = scope_title_scale }}),
+            // The npub only when it is not already the line above it: an account
+            // with no kind:0 yet would otherwise read its own key twice.
+            if (accountHasName()) vgap(ui, 2) else ui.spacer(0),
+            if (accountHasName())
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = npubShort(), .monospace = true, .scale = mono_meta_scale }})
+            else
+                ui.spacer(0),
+        }),
+        hgap(ui, 8),
+        settingsLink(ui, "Copy npub", Msg.copy_npub),
+        hgap(ui, 10),
+        settingsLink(ui, "Edit profile", Msg.open_profile_edit),
+    });
+    n += 1;
+
+    rows[n] = cardDivider(ui);
+    n += 1;
+
+    // What holds the key, said as a fact about this machine rather than as a
+    // badge. The dot is green only for a signer that is answering.
+    rows[n] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.el(.panel, .{ .width = 7, .height = 7, .padding = 0.01, .style = .{ .background = p.status_success, .radius = 4, .stroke_width = 0 } }, .{}),
+        hgap(ui, 9),
+        ui.column(.{ .gap = 0, .grow = 1 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = model.signer_line(), .weight = .medium, .scale = menu_scale }}),
+            vgap(ui, 2),
+            ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_faint } }, &.{.{ .text = model.signer_sub(), .scale = mono_hint_scale }}),
+        }),
+        // The design puts a "Change…" here. There is no change-signer flow to
+        // send it to: changing what signs means signing out and signing back in
+        // differently, and the control for that is at the bottom of the screen
+        // wearing the word it deserves. A gentler-looking link that opens a
+        // confirmation about removing your key is the dishonest option.
+    });
+    n += 1;
+
+    // The backup card has no home in the design, and dropping it would drop the
+    // only way off this machine with the key that IS the account. It lives under
+    // the signer line, which is exactly the row it qualifies.
+    if (model.is_local_key()) {
+        rows[n] = ui.column(.{ .gap = 0 }, .{
+            cardDivider(ui),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "This key lives only on this Mac. Back it up so losing the Mac is not losing the account. Plaza never sends it anywhere.", .scale = mono_hint_scale }},
+            ),
+            vgap(ui, 9),
+            if (model.nsec_hidden())
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Reveal secret key"),
+                    ui.spacer(1),
+                })
+            else
+                ui.column(.{ .gap = 0 }, .{
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = p.text_sheet_title } },
+                        &.{.{ .text = model.revealed_nsec(ui.arena), .monospace = true, .scale = mono_row_scale }},
+                    ),
+                    vgap(ui, 9),
+                    ui.row(.{ .cross = .center, .gap = 8 }, .{
                         ui.button(.{ .size = .sm, .on_press = Msg.copy_nsec }, "Copy nsec"),
                         ui.spacer(1),
                         ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Hide"),
@@ -5995,30 +6223,110 @@ fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
         n += 1;
     }
 
-    cards[n] = relayCard(ui, model);
-    n += 1;
+    return settingsSection(ui, "IDENTITY", "", settingsCard(ui, .{rows[0..n]}));
+}
 
-    cards[n] = settingsCard(ui, .{
-        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Load media previews"),
-        vgap(ui, 8),
-        ui.text(.{ .wrap = true, .style = .{ .foreground = p.text_muted } }, model.previews_explainer()),
-        vgap(ui, 8),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, model.previews_state()),
-            ui.spacer(1),
-            ui.button(.{ .size = .sm, .on_press = Msg.previews_toggle }, model.previews_action()),
-        }),
+/// A quiet inline action: the design's "Copy npub", "Edit profile", "Change…".
+/// Text, not a button, because a card full of buttons reads as a form.
+fn settingsLink(ui: *AppUi, label: []const u8, msg: Msg) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.list_item, .{
+        .padding = 0.01,
+        .height = 18,
+        .cross = .center,
+        .on_press = msg,
+        .style = .{ .radius = 4 },
+        .semantics = .{ .role = .button, .label = label, .focusable = true },
+    }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = label, .scale = meta_scale }}),
     });
-    n += 1;
+}
 
-    cards[n] = settingsCard(ui, .{
-        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Media proxy"),
-        vgap(ui, 8),
-        ui.text(
-            .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-            "Images are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.",
+/// Appearance. Nothing here is adjustable yet, and the section says so by
+/// showing where the app stands on each axis with the alternatives disabled: a
+/// statement about the app rather than a row of dead controls.
+fn appearanceCard(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return settingsCard(ui, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            themeRadio(ui, "Dark", true),
+            hgap(ui, 14),
+            themeRadio(ui, "System", false),
+            hgap(ui, 14),
+            themeRadio(ui, "Light", false),
+            ui.spacer(1),
+        }),
+        vgap(ui, 9),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "Plaza is dark only for now, at a comfortable density. Both are on the list.", .scale = mono_hint_scale }},
         ),
-        vgap(ui, 8),
+    });
+}
+
+/// One appearance choice. Only the selected one is live, and the others are
+/// disabled rather than absent, so the axis is legible.
+fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.el(.radio, .{
+            .size = .sm,
+            .selected = selected,
+            // Even the selected one takes no press: there is nothing to switch
+            // to. `disabled` also stops the control claiming a press it would
+            // then drop, which is what a live-looking dead control does.
+            .disabled = true,
+            .opacity = if (selected) 1.0 else 0.55,
+            .style = .{
+                .border = if (selected) p.surface_control_solid else p.border_radio,
+                .accent = p.surface_control_solid,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = label },
+        }, .{}),
+        hgap(ui, 6),
+        ui.paragraph(
+            .{ .style = .{ .foreground = if (selected) p.text_body_strong else p.text_muted_alt }, .opacity = if (selected) 1.0 else 0.55 },
+            &.{.{ .text = label, .scale = menu_scale }},
+        ),
+    });
+}
+
+/// The feed section: what the app is allowed to fetch on the reader's behalf,
+/// and where pictures are resized. Both are privacy settings before they are
+/// anything else, which is why each keeps its sentence.
+fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return settingsCard(ui, .{
+        // A real checkbox: it owns its whole row, because a control nested in a
+        // pressable row claims the press and drops it.
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.previews_on(),
+            .text = "Load media previews",
+            .on_toggle = Msg.previews_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Load media previews", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.previews_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
+        ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, &.{.{ .text = "Media proxy", .scale = menu_scale }}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "Pictures are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.", .scale = mono_hint_scale }},
+        ),
+        vgap(ui, 9),
         ui.inputGroup(
             .{ .semantics = .{ .label = "Media proxy" } },
             ui.el(.textarea, .{
@@ -6029,50 +6337,34 @@ fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
                 .height = 30,
             }, .{}),
             ui.inputGroupActions(.{}, .{
-                ui.text(.{ .size = .sm, .grow = 1, .style = .{ .foreground = p.text_muted } }, model.proxy_status()),
+                ui.paragraph(
+                    .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = model.proxy_status(), .scale = mono_hint_scale }},
+                ),
                 ui.button(.{ .size = .sm, .on_press = Msg.proxy_save }, "Save"),
             }),
         ),
     });
-    n += 1;
-
-    if (model.logout_idle()) {
-        cards[n] = ui.button(.{ .variant = .destructive, .on_press = Msg.logout_request }, "Log out");
-        n += 1;
-    } else if (model.logout_confirming()) {
-        cards[n] = settingsCard(ui, .{
-            ui.text(.{ .wrap = true }, model.logout_warning()),
-            vgap(ui, 12),
-            ui.row(.{ .gap = 8, .cross = .center }, .{
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.logout_cancel }, "Cancel"),
-                ui.spacer(1),
-                ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.logout_confirm }, "Log out"),
-            }),
-        });
-        n += 1;
-    }
-
-    cards[n] = ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, model.version_line());
-    n += 1;
-
-    return ui.column(.{ .gap = 0, .grow = 1 }, .{
-        ui.row(.{ .gap = 8, .cross = .center, .padding = 16 }, .{
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Back"),
-            ui.text(.{ .size = .heading, .grow = 1 }, "Settings"),
-        }),
-        ui.separator(.{}),
-        ui.scroll(.{ .grow = 1 }, .{
-            ui.column(.{ .gap = 16, .padding = 16 }, .{cards[0..n]}),
-        }),
-    });
 }
 
-/// One settings card: the house card chrome, so every section on the screen
-/// wears the same edge.
-fn settingsCard(ui: *AppUi, children: anytype) AppUi.Node {
-    const p = theme.palette;
-    return ui.el(.card, .{ .padding = 16, .style = .{ .background = p.surface_settings_card, .border = p.border_hairline, .radius = 10, .stroke_width = 1 } }, .{
-        ui.column(.{ .gap = 0 }, children),
+/// Signing out: one press to ask, one card to confirm. The card is the whole
+/// section when it is up, because a confirmation that shares a row with other
+/// controls is a confirmation nobody reads.
+fn logoutSection(ui: *AppUi, model: *const Model) AppUi.Node {
+    if (model.logout_idle()) {
+        return ui.row(.{ .gap = 0 }, .{
+            ui.button(.{ .variant = .destructive, .on_press = Msg.logout_request }, "Log out"),
+            ui.spacer(1),
+        });
+    }
+    return settingsCard(ui, .{
+        ui.paragraph(.{ .wrap = true, .style = .{ .foreground = theme.palette.text_primary } }, &.{.{ .text = model.logout_warning(), .scale = menu_scale }}),
+        vgap(ui, 12),
+        ui.row(.{ .cross = .center, .gap = 8 }, .{
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.logout_cancel }, "Cancel"),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.logout_confirm }, "Log out"),
+        }),
     });
 }
 
@@ -6126,17 +6418,16 @@ fn forgetRelaySlotState(i: usize) void {
 fn relayCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const slots = relaySlots();
-    const rows = ui.arena.alloc(AppUi.Node, slots + 3) catch return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, slots + 4) catch return ui.spacer(0);
     var n: usize = 0;
-    rows[n] = ui.column(.{ .gap = 0 }, .{
-        ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "Relays", .weight = .medium, .scale = menu_scale }}),
-        vgap(ui, 4),
-        ui.paragraph(
-            .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
-            &.{.{ .text = "Reads and writes route by these markers. Press a badge to change what a relay is for.", .scale = mono_meta_scale }},
-        ),
-        vgap(ui, 10),
-    });
+    // No heading here: the section above the card already says RELAYS, and the
+    // caption beside it already says what the markers do.
+    rows[n] = ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+        &.{.{ .text = "Press a badge to change what a relay is for.", .scale = mono_hint_scale }},
+    );
+    n += 1;
+    rows[n] = vgap(ui, 10);
     n += 1;
     for (0..slots) |i| {
         const e = relayAt(i) orelse continue;
@@ -6299,6 +6590,9 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.stage == .ready and model.naming) {
         return ui.stack(.{ .grow = 1 }, .{ base, nameSheet(ui, model) });
     }
+    if (model.stage == .settings and model.editing_profile) {
+        return ui.stack(.{ .grow = 1 }, .{ base, profileSheet(ui, model) });
+    }
     if (model.stage == .ready and model.composing) {
         return ui.stack(.{ .grow = 1 }, .{ base, composeSheet(ui, model) });
     }
@@ -6340,6 +6634,73 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 }),
             })),
         }),
+    });
+}
+
+/// The Edit profile sheet. No mock draws it, so it is the modal-card recipe with
+/// three fields; flagged in the PR for review.
+///
+/// The status line under the fields is the point of the sheet, not decoration: a
+/// profile is REPLACEABLE, so saving rewrites the whole thing, and the sheet must
+/// be able to say whether it actually has the reader's current profile to rewrite.
+fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const status = model.profile_status();
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .on_dismiss = Msg.close_profile_edit,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "Edit profile" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            modalCard(ui, 400, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
+                ),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                    &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
+                ),
+                profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
+                profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
+                profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
+                if (status.len > 0)
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
+                        &.{.{ .text = status, .scale = mono_hint_scale }},
+                    )
+                else
+                    ui.spacer(0),
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_profile_edit }, "Close"),
+                    ui.spacer(1),
+                    ui.button(.{
+                        .size = .sm,
+                        .variant = .primary,
+                        .disabled = !model.profile_can_save(),
+                        .on_press = Msg.profile_save,
+                    }, "Save"),
+                }),
+            })),
+        }),
+    });
+}
+
+/// One labelled field in the sheet.
+fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: []const u8, comptime tag: std.meta.Tag(Msg)) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }}),
+        vgap(ui, 5),
+        ui.el(.textarea, .{
+            .text = value,
+            .placeholder = placeholder,
+            .on_input = AppUi.inputMsg(tag),
+            .height = 34,
+            .semantics = .{ .label = label },
+        }, .{}),
     });
 }
 
@@ -10542,6 +10903,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
+                // The Edit profile sheet waits on a real answer before it lets
+                // anything be published over a profile it has not read.
+                if (model.editing_profile and model.profile_stage == .fetching) {
+                    const gpa = std.heap.page_allocator;
+                    if (ownProfileJson(gpa)) |own| {
+                        defer gpa.free(own.json);
+                        seedProfileFields(model, own.json);
+                        model.profile_stage = .have;
+                    } else if (g_own_profile_asked.load(.acquire)) {
+                        model.profile_stage = .absent;
+                    }
+                }
                 // Their published relay list, taken on this thread so no ingest
                 // thread ever swaps the pool out from under the others.
                 _ = adoptRelayList();
@@ -10651,9 +11024,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
-        // The ack bits name slots, and this slot's direction just changed.
+        .open_profile_edit => openProfileEdit(model),
+        .close_profile_edit => model.editing_profile = false,
+        .profile_name_edit => |edit| model.profile_name_buffer.apply(edit),
+        .profile_about_edit => |edit| model.profile_about_buffer.apply(edit),
+        .profile_picture_edit => |edit| model.profile_picture_buffer.apply(edit),
+        .profile_save => saveProfile(model, fx),
         .relay_cycle => |i| {
             cycleRelay(i);
+            // The ack bits name slots, and this slot's direction just changed.
             relayListEdited();
         },
         .relay_remove => |i| {
@@ -10802,7 +11181,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .backup_now => {
             model.backup_nudge = false;
             model.backup_nudge_dismissed = true;
-            model.stage = .settings;
+            enterSettings(model);
         },
         .backup_later => {
             model.backup_nudge = false;
@@ -10843,13 +11222,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
             }
         },
-        .open_settings => {
-            model.menu = .none;
-            // Seed the proxy field from the live setting so it edits in place.
-            model.proxy_buffer.set(mediaProxy());
-            model.proxy_saved = false;
-            model.stage = .settings;
-        },
+        .open_settings => enterSettings(model),
         .proxy_edit => |edit| {
             model.proxy_buffer.apply(edit);
             model.proxy_saved = false;
@@ -10945,42 +11318,304 @@ fn setToast(model: *Model, text: []const u8) void {
     model.toast_until = nowSeconds() + 3;
 }
 
-/// Publishes the name beat's text as the account's kind:0 metadata, and seeds
-/// the local profile cache so the app shows the name at once. Local keys only
-/// (the beat never runs for imports or signers). Quotes and backslashes are
-/// dropped rather than escaped: a display name is prose, not JSON.
-fn publishName(model: *Model, fx: *Effects) void {
-    const raw = std.mem.trim(u8, model.name_buffer.text(), " \t\r\n");
-    if (raw.len == 0) return;
-    const signer = g_identity_signer orelse return;
-    const kp = g_identity_kp orelse return;
+/// The one door into Settings. Every field on the screen that edits a live
+/// setting is seeded here, because an arm that sets `stage = .settings` on its
+/// own leaves those fields EMPTY, and an empty field over a Save button is an
+/// invitation to erase the setting it was supposed to show. The backup nudge did
+/// exactly that to the media proxy.
+fn enterSettings(model: *Model) void {
+    model.menu = .none;
+    model.proxy_buffer.set(mediaProxy());
+    model.proxy_saved = false;
+    model.editing_profile = false;
+    model.stage = .settings;
+}
+
+/// What the Edit profile sheet knows about the profile it is editing.
+///
+/// The distinction that matters is `fetching` versus `absent`. "The store has no
+/// kind:0 for me" means either that this account has never had a profile or that
+/// nobody has answered yet, and those two look identical from here. Publishing
+/// under the second reading REPLACES a real profile with whatever three fields
+/// this app models, which is how somebody's lightning address disappears. So the
+/// sheet asks every read relay first, and only calls it `absent` once they have
+/// all answered.
+pub const ProfileStage = enum { fetching, absent, have, saving, saved, failed };
+
+/// Whether a full round of asking for our own kind:0 has completed. Set by the
+/// worker, read by the tick, so `absent` is a fact rather than an assumption.
+var g_own_profile_asked = std.atomic.Value(bool).init(false);
+var g_own_profile_asking = std.atomic.Value(bool).init(false);
+
+/// The reader's own newest kind:0, raw. The RAW content is the source of truth,
+/// never the `Profile` cache: the cache models four fields and drops everything
+/// else, so rebuilding from it would publish a profile with the rest deleted.
+///
+/// The returned slice is owned by the caller's allocator.
+fn ownProfileJson(gpa: std.mem.Allocator) ?struct { json: []u8, created_at: i64 } {
+    const store = g_store orelse return null;
+    const pk = activePubkey() orelse return null;
+    const kinds = [_]u16{0};
+    const authors = [_][32]u8{pk};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return null;
+    defer result.deinit();
+    if (result.events.len == 0) return null;
+    // Copied out before `result.deinit()`: the query owns its events through an
+    // arena, and the write seam holds what it is given past this frame.
+    const copy = gpa.dupe(u8, result.events[0].content) catch return null;
+    return .{ .json = copy, .created_at = result.events[0].created_at };
+}
+
+/// Opens the sheet, seeded from the reader's own kind:0 if the app has it.
+fn openProfileEdit(model: *Model) void {
+    model.editing_profile = true;
+    model.profile_name_buffer.clear();
+    model.profile_about_buffer.clear();
+    model.profile_picture_buffer.clear();
+    const gpa = std.heap.page_allocator;
+    if (ownProfileJson(gpa)) |own| {
+        defer gpa.free(own.json);
+        seedProfileFields(model, own.json);
+        model.profile_stage = .have;
+        return;
+    }
+    // Nothing here yet. Ask before concluding anything.
+    model.profile_stage = if (g_own_profile_asked.load(.acquire)) .absent else .fetching;
+    if (model.profile_stage == .fetching) startOwnProfileFetch();
+}
+
+/// Fills the sheet's fields from the RAW blob, so what the reader sees is what
+/// is about to be rewritten.
+fn seedProfileFields(model: *Model, json: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{
+        // A real profile out there has repeated keys sometimes, and refusing to
+        // parse it would refuse to edit it.
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch return;
+    if (root != .object) return;
+    const obj = root.object;
+    if (stringField(obj, "display_name") orelse stringField(obj, "displayName") orelse stringField(obj, "name")) |v| {
+        model.profile_name_buffer.set(v);
+    }
+    if (stringField(obj, "about")) |v| model.profile_about_buffer.set(v);
+    if (stringField(obj, "picture")) |v| model.profile_picture_buffer.set(v);
+}
+
+fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |str| if (str.len == 0) null else str,
+        else => null,
+    };
+}
+
+/// Publishes the sheet's fields, MERGED into the reader's existing kind:0.
+///
+/// kind:0 is replaceable: what is published replaces the whole profile. Real
+/// profiles carry `about`, `banner`, `website`, `lud16` (the lightning address
+/// that is how somebody gets paid), and whatever else their other clients wrote.
+/// This app models three of those, so it edits three keys of the object it read
+/// and leaves every other key exactly where it was.
+fn saveProfile(model: *Model, fx: *Effects) void {
+    if (!model.profile_can_save()) return;
+    if (activePubkey() == null) return;
     const gpa = std.heap.page_allocator;
 
-    var clean_buf: [64]u8 = undefined;
-    var clean_len: usize = 0;
-    for (raw) |c| {
-        if (c == '"' or c == '\\') continue;
-        clean_buf[clean_len] = c;
-        clean_len += 1;
-    }
-    const clean = clean_buf[0..clean_len];
-    if (clean.len == 0) return;
-
-    const json = std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{clean}) catch return;
-    if (g_signer_kind == .helper) {
-        // The daemon signs the kind:0; the response seeds the cache.
-        requestHelperSign(fx, gpa, nowSeconds(), 0, &.{}, json);
-        model.name_buffer.clear();
+    var prev_created_at: i64 = 0;
+    var existing: ?[]u8 = null;
+    if (ownProfileJson(gpa)) |own| {
+        existing = own.json;
+        prev_created_at = own.created_at;
+    } else if (model.profile_stage != .absent) {
+        // It arrived as `have` and is gone now, or the round never finished.
+        // Either way there is nothing safe to merge into.
+        model.profile_stage = .fetching;
+        startOwnProfileFetch();
         return;
     }
-    const ev = nostr.event.create(gpa, signer, kp, nowSeconds(), 0, &.{}, json, null) catch {
-        gpa.free(json);
+    defer if (existing) |e| gpa.free(e);
+
+    const merged = mergeProfileJson(gpa, existing orelse "{}", model) orelse {
+        model.profile_stage = .failed;
         return;
     };
-    ingestAndPublish(gpa, ev, null);
+    // A replaceable event with a stamp that does not beat the one already stored
+    // is DROPPED, by this store and by every relay. A second edit inside one
+    // second, or a clock that was ahead when the last client wrote, would make
+    // the edit vanish while the app claimed success.
+    const created = @max(nowSeconds(), prev_created_at + 1);
+    signAndPublish(fx, gpa, created, 0, &.{}, merged, false);
+    // Seed the cache so the name changes here at once, the same beat the feed
+    // and the composer read it from.
+    if (activePubkey()) |pk| {
+        if (upsertProfile(pk)) |prof| parseMetadataInto(prof, merged);
+    }
+    model.profile_stage = .saved;
+}
+
+/// Parses `existing`, replaces the three keys this app models, and serialises the
+/// whole object back. Key order survives the round trip, so a profile this app
+/// did not change comes back byte-similar rather than reshuffled.
+fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
+    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
+    var obj = root.object;
+
+    // An emptied field REMOVES its key rather than writing "": a profile with
+    // `"about": ""` reads to other clients as a bio the reader deliberately
+    // blanked, which is a different statement from not having one.
+    setOrRemove(&obj, a, "display_name", trimmedField(model.profile_name())) catch return null;
+    setOrRemove(&obj, a, "about", trimmedField(model.profile_about())) catch return null;
+    setOrRemove(&obj, a, "picture", trimmedField(model.profile_picture())) catch return null;
+    // `name` is the handle, and the design's one name field edits the DISPLAY
+    // name. An account that has no `name` at all gets one, so clients that only
+    // read `name` have something to show; an account that has one keeps it.
+    if (stringField(obj, "name") == null) {
+        setOrRemove(&obj, a, "name", trimmedField(model.profile_name())) catch return null;
+    }
+
+    // Straight onto the caller's allocator: the write seam holds this for the
+    // life of the process, and the arena above dies with this function.
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
+}
+
+/// The merge, exposed so a test can prove what survives it. This is the whole
+/// safety argument of the Edit profile sheet in one function.
+pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
+    return mergeProfileJson(gpa, existing, model);
+}
+
+pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
+    return mergeNameJson(gpa, existing, name);
+}
+
+/// A field's text with the whitespace a reader leaves behind taken off.
+fn trimmedField(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r\n");
+}
+
+fn setOrRemove(obj: *std.json.ObjectMap, a: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    if (value.len == 0) {
+        _ = obj.orderedRemove(key);
+        return;
+    }
+    try obj.put(a, key, .{ .string = try a.dupe(u8, value) });
+}
+
+/// Asks every read relay for our own kind:0, once. Until this has finished, "the
+/// store has no profile for me" is not a fact about the account.
+fn startOwnProfileFetch() void {
+    if (g_own_profile_asking.swap(true, .acq_rel)) return;
+    const pk = activePubkey() orelse {
+        g_own_profile_asking.store(false, .release);
+        return;
+    };
+    const thread = std.Thread.spawn(.{}, ownProfileWorker, .{pk}) catch {
+        g_own_profile_asking.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn ownProfileWorker(pk: [32]u8) void {
+    defer {
+        // Asked, whatever came back. A relay that answered with nothing has
+        // answered: that is the difference between `fetching` and `absent`.
+        g_own_profile_asked.store(true, .release);
+        g_own_profile_asking.store(false, .release);
+    }
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const kinds = [_]u16{0};
+    const authors = [_][32]u8{pk};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .limit = 1 }};
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        defer relay.deinit();
+        relay.subscribe("plaza-me", &filters) catch continue;
+        var seen: usize = 0;
+        while (seen < 32) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const store = g_store orelse continue;
+                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                },
+                .eose => break,
+                else => continue,
+            }
+        }
+    }
+}
+
+/// Publishes the name beat's text as the account's kind:0 metadata, and seeds
+/// the local profile cache so the app shows the name at once.
+///
+/// The beat runs right after a key is created, when there is nothing to merge
+/// into, but it goes through the same merge as the Edit profile sheet anyway:
+/// the destructive shape is the one where a name is published as the WHOLE
+/// profile, and having exactly one path here means that shape cannot come back
+/// the next time somebody reaches for this function.
+fn publishName(model: *Model, fx: *Effects) void {
+    const raw = trimmedField(model.name_buffer.text());
+    if (raw.len == 0) return;
+    const gpa = std.heap.page_allocator;
+
+    var prev_created_at: i64 = 0;
+    var existing: ?[]u8 = null;
+    if (ownProfileJson(gpa)) |own| {
+        existing = own.json;
+        prev_created_at = own.created_at;
+    }
+    defer if (existing) |e| gpa.free(e);
+
+    // Quotes and backslashes are ESCAPED, not dropped: a name is prose, and the
+    // serializer knows how to carry prose. (Dropping them was a fixed 64-byte
+    // buffer away from a longer field overflowing it.)
+    const json = mergeNameJson(gpa, existing orelse "{}", raw) orelse return;
+    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, &.{}, json, false);
     // Seed the cache: the composer line and the feed show the name at once.
-    if (upsertProfile(kp.public_key)) |prof| parseMetadataInto(prof, json);
+    if (activePubkey()) |pk| {
+        if (upsertProfile(pk)) |prof| parseMetadataInto(prof, json);
+    }
     model.name_buffer.clear();
+}
+
+/// The name beat's one-field merge: the same read-modify-write as the sheet's,
+/// with only the name touched.
+fn mergeNameJson(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
+    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
+    var obj = root.object;
+    setOrRemove(&obj, a, "name", name) catch return null;
+    setOrRemove(&obj, a, "display_name", name) catch return null;
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
 }
 
 /// Completes the remembered first intent once an identity exists: the guest

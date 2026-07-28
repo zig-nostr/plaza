@@ -102,12 +102,22 @@ test "the settings screen shows the identity, key backup, and logout" {
     model.stage = .settings;
     const tree = try buildTree(arena, &model);
 
-    try testing.expect(findByText(tree.root, .text, "Settings") != null);
-    try testing.expect(findAnyText(tree.root, "Signed in as") != null);
-    // Default signer kind is a local key, so the key-backup card and its reveal
-    // control render.
-    try testing.expect(findAnyText(tree.root, "Local key") != null);
+    try testing.expect(findAnyText(tree.root, "Settings") != null);
+    // Every section the design names, in the order it names them.
+    try testing.expect(findAnyText(tree.root, "IDENTITY") != null);
+    try testing.expect(findAnyText(tree.root, "RELAYS") != null);
+    try testing.expect(findAnyText(tree.root, "APPEARANCE") != null);
+    try testing.expect(findAnyText(tree.root, "FEED") != null);
+    // The identity card says what signs, and offers the way into the profile.
+    try testing.expect(findAnyText(tree.root, "Signing with a local key") != null);
+    try testing.expect(findAnyText(tree.root, "Edit profile") != null);
+    try testing.expect(findAnyText(tree.root, "Copy npub") != null);
+    // The key-backup card has no home in the design and must not be dropped: a
+    // local key is the account, and this is the only way to take a copy of it.
     try testing.expect(findAnyText(tree.root, "Reveal secret key") != null);
+    // So is the media proxy, which is a privacy setting with no other UI.
+    try testing.expect(findAnyText(tree.root, "Media proxy") != null);
+    try testing.expect(findAnyText(tree.root, "Load media previews") != null);
     // The logout entry point is present; the confirmation is not yet.
     try testing.expect(findAnyText(tree.root, "Log out") != null);
     try testing.expect(findAnyText(tree.root, "Cancel") == null);
@@ -3701,4 +3711,114 @@ test "signing out leaves the account's relay list with the account" {
     try testing.expectEqual(@as(usize, 5), main.relayCount());
     try testing.expectEqualStrings("wss://relay.damus.io", main.relayUrlAt(0));
     try testing.expectEqual(@as(usize, 0), main.relaySuggestionCount());
+}
+
+test "editing a profile keeps every field this app does not model" {
+    // kind:0 is REPLACEABLE: what is published replaces the whole profile. Real
+    // profiles carry a lightning address, a banner, a website and whatever else
+    // their owner's other clients wrote. This app models three fields, so it
+    // edits three keys and leaves the rest exactly where they were. Getting this
+    // wrong silently stops somebody being paid.
+    const existing =
+        \\{"name":"alice","display_name":"Alice","about":"old bio","picture":"https://old.example.com/a.png",
+        \\"lud16":"alice@getalby.com","banner":"https://ex.com/b.png","website":"https://alice.example",
+        \\"nip05":"alice@example.com","pronouns":"she/her"}
+    ;
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice Liddell");
+    model.profile_about_buffer.set("new bio");
+    model.profile_picture_buffer.set("https://new.example.com/a.png");
+
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+
+    // What the reader edited.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice Liddell\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"about\":\"new bio\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"picture\":\"https://new.example.com/a.png\"") != null);
+    // What they did not, and what this app cannot even see.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"banner\":\"https://ex.com/b.png\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"website\":\"https://alice.example\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
+    // The handle is not the display name, and an account that already has one
+    // keeps it: renaming yourself must not rename your @handle out from under
+    // everyone who mentions you.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\":\"alice\"") != null);
+}
+
+test "an emptied profile field removes its key rather than blanking it" {
+    // `"about": ""` reads to other clients as a bio deliberately blanked, which
+    // is a different statement from not having one.
+    const existing = "{\"name\":\"alice\",\"about\":\"old bio\",\"lud16\":\"alice@getalby.com\"}";
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice");
+    model.profile_about_buffer.set("   ");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "about") == null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+}
+
+test "a profile with no handle gets one, and prose survives being prose" {
+    // An account with no `name` at all gets one, so clients that read only
+    // `name` have something to show. And a name with a quote in it is ESCAPED,
+    // not stripped: dropping characters was a fixed-size buffer away from an
+    // overflow, and it silently renamed people.
+    var model = main.initialModel();
+    model.profile_name_buffer.set("A \"quoted\" name \\ here");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, "{}", &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\\\"quoted\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\"") != null);
+}
+
+test "the name beat merges too, so it can never publish a name as the whole profile" {
+    // The beat runs when there is nothing to merge into, but it goes through the
+    // merge anyway: the destructive shape is a name published as the WHOLE
+    // profile, and one path means that shape cannot come back.
+    const existing = "{\"about\":\"kept\",\"lud16\":\"me@example.com\"}";
+    const merged = main.mergeNameJsonForTest(testing.allocator, existing, "Bob").?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\":\"Bob\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"about\":\"kept\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"me@example.com\"") != null);
+}
+
+test "a profile that will not parse does not become a blank profile" {
+    // Garbage in the store must not turn into an empty object with three fields
+    // written over it. It falls back to an object the edit is applied to, and
+    // the caller's stage machine is what decides whether to publish at all.
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice\"") != null);
+}
+
+test "the sheet refuses to save until it has read the profile it would replace" {
+    // "The store has no kind:0 for me" means either that this account has no
+    // profile or that nobody has answered yet, and those look identical. Saving
+    // under the second reading replaces a real profile with three fields.
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(findAnyTextIn(model.profile_status(), "Reading your current profile"));
+
+    // Only once every read relay has answered does "absent" become a fact.
+    model.profile_stage = .absent;
+    try testing.expect(model.profile_can_save());
+
+    model.profile_stage = .have;
+    try testing.expect(model.profile_can_save());
+    try testing.expectEqualStrings("", model.profile_status());
+
+    model.profile_stage = .saving;
+    try testing.expect(!model.profile_can_save());
+}
+
+fn findAnyTextIn(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, haystack, needle) != null;
 }

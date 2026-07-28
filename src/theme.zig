@@ -153,7 +153,17 @@ pub const palette = struct {
     // reads as a bordered, rounded panel, not an edgeless dark shape.
     pub const border_modal = hex("#43434f");
     pub const border_focus = hex("#4a4a56");
+    /// 11c's unselected radio ring. A hair off `border_focus` on purpose: a ring
+    /// that says "not chosen" and a ring that says "keyboard is here" must be
+    /// able to move apart without dragging each other.
+    pub const border_radio = hex("#4a4a54");
     pub const border_dashed = hex("#3a3a44");
+
+    /// The one solid light FILL in the app: a checked box, a selected radio's
+    /// ring and dot, the Add button's plate. Shares its value with
+    /// `text_body_strong` and is deliberately named apart from it, because a
+    /// text ramp and a control fill answer to different reasons to change.
+    pub const surface_control_solid = hex("#e9e9ec");
 
     // The chrome accent (the one working accent) and text on it.
     pub const accent = hex("#f2f2f4");
