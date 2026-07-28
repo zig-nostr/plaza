@@ -136,6 +136,10 @@ pub const palette = struct {
     /// 11g's depth-1 pill: the seat a quote-of-a-quote gets instead of a third
     /// nested body.
     pub const surface_pill = hex("#17171b");
+    /// The scrim a chip laid over a photograph sits on, dark enough to read
+    /// against anything under it, and the hairline around it.
+    pub const scrim_chip = canvas.Color.rgba8(10, 10, 11, 179);
+    pub const border_chip_alt = hex("#2c2c33");
     pub const border_pill = hex("#2c2c33");
     pub const border_menu = hex("#333338");
     pub const border_offline = hex("#3d3320");

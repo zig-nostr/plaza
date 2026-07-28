@@ -272,6 +272,16 @@ const quote_pill_height: f32 = 22;
 /// How wide the pill's one line may run before it elides, so a quoted note with
 /// a lot to say cannot push the pill across the row.
 const quote_pill_label_width: f32 = 190;
+/// A picture and the chips over it (11o): the corner inset, the chip's own
+/// height, and how much of each label may run before it elides. The alt chip is
+/// given room for a phrase, the dimensions chip for `4032x3024`.
+const picture_radius: f32 = 10;
+const picture_chip_inset: f32 = 8;
+const picture_chip_height: f32 = 18;
+const picture_dims_width: f32 = 58;
+/// The chips' own 10px mono register, a rung below the metadata mono.
+const mono_chip_scale: f32 = 10.0 / 14.5;
+const picture_alt_width: f32 = 180;
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
 /// children. MEASURED in the running layout rather than summed from those parts,
@@ -2265,6 +2275,15 @@ pub const Note = struct {
     // what lets the card reserve exactly the right space, so nothing shifts
     // when the image arrives (or is evicted and comes back).
     image_aspect: f32 = 0,
+    /// What the picture's own chrome says: its pixel dimensions, from the same
+    /// `imeta` tag the aspect comes from, and its alt text. Both are the note
+    /// author's claim about the file, which is the only thing available before
+    /// the bytes are, and the chips read at rest rather than on hover (the
+    /// design's hover-expand is not expressible).
+    image_w: u16 = 0,
+    image_h: u16 = 0,
+    image_alt_buf: [96]u8 = [_]u8{0} ** 96,
+    image_alt_len: u8 = 0,
     // The first `nostr:nevent`/`note` reference in the content, decoded once at
     // parse time: the quoted event id, and the byte span of its raw token in
     // `content_buf` so the body can split around it and render an embedded quote
@@ -2291,6 +2310,17 @@ pub const Note = struct {
     /// Whether this note carries an image to render.
     pub fn hasImage(self: *const Note) bool {
         return self.image_url_len > 0;
+    }
+    /// The author's description of the picture, empty when they gave none.
+    pub fn imageAlt(self: *const Note) []const u8 {
+        return self.image_alt_buf[0..self.image_alt_len];
+    }
+    /// The picture's declared size as the chip shows it, or empty when the note
+    /// does not say. Never guessed from the decoded bytes: the chip is the
+    /// author's claim, and the bytes may not have arrived.
+    pub fn imageDims(self: *const Note, arena: std.mem.Allocator) []const u8 {
+        if (self.image_w == 0 or self.image_h == 0) return "";
+        return std.fmt.allocPrint(arena, "{d}x{d}", .{ self.image_w, self.image_h }) catch "";
     }
     /// The note's image URL (empty when it has none).
     pub fn imageUrl(self: *const Note) []const u8 {
@@ -3785,7 +3815,13 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             @memcpy(note.image_url_buf[0..url.len], url);
             note.image_url_len = @intCast(url.len);
             image_url = note.imageUrl();
-            note.image_aspect = imetaAspect(ev.tags, url);
+            const meta = imetaFor(ev.tags, url);
+            note.image_aspect = meta.aspect();
+            note.image_w = meta.width;
+            note.image_h = meta.height;
+            const alt_len = @min(meta.alt.len, note.image_alt_buf.len);
+            @memcpy(note.image_alt_buf[0..alt_len], meta.alt[0..alt_len]);
+            note.image_alt_len = @intCast(alt_len);
         }
     }
 
@@ -4246,6 +4282,55 @@ fn findQuoteRef(note: *Note) void {
 /// `url`, or 0 when it says nothing. An `imeta` tag reads
 /// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
 /// written as floats, so both forms parse.
+/// What a note's NIP-92 `imeta` tag says about `url`: its pixel dimensions, its
+/// alt text and its blurhash. One walk, because the picture's chrome wants all
+/// three and the tag is one place.
+pub const Imeta = struct {
+    width: u16 = 0,
+    height: u16 = 0,
+    /// A slice of the EVENT's memory, so it lives as long as the event does. The
+    /// caller copies what it wants to keep.
+    alt: []const u8 = "",
+    blurhash: []const u8 = "",
+
+    /// Height over width, or 0 when the tag says nothing. Knowing the shape
+    /// before the bytes arrive is what lets a row reserve exactly the right
+    /// space, so nothing shifts when the picture lands.
+    pub fn aspect(self: Imeta) f32 {
+        if (self.width == 0 or self.height == 0) return 0;
+        return @as(f32, @floatFromInt(self.height)) / @as(f32, @floatFromInt(self.width));
+    }
+};
+
+pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
+    for (tags) |tag| {
+        if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
+        var matches_url = false;
+        var found: Imeta = .{};
+        for (tag[1..]) |field| {
+            if (std.mem.startsWith(u8, field, "url ")) {
+                matches_url = std.mem.eql(u8, std.mem.trim(u8, field[4..], " "), url);
+            } else if (std.mem.startsWith(u8, field, "dim ")) {
+                const dim = std.mem.trim(u8, field[4..], " ");
+                const x = std.mem.indexOfScalar(u8, dim, 'x') orelse continue;
+                // Written as floats by some clients, so parse wide and narrow.
+                const w = std.fmt.parseFloat(f32, dim[0..x]) catch continue;
+                const h = std.fmt.parseFloat(f32, dim[x + 1 ..]) catch continue;
+                if (w > 0 and h > 0 and w < 65536 and h < 65536) {
+                    found.width = @intFromFloat(w);
+                    found.height = @intFromFloat(h);
+                }
+            } else if (std.mem.startsWith(u8, field, "alt ")) {
+                found.alt = std.mem.trim(u8, field[4..], " ");
+            } else if (std.mem.startsWith(u8, field, "blurhash ")) {
+                found.blurhash = std.mem.trim(u8, field["blurhash ".len..], " ");
+            }
+        }
+        if (matches_url) return found;
+    }
+    return .{};
+}
+
 pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
     for (tags) |tag| {
         if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
@@ -7969,10 +8054,73 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
         .width = pictureWidth(note),
         .height = height,
         .padding = 0,
-        .style = .{ .quiet_hover = true },
+        .style = .{ .quiet_hover = true, .radius = picture_radius, .border = theme.palette.border_hairline, .stroke_width = 1 },
         .on_press = Msg{ .expand_image = note.id },
         .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
-    }, .{picture});
+    }, .{
+        // The picture, with what the note SAYS about it laid over the corners: the
+        // size in one chip and the author's description in the other. A stack
+        // layers them; each chip's own row alignment puts it in its corner, since
+        // there is no way to place a child at a point.
+        ui.stack(.{ .grow = 1 }, .{
+            picture,
+            pictureChips(ui, note),
+        }),
+    });
+}
+
+/// The two chips 11o lays over a picture: its declared size at the top right and
+/// its alt text at the bottom left. Both read at rest, because hover cannot
+/// restyle or reveal a child.
+fn pictureChips(ui: *AppUi, note: *const Note) AppUi.Node {
+    const dims = note.imageDims(ui.arena);
+    const alt = note.imageAlt();
+    if (dims.len == 0 and alt.len == 0) return ui.spacer(0);
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{
+        ui.row(.{ .grow = 1, .main = .end, .cross = .start, .gap = 0 }, .{
+            if (dims.len == 0) ui.spacer(0) else pictureChip(ui, dims, false),
+            hgap(ui, picture_chip_inset),
+        }),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, picture_chip_inset),
+            if (alt.len == 0) ui.spacer(0) else pictureChip(ui, ui.fmt("ALT · {s}", .{alt}), true),
+            ui.spacer(1),
+        }),
+        vgap(ui, picture_chip_inset),
+    });
+}
+
+/// One chip over a picture: mono, small, on a scrim dark enough to read against
+/// any photograph.
+fn pictureChip(ui: *AppUi, label: []const u8, emphatic: bool) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, picture_chip_inset),
+        ui.el(.panel, .{
+            .padding = 0.01,
+            .height = picture_chip_height,
+            .style = .{ .background = p.scrim_chip, .border = p.border_chip_alt, .radius = 5, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 7),
+                // A scaled span, because the 10px mono register has no size enum
+                // rung; `wrap = false` is what makes the single-line overflow
+                // policy apply to a paragraph.
+                ui.paragraph(.{
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .width = if (emphatic) picture_alt_width else picture_dims_width,
+                    .style = .{ .foreground = if (emphatic) p.text_secondary else p.text_muted_alt },
+                }, &.{.{
+                    .text = label,
+                    .monospace = true,
+                    .weight = if (emphatic) .medium else .regular,
+                    .scale = mono_chip_scale,
+                }}),
+                hgap(ui, 7),
+            }),
+        }),
+    });
 }
 
 /// How wide the drawn picture is: its own shape at the reserved height, never
