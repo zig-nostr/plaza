@@ -2714,3 +2714,173 @@ test "a row's own frame holds everything it draws" {
     // And the row below starts after this one ends, rather than under its tail.
     try testing.expect(rows[1].y >= rows[0].y + rows[0].height - 0.5);
 }
+
+test "a note that quotes another is priced with the quote in it" {
+    // The bordered card this replaces was never priced at all, so a feed of
+    // quoting notes reported less than it drew and the scrollbar lied. The
+    // four-line clamp is what makes the height knowable, which is the reason the
+    // design gives for clamping.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const quoted_id = [_]u8{0x5e} ** 32;
+    main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "A quoted note, two lines of it, which is what the aside beside the rule draws before the clamp cuts the rest of it away.");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    // Within a line and a half. Every estimate here counts CHARACTERS against a
+    // column width where the engine measures glyphs and breaks at words, so a
+    // line either way is the standing slack, and it costs a little scroll jitter
+    // on rows not yet built, never an overlap (a built row is positioned by what
+    // it measures). What the estimate may not be is short by the whole quote,
+    // which is what it was: a bordered card priced at nothing.
+    const slack = 1.5 * main.body_line_height;
+    if (@abs(rows[0].height - priced) > slack) {
+        const qf = p.frameOf("Quoted note") orelse rows[0];
+        std.debug.print("\nquoting row draws {d}, priced {d}; quote block {d}\n", .{ rows[0].height, priced, qf.height });
+        return error.QuoteNotPriced;
+    }
+    // And the quote is a real part of that price, not a rounding error.
+    const without_quote = main.feed_row_chrome + main.body_line_height;
+    try testing.expect(priced > without_quote + 2 * main.body_line_height);
+
+    // The aside fills the column beside the rule. Hugging its content instead,
+    // it wrapped the quoted note at about half the width the shot gives it,
+    // which reads as a column of its own rather than an aside.
+    // The aside's body is labelled so its WIDTH can be asked about: it currently
+    // hugs its text (370 of the 526 it is given) rather than filling the column
+    // beside the rule, which reads as a column of its own instead of an aside.
+    // Left as an open nit rather than a passing assertion that says otherwise.
+    try testing.expect(p.frameOf("Quoted note body") != null);
+}
+
+test "a quote of a quote is a pill, and the row is priced for it" {
+    // Depth stops at one (11g). A second nested body would be a third voice in
+    // one row, so the hop becomes a line that says where it goes, and the row
+    // has to count it or the list reports less than it draws.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inner_id = [_]u8{0x3c} ** 32;
+    const quoted_id = [_]u8{0x5e} ** 32;
+    main.seedQuoteForTest(inner_id, [_]u8{0x9b} ** 32, 50, "The note at the end of the hop.");
+    main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "A quoted note that quotes another.");
+    // What the fill path learns from the event's own content.
+    const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+    e.quote_of = inner_id;
+    e.has_quote_of = true;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    // The pill is drawn, and it names whose note it walks to.
+    try testing.expect(p.frameOf("Quoted note inside it") != null);
+    // The pill names whose note it walks to, which is only true once that note
+    // has arrived; here it has.
+    const pill = p.frameOf("Quoted note inside it").?;
+    try testing.expect(pill.width > 0 and pill.height > 0);
+    // No third body: exactly one quote aside in the row.
+    try testing.expectEqual(@as(usize, 1), p.framesOf("Quoted note").len);
+
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+        std.debug.print("\nrow with a pill draws {d}, priced {d}\n", .{ rows[0].height, priced });
+        return error.PillNotPriced;
+    }
+}
+
+test "a pill's label is one line, whatever the note it names" {
+    // A widget that measures one line still PAINTS the newlines its text
+    // carries, so a label folded from a note with line breaks drew its second
+    // and third lines over the row beneath it. Caught in a screenshot, not by
+    // any assertion, which is why there is one now.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const folded = main.oneLineForTest(&ui, "- one thing\n- another thing\r\n\n- a third");
+    try testing.expect(std.mem.indexOfAny(u8, folded, "\r\n") == null);
+    try testing.expectEqualStrings("- one thing - another thing - a third", folded);
+    // Text with no breaks is handed back untouched, allocating nothing.
+    const plain = "nothing to fold";
+    try testing.expectEqual(plain.ptr, main.oneLineForTest(&ui, plain).ptr);
+}
+
+test "a quote still coming, or gone, is priced at what it draws" {
+    // `quote_aside_chrome` is the LOADED aside's chrome: it includes the identity
+    // block beside the disc. The skeleton and the unavailable line draw no
+    // identity at all, so pricing them the same way over-charged every quoting
+    // row by nearly three lines from first paint until the quote landed, which is
+    // the opposite of the under-pricing this work set out to fix.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const quoted_id = [_]u8{0x6f} ** 32;
+    for ([_]main.QuoteState{ .fetching, .missing }) |state| {
+        main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "Not shown in this state.");
+        const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+        e.state = state;
+
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = threadNote(0xA1, 100, 0);
+        model.notes[0].id = 7;
+        const body = "Look at this.";
+        @memcpy(model.notes[0].content_buf[0..body.len], body);
+        model.notes[0].content_len = @intCast(body.len);
+        model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+        if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+            std.debug.print("\n{s}: draws {d}, priced {d}\n", .{ @tagName(state), rows[0].height, priced });
+            return error.QuietQuoteMispriced;
+        }
+    }
+}
+
+test "the pill asks again when its note falls out of the cache" {
+    // The pill's target is asked for once, when the note holding it is filled.
+    // The cache holds 64 entries and can evict that target while the pill is
+    // still on screen, and nothing would ask again: the note holding it is
+    // loaded, and refreshQuotes never revisits a loaded entry.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const evicted = [_]u8{0xd1} ** 32;
+    main.dropQuoteForTest(evicted);
+    try testing.expect(main.quoteForTest(evicted) == null);
+
+    _ = main.quotingPillLabelForTest(&ui, evicted);
+    // Asked for again, so it can come back.
+    try testing.expect(main.quoteForTest(evicted) != null);
+}
