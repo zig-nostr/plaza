@@ -3140,3 +3140,98 @@ test "the pressable box is the picture, not the space around it" {
     note.image_aspect = 0.5625;
     try testing.expectApproxEqAbs(main.picture_column_width_for_test, main.pictureWidth(&note), 0.5);
 }
+
+test "a note that no relay took is still owed" {
+    // The whole point of the queue: a note written on a train and lost on
+    // landing is the worst thing a client can do.
+    main.resetOutboxForTest();
+    const id = [_]u8{0xa7} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(id, 1000));
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+
+    // One relay takes it; the note is no longer owed, and the count says so.
+    main.recordOutboxAckForTest(id, 0, true);
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+
+    var entries: [16]main.OutboxEntry = undefined;
+    const n = main.outboxSnapshot(&entries);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 1), entries[0].ackCount());
+    try testing.expectEqual(main.OutboxState.sent, entries[0].state());
+
+    // A refusal is not an acknowledgement: the note is still owed.
+    const other = [_]u8{0xb8} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(other, 1001));
+    main.recordOutboxAckForTest(other, 1, false);
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+}
+
+test "the queue stops asking, and lets go of what landed" {
+    // It is a record of what is owed, not a retry engine: a note nobody will
+    // take stops asking rather than hammering strangers' servers forever, and a
+    // note that landed is forgotten once the reader has had a chance to see it.
+    main.resetOutboxForTest();
+    const stuck = [_]u8{0xc9} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(stuck, 1000));
+    for (0..main.max_outbox_rounds_for_test) |_| main.countOutboxRoundForTest(stuck);
+    main.sweepOutboxForTest(1000);
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+
+    const landed = [_]u8{0xda} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(landed, 2000));
+    main.recordOutboxAckForTest(landed, 0, true);
+    // Still shown a moment later, so the reader sees that it went.
+    main.sweepOutboxForTest(2001);
+    var entries: [16]main.OutboxEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), main.outboxSnapshot(&entries));
+    // And gone once it has been on screen long enough to read.
+    main.sweepOutboxForTest(2000 + main.outbox_sent_linger_for_test + 1);
+    try testing.expectEqual(@as(usize, 0), main.outboxSnapshot(&entries));
+}
+
+test "the outbox zone appears only when something is owed" {
+    // The zone is absent most of the time on purpose: one that is always there
+    // teaches nothing, and an empty popover under it would be worse.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    model.notes_len = 1;
+
+    const quiet = try painted.Painted.render(arena, &model);
+    try testing.expect(quiet.frameOf("Notes on their way") == null);
+
+    model.outbox_pending = 2;
+    const owed = try painted.Painted.render(arena, &model);
+    const zone = owed.frameOf("Notes on their way") orelse return error.NoZone;
+    try testing.expect(zone.width > 0);
+    // It says how many, in the shot's own words.
+    try testing.expectEqualStrings("posting 2 notes…", model.outbox_label(arena));
+    model.outbox_pending = 1;
+    try testing.expectEqualStrings("posting 1 note…", model.outbox_label(arena));
+}
+
+test "the offline banner says what still works" {
+    // 11p's banner. A spinner would say the opposite of the truth: the store is
+    // the app, so reading continues, and a note written now is kept.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes_len = 0;
+
+    // No relay is up in a test, so the banner is the state under test.
+    const p = try painted.Painted.render(arena, &model);
+    const banner = p.fillRectOf(theme.palette.surface_offline) orelse return error.NoBanner;
+    try testing.expect(banner.width > 100);
+    // And it names what is waiting, when something is.
+    model.outbox_pending = 3;
+    const text = main.offlineBannerTextForTest(arena, model.outbox_pending);
+    try testing.expect(std.mem.indexOf(u8, text, "3 notes are") != null);
+}
