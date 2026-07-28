@@ -2945,23 +2945,27 @@ test "a page's own words come out of its head" {
         "<meta property=\"og:description\" content=\"What it says about itself.\">" ++
         "</head><body>ignored</body></html>";
     const meta = main.parsePageMeta(og);
-    try testing.expectEqualStrings("The real title", meta.title);
+    try testing.expectEqualStrings("The real title", meta.heading());
     try testing.expectEqualStrings("What it says about itself.", meta.description);
 
     // No Open Graph: the title tag and the description meta stand in.
     const plain = "<html><head><title>Just a title</title><meta name='description' content='Plain words.'></head></html>";
     const fallback = main.parsePageMeta(plain);
-    try testing.expectEqualStrings("Just a title", fallback.title);
+    try testing.expectEqualStrings("Just a title", fallback.heading());
     try testing.expectEqualStrings("Plain words.", fallback.description);
 
     // Nothing to say, and nothing invented.
     const bare = main.parsePageMeta("<html><body>no head at all</body></html>");
-    try testing.expectEqual(@as(usize, 0), bare.title.len);
+    try testing.expectEqual(@as(usize, 0), bare.heading().len);
     try testing.expectEqual(@as(usize, 0), bare.description.len);
 
     // An attribute whose name merely ENDS with one we want is not that one.
     const tricky = "<meta data-og:title=\"nope\" property=\"og:title\" content=\"yes\">";
-    try testing.expectEqualStrings("yes", main.parsePageMeta(tricky).title);
+    try testing.expectEqualStrings("yes", main.parsePageMeta(tricky).heading());
+
+    // An empty Open Graph title is not an answer: the page's own title stands.
+    const empty_og = "<html><head><title>Real title</title><meta property='og:title' content=''></head></html>";
+    try testing.expectEqualStrings("Real title", main.parsePageMeta(empty_og).heading());
 }
 
 test "the domain a card shows is the host, without its www" {
@@ -3040,4 +3044,99 @@ test "a picture with a blurhash shows its colours before its bytes" {
         std.debug.print("\npainted {any}, not a blurhash cell\n", .{sample});
         return error.NotTheBlurhash;
     }
+}
+
+test "a link is only previewed when it is safe to ask" {
+    // This is the one place the app reaches out to an address a STRANGER chose,
+    // unattended, because a note scrolled into view. Every rejection here is a
+    // thing a note must not be able to make every reader's machine do.
+    try testing.expect(main.previewableUrl("https://example.com/post"));
+    try testing.expect(main.previewableUrl("https://news.ycombinator.com/item?id=1"));
+
+    // Plaintext puts the reader's IP and the exact URL on the wire.
+    try testing.expect(!main.previewableUrl("http://example.com/"));
+    // Userinfo becomes an authorization header on a host of the author's choice.
+    try testing.expect(!main.previewableUrl("https://admin:admin@example.com/"));
+    try testing.expect(!main.previewableUrl("https://wirth.ch@evil.tld/x"));
+    // The reader's own machine and their own network.
+    try testing.expect(!main.previewableUrl("https://127.0.0.1/x"));
+    try testing.expect(!main.previewableUrl("https://10.1.2.3/x"));
+    try testing.expect(!main.previewableUrl("https://192.168.1.1/admin"));
+    try testing.expect(!main.previewableUrl("https://172.16.0.1/"));
+    try testing.expect(!main.previewableUrl("https://169.254.169.254/latest/meta-data/"));
+    try testing.expect(!main.previewableUrl("https://100.64.0.1/"));
+    try testing.expect(!main.previewableUrl("https://[::1]/"));
+    // A service, not a site.
+    try testing.expect(!main.previewableUrl("https://example.com:8787/approve"));
+    // Names that are not public sites.
+    try testing.expect(!main.previewableUrl("https://localhost/"));
+    try testing.expect(!main.previewableUrl("https://printer.local/"));
+    try testing.expect(!main.previewableUrl("https://vault.internal/"));
+    // A public address that merely starts with a private-looking octet is fine.
+    try testing.expect(main.previewableUrl("https://172.32.0.1/"));
+}
+
+test "the domain on a card is the host, not what precedes an at sign" {
+    // The oldest phishing shape there is. A card showing `wirth.ch@evil.tld`
+    // would be lending its credibility to whoever wrote the note.
+    try testing.expectEqualStrings("evil.tld", main.urlDomain("https://wirth.ch@evil.tld/x"));
+    try testing.expectEqualStrings("evil.tld", main.urlDomain("https://a@b@evil.tld/x"));
+    // The port is not part of the name a reader recognises.
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://example.com:8443/x"));
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://www.example.com/a"));
+}
+
+test "a link card is priced at what it draws, with a description and without" {
+    // The card's height comes from its text column, not from its 30px tile:
+    // every line takes a full body line box whatever register it is set in. The
+    // constant is measured for the same reason the others are.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = "https://example.com/post";
+    for ([_][]const u8{ "What it says about itself.", "" }) |desc| {
+        main.seedLinkForTest(url, "The page's title", desc);
+
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = threadNote(0xA1, 100, 0);
+        model.notes[0].id = 7;
+        const body = "Read this.";
+        @memcpy(model.notes[0].content_buf[0..body.len], body);
+        model.notes[0].content_len = @intCast(body.len);
+        @memcpy(model.notes[0].link_url_buf[0..url.len], url);
+        model.notes[0].link_url_len = @intCast(url.len);
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        const card = p.frameOf("Open link") orelse return error.NoCard;
+        const priced = if (desc.len > 0) main.link_card_height_for_test else main.link_card_height_bare_for_test;
+        if (@abs(card.height - priced) > 0.5) {
+            std.debug.print("\ncard with desc={d} draws {d}, priced {d}\n", .{ desc.len, card.height, priced });
+            return error.CardMispriced;
+        }
+    }
+}
+
+test "the pressable box is the picture, not the space around it" {
+    // A portrait taller than the aspect cap is drawn contained at the reserved
+    // height. If the box stayed column-wide, the bare window either side of it
+    // would be inside the border and pressable, and pressing it would open the
+    // viewer for a picture the reader was not pointing at.
+    var note = threadNote(0xA1, 100, 0);
+    const url = "https://host.example/tall.jpg";
+    @memcpy(note.image_url_buf[0..url.len], url);
+    note.image_url_len = @intCast(url.len);
+    note.image_aspect = 2.0;
+
+    const height = main.pictureHeight(&note);
+    const width = main.pictureWidth(&note);
+    // Reserved at the cap, drawn at its own shape.
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * 1.25, height, 0.5);
+    try testing.expectApproxEqAbs(height / 2.0, width, 0.5);
+
+    // A landscape picture fills the column.
+    note.image_aspect = 0.5625;
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test, main.pictureWidth(&note), 0.5);
 }
