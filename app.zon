@@ -33,4 +33,17 @@
     },
     .web_engine = "system",
     .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    // Only the two with no in-canvas equivalent.
+    //
+    // Cmd+Enter and Escape are NOT declared, deliberately: a declared shortcut
+    // is swallowed by the shell's key monitor before the responder chain, so
+    // declaring them would take Cmd+Enter away from every multi-line field's
+    // own submit (the SDK's convention for a textarea, which the nsec, bunker,
+    // name and proxy fields all rely on) and Escape away from every surface's
+    // `on_dismiss`, which already knows the layer order. The composer gets both
+    // behaviours from the field and the sheet it is made of.
+    .shortcuts = .{
+        .{ .id = "new-note", .key = "n", .modifiers = .{"primary"} },
+        .{ .id = "settings", .key = ",", .modifiers = .{"primary"} },
+    },
 }

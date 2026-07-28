@@ -288,6 +288,11 @@ const picture_column_width: f32 = feed_column_width - row_pad_side * 2 - avatar_
 pub const picture_column_width_for_test: f32 = picture_column_width;
 const picture_max_aspect: f32 = 1.25;
 const picture_default_aspect: f32 = 0.66;
+/// The composer sheet (11l): its width, the header band, and how tall the editor
+/// stands before it scrolls (about eight lines of its own register).
+const compose_sheet_width: f32 = 560;
+const compose_header_height: f32 = 38;
+const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
 /// that refuses the whole view when it is crossed.
@@ -5160,6 +5165,8 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// Replaces the `@word` being typed with a real reference to this key.
+    insert_mention: [32]u8,
     /// Close whatever chrome menu is open (Escape, or a press outside it).
     close_menu,
     /// Stop talking to the relays until resumed, or start again.
@@ -5460,6 +5467,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// On demand from the titlebar's "New note", so the feed is not sharing the
 /// window with a permanent composer. Escape or a click outside closes it.
 fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     return ui.el(.dialog, .{
         .grow = 1,
         .padding = 16,
@@ -5468,25 +5476,246 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "New note" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.el(.card, .{ .width = 520, .style = .{ .background = theme.palette.surface_modal, .border = theme.palette.border_modal, .radius = 14, .stroke_width = 1 } }, .{
-                ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
-                    ui.el(.textarea, .{
-                        .text = model.draft(),
-                        .placeholder = "What's on your mind?",
-                        .on_input = AppUi.inputMsg(.draft_edit),
-                        .on_submit = .post,
-                        .height = 140,
-                    }, .{}),
-                    ui.row(.{ .cross = .center, .gap = 8 }, .{
-                        ui.text(.{ .size = .sm, .style = .{ .foreground = theme.palette.text_muted } }, model.identity(ui.arena)),
-                        ui.spacer(1),
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
-                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+            ui.el(.card, .{
+                .width = compose_sheet_width,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
+            }, .{
+                ui.column(.{ .gap = 0 }, .{
+                    // The header band: a title and nothing else, so the sheet
+                    // says what it is before the eye reaches the field.
+                    ui.row(.{ .height = compose_header_height, .cross = .center, .main = .center, .gap = 0 }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_primary } },
+                            &.{.{ .text = "New note", .weight = .medium, .scale = menu_scale }},
+                        ),
                     }),
+                    ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+                    // The writer and their words, side by side: the disc says
+                    // whose voice this is, which is the one thing a composer
+                    // must not leave ambiguous when a signer can be swapped.
+                    ui.row(.{ .gap = 0, .cross = .start }, .{
+                        hgap(ui, 18),
+                        ui.column(.{ .gap = 0 }, .{
+                            vgap(ui, 16),
+                            meAvatar(ui, avatar_size),
+                        }),
+                        hgap(ui, 12),
+                        ui.column(.{ .grow = 1, .gap = 0 }, .{
+                            vgap(ui, 16),
+                            ui.el(.textarea, .{
+                                .text = model.draft(),
+                                .placeholder = "What's on your mind?",
+                                .on_input = AppUi.inputMsg(.draft_edit),
+                                .on_submit = .post,
+                                .height = compose_editor_height,
+                                .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
+                            }, .{}),
+                            // Under the field, because the caret cannot be
+                            // located and a picker that floats elsewhere is a
+                            // guess about where the reader is looking.
+                            mentionPicker(ui, model),
+                            vgap(ui, 14),
+                        }),
+                        hgap(ui, 18),
+                    }),
+                    ui.separator(.{ .style = .{ .foreground = p.divider_row, .background = p.divider_row } }),
+                    // What pressing Post will do, in the terms that matter: how
+                    // far the note goes, and that nothing here will truncate it.
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        hgap(ui, 18),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_dim } },
+                            &.{.{ .text = composeReach(ui), .monospace = true, .scale = mono_meta_scale }},
+                        ),
+                        ui.spacer(1),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = "Cmd + Enter", .monospace = true, .scale = mono_hint_scale }},
+                        ),
+                        hgap(ui, 10),
+                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+                        hgap(ui, 4),
+                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+                        hgap(ui, 18),
+                    }),
+                    vgap(ui, 12),
                 }),
             }),
         }),
     });
+}
+
+/// Replaces the `@word` being typed with a real `nostr:npub…` reference.
+///
+/// A plain `@name` is a string; only the reference is a link that another
+/// client can resolve to a person, and it is what the note's own renderer turns
+/// back into a name when it is read. The picker exists to make that the easy
+/// path rather than the knowledgeable one.
+fn insertMention(model: *Model, pubkey: [32]u8) void {
+    const text = model.draft();
+    // Through the same reader the picker used, so the cut is the run being
+    // typed and never, say, the domain of an address written earlier.
+    const query = mentionQuery(text) orelse return;
+    const at = text.len - query.len - 1;
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const npub = nostr.nip19.encodeNpub(fba.allocator(), pubkey) catch return;
+    // Sized to what the draft can actually hold, so an insert that will not fit
+    // is REFUSED rather than written short: the buffer truncates in silence,
+    // and half a bech32 reference is one no client can resolve, published
+    // without a word of warning.
+    var buf: [compose_capacity]u8 = undefined;
+    const written = std.fmt.bufPrint(&buf, "{s}nostr:{s} ", .{ text[0..at], npub }) catch return;
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(written);
+    g_draft_dirty = true;
+}
+
+pub fn insertMentionForTest(model: *Model, pubkey: [32]u8) void {
+    insertMention(model, pubkey);
+}
+
+/// One candidate for a mention, and why it is where it is in the list.
+const MentionCandidate = struct {
+    pubkey: [32]u8,
+    name: []const u8,
+    handle: []const u8,
+    verified: bool,
+    /// Lower sorts first. The design's ranking is follows, then follows-you,
+    /// then everyone the app has seen; the middle tier needs the follows' own
+    /// contact lists, which a later milestone builds, so it is empty here and
+    /// the code is shaped to take it.
+    tier: u8,
+};
+
+const mention_tier_follows: u8 = 0;
+const mention_tier_follows_you: u8 = 1;
+const mention_tier_seen: u8 = 2;
+/// How many names the picker offers at once. A list longer than this is a
+/// search, which is a different surface.
+const mention_rows_max = 6;
+
+/// The word being typed after an `@`, or null when the caret is not in one.
+/// Only ever the LAST such run in the draft, because that is the one being
+/// written: an `@name` earlier in the note is already said.
+pub fn mentionQuery(text: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, text, '@') orelse return null;
+    // An `@` mid-word is an email or a handle already written, not a mention
+    // being composed.
+    if (at > 0) {
+        const before = text[at - 1];
+        if (!std.ascii.isWhitespace(before)) return null;
+    }
+    const word = text[at + 1 ..];
+    // A space ends it: the reader has moved on and is no longer picking.
+    for (word) |c| {
+        if (std.ascii.isWhitespace(c)) return null;
+    }
+    return word;
+}
+
+/// The names to offer for `query`, best first. Matches on the display name and
+/// on the handle, because a reader types whichever they remember.
+fn mentionCandidates(ui: *AppUi, query: []const u8) []const MentionCandidate {
+    const out = ui.arena.alloc(MentionCandidate, mention_rows_max) catch return &.{};
+    var n: usize = 0;
+    for (&g_profiles) |*pr| {
+        if (!pr.used or n == out.len) continue;
+        const name = pr.name();
+        const user = pr.username();
+        if (name.len == 0 and user.len == 0) continue;
+        if (query.len > 0 and !startsWithFold(name, query) and !startsWithFold(user, query)) continue;
+        out[n] = .{
+            .pubkey = pr.pubkey,
+            .name = if (name.len > 0) name else user,
+            .handle = user,
+            .verified = pr.nip05_state == .verified,
+            // Everyone in the pack is someone the reader follows; anyone else
+            // is someone the app has merely seen.
+            .tier = if (inFollowGraph(pr.pubkey)) mention_tier_follows else mention_tier_seen,
+        };
+        n += 1;
+    }
+    std.mem.sort(MentionCandidate, out[0..n], {}, struct {
+        fn lt(_: void, a: MentionCandidate, b: MentionCandidate) bool {
+            if (a.tier != b.tier) return a.tier < b.tier;
+            return a.name.len < b.name.len;
+        }
+    }.lt);
+    return out[0..n];
+}
+
+/// Case-insensitive prefix match, which is how a reader types a name.
+fn startsWithFold(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+/// The picker: the names the reader might mean, under the field they are typing
+/// in. Anchored to the field rather than the caret, which cannot be located
+/// (0.5), so it hangs under the whole editor.
+fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const query = mentionQuery(model.draft()) orelse return ui.spacer(0);
+    const names = mentionCandidates(ui, query);
+    if (names.len == 0) return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, names.len + 1) catch return ui.spacer(0);
+    for (names, rows[0..names.len], 0..) |c, *row, i| {
+        const tint = avatarTint(c.pubkey);
+        const hexdigits = "0123456789abcdef";
+        row.* = ui.el(.list_item, .{
+            .padding = 0.01,
+            .cross = .center,
+            .on_press = Msg{ .insert_mention = c.pubkey },
+            .style = .{ .radius = 6, .background = if (i == 0) p.surface_menu_selected else null },
+            .semantics = .{ .role = .button, .label = c.name, .focusable = true },
+        }, .{
+            hgap(ui, 8),
+            ui.avatar(.{
+                .image = 0,
+                .width = 24,
+                .height = 24,
+                .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+            }, ui.fmt("{c}{c}", .{ hexdigits[c.pubkey[0] >> 4], hexdigits[c.pubkey[0] & 0x0f] })),
+            hgap(ui, 9),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = c.name, .weight = .medium, .scale = menu_scale }}),
+            if (c.verified) hgap(ui, 5) else ui.spacer(0),
+            if (c.verified)
+                ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.status_success } }, "check-circle")
+            else
+                ui.spacer(0),
+            hgap(ui, 6),
+            if (c.handle.len > 0)
+                ui.paragraph(.{ .style = .{ .foreground = p.accent_identity } }, &.{.{ .text = ui.fmt("@{s}", .{c.handle}), .scale = mono_row_scale }})
+            else
+                ui.spacer(0),
+            ui.spacer(1),
+            hgap(ui, 8),
+        });
+    }
+    // What pressing one does, said once at the foot rather than per row.
+    rows[names.len] = ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 2),
+        ui.separator(.{ .style = .{ .foreground = p.border_menu, .background = p.border_menu } }),
+        vgap(ui, 5),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = "inserts a nostr: link, not just a name", .monospace = true, .scale = mono_chip_scale }},
+            ),
+        }),
+        vgap(ui, 3),
+    });
+    return menuSurfacePlaced(ui, 320, .below, .start, rows);
+}
+
+/// How far a note will go, said before it goes rather than after: the relays
+/// that will take a write, and that Plaza imposes no length of its own.
+fn composeReach(ui: *AppUi) []const u8 {
+    const live = liveRelayCount();
+    if (live == 0) return "no relay is answering · it will wait in the outbox";
+    return ui.fmt("posts to {d} {s} · no length limit", .{ live, if (live == 1) "relay" else "relays" });
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes
@@ -9210,6 +9439,18 @@ pub fn pictureWidth(note: *const Note) f32 {
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
+
+/// The keyboard, as the shell delivers it: a shortcut declared in the manifest
+/// arrives here by id and becomes an ordinary message, so a key does exactly
+/// what the control it stands for does, and never a second implementation of it.
+///
+/// What each one means depends on what is open, and that is decided in `update`
+/// where the model is, not here: this only names the intent.
+fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, "new-note")) return .open_compose;
+    if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    return null;
+}
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
 pub const EffectsForTest = Effects;
@@ -9218,6 +9459,11 @@ pub const EffectsForTest = Effects;
 /// arm the repeating timers.
 pub fn boot(model: *Model, fx: *Effects) void {
     model.refresh(nowSeconds());
+    // What was written but not sent when the app last closed, back in the
+    // composer where it was left.
+    var draft_buf: [note_content_cap]u8 = undefined;
+    const stashed = loadDraft(&draft_buf);
+    if (stashed.len > 0) model.draft_buffer = @TypeOf(model.draft_buffer).init(stashed);
     // What was owed when the app last closed. Read before the first frame, so a
     // note written offline yesterday is visible as owed rather than lost, and
     // offered again as soon as a relay answers.
@@ -9269,6 +9515,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // flight is skipped.
                 if (liveRelayCount() > 0) drainOutbox(std.heap.page_allocator);
                 sweepOutbox(now);
+                // At most one write a second, and only when something changed.
+                if (g_draft_dirty) {
+                    g_draft_dirty = false;
+                    saveDraft(model.draft());
+                }
                 const counts = outboxCounts();
                 model.outbox_pending = counts.trying;
                 model.outbox_stuck = counts.stuck;
@@ -9329,11 +9580,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
+            // Marked, not written: the tick flushes it. Saving on CLOSE alone
+            // was the wrong half, because the state a writer is in when the
+            // machine sleeps or the app is killed is the sheet OPEN.
+            g_draft_dirty = true;
             // The user is composing again: retire a stale "signer didn't respond".
             g_remote_sign_notice.store(false, .release);
         },
         .post => {
+            // Every precondition, before anything is signed or said. A message
+            // is reachable from more places than the button that names it: the
+            // field's own submit chord, a future menu entry, a key. Publishing
+            // is not something to do on a model that was not showing a
+            // composer, and a draft restored from disk must never leave the
+            // machine without the reader seeing it in one.
+            if (!model.composing or model.stage != .ready or model.is_guest()) return;
+            if (model.draft_empty()) return;
             submitPost(model, fx);
+            // The slot is emptied the moment its contents go to a signer.
+            // Leaving it would restore an already-published note into the next
+            // launch's composer, one keystroke from being posted twice.
+            saveDraft("");
             // Posting closes the sheet; the note is already local and will
             // appear on the next tick.
             model.composing = false;
@@ -9351,7 +9618,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
-        .close_compose => model.composing = false,
+        .insert_mention => |pubkey| insertMention(model, pubkey),
+        .close_compose => {
+            model.composing = false;
+            // Closing the sheet stashes what is in it. The words survived a
+            // closed sheet already; this is what carries them past a quit.
+            saveDraft(model.draft());
+        },
         .open_join => model.joining = true,
         .close_join => {
             model.joining = false;
@@ -10971,6 +11244,7 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .view = appView,
+        .on_command = onCommand,
         // No canvas-registered fonts: the typography tokens sit on the
         // BUILT-IN ids (the SDK's default sans IS Geist), which is the only
         // routing that gives span weights real medium/bold faces; a
@@ -11337,6 +11611,49 @@ fn saveSettings() void {
     }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
 }
 
+/// Where an unsent draft waits between launches. One slot, because the composer
+/// is one sheet: a list of drafts is a different feature and the plan says so.
+const draft_file = "draft";
+/// Set by an edit, cleared by the tick that writes it: a keystroke must not
+/// carry a file write, and a file write must not wait for the sheet to close.
+var g_draft_dirty = false;
+
+/// Keeps what was written but not sent. The composer already survives being
+/// closed within a session; this is what makes it survive the app quitting,
+/// which is the case that actually loses words: a machine that sleeps, an
+/// update, a crash.
+///
+/// Written with the same restrictive permissions as the rest of ~/.plaza,
+/// because an unsent note is as private as a sent one and rather more likely
+/// to be unfinished thinking.
+fn saveDraft(text: []const u8) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    if (text.len == 0) {
+        // Nothing to keep: the slot is removed rather than left holding a stale
+        // draft that would reappear over the next empty composer.
+        dir.deleteFile(io, draft_file) catch {};
+        return;
+    }
+    dir.writeFile(io, .{
+        .sub_path = draft_file,
+        .data = text,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+/// Reads the stashed draft back, or an empty slice when there is none.
+fn loadDraft(out: []u8) []const u8 {
+    const io = g_io orelse return "";
+    const environ = g_environ orelse return "";
+    var dir = plazaDir(io, environ) catch return "";
+    defer dir.close(io);
+    const n = dir.readFile(io, draft_file, out) catch return "";
+    return out[0..n.len];
+}
+
 /// Logs out: deletes the session (and, for a local key, the key file itself),
 /// resets the identity globals, and returns to onboarding. The feed store and
 /// its ingest threads keep running (they serve the starter pack regardless of
@@ -11385,6 +11702,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
+    // And off the disk. An unfinished note is the previous account's private
+    // thinking; leaving it would hand it to whoever signs in next, in their
+    // composer, one keystroke from being published under THEIR key.
+    saveDraft("");
     model.logout_pending = false;
     model.reveal_nsec = false;
     model.notes_len = 0;
