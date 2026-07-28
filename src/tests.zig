@@ -2982,3 +2982,62 @@ test "the link a card previews is the first plain one" {
     // A note with nothing but its picture has no link to preview.
     try testing.expect(main.firstLinkUrl("here " ++ image, image) == null);
 }
+
+test "a blurhash decodes to the picture's own colours" {
+    // The reference hash from the format's own README, which encodes a warm
+    // photograph. Decoding is what lets a picture that has not arrived show its
+    // palette instead of a grey box.
+    const blur = main.decodeBlurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj");
+    try testing.expect(blur.ok);
+    // Every cell is opaque and inside the gamut.
+    for (blur.cells) |c| {
+        try testing.expect(c.a > 0.99);
+        try testing.expect(c.r >= 0 and c.r <= 1);
+    }
+    // The corners differ: a hash that decoded to one flat colour would be a
+    // decoder that dropped its AC components.
+    const first = blur.cells[0];
+    const last = blur.cells[blur.cells.len - 1];
+    try testing.expect(@abs(first.r - last.r) + @abs(first.g - last.g) + @abs(first.b - last.b) > 0.02);
+
+    // Rubbish in, nothing out: a malformed hash draws stripes, never a guess.
+    try testing.expect(!main.decodeBlurhash("").ok);
+    try testing.expect(!main.decodeBlurhash("not a hash").ok);
+    try testing.expect(!main.decodeBlurhash("LEHV6nWB2yk8pyo0adR*.7kCMdn").ok);
+}
+
+test "a picture with a blurhash shows its colours before its bytes" {
+    // The placeholder is flat cells, not an image: all sixteen image slots are
+    // spent on faces and photographs, and a placeholder must never evict the
+    // thing it stands in for.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const url = "https://host.example/a.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = @intCast(url.len);
+    model.notes[0].image_aspect = 0.5;
+    const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
+    @memcpy(model.notes[0].image_blur_buf[0..hash.len], hash);
+    model.notes[0].image_blur_len = @intCast(hash.len);
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const box = p.frameOf("Attached image, press to enlarge") orelse return error.NoBox;
+    // The box paints a colour from the hash, not the striped fallback.
+    const blur = main.decodeBlurhash(hash);
+    const sample = p.fillAt(box.x + box.width / 2, box.y + box.height / 2) orelse return error.NothingPainted;
+    var matched = false;
+    for (blur.cells) |c| {
+        if (@abs(c.r - sample.r) < 0.01 and @abs(c.g - sample.g) < 0.01 and @abs(c.b - sample.b) < 0.01) matched = true;
+    }
+    if (!matched) {
+        std.debug.print("\npainted {any}, not a blurhash cell\n", .{sample});
+        return error.NotTheBlurhash;
+    }
+}

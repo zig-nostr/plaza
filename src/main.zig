@@ -2623,6 +2623,10 @@ pub const Note = struct {
     image_w: u16 = 0,
     image_h: u16 = 0,
     image_bytes: u32 = 0,
+    /// The picture's blurhash, when the note carries one: its colour before its
+    /// bytes. Fixed buffer, because the tag's memory is the event's.
+    image_blur_buf: [40]u8 = [_]u8{0} ** 40,
+    image_blur_len: u8 = 0,
     /// The first plain link in the note, previewed as a card under the body. One
     /// per note, which is what 11o draws; the URL stays in the text as well.
     link_url_buf: [300]u8 = [_]u8{0} ** 300,
@@ -2653,6 +2657,10 @@ pub const Note = struct {
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
+    }
+    /// The picture's blurhash, empty when the note carries none.
+    pub fn imageBlurhash(self: *const Note) []const u8 {
+        return self.image_blur_buf[0..self.image_blur_len];
     }
     /// The link this note previews, empty when it has none.
     pub fn linkUrl(self: *const Note) []const u8 {
@@ -4181,6 +4189,9 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             note.image_w = meta.width;
             note.image_h = meta.height;
             note.image_bytes = meta.size;
+            const blur_len = @min(meta.blurhash.len, note.image_blur_buf.len);
+            @memcpy(note.image_blur_buf[0..blur_len], meta.blurhash[0..blur_len]);
+            note.image_blur_len = @intCast(blur_len);
             note.image_has_alt = meta.alt.len > 0;
         }
     }
@@ -8499,7 +8510,7 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
         // The same box the picture will fill, striped: reserved space, not an
         // empty frame, and not a skeleton either, which reads as a row of text
         // still loading rather than as a photograph.
-        return pictureBox(ui, note, height, pictureStripes(ui, height));
+        return pictureBox(ui, note, height, pictureBlur(ui, note, height));
     }
     var picture = ui.image(.{ .image = image_id, .grow = 1 });
     // `ui.image` leaves the fit at `stretch`, which distorts the picture into
@@ -8564,6 +8575,144 @@ fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
         }),
         ui.spacer(1),
     });
+}
+
+/// A decoded blurhash: the low-frequency colour of a picture, which is all a
+/// blurhash carries. Drawn as a grid of flat cells rather than an image, because
+/// every one of the runtime's sixteen image slots is already spent on faces and
+/// photographs, and a placeholder must not evict the thing it is standing in for.
+pub const Blur = struct {
+    /// Row-major, `cells_x * cells_y` colours.
+    cells: [blur_cells_x * blur_cells_y]canvas.Color = undefined,
+    ok: bool = false,
+};
+
+const blur_cells_x = 8;
+const blur_cells_y = 6;
+
+/// blurhash's own alphabet.
+fn base83(c: u8) ?f32 {
+    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~";
+    const i = std.mem.indexOfScalar(u8, alphabet, c) orelse return null;
+    return @floatFromInt(i);
+}
+
+fn base83Value(hash: []const u8, from: usize, len: usize) ?f32 {
+    if (from + len > hash.len) return null;
+    var value: f32 = 0;
+    for (hash[from .. from + len]) |c| {
+        const digit = base83(c) orelse return null;
+        value = value * 83 + digit;
+    }
+    return value;
+}
+
+/// sRGB companding, the two halves of it the format needs.
+fn srgbToLinear(v: f32) f32 {
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(v: f32) f32 {
+    const c = std.math.clamp(v, 0, 1);
+    return if (c <= 0.0031308) c * 12.92 else 1.055 * std.math.pow(f32, c, 1.0 / 2.4) - 0.055;
+}
+
+/// Decodes a blurhash into a small grid of colours. The format is a handful of
+/// cosine components; sampling them at each cell's centre is the same sum the
+/// reference decoder runs per pixel, at the resolution the eye gets from a
+/// placeholder anyway.
+pub fn decodeBlurhash(hash: []const u8) Blur {
+    var out: Blur = .{};
+    if (hash.len < 6) return out;
+    const size_flag = base83Value(hash, 0, 1) orelse return out;
+    const comp_x: usize = @intFromFloat(@mod(size_flag, 9) + 1);
+    const comp_y: usize = @intFromFloat(@floor(size_flag / 9) + 1);
+    if (hash.len != 4 + 2 * comp_x * comp_y) return out;
+
+    const quant_max = base83Value(hash, 1, 1) orelse return out;
+    const max_ac = (quant_max + 1) / 166.0;
+
+    // The DC term is the average colour, straight sRGB bytes.
+    const dc = base83Value(hash, 2, 4) orelse return out;
+    const dc_int: u32 = @intFromFloat(dc);
+    var colours: [9 * 9][3]f32 = undefined;
+    colours[0] = .{
+        srgbToLinear(@as(f32, @floatFromInt((dc_int >> 16) & 255)) / 255.0),
+        srgbToLinear(@as(f32, @floatFromInt((dc_int >> 8) & 255)) / 255.0),
+        srgbToLinear(@as(f32, @floatFromInt(dc_int & 255)) / 255.0),
+    };
+
+    var i: usize = 1;
+    while (i < comp_x * comp_y) : (i += 1) {
+        const ac = base83Value(hash, 4 + i * 2, 2) orelse return out;
+        const ac_int: u32 = @intFromFloat(ac);
+        colours[i] = .{
+            signPow((@as(f32, @floatFromInt(ac_int / (19 * 19))) - 9) / 9, 2.0) * max_ac,
+            signPow((@as(f32, @floatFromInt((ac_int / 19) % 19)) - 9) / 9, 2.0) * max_ac,
+            signPow((@as(f32, @floatFromInt(ac_int % 19)) - 9) / 9, 2.0) * max_ac,
+        };
+    }
+
+    for (0..blur_cells_y) |cy| {
+        for (0..blur_cells_x) |cx| {
+            // The centre of the cell, in the 0..1 the basis is defined over.
+            const x = (@as(f32, @floatFromInt(cx)) + 0.5) / @as(f32, @floatFromInt(blur_cells_x));
+            const y = (@as(f32, @floatFromInt(cy)) + 0.5) / @as(f32, @floatFromInt(blur_cells_y));
+            var r: f32 = 0;
+            var g: f32 = 0;
+            var b: f32 = 0;
+            for (0..comp_y) |j| {
+                for (0..comp_x) |k| {
+                    const basis = @cos(std.math.pi * x * @as(f32, @floatFromInt(k))) *
+                        @cos(std.math.pi * y * @as(f32, @floatFromInt(j)));
+                    const c = colours[j * comp_x + k];
+                    r += c[0] * basis;
+                    g += c[1] * basis;
+                    b += c[2] * basis;
+                }
+            }
+            out.cells[cy * blur_cells_x + cx] = canvas.Color.rgba8(
+                @intFromFloat(linearToSrgb(r) * 255 + 0.5),
+                @intFromFloat(linearToSrgb(g) * 255 + 0.5),
+                @intFromFloat(linearToSrgb(b) * 255 + 0.5),
+                255,
+            );
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+fn signPow(value: f32, exp: f32) f32 {
+    const magnitude = std.math.pow(f32, @abs(value), exp);
+    return if (value < 0) -magnitude else magnitude;
+}
+
+/// What a picture that has not arrived looks like: its own colours when the note
+/// carries a blurhash, stripes when it does not.
+fn pictureBlur(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
+    const hash = note.imageBlurhash();
+    if (hash.len == 0) return pictureStripes(ui, height);
+    const blur = decodeBlurhash(hash);
+    if (!blur.ok) return pictureStripes(ui, height);
+
+    // Flat cells, not an image: the runtime has sixteen image slots and they are
+    // all spent on faces and photographs, so a placeholder must not evict the
+    // thing it stands in for. A blurhash carries only low frequencies anyway,
+    // which is what a grid of them shows.
+    const rows = ui.arena.alloc(AppUi.Node, blur_cells_y) catch return pictureStripes(ui, height);
+    for (rows, 0..) |*row, y| {
+        const cells = ui.arena.alloc(AppUi.Node, blur_cells_x) catch return pictureStripes(ui, height);
+        for (cells, 0..) |*cell, x| {
+            cell.* = ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = blur.cells[y * blur_cells_x + x], .radius = 0, .stroke_width = 0 },
+            }, .{});
+        }
+        row.* = ui.row(.{ .grow = 1, .gap = 0 }, .{cells});
+    }
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{rows});
 }
 
 /// The fill under a picture that has not arrived. The shot draws 45 degree
