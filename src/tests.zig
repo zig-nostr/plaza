@@ -2933,3 +2933,52 @@ test "with previews off a picture is one chip, and asking for it loads that one"
     const box_priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
     try testing.expect(box_priced > chip_priced + 100);
 }
+
+test "a page's own words come out of its head" {
+    // Open Graph first, then the plain fallbacks, which is the order every other
+    // reader uses. The parser is deliberately small: the body arrives capped at
+    // 256 KiB, which is where the head lives, and what it cannot make sense of
+    // leaves the card without that line rather than guessing.
+    const og =
+        "<html><head><title>Fallback</title>" ++
+        "<meta property=\"og:title\" content=\"The real title\">" ++
+        "<meta property=\"og:description\" content=\"What it says about itself.\">" ++
+        "</head><body>ignored</body></html>";
+    const meta = main.parsePageMeta(og);
+    try testing.expectEqualStrings("The real title", meta.title);
+    try testing.expectEqualStrings("What it says about itself.", meta.description);
+
+    // No Open Graph: the title tag and the description meta stand in.
+    const plain = "<html><head><title>Just a title</title><meta name='description' content='Plain words.'></head></html>";
+    const fallback = main.parsePageMeta(plain);
+    try testing.expectEqualStrings("Just a title", fallback.title);
+    try testing.expectEqualStrings("Plain words.", fallback.description);
+
+    // Nothing to say, and nothing invented.
+    const bare = main.parsePageMeta("<html><body>no head at all</body></html>");
+    try testing.expectEqual(@as(usize, 0), bare.title.len);
+    try testing.expectEqual(@as(usize, 0), bare.description.len);
+
+    // An attribute whose name merely ENDS with one we want is not that one.
+    const tricky = "<meta data-og:title=\"nope\" property=\"og:title\" content=\"yes\">";
+    try testing.expectEqualStrings("yes", main.parsePageMeta(tricky).title);
+}
+
+test "the domain a card shows is the host, without its www" {
+    try testing.expectEqualStrings("example.com", main.urlDomain("https://www.example.com/a/b?c=d"));
+    try testing.expectEqualStrings("news.ycombinator.com", main.urlDomain("https://news.ycombinator.com/item?id=1"));
+    try testing.expectEqualStrings("example.com", main.urlDomain("http://example.com"));
+}
+
+test "the link a card previews is the first plain one" {
+    // The picture's own URL is not a link to preview, and neither is any other
+    // image: those are drawn, not summarised.
+    const image = "https://host.example/a.jpg";
+    const content = "look " ++ image ++ " and read https://example.com/post, then " ++ "https://other.example/b.png";
+    const link = main.firstLinkUrl(content, image) orelse return error.NoLink;
+    // The trailing comma is punctuation, not part of the address.
+    try testing.expectEqualStrings("https://example.com/post", link);
+
+    // A note with nothing but its picture has no link to preview.
+    try testing.expect(main.firstLinkUrl("here " ++ image, image) == null);
+}

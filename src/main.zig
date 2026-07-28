@@ -142,6 +142,7 @@ const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
 // NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
 const nip05_fetch_key_base: u64 = 3000;
+const link_fetch_key_base: u64 = 4000;
 const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It must be
@@ -296,6 +297,8 @@ const picture_default_aspect: f32 = 0.66;
 const picture_stripe_cap: usize = 24;
 /// The off-state chip's own height.
 const picture_ask_height: f32 = 24;
+/// A link card: two 10px pads around a 30px tile, which is what sets its height.
+const link_card_height: f32 = 10 + 30 + 10;
 const picture_alt_width: f32 = 180;
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
@@ -1535,6 +1538,315 @@ const QuoteEntry = struct {
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
 var g_quote_clock: u64 = 0;
 
+/// A link preview: what a page says about itself, for the card 11o draws under a
+/// note that links out. Small and fixed, like every other cache here.
+const link_title_cap = 96;
+const link_desc_cap = 140;
+const link_domain_cap = 48;
+const link_cache_cap = 32;
+/// How many previews may be in flight at once. The SDK has 16 effect slots for
+/// everything the app does, so previews take a small, fixed share and wait their
+/// turn rather than starving avatars and pictures.
+const max_link_fetches = 2;
+const max_link_attempts = 2;
+
+const LinkPreview = struct {
+    used: bool = false,
+    /// The URL as written in the note, which is both the key and what a press
+    /// opens.
+    url_buf: [300]u8 = [_]u8{0} ** 300,
+    url_len: u16 = 0,
+    state: enum { idle, fetching, loaded, missing } = .idle,
+    attempts: u8 = 0,
+    requested: bool = false,
+    title_buf: [link_title_cap]u8 = [_]u8{0} ** link_title_cap,
+    title_len: u8 = 0,
+    desc_buf: [link_desc_cap]u8 = [_]u8{0} ** link_desc_cap,
+    desc_len: u8 = 0,
+    domain_buf: [link_domain_cap]u8 = [_]u8{0} ** link_domain_cap,
+    domain_len: u8 = 0,
+    last_used: u64 = 0,
+
+    pub fn url(self: *const LinkPreview) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+    pub fn title(self: *const LinkPreview) []const u8 {
+        return self.title_buf[0..self.title_len];
+    }
+    pub fn description(self: *const LinkPreview) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+    pub fn domain(self: *const LinkPreview) []const u8 {
+        return self.domain_buf[0..self.domain_len];
+    }
+};
+var g_links = [_]LinkPreview{.{}} ** link_cache_cap;
+var g_link_clock: u64 = 0;
+
+/// The host of a URL, without its `www.`: what the card shows above the title,
+/// and what a reader actually checks before pressing.
+pub fn urlDomain(url: []const u8) []const u8 {
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    var host = rest[0..end];
+    if (std.mem.startsWith(u8, host, "www.")) host = host["www.".len..];
+    return host;
+}
+
+/// The first plain link in a note's content: the one the card previews. An image
+/// URL is not one (it is drawn as the picture), and neither is anything inside a
+/// `nostr:` token.
+pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (!std.mem.startsWith(u8, content[i..], "https://") and !std.mem.startsWith(u8, content[i..], "http://")) continue;
+        if (i > 0 and !std.ascii.isWhitespace(content[i - 1])) continue;
+        var j = i;
+        while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+        // A trailing sentence mark is punctuation, not part of the address.
+        var end = j;
+        while (end > i and (content[end - 1] == '.' or content[end - 1] == ',' or content[end - 1] == ')')) end -= 1;
+        const candidate = content[i..end];
+        if (candidate.len > 300) {
+            i = j;
+            continue;
+        }
+        if (image_url.len > 0 and std.mem.eql(u8, candidate, image_url)) {
+            i = j;
+            continue;
+        }
+        if (looksLikeImageUrl(candidate)) {
+            i = j;
+            continue;
+        }
+        return candidate;
+    }
+    return null;
+}
+
+/// The cache entry for `url`, claimed if it is not already there. Evicts the
+/// least recently drawn entry that is not mid-fetch, like the other caches.
+fn wantLink(url: []const u8) ?*LinkPreview {
+    if (url.len == 0 or url.len > 300) return null;
+    for (&g_links) |*l| {
+        if (l.used and std.mem.eql(u8, l.url(), url)) return l;
+    }
+    var victim: ?*LinkPreview = null;
+    for (&g_links) |*l| {
+        if (!l.used) {
+            victim = l;
+            break;
+        }
+        if (l.state == .fetching) continue;
+        if (victim == null or l.last_used < victim.?.last_used) victim = l;
+    }
+    const slot = victim orelse return null;
+    slot.* = .{ .used = true };
+    @memcpy(slot.url_buf[0..url.len], url);
+    slot.url_len = @intCast(url.len);
+    const host = urlDomain(url);
+    const host_len = @min(host.len, slot.domain_buf.len);
+    @memcpy(slot.domain_buf[0..host_len], host[0..host_len]);
+    slot.domain_len = @intCast(host_len);
+    return slot;
+}
+
+fn linkFor(url: []const u8) ?*LinkPreview {
+    for (&g_links) |*l| {
+        if (l.used and std.mem.eql(u8, l.url(), url)) return l;
+    }
+    return null;
+}
+
+/// Asks for the pages the reader can actually see. Gated by the previews
+/// setting, like pictures: with it off, no page learns it was linked to.
+fn scanLinkFetches(fx: *Effects, model: *const Model) void {
+    if (!g_media_previews) return;
+    g_link_clock += 1;
+    var fired: usize = 0;
+    if (model.viewing_thread != 0) {
+        fireLink(fx, &model.thread_root, &fired);
+        for (model.thread_notes[0..model.thread_notes_len]) |*note| fireLink(fx, note, &fired);
+        return;
+    }
+    const range = model.visibleRange();
+    var i = range.first;
+    while (i <= range.last and i < model.notes_len) : (i += 1) fireLink(fx, &model.notes[i], &fired);
+}
+
+fn fireLink(fx: *Effects, note: *const Note, fired: *usize) void {
+    if (!note.hasLink()) return;
+    const slot = wantLink(note.linkUrl()) orelse return;
+    slot.last_used = g_link_clock;
+    if (slot.state != .idle) return;
+    if (slot.attempts >= max_link_attempts) {
+        slot.state = .missing;
+        return;
+    }
+    if (loadCachedLink(slot)) return;
+    if (fired.* >= max_link_fetches) return;
+    fired.* += 1;
+    slot.state = .fetching;
+    slot.attempts += 1;
+    const index = (@intFromPtr(slot) - @intFromPtr(&g_links[0])) / @sizeOf(LinkPreview);
+    fx.fetch(.{
+        .key = link_fetch_key_base + index,
+        .url = slot.url(),
+        .on_response = Effects.responseMsg(.link_fetched),
+    });
+}
+
+/// Files what a page said about itself. The body is TRUNCATED at 256 KiB by the
+/// runtime and that is fine here, unlike an image: `og:` tags live in the head,
+/// so a cut tail costs nothing. Every other handler in this app rejects a
+/// truncated body, correctly, because half a picture is garbage.
+fn handleLinkFetched(response: native_sdk.EffectResponse) void {
+    const index = response.key - link_fetch_key_base;
+    if (index >= g_links.len) return;
+    const slot = &g_links[index];
+    if (!slot.used or slot.state != .fetching) return;
+    if (response.outcome == .rejected) {
+        // Every effect slot was busy. Not a failure of the page: try again.
+        slot.state = .idle;
+        slot.attempts -|= 1;
+        return;
+    }
+    if (response.outcome != .ok or response.status < 200 or response.status >= 300) {
+        slot.state = if (slot.attempts >= max_link_attempts) .missing else .idle;
+        return;
+    }
+    const meta = parsePageMeta(response.body);
+    storeLinkMeta(slot, meta);
+    slot.state = if (slot.title_len == 0) .missing else .loaded;
+    if (slot.state == .loaded) cacheLink(slot);
+}
+
+/// Copies what the page said into the entry's own buffers: the response body is
+/// recycled the moment this returns.
+fn storeLinkMeta(slot: *LinkPreview, meta: PageMeta) void {
+    const title = std.mem.trim(u8, meta.title, " \t\r\n");
+    const desc = std.mem.trim(u8, meta.description, " \t\r\n");
+    const t = @min(utf8SafeLen(title, slot.title_buf.len), slot.title_buf.len);
+    @memcpy(slot.title_buf[0..t], title[0..t]);
+    slot.title_len = @intCast(t);
+    const d = @min(utf8SafeLen(desc, slot.desc_buf.len), slot.desc_buf.len);
+    @memcpy(slot.desc_buf[0..d], desc[0..d]);
+    slot.desc_len = @intCast(d);
+}
+
+/// `$HOME/.plaza/links/<sha256 of the url>`, holding the three lines the card
+/// draws. A preview is worth keeping: the page rarely changes, and a feed
+/// re-read from disk should not re-ask the whole web what it said.
+fn linkCacheDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
+    const home = environ.get("HOME") orelse ".";
+    var dir_buf: [512]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza/links", .{home});
+    return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+}
+
+fn loadCachedLink(slot: *LinkPreview) bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+    var dir = linkCacheDir(io, environ) catch return false;
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, slot.url());
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(1024)) catch return false;
+    defer gpa.free(raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    const title = lines.next() orelse return false;
+    const desc = lines.next() orelse "";
+    if (title.len == 0) return false;
+    storeLinkMeta(slot, .{ .title = title, .description = desc });
+    slot.state = .loaded;
+    return true;
+}
+
+fn cacheLink(slot: *const LinkPreview) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = linkCacheDir(io, environ) catch return;
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, slot.url());
+    var buf: [link_title_cap + link_desc_cap + 4]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "{s}\n{s}\n", .{ slot.title(), slot.description() }) catch return;
+    dir.writeFile(io, .{ .sub_path = name, .data = data }) catch return;
+}
+
+/// What a page says about itself, read out of its head. Open Graph first, then
+/// the plain HTML fallbacks, which is the order every other reader uses.
+pub const PageMeta = struct {
+    title: []const u8 = "",
+    description: []const u8 = "",
+};
+
+/// Pulls `og:title`/`og:description` (falling back to `<title>` and
+/// `meta name="description"`) out of `html`.
+///
+/// A deliberately small parser: it walks tags, and inside a `meta` tag it reads
+/// the attributes it knows. It does NOT try to be an HTML parser, because it does
+/// not have to be: the body arrives capped at 256 KiB, which is where the head
+/// lives, and anything it cannot make sense of simply leaves the card without
+/// that line rather than guessing.
+pub fn parsePageMeta(html: []const u8) PageMeta {
+    var out: PageMeta = .{};
+    var i: usize = 0;
+    while (i < html.len) : (i += 1) {
+        if (html[i] != '<') continue;
+        const rest = html[i + 1 ..];
+        if (std.ascii.startsWithIgnoreCase(rest, "title>")) {
+            const start = i + 1 + "title>".len;
+            const end = std.mem.indexOfPos(u8, html, start, "<") orelse html.len;
+            if (out.title.len == 0) out.title = std.mem.trim(u8, html[start..end], " \t\r\n");
+            i = end;
+            continue;
+        }
+        if (!std.ascii.startsWithIgnoreCase(rest, "meta")) continue;
+        const tag_end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+        const tag = html[i..tag_end];
+        const key = metaAttr(tag, "property") orelse metaAttr(tag, "name") orelse {
+            i = tag_end;
+            continue;
+        };
+        const content = metaAttr(tag, "content") orelse {
+            i = tag_end;
+            continue;
+        };
+        if (std.ascii.eqlIgnoreCase(key, "og:title")) {
+            out.title = content;
+        } else if (std.ascii.eqlIgnoreCase(key, "og:description")) {
+            out.description = content;
+        } else if (std.ascii.eqlIgnoreCase(key, "description") and out.description.len == 0) {
+            out.description = content;
+        }
+        i = tag_end;
+    }
+    return out;
+}
+
+/// One attribute's value out of a tag, single or double quoted.
+fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(tag, i, name)) |at| {
+        i = at + name.len;
+        // A whole attribute name, not a suffix of another one.
+        if (at > 0 and (std.ascii.isAlphanumeric(tag[at - 1]) or tag[at - 1] == '-' or tag[at - 1] == ':')) continue;
+        var j = i;
+        while (j < tag.len and (tag[j] == ' ' or tag[j] == '=')) j += 1;
+        if (j >= tag.len) return null;
+        const quote = tag[j];
+        if (quote != '"' and quote != '\'') continue;
+        j += 1;
+        const end = std.mem.indexOfScalarPos(u8, tag, j, quote) orelse return null;
+        return tag[j..end];
+    }
+    return null;
+}
+
 /// Records that a quoted event `id` needs resolving, deduping and (when full)
 /// evicting the least-recently-drawn entry that is not mid-fetch.
 fn wantQuote(id: [32]u8) void {
@@ -2311,6 +2623,10 @@ pub const Note = struct {
     image_w: u16 = 0,
     image_h: u16 = 0,
     image_bytes: u32 = 0,
+    /// The first plain link in the note, previewed as a card under the body. One
+    /// per note, which is what 11o draws; the URL stays in the text as well.
+    link_url_buf: [300]u8 = [_]u8{0} ** 300,
+    link_url_len: u16 = 0,
     /// Whether the note described its picture. The chip is the marker the shot
     /// draws, one word: the description itself would need a hover expand, which
     /// is not expressible.
@@ -2337,6 +2653,13 @@ pub const Note = struct {
 
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
+    }
+    /// The link this note previews, empty when it has none.
+    pub fn linkUrl(self: *const Note) []const u8 {
+        return self.link_url_buf[0..self.link_url_len];
+    }
+    pub fn hasLink(self: *const Note) bool {
+        return self.link_url_len > 0;
     }
     /// Whether this note carries an image to render.
     pub fn hasImage(self: *const Note) bool {
@@ -3866,6 +4189,15 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
     note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
 
+    // The first plain link, for the preview card. Read from the ORIGINAL content:
+    // the rendered copy has mentions rewritten and may be capped.
+    if (firstLinkUrl(ev.content, image_url)) |link| {
+        if (link.len <= note.link_url_buf.len) {
+            @memcpy(note.link_url_buf[0..link.len], link);
+            note.link_url_len = @intCast(link.len);
+        }
+    }
+
     // The first quoted event (nevent/note), decoded once into a byte span the
     // body splits on, and queued for resolving.
     findQuoteRef(&note);
@@ -4404,6 +4736,18 @@ pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
     return 0;
 }
 
+/// Whether a URL names an image file. By extension, which is what Nostr media
+/// hosts serve; a link without one is an ordinary link.
+pub fn looksLikeImageUrl(url: []const u8) bool {
+    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+    const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+    const path = url[0..path_end];
+    for (exts) |ext| {
+        if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
+    }
+    return false;
+}
+
 /// The first image URL in `content`, or null. Recognised by extension, which is
 /// what Nostr media hosts serve; a link without one stays ordinary text.
 pub fn firstImageUrl(content: []const u8) ?[]const u8 {
@@ -4695,6 +5039,8 @@ pub const Msg = union(enum) {
     media_fetched: native_sdk.EffectResponse,
     /// A NIP-05 well-known lookup finished: mark the author verified on a match.
     nip05_verified: native_sdk.EffectResponse,
+    /// A page that was asked what it says about itself.
+    link_fetched: native_sdk.EffectResponse,
     /// A text edit in the Settings media-proxy field.
     proxy_edit: canvas.TextInputEvent,
     /// Save the media-proxy setting.
@@ -4734,7 +5080,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -5058,6 +5404,12 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
+    // A link card, once the page has answered; nothing before that.
+    if (note.hasLink()) {
+        if (linkFor(note.linkUrl())) |l| {
+            if (l.state == .loaded) extent += link_card_height + 3;
+        }
+    }
     // A picture nobody asked for is one quiet chip, not a reserved box.
     if (note.hasImage()) {
         const shown = g_media_previews or isMediaAsked(note.id) or note.media_id() != 0;
@@ -5639,6 +5991,7 @@ fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
                 focalBody(ui, note),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
             }),
@@ -5998,6 +6351,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 noteBody(ui, note, true),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, note),
             }),
@@ -8012,6 +8366,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         // shifts as images arrive.
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                         if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                         vgap(ui, 10),
                         engagementRow(ui, note),
                     }),
@@ -8230,6 +8585,80 @@ fn pictureStripes(ui: *AppUi, height: f32) AppUi.Node {
     return ui.column(.{ .grow = 1, .gap = 0 }, .{bands});
 }
 
+/// 11o's link preview: what the page on the other end says it is. One per note,
+/// under the body, and the URL stays in the text as well, because the card is a
+/// courtesy and the address is the fact.
+///
+/// The tile is a letter, never a favicon: a favicon would want one of the
+/// sixteen image slots the whole runtime has, and those belong to faces and
+/// photographs.
+fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const url = note.linkUrl();
+    const entry = linkFor(url);
+    // Nothing to show until the page has answered. No skeleton: a card that
+    // might never come is worse than a link that reads as a link.
+    if (entry == null or entry.?.state != .loaded) return ui.spacer(0);
+    const link = entry.?;
+    const initial = std.ascii.toUpper(if (link.domain().len > 0) link.domain()[0] else '?');
+
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 3),
+        ui.el(.list_item, .{
+            .width = picture_column_width,
+            .padding = 0.01,
+            // The URL slice lives in the note, which lives in the model, and the
+            // opener copies it before it runs.
+            .on_press = Msg{ .open_url = url },
+            .style = .{ .background = p.surface_link_card, .border = p.border_chip_alt, .radius = 10, .stroke_width = 1 },
+            .semantics = .{ .role = .link, .label = "Open link", .focusable = true },
+        }, .{
+            hgap(ui, 12),
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.el(.panel, .{
+                    .width = 30,
+                    .height = 30,
+                    .padding = 0.01,
+                    .style = .{ .background = p.surface_link_tile, .radius = 7, .stroke_width = 0 },
+                }, .{
+                    ui.column(.{ .width = 30, .height = 30, .main = .center, .cross = .center }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = ui.fmt("{c}", .{initial}), .monospace = true, .weight = .medium, .scale = meta_scale }},
+                        ),
+                    }),
+                }),
+            }),
+            hgap(ui, 10),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = link.domain(), .monospace = true, .scale = mono_chip_scale }},
+                ),
+                vgap(ui, 2),
+                ui.text(.{
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .grow = 1,
+                    .size = .sm,
+                    .style = .{ .foreground = p.text_link_title },
+                }, link.title()),
+                if (link.description().len == 0) ui.spacer(0) else vgap(ui, 2),
+                if (link.description().len == 0) ui.spacer(0) else ui.paragraph(.{
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .grow = 1,
+                    .style = .{ .foreground = p.text_muted },
+                }, &.{.{ .text = link.description(), .scale = mono_row_scale }}),
+                vgap(ui, 10),
+            }),
+            hgap(ui, 12),
+        }),
+    });
+}
+
 /// The two chips 11o lays over a picture: its declared size at the top right and
 /// its alt text at the bottom left. Both read at rest, because hover cannot
 /// restyle or reveal a child.
@@ -8312,6 +8741,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
+    scanLinkFetches(fx, model);
     scanNip05Fetches(fx);
     fx.startTimer(.{
         .key = refresh_timer_key,
@@ -8351,6 +8781,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                scanLinkFetches(fx, model);
+                scanLinkFetches(fx, model);
+                scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
@@ -8576,11 +9009,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
+        .link_fetched => |response| handleLinkFetched(response),
         .open_url => |url| openExternally(fx, url),
         .expand_image => |note_id| model.expanded_note = note_id,
         .load_image => |note_id| {
             askForMedia(note_id);
             scanMediaFetches(fx, model);
+            scanLinkFetches(fx, model);
+            scanLinkFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
         .like => |note_id| toggleLike(model, fx, note_id),
@@ -8598,6 +9034,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             assignAvatarSlots(fx, model);
             scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
+            scanLinkFetches(fx, model);
+            scanLinkFetches(fx, model);
         },
         .load_older => {
             // One more page from the store, up to what the feed can hold.
