@@ -5165,6 +5165,8 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// Replaces the `@word` being typed with a real reference to this key.
+    insert_mention: [32]u8,
     /// Close whatever chrome menu is open (Escape, or a press outside it).
     close_menu,
     /// Stop talking to the relays until resumed, or start again.
@@ -5509,6 +5511,10 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                                 .height = compose_editor_height,
                                 .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
                             }, .{}),
+                            // Under the field, because the caret cannot be
+                            // located and a picker that floats elsewhere is a
+                            // guess about where the reader is looking.
+                            mentionPicker(ui, model),
                             vgap(ui, 14),
                         }),
                         hgap(ui, 18),
@@ -5538,6 +5544,158 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
         }),
     });
+}
+
+/// Replaces the `@word` being typed with a real `nostr:npub…` reference.
+///
+/// A plain `@name` is a string; only the reference is a link that another
+/// client can resolve to a person, and it is what the note's own renderer turns
+/// back into a name when it is read. The picker exists to make that the easy
+/// path rather than the knowledgeable one.
+fn insertMention(model: *Model, pubkey: [32]u8) void {
+    const text = model.draft();
+    const at = std.mem.lastIndexOfScalar(u8, text, '@') orelse return;
+    var buf: [note_content_cap]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const npub = nostr.nip19.encodeNpub(fba.allocator(), pubkey) catch return;
+    const written = std.fmt.bufPrint(&buf, "{s}nostr:{s} ", .{ text[0..at], npub }) catch return;
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(written);
+}
+
+/// One candidate for a mention, and why it is where it is in the list.
+const MentionCandidate = struct {
+    pubkey: [32]u8,
+    name: []const u8,
+    handle: []const u8,
+    verified: bool,
+    /// Lower sorts first. The design's ranking is follows, then follows-you,
+    /// then everyone the app has seen; the middle tier needs the follows' own
+    /// contact lists, which a later milestone builds, so it is empty here and
+    /// the code is shaped to take it.
+    tier: u8,
+};
+
+const mention_tier_follows: u8 = 0;
+const mention_tier_follows_you: u8 = 1;
+const mention_tier_seen: u8 = 2;
+/// How many names the picker offers at once. A list longer than this is a
+/// search, which is a different surface.
+const mention_rows_max = 6;
+
+/// The word being typed after an `@`, or null when the caret is not in one.
+/// Only ever the LAST such run in the draft, because that is the one being
+/// written: an `@name` earlier in the note is already said.
+pub fn mentionQuery(text: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, text, '@') orelse return null;
+    // An `@` mid-word is an email or a handle already written, not a mention
+    // being composed.
+    if (at > 0) {
+        const before = text[at - 1];
+        if (!std.ascii.isWhitespace(before)) return null;
+    }
+    const word = text[at + 1 ..];
+    // A space ends it: the reader has moved on and is no longer picking.
+    for (word) |c| {
+        if (std.ascii.isWhitespace(c)) return null;
+    }
+    return word;
+}
+
+/// The names to offer for `query`, best first. Matches on the display name and
+/// on the handle, because a reader types whichever they remember.
+fn mentionCandidates(ui: *AppUi, query: []const u8) []const MentionCandidate {
+    const out = ui.arena.alloc(MentionCandidate, mention_rows_max) catch return &.{};
+    var n: usize = 0;
+    for (&g_profiles) |*pr| {
+        if (!pr.used or n == out.len) continue;
+        const name = pr.name();
+        const user = pr.username();
+        if (name.len == 0 and user.len == 0) continue;
+        if (query.len > 0 and !startsWithFold(name, query) and !startsWithFold(user, query)) continue;
+        out[n] = .{
+            .pubkey = pr.pubkey,
+            .name = if (name.len > 0) name else user,
+            .handle = user,
+            .verified = pr.nip05_state == .verified,
+            // Everyone in the pack is someone the reader follows; anyone else
+            // is someone the app has merely seen.
+            .tier = if (inFollowGraph(pr.pubkey)) mention_tier_follows else mention_tier_seen,
+        };
+        n += 1;
+    }
+    std.mem.sort(MentionCandidate, out[0..n], {}, struct {
+        fn lt(_: void, a: MentionCandidate, b: MentionCandidate) bool {
+            if (a.tier != b.tier) return a.tier < b.tier;
+            return a.name.len < b.name.len;
+        }
+    }.lt);
+    return out[0..n];
+}
+
+/// Case-insensitive prefix match, which is how a reader types a name.
+fn startsWithFold(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+/// The picker: the names the reader might mean, under the field they are typing
+/// in. Anchored to the field rather than the caret, which cannot be located
+/// (0.5), so it hangs under the whole editor.
+fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const query = mentionQuery(model.draft()) orelse return ui.spacer(0);
+    const names = mentionCandidates(ui, query);
+    if (names.len == 0) return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, names.len + 1) catch return ui.spacer(0);
+    for (names, rows[0..names.len], 0..) |c, *row, i| {
+        const tint = avatarTint(c.pubkey);
+        const hexdigits = "0123456789abcdef";
+        row.* = ui.el(.list_item, .{
+            .padding = 0.01,
+            .cross = .center,
+            .on_press = Msg{ .insert_mention = c.pubkey },
+            .style = .{ .radius = 6, .background = if (i == 0) p.surface_menu_selected else null },
+            .semantics = .{ .role = .button, .label = c.name, .focusable = true },
+        }, .{
+            hgap(ui, 8),
+            ui.avatar(.{
+                .image = 0,
+                .width = 24,
+                .height = 24,
+                .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+            }, ui.fmt("{c}{c}", .{ hexdigits[c.pubkey[0] >> 4], hexdigits[c.pubkey[0] & 0x0f] })),
+            hgap(ui, 9),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = c.name, .weight = .medium, .scale = menu_scale }}),
+            if (c.verified) hgap(ui, 5) else ui.spacer(0),
+            if (c.verified)
+                ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.status_success } }, "check-circle")
+            else
+                ui.spacer(0),
+            hgap(ui, 6),
+            if (c.handle.len > 0)
+                ui.paragraph(.{ .style = .{ .foreground = p.accent_identity } }, &.{.{ .text = ui.fmt("@{s}", .{c.handle}), .scale = mono_row_scale }})
+            else
+                ui.spacer(0),
+            ui.spacer(1),
+            hgap(ui, 8),
+        });
+    }
+    // What pressing one does, said once at the foot rather than per row.
+    rows[names.len] = ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 2),
+        ui.separator(.{ .style = .{ .foreground = p.border_menu, .background = p.border_menu } }),
+        vgap(ui, 5),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = "inserts a nostr: link, not just a name", .monospace = true, .scale = mono_chip_scale }},
+            ),
+        }),
+        vgap(ui, 3),
+    });
+    return menuSurfacePlaced(ui, 320, .below, .start, rows);
 }
 
 /// How far a note will go, said before it goes rather than after: the relays
@@ -9415,6 +9573,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
+        .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
             model.composing = false;
             // Closing the sheet stashes what is in it. The words survived a

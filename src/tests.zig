@@ -3273,3 +3273,17 @@ test "a stuck note is offered again, but not every second" {
     try testing.expect(main.outboxRetryDelayForTest(3) > main.outboxRetryDelayForTest(2));
     try testing.expect(main.outboxRetryDelayForTest(5) >= 300);
 }
+
+test "the picker knows when a mention is being typed" {
+    // The last `@word` is the one being written; an `@name` earlier in the note
+    // is already said, and an `@` inside a word is an address, not a mention.
+    try testing.expectEqualStrings("wir", main.mentionQuery("hello @wir").?);
+    try testing.expectEqualStrings("", main.mentionQuery("hello @").?);
+    // Finished: a space means the reader has moved on.
+    try testing.expect(main.mentionQuery("hello @wirth and then") == null);
+    // Mid-word, so not a mention being composed.
+    try testing.expect(main.mentionQuery("mail me at me@example.com") == null);
+    try testing.expect(main.mentionQuery("nothing here") == null);
+    // The LAST run wins, not the first.
+    try testing.expectEqualStrings("ed", main.mentionQuery("@wirth said @ed").?);
+}
