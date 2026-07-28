@@ -288,6 +288,11 @@ const picture_column_width: f32 = feed_column_width - row_pad_side * 2 - avatar_
 pub const picture_column_width_for_test: f32 = picture_column_width;
 const picture_max_aspect: f32 = 1.25;
 const picture_default_aspect: f32 = 0.66;
+/// The composer sheet (11l): its width, the header band, and how tall the editor
+/// stands before it scrolls (about eight lines of its own register).
+const compose_sheet_width: f32 = 560;
+const compose_header_height: f32 = 38;
+const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
 /// that refuses the whole view when it is crossed.
@@ -5460,6 +5465,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// On demand from the titlebar's "New note", so the feed is not sharing the
 /// window with a permanent composer. Escape or a click outside closes it.
 fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     return ui.el(.dialog, .{
         .grow = 1,
         .padding = 16,
@@ -5468,25 +5474,78 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "New note" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.el(.card, .{ .width = 520, .style = .{ .background = theme.palette.surface_modal, .border = theme.palette.border_modal, .radius = 14, .stroke_width = 1 } }, .{
-                ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
-                    ui.el(.textarea, .{
-                        .text = model.draft(),
-                        .placeholder = "What's on your mind?",
-                        .on_input = AppUi.inputMsg(.draft_edit),
-                        .on_submit = .post,
-                        .height = 140,
-                    }, .{}),
-                    ui.row(.{ .cross = .center, .gap = 8 }, .{
-                        ui.text(.{ .size = .sm, .style = .{ .foreground = theme.palette.text_muted } }, model.identity(ui.arena)),
-                        ui.spacer(1),
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
-                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+            ui.el(.card, .{
+                .width = compose_sheet_width,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
+            }, .{
+                ui.column(.{ .gap = 0 }, .{
+                    // The header band: a title and nothing else, so the sheet
+                    // says what it is before the eye reaches the field.
+                    ui.row(.{ .height = compose_header_height, .cross = .center, .main = .center, .gap = 0 }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_primary } },
+                            &.{.{ .text = "New note", .weight = .medium, .scale = menu_scale }},
+                        ),
                     }),
+                    ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+                    // The writer and their words, side by side: the disc says
+                    // whose voice this is, which is the one thing a composer
+                    // must not leave ambiguous when a signer can be swapped.
+                    ui.row(.{ .gap = 0, .cross = .start }, .{
+                        hgap(ui, 18),
+                        ui.column(.{ .gap = 0 }, .{
+                            vgap(ui, 16),
+                            meAvatar(ui, avatar_size),
+                        }),
+                        hgap(ui, 12),
+                        ui.column(.{ .grow = 1, .gap = 0 }, .{
+                            vgap(ui, 16),
+                            ui.el(.textarea, .{
+                                .text = model.draft(),
+                                .placeholder = "What's on your mind?",
+                                .on_input = AppUi.inputMsg(.draft_edit),
+                                .on_submit = .post,
+                                .height = compose_editor_height,
+                                .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
+                            }, .{}),
+                            vgap(ui, 14),
+                        }),
+                        hgap(ui, 18),
+                    }),
+                    ui.separator(.{ .style = .{ .foreground = p.divider_row, .background = p.divider_row } }),
+                    // What pressing Post will do, in the terms that matter: how
+                    // far the note goes, and that nothing here will truncate it.
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        hgap(ui, 18),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_dim } },
+                            &.{.{ .text = composeReach(ui), .monospace = true, .scale = mono_meta_scale }},
+                        ),
+                        ui.spacer(1),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = "Cmd + Enter", .monospace = true, .scale = mono_hint_scale }},
+                        ),
+                        hgap(ui, 10),
+                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+                        hgap(ui, 4),
+                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+                        hgap(ui, 18),
+                    }),
+                    vgap(ui, 12),
                 }),
             }),
         }),
     });
+}
+
+/// How far a note will go, said before it goes rather than after: the relays
+/// that will take a write, and that Plaza imposes no length of its own.
+fn composeReach(ui: *AppUi) []const u8 {
+    const live = liveRelayCount();
+    if (live == 0) return "no relay is answering · it will wait in the outbox";
+    return ui.fmt("posts to {d} {s} · no length limit", .{ live, if (live == 1) "relay" else "relays" });
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes
@@ -9218,6 +9277,11 @@ pub const EffectsForTest = Effects;
 /// arm the repeating timers.
 pub fn boot(model: *Model, fx: *Effects) void {
     model.refresh(nowSeconds());
+    // What was written but not sent when the app last closed, back in the
+    // composer where it was left.
+    var draft_buf: [note_content_cap]u8 = undefined;
+    const stashed = loadDraft(&draft_buf);
+    if (stashed.len > 0) model.draft_buffer = @TypeOf(model.draft_buffer).init(stashed);
     // What was owed when the app last closed. Read before the first frame, so a
     // note written offline yesterday is visible as owed rather than lost, and
     // offered again as soon as a relay answers.
@@ -9351,7 +9415,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
-        .close_compose => model.composing = false,
+        .close_compose => {
+            model.composing = false;
+            // Closing the sheet stashes what is in it. The words survived a
+            // closed sheet already; this is what carries them past a quit.
+            saveDraft(model.draft());
+        },
         .open_join => model.joining = true,
         .close_join => {
             model.joining = false;
@@ -11335,6 +11404,46 @@ fn saveSettings() void {
         .data = data,
         .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
+}
+
+/// Where an unsent draft waits between launches. One slot, because the composer
+/// is one sheet: a list of drafts is a different feature and the plan says so.
+const draft_file = "draft";
+
+/// Keeps what was written but not sent. The composer already survives being
+/// closed within a session; this is what makes it survive the app quitting,
+/// which is the case that actually loses words: a machine that sleeps, an
+/// update, a crash.
+///
+/// Written with the same restrictive permissions as the rest of ~/.plaza,
+/// because an unsent note is as private as a sent one and rather more likely
+/// to be unfinished thinking.
+fn saveDraft(text: []const u8) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    if (text.len == 0) {
+        // Nothing to keep: the slot is removed rather than left holding a stale
+        // draft that would reappear over the next empty composer.
+        dir.deleteFile(io, draft_file) catch {};
+        return;
+    }
+    dir.writeFile(io, .{
+        .sub_path = draft_file,
+        .data = text,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+/// Reads the stashed draft back, or an empty slice when there is none.
+fn loadDraft(out: []u8) []const u8 {
+    const io = g_io orelse return "";
+    const environ = g_environ orelse return "";
+    var dir = plazaDir(io, environ) catch return "";
+    defer dir.close(io);
+    const n = dir.readFile(io, draft_file, out) catch return "";
+    return out[0..n.len];
 }
 
 /// Logs out: deletes the session (and, for a local key, the key file itself),
