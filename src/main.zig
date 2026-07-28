@@ -14,12 +14,13 @@
 //! `sign_event` round-trip to the bunker), which is stored locally and published
 //! to the pool. The feed runs as a pool (each relay on its own thread ingesting
 //! into the one shared store, deduped by event id), scoped to the follow set,
-//! rendered from disk on a timer, all in one process. Real names (kind:0
-//! profiles) and NIP-65 outbox routing come in the milestones ahead.
+//! rendered from disk on a timer, all in one process. Reads and writes route
+//! by the reader's own NIP-65 relay list.
 //!
-//! The static screens live in `onboarding.native` and `settings.native`; the
-//! feed is a Zig view (inline images need a runtime image reference the markup
-//! grammar does not carry). This file is the logic.
+//! Onboarding lives in `onboarding.native`; the feed and Settings are Zig views
+//! (inline images need a runtime image reference, and a relay row needs its own
+//! index in three messages, neither of which the markup grammar carries). This
+//! file is the logic.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -53,13 +54,461 @@ const thread_column_width: f32 = feed_column_width;
 // store, which dedupes by event id. NIP-65 outbox routing (reading each author
 // from their own write relays) needs a follow list, so it arrives with a later
 // milestone; here a fixed pool is the relay engine.
-const relays = [_][]const u8{
+// ---------------------------------------------------------------------- the pool
+//
+// Which relays this app talks to, and in which direction.
+//
+// It was a comptime list, which made every per-relay table a fixed array
+// indexed by position and every thread a permanent one. A reader cannot be
+// asked to accept somebody else's five relays forever, so the pool is a TABLE
+// now: fixed capacity, because a client with fifty relays is not a client but a
+// crawler, and a live count that only ever grows toward that cap.
+//
+// Two rules make the change safe rather than sprawling. A relay's SLOT is
+// stable for the life of the process once claimed, so every index held
+// elsewhere (the status table, the RTT ring, the outbox's per-relay ack bits)
+// stays valid; removing a relay marks its slot dormant rather than compacting
+// the array. And a slot's thread outlives its relay: it notices the change and
+// re-dials, which is the same path a dropped connection already takes.
+const max_relays = 8;
+// The outbox records one BIT per relay in a `u8`, and a shift amount is a `u3`,
+// so nine relays would not be a tight fit: it would be an @intCast panic in a
+// safe build and worse in a fast one. Widening the pool means widening that
+// mask, its persisted form, and this line together.
+comptime {
+    if (max_relays > 8) @compileError("max_relays exceeds the outbox ack mask; widen OutboxEntry.acked with it");
+}
+
+/// One relay, and what the reader asked of it. NIP-65's markers: a relay may be
+/// read-only, write-only, or both, and both is the default because that is what
+/// an `r` tag with no marker means.
+const RelayEntry = struct {
+    used: bool = false,
+    url_buf: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    read: bool = true,
+    write: bool = true,
+
+    fn url(self: *const RelayEntry) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
+
+/// The pool the app was born with, used until the reader's own list is read
+/// from their kind:10002 or from disk. Not a default to be proud of, just a
+/// starting point that works on the first launch.
+const bootstrap_relays = [_][]const u8{
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
     "wss://relay.nostr.band",
     "wss://relay.snort.social",
 };
+
+var g_relays = [_]RelayEntry{.{}} ** max_relays;
+/// How many slots have ever been claimed. It never shrinks, because a slot's
+/// index is a promise to everything that recorded one.
+var g_relay_count = std.atomic.Value(u8).init(0);
+
+/// NIP-65's kind. A reader's relay list is a replaceable event: the newest one
+/// they signed IS their list, which is why an edit here publishes.
+const relay_list_kind: u16 = 10002;
+
+/// Relays this reader's follows publish to, learned from their own kind:10002.
+/// Offered under the add field, because the relays the people you read write to
+/// are the relays that will actually carry their notes to you.
+const max_relay_suggestions = 6;
+var g_suggested = [_][96]u8{[_]u8{0} ** 96} ** max_relay_suggestions;
+var g_suggested_len = [_]u8{0} ** max_relay_suggestions;
+var g_suggested_count = std.atomic.Value(u8).init(0);
+/// Guards the relay table and the suggestions beside it. Ingest threads dial
+/// out of one and write the other, the UI thread edits both, and every critical
+/// section is a short scan or a fixed copy with no IO in it, so a spinlock is
+/// the right weight (and `std.Io.Mutex` would drag an `io` through threads that
+/// deliberately never share one).
+var g_suggested_lock = std.atomic.Value(bool).init(false);
+
+fn lockRelayTable() void {
+    while (g_suggested_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockRelayTable() void {
+    g_suggested_lock.store(false, .release);
+}
+
+/// Records a relay a follow writes to, unless it is already in the pool or
+/// already suggested. First come, first kept: the table is small on purpose,
+/// because a wall of suggestions is not a suggestion.
+fn noteRelaySuggestion(url: []const u8) void {
+    if (url.len == 0 or url.len > 96) return;
+    if (!isRelayUrl(url)) return;
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse continue;
+        if (relayUrlEql(e.url(), url)) return;
+    }
+    lockRelayTable();
+    defer unlockRelayTable();
+    const n = g_suggested_count.load(.monotonic);
+    for (0..n) |i| {
+        if (relayUrlEql(g_suggested[i][0..g_suggested_len[i]], url)) return;
+    }
+    if (n >= max_relay_suggestions) return;
+    @memcpy(g_suggested[n][0..url.len], url);
+    g_suggested_len[n] = @intCast(url.len);
+    g_suggested_count.store(n + 1, .release);
+}
+
+/// Reads a suggestion into `buf`, which the caller owns. Copied under the lock
+/// rather than returned as a slice, so an ingest thread cannot rewrite the row
+/// a caller is still holding.
+pub fn relaySuggestionCopy(index: usize, buf: *[96]u8) ?[]const u8 {
+    lockRelayTable();
+    defer unlockRelayTable();
+    if (index >= g_suggested_count.load(.monotonic)) return null;
+    const len = g_suggested_len[index];
+    @memcpy(buf[0..len], g_suggested[index][0..len]);
+    return buf[0..len];
+}
+
+pub fn relaySuggestionCount() usize {
+    return g_suggested_count.load(.acquire);
+}
+
+/// Drops a suggestion once it has been taken, so the row does not linger under
+/// a relay that is now in the list above it.
+fn forgetRelaySuggestion(index: usize) void {
+    lockRelayTable();
+    defer unlockRelayTable();
+    const n = g_suggested_count.load(.monotonic);
+    if (index >= n) return;
+    for (index..n - 1) |i| {
+        g_suggested[i] = g_suggested[i + 1];
+        g_suggested_len[i] = g_suggested_len[i + 1];
+    }
+    g_suggested_count.store(n - 1, .release);
+}
+
+/// Two relay URLs naming the same relay. Relays are addresses, not text: a
+/// trailing slash and the scheme's case are noise, so `wss://Relay.io/` and
+/// `wss://relay.io` are one relay and the list should not hold both.
+pub fn relayUrlEql(a: []const u8, b: []const u8) bool {
+    const ta = std.mem.trimEnd(u8, a, "/");
+    const tb = std.mem.trimEnd(u8, b, "/");
+    return std.ascii.eqlIgnoreCase(ta, tb);
+}
+
+/// Whether this reader has a list of their own, as opposed to the one the app
+/// was born with. It gates the one moment a remote event may rewrite the pool:
+/// their published kind:10002 is their list, but only until they edit here.
+var g_relays_are_mine = false;
+
+/// A reader's own kind:10002, parsed and waiting for the UI thread to take it.
+/// An ingest thread must not swap the pool out from under the threads reading
+/// it (nor write the file), so it stages the list here and `adoptRelayList`
+/// installs it between frames.
+var g_staged_relays = [_]RelayEntry{.{}} ** max_relays;
+var g_staged_ready = std.atomic.Value(bool).init(false);
+
+/// Stages a reader's own kind:10002 as their relay list. NIP-65's markers read
+/// plainly: an `r` tag with no marker is both, `read` or `write` narrows it.
+///
+/// Only ever staged when the pool is still the one the app was born with, so a
+/// stale event from a relay cannot undo an edit made here.
+fn applyOwnRelayList(ev: nostr.event.Event) void {
+    if (g_relays_are_mine) return;
+    if (g_staged_ready.load(.acquire)) return;
+    var next = [_]RelayEntry{.{}} ** max_relays;
+    var n: usize = 0;
+    for (ev.tags) |tag| {
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "r")) continue;
+        const url = std.mem.trim(u8, tag[1], " \t\r\n");
+        if (!isRelayUrl(url) or url.len > 96) continue;
+        var dup = false;
+        for (next[0..n]) |e| {
+            if (relayUrlEql(e.url(), url)) dup = true;
+        }
+        if (dup) continue;
+        if (n >= max_relays) break;
+        const marker: []const u8 = if (tag.len >= 3) tag[2] else "";
+        next[n].used = true;
+        @memcpy(next[n].url_buf[0..url.len], url);
+        next[n].url_len = @intCast(url.len);
+        next[n].read = marker.len == 0 or std.mem.eql(u8, marker, "read");
+        next[n].write = marker.len == 0 or std.mem.eql(u8, marker, "write");
+        n += 1;
+    }
+    // An empty list is not a list. A reader whose kind:10002 has no usable `r`
+    // tag keeps the pool they have, rather than losing every relay at once.
+    if (n == 0) return;
+    lockRelayTable();
+    g_staged_relays = next;
+    unlockRelayTable();
+    g_staged_ready.store(true, .release);
+}
+
+/// Installs a staged relay list, on the UI thread, between frames. Returns
+/// whether anything changed, so the caller can say the pool moved.
+fn adoptRelayList() bool {
+    if (!g_staged_ready.load(.acquire)) return false;
+    g_staged_ready.store(false, .monotonic);
+    // An edit made while the event was in flight wins: their hands beat their
+    // history.
+    if (g_relays_are_mine) return false;
+    lockRelayTable();
+    g_relays = g_staged_relays;
+    unlockRelayTable();
+    var n: u8 = 0;
+    for (g_relays, 0..) |e, i| {
+        if (e.used) n = @intCast(i + 1);
+    }
+    if (n > g_relay_count.load(.monotonic)) g_relay_count.store(n, .release);
+    g_relays_are_mine = true;
+    forgetOutboxAcks();
+    saveRelays();
+    return true;
+}
+
+/// Routes a kind:10002 by whose it is: the reader's own IS their list, a
+/// follow's only offers where that follow can be reached.
+fn ingestRelayList(ev: nostr.event.Event) void {
+    if (activePubkey()) |pk| {
+        if (std.mem.eql(u8, &pk, &ev.pubkey)) {
+            applyOwnRelayList(ev);
+            return;
+        }
+    }
+    for (ev.tags) |tag| {
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "r")) continue;
+        // Only where they WRITE: a relay a follow merely reads from will never
+        // hold their notes, so adding it would buy nothing.
+        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
+        noteRelaySuggestion(std.mem.trim(u8, tag[1], " \t\r\n"));
+    }
+}
+
+/// Publishes this reader's list as their kind:10002, so the next client they
+/// open reads the same pool. An edit here is the source of truth: it goes to
+/// disk and to the network in the same breath.
+fn publishRelayList(fx: *Effects) void {
+    // A guest has no identity to sign with, and their list stays local.
+    if (activePubkey() == null) return;
+    const gpa = std.heap.page_allocator;
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse continue;
+        if (!e.read and !e.write) continue;
+        const url = gpa.dupe(u8, e.url()) catch return;
+        var parts = gpa.alloc([]const u8, if (e.read and e.write) 2 else 3) catch return;
+        parts[0] = "r";
+        parts[1] = url;
+        if (!(e.read and e.write)) parts[2] = if (e.read) "read" else "write";
+        tags.append(gpa, parts) catch return;
+    }
+    const owned = tags.toOwnedSlice(gpa) catch return;
+    if (owned.len == 0) return;
+    // A relay list carries everything in its tags: the content is empty by
+    // NIP-65, not by omission.
+    signAndPublish(fx, gpa, nowSeconds(), relay_list_kind, owned, "", false);
+}
+
+/// Where the reader's relay list lives on disk, for a guest and as the fallback
+/// when no kind:10002 has been read yet. One URL per line with an optional
+/// `read` or `write` marker, which is NIP-65's own vocabulary written plainly:
+/// no marker means both, which is what an unmarked `r` tag means.
+const relays_file = "relays";
+
+/// Reads the reader's list, or seeds the one the app was born with. Called
+/// before the ingest threads start, so the first dial goes where they asked.
+fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch {
+        seedBootstrapRelays();
+        return;
+    };
+    defer dir.close(io);
+    var buf: [max_relays * 128]u8 = undefined;
+    const raw = dir.readFile(io, relays_file, &buf) catch {
+        seedBootstrapRelays();
+        return;
+    };
+    var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
+    var added: usize = 0;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        var parts = std.mem.tokenizeScalar(u8, trimmed, ' ');
+        const url = parts.next() orelse continue;
+        if (!isRelayUrl(url)) continue;
+        const marker = parts.next();
+        const read = marker == null or std.mem.eql(u8, marker.?, "read");
+        const write = marker == null or std.mem.eql(u8, marker.?, "write");
+        if (addRelay(url, read, write) != null) added += 1;
+    }
+    // A file that exists but holds nothing usable would leave the app with no
+    // way to reach anyone, which is worse than ignoring it.
+    if (added == 0) {
+        seedBootstrapRelays();
+        return;
+    }
+    // A saved list is theirs: a kind:10002 that arrives later does not get to
+    // undo it, because they may have edited it here since.
+    g_relays_are_mine = true;
+}
+
+/// Writes the list back in the same plain form.
+fn saveRelays() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    var buf: [max_relays * 128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse continue;
+        const marker: []const u8 = if (e.read and e.write) "" else if (e.read) " read" else " write";
+        w.print("{s}{s}\n", .{ e.url(), marker }) catch return;
+    }
+    dir.writeFile(io, .{ .sub_path = relays_file, .data = w.buffered(), .flags = .{} }) catch {};
+}
+
+/// Whether a string is a relay address this app will dial. Deliberately narrow:
+/// this is a URL the reader typed, and everything else in the app trusts the
+/// pool to be relays.
+pub fn isRelayUrl(url: []const u8) bool {
+    // `wss://` only. A relay this app can reach is on the public internet (the
+    // host check below rules out anything else), and over `ws://` every filter
+    // the reader sends and every note they read travels in the clear to anyone
+    // on the path. A follow's published list DOES carry plain `ws://` relays,
+    // which is exactly why this is checked here rather than assumed.
+    if (!std.mem.startsWith(u8, url, "wss://")) return false;
+    const rest = url["wss://".len..];
+    if (rest.len == 0 or rest.len > 80) return false;
+    // A host, at least: something before the first slash, with a dot in it.
+    const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const host = rest[0..host_end];
+    if (host.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, host, '@') != null) return false;
+    return std.mem.indexOfScalar(u8, host, '.') != null;
+}
+
+/// The URL in slot `i`, or a placeholder when the slot is empty. For messages
+/// about a slot, where a missing relay is still worth naming.
+pub fn relayUrlAt(i: usize) []const u8 {
+    const e = relayAt(i) orelse return "(removed)";
+    return e.url();
+}
+
+/// How many relays the reader actually has, which is what every count they are
+/// shown is out of. A dormant slot is not a relay.
+pub fn relayCount() usize {
+    var n: usize = 0;
+    for (0..relaySlots()) |i| {
+        if (relayAt(i) != null) n += 1;
+    }
+    return n;
+}
+
+/// How many of them take writes, which is the denominator an outbox
+/// acknowledgement is out of: a note is not owed to a relay never asked to hold
+/// it.
+pub fn writeRelayCount() usize {
+    var n: usize = 0;
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse continue;
+        if (e.write) n += 1;
+    }
+    return n;
+}
+
+/// Puts the pool back to the one the app was born with. For tests, which need a
+/// known pool: the real one is loaded from disk or from their kind:10002.
+pub fn resetRelaysForTest() void {
+    g_relays = [_]RelayEntry{.{}} ** max_relays;
+    g_relay_count.store(0, .release);
+    g_relays_are_mine = false;
+    g_staged_ready.store(false, .release);
+    g_suggested_count.store(0, .release);
+    seedBootstrapRelays();
+}
+
+/// Applies a staged kind:10002 the way the frame loop does.
+pub fn adoptRelayListForTest() bool {
+    return adoptRelayList();
+}
+
+pub fn stageOwnRelayListForTest(ev: nostr.event.Event) void {
+    applyOwnRelayList(ev);
+}
+
+pub fn ingestRelayListForTest(ev: nostr.event.Event) void {
+    ingestRelayList(ev);
+}
+
+pub fn cycleRelayForTest(i: usize) void {
+    cycleRelay(i);
+}
+
+pub fn removeRelayForTest(i: usize) void {
+    removeRelay(i);
+}
+
+pub fn addRelayForTest(url: []const u8, read: bool, write: bool) ?usize {
+    return addRelay(url, read, write);
+}
+
+pub fn markRelaysMineForTest() void {
+    g_relays_are_mine = true;
+}
+
+pub fn relayIsMineForTest() bool {
+    return g_relays_are_mine;
+}
+
+pub const RelayUse = struct { read: bool, write: bool };
+
+pub fn relayReadWriteForTest(i: usize) ?RelayUse {
+    const e = relayAt(i) orelse return null;
+    return .{ .read = e.read, .write = e.write };
+}
+
+/// The relay in slot `i`, or null when that slot is empty or dormant.
+pub fn relayAt(i: usize) ?*const RelayEntry {
+    if (i >= g_relays.len) return null;
+    const e = &g_relays[i];
+    return if (e.used) e else null;
+}
+
+/// How many slots to walk. Everything that iterates the pool uses this rather
+/// than a length, because a dormant slot in the middle is normal.
+pub fn relaySlots() usize {
+    return @min(g_relay_count.load(.monotonic), g_relays.len);
+}
+
+/// Fills the pool from the bootstrap list, for a first run with nothing saved.
+fn seedBootstrapRelays() void {
+    for (bootstrap_relays) |url| _ = addRelay(url, true, true);
+}
+
+/// Claims a slot for `url`, or returns the slot it already occupies. Returns
+/// null when the pool is full, which the caller surfaces rather than hides.
+fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
+    if (url.len == 0 or url.len > 96) return null;
+    for (0..relaySlots()) |i| {
+        if (g_relays[i].used and std.mem.eql(u8, g_relays[i].url(), url)) return i;
+    }
+    // A dormant slot first, so removing and re-adding does not consume the pool.
+    for (0..g_relays.len) |i| {
+        if (g_relays[i].used) continue;
+        lockRelayTable();
+        g_relays[i] = .{ .used = true, .read = read, .write = write };
+        @memcpy(g_relays[i].url_buf[0..url.len], url);
+        g_relays[i].url_len = @intCast(url.len);
+        unlockRelayTable();
+        if (i >= relaySlots()) g_relay_count.store(@intCast(i + 1), .release);
+        return i;
+    }
+    return null;
+}
 
 // The curated starter pack a newcomer follows on first run: a handful of
 // well-known, active accounts so the feed is alive from the first second. The
@@ -432,7 +881,7 @@ const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2 };
 var g_store: ?*nostr.store.Store = null;
 // One connection state per relay in the pool, flipped by that relay's ingest
 // thread and read by the UI thread to summarise the pool.
-var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** relays.len;
+var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** max_relays;
 
 /// Arrival order inside a thread level: the build a reply first appeared in, so a
 /// late arrival lands after what has already been read instead of jumping into the
@@ -585,8 +1034,8 @@ const rtt_samples = 8;
 /// bar shows, and how often each relay is asked for it.
 const probe_sub = "plaza-ping";
 const probe_interval_ms: i64 = 20_000;
-var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** relays.len;
-var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** relays.len;
+var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** max_relays;
+var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** max_relays;
 
 /// Records one round trip for relay `index`. Stored as milliseconds PLUS ONE, so
 /// a sub-millisecond answer (a warm or local relay, truncated to 0) is a reading
@@ -600,7 +1049,7 @@ pub fn clearRelayRttForTest(index: usize) void {
 }
 
 fn recordRelayRtt(index: usize, ms: u64) void {
-    if (index >= relays.len) return;
+    if (index >= max_relays) return;
     const slot = g_relay_rtt_at[index].load(.monotonic) % rtt_samples;
     g_relay_rtt[index][slot].store(@intCast(@min(ms, std.math.maxInt(u16) - 1) + 1), .monotonic);
     g_relay_rtt_at[index].store(slot +% 1, .monotonic);
@@ -609,13 +1058,13 @@ fn recordRelayRtt(index: usize, ms: u64) void {
 /// Forgets relay `index`'s samples. Called when it drops, so the bar never shows
 /// a number measured on a connection that no longer exists.
 fn clearRelayRtt(index: usize) void {
-    if (index >= relays.len) return;
+    if (index >= max_relays) return;
     for (&g_relay_rtt[index]) |*sample| sample.store(0, .monotonic);
 }
 
 /// Relay `index`'s median round trip, or null when it has never answered.
 pub fn relayRttMs(index: usize) ?u16 {
-    if (index >= relays.len) return null;
+    if (index >= max_relays) return null;
     var seen: [rtt_samples]u16 = undefined;
     var n: usize = 0;
     for (&g_relay_rtt[index]) |*sample| {
@@ -643,9 +1092,9 @@ fn median(sorted: []const u16) u16 {
 /// post lands; until a relay list with read/write markers exists, every relay in
 /// the pool is both, so this is that number.
 pub fn poolLatencyMs() ?u16 {
-    var seen: [relays.len]u16 = undefined;
+    var seen: [max_relays]u16 = undefined;
     var n: usize = 0;
-    for (0..relays.len) |i| {
+    for (0..relaySlots()) |i| {
         // Connected relays only: a number measured before a relay dropped says
         // nothing about how fast the pool answers now.
         const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
@@ -1498,7 +1947,12 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
 
     const kinds = [_]u16{0};
     const filters = [_]nostr.filter.Filter{.{ .authors = batch[0..len], .kinds = &kinds, .limit = @intCast(len) }};
-    for (relays) |url| {
+    for (0..relaySlots()) |ri| {
+        const entry = relayAt(ri) orelse continue;
+        // A read-only or read-write relay. Asking a write-only relay to answer
+        // a filter is asking the wrong question of it.
+        if (!entry.read) continue;
+        const url = entry.url();
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
         relay.subscribe("plaza-mentions", &filters) catch continue;
@@ -2113,7 +2567,12 @@ fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len
     defer signer.deinit();
 
     const filters = [_]nostr.filter.Filter{.{ .ids = batch[0..len], .limit = @intCast(len) }};
-    for (relays) |url| {
+    for (0..relaySlots()) |ri| {
+        const entry = relayAt(ri) orelse continue;
+        // A read-only or read-write relay. Asking a write-only relay to answer
+        // a filter is asking the wrong question of it.
+        if (!entry.read) continue;
+        const url = entry.url();
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
         relay.subscribe("plaza-quotes", &filters) catch continue;
@@ -2939,6 +3398,10 @@ pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
     notes_len: usize = 0,
     live_relays: usize = 0,
+    /// How many relays the reader has, sampled on the tick beside the live
+    /// count: a frame that mixed a fresh numerator with a stale denominator
+    /// would read "4/3 relays".
+    relay_count: usize = 0,
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
@@ -2977,6 +3440,10 @@ pub const Model = struct {
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
+    // The add-a-relay field, and why the last press did nothing.
+    relay_buffer: canvas.TextBuffer(96) = .{},
+    relay_error: bool = false,
+    relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
     // Whether the compose sheet is open. Compose is on demand from the "New
@@ -3215,6 +3682,16 @@ pub const Model = struct {
         if (!self.proxy_saved) return "";
         return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
     }
+    /// The add-a-relay field's text.
+    pub fn relay_draft(self: *const Model) []const u8 {
+        return self.relay_buffer.text();
+    }
+    /// Why the last Add did nothing, said in the field's own terms.
+    pub fn relay_status(self: *const Model) []const u8 {
+        if (self.relay_full) return "That's the most relays this app keeps. Remove one first.";
+        if (self.relay_error) return "A relay address starts with wss:// and names a host.";
+        return "";
+    }
     /// What the previews switch is, in the terms that matter: not bandwidth.
     pub fn previews_explainer(self: *const Model) []const u8 {
         _ = self;
@@ -3265,12 +3742,12 @@ pub const Model = struct {
     /// Header status line: how much of the relay pool is live.
     pub fn status(self: *const Model, arena: std.mem.Allocator) []const u8 {
         if (self.live_relays > 0)
-            return std.fmt.allocPrint(arena, "Live · {d}/{d} relays", .{ self.live_relays, relays.len }) catch "Live";
-        if (self.offline_relays >= relays.len) return "Offline, reconnecting…";
+            return std.fmt.allocPrint(arena, "Live · {d}/{d} relays", .{ self.live_relays, self.relay_count }) catch "Live";
+        if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Offline, reconnecting…";
         return "Connecting…";
     }
     pub fn empty_text(self: *const Model) []const u8 {
-        if (self.offline_relays >= relays.len) return "Can't reach any relay. Retrying…";
+        if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
         return "Connecting to the relay pool…";
     }
     /// Status-bar summary.
@@ -3289,7 +3766,7 @@ pub const Model = struct {
 
     /// The status bar's relay health, drawn after the online dot.
     pub fn relay_health(self: *const Model, arena: std.mem.Allocator) []const u8 {
-        return std.fmt.allocPrint(arena, "{d}/{d} relays", .{ self.live_relays, relays.len }) catch "relays";
+        return std.fmt.allocPrint(arena, "{d}/{d} relays", .{ self.live_relays, self.relay_count }) catch "relays";
     }
 
     /// Whether at least one relay is connected (drives the status dot color).
@@ -3408,8 +3885,12 @@ pub const Model = struct {
     fn refresh(self: *Model, now_s: i64) void {
         var live: usize = 0;
         var offline: usize = 0;
-        for (&g_relay_status) |*s| {
-            switch (@as(Conn, @enumFromInt(s.load(.acquire)))) {
+        // Only slots that hold a relay: a dormant slot's status is whatever it
+        // was when its relay was removed, and counting it would report the app
+        // offline from a relay the reader deleted.
+        for (0..relaySlots()) |i| {
+            if (relayAt(i) == null) continue;
+            switch (@as(Conn, @enumFromInt(g_relay_status[i].load(.acquire)))) {
                 .connected => live += 1,
                 .offline => offline += 1,
                 .connecting => {},
@@ -3417,6 +3898,9 @@ pub const Model = struct {
         }
         self.live_relays = live;
         self.offline_relays = offline;
+        // Sampled together, so a frame never mixes a fresh numerator with a
+        // stale denominator and reads "4/3 relays".
+        self.relay_count = relayCount();
 
         const store = g_store orelse return;
 
@@ -5165,6 +5649,15 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// Walks a relay through what it is for: both, read, write.
+    relay_cycle: u8,
+    /// Drops a relay from the pool.
+    relay_remove: u8,
+    /// The relay being typed into the add field.
+    relay_edit: canvas.TextInputEvent,
+    /// Adds what was typed, or the suggestion pressed.
+    relay_add,
+    relay_suggest: u8,
     /// Replaces the `@word` being typed with a real reference to this key.
     insert_mention: [32]u8,
     /// Close whatever chrome menu is open (Escape, or a press outside it).
@@ -5286,14 +5779,326 @@ pub const AppUi = canvas.Ui(Msg);
 // reference, which the markup grammar deliberately does not carry, so a media
 // feed has to be a Zig view.
 const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboarding.native"));
-const SettingsView = canvas.CompiledMarkupView(Model, Msg, @embedFile("settings.native"));
+/// Settings, built in Zig. It was markup until the relay list needed a row that
+/// carries its own index into three different messages, which a binding cannot
+/// express: the same wall the feed hit. Cards below read top to bottom the way
+/// the screen does.
+fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    var cards: [8]AppUi.Node = undefined;
+    var n: usize = 0;
+
+    cards[n] = settingsCard(ui, .{
+        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Signed in as"),
+        vgap(ui, 8),
+        ui.text(.{ .wrap = true }, model.active_npub()),
+        vgap(ui, 8),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.accent } }, model.identity_kind_label()),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.copy_npub }, "Copy npub"),
+        }),
+    });
+    n += 1;
+
+    if (model.is_local_key()) {
+        cards[n] = settingsCard(ui, .{
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Your secret key"),
+            vgap(ui, 8),
+            ui.text(
+                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                "Right now this key lives only on this Mac. Back it up so losing the Mac is not losing the account. Plaza never sends it anywhere.",
+            ),
+            vgap(ui, 8),
+            if (model.nsec_hidden())
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Reveal secret key")
+            else
+                ui.column(.{ .gap = 8 }, .{
+                    ui.text(.{ .wrap = true }, model.revealed_nsec(ui.arena)),
+                    ui.row(.{ .gap = 8, .cross = .center }, .{
+                        ui.button(.{ .size = .sm, .on_press = Msg.copy_nsec }, "Copy nsec"),
+                        ui.spacer(1),
+                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Hide"),
+                    }),
+                }),
+        });
+        n += 1;
+    }
+
+    cards[n] = relayCard(ui, model);
+    n += 1;
+
+    cards[n] = settingsCard(ui, .{
+        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Load media previews"),
+        vgap(ui, 8),
+        ui.text(.{ .wrap = true, .style = .{ .foreground = p.text_muted } }, model.previews_explainer()),
+        vgap(ui, 8),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, model.previews_state()),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .on_press = Msg.previews_toggle }, model.previews_action()),
+        }),
+    });
+    n += 1;
+
+    cards[n] = settingsCard(ui, .{
+        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, "Media proxy"),
+        vgap(ui, 8),
+        ui.text(
+            .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+            "Images are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.",
+        ),
+        vgap(ui, 8),
+        ui.inputGroup(
+            .{ .semantics = .{ .label = "Media proxy" } },
+            ui.el(.textarea, .{
+                .text = model.proxy_draft(),
+                .placeholder = "https://wsrv.nl/",
+                .on_input = AppUi.inputMsg(.proxy_edit),
+                .on_submit = Msg.proxy_save,
+                .height = 30,
+            }, .{}),
+            ui.inputGroupActions(.{}, .{
+                ui.text(.{ .size = .sm, .grow = 1, .style = .{ .foreground = p.text_muted } }, model.proxy_status()),
+                ui.button(.{ .size = .sm, .on_press = Msg.proxy_save }, "Save"),
+            }),
+        ),
+    });
+    n += 1;
+
+    if (model.logout_idle()) {
+        cards[n] = ui.button(.{ .variant = .destructive, .on_press = Msg.logout_request }, "Log out");
+        n += 1;
+    } else if (model.logout_confirming()) {
+        cards[n] = settingsCard(ui, .{
+            ui.text(.{ .wrap = true }, model.logout_warning()),
+            vgap(ui, 12),
+            ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.logout_cancel }, "Cancel"),
+                ui.spacer(1),
+                ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.logout_confirm }, "Log out"),
+            }),
+        });
+        n += 1;
+    }
+
+    cards[n] = ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, model.version_line());
+    n += 1;
+
+    return ui.column(.{ .gap = 0, .grow = 1 }, .{
+        ui.row(.{ .gap = 8, .cross = .center, .padding = 16 }, .{
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Back"),
+            ui.text(.{ .size = .heading, .grow = 1 }, "Settings"),
+        }),
+        ui.separator(.{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.column(.{ .gap = 16, .padding = 16 }, .{cards[0..n]}),
+        }),
+    });
+}
+
+/// One settings card: the house card chrome, so every section on the screen
+/// wears the same edge.
+fn settingsCard(ui: *AppUi, children: anytype) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.card, .{ .padding = 16, .style = .{ .background = p.surface_settings_card, .border = p.border_hairline, .radius = 10, .stroke_width = 1 } }, .{
+        ui.column(.{ .gap = 0 }, children),
+    });
+}
+
+/// Walks a relay through what it is for. Both, then read, then write, then both
+/// again: three states, because a relay that is neither is a relay you have
+/// removed, and there is a button for that.
+fn cycleRelay(i: usize) void {
+    if (i >= g_relays.len) return;
+    const e = &g_relays[i];
+    if (!e.used) return;
+    if (e.read and e.write) {
+        e.write = false;
+    } else if (e.read) {
+        e.read = false;
+        e.write = true;
+    } else {
+        e.read = true;
+        e.write = true;
+    }
+}
+
+/// Drops a relay. The SLOT stays claimed and dormant: its index is a promise to
+/// everything that recorded one, and its thread simply finds nothing to dial.
+fn removeRelay(i: usize) void {
+    if (i >= g_relays.len) return;
+    lockRelayTable();
+    g_relays[i] = .{};
+    unlockRelayTable();
+}
+
+/// The relay list: which relays this app talks to, and in which direction.
+///
+/// The badge is the control, not a label. Pressing it walks R and W, which is
+/// the whole of NIP-65's vocabulary: a relay you read from, a relay you write
+/// to, or both. Reads and writes actually follow it, so a relay set to R never
+/// sees a note and a relay set to W is never asked a question.
+fn relayCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const slots = relaySlots();
+    const rows = ui.arena.alloc(AppUi.Node, slots + 3) catch return ui.spacer(0);
+    var n: usize = 0;
+    rows[n] = ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "Relays", .weight = .medium, .scale = menu_scale }}),
+        vgap(ui, 4),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
+            &.{.{ .text = "Reads and writes route by these markers. Press a badge to change what a relay is for.", .scale = mono_meta_scale }},
+        ),
+        vgap(ui, 10),
+    });
+    n += 1;
+    for (0..slots) |i| {
+        const e = relayAt(i) orelse continue;
+        const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
+        rows[n] = relayListRow(ui, e, i, state);
+        n += 1;
+    }
+    rows[n] = relayAddRow(ui, model);
+    n += 1;
+    return settingsCard(ui, .{rows[0..n]});
+}
+
+/// One relay: how it is doing, where it is, what it is for, and a way out.
+fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) AppUi.Node {
+    const p = theme.palette;
+    const dot: canvas.Color = switch (state) {
+        .connected => p.status_success,
+        .connecting => p.status_warning_text,
+        .offline => p.status_offline,
+    };
+    const badge: []const u8 = if (e.read and e.write) "R·W" else if (e.read) "R" else "W";
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.el(.panel, .{ .width = 7, .height = 7, .padding = 0.01, .style = .{ .background = dot, .radius = 4, .stroke_width = 0 } }, .{}),
+            hgap(ui, 9),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_secondary } }, &.{.{ .text = e.url(), .monospace = true, .scale = mono_row_scale }}),
+            hgap(ui, 9),
+            // Reconnecting is worth saying: an amber dot alone reads as a fault
+            // rather than as the app already doing something about it.
+            if (state == .connecting)
+                ui.paragraph(.{ .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = "reconnecting", .monospace = true, .scale = mono_chip_scale }})
+            else if (relayRttMs(index)) |ms|
+                ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = ui.fmt("{d} ms", .{ms}), .monospace = true, .scale = mono_chip_scale }})
+            else
+                ui.spacer(0),
+            ui.spacer(1),
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .height = 20,
+                .cross = .center,
+                .on_press = Msg{ .relay_cycle = @intCast(index) },
+                .style = .{ .radius = 4, .border = p.border_chip, .stroke_width = 1 },
+                .semantics = .{ .role = .button, .label = ui.fmt("Change what {s} is for", .{e.url()}), .focusable = true },
+            }, .{
+                hgap(ui, 5),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = badge, .monospace = true, .scale = mono_badge_scale }}),
+                hgap(ui, 5),
+            }),
+            hgap(ui, 8),
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .height = 20,
+                .cross = .center,
+                .on_press = Msg{ .relay_remove = @intCast(index) },
+                .style = .{ .radius = 4 },
+                .semantics = .{ .role = .button, .label = ui.fmt("Remove {s}", .{e.url()}), .focusable = true },
+            }, .{
+                hgap(ui, 4),
+                ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_dim } }, "x"),
+                hgap(ui, 4),
+            }),
+        }),
+        vgap(ui, 9),
+    });
+}
+
+/// The relays this reader's follows write to, offered as one press each. Empty
+/// until a follow's kind:10002 has actually been read, because a suggestion the
+/// app invented would just be another default wearing a recommendation's face.
+fn relaySuggestions(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    const count = relaySuggestionCount();
+    if (count == 0) return ui.spacer(0);
+    const chips = ui.arena.alloc(AppUi.Node, count) catch return ui.spacer(0);
+    var n: usize = 0;
+    for (0..count) |i| {
+        var buf: [96]u8 = undefined;
+        const url = relaySuggestionCopy(i, &buf) orelse continue;
+        // The arena copy is what the frame renders: `buf` dies with this loop.
+        const shown = ui.arena.dupe(u8, relayShortName(url)) catch continue;
+        chips[n] = ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = 22,
+            .cross = .center,
+            .on_press = Msg{ .relay_suggest = @intCast(i) },
+            .style = .{ .radius = 5, .border = p.border_chip, .stroke_width = 1 },
+            .semantics = .{ .role = .button, .label = ui.fmt("Add {s}", .{shown}), .focusable = true },
+        }, .{
+            hgap(ui, 7),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = ui.fmt("+ {s}", .{shown}), .monospace = true, .scale = mono_chip_scale }}),
+            hgap(ui, 7),
+        });
+        n += 1;
+    }
+    if (n == 0) return ui.spacer(0);
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 10),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_dim } },
+            &.{.{ .text = "Relays the people you read write to", .scale = mono_meta_scale }},
+        ),
+        vgap(ui, 6),
+        ui.row(.{ .gap = 6, .wrap = true }, .{chips[0..n]}),
+    });
+}
+
+/// A relay URL with the scheme and any trailing slash taken off. The scheme is
+/// the same on every row, so it is the part that carries no information.
+pub fn relayShortName(url: []const u8) []const u8 {
+    var out = url;
+    if (std.mem.startsWith(u8, out, "wss://")) out = out["wss://".len..];
+    return std.mem.trimEnd(u8, out, "/");
+}
+
+/// Where a relay is added, and where the ones your follows use are offered.
+fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.inputGroup(
+            .{ .semantics = .{ .label = "Add a relay" } },
+            ui.el(.textarea, .{
+                .text = model.relay_draft(),
+                .placeholder = "wss://",
+                .on_input = AppUi.inputMsg(.relay_edit),
+                .on_submit = Msg.relay_add,
+                .height = 30,
+            }, .{}),
+            ui.inputGroupActions(.{}, .{
+                ui.paragraph(
+                    .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = model.relay_status(), .scale = mono_meta_scale }},
+                ),
+                ui.button(.{ .size = .sm, .on_press = Msg.relay_add }, "Add"),
+            }),
+        ),
+        relaySuggestions(ui, model),
+    });
+}
 
 /// The root view: one screen at a time, chosen by the stage, with an expanded
 /// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     const base = switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
-        .settings => SettingsView.build(ui, model),
+        .settings => settingsView(ui, model),
         .ready => feedView(ui, model),
     };
     if (model.expanded_note) |note_id| {
@@ -7704,7 +8509,8 @@ fn menuSeparator(ui: *AppUi) AppUi.Node {
 /// answers, then the two things a reader can do about it.
 fn relayPopover(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    const rows = ui.arena.alloc(AppUi.Node, relays.len + 4) catch return ui.spacer(0);
+    const slots = relaySlots();
+    const rows = ui.arena.alloc(AppUi.Node, slots + 4) catch return ui.spacer(0);
     // The header says what the list means, so nobody reads it as a picker.
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
@@ -7715,12 +8521,18 @@ fn relayPopover(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.spacer(1),
         hgap(ui, 9),
     });
-    for (relays, 0..) |url, i| {
+    for (0..relaySlots()) |i| {
+        const entry = relayAt(i) orelse continue;
+        // Only where the reader asked to be published. The slot index is what
+        // the outbox records an acknowledgement against, which is why a slot is
+        // never reused for a different relay while the process lives.
+        if (!entry.write) continue;
+        const url = entry.url();
         rows[1 + i] = relayRow(ui, url, i, model);
     }
-    rows[relays.len + 1] = menuSeparator(ui);
-    rows[relays.len + 2] = menuRow(ui, if (model.relays_paused) "Resume Relays" else "Pause Relays", null, null, .toggle_relays_paused);
-    rows[relays.len + 3] = menuRow(ui, "Relay Settings…", null, "Cmd+,", .open_settings);
+    rows[slots + 1] = menuSeparator(ui);
+    rows[slots + 2] = menuRow(ui, if (model.relays_paused) "Resume Relays" else "Pause Relays", null, null, .toggle_relays_paused);
+    rows[slots + 3] = menuRow(ui, "Relay Settings…", null, "Cmd+,", .open_settings);
     return menuSurface(ui, 340, rows);
 }
 
@@ -7961,7 +8773,7 @@ fn outboxMenu(ui: *AppUi) AppUi.Node {
                 ui.spacer(1),
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_dim } },
-                    &.{.{ .text = ui.fmt("{d}/{d} relays", .{ e.ackCount(), relays.len }), .monospace = true, .scale = mono_hint_scale }},
+                    &.{.{ .text = ui.fmt("{d}/{d} relays", .{ e.ackCount(), writeRelayCount() }), .monospace = true, .scale = mono_hint_scale }},
                 ),
                 hgap(ui, 9),
             }),
@@ -7987,13 +8799,13 @@ fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
     else
         p.status_success;
     const label = if (settling)
-        ui.fmt("pausing · {d}/{d} relays", .{ live, relays.len })
+        ui.fmt("pausing · {d}/{d} relays", .{ live, relayCount() })
     else if (paused)
-        ui.fmt("paused · 0/{d} relays", .{relays.len})
+        ui.fmt("paused · 0/{d} relays", .{relayCount()})
     else if (poolLatencyMs()) |ms|
-        ui.fmt("{d}/{d} relays · {d} ms", .{ live, relays.len, ms })
+        ui.fmt("{d}/{d} relays · {d} ms", .{ live, relayCount(), ms })
     else
-        ui.fmt("{d}/{d} relays", .{ live, relays.len });
+        ui.fmt("{d}/{d} relays", .{ live, relayCount() });
     // The chip carries its plate when the pool is healthy AND when it is paused:
     // a deliberate pause is a state worth reading at a glance, not a fault.
     const plated = paused or poolIsHealthy(live);
@@ -8042,7 +8854,9 @@ pub fn poolIsHealthyForTest(live: usize) bool {
 }
 
 fn poolIsHealthy(live: usize) bool {
-    return live * 5 >= relays.len * 4;
+    const total = relayCount();
+    if (total == 0) return false;
+    return live * 5 >= total * 4;
 }
 
 /// What the status bar says about signing: which signer holds the key, and
@@ -8858,7 +9672,7 @@ fn pluralize(ui: *AppUi, n: usize, comptime one: []const u8, comptime many: []co
 /// How many relays are connected right now.
 fn liveRelayCount() usize {
     var n: usize = 0;
-    for (0..relays.len) |i| {
+    for (0..relaySlots()) |i| {
         const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
         if (state == .connected) n += 1;
     }
@@ -9513,6 +10327,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
+                // Their published relay list, taken on this thread so no ingest
+                // thread ever swaps the pool out from under the others.
+                _ = adoptRelayList();
                 if (liveRelayCount() > 0) drainOutbox(std.heap.page_allocator);
                 sweepOutbox(now);
                 // At most one write a second, and only when something changed.
@@ -9617,6 +10434,51 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.joining = true;
                 model.pending_compose = true;
             } else model.composing = true;
+        },
+        .relay_cycle => |i| {
+            cycleRelay(i);
+            g_relays_are_mine = true;
+            saveRelays();
+            // The ack bits name slots, and this slot's direction just changed.
+            forgetOutboxAcks();
+            publishRelayList(fx);
+        },
+        .relay_remove => |i| {
+            removeRelay(i);
+            g_relays_are_mine = true;
+            saveRelays();
+            forgetOutboxAcks();
+            publishRelayList(fx);
+        },
+        .relay_edit => |edit| model.relay_buffer.apply(edit),
+        .relay_add => {
+            const typed = std.mem.trim(u8, model.relay_buffer.text(), " \t\r\n");
+            if (!isRelayUrl(typed)) {
+                model.relay_error = true;
+                return;
+            }
+            model.relay_error = false;
+            if (addRelay(typed, true, true) == null) {
+                model.relay_full = true;
+                return;
+            }
+            model.relay_full = false;
+            model.relay_buffer.clear();
+            g_relays_are_mine = true;
+            saveRelays();
+            forgetOutboxAcks();
+            publishRelayList(fx);
+        },
+        .relay_suggest => |i| {
+            var buf: [96]u8 = undefined;
+            const url = relaySuggestionCopy(i, &buf) orelse return;
+            if (addRelay(url, true, true) != null) {
+                g_relays_are_mine = true;
+                forgetRelaySuggestion(i);
+                saveRelays();
+                forgetOutboxAcks();
+                publishRelayList(fx);
+            }
         },
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
@@ -10309,7 +11171,7 @@ fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
 
 /// Records what one relay said about one note.
 fn recordOutboxAck(id: [32]u8, relay_index: usize, accepted: bool) void {
-    if (relay_index >= relays.len) return;
+    if (relay_index >= max_relays) return;
     outboxLock();
     defer outboxUnlock();
     const e = outboxEntryFor(id) orelse return;
@@ -10418,6 +11280,42 @@ pub fn outboxRetryDelayForTest(rounds: u8) i64 {
 pub const max_outbox_rounds_for_test = max_outbox_rounds;
 pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
 
+/// A fingerprint of the pool, in slot order. The outbox records which relay took
+/// a note as a BIT PER SLOT, so those bits only mean anything against the list
+/// they were written for: after an edit, bit 2 may be a relay that never saw the
+/// note. The fingerprint travels with the queue so a changed list is noticed
+/// rather than silently misread.
+fn relayListFingerprint() u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse {
+            h.update("-");
+            continue;
+        };
+        h.update(e.url());
+        h.update(if (e.write) "w" else ".");
+    }
+    return h.final();
+}
+
+/// Forgets which relays took what, keeping the notes themselves. Called when the
+/// list changes: a note that was delivered will simply be offered again, and a
+/// relay that already has it will say so, which is cheaper than remembering a
+/// claim that may now name the wrong relay.
+fn forgetOutboxAcks() void {
+    outboxLock();
+    defer outboxUnlock();
+    var changed = false;
+    for (&g_outbox) |*e| {
+        if (!e.used or (e.acked == 0 and e.refused == 0)) continue;
+        e.acked = 0;
+        e.refused = 0;
+        e.rounds = 0;
+        changed = true;
+    }
+    if (changed) _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
 /// The queue's key in the store's generic table. The events themselves are in
 /// the store's own event tables (we ingest what we sign), so this holds only the
 /// index: which ids are owed, and what each relay said.
@@ -10447,8 +11345,10 @@ fn saveOutbox() void {
     // second, three small numbers and a newline. Sized at the worst case rather
     // than the typical one, because a short buffer would drop the LAST entries,
     // which is exactly when the queue matters most.
-    var buf: [outbox_cap * 100]u8 = undefined;
+    var buf: [outbox_cap * 100 + 32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
+    // The list those ack bits were recorded against, first.
+    w.print("pool {d}\n", .{relayListFingerprint()}) catch return;
     for (entries[0..n]) |e| {
         var hex: [64]u8 = undefined;
         writeHexId(&hex, e.id);
@@ -10478,8 +11378,15 @@ fn loadOutbox() void {
     // read transaction, and the lock may not span IO.
     var parsed: [outbox_cap]OutboxEntry = undefined;
     var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+    // Whether the ack bits still refer to the relays they were written for.
+    var same_pool = false;
     var n: usize = 0;
     while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "pool ")) {
+            const saved = std.fmt.parseInt(u64, line["pool ".len..], 10) catch 0;
+            same_pool = saved == relayListFingerprint();
+            continue;
+        }
         if (n == parsed.len) break;
         var parts = std.mem.splitScalar(u8, line, ':');
         const hex = parts.next() orelse continue;
@@ -10494,7 +11401,12 @@ fn loadOutbox() void {
         const se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
         var owned = se;
         owned.deinit();
-        parsed[n] = .{ .used = true, .id = id, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds };
+        // A note is kept whatever the list did; only the CLAIMS about who has it
+        // are dropped, so it is offered again rather than assumed delivered.
+        parsed[n] = if (same_pool)
+            .{ .used = true, .id = id, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds }
+        else
+            .{ .used = true, .id = id, .queued_at = queued_at };
         n += 1;
     }
     outboxLock();
@@ -10605,7 +11517,13 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    for (relays, 0..) |url, i| {
+    for (0..relaySlots()) |i| {
+        const entry = relayAt(i) orelse continue;
+        // Only where the reader asked to be published. The slot index is what
+        // the outbox records an acknowledgement against, which is why a slot is
+        // never reused for a different relay while the process lives.
+        if (!entry.write) continue;
+        const url = entry.url();
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
         relay.publish(ev) catch continue;
@@ -10776,7 +11694,12 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     var root_hex: [64]u8 = undefined;
     hexLower(&root_hex, root_id);
 
-    for (relays) |url| {
+    for (0..relaySlots()) |ri| {
+        const entry = relayAt(ri) orelse continue;
+        // A read-only or read-write relay. Asking a write-only relay to answer
+        // a filter is asking the wrong question of it.
+        if (!entry.read) continue;
+        const url = entry.url();
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
 
@@ -11295,12 +12218,19 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     };
     g_store = store;
 
-    // One ingest thread per relay in the pool. Each dials independently, so a
-    // slow or down relay never holds up the others, and all write into the one
-    // shared store (LMDB serialises the concurrent writers).
-    for (0..relays.len) |i| {
+    // The reader's own list, or the one the app was born with. Read before the
+    // threads start, so the first dial goes where they asked.
+    loadRelays(io, environ);
+
+    // One ingest thread per SLOT, not per relay: a slot's thread outlives the
+    // relay in it, so adding one later is a slot claim rather than a thread
+    // spawn from the UI, and removing one leaves a thread that finds the slot
+    // dormant and waits. Each dials independently, so a slow or down relay never
+    // holds up the others, and all write into the one shared store (LMDB
+    // serialises the concurrent writers).
+    for (0..max_relays) |i| {
         const thread = std.Thread.spawn(.{}, ingestRelay, .{ gpa, i }) catch |err| {
-            std.debug.print("plaza: [{s}] could not start: {s}\n", .{ relays[i], @errorName(err) });
+            std.debug.print("plaza: [{s}] could not start: {s}\n", .{ relayUrlAt(i), @errorName(err) });
             setRelayStatus(i, .offline);
             continue;
         };
@@ -11733,6 +12663,13 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     defer signer.deinit();
 
     while (true) {
+        // An empty slot is not an error: it is a seat kept for a relay the
+        // reader may add. It costs a sleeping thread and nothing else.
+        if (relayAt(index) == null) {
+            setRelayStatus(index, .offline);
+            io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
+            continue;
+        }
         // A paused pool never dials. The reader still has the whole store, so
         // pausing costs them nothing but the live tail.
         if (relaysPaused()) {
@@ -11742,7 +12679,7 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
         }
         setRelayStatus(index, .connecting);
         ingestOnce(gpa, io, signer, index) catch |err| {
-            std.debug.print("plaza: [{s}] {s}\n", .{ relays[index], @errorName(err) });
+            std.debug.print("plaza: [{s}] {s}\n", .{ relayUrlAt(index), @errorName(err) });
         };
         setRelayStatus(index, .offline);
         clearRelayRtt(index);
@@ -11753,7 +12690,21 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
 /// Dials relay `index`, subscribes for recent kind:1, and ingests each event
 /// into the shared store until the connection closes.
 fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, index: usize) !void {
-    var relay = try nostr.relay.dial(gpa, io, relays[index]);
+    // Read fresh each time round: the reader may have changed this slot's URL,
+    // or emptied it, since the last dial.
+    const entry = relayAt(index) orelse return error.RelayRemoved;
+    // Copied under the lock, and the length read ONCE: the reader can retype
+    // this slot mid-dial, and a length that changed between the slice and the
+    // copy would dial a torn address.
+    var url_buf: [96]u8 = undefined;
+    lockRelayTable();
+    const url_len = entry.url_len;
+    @memcpy(url_buf[0..url_len], entry.url_buf[0..url_len]);
+    const reads = entry.read;
+    unlockRelayTable();
+    const url = url_buf[0..url_len];
+    if (url.len == 0) return error.RelayRemoved;
+    var relay = try nostr.relay.dial(gpa, io, url);
     defer relay.deinit();
     setRelayStatus(index, .connected);
 
@@ -11767,12 +12718,18 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         authors_len += 1;
     }
     const feed_kinds = [_]u16{1};
-    const profile_kinds = [_]u16{0};
+    // kind:0 is who they are, kind:10002 is where they are: the reader's own
+    // relay list, and the relays their follows write to, which is what makes a
+    // suggestion under the add field a fact rather than a guess.
+    const profile_kinds = [_]u16{ 0, relay_list_kind };
     const filters = [_]nostr.filter.Filter{
         .{ .authors = &starter_pack, .kinds = &feed_kinds, .limit = feed_capacity },
         .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
     };
-    try relay.subscribe("plaza-feed", &filters);
+    // A relay marked write-only is not asked anything. It keeps its socket, so a
+    // note goes out the moment it is written, but no filter of this reader's
+    // ever reaches it: that is the whole difference the badge promises.
+    if (reads) try relay.subscribe("plaza-feed", &filters);
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
     // feed REQ asks for a 300-note backlog plus profiles, so timing it measures
@@ -11804,6 +12761,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // Time to re-probe? `receive()` blocks with no deadline, so the probe
         // rides the next message rather than a timer; a relay too quiet to carry
         // one is also a relay whose latency nobody is waiting on.
+        //
+        // A write-only relay is probed too: one newest note, which says nothing
+        // about who this reader follows or reads, and its answer is the latency
+        // shown beside a relay they do use.
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         if (probe_at == 0 and (probed_at == 0 or now_ms - probed_at > probe_interval_ms)) {
             const probe_filters = [_]nostr.filter.Filter{.{ .kinds = &feed_kinds, .limit = 1 }};
@@ -11821,6 +12782,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
                     if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);
+                    if (e.event.kind == relay_list_kind) ingestRelayList(e.event);
                     // Note this feed post so its engagement can be watched. Bounded
                     // to keep the `#e` filter a size relays accept.
                     if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {

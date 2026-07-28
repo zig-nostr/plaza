@@ -1033,9 +1033,11 @@ test "the status bar summarises the relay pool" {
 
     // Some relays live: the status bar shows the live count out of the pool
     // (the dot beside it carries the color; the text carries the fact).
+    main.resetRelaysForTest();
     var live = main.initialModel();
     live.stage = .ready;
     live.live_relays = 3;
+    live.relay_count = main.relayCount();
     const live_tree = try buildTree(arena, &live);
     try testing.expect(findAnyText(live_tree.root, "3/5 relays") != null);
 
@@ -1043,6 +1045,7 @@ test "the status bar summarises the relay pool" {
     var down = main.initialModel();
     down.stage = .ready;
     down.offline_relays = 5;
+    down.relay_count = main.relayCount();
     const down_tree = try buildTree(arena, &down);
     try testing.expect(findAnyText(down_tree.root, "Can't reach any relay. Retrying…") != null);
     try testing.expect(findAnyText(down_tree.root, "0/5 relays") != null);
@@ -1929,6 +1932,7 @@ test "the relay chip goes green at four fifths, the way the design's bar does" {
     // The redesign's at-rest bar reads "4/5 relays" in green while its working
     // bar reads "3/5" in amber, so the healthy line sits at four fifths, not at
     // every relay. A bar that goes amber for one straggler is a bar nobody reads.
+    main.resetRelaysForTest();
     try testing.expect(main.poolIsHealthyForTest(5));
     try testing.expect(main.poolIsHealthyForTest(4));
     try testing.expect(!main.poolIsHealthyForTest(3));
@@ -3354,4 +3358,160 @@ test "an insert that will not fit is refused, not truncated" {
     main.insertMentionForTest(&model, [_]u8{0x7a} ** 32);
     try testing.expect(std.mem.indexOf(u8, model.draft(), "nostr:npub1") != null);
     try testing.expect(model.draft().len > 60);
+}
+
+test "a relay badge walks the three things a relay can be for" {
+    // NIP-65's whole vocabulary is read and write. The badge walks both, then
+    // read, then write, and back: a relay that is neither is a relay you have
+    // removed, and there is a button for that.
+    main.resetRelaysForTest();
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = true, .write = true }), main.relayReadWriteForTest(0));
+    main.cycleRelayForTest(0);
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = true, .write = false }), main.relayReadWriteForTest(0));
+    main.cycleRelayForTest(0);
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = false, .write = true }), main.relayReadWriteForTest(0));
+    main.cycleRelayForTest(0);
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = true, .write = true }), main.relayReadWriteForTest(0));
+}
+
+test "a removed relay leaves its seat, and the next add takes it back" {
+    // A slot index is a promise: the outbox's ack bits and the per-note relay
+    // marks both name one. Removing must therefore empty a seat, never shift
+    // the seats after it.
+    main.resetRelaysForTest();
+    const before = main.relaySlots();
+    main.removeRelayForTest(1);
+    try testing.expect(main.relayAt(1) == null);
+    // The relay in slot 2 did not slide down into the hole.
+    try testing.expect(main.relayAt(2) != null);
+    try testing.expectEqual(before, main.relaySlots());
+
+    // And the empty seat is reused, so remove-then-add does not consume the pool.
+    try testing.expectEqual(@as(?usize, 1), main.addRelayForTest("wss://relay.example.com", true, true));
+    try testing.expectEqual(before, main.relaySlots());
+}
+
+test "the pool refuses what is not a relay, and refuses to overflow" {
+    main.resetRelaysForTest();
+    try testing.expect(!main.isRelayUrl("https://relay.example.com"));
+    try testing.expect(!main.isRelayUrl("wss://localhost"));
+    try testing.expect(!main.isRelayUrl("wss://user:pass@relay.example.com"));
+    // A follow's published list really does carry plain `ws://` relays, and
+    // taking one would put every filter this reader sends on the wire in clear.
+    try testing.expect(!main.isRelayUrl("ws://relay.example.com"));
+    try testing.expect(main.isRelayUrl("wss://relay.example.com"));
+
+    // The bootstrap five plus three more is the cap; the ninth is refused
+    // rather than silently dropped, because the card says so.
+    try testing.expect(main.addRelayForTest("wss://a.example.com", true, true) != null);
+    try testing.expect(main.addRelayForTest("wss://b.example.com", true, true) != null);
+    try testing.expect(main.addRelayForTest("wss://c.example.com", true, true) != null);
+    try testing.expect(main.addRelayForTest("wss://d.example.com", true, true) == null);
+    // Adding one already in the pool returns its seat rather than taking a new one.
+    try testing.expectEqual(@as(?usize, 0), main.addRelayForTest("wss://relay.damus.io", true, true));
+}
+
+test "their published relay list becomes the pool, once, and never over an edit" {
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://one.example.com" },
+        &.{ "r", "wss://two.example.com", "read" },
+        &.{ "r", "wss://three.example.com", "write" },
+        // Junk in a tag is not a relay: it is skipped, not dialed.
+        &.{ "r", "http://four.example.com" },
+        &.{"p"},
+    };
+    var ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{7} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+
+    main.resetRelaysForTest();
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://one.example.com", main.relayUrlAt(0));
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = true, .write = true }), main.relayReadWriteForTest(0));
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = true, .write = false }), main.relayReadWriteForTest(1));
+    try testing.expectEqual(@as(?main.RelayUse, .{ .read = false, .write = true }), main.relayReadWriteForTest(2));
+    try testing.expectEqual(@as(usize, 3), main.relayCount());
+    try testing.expect(main.relayIsMineForTest());
+
+    // A second list does not get to arrive: the pool is theirs now, and a later
+    // event must not undo what they set here.
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(!main.adoptRelayListForTest());
+
+    // An edit made while an event was in flight wins over the event.
+    main.resetRelaysForTest();
+    main.stageOwnRelayListForTest(ev);
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.markRelaysMineForTest();
+    try testing.expect(!main.adoptRelayListForTest());
+
+    // A list with nothing usable in it is not a list: keeping five relays beats
+    // being left with none.
+    const empty_tags = [_]nostr.event.Tag{&.{ "r", "http://nope.example.com" }};
+    ev.tags = &empty_tags;
+    main.resetRelaysForTest();
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(!main.adoptRelayListForTest());
+    try testing.expectEqual(@as(usize, 5), main.relayCount());
+}
+
+test "a follow's relay list is a suggestion, and only where they write" {
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://writes.example.com", "write" },
+        &.{ "r", "wss://both.example.com" },
+        // Where they only READ will never hold their notes, so it buys nothing.
+        &.{ "r", "wss://reads.example.com", "read" },
+        // Already in the pool: not worth offering.
+        &.{ "r", "wss://relay.damus.io" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{9} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.resetRelaysForTest();
+    main.ingestRelayListForTest(ev);
+    try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://writes.example.com", main.relaySuggestionCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://both.example.com", main.relaySuggestionCopy(1, &buf).?);
+
+    // The same list again adds nothing: a suggestion is a fact, not a tally.
+    main.ingestRelayListForTest(ev);
+    try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+}
+
+test "one relay under two spellings is one relay" {
+    // A relay is an address, not text: the scheme's case and a trailing slash
+    // carry nothing, and a list holding both spellings would dial twice.
+    try testing.expect(main.relayUrlEql("wss://relay.example.com", "wss://relay.example.com/"));
+    try testing.expect(main.relayUrlEql("WSS://Relay.example.com", "wss://relay.example.com"));
+    try testing.expect(!main.relayUrlEql("wss://relay.example.com", "wss://relay.example.org"));
+    try testing.expectEqualStrings("relay.example.com", main.relayShortName("wss://relay.example.com/"));
+}
+
+test "the ack denominator counts only relays a note is actually sent to" {
+    // An outbox entry is owed to the relays that take writes. A relay the reader
+    // set to read-only was never asked to hold the note, so counting it would
+    // leave every note permanently short of its acks.
+    main.resetRelaysForTest();
+    try testing.expectEqual(@as(usize, 5), main.writeRelayCount());
+    main.cycleRelayForTest(0); // R·W -> R
+    try testing.expectEqual(@as(usize, 4), main.writeRelayCount());
+    main.cycleRelayForTest(0); // R -> W
+    try testing.expectEqual(@as(usize, 5), main.writeRelayCount());
+    main.removeRelayForTest(0);
+    try testing.expectEqual(@as(usize, 4), main.writeRelayCount());
+    try testing.expectEqual(@as(usize, 4), main.relayCount());
 }
