@@ -3310,3 +3310,48 @@ test "an empty composer cannot be posted, by button or by key" {
     main.update(&model, .post, &fx);
     try testing.expect(model.composing);
 }
+
+test "a draft cannot be published without a composer to see it in" {
+    // The message is reachable from more places than the button that names it,
+    // and a draft restored from disk must never leave the machine without the
+    // reader seeing it in a composer. Publishing from a closed sheet, from
+    // Settings, or as a guest are all the same mistake.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.draft_buffer = @TypeOf(model.draft_buffer).init("a note restored from the last launch");
+
+    // Closed sheet: nothing goes.
+    model.composing = false;
+    main.update(&model, .post, &fx);
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+    try testing.expect(!model.draft_empty());
+
+    // On another screen, sheet flag notwithstanding.
+    model.composing = true;
+    model.stage = .settings;
+    main.update(&model, .post, &fx);
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+    try testing.expect(!model.draft_empty());
+}
+
+test "an insert that will not fit is refused, not truncated" {
+    // The draft buffer truncates in silence, and half a bech32 reference is one
+    // no client can resolve, published without a word of warning.
+    var model = main.initialModel();
+    var long: [500]u8 = undefined;
+    @memset(&long, 'x');
+    long[499] = '@';
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(&long);
+    const before = model.draft();
+
+    main.insertMentionForTest(&model, [_]u8{0x7a} ** 32);
+    // Unchanged: it did not fit, so it did not happen.
+    try testing.expectEqualStrings(before, model.draft());
+
+    // With room, it lands whole and ends in a resolvable reference.
+    model.draft_buffer = @TypeOf(model.draft_buffer).init("thanks @gi");
+    main.insertMentionForTest(&model, [_]u8{0x7a} ** 32);
+    try testing.expect(std.mem.indexOf(u8, model.draft(), "nostr:npub1") != null);
+    try testing.expect(model.draft().len > 60);
+}

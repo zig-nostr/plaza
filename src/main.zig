@@ -5165,10 +5165,6 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
-    /// Escape: closes whatever is on top, one layer at a time. Which layer that
-    /// is depends on the model, so the key names the intent and `update`
-    /// decides, rather than four shortcuts racing to own the same key.
-    dismiss_top,
     /// Replaces the `@word` being typed with a real reference to this key.
     insert_mention: [32]u8,
     /// Close whatever chrome menu is open (Escape, or a press outside it).
@@ -5558,13 +5554,25 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 /// path rather than the knowledgeable one.
 fn insertMention(model: *Model, pubkey: [32]u8) void {
     const text = model.draft();
-    const at = std.mem.lastIndexOfScalar(u8, text, '@') orelse return;
-    var buf: [note_content_cap]u8 = undefined;
+    // Through the same reader the picker used, so the cut is the run being
+    // typed and never, say, the domain of an address written earlier.
+    const query = mentionQuery(text) orelse return;
+    const at = text.len - query.len - 1;
     var scratch: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const npub = nostr.nip19.encodeNpub(fba.allocator(), pubkey) catch return;
+    // Sized to what the draft can actually hold, so an insert that will not fit
+    // is REFUSED rather than written short: the buffer truncates in silence,
+    // and half a bech32 reference is one no client can resolve, published
+    // without a word of warning.
+    var buf: [compose_capacity]u8 = undefined;
     const written = std.fmt.bufPrint(&buf, "{s}nostr:{s} ", .{ text[0..at], npub }) catch return;
     model.draft_buffer = @TypeOf(model.draft_buffer).init(written);
+    g_draft_dirty = true;
+}
+
+pub fn insertMentionForTest(model: *Model, pubkey: [32]u8) void {
+    insertMention(model, pubkey);
 }
 
 /// One candidate for a mention, and why it is where it is in the list.
@@ -9440,9 +9448,7 @@ const PlazaApp = native_sdk.UiApp(Model, Msg);
 /// where the model is, not here: this only names the intent.
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "new-note")) return .open_compose;
-    if (std.mem.eql(u8, name, "post-note")) return .post;
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
-    if (std.mem.eql(u8, name, "dismiss")) return .dismiss_top;
     return null;
 }
 const Effects = PlazaApp.Effects;
@@ -9509,6 +9515,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // flight is skipped.
                 if (liveRelayCount() > 0) drainOutbox(std.heap.page_allocator);
                 sweepOutbox(now);
+                // At most one write a second, and only when something changed.
+                if (g_draft_dirty) {
+                    g_draft_dirty = false;
+                    saveDraft(model.draft());
+                }
                 const counts = outboxCounts();
                 model.outbox_pending = counts.trying;
                 model.outbox_stuck = counts.stuck;
@@ -9569,17 +9580,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
+            // Marked, not written: the tick flushes it. Saving on CLOSE alone
+            // was the wrong half, because the state a writer is in when the
+            // machine sleeps or the app is killed is the sheet OPEN.
+            g_draft_dirty = true;
             // The user is composing again: retire a stale "signer didn't respond".
             g_remote_sign_notice.store(false, .release);
         },
         .post => {
-            // A KEY can reach this where the button could not: the button is
-            // disabled on an empty draft, so until Cmd+Enter existed this
-            // message never arrived with nothing to send. Closing the sheet and
-            // saying "Posted" over an empty composer would be the plainest lie
-            // in the app.
+            // Every precondition, before anything is signed or said. A message
+            // is reachable from more places than the button that names it: the
+            // field's own submit chord, a future menu entry, a key. Publishing
+            // is not something to do on a model that was not showing a
+            // composer, and a draft restored from disk must never leave the
+            // machine without the reader seeing it in one.
+            if (!model.composing or model.stage != .ready or model.is_guest()) return;
             if (model.draft_empty()) return;
             submitPost(model, fx);
+            // The slot is emptied the moment its contents go to a signer.
+            // Leaving it would restore an already-published note into the next
+            // launch's composer, one keystroke from being posted twice.
+            saveDraft("");
             // Posting closes the sheet; the note is already local and will
             // appear on the next tick.
             model.composing = false;
@@ -9596,26 +9617,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.joining = true;
                 model.pending_compose = true;
             } else model.composing = true;
-        },
-        .dismiss_top => {
-            // Topmost first: a menu over a sheet over a thread. Each press
-            // closes exactly one thing, which is what makes the key learnable.
-            if (model.menu != .none) {
-                model.menu = .none;
-            } else if (model.expanded_note != 0) {
-                model.expanded_note = 0;
-            } else if (model.composing) {
-                model.composing = false;
-                saveDraft(model.draft());
-            } else if (model.joining) {
-                model.joining = false;
-            } else if (model.stage == .settings) {
-                model.logout_pending = false;
-                model.reveal_nsec = false;
-                model.stage = .ready;
-            } else if (model.viewing_thread != 0) {
-                closeThread(model);
-            }
         },
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
@@ -11613,6 +11614,9 @@ fn saveSettings() void {
 /// Where an unsent draft waits between launches. One slot, because the composer
 /// is one sheet: a list of drafts is a different feature and the plan says so.
 const draft_file = "draft";
+/// Set by an edit, cleared by the tick that writes it: a keystroke must not
+/// carry a file write, and a file write must not wait for the sheet to close.
+var g_draft_dirty = false;
 
 /// Keeps what was written but not sent. The composer already survives being
 /// closed within a session; this is what makes it survive the app quitting,
@@ -11698,6 +11702,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
+    // And off the disk. An unfinished note is the previous account's private
+    // thinking; leaving it would hand it to whoever signs in next, in their
+    // composer, one keystroke from being published under THEIR key.
+    saveDraft("");
     model.logout_pending = false;
     model.reveal_nsec = false;
     model.notes_len = 0;
