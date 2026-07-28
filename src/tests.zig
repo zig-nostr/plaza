@@ -3174,9 +3174,18 @@ test "the queue stops asking, and lets go of what landed" {
     const stuck = [_]u8{0xc9} ** 32;
     try testing.expect(main.enqueueOutboxForTest(stuck, 1000));
     for (0..main.max_outbox_rounds_for_test) |_| main.countOutboxRoundForTest(stuck);
+    // It stops ASKING, and it stays: erasing a note the reader wrote, because
+    // no relay would take it, is the one thing this queue exists to prevent.
     main.sweepOutboxForTest(1000);
-    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+    const counts = main.outboxCounts();
+    try testing.expectEqual(@as(usize, 0), counts.trying);
+    try testing.expectEqual(@as(usize, 1), counts.stuck);
+    var stuck_entries: [16]main.OutboxEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), main.outboxSnapshot(&stuck_entries));
+    try testing.expectEqual(main.OutboxState.stuck, stuck_entries[0].state());
 
+    // A fresh queue for the other half: the stuck note above stays by design.
+    main.resetOutboxForTest();
     const landed = [_]u8{0xda} ** 32;
     try testing.expect(main.enqueueOutboxForTest(landed, 2000));
     main.recordOutboxAckForTest(landed, 0, true);
@@ -3234,4 +3243,33 @@ test "the offline banner says what still works" {
     model.outbox_pending = 3;
     const text = main.offlineBannerTextForTest(arena, model.outbox_pending);
     try testing.expect(std.mem.indexOf(u8, text, "3 notes are") != null);
+}
+
+test "a note that gave up is not called posting" {
+    // The zone's words follow the state, because "posting" over a note that will
+    // never go is the same lie the queue was built to stop telling.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.outbox_pending = 0;
+    model.outbox_stuck = 1;
+    try testing.expectEqualStrings("1 note did not go out", model.outbox_label(arena));
+    model.outbox_stuck = 3;
+    try testing.expectEqualStrings("3 notes did not go out", model.outbox_label(arena));
+
+    // Still trying wins the label: what is moving matters more than what stalled.
+    model.outbox_pending = 2;
+    try testing.expectEqualStrings("posting 2 notes…", model.outbox_label(arena));
+}
+
+test "a stuck note is offered again, but not every second" {
+    // Without spacing, the drain runs each tick and burns every round within
+    // seconds of a transient failure, leaving a note stuck moments after it was
+    // written.
+    try testing.expectEqual(@as(i64, 0), main.outboxRetryDelayForTest(0));
+    try testing.expect(main.outboxRetryDelayForTest(1) > 0);
+    try testing.expect(main.outboxRetryDelayForTest(3) > main.outboxRetryDelayForTest(2));
+    try testing.expect(main.outboxRetryDelayForTest(5) >= 300);
 }
