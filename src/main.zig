@@ -2937,6 +2937,11 @@ pub const Model = struct {
     /// Which chrome menu is open, if any. One at a time: opening one closes the
     /// rest, and Escape or a press outside closes whatever is open.
     menu: ChromeMenu = .none,
+    /// Notes still owed to the relays, sampled on the tick: the queue itself is
+    /// written by the publisher's thread, so the view reads this snapshot rather
+    /// than the queue, and one frame never disagrees with itself.
+    outbox_pending: usize = 0,
+    outbox_stuck: usize = 0,
     /// Whether a level is showing its replies from outside the follow graph, and
     /// how many pages of replies it has revealed. PER LEVEL, indexed like the
     /// back-stack: a level stays mounted while the reader walks into a reply and
@@ -3218,6 +3223,20 @@ pub const Model = struct {
     pub fn previews_action(self: *const Model) []const u8 {
         _ = self;
         return if (g_media_previews) "Turn off" else "Turn on";
+    }
+    /// How many notes are still waiting for their first relay. Read once per
+    /// build, because the publisher writes the queue from its own thread and the
+    /// view must see one answer for the whole frame.
+    pub fn outbox_label(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        // A note that gave up is not "posting". Saying so would be the same lie
+        // the queue was built to stop telling.
+        if (self.outbox_pending == 0 and self.outbox_stuck > 0) {
+            if (self.outbox_stuck == 1) return "1 note did not go out";
+            return std.fmt.allocPrint(arena, "{d} notes did not go out", .{self.outbox_stuck}) catch "notes did not go out";
+        }
+        const n = self.outbox_pending;
+        if (n == 1) return "posting 1 note…";
+        return std.fmt.allocPrint(arena, "posting {d} notes…", .{n}) catch "posting…";
     }
     /// The app version line for the Settings footer.
     pub fn version_line(self: *const Model) []const u8 {
@@ -5108,7 +5127,7 @@ fn utf8SafeLen(s: []const u8, max: usize) usize {
 /// The chrome's anchored menus. These are floating surfaces positioned against
 /// their trigger, so each one is drawn as the trigger's sibling inside a stack
 /// and rendered only while it is the open one.
-pub const ChromeMenu = enum { none, scope, relays, account };
+pub const ChromeMenu = enum { none, scope, relays, account, outbox };
 
 pub const Msg = union(enum) {
     /// The repeating refresh timer fired: reconcile the feed with the store.
@@ -7101,6 +7120,8 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
 
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
+        // Under the guest strip, because being signed out is the bigger fact.
+        offlineBanner(ui, model),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
@@ -7360,6 +7381,7 @@ fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
                 .semantics = "Refresh the feed",
             }),
             ui.spacer(1),
+            outboxZone(ui, model),
             relayZone(ui, model),
             hgap(ui, 4),
             signerZone(ui, model),
@@ -7589,6 +7611,137 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
 /// The relay zone: the pool's health, and the popover that explains it. The chip
 /// is highlighted while the pool is healthy, because that is when the number is
 /// worth reading at a glance; a degraded pool speaks through its dot instead.
+/// The banner 11p draws when no relay is answering. It says what still works,
+/// which is nearly everything: the store is the app, so reading continues, and a
+/// note written now is queued rather than refused. A spinner would say the
+/// opposite.
+fn offlineBanner(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    if (liveRelayCount() > 0) return ui.spacer(0);
+    const queued = model.outbox_pending;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_offline, .border = p.border_offline, .radius = 8, .stroke_width = 1 },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 11),
+                    ui.column(.{ .gap = 0 }, .{
+                        vgap(ui, 8),
+                        ui.row(.{ .cross = .center, .gap = 0 }, .{
+                            ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_warning } }, "alert"),
+                            hgap(ui, 8),
+                            ui.paragraph(
+                                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.status_warning_text } },
+                                &.{.{ .text = offlineBannerText(ui, queued), .scale = meta_scale }},
+                            ),
+                        }),
+                        vgap(ui, 8),
+                    }),
+                    hgap(ui, 11),
+                }),
+            }),
+            hgap(ui, chrome_inset),
+        }),
+    });
+}
+
+/// What the banner says, which depends on whether anything is owed.
+fn offlineBannerText(ui: *AppUi, queued: usize) []const u8 {
+    if (queued == 0) return "No relay is answering. Reading continues from this machine; anything you write is kept until one does.";
+    return ui.fmt("No relay is answering. Reading continues from this machine, and {d} {s} waiting to go out.", .{ queued, if (queued == 1) "note is" else "notes are" });
+}
+
+pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return offlineBannerText(&ui, queued);
+}
+
+/// What the app still owes the reader. Absent when nothing is queued, which is
+/// most of the time: a zone that is always there teaches nothing, and an empty
+/// popover under it would be worse.
+///
+/// Amber, because this is work in progress rather than a warning: a note on its
+/// way is the ordinary case. The glyph takes the text's own hex, not the
+/// brighter alert amber.
+fn outboxZone(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    if (model.outbox_pending == 0 and model.outbox_stuck == 0) return ui.spacer(0);
+    const stuck = model.outbox_pending == 0 and model.outbox_stuck > 0;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = 22,
+            .cross = .center,
+            .on_press = Msg{ .toggle_menu = .outbox },
+            .style = .{ .radius = 6, .background = if (model.menu == .outbox) p.surface_chip else null },
+            .semantics = .{ .role = .button, .label = "Notes on their way", .focusable = true },
+        }, .{
+            hgap(ui, 7),
+            // A runtime choice of glyph, so `appIcon` rather than the
+            // comptime-checked `icon`.
+            ui.appIcon(.{ .width = 11, .height = 11, .style = .{ .foreground = if (stuck) p.status_offline else p.status_warning_text } }, if (stuck) "alert" else "arrow-up"),
+            hgap(ui, 6),
+            ui.paragraph(
+                .{ .style = .{ .foreground = if (stuck) p.status_offline else p.status_warning_text } },
+                &.{.{ .text = model.outbox_label(ui.arena), .scale = status_scale }},
+            ),
+            hgap(ui, 7),
+        }),
+        if (model.menu == .outbox) outboxMenu(ui) else ui.spacer(0),
+        hgap(ui, 4),
+    });
+}
+
+/// One card per note on its way, newest first. No mock exists for this surface;
+/// it is the smallest thing that answers the question the zone raises, which is
+/// "which note, and how far did it get".
+fn outboxMenu(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    var entries: [outbox_cap]OutboxEntry = undefined;
+    const n = outboxSnapshot(&entries);
+    if (n == 0) return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, n) catch return ui.spacer(0);
+    for (rows, entries[0..n]) |*row, e| {
+        const title = switch (e.state()) {
+            .queued => "Waiting for a relay",
+            .sending => "Sending",
+            .sent => "Sent",
+            .stuck => "No relay took it",
+        };
+        row.* = ui.column(.{ .gap = 0 }, .{
+            vgap(ui, 6),
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 9),
+                ui.el(.panel, .{ .width = 6, .height = 6, .padding = 0.01, .style = .{
+                    .background = switch (e.state()) {
+                        .queued => p.status_offline,
+                        .sending => p.status_warning_text,
+                        .sent => p.status_success,
+                        .stuck => p.status_offline,
+                    },
+                    .radius = 3,
+                    .stroke_width = 0,
+                } }, .{}),
+                hgap(ui, 8),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_secondary } }, &.{.{ .text = title, .weight = .medium, .scale = menu_scale }}),
+                ui.spacer(1),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = ui.fmt("{d}/{d} relays", .{ e.ackCount(), relays.len }), .monospace = true, .scale = mono_hint_scale }},
+                ),
+                hgap(ui, 9),
+            }),
+            vgap(ui, 6),
+        });
+    }
+    return menuSurface(ui, 240, rows);
+}
+
 fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const paused = model.relays_paused;
@@ -9065,6 +9218,10 @@ pub const EffectsForTest = Effects;
 /// arm the repeating timers.
 pub fn boot(model: *Model, fx: *Effects) void {
     model.refresh(nowSeconds());
+    // What was owed when the app last closed. Read before the first frame, so a
+    // note written offline yesterday is visible as owed rather than lost, and
+    // offered again as soon as a relay answers.
+    loadOutbox();
     // Local-first, all the way to the first frame: cached avatars and pictures
     // are registered here, so a returning user gets faces WITH the notes rather
     // than a tick later. Only what is on disk resolves now; the rest is fetched
@@ -9107,6 +9264,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
                 model.refreshThreadNotes(now);
+                // Anything still owed goes back out whenever a relay is up: this
+                // is the drain, and it is idempotent, since an entry already in
+                // flight is skipped.
+                if (liveRelayCount() > 0) drainOutbox(std.heap.page_allocator);
+                sweepOutbox(now);
+                const counts = outboxCounts();
+                model.outbox_pending = counts.trying;
+                model.outbox_stuck = counts.stuck;
+                if (g_outbox_rev.load(.monotonic) != g_outbox_saved_rev) {
+                    g_outbox_saved_rev = g_outbox_rev.load(.monotonic);
+                    saveOutbox();
+                }
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
                 assignAvatarSlots(fx, model);
@@ -9704,8 +9873,453 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
         // stop it reaching the pool.
         _ = store.ingest(gpa, ev, .{}) catch {};
     }
-    const thread = std.Thread.spawn(.{}, publishEvent, .{ gpa, ev }) catch return;
+    // Queued BEFORE the walk, so a note that never reaches a relay is still a
+    // note the app knows it owes the reader. A queue with no room says so:
+    // publishing anyway would be a note nobody is tracking while the banner
+    // promises that anything written is kept.
+    if (!enqueueOutbox(ev.id, nowSeconds())) {
+        g_outbox_overflow.store(true, .monotonic);
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, publishWorker, .{ gpa, ev }) catch {
+        // No thread: the note stays queued and the next drain will carry it.
+        return;
+    };
     thread.detach();
+}
+
+/// One publish walk for `ev`, with the queue updated around it.
+fn publishWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    markOutboxSending(ev.id, true);
+    publishEvent(gpa, ev);
+    markOutboxSending(ev.id, false);
+}
+
+fn markOutboxSending(id: [32]u8, sending: bool) void {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return;
+    e.sending = sending;
+    if (!sending) e.rounds +|= 1;
+    _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
+// -------------------------------------------------------------------- the outbox
+//
+// What happens to a note between pressing Post and knowing it is somewhere else.
+//
+// Publishing used to be fire-and-forget: a detached thread dialled every relay,
+// wrote the frame, read one message to flush it, and dropped the verdict. The
+// note was in the local store, so the feed showed it, and whether it ever
+// reached anyone was not a question the app could answer.
+//
+// Now every publish goes through a queue. Each entry names an event that is
+// already in the store's own tables (we ingest what we sign) and carries one bit
+// per relay: did that relay say OK. The queue is the app's answer to "is my note
+// out there", the status bar reads it, and it survives a quit, because a note
+// written on a train and lost on landing is the worst thing a client can do.
+//
+// The queue is small on purpose. It is not a retry engine for a broken network;
+// it is a record of what has not been acknowledged yet, drained whenever a relay
+// comes back.
+
+/// One note on its way out.
+pub const OutboxEntry = struct {
+    used: bool = false,
+    id: [32]u8 = [_]u8{0} ** 32,
+    /// When it was queued, so the popover can say how long it has been waiting
+    /// and the oldest entry can be dropped when the queue is full.
+    queued_at: i64 = 0,
+    /// One bit per pool relay: this relay answered OK.
+    acked: u8 = 0,
+    /// One bit per pool relay: this relay answered, and said no.
+    refused: u8 = 0,
+    /// How many times the publisher has walked the relays for this entry, so a
+    /// note nobody will take stops asking rather than hammering forever.
+    rounds: u8 = 0,
+    /// Whether a publish walk is in flight for this entry right now.
+    sending: bool = false,
+    /// When the last walk started, so the next one waits.
+    last_try_at: i64 = 0,
+
+    /// How many relays have taken it.
+    pub fn ackCount(self: OutboxEntry) usize {
+        return @popCount(self.acked);
+    }
+
+    /// Where this note is, in the words the popover uses.
+    pub fn state(self: OutboxEntry) OutboxState {
+        if (self.acked != 0) return .sent;
+        if (self.sending) return .sending;
+        if (self.rounds >= max_outbox_rounds) return .stuck;
+        return .queued;
+    }
+};
+
+pub const OutboxState = enum { queued, sending, sent, stuck };
+
+/// How long to wait before offering a note again, widening with each attempt so
+/// a relay that is down is asked minutes apart rather than every second.
+fn outboxRetryDelay(rounds: u8) i64 {
+    return switch (rounds) {
+        0 => 0,
+        1 => 5,
+        2 => 20,
+        3 => 60,
+        else => 300,
+    };
+}
+
+/// Set when a note could not be queued at all, so the reader is told rather than
+/// left with a promise the app did not keep.
+var g_outbox_overflow = std.atomic.Value(bool).init(false);
+
+/// Room for a burst of posting without becoming a store of its own. A reader who
+/// writes more than this while offline is past what a status bar can explain.
+const outbox_cap = 16;
+/// How many times a note is offered to the relays before the queue stops asking.
+/// Every round is a full walk of the pool, so this is not a byte-level retry.
+const max_outbox_rounds = 6;
+
+var g_outbox = [_]OutboxEntry{.{}} ** outbox_cap;
+/// Bumped whenever the queue changes, so the UI thread can tell that the
+/// publisher touched something without locking.
+var g_outbox_rev = std.atomic.Value(u32).init(0);
+/// The same tiny spinlock the pending-signature table uses, and for the same
+/// reason: every critical section here is a handful of field writes or a
+/// 16-slot scan and never touches IO, while `std.Io.Mutex` would drag a
+/// per-thread `io` across threads that deliberately never share one.
+var g_outbox_lock = std.atomic.Value(bool).init(false);
+
+fn outboxLock() void {
+    while (g_outbox_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn outboxUnlock() void {
+    g_outbox_lock.store(false, .release);
+}
+
+/// Puts `id` in the queue, or returns the entry already there. The caller holds
+/// the lock.
+fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
+    for (&g_outbox) |*e| {
+        if (e.used and std.mem.eql(u8, &e.id, &id)) return e;
+    }
+    return null;
+}
+
+/// Queues a note we have just signed and stored. Returns false when the queue is
+/// full of notes that have not been acknowledged, which is a state the reader can
+/// see rather than one the app hides.
+fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
+    outboxLock();
+    defer outboxUnlock();
+    if (outboxEntryFor(id) != null) return true;
+    for (&g_outbox) |*e| {
+        if (!e.used) {
+            e.* = .{ .used = true, .id = id, .queued_at = now_s };
+            _ = g_outbox_rev.fetchAdd(1, .monotonic);
+            return true;
+        }
+    }
+    // Full: drop the oldest note that has already reached somebody, since its
+    // record is the least useful thing here.
+    var victim: ?*OutboxEntry = null;
+    for (&g_outbox) |*e| {
+        if (e.acked == 0) continue;
+        if (victim == null or e.queued_at < victim.?.queued_at) victim = e;
+    }
+    const slot = victim orelse return false;
+    slot.* = .{ .used = true, .id = id, .queued_at = now_s };
+    _ = g_outbox_rev.fetchAdd(1, .monotonic);
+    return true;
+}
+
+/// Records what one relay said about one note.
+fn recordOutboxAck(id: [32]u8, relay_index: usize, accepted: bool) void {
+    if (relay_index >= relays.len) return;
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return;
+    const bit = @as(u8, 1) << @intCast(relay_index);
+    if (accepted) e.acked |= bit else e.refused |= bit;
+    _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
+/// A snapshot of the queue for the view, newest first. The view never reads the
+/// queue directly: the publisher writes it from its own thread.
+pub fn outboxSnapshot(out: []OutboxEntry) usize {
+    outboxLock();
+    defer outboxUnlock();
+    var n: usize = 0;
+    for (&g_outbox) |*e| {
+        if (!e.used or n == out.len) continue;
+        out[n] = e.*;
+        n += 1;
+    }
+    std.mem.sort(OutboxEntry, out[0..n], {}, struct {
+        fn lt(_: void, a: OutboxEntry, b: OutboxEntry) bool {
+            return a.queued_at > b.queued_at;
+        }
+    }.lt);
+    return n;
+}
+
+/// How many notes are still trying, and how many have given up. They are
+/// counted apart because they say different things: one is work in progress,
+/// the other is a note the reader wrote that never left.
+pub const OutboxCounts = struct { trying: usize = 0, stuck: usize = 0 };
+
+pub fn outboxCounts() OutboxCounts {
+    outboxLock();
+    defer outboxUnlock();
+    var counts: OutboxCounts = .{};
+    for (&g_outbox) |*e| {
+        if (!e.used or e.acked != 0) continue;
+        if (e.state() == .stuck) counts.stuck += 1 else counts.trying += 1;
+    }
+    return counts;
+}
+
+/// How many notes are still waiting for their first relay, trying or not.
+pub fn outboxPending() usize {
+    const c = outboxCounts();
+    return c.trying + c.stuck;
+}
+
+/// Forgets the notes that are done: acknowledged by somebody, or refused by
+/// everyone that answered after enough rounds. Called once the reader has had a
+/// chance to see them, so the zone does not blink out mid-glance.
+fn sweepOutbox(now_s: i64) void {
+    outboxLock();
+    defer outboxUnlock();
+    var changed = false;
+    for (&g_outbox) |*e| {
+        if (!e.used or e.sending) continue;
+        // A note that LANDED is let go once it has been on screen long enough to
+        // read. A note that did not is KEPT: erasing it would be the app quietly
+        // dropping something the reader wrote, which is the one thing this queue
+        // exists to prevent. It stops asking, and it stays visible as stuck.
+        if (e.acked != 0 and now_s - e.queued_at > outbox_sent_linger_s) {
+            e.* = .{};
+            changed = true;
+        }
+    }
+    if (changed) _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
+/// How long a sent note stays in the queue so the reader can see that it landed.
+const outbox_sent_linger_s: i64 = 20;
+/// The revision last written to disk, so the queue is saved when it changes and
+/// not on every tick.
+var g_outbox_saved_rev: u32 = 0;
+
+/// The queue's own seams, so a test drives the real state machine rather than a
+/// copy of it.
+pub fn resetOutboxForTest() void {
+    outboxLock();
+    defer outboxUnlock();
+    for (&g_outbox) |*e| e.* = .{};
+}
+
+pub fn enqueueOutboxForTest(id: [32]u8, now_s: i64) bool {
+    return enqueueOutbox(id, now_s);
+}
+
+pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
+    recordOutboxAck(id, relay_index, accepted);
+}
+
+pub fn countOutboxRoundForTest(id: [32]u8) void {
+    markOutboxSending(id, true);
+    markOutboxSending(id, false);
+}
+
+pub fn sweepOutboxForTest(now_s: i64) void {
+    sweepOutbox(now_s);
+}
+
+pub fn outboxRetryDelayForTest(rounds: u8) i64 {
+    return outboxRetryDelay(rounds);
+}
+
+pub const max_outbox_rounds_for_test = max_outbox_rounds;
+pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
+
+/// The queue's key in the store's generic table. The events themselves are in
+/// the store's own event tables (we ingest what we sign), so this holds only the
+/// index: which ids are owed, and what each relay said.
+const outbox_key = "outbox";
+
+/// Writes the queue where a restart can find it. A note written on a train and
+/// lost on landing is the worst thing a client can do, so this runs on every
+/// change rather than at exit, which may never come.
+fn saveOutbox() void {
+    const store = g_store orelse return;
+    // Snapshotted under the lock, written outside it. `store.put` opens a write
+    // transaction and commits it, which fsyncs and waits on LMDB's writer mutex
+    // that the ingest threads hold: holding a SPINLOCK across that would burn a
+    // core in every publisher and stall the frame that reads the queue. The lock
+    // is only justified while it is what it claims to be, a few field writes.
+    var entries: [outbox_cap]OutboxEntry = undefined;
+    var n: usize = 0;
+    outboxLock();
+    for (&g_outbox) |*e| {
+        if (!e.used) continue;
+        entries[n] = e.*;
+        n += 1;
+    }
+    outboxUnlock();
+
+    // Room for every entry at its longest: 64 hex, four separators, a ten-digit
+    // second, three small numbers and a newline. Sized at the worst case rather
+    // than the typical one, because a short buffer would drop the LAST entries,
+    // which is exactly when the queue matters most.
+    var buf: [outbox_cap * 100]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    for (entries[0..n]) |e| {
+        var hex: [64]u8 = undefined;
+        writeHexId(&hex, e.id);
+        // A short write means the buffer was mis-sized, so nothing is written at
+        // all: a truncated index would silently lose notes on the next start.
+        w.print("{s}:{d}:{d}:{d}:{d}\n", .{ hex[0..], e.queued_at, e.acked, e.refused, e.rounds }) catch return;
+    }
+    store.put(outbox_key, w.buffered()) catch {};
+}
+
+fn writeHexId(out: *[64]u8, id: [32]u8) void {
+    const hexdigits = "0123456789abcdef";
+    for (id, 0..) |b, i| {
+        out[i * 2] = hexdigits[b >> 4];
+        out[i * 2 + 1] = hexdigits[b & 0x0f];
+    }
+}
+
+/// Reads the queue back at boot. Anything whose event is no longer in the store
+/// is dropped: the index points at events, and an index without its event is not
+/// something the reader can be shown or the app can publish.
+fn loadOutbox() void {
+    const store = g_store orelse return;
+    const raw = (store.get(std.heap.page_allocator, outbox_key) catch return) orelse return;
+    defer std.heap.page_allocator.free(raw);
+    // Parsed and resolved first, installed second: every `getEvent` below opens a
+    // read transaction, and the lock may not span IO.
+    var parsed: [outbox_cap]OutboxEntry = undefined;
+    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        if (n == parsed.len) break;
+        var parts = std.mem.splitScalar(u8, line, ':');
+        const hex = parts.next() orelse continue;
+        if (hex.len != 64) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, hex) catch continue;
+        const queued_at = std.fmt.parseInt(i64, parts.next() orelse "0", 10) catch continue;
+        const acked = std.fmt.parseInt(u8, parts.next() orelse "0", 10) catch 0;
+        const refused = std.fmt.parseInt(u8, parts.next() orelse "0", 10) catch 0;
+        const rounds = std.fmt.parseInt(u8, parts.next() orelse "0", 10) catch 0;
+        // The event has to still be there, or there is nothing to publish.
+        const se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
+        var owned = se;
+        owned.deinit();
+        parsed[n] = .{ .used = true, .id = id, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds };
+        n += 1;
+    }
+    outboxLock();
+    defer outboxUnlock();
+    for (parsed[0..n], g_outbox[0..n]) |src, *dst| dst.* = src;
+}
+
+/// Offers every note that nobody has taken to the relays again. Called when a
+/// relay comes back, which is the moment the answer might have changed.
+fn drainOutbox(gpa: std.mem.Allocator) void {
+    const store = g_store orelse return;
+    var ids: [outbox_cap][32]u8 = undefined;
+    var n: usize = 0;
+    const now = nowSeconds();
+    outboxLock();
+    for (&g_outbox) |*e| {
+        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
+        // Spaced out, and widening: the drain runs every tick, so without this a
+        // transient failure (a captive portal, a TLS error, a relay that takes
+        // the socket and refuses the publish) would burn every round in seconds
+        // and leave the note stuck a moment after it was written.
+        if (e.last_try_at != 0 and now - e.last_try_at < outboxRetryDelay(e.rounds)) continue;
+        if (n == ids.len) break;
+        e.last_try_at = now;
+        ids[n] = e.id;
+        n += 1;
+    }
+    outboxUnlock();
+    for (ids[0..n]) |id| {
+        var se = (store.getEvent(gpa, id) catch continue) orelse continue;
+        defer se.deinit();
+        // COPIED, not borrowed. `StoredEvent.deinit` tears down the arena that
+        // backs the content and the tags, and it would fire at the end of this
+        // iteration, while the detached publisher is still serialising them.
+        // `ingestAndPublish` states the same rule for its own path: what the
+        // publisher reads has to outlive the call that spawned it.
+        const owned = dupeEventForPublish(se.event) orelse continue;
+        const thread = std.Thread.spawn(.{}, publishOwnedWorker, .{ gpa, owned }) catch {
+            freePublishedEvent(owned);
+            continue;
+        };
+        thread.detach();
+    }
+}
+
+/// A process-lifetime copy of an event, for handing to a detached publisher.
+/// Returns null when the copy cannot be made, in which case nothing is spawned.
+fn dupeEventForPublish(ev: nostr.event.Event) ?nostr.event.Event {
+    const gpa = std.heap.page_allocator;
+    var out = ev;
+    out.content = gpa.dupe(u8, ev.content) catch return null;
+    const tags = gpa.alloc(nostr.event.Tag, ev.tags.len) catch {
+        gpa.free(out.content);
+        return null;
+    };
+    var filled: usize = 0;
+    errdefer {
+        for (tags[0..filled]) |t| {
+            for (t) |field| gpa.free(field);
+            gpa.free(t);
+        }
+        gpa.free(tags);
+        gpa.free(out.content);
+    }
+    for (ev.tags, tags) |src, *dst| {
+        const fields = gpa.alloc([]const u8, src.len) catch return null;
+        var wrote: usize = 0;
+        for (src, fields) |field, *slot| {
+            slot.* = gpa.dupe(u8, field) catch {
+                for (fields[0..wrote]) |f| gpa.free(f);
+                gpa.free(fields);
+                return null;
+            };
+            wrote += 1;
+        }
+        dst.* = fields;
+        filled += 1;
+    }
+    out.tags = tags;
+    return out;
+}
+
+/// Frees what `dupeEventForPublish` allocated.
+fn freePublishedEvent(ev: nostr.event.Event) void {
+    const gpa = std.heap.page_allocator;
+    for (ev.tags) |t| {
+        for (t) |field| gpa.free(field);
+        gpa.free(t);
+    }
+    gpa.free(ev.tags);
+    gpa.free(ev.content);
+}
+
+/// The drain's worker: publishes a copy it owns, and frees it when the walk is
+/// over rather than leaving it to a caller that has already moved on.
+fn publishOwnedWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    defer freePublishedEvent(ev);
+    publishWorker(gpa, ev);
 }
 
 /// Publishes `ev` to every relay in the pool, each on a throwaway connection,
@@ -9718,16 +10332,35 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    for (relays) |url| {
+    for (relays, 0..) |url, i| {
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
         defer relay.deinit();
         relay.publish(ev) catch continue;
-        // Read the relay's OK so the frame is flushed and acknowledged before we
-        // close the connection; best-effort, its verdict is not surfaced yet.
-        var msg = (relay.receive() catch continue) orelse continue;
-        msg.deinit();
+        // The relay's OK is the answer to "is my note out there", so it is READ
+        // rather than merely waited for: which relay took it, and which refused,
+        // is the whole content of the outbox. A relay may say other things
+        // first (a NOTICE, an EVENT for an open subscription), so this reads
+        // until it sees a verdict for THIS id or runs out of patience.
+        var seen: usize = 0;
+        while (seen < max_publish_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .ok => |ok| {
+                    if (!std.mem.eql(u8, &ok.event_id, &ev.id)) continue;
+                    recordOutboxAck(ev.id, i, ok.accepted);
+                    break;
+                },
+                else => continue,
+            }
+        }
     }
 }
+
+/// How many frames to read from one relay while waiting for its verdict. A relay
+/// with a busy subscription can have several in front of the OK; past this it is
+/// not answering about this note.
+const max_publish_messages = 8;
 
 // ------------------------------------------------------------------------ threads
 //
