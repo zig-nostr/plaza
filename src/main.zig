@@ -2854,6 +2854,18 @@ pub fn resetProfilesForTest() void {
     g_avatar_clock = 0;
 }
 
+/// Drops a cached avatar. `parseMetadataInto` only ever REPLACES a picture URL,
+/// which is right for an incoming profile (an absent key is silence, not a
+/// removal) and wrong for an edit made here, where clearing the field IS the
+/// removal and the old face would otherwise keep being drawn.
+fn clearProfilePicture(pubkey: [32]u8) void {
+    const profile = lookupProfile(pubkey) orelse return;
+    profile.picture_len = 0;
+    profile.url_len = 0;
+    profile.avatar_state = .idle;
+    profile.image_id = 0;
+}
+
 /// Marks `pubkey`'s profile as having (or not having) a kind:0 picture, so a
 /// test can exercise the avatar-id LRU without a real fetch.
 pub fn setProfilePictureForTest(pubkey: [32]u8, present: bool) void {
@@ -3622,6 +3634,15 @@ pub const Model = struct {
     // whether the app has the reader's current profile to merge into.
     editing_profile: bool = false,
     profile_stage: ProfileStage = .fetching,
+    // Which key the name was read from, so the edit rewrites THAT key.
+    profile_name_key: ProfileNameKey = .display_name,
+    // Whether the sheet has been seeded from the reader's own profile, so the
+    // background fetch landing later never overwrites what they have typed.
+    profile_seeded: bool = false,
+    // A field whose real value did not fit. Left empty and left alone.
+    profile_name_long: bool = false,
+    profile_about_long: bool = false,
+    profile_picture_long: bool = false,
     profile_name_buffer: canvas.TextBuffer(64) = .{},
     profile_about_buffer: canvas.TextBuffer(280) = .{},
     profile_picture_buffer: canvas.TextBuffer(200) = .{},
@@ -3905,15 +3926,28 @@ pub const Model = struct {
             .fetching => "Reading your current profile from your relays…",
             .absent => "You have no profile yet. Saving publishes your first one.",
             .have => "",
-            .saving => "Signing and publishing…",
-            .saved => "Published. Other clients will show it as your relays pass it on.",
+            .saving => "Signing…",
+            .sent => "Saved here and sent to your relays. Other clients will show it as they pass it on.",
             .failed => "Could not sign this. Nothing was published, and your profile is unchanged.",
         };
+    }
+    /// Whether all three fields are still empty, which is the only state where a
+    /// late-arriving profile may fill them in.
+    pub fn profile_untouched(self: *const Model) bool {
+        return self.profile_name_buffer.text().len == 0 and
+            self.profile_about_buffer.text().len == 0 and
+            self.profile_picture_buffer.text().len == 0;
     }
     /// Saving is refused until the app HAS the profile it would be merging into.
     /// Publishing a merge of nothing is how a lightning address disappears.
     pub fn profile_can_save(self: *const Model) bool {
-        return self.profile_stage == .have or self.profile_stage == .absent or self.profile_stage == .failed;
+        // `.sent` stays savable: a reader who spots a typo in the name they just
+        // saved must be able to fix it, and a sheet whose Save is dead after one
+        // press is a sheet they have to close and reopen to use again.
+        return switch (self.profile_stage) {
+            .have, .absent, .failed, .sent => true,
+            .fetching, .saving => false,
+        };
     }
     /// The add-a-relay field's text.
     pub fn relay_draft(self: *const Model) []const u8 {
@@ -6165,7 +6199,7 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
         hgap(ui, 8),
         settingsLink(ui, "Copy npub", Msg.copy_npub),
         hgap(ui, 10),
-        settingsLink(ui, "Edit profile", Msg.open_profile_edit),
+        if (model.is_guest()) ui.spacer(0) else settingsLink(ui, "Edit profile", Msg.open_profile_edit),
     });
     n += 1;
 
@@ -6174,13 +6208,28 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
 
     // What holds the key, said as a fact about this machine rather than as a
     // badge. The dot is green only for a signer that is answering.
+    // The dot reports the signer. Painting it green unconditionally would say
+    // "this is working" while a dead Signet daemon quietly refused every note.
+    const signer_state = signerStatus();
+    const signer_healthy = signerIsHealthy();
     rows[n] = ui.row(.{ .cross = .center, .gap = 0 }, .{
-        ui.el(.panel, .{ .width = 7, .height = 7, .padding = 0.01, .style = .{ .background = p.status_success, .radius = 4, .stroke_width = 0 } }, .{}),
+        ui.el(.panel, .{ .width = 7, .height = 7, .padding = 0.01, .style = .{
+            .background = signer_state.color,
+            .radius = 4,
+            .stroke_width = 0,
+        } }, .{}),
         hgap(ui, 9),
         ui.column(.{ .gap = 0, .grow = 1 }, .{
+            // The line says what signs for you; the sub-line says how that is
+            // going. When the signer is unhealthy its own words take the
+            // sub-line, because "Signet unreachable" is the thing worth reading
+            // and a fixed reassurance underneath it would be a lie.
             ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = model.signer_line(), .weight = .medium, .scale = menu_scale }}),
             vgap(ui, 2),
-            ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_faint } }, &.{.{ .text = model.signer_sub(), .scale = mono_hint_scale }}),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = if (signer_healthy) p.text_faint else p.status_warning_text } },
+                &.{.{ .text = if (signer_healthy) model.signer_sub() else signer_state.label, .scale = mono_hint_scale }},
+            ),
         }),
         // The design puts a "Change…" here. There is no change-signer flow to
         // send it to: changing what signs means signing out and signing back in
@@ -6698,6 +6747,10 @@ fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: [
             .text = value,
             .placeholder = placeholder,
             .on_input = AppUi.inputMsg(tag),
+            // REQUIRED, and not decoration: a textarea with on_input but no
+            // on_submit renders, focuses, advertises set_text, and accepts
+            // nothing. It reads as a live field and is inert.
+            .on_submit = Msg.profile_save,
             .height = 34,
             .semantics = .{ .label = label },
         }, .{}),
@@ -9437,6 +9490,16 @@ fn poolIsHealthyOf(live: usize, total: usize) bool {
 /// whether it can be reached.
 const SignerStatus = struct { label: []const u8, glyph: []const u8, color: canvas.Color };
 
+/// Whether the thing that signs is actually able to sign right now. The chrome
+/// carries this as a colour; the identity card needs it as a fact.
+pub fn signerIsHealthy() bool {
+    return switch (g_signer_kind) {
+        .helper => g_helper_state.load(.monotonic) == 2,
+        .remote => !g_remote_sign_notice.load(.acquire),
+        .local => true,
+    };
+}
+
 fn signerStatus() SignerStatus {
     const p = theme.palette;
     return switch (g_signer_kind) {
@@ -10908,10 +10971,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (model.editing_profile and model.profile_stage == .fetching) {
                     const gpa = std.heap.page_allocator;
                     if (ownProfileJson(gpa)) |own| {
-                        defer gpa.free(own.json);
-                        seedProfileFields(model, own.json);
+                        defer freeOwnProfile(gpa, own);
+                        // Only if the reader has not started writing. A profile
+                        // arriving a few seconds late must not replace the
+                        // sentence they are in the middle of typing.
+                        if (!model.profile_seeded and model.profile_untouched()) {
+                            seedProfileFields(model, own.json);
+                        }
                         model.profile_stage = .have;
-                    } else if (g_own_profile_asked.load(.acquire)) {
+                    } else if (ownProfileAnswered()) {
                         model.profile_stage = .absent;
                     }
                 }
@@ -11340,19 +11408,73 @@ fn enterSettings(model: *Model) void {
 /// this app models, which is how somebody's lightning address disappears. So the
 /// sheet asks every read relay first, and only calls it `absent` once they have
 /// all answered.
-pub const ProfileStage = enum { fetching, absent, have, saving, saved, failed };
+pub const ProfileStage = enum { fetching, absent, have, saving, sent, failed };
 
-/// Whether a full round of asking for our own kind:0 has completed. Set by the
-/// worker, read by the tick, so `absent` is a fact rather than an assumption.
-var g_own_profile_asked = std.atomic.Value(bool).init(false);
+/// Which key in the profile object the sheet's one Name field stands for. NIP-01
+/// has `name` (a handle) and `display_name` (a fuller name), and some clients
+/// still write the legacy `displayName`. The sheet edits whichever one the
+/// reader's profile actually uses.
+pub const ProfileNameKey = enum { display_name, display_name_legacy, name };
+
+/// WHO has been asked about, and whether a relay actually answered.
+///
+/// Two things a bool got wrong. It survived a sign-out, so the round run for one
+/// account decided that the NEXT account had no profile, and Save then published
+/// an empty object over a real one. And it was set even when every relay was
+/// offline, unreachable or write-only, so "nobody answered" and "they answered,
+/// you have no profile" were the same state. Both readings end in a wipe, so the
+/// answer records the pubkey it is about and is only set when a relay reached
+/// the end of its answer.
+var g_own_profile_asked_for: ?[32]u8 = null;
 var g_own_profile_asking = std.atomic.Value(bool).init(false);
+/// Set by the worker when at least one relay ANSWERED (EOSE), paired with the
+/// pubkey it asked about. Read on the UI thread through `ownProfileAnswered`.
+var g_own_profile_answered = std.atomic.Value(bool).init(false);
+var g_own_profile_lock = std.atomic.Value(bool).init(false);
+
+fn lockOwnProfile() void {
+    while (g_own_profile_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockOwnProfile() void {
+    g_own_profile_lock.store(false, .release);
+}
+
+/// Whether a relay has answered about THIS account. Anything else, including a
+/// round for a previous account and a round where nothing connected, is not an
+/// answer about this one.
+fn ownProfileAnswered() bool {
+    const pk = activePubkey() orelse return false;
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    const asked = g_own_profile_asked_for orelse return false;
+    if (!std.mem.eql(u8, &asked, &pk)) return false;
+    return g_own_profile_answered.load(.acquire);
+}
+
+/// Forgets what was asked. Called whenever the identity changes, so no
+/// conclusion about one account is ever read as a fact about another.
+fn forgetOwnProfileAnswer() void {
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    g_own_profile_asked_for = null;
+    g_own_profile_answered.store(false, .release);
+}
+
+/// A profile as it was published: its content AND its tags. NIP-39 puts identity
+/// proofs (a GitHub account, a Mastodon handle) in kind:0's TAGS, so republishing
+/// with `&.{}` deletes them exactly as silently as dropping a JSON key would.
+const OwnProfile = struct {
+    json: []u8,
+    tags: []const nostr.event.Tag,
+    created_at: i64,
+};
 
 /// The reader's own newest kind:0, raw. The RAW content is the source of truth,
 /// never the `Profile` cache: the cache models four fields and drops everything
 /// else, so rebuilding from it would publish a profile with the rest deleted.
 ///
 /// The returned slice is owned by the caller's allocator.
-fn ownProfileJson(gpa: std.mem.Allocator) ?struct { json: []u8, created_at: i64 } {
+fn ownProfileJson(gpa: std.mem.Allocator) ?OwnProfile {
     const store = g_store orelse return null;
     const pk = activePubkey() orelse return null;
     const kinds = [_]u16{0};
@@ -11363,11 +11485,29 @@ fn ownProfileJson(gpa: std.mem.Allocator) ?struct { json: []u8, created_at: i64 
     // Copied out before `result.deinit()`: the query owns its events through an
     // arena, and the write seam holds what it is given past this frame.
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    return .{ .json = copy, .created_at = result.events[0].created_at };
+    const tags = dupeTags(gpa, result.events[0].tags);
+    return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at };
+}
+
+/// Frees what `ownProfileJson` handed back.
+fn freeOwnProfile(gpa: std.mem.Allocator, own: OwnProfile) void {
+    gpa.free(own.json);
+    for (own.tags) |t| {
+        for (t) |field| gpa.free(field);
+        gpa.free(t);
+    }
+    gpa.free(own.tags);
 }
 
 /// Opens the sheet, seeded from the reader's own kind:0 if the app has it.
 fn openProfileEdit(model: *Model) void {
+    // A guest has no key, so there is nothing to read and nothing that could
+    // sign an edit. The sheet would sit on "Reading your current profile" for
+    // the rest of the session.
+    if (model.is_guest()) {
+        model.joining = true;
+        return;
+    }
     model.editing_profile = true;
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
@@ -11380,12 +11520,19 @@ fn openProfileEdit(model: *Model) void {
         return;
     }
     // Nothing here yet. Ask before concluding anything.
-    model.profile_stage = if (g_own_profile_asked.load(.acquire)) .absent else .fetching;
+    model.profile_seeded = false;
+    model.profile_stage = if (ownProfileAnswered()) .absent else .fetching;
     if (model.profile_stage == .fetching) startOwnProfileFetch();
 }
 
 /// Fills the sheet's fields from the RAW blob, so what the reader sees is what
 /// is about to be rewritten.
+///
+/// A value too long for its field is NOT shown truncated. A bio that runs past
+/// the buffer would otherwise appear cut off, and saving without touching it
+/// would write the cut-off version back over the real one: silent data loss from
+/// merely opening a sheet. Such a field is left empty and marked, and the merge
+/// then leaves that key exactly as it was.
 fn seedProfileFields(model: *Model, json: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -11398,11 +11545,37 @@ fn seedProfileFields(model: *Model, json: []const u8) void {
     }) catch return;
     if (root != .object) return;
     const obj = root.object;
-    if (stringField(obj, "display_name") orelse stringField(obj, "displayName") orelse stringField(obj, "name")) |v| {
-        model.profile_name_buffer.set(v);
+    // Which key the name came from, so the edit REWRITES that key. Seeding from
+    // `name` and writing `display_name` leaves the value the reader edited
+    // exactly where it was, and the rename silently does nothing.
+    model.profile_name_key = .display_name;
+    var name: ?[]const u8 = null;
+    if (stringField(obj, "display_name")) |v| {
+        name = v;
+    } else if (stringField(obj, "displayName")) |v| {
+        name = v;
+        model.profile_name_key = .display_name_legacy;
+    } else if (stringField(obj, "name")) |v| {
+        name = v;
+        model.profile_name_key = .name;
     }
-    if (stringField(obj, "about")) |v| model.profile_about_buffer.set(v);
-    if (stringField(obj, "picture")) |v| model.profile_picture_buffer.set(v);
+    model.profile_name_long = seedField(&model.profile_name_buffer, name);
+    model.profile_about_long = seedField(&model.profile_about_buffer, stringField(obj, "about"));
+    model.profile_picture_long = seedField(&model.profile_picture_buffer, stringField(obj, "picture"));
+    model.profile_seeded = true;
+}
+
+/// Seeds one field. Returns whether the value was too long to hold, in which
+/// case the field is left EMPTY rather than truncated: an empty field the merge
+/// leaves alone is honest, a truncated one that gets written back is not.
+fn seedField(buffer: anytype, value: ?[]const u8) bool {
+    const v = value orelse return false;
+    if (v.len > buffer.storage.len) {
+        buffer.clear();
+        return true;
+    }
+    buffer.set(v);
+    return false;
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -11426,10 +11599,12 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     const gpa = std.heap.page_allocator;
 
     var prev_created_at: i64 = 0;
-    var existing: ?[]u8 = null;
+    var prev_tags: []const nostr.event.Tag = &.{};
+    var existing: ?OwnProfile = null;
     if (ownProfileJson(gpa)) |own| {
-        existing = own.json;
+        existing = own;
         prev_created_at = own.created_at;
+        prev_tags = own.tags;
     } else if (model.profile_stage != .absent) {
         // It arrived as `have` and is gone now, or the round never finished.
         // Either way there is nothing safe to merge into.
@@ -11437,24 +11612,36 @@ fn saveProfile(model: *Model, fx: *Effects) void {
         startOwnProfileFetch();
         return;
     }
-    defer if (existing) |e| gpa.free(e);
+    defer if (existing) |e| freeOwnProfile(gpa, e);
 
-    const merged = mergeProfileJson(gpa, existing orelse "{}", model) orelse {
+    const merged = mergeProfileJson(gpa, if (existing) |e| e.json else "{}", model) orelse {
         model.profile_stage = .failed;
         return;
     };
+    // The cache is seeded from a COPY, and BEFORE the write seam takes the
+    // original: `signAndPublish` owns what it is handed and the remote path
+    // frees it, so reading `merged` afterwards is a use-after-free.
+    if (activePubkey()) |pk| {
+        if (upsertProfile(pk)) |prof| parseMetadataInto(prof, merged);
+        // A cleared picture has to leave the cache too, or the old avatar keeps
+        // being drawn from a slot nothing will overwrite.
+        if (trimmedField(model.profile_picture()).len == 0) clearProfilePicture(pk);
+    }
     // A replaceable event with a stamp that does not beat the one already stored
     // is DROPPED, by this store and by every relay. A second edit inside one
     // second, or a clock that was ahead when the last client wrote, would make
     // the edit vanish while the app claimed success.
     const created = @max(nowSeconds(), prev_created_at + 1);
-    signAndPublish(fx, gpa, created, 0, &.{}, merged, false);
-    // Seed the cache so the name changes here at once, the same beat the feed
-    // and the composer read it from.
-    if (activePubkey()) |pk| {
-        if (upsertProfile(pk)) |prof| parseMetadataInto(prof, merged);
-    }
-    model.profile_stage = .saved;
+    // The TAGS come forward too. NIP-39 identity proofs (a GitHub account, a
+    // Mastodon handle) live in kind:0's tags, and republishing with none would
+    // delete them as silently as dropping a JSON key.
+    const tags = dupeTags(gpa, prev_tags);
+    signAndPublish(fx, gpa, created, 0, tags, merged, false);
+    // NOT "published": nothing here can know that yet. `signAndPublish` returns
+    // no verdict, the remote and helper paths have not even signed, and a kind:0
+    // that reaches no relay is not retried. What IS true is that the edit is
+    // saved here and is on its way out.
+    model.profile_stage = .sent;
 }
 
 /// Parses `existing`, replaces the three keys this app models, and serialises the
@@ -11475,14 +11662,31 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
     // An emptied field REMOVES its key rather than writing "": a profile with
     // `"about": ""` reads to other clients as a bio the reader deliberately
     // blanked, which is a different statement from not having one.
-    setOrRemove(&obj, a, "display_name", trimmedField(model.profile_name())) catch return null;
-    setOrRemove(&obj, a, "about", trimmedField(model.profile_about())) catch return null;
-    setOrRemove(&obj, a, "picture", trimmedField(model.profile_picture())) catch return null;
-    // `name` is the handle, and the design's one name field edits the DISPLAY
-    // name. An account that has no `name` at all gets one, so clients that only
-    // read `name` have something to show; an account that has one keeps it.
-    if (stringField(obj, "name") == null) {
-        setOrRemove(&obj, a, "name", trimmedField(model.profile_name())) catch return null;
+    // A field whose real value did not fit its buffer was never SHOWN, so it is
+    // never written: the key keeps exactly what it had.
+    if (!model.profile_name_long) {
+        // Whichever key the name was read from is the key the edit rewrites.
+        // Seeding from `name` and writing `display_name` would leave the value
+        // the reader edited untouched, so the rename would silently do nothing.
+        const key: []const u8 = switch (model.profile_name_key) {
+            .display_name => "display_name",
+            .display_name_legacy => "displayName",
+            .name => "name",
+        };
+        setOrRemove(&obj, a, key, trimmedField(model.profile_name())) catch return null;
+        // A profile with no handle at all gets one, so clients that read only
+        // `name` have something to show. One that has a handle keeps it: a
+        // display name is not a handle, and renaming yourself must not rename
+        // the @handle everyone mentions you by.
+        if (stringField(obj, "name") == null) {
+            setOrRemove(&obj, a, "name", trimmedField(model.profile_name())) catch return null;
+        }
+    }
+    if (!model.profile_about_long) {
+        setOrRemove(&obj, a, "about", trimmedField(model.profile_about())) catch return null;
+    }
+    if (!model.profile_picture_long) {
+        setOrRemove(&obj, a, "picture", trimmedField(model.profile_picture())) catch return null;
     }
 
     // Straight onto the caller's allocator: the write seam holds this for the
@@ -11529,10 +11733,16 @@ fn startOwnProfileFetch() void {
 }
 
 fn ownProfileWorker(pk: [32]u8) void {
+    var answered = false;
     defer {
-        // Asked, whatever came back. A relay that answered with nothing has
-        // answered: that is the difference between `fetching` and `absent`.
-        g_own_profile_asked.store(true, .release);
+        // ANSWERED, not merely attempted. A round where every relay was offline,
+        // write-only, or refused the dial proves nothing about the account, and
+        // reading it as "you have no profile" is how a profile gets replaced
+        // with an empty one.
+        lockOwnProfile();
+        g_own_profile_asked_for = pk;
+        g_own_profile_answered.store(answered, .release);
+        unlockOwnProfile();
         g_own_profile_asking.store(false, .release);
     }
     const gpa = std.heap.page_allocator;
@@ -11559,9 +11769,17 @@ fn ownProfileWorker(pk: [32]u8) void {
             switch (msg.value) {
                 .event => |e| {
                     const store = g_store orelse continue;
-                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                    const result = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    // A relay can send any event down any subscription. Only a
+                    // VERIFIED one counts as this account's own profile.
+                    if (result != .invalid) answered = true;
                 },
-                .eose => break,
+                // A relay that says "that is all I have" has answered, and so
+                // has one that closes the subscription: both are a reply.
+                .eose, .closed => {
+                    answered = true;
+                    break;
+                },
                 else => continue,
             }
         }
@@ -13508,6 +13726,12 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // relays, and hand the new account a list they never chose. Back to the
     // relays the app was born with, ready to adopt the next account's own.
     resetRelaysToBootstrap();
+    // And what was concluded about the leaving account's profile. Carrying it
+    // would let the next account be judged "has no profile" without being asked,
+    // and Save would then publish an empty object over a real profile.
+    forgetOwnProfileAnswer();
+    model.editing_profile = false;
+    model.profile_seeded = false;
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
@@ -13658,12 +13882,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 if (std.mem.eql(u8, e.subscription_id, "plaza-feed")) {
                     const store = g_store orelse continue;
                     // Verify (secp256k1) before storing; silently drop a bad event.
-                    const stored = if (store.ingest(gpa, e.event, .{ .verify_with = signer })) |_| true else |_| false;
-                    // A relay list decides where this reader talks, so it is
-                    // acted on ONLY once its signature has been checked. A relay
-                    // can send whatever it likes down a subscription; an event
-                    // that failed to store failed to verify, and gets no say.
-                    if (!stored) continue;
+                    // `.invalid` is a RETURNED VALUE here, not an error: a
+                    // forged event does not throw, it comes back saying it did
+                    // not verify. Reading only the error channel let a relay
+                    // hand this reader a relay list signed by nobody.
+                    const result = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
                     if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);

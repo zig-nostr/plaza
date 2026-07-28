@@ -98,6 +98,10 @@ test "the settings screen shows the identity, key backup, and logout" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Signed in, because half this screen is about the identity: a guest has no
+    // profile to edit and no key to back up.
+    main.setIdentityForTest([_]u8{9} ** 32);
+    defer main.clearIdentityForTest();
     var model = main.initialModel();
     model.stage = .settings;
     const tree = try buildTree(arena, &model);
@@ -123,6 +127,29 @@ test "the settings screen shows the identity, key backup, and logout" {
     try testing.expect(findAnyText(tree.root, "Cancel") == null);
     // The version line renders.
     try testing.expect(findAnyText(tree.root, "Plaza 0.1.0") != null);
+}
+
+test "a guest is not offered a profile to edit" {
+    // A guest has no key: nothing to read their profile from and nothing that
+    // could sign an edit. Offering the sheet would sit on "Reading your current
+    // profile" for the rest of the session.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "IDENTITY") != null);
+    try testing.expect(findAnyText(tree.root, "Edit profile") == null);
+
+    // And reaching for it anyway routes to the join sheet rather than opening a
+    // sheet that can never finish.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(!model.editing_profile);
+    try testing.expect(model.joining);
 }
 
 test "a kind:0 profile gives an author a display name" {
@@ -3821,4 +3848,66 @@ test "the sheet refuses to save until it has read the profile it would replace" 
 
 fn findAnyTextIn(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+/// Every editable field in a built tree, with whether it has a submit handler.
+fn assertFieldsEditable(tree: AppUi.Tree, where: []const u8) !void {
+    _ = where;
+    var stack: [64]canvas.Widget = undefined;
+    var depth: usize = 0;
+    stack[depth] = tree.root;
+    depth += 1;
+    while (depth > 0) {
+        depth -= 1;
+        const w = stack[depth];
+        if (w.kind == .textarea or w.kind == .text_field or w.kind == .input or w.kind == .search_field) {
+            var has_submit = false;
+            for (tree.handlers) |h| {
+                if (h.id == w.id and h.event == .submit) has_submit = true;
+            }
+            try testing.expect(has_submit);
+        }
+        for (w.children) |child| {
+            if (depth < stack.len) {
+                stack[depth] = child;
+                depth += 1;
+            }
+        }
+    }
+}
+
+test "every text field in the app has a submit handler, because without one it is not editable" {
+    // A textarea with `on_input` but NO `on_submit` renders, focuses, reports
+    // `set_text` in its actions, and accepts nothing: not a keystroke, not a
+    // paste, not an automated set_text. It reads as a live field and is inert.
+    // The Edit profile sheet shipped that way until it was driven for real, so
+    // this walks every screen rather than trusting a reading of one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var settings = main.initialModel();
+    settings.stage = .settings;
+    try assertFieldsEditable(try buildTree(arena, &settings), "settings");
+
+    var sheet = main.initialModel();
+    sheet.stage = .settings;
+    sheet.editing_profile = true;
+    sheet.profile_stage = .have;
+    try assertFieldsEditable(try buildTree(arena, &sheet), "edit profile");
+
+    var composing = main.initialModel();
+    composing.stage = .ready;
+    composing.composing = true;
+    try assertFieldsEditable(try buildTree(arena, &composing), "composer");
+
+    var joining = main.initialModel();
+    joining.stage = .ready;
+    joining.joining = true;
+    try assertFieldsEditable(try buildTree(arena, &joining), "join");
+
+    var naming = main.initialModel();
+    naming.stage = .ready;
+    naming.naming = true;
+    try assertFieldsEditable(try buildTree(arena, &naming), "name");
 }
