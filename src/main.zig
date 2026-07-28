@@ -278,6 +278,10 @@ const quote_pill_label_width: f32 = 190;
 /// the way every other row constant here now is, because summing them was wrong
 /// by a line and a half and nothing said so.
 const quote_aside_chrome: f32 = 62.125;
+/// The same for a quote that has not arrived, or never will: the 5 above it, the
+/// column's sibling gap and the 2px pads, and NO identity block, because those
+/// states draw a bar or a single line where the identity would be.
+const quote_quiet_chrome: f32 = 5 + 4 + 2 + 2;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
 /// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
 /// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
@@ -1468,10 +1472,14 @@ const quote_fetch_batch = 16;
 /// characters a line at the quote's register), so the clamp decides where the
 /// text ends rather than the cache. 64 entries, so the whole table is ~20 KiB.
 const quote_text_cap = 320;
+/// Where a cached quote is in its life: asked for, in flight, in hand, or asked
+/// for enough times that no relay has it.
+pub const QuoteState = enum { idle, fetching, loaded, missing };
+
 const QuoteEntry = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
-    state: enum { idle, fetching, loaded, missing } = .idle,
+    state: QuoteState = .idle,
     attempts: u8 = 0,
     requested: bool = false,
     pubkey: [32]u8 = [_]u8{0} ** 32,
@@ -1534,6 +1542,10 @@ fn quoteFor(id: [32]u8) ?*QuoteEntry {
 /// landed): copies the quoted author and a truncated body, and asks for the
 /// author's name. Gives up (marks missing) once every relay has been tried.
 fn refreshQuotes(store: *nostr.store.Store) void {
+    // The nested references this pass finds, asked for once it is over (see the
+    // note where they are collected).
+    var nested: [quote_cache_cap][32]u8 = undefined;
+    var nested_count: usize = 0;
     for (&g_quotes) |*q| {
         if (!q.used or q.state == .loaded or q.state == .missing) continue;
         var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
@@ -1559,12 +1571,21 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         q.has_quote_of = probe.quote.kind == .event;
         if (q.has_quote_of) {
             q.quote_of = probe.quote.id;
-            // Resolve it too, so the pill can say whose note it walks to.
-            wantQuote(q.quote_of);
+            // Asked for AFTER this pass, never during it: `wantQuote` writes over
+            // whichever slot it evicts, and the entry being filled here is the
+            // one it picks first (it is `.idle` and has never been drawn, so its
+            // clock is the minimum). Evicting it mid-fill left the nested id
+            // cached as loaded with a zero author and an empty body, permanently,
+            // because a loaded entry is never retried.
+            if (nested_count < nested.len) {
+                nested[nested_count] = q.quote_of;
+                nested_count += 1;
+            }
         }
         q.state = .loaded;
         wantProfile(q.pubkey);
     }
+    for (nested[0..nested_count]) |id| wantQuote(id);
 }
 
 /// Lets the still-unresolved quotes be asked for again on the next round.
@@ -4919,14 +4940,17 @@ fn noteRowEstimate(note: *const Note, chrome: f32) f32 {
 /// resolving is priced at the skeleton it shows, so the row does not jump when
 /// it lands.
 fn quoteAsideExtent(id: [32]u8) f32 {
-    const chrome: f32 = quote_aside_chrome;
-    const e = quoteFor(id) orelse return chrome + quote_skeleton_height;
+    const e = quoteFor(id) orelse return quote_quiet_chrome + quote_skeleton_height;
     return switch (e.state) {
-        .idle, .fetching => chrome + quote_skeleton_height,
-        .missing => chrome + body_line_height,
+        // The quiet states draw no identity block, so they do not carry its
+        // chrome: only the 5 above, the sibling gap and the 2px pads. Pricing
+        // them like the loaded aside over-charged every quoting row by nearly
+        // three lines from first paint until its quote landed.
+        .idle, .fetching => quote_quiet_chrome + quote_skeleton_height,
+        .missing => quote_quiet_chrome + body_line_height,
         // The depth-1 pill, when the quoted note quotes something itself: it is
         // a row of its own under the body, and the row around it is priced.
-        .loaded => chrome + quoteBodyLines(e) * body_line_height +
+        .loaded => quote_aside_chrome + quoteBodyLines(e) * body_line_height +
             (if (e.has_quote_of) quote_pill_height + 4 else 0),
     };
 }
@@ -7528,7 +7552,15 @@ fn quotingPillAuthor(id: [32]u8) [32]u8 {
 /// plainly that it is still coming until then, rather than showing a name it
 /// does not have.
 fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
-    const e = quoteFor(id) orelse return "Quoting a note";
+    // Re-queued when the entry is gone, the same way the aside itself does it:
+    // the pill's target is asked for once, when the note holding it is filled,
+    // and the 64-entry cache can evict it while the pill is still on screen. Then
+    // nothing would ever ask again, because the note holding it is loaded and a
+    // loaded entry is never revisited.
+    const e = quoteFor(id) orelse {
+        wantQuote(id);
+        return "Quoting a note";
+    };
     return switch (e.state) {
         // Whose note, and the start of what it says: the shot's own pill reads
         // "Quoting @edith · Shipping it: the feed renders…", so the reader can
@@ -7568,10 +7600,18 @@ fn quotePillHandle(ui: *AppUi, pubkey: [32]u8) []const u8 {
 /// wash here would be a state the design does not draw.
 fn quoteAside(ui: *AppUi, id: ?[32]u8, body: AppUi.Node) AppUi.Node {
     const p = theme.palette;
-    const inner = ui.row(.{ .gap = 0 }, .{
-        // The rule, filling the block's height: the same construct as a thread's
-        // rail, and the same trap, it draws nothing unless the row stretches it.
-        ui.separator(.{ .width = 2, .grow = 1, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
+    // `grow` on the row, so the aside is as wide as the column it sits in. Its
+    // parent is a column, where grow is the vertical axis for the WRAPPER but the
+    // width for this row's own sizing: without it the row took its intrinsic
+    // width, which for a long quote measured three times the window.
+    const inner = ui.row(.{ .grow = 1, .gap = 0 }, .{
+        // The rule takes the row's height from the default cross STRETCH. It must
+        // not `grow`: grow in a row is the horizontal axis, so a growing 2px rule
+        // and the growing content column split the width between them, and the
+        // quote wrapped at half the space the shot gives it. The thread's rail
+        // uses the same construct correctly because it sits in a COLUMN, where
+        // grow is the axis it wants.
+        ui.separator(.{ .width = 2, .style = .{ .foreground = p.divider_reply, .background = p.divider_reply } }),
         hgap(ui, 12),
         ui.column(.{ .grow = 1, .gap = 0 }, .{
             vgap(ui, 2),
@@ -7615,6 +7655,16 @@ pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []con
 
 pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
     return quoteFor(id);
+}
+
+pub fn dropQuoteForTest(id: [32]u8) void {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) q.* = .{};
+    }
+}
+
+pub fn quotingPillLabelForTest(ui: *AppUi, id: [32]u8) []const u8 {
+    return quotingPillLabel(ui, id);
 }
 
 pub fn quoteBodyLinesForTest(e: *const QuoteEntry) f32 {

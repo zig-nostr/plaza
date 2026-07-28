@@ -2829,3 +2829,58 @@ test "a pill's label is one line, whatever the note it names" {
     const plain = "nothing to fold";
     try testing.expectEqual(plain.ptr, main.oneLineForTest(&ui, plain).ptr);
 }
+
+test "a quote still coming, or gone, is priced at what it draws" {
+    // `quote_aside_chrome` is the LOADED aside's chrome: it includes the identity
+    // block beside the disc. The skeleton and the unavailable line draw no
+    // identity at all, so pricing them the same way over-charged every quoting
+    // row by nearly three lines from first paint until the quote landed, which is
+    // the opposite of the under-pricing this work set out to fix.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const quoted_id = [_]u8{0x6f} ** 32;
+    for ([_]main.QuoteState{ .fetching, .missing }) |state| {
+        main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "Not shown in this state.");
+        const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+        e.state = state;
+
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = threadNote(0xA1, 100, 0);
+        model.notes[0].id = 7;
+        const body = "Look at this.";
+        @memcpy(model.notes[0].content_buf[0..body.len], body);
+        model.notes[0].content_len = @intCast(body.len);
+        model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+        if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+            std.debug.print("\n{s}: draws {d}, priced {d}\n", .{ @tagName(state), rows[0].height, priced });
+            return error.QuietQuoteMispriced;
+        }
+    }
+}
+
+test "the pill asks again when its note falls out of the cache" {
+    // The pill's target is asked for once, when the note holding it is filled.
+    // The cache holds 64 entries and can evict that target while the pill is
+    // still on screen, and nothing would ask again: the note holding it is
+    // loaded, and refreshQuotes never revisits a loaded entry.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+
+    const evicted = [_]u8{0xd1} ** 32;
+    main.dropQuoteForTest(evicted);
+    try testing.expect(main.quoteForTest(evicted) == null);
+
+    _ = main.quotingPillLabelForTest(&ui, evicted);
+    // Asked for again, so it can come back.
+    try testing.expect(main.quoteForTest(evicted) != null);
+}
