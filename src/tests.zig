@@ -3287,3 +3287,26 @@ test "the picker knows when a mention is being typed" {
     // The LAST run wins, not the first.
     try testing.expectEqualStrings("ed", main.mentionQuery("@wirth said @ed").?);
 }
+
+test "an empty composer cannot be posted, by button or by key" {
+    // The button is disabled when the draft is empty, so before Cmd+Enter the
+    // message could never arrive with nothing to send. A key can, and closing
+    // the sheet with a "Posted" toast over an empty composer would be the
+    // plainest lie in the app.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    try testing.expect(model.draft_empty());
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .post, &fx);
+    // Still open, and nothing claimed.
+    try testing.expect(model.composing);
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+
+    // Whitespace is empty too: a note of three spaces is not a note.
+    model.draft_buffer = @TypeOf(model.draft_buffer).init("   \n ");
+    try testing.expect(model.draft_empty());
+    main.update(&model, .post, &fx);
+    try testing.expect(model.composing);
+}

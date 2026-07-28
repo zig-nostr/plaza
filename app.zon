@@ -33,4 +33,12 @@
     },
     .web_engine = "system",
     .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    // The four the redesign names. A character key needs a modifier, so Escape
+    // is the only bare one, and it is the one every sheet already answers to.
+    .shortcuts = .{
+        .{ .id = "new-note", .key = "n", .modifiers = .{"primary"} },
+        .{ .id = "post-note", .key = "Enter", .modifiers = .{"primary"} },
+        .{ .id = "settings", .key = ",", .modifiers = .{"primary"} },
+        .{ .id = "dismiss", .key = "Escape" },
+    },
 }

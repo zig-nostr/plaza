@@ -5165,6 +5165,10 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// Escape: closes whatever is on top, one layer at a time. Which layer that
+    /// is depends on the model, so the key names the intent and `update`
+    /// decides, rather than four shortcuts racing to own the same key.
+    dismiss_top,
     /// Replaces the `@word` being typed with a real reference to this key.
     insert_mention: [32]u8,
     /// Close whatever chrome menu is open (Escape, or a press outside it).
@@ -9427,6 +9431,20 @@ pub fn pictureWidth(note: *const Note) f32 {
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
+
+/// The keyboard, as the shell delivers it: a shortcut declared in the manifest
+/// arrives here by id and becomes an ordinary message, so a key does exactly
+/// what the control it stands for does, and never a second implementation of it.
+///
+/// What each one means depends on what is open, and that is decided in `update`
+/// where the model is, not here: this only names the intent.
+fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, "new-note")) return .open_compose;
+    if (std.mem.eql(u8, name, "post-note")) return .post;
+    if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    if (std.mem.eql(u8, name, "dismiss")) return .dismiss_top;
+    return null;
+}
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
 pub const EffectsForTest = Effects;
@@ -9555,6 +9573,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_remote_sign_notice.store(false, .release);
         },
         .post => {
+            // A KEY can reach this where the button could not: the button is
+            // disabled on an empty draft, so until Cmd+Enter existed this
+            // message never arrived with nothing to send. Closing the sheet and
+            // saying "Posted" over an empty composer would be the plainest lie
+            // in the app.
+            if (model.draft_empty()) return;
             submitPost(model, fx);
             // Posting closes the sheet; the note is already local and will
             // appear on the next tick.
@@ -9572,6 +9596,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.joining = true;
                 model.pending_compose = true;
             } else model.composing = true;
+        },
+        .dismiss_top => {
+            // Topmost first: a menu over a sheet over a thread. Each press
+            // closes exactly one thing, which is what makes the key learnable.
+            if (model.menu != .none) {
+                model.menu = .none;
+            } else if (model.expanded_note != 0) {
+                model.expanded_note = 0;
+            } else if (model.composing) {
+                model.composing = false;
+                saveDraft(model.draft());
+            } else if (model.joining) {
+                model.joining = false;
+            } else if (model.stage == .settings) {
+                model.logout_pending = false;
+                model.reveal_nsec = false;
+                model.stage = .ready;
+            } else if (model.viewing_thread != 0) {
+                closeThread(model);
+            }
         },
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
@@ -11199,6 +11243,7 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .view = appView,
+        .on_command = onCommand,
         // No canvas-registered fonts: the typography tokens sit on the
         // BUILT-IN ids (the SDK's default sans IS Geist), which is the only
         // routing that gives span weights real medium/bold faces; a
