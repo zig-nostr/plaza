@@ -278,9 +278,22 @@ const quote_pill_label_width: f32 = 190;
 const picture_radius: f32 = 10;
 const picture_chip_inset: f32 = 8;
 const picture_chip_height: f32 = 18;
-const picture_dims_width: f32 = 58;
+/// Room for the longest honest label, `1600×900 · 240 KB`, at the chip's 10px
+/// mono register.
+const picture_dims_width: f32 = 124;
 /// The chips' own 10px mono register, a rung below the metadata mono.
 const mono_chip_scale: f32 = 10.0 / 14.5;
+/// The picture's box: the reading column it spans, the aspect past which a very
+/// tall picture is contained rather than taking over the feed, and the shape to
+/// assume when the note says nothing and nothing has been decoded yet.
+const picture_column_width: f32 = feed_column_width - row_pad_side * 2 - avatar_size - avatar_to_text_gap;
+pub const picture_column_width_for_test: f32 = picture_column_width;
+const picture_max_aspect: f32 = 1.25;
+const picture_default_aspect: f32 = 0.66;
+/// How many bands a striped placeholder may draw. A tall picture would otherwise
+/// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
+/// that refuses the whole view when it is crossed.
+const picture_stripe_cap: usize = 24;
 const picture_alt_width: f32 = 180;
 /// A quote's aside minus its body lines: the 5 above it, the 2 either side, the
 /// identity block beside the disc and the gaps between the column's three
@@ -2282,8 +2295,11 @@ pub const Note = struct {
     /// design's hover-expand is not expressible).
     image_w: u16 = 0,
     image_h: u16 = 0,
-    image_alt_buf: [96]u8 = [_]u8{0} ** 96,
-    image_alt_len: u8 = 0,
+    image_bytes: u32 = 0,
+    /// Whether the note described its picture. The chip is the marker the shot
+    /// draws, one word: the description itself would need a hover expand, which
+    /// is not expressible.
+    image_has_alt: bool = false,
     // The first `nostr:nevent`/`note` reference in the content, decoded once at
     // parse time: the quoted event id, and the byte span of its raw token in
     // `content_buf` so the body can split around it and render an embedded quote
@@ -2311,16 +2327,19 @@ pub const Note = struct {
     pub fn hasImage(self: *const Note) bool {
         return self.image_url_len > 0;
     }
-    /// The author's description of the picture, empty when they gave none.
-    pub fn imageAlt(self: *const Note) []const u8 {
-        return self.image_alt_buf[0..self.image_alt_len];
-    }
-    /// The picture's declared size as the chip shows it, or empty when the note
-    /// does not say. Never guessed from the decoded bytes: the chip is the
-    /// author's claim, and the bytes may not have arrived.
-    pub fn imageDims(self: *const Note, arena: std.mem.Allocator) []const u8 {
-        if (self.image_w == 0 or self.image_h == 0) return "";
-        return std.fmt.allocPrint(arena, "{d}x{d}", .{ self.image_w, self.image_h }) catch "";
+    /// What the picture's chip says: its dimensions and its weight, as the note
+    /// claims them, in the shot's own form (`1600x900 · 240 KB`). Either half may
+    /// be missing, and the chip is empty when both are. Never taken from the
+    /// decoded bytes, which are the proxy's 480px box and would be a lie about
+    /// the file, and never from the response, which carries no headers.
+    pub fn imageChipLabel(self: *const Note, arena: std.mem.Allocator) []const u8 {
+        const has_dims = self.image_w > 0 and self.image_h > 0;
+        if (has_dims and self.image_bytes > 0) {
+            return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ self.image_w, self.image_h, byteSize(arena, self.image_bytes) }) catch "";
+        }
+        if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ self.image_w, self.image_h }) catch "";
+        if (self.image_bytes > 0) return byteSize(arena, self.image_bytes);
+        return "";
     }
     /// The note's image URL (empty when it has none).
     pub fn imageUrl(self: *const Note) []const u8 {
@@ -3819,9 +3838,8 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             note.image_aspect = meta.aspect();
             note.image_w = meta.width;
             note.image_h = meta.height;
-            const alt_len = @min(meta.alt.len, note.image_alt_buf.len);
-            @memcpy(note.image_alt_buf[0..alt_len], meta.alt[0..alt_len]);
-            note.image_alt_len = @intCast(alt_len);
+            note.image_bytes = meta.size;
+            note.image_has_alt = meta.alt.len > 0;
         }
     }
 
@@ -4282,6 +4300,15 @@ fn findQuoteRef(note: *Note) void {
 /// `url`, or 0 when it says nothing. An `imeta` tag reads
 /// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
 /// written as floats, so both forms parse.
+/// A byte count as a reader reads it: `240 KB`, `1.4 MB`. Decimal units, because
+/// that is what the file's own host quotes and what the note author copied.
+fn byteSize(arena: std.mem.Allocator, bytes: u32) []const u8 {
+    if (bytes < 1000) return std.fmt.allocPrint(arena, "{d} B", .{bytes}) catch "";
+    if (bytes < 1_000_000) return std.fmt.allocPrint(arena, "{d} KB", .{bytes / 1000}) catch "";
+    const mb = @as(f32, @floatFromInt(bytes)) / 1_000_000.0;
+    return std.fmt.allocPrint(arena, "{d:.1} MB", .{mb}) catch "";
+}
+
 /// What a note's NIP-92 `imeta` tag says about `url`: its pixel dimensions, its
 /// alt text and its blurhash. One walk, because the picture's chrome wants all
 /// three and the tag is one place.
@@ -4292,6 +4319,10 @@ pub const Imeta = struct {
     /// caller copies what it wants to keep.
     alt: []const u8 = "",
     blurhash: []const u8 = "",
+    /// The file's size in bytes, as the note claims it. The only source there is:
+    /// the SDK's fetch response carries no headers, so there is no Content-Length
+    /// to read, and with previews off nothing is fetched at all.
+    size: u32 = 0,
 
     /// Height over width, or 0 when the tag says nothing. Knowing the shape
     /// before the bytes arrive is what lets a row reserve exactly the right
@@ -4322,6 +4353,8 @@ pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
                 }
             } else if (std.mem.startsWith(u8, field, "alt ")) {
                 found.alt = std.mem.trim(u8, field[4..], " ");
+            } else if (std.mem.startsWith(u8, field, "size ")) {
+                found.size = std.fmt.parseInt(u32, std.mem.trim(u8, field[5..], " "), 10) catch 0;
             } else if (std.mem.startsWith(u8, field, "blurhash ")) {
                 found.blurhash = std.mem.trim(u8, field["blurhash ".len..], " ");
             }
@@ -8017,13 +8050,24 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
 /// last time it was decoded, else a gentle default. Clamped so one very tall
 /// image cannot take over the feed.
 pub fn pictureHeight(note: *const Note) f32 {
-    const nominal_width: f32 = 300;
-    const default_aspect: f32 = 0.66;
-    const aspect = if (note.image_aspect > 0)
-        note.image_aspect
-    else
-        recalledAspect(note.id) orelse default_aspect;
-    return std.math.clamp(nominal_width * aspect, 80, 320);
+    // The picture spans the reading column, which is what 11o draws, and takes
+    // exactly the height the note's own `imeta` implies at that width. It was
+    // based on a 300px box and clamped at 320px, so a tall picture was reserved
+    // at a height it never drew and the row shifted when the bytes arrived, which
+    // is the whole thing a declared shape exists to prevent.
+    //
+    // The cap is on the ASPECT, not the pixels: a very tall picture is contained
+    // rather than allowed to take over the feed, and contained at a height the
+    // estimate can state exactly.
+    return picture_column_width * @min(pictureAspect(note), picture_max_aspect);
+}
+
+/// The shape to draw at: what the note declares, else what this picture measured
+/// when it was last decoded (remembered past its slot, so an evicted picture does
+/// not shrink and shift the feed), else a landscape guess.
+fn pictureAspect(note: *const Note) f32 {
+    if (note.image_aspect > 0) return note.image_aspect;
+    return recalledAspect(note.id) orelse picture_default_aspect;
 }
 
 /// A note's picture: the image once registered, or a placeholder holding the
@@ -8034,8 +8078,10 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     const height = pictureHeight(note);
     const image_id = note.media_id();
     if (image_id == 0) {
-        // Reserved space, not an empty frame: same height the picture will take.
-        return ui.el(.skeleton, .{ .height = height, .semantics = .{ .label = "Loading image" } }, .{});
+        // The same box the picture will fill, striped: reserved space, not an
+        // empty frame, and not a skeleton either, which reads as a row of text
+        // still loading rather than as a photograph.
+        return pictureBox(ui, note, height, pictureStripes(ui, height));
     }
     var picture = ui.image(.{ .image = image_id, .grow = 1 });
     // `ui.image` leaves the fit at `stretch`, which distorts the picture into
@@ -8050,6 +8096,14 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // The link role is what puts the pointing hand over it: the engine follows
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
+    return pictureBox(ui, note, height, picture);
+}
+
+/// The picture's frame: the reading column at the declared height, with the
+/// radius and hairline 11o gives it, whatever is inside it, and the chips laid
+/// over the corners. A `data_row` lays children out horizontally, so the chips
+/// ride a stack: there is no way to place a child at a point.
+fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) AppUi.Node {
     return ui.el(.data_row, .{
         .width = pictureWidth(note),
         .height = height,
@@ -8058,24 +8112,39 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
         .on_press = Msg{ .expand_image = note.id },
         .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
     }, .{
-        // The picture, with what the note SAYS about it laid over the corners: the
-        // size in one chip and the author's description in the other. A stack
-        // layers them; each chip's own row alignment puts it in its corner, since
-        // there is no way to place a child at a point.
         ui.stack(.{ .grow = 1 }, .{
-            picture,
+            content,
             pictureChips(ui, note),
         }),
     });
+}
+
+/// The fill under a picture that has not arrived. The shot draws 45 degree
+/// stripes; the canvas has no gradients at the widget level and no rotation, so
+/// they run flat, which keeps what the stripes are FOR (this is a photograph
+/// arriving, not a paragraph) without pretending to an angle.
+fn pictureStripes(ui: *AppUi, height: f32) AppUi.Node {
+    const p = theme.palette;
+    const band: f32 = 14;
+    const count: usize = @intFromFloat(@ceil(height / band));
+    const bands = ui.arena.alloc(AppUi.Node, @min(count, picture_stripe_cap)) catch return ui.spacer(0);
+    for (bands, 0..) |*b, i| {
+        b.* = ui.el(.panel, .{
+            .height = band,
+            .padding = 0.01,
+            .style = .{ .background = if (i % 2 == 0) p.surface_stripe_a else p.surface_stripe_b, .radius = 0, .stroke_width = 0 },
+        }, .{});
+    }
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{bands});
 }
 
 /// The two chips 11o lays over a picture: its declared size at the top right and
 /// its alt text at the bottom left. Both read at rest, because hover cannot
 /// restyle or reveal a child.
 fn pictureChips(ui: *AppUi, note: *const Note) AppUi.Node {
-    const dims = note.imageDims(ui.arena);
-    const alt = note.imageAlt();
-    if (dims.len == 0 and alt.len == 0) return ui.spacer(0);
+    const dims = note.imageChipLabel(ui.arena);
+    const alt = note.image_has_alt;
+    if (dims.len == 0 and !alt) return ui.spacer(0);
     return ui.column(.{ .grow = 1, .gap = 0 }, .{
         ui.row(.{ .grow = 1, .main = .end, .cross = .start, .gap = 0 }, .{
             if (dims.len == 0) ui.spacer(0) else pictureChip(ui, dims, false),
@@ -8083,7 +8152,7 @@ fn pictureChips(ui: *AppUi, note: *const Note) AppUi.Node {
         }),
         ui.row(.{ .gap = 0 }, .{
             hgap(ui, picture_chip_inset),
-            if (alt.len == 0) ui.spacer(0) else pictureChip(ui, ui.fmt("ALT · {s}", .{alt}), true),
+            if (!alt) ui.spacer(0) else pictureChip(ui, "ALT", true),
             ui.spacer(1),
         }),
         vgap(ui, picture_chip_inset),
@@ -8127,14 +8196,12 @@ fn pictureChip(ui: *AppUi, label: []const u8, emphatic: bool) AppUi.Node {
 /// wider than the card. `contain` centres a narrow picture in its box, so
 /// matching the box to the picture is what keeps the press on the picture.
 pub fn pictureWidth(note: *const Note) f32 {
-    const nominal_width: f32 = 300;
-    const height = pictureHeight(note);
-    const aspect = if (note.image_aspect > 0)
-        note.image_aspect
-    else
-        recalledAspect(note.id) orelse 0.66;
-    if (aspect <= 0) return nominal_width;
-    return @min(nominal_width, height / aspect);
+    _ = note;
+    // The box is the reading column. A picture narrower than its box is centred
+    // inside it by `image_fit = .contain`, and the chips sit in the BOX's
+    // corners, which is where the shot puts them: the box is the frame, not the
+    // photograph.
+    return picture_column_width;
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);

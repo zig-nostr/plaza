@@ -722,10 +722,20 @@ test "a picture reserves the same space loaded or not" {
     const note = main.noteFrom(ev, 1_800_000_000);
 
     try testing.expect(note.hasImage());
-    // 2:1 tall against the nominal 300pt width would be 600, clamped to 320.
-    try testing.expectApproxEqAbs(@as(f32, 320), main.pictureHeight(&note), 0.5);
+    // The box is the reading column, so a 2:1 picture would be twice that tall;
+    // the aspect is capped instead, and the cap is what it draws at. Capping the
+    // ASPECT rather than the pixels is what keeps the reservation exact: the
+    // height is stated, not clamped after the fact.
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * 1.25, main.pictureHeight(&note), 0.5);
     // Nothing is loaded, yet the reserved height is already the final one.
     try testing.expectEqual(@as(u64, 0), note.media_id());
+
+    // A landscape picture takes exactly the height its declared shape implies.
+    const wide_url = "https://host.example/wide.jpg";
+    const wide_tags = [_]nostr.event.Tag{&.{ "imeta", "url " ++ wide_url, "dim 1600x900" }};
+    const wide_ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &wide_tags, "look " ++ wide_url, null);
+    const wide = main.noteFrom(wide_ev, 1_800_000_000);
+    try testing.expectApproxEqAbs(main.picture_column_width_for_test * (900.0 / 1600.0), main.pictureHeight(&wide), 0.5);
 }
 
 test "imeta dimensions parse, including float forms" {

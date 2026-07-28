@@ -140,6 +140,9 @@ pub const palette = struct {
     /// against anything under it, and the hairline around it.
     pub const scrim_chip = canvas.Color.rgba8(10, 10, 11, 179);
     pub const border_chip_alt = hex("#2c2c33");
+    /// The two bands of a loading picture's stripe.
+    pub const surface_stripe_a = hex("#17171c");
+    pub const surface_stripe_b = hex("#1b1b21");
     pub const border_pill = hex("#2c2c33");
     pub const border_menu = hex("#333338");
     pub const border_offline = hex("#3d3320");
