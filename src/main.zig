@@ -2212,6 +2212,36 @@ pub fn mediaPreviews() bool {
 pub fn setMediaPreviews(on: bool) void {
     g_media_previews = on;
 }
+/// Whether notes published from here say so, with NIP-89's `client` tag.
+///
+/// OFF by default. The tag is a small permanent fact about the reader attached
+/// to everything they write: not what they said, but what they said it WITH, and
+/// it follows the note to every relay and every client forever. NIP-89 puts the
+/// privacy question in the spec itself ("clients SHOULD allow users to opt-out
+/// of using this tag"), which is unusual enough to be worth reading as a hint
+/// about which way the default should fall.
+///
+/// The argument the other way is real and lost: this is how anyone discovers a
+/// new client exists at all. Sepehr chose the private default (2026-07-31), so
+/// Plaza is invisible in other people's clients unless the reader decides
+/// otherwise. Reading the tag on OTHER people's notes is unaffected: that is
+/// their disclosure, already made.
+var g_client_tag: bool = false;
+
+pub fn clientTag() bool {
+    return g_client_tag;
+}
+
+pub fn setClientTag(on: bool) void {
+    g_client_tag = on;
+}
+
+/// What Plaza calls itself in that tag. NIP-89's full tuple also carries a
+/// `31990:<pubkey>:<d>` handler address and a relay hint, which point at a
+/// handler event Plaza does not publish; the name alone is valid, and is what
+/// most clients actually emit.
+const client_tag_name = "Plaza";
+
 var g_media_proxy_buf: [200]u8 = undefined;
 var g_media_proxy_len: usize = 0;
 
@@ -4436,6 +4466,12 @@ pub const Note = struct {
     // nothing; the flag disambiguates a genuine all-zero id.
     reply_parent: [32]u8 = [_]u8{0} ** 32,
     has_reply_parent: bool = false,
+    /// What the note says it was written with, from NIP-89's `client` tag.
+    /// Copied in rather than read at render time because it is foreign text on a
+    /// borrowed event: the buffer is the sanitiser's output, bounded here so a
+    /// name can never be longer than the row that draws it.
+    client_buf: [client_name_max]u8 = [_]u8{0} ** client_name_max,
+    client_len: u8 = 0,
     // Thread placement, stamped by `arrangeThread`: how deep this reply sits
     // under the root (1 = a direct reply). Meaningless outside an arranged
     // thread.
@@ -4561,6 +4597,11 @@ pub const Note = struct {
     }
     pub fn time(self: *const Note) []const u8 {
         return self.time_buf[0..self.time_len];
+    }
+
+    /// What this note says it was written with, empty when it says nothing.
+    pub fn client(self: *const Note) []const u8 {
+        return self.client_buf[0..self.client_len];
     }
     pub fn content(self: *const Note) []const u8 {
         return self.content_buf[0..self.content_len];
@@ -4968,6 +5009,17 @@ pub const Model = struct {
             .sent => "Saved here and sent to your relays. Other clients will show it as they pass it on.",
             .failed => "Could not sign this. Nothing was published, and your profile is unchanged.",
         };
+    }
+    pub fn client_tag_on(_: *const Model) bool {
+        return clientTag();
+    }
+    /// Says what turning it on actually publishes, in the terms the reader cares
+    /// about: not "adds a tag" but "every note says where it came from, forever".
+    pub fn client_tag_explainer(_: *const Model) []const u8 {
+        return if (clientTag())
+            "On. Every note you post says it was written in Plaza. Anyone reading it in any client can see that."
+        else
+            "Off. Your notes say nothing about what you wrote them with.";
     }
     /// Whether all three fields are still empty, which is the only state where a
     /// late-arriving profile may fill them in.
@@ -6255,6 +6307,12 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     setAuthor(&note, ev.pubkey);
 
+    if (clientOf(ev)) |name| {
+        const n = @min(name.len, note.client_buf.len);
+        @memcpy(note.client_buf[0..n], name[0..n]);
+        note.client_len = @intCast(n);
+    }
+
     // An image link becomes a picture, so lift it out of the text and omit it
     // from the rendered content rather than showing a bare URL beside it.
     var image_url: []const u8 = "";
@@ -7175,6 +7233,7 @@ pub const Msg = union(enum) {
     proxy_save,
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
+    client_tag_toggle,
     /// The feed scrolled: remember where, so images load around the viewport.
     feed_scrolled: canvas.ScrollState,
     /// A link in a note was pressed: open it in the browser.
@@ -7537,6 +7596,26 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
             &.{.{ .text = model.previews_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.client_tag_on(),
+            .text = "Say notes were written in Plaza",
+            .on_toggle = Msg.client_tag_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Say notes were written in Plaza", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.client_tag_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
         ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, &.{.{ .text = "Media proxy", .scale = menu_scale }}),
@@ -10251,7 +10330,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
                 ui.row(.{ .gap = 6, .cross = .start }, .{
                     identityBlock(ui, note),
                     ui.spacer(1),
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = meta_scale }}),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, meta_scale)),
                 }),
                 // The gap stays whatever the body is: it is a term of the row's
                 // chrome, and dropping it would make the estimate wrong by 4px
@@ -13243,7 +13322,10 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         // the avatar's height, with the time hung top-right.
                         ui.row(.{ .gap = 6, .cross = .start }, .{
                             identityBlock(ui, note),
-                            metaText(ui, note.time(), theme.palette.text_faint_alt),
+                            ui.paragraph(
+                                .{ .style = .{ .foreground = theme.palette.text_faint_alt } },
+                                timeSpans(ui, note, meta_scale),
+                            ),
                         }),
                         vgap(ui, 5),
                         noteBody(ui, note, true),
@@ -14267,6 +14349,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Retry anything that failed to load under the previous setting.
             retryFailedImages();
         },
+        .client_tag_toggle => {
+            setClientTag(!clientTag());
+            saveSettings();
+        },
         .previews_toggle => {
             setMediaPreviews(!mediaPreviews());
             saveSettings();
@@ -15015,7 +15101,13 @@ fn submitPost(model: *Model, fx: *Effects) void {
 /// remote paths reference them after this returns, and the write seam intends
 /// them to outlive the detached publish). `restorable` marks a composer draft,
 /// so only a lost post is put back in the composer, never a reaction.
-fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags_in: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+    // Here, rather than at each call site, because this is the ONE door every
+    // published event goes through: a switch the reader turned on has to hold for
+    // the note they write, the note they repost and the note they quote, and a
+    // per-caller version of it is a switch that holds for whichever paths someone
+    // remembered.
+    const tags = withClientTag(gpa, kind, tags_in);
     switch (g_signer_kind) {
         .local => {
             const signer = g_identity_signer orelse return;
@@ -15026,6 +15118,68 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
         .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
         .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned),
     }
+}
+
+/// Appends NIP-89's `client` tag when the reader has asked for it.
+///
+/// Only to the kinds that ARE the reader's writing. A reaction, a deletion and a
+/// contact list are machinery; stamping those would broadcast the same fact more
+/// widely for no reader-visible benefit, which is the opposite of what an opt-in
+/// privacy switch is for.
+pub fn withClientTag(gpa: std.mem.Allocator, kind: u16, tags: []const nostr.event.Tag) []const nostr.event.Tag {
+    if (!g_client_tag) return tags;
+    if (kind != 1 and kind != 6) return tags;
+    const tag = gpa.dupe([]const u8, &.{ "client", client_tag_name }) catch return tags;
+    const out = gpa.alloc(nostr.event.Tag, tags.len + 1) catch return tags;
+    @memcpy(out[0..tags.len], tags);
+    out[tags.len] = tag;
+    return out;
+}
+
+/// The time, and what the note was written with when it says so.
+///
+/// Returned as SPANS of the paragraph the time already occupies, not as a node of
+/// its own. A feed row is priced in widget nodes against a per-view ceiling that
+/// refuses the whole screen when crossed, and "a quiet second line of metadata"
+/// is precisely the sort of thing that costs ten rows' worth of budget without
+/// looking like it costs anything.
+///
+/// The name is drawn in the meta register and prefixed, so it can never be read
+/// as the note's own words. It is somebody else's claim about their software.
+fn timeSpans(ui: *AppUi, note: *const Note, scale: f32) []const canvas.TextSpan {
+    const name = note.client();
+    if (name.len == 0) {
+        const one = ui.arena.alloc(canvas.TextSpan, 1) catch return &.{};
+        one[0] = .{ .text = note.time(), .scale = scale };
+        return one;
+    }
+    const two = ui.arena.alloc(canvas.TextSpan, 2) catch return &.{};
+    two[0] = .{ .text = note.time(), .scale = scale };
+    // Same faint register as the time it follows: inherited from the paragraph,
+    // so it cannot drift into looking like the note's own words.
+    two[1] = .{ .text = ui.fmt(" via {s}", .{name}), .scale = scale };
+    return two;
+}
+
+/// What a note says it was written with, if it says anything.
+///
+/// Foreign text from a stranger's event, so it is treated as such: a name longer
+/// than a label is not a label, and control characters in a meta row are how a
+/// row stops looking like a row. An absent or unusable tag draws nothing at all,
+/// never "via unknown", because what a note does not say is not a fact about it.
+const client_name_max = 24;
+
+pub fn clientOf(ev: nostr.event.Event) ?[]const u8 {
+    for (ev.tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "client")) continue;
+        const name = std.mem.trim(u8, tag[1], " \t\r\n");
+        if (name.len == 0 or name.len > client_name_max) return null;
+        for (name) |c| {
+            if (c < 0x20 or c == 0x7f) return null;
+        }
+        return name;
+    }
+    return null;
 }
 
 /// Publishes the reply composer's text as a NIP-10 reply to the open thread's
@@ -16868,6 +17022,7 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
 fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
+    g_client_tag = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
@@ -16879,6 +17034,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // An empty value is meaningful: the user chose to load originals.
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
     }
 }
 
@@ -16889,9 +17045,10 @@ fn saveSettings() void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     var buf: [512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
+        if (g_client_tag) "on" else "off",
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",

@@ -50,6 +50,22 @@ fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
     return null;
 }
 
+/// Whether any widget's text CONTAINS this needle (span-joined paragraphs).
+fn findAnyTextContaining(widget: canvas.Widget, needle: []const u8) bool {
+    if (std.mem.indexOf(u8, widget.text, needle) != null) return true;
+    for (widget.children) |child| {
+        if (findAnyTextContaining(child, needle)) return true;
+    }
+    return false;
+}
+
+/// How many widgets the tree holds, which is what the view budget counts.
+fn countNodes(widget: canvas.Widget) usize {
+    var n: usize = 1;
+    for (widget.children) |child| n += countNodes(child);
+    return n;
+}
+
 /// How many widgets carry this exact label. A row count, when the rows are
 /// alike: `findByLabel` says one exists, this says how many were built.
 fn countByLabel(widget: canvas.Widget, label: []const u8) usize {
@@ -6363,4 +6379,123 @@ test "the notifications sheet renders what it holds" {
     const tree = try buildTree(arena, &model);
     try testing.expect(findAnyText(tree.root, "mentioned you") != null);
     try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
+}
+
+// ------------------------------------------------------- NIP-89 the client tag
+
+test "a note says nothing about what wrote it unless the reader asks" {
+    // OFF by default, which is the choice Sepehr made and NIP-89 hints at: the
+    // tag is a small permanent fact about the reader attached to everything they
+    // write, and it follows the note to every relay forever.
+    const gpa = testing.allocator;
+    main.setClientTag(false);
+    defer main.setClientTag(false);
+
+    const base = [_]nostr.event.Tag{&.{ "e", "ab" ** 32 }};
+    {
+        const out = main.withClientTag(gpa, 1, &base);
+        try testing.expectEqual(@as(usize, 1), out.len);
+    }
+
+    main.setClientTag(true);
+    // A note, and a repost of one: the things the reader actually wrote.
+    for ([_]u16{ 1, 6 }) |kind| {
+        const out = main.withClientTag(gpa, kind, &base);
+        defer {
+            gpa.free(out[out.len - 1]);
+            gpa.free(out);
+        }
+        try testing.expectEqual(@as(usize, 2), out.len);
+        try testing.expectEqualStrings("client", out[1][0]);
+        try testing.expectEqualStrings("Plaza", out[1][1]);
+    }
+    // Machinery is not writing. A reaction and a deletion carry nothing: they
+    // would broadcast the same fact more widely for nothing the reader can see,
+    // which is the opposite of what an opt-in privacy switch is for.
+    for ([_]u16{ 7, 5, 3, 0 }) |kind| {
+        const out = main.withClientTag(gpa, kind, &base);
+        try testing.expectEqual(@as(usize, 1), out.len);
+    }
+}
+
+test "what a stranger's note claims about its client is treated as foreign text" {
+    const long = "x" ** 40;
+    const cases = [_]struct { value: []const u8, shown: ?[]const u8 }{
+        .{ .value = "Plaza", .shown = "Plaza" },
+        .{ .value = "  Amethyst  ", .shown = "Amethyst" },
+        // Longer than a label is not a label.
+        .{ .value = long, .shown = null },
+        // A newline in a meta row is how a row stops looking like a row.
+        .{ .value = "Damus\nHACKED", .shown = null },
+        .{ .value = "", .shown = null },
+        .{ .value = "   ", .shown = null },
+    };
+    for (cases) |c| {
+        const ev = nostr.event.Event{
+            .id = [_]u8{0} ** 32,
+            .pubkey = [_]u8{0} ** 32,
+            .created_at = 1_800_000_000,
+            .kind = 1,
+            .tags = &.{&.{ "client", c.value }},
+            .content = "hi",
+            .sig = [_]u8{0} ** 64,
+        };
+        if (c.shown) |want| {
+            try testing.expectEqualStrings(want, main.clientOf(ev) orelse return error.NothingShown);
+        } else {
+            try testing.expect(main.clientOf(ev) == null);
+        }
+    }
+    // A note with no tag at all draws nothing, never "via unknown": what a note
+    // does not say is not a fact about it.
+    const bare = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "hi",
+        .sig = [_]u8{0} ** 64,
+    };
+    try testing.expect(main.clientOf(bare) == null);
+}
+
+test "the feed draws via without spending a node on it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const plain = nostr.event.Event{
+        .id = [_]u8{0xC1} ** 32,
+        .pubkey = [_]u8{0x51} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "no client tag here",
+        .sig = [_]u8{0} ** 64,
+    };
+    var tagged = plain;
+    tagged.id = [_]u8{0xC2} ** 32;
+    tagged.tags = &.{&.{ "client", "Amethyst" }};
+    tagged.content = "written elsewhere";
+
+    model.notes[0] = main.noteFrom(plain, 1_800_000_000);
+    model.notes[1] = main.noteFrom(tagged, 1_800_000_000);
+    model.notes_len = 2;
+
+    const before = try buildTree(arena, &model);
+    const nodes_with = countNodes(before.root);
+    try testing.expect(findAnyTextContaining(before.root, "via Amethyst"));
+    // The note that says nothing gets no "via" of its own.
+    try testing.expect(!findAnyTextContaining(before.root, "via Plaza"));
+
+    // And the row costs the same either way: the name rides as a second SPAN of
+    // the paragraph the time already occupies, not as a node beside it. A feed
+    // row is priced against a per-view ceiling that refuses the whole screen.
+    model.notes[1] = main.noteFrom(plain, 1_800_000_000);
+    model.notes[1].id = 999;
+    const after = try buildTree(arena, &model);
+    try testing.expectEqual(nodes_with, countNodes(after.root));
 }
