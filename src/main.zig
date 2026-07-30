@@ -326,6 +326,9 @@ fn adoptRelayList() bool {
 fn ingestRelayList(ev: nostr.event.Event) void {
     if (activePubkey()) |pk| {
         if (std.mem.eql(u8, &pk, &ev.pubkey)) {
+            // Heard. Whatever happens to the pool now, a publish is no longer
+            // writing over something nobody has read.
+            noteOwnRelaysAnswered(pk);
             applyOwnRelayList(ev);
             return;
         }
@@ -351,9 +354,12 @@ const relay_list_settle_s: i64 = 2;
 /// Marks the pool changed. The file is written at once (a crash must not lose an
 /// edit), and the network hears about it once the reader stops pressing.
 fn relayListEdited() void {
+    // Claimed BEFORE the file is written, or the file records the PREVIOUS owner
+    // (none, on the edit that matters) and the next launch reads this reader's
+    // own list back as belonging to nobody.
+    claimRelayList();
     saveRelays();
     forgetOutboxAcks();
-    claimRelayList();
     g_relay_list_dirty = true;
     g_relay_list_touched = nowSeconds();
 }
@@ -401,28 +407,40 @@ fn isReaderNote(kind: u16) bool {
 /// open reads the same pool. An edit here is the source of truth: it goes to
 /// disk and to the network in the same breath.
 fn publishRelayList(fx: *Effects) void {
+    _ = publishRelayListReporting(fx);
+}
+
+/// Publishes, and says whether it did. The caller ignores the answer; a test
+/// cannot, because "did not publish" is the whole safety property.
+fn publishRelayListReporting(fx: *Effects) bool {
     // A guest has no identity to sign with, and their list stays local.
-    if (activePubkey() == null) return;
-    // NOTHING is published over a list that has not been read. A relay list is
+    if (activePubkey() == null) return false;
+    // NOTHING is published over a list that has not been READ. A relay list is
     // replaceable: publishing one replaces whatever the reader had, on every
-    // relay. The pool in memory is only safe to publish once it IS this
-    // account's, which means either they edited it here or it came from their
-    // own kind:10002.
-    if (!relayListIsOwned()) return;
+    // relay.
+    //
+    // Ownership alone is not enough, and getting that wrong is how the original
+    // hole worked: editing in Settings claims the pool for this account, so an
+    // edit would self-authorize its own publish and the bootstrap five would go
+    // out over a real list nobody had looked at yet. So the gate is BOTH. Owned,
+    // meaning this account's, AND answered, meaning a relay has actually said
+    // what their list is (or that they have none).
+    if (!relayListIsOwned()) return false;
+    if (!ownRelaysAnswered()) return false;
     const gpa = std.heap.page_allocator;
     var tags = std.ArrayList(nostr.event.Tag).empty;
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
         if (!e.read and !e.write) continue;
-        const url = gpa.dupe(u8, e.url()) catch return;
-        var parts = gpa.alloc([]const u8, if (e.read and e.write) 2 else 3) catch return;
+        const url = gpa.dupe(u8, e.url()) catch return false;
+        var parts = gpa.alloc([]const u8, if (e.read and e.write) 2 else 3) catch return false;
         parts[0] = "r";
         parts[1] = url;
         if (!(e.read and e.write)) parts[2] = if (e.read) "read" else "write";
-        tags.append(gpa, parts) catch return;
+        tags.append(gpa, parts) catch return false;
     }
-    const owned = tags.toOwnedSlice(gpa) catch return;
-    if (owned.len == 0) return;
+    const owned = tags.toOwnedSlice(gpa) catch return false;
+    if (owned.len == 0) return false;
     // Past whatever is already stored. A replaceable event whose stamp does not
     // beat the stored one is dropped by this store and by every relay, so an
     // edit could vanish everywhere while the app showed it applied.
@@ -430,6 +448,13 @@ fn publishRelayList(fx: *Effects) void {
     // A relay list carries everything in its tags: the content is empty by
     // NIP-65, not by omission.
     signAndPublish(fx, gpa, created, relay_list_kind, owned, "", false);
+    return true;
+}
+
+/// Whether publishing the pool would go out right now. The safety property is
+/// that it does NOT, until a relay has said what this account's list is.
+pub fn publishRelayListForTest(fx: *Effects) bool {
+    return publishRelayListReporting(fx);
 }
 
 // ------------------------------------------------------- your own lists
@@ -475,35 +500,58 @@ fn isOwnList(kind: u16) bool {
 /// missed call site is a contact list lost while the app believes it has a copy.
 fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.store.IngestOptions) !nostr.store.IngestResult {
     const store = g_store orelse return error.NoStore;
-    backupIfOwnList(gpa, store, ev);
-    return store.ingest(gpa, ev, options);
+    // Read what is about to be destroyed, BEFORE the write that destroys it,
+    // but keep the copy only once the store says it actually replaced
+    // something. Backing up on the way in was wrong twice over: the signature
+    // is not checked until inside `ingest`, so three forged events carrying the
+    // reader's pubkey and a future stamp would rotate their real history out of
+    // a three-slot ring from across the network; and the store's own rule for
+    // what replaces what (NIP-01's tie-break on equal timestamps) is the only
+    // correct answer to whether a copy is even needed.
+    const previous = capturePrevious(gpa, store, ev);
+    defer if (previous) |prev| gpa.free(prev.json);
+    const result = try store.ingest(gpa, ev, options);
+    if (result == .replaced) {
+        if (previous) |prev| keepReplaced(gpa, store, ev.kind, prev.json);
+    }
+    return result;
 }
 
-/// Keeps a copy of the version `ev` is about to replace, when `ev` is one of our
-/// own lists. Best effort by design: a backup that failed must never stop the
-/// event being stored, or a full disk would freeze the feed.
-fn backupIfOwnList(gpa: std.mem.Allocator, store: *nostr.store.Store, ev: nostr.event.Event) void {
-    if (!isOwnList(ev.kind)) return;
-    const pk = activePubkey() orelse return;
-    if (!std.mem.eql(u8, &pk, &ev.pubkey)) return;
+const ReplacedCopy = struct { json: []u8 };
+
+/// The version `ev` would replace, serialised, or null when there is nothing to
+/// keep. Cheap for everything that is not one of our own lists: a kind compare.
+fn capturePrevious(gpa: std.mem.Allocator, store: *nostr.store.Store, ev: nostr.event.Event) ?ReplacedCopy {
+    if (!isOwnList(ev.kind)) return null;
+    const pk = activePubkey() orelse return null;
+    if (!std.mem.eql(u8, &pk, &ev.pubkey)) return null;
 
     const kinds = [_]u16{ev.kind};
     const authors = [_][32]u8{pk};
-    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return;
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return null;
     defer result.deinit();
-    if (result.events.len == 0) return;
-    const previous = result.events[0];
-    // Not a replacement: the same event arriving twice, or an older one the
-    // store is about to refuse anyway.
-    if (std.mem.eql(u8, &previous.id, &ev.id)) return;
-    if (previous.created_at >= ev.created_at) return;
+    if (result.events.len == 0) return null;
+    // The same event arriving twice replaces nothing.
+    if (std.mem.eql(u8, &result.events[0].id, &ev.id)) return null;
+    const json = nostr.event.toJson(gpa, result.events[0]) catch return null;
+    return .{ .json = json };
+}
 
-    const json = nostr.event.toJson(gpa, previous) catch return;
-    defer gpa.free(json);
+/// Guards the backup ring. The read-modify-write below spans three separate LMDB
+/// transactions, and eight ingest threads plus the UI thread can reach it, so
+/// without this two replacements landing together can leave the ring holding two
+/// copies of one version and none of the other.
+var g_backup_lock = std.atomic.Value(bool).init(false);
 
+/// Puts `json` at the front of the ring for `kind`, dropping the oldest.
+fn keepReplaced(gpa: std.mem.Allocator, store: *nostr.store.Store, kind: u16, json: []const u8) void {
+    const pk = activePubkey() orelse return;
     var key_buf: [96]u8 = undefined;
-    const key = ownBackupKey(&key_buf, ev.kind, pk);
+    const key = ownBackupKey(&key_buf, kind, pk);
     if (key.len == 0) return;
+
+    while (g_backup_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    defer g_backup_lock.store(false, .release);
 
     // Newest first, oldest dropped: the reader wants the version from a minute
     // ago, not the one from last year, and the KV cannot be pruned any other way.
@@ -533,6 +581,23 @@ pub fn setStoreForTest(store: ?*nostr.store.Store) void {
 
 pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
     return plazaIngest(gpa, ev, .{});
+}
+
+/// Drives the funnel with verification ON, the way every relay-fed path does.
+pub fn plazaIngestVerifiedForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer) !nostr.store.IngestResult {
+    return plazaIngest(gpa, ev, .{ .verify_with = signer });
+}
+
+pub fn noteOwnRelaysAnsweredForTest(pk: [32]u8) void {
+    noteOwnRelaysAnswered(pk);
+}
+
+pub fn ownRelaysAnsweredForTest() bool {
+    return ownRelaysAnswered();
+}
+
+pub fn forgetOwnRecordAnswersForTest() void {
+    forgetOwnRecordAnswers();
 }
 
 /// The versions of `kind` this account has had replaced, newest first. This is
@@ -11673,6 +11738,45 @@ pub const ProfileNameKey = enum { display_name, display_name_legacy, name };
 /// answer records the pubkey it is about and is only set when a relay reached
 /// the end of its answer.
 var g_own_profile_asked_for: ?[32]u8 = null;
+/// The same question for the RELAY list: has a relay told this account what
+/// their kind:10002 is? An edit made in Settings claims the pool for this
+/// account, which is what stops a stale event undoing it, but claiming is not
+/// reading: publishing needs to have HEARD, or the first badge press on a
+/// bootstrap pool still replaces a real list nobody has looked at yet.
+var g_own_relays_asked_for: ?[32]u8 = null;
+var g_own_relays_answered = std.atomic.Value(bool).init(false);
+
+/// Whether a relay has told THIS account what their relay list is (including
+/// telling us there is none).
+fn ownRelaysAnswered() bool {
+    const pk = activePubkey() orelse return false;
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    const asked = g_own_relays_asked_for orelse return false;
+    if (!std.mem.eql(u8, &asked, &pk)) return false;
+    return g_own_relays_answered.load(.acquire);
+}
+
+/// Records that a relay answered about this account's relay list. Called from an
+/// ingest thread when a kind:10002 for us arrives, and from the pool's EOSE,
+/// which is a relay saying "that is all I have" and therefore an answer too.
+fn noteOwnRelaysAnswered(pk: [32]u8) void {
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    g_own_relays_asked_for = pk;
+    g_own_relays_answered.store(true, .release);
+}
+
+/// Forgets every conclusion about this account's own records. Called on any
+/// identity change, so nothing decided about one account is read as a fact about
+/// the next.
+fn forgetOwnRecordAnswers() void {
+    forgetOwnProfileAnswer();
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    g_own_relays_asked_for = null;
+    g_own_relays_answered.store(false, .release);
+}
 var g_own_profile_asking = std.atomic.Value(bool).init(false);
 /// Set by the worker when at least one relay ANSWERED (EOSE), paired with the
 /// pubkey it asked about. Read on the UI thread through `ownProfileAnswered`.
@@ -13996,10 +14100,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // relays, and hand the new account a list they never chose. Back to the
     // relays the app was born with, ready to adopt the next account's own.
     resetRelaysToBootstrap();
-    // And what was concluded about the leaving account's profile. Carrying it
-    // would let the next account be judged "has no profile" without being asked,
-    // and Save would then publish an empty object over a real profile.
-    forgetOwnProfileAnswer();
+    // And what was concluded about the leaving account's own records. Carrying
+    // any of it would let the next account be judged without being asked, and a
+    // write would then go out over a list nobody has read.
+    forgetOwnRecordAnswers();
     model.editing_profile = false;
     model.profile_seeded = false;
 
@@ -14195,6 +14299,14 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - probe_at;
                     if (elapsed >= 0) recordRelayRtt(index, @intCast(@min(elapsed, std.math.maxInt(u16))));
                     probe_at = 0;
+                }
+                // The feed subscription asks for this account's own kind:10002
+                // alongside everyone's kind:0. A relay reaching the end of that
+                // without sending one has told us they hold none, which is an
+                // answer: it is what lets a first edit be published at all,
+                // instead of the app waiting forever for a list nobody has.
+                if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                    if (activePubkey()) |me| noteOwnRelaysAnswered(me);
                 }
                 // Stored feed drained: now watch those notes' engagement.
                 if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
