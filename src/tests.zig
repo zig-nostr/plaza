@@ -6499,3 +6499,95 @@ test "the feed draws via without spending a node on it" {
     const after = try buildTree(arena, &model);
     try testing.expectEqual(nodes_with, countNodes(after.root));
 }
+
+test "nothing that calls itself a button is dead" {
+    // The recurring failure in this app is not a broken control, it is a control
+    // that LOOKS live and does nothing: a badge saying "W" while filters still
+    // went out, a textarea that renders and accepts no keys, a Repost verb drawn
+    // beside a working Like. Each was found by hand, late, and only after it had
+    // been reviewed and snapshot-checked. So the invariant is stated once here:
+    // if a widget announces itself to the reader as a button, something has to
+    // happen when it is pressed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+
+    // Every screen the app can be on, including the ones layered over others.
+    const Screen = struct { name: []const u8, prepare: *const fn (*main.Model) void };
+    const screens = [_]Screen{
+        .{ .name = "feed", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+            }
+        }.f },
+        .{ .name = "thread", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.viewing_thread = 1;
+                m.thread_root = threadNote(0xAA, 100, 0);
+                m.thread_root.id = 1;
+            }
+        }.f },
+        .{ .name = "profile", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.viewing_profile = [_]u8{0x33} ** 32;
+            }
+        }.f },
+        .{ .name = "settings", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .settings;
+            }
+        }.f },
+        .{ .name = "compose", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.composing = true;
+            }
+        }.f },
+        .{ .name = "notifications", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.notifications_open = true;
+            }
+        }.f },
+        .{ .name = "onboarding", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .onboarding;
+            }
+        }.f },
+    };
+
+    for (screens) |screen| {
+        var per_screen = std.heap.ArenaAllocator.init(testing.allocator);
+        defer per_screen.deinit();
+        var model = main.initialModel();
+        screen.prepare(&model);
+        const tree = try buildTree(per_screen.allocator(), &model);
+        var dead: usize = 0;
+        countDeadButtons(tree, tree.root, &dead);
+        if (dead != 0) {
+            std.debug.print("{s}: {d} widget(s) announce a button role with nothing behind them\n", .{ screen.name, dead });
+            return error.DeadControl;
+        }
+    }
+}
+
+/// Counts widgets that announce a button role but carry no handler of any kind.
+fn countDeadButtons(tree: AppUi.Tree, widget: canvas.Widget, out: *usize) void {
+    if (widget.semantics.role == .button) {
+        var wired = false;
+        for (tree.handlers) |h| {
+            if (h.id == widget.id) wired = true;
+        }
+        if (!wired) {
+            out.* += 1;
+            std.debug.print("  DEAD: label='{s}' kind={s}\n", .{ widget.semantics.label, @tagName(widget.kind) });
+        }
+    }
+    for (widget.children) |child| countDeadButtons(tree, child, out);
+}

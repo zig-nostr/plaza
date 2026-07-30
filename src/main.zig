@@ -9465,6 +9465,7 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
 fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const liked = likeEntry(note.id) != null;
+    const counts = engagementFor(note.id);
     // The mock's insets are 2 above, 40 each side, 4 below, and padding on this
     // engine is ONE number for all four edges, so each axis is stated where it
     // belongs: this column carries the 2 and the 4, the row carries the 40s as
@@ -9475,18 +9476,57 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
         vgap(ui, 2),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, 40),
-            // Repost becomes a two-item menu with the repost work; inert until then.
-            focalVerb(ui, "repeat", "Repost", null, p.text_verb),
+            // Repost and zap are READINGS here, not verbs: an icon and a number,
+            // no press, no hover, not in the focus order, and labelled as the
+            // count they are. Reposting needs its own milestone and zapping needs
+            // a wallet, and a control that draws like the live ones beside it and
+            // does nothing when pressed is a promise the app cannot keep. The
+            // number is still worth showing, because what other people did with
+            // this note is true and knowable today.
+            focalStat(ui, "repeat", counts.reposts, "{d} repost", "{d} reposts", p.text_verb),
             ui.spacer(1),
             focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
             ui.spacer(1),
-            // Zap waits on a wallet; it draws at rest and does nothing.
-            focalVerb(ui, "zap", "Zap", null, p.text_verb),
+            focalStat(ui, "zap", @intCast(counts.zap_msat / 1000), "{d} sat", "{d} sats", p.text_verb),
             ui.spacer(1),
             focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
             hgap(ui, 40),
         }),
         vgap(ui, 4),
+    });
+}
+
+/// A reading on the action bar: what other people did, stated rather than
+/// offered.
+///
+/// Deliberately NOT a `focalVerb` with a null press. That shape draws the same
+/// box, keeps the same hover wash and still announces itself to the reader as a
+/// button, so it reads as something that ought to work and quietly does not.
+/// This one has no press, no hover, no focus, and its accessible name is the
+/// count rather than a verb, so nothing about it offers an action.
+fn focalStat(
+    ui: *AppUi,
+    glyph: []const u8,
+    n: u32,
+    comptime one: []const u8,
+    comptime many: []const u8,
+    tint: canvas.Color,
+) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{
+        .padding = 6,
+        .cross = .center,
+        .gap = 6,
+        // Named as the count, not as a verb: a screen reader should hear "three
+        // reposts", which is what this is, and never "Repost", which is an offer
+        // this cannot honour.
+        .semantics = .{ .label = pluralize(ui, n, one, many) },
+    }, .{
+        ui.appIcon(.{ .width = 17, .height = 17, .style = .{ .foreground = tint } }, glyph),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_metric } },
+            &.{.{ .text = ui.fmt("{d}", .{n}), .scale = meta_scale }},
+        ),
     });
 }
 
@@ -10715,7 +10755,14 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                 .gap = 0,
                 .on_press = if (ready) Msg.reply_submit else null,
                 .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Reply", .focusable = ready },
+                // Not a button until there is something to send. The SDK's
+                // semantics have no "disabled" bit, so the honest choice between
+                // announcing an unavailable button and announcing no button is
+                // the second one: the word "Reply" is still on screen, visibly
+                // dimmed. This also keeps the rule that a button role always has
+                // something behind it exactly true, with no exception list to
+                // hide the next dead control in.
+                .semantics = .{ .role = if (ready) .button else .none, .label = "Reply", .focusable = ready },
             }, .{
                 ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = if (ready) p.accent else p.surface_rail_tile, .radius = 8, .stroke_width = 0 } }, .{
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
