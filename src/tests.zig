@@ -5356,3 +5356,205 @@ test "the follow count counts people, not tags" {
     };
     try testing.expectEqual(@as(usize, 2), main.countPeopleForTest(&tags));
 }
+
+fn inboxEvent(kind: u16, author: u8, tags: []const nostr.event.Tag, created_at: i64) nostr.event.Event {
+    return inboxEventBy(kind, [_]u8{author} ** 32, tags, created_at);
+}
+
+fn inboxEventBy(kind: u16, author: [32]u8, tags: []const nostr.event.Tag, created_at: i64) nostr.event.Event {
+    return .{
+        .id = author,
+        .pubkey = author,
+        .created_at = created_at,
+        .kind = kind,
+        .tags = tags,
+        .content = "+",
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+test "a p tag alone is not a notification" {
+    // An inbox is the first surface where a stranger decides what the reader
+    // sees, so what does NOT get in matters as much as what does.
+    main.setIdentityForTest([_]u8{0xB1} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // Naming somebody else is not naming me, however loudly.
+    const other = [_]nostr.event.Tag{&.{ "p", "aa" ** 32 }};
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &other, 100), me) == null);
+
+    // Naming me IS a mention.
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(inboxEvent(1, 0xC1, &mine, 100), me).?);
+
+    // A note naming twenty people is a broadcast, and being one of the twenty
+    // is not a message. This is the cheapest filter that works.
+    var many: [12]nostr.event.Tag = undefined;
+    var hexes: [12][64]u8 = undefined;
+    for (0..12) |i| {
+        for (0..32) |b| _ = std.fmt.bufPrint(hexes[i][b * 2 ..][0..2], "{x:0>2}", .{@as(u8, @intCast(i + 1))}) catch {};
+        many[i] = &.{ "p", &hexes[i] };
+    }
+    many[11] = &.{ "p", &me_hex };
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &many, 100), me) == null);
+
+    // My own note is not news to me. (Built from the real pubkey: the identity
+    // helper takes a SECRET key, and the two are not the same bytes.)
+    try testing.expect(main.inboxVerbForTest(inboxEventBy(1, me, &mine, 100), me) == null);
+}
+
+test "a reaction that is not a like is not a notification" {
+    main.setIdentityForTest([_]u8{0xB2} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    var like = inboxEvent(7, 0xC2, &mine, 100);
+    try testing.expectEqual(main.InboxVerb.like, main.inboxVerbForTest(like, me).?);
+    // A downvote is not something to celebrate in a bell.
+    like.content = "-";
+    try testing.expect(main.inboxVerbForTest(like, me) == null);
+
+    // Reposts and zaps are their own verbs.
+    try testing.expectEqual(main.InboxVerb.repost, main.inboxVerbForTest(inboxEvent(6, 0xC2, &mine, 100), me).?);
+    try testing.expectEqual(main.InboxVerb.zap, main.inboxVerbForTest(inboxEvent(9735, 0xC2, &mine, 100), me).?);
+}
+
+test "one event dated in the future does not kill the bell forever" {
+    // created_at is written by whoever signed the event, so it is not a fact.
+    // Believing one dated 2100 pushes the read mark past everything that will
+    // ever arrive and the bell never lights again. Nostur ships this bug with
+    // the TODO still in the file.
+    main.setIdentityForTest([_]u8{0xB3} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    // Dated seventy years out.
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC3, &mine, now + 2_000_000_000), now);
+    main.inboxMarkAllRead();
+
+    // The absurd stamp was clamped to the moment it arrived, so the mark sits at
+    // `now` rather than seventy years out. A genuine mention a minute later is
+    // therefore still unread, which is the whole point.
+    try testing.expectEqual(now, main.inboxReadThrough());
+    var second = inboxEvent(1, 0xC4, &mine, now + 60);
+    second.id = [_]u8{0xD4} ** 32;
+    _ = main.inboxAddForTest(second, now + 60);
+    try testing.expect(main.inboxUnread() > 0);
+}
+
+test "marking read uses the newest item held, never the clock" {
+    // Marking at now() means anything arriving later with an older stamp, which
+    // is every backfill and every slow relay, is born already read.
+    main.setIdentityForTest([_]u8{0xB4} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC5, &mine, now - 100), now);
+    main.inboxMarkAllRead();
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+    // The mark sits on the item, not on the clock, so an older one that shows
+    // up afterwards is still counted.
+    try testing.expectEqual(now - 100, main.inboxReadThrough());
+
+    var older = inboxEvent(1, 0xC6, &mine, now - 50);
+    older.id = [_]u8{0xD6} ** 32;
+    _ = main.inboxAddForTest(older, now);
+    try testing.expectEqual(@as(usize, 1), main.inboxUnread());
+}
+
+test "the bell counts what it can speak for" {
+    // A like is worth reading and is not worth a number on a tile. The bell and
+    // the sheet read the same list, so they cannot disagree about what is in it.
+    main.setIdentityForTest([_]u8{0xB5} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    var like = inboxEvent(7, 0xC7, &mine, now);
+    like.id = [_]u8{0xE1} ** 32;
+    _ = main.inboxAddForTest(like, now);
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+
+    var mention = inboxEvent(1, 0xC8, &mine, now);
+    mention.id = [_]u8{0xE2} ** 32;
+    _ = main.inboxAddForTest(mention, now);
+    try testing.expectEqual(@as(usize, 1), main.inboxUnread());
+
+    // Both are in the sheet, though: the bell is quieter than the list, not a
+    // different list.
+    var buf: [16]main.InboxItem = undefined;
+    try testing.expectEqual(@as(usize, 2), main.inboxItems(&buf, false).len);
+}
+
+test "one reader's notifications are never another's" {
+    main.setIdentityForTest([_]u8{0xB6} ** 32);
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC9, &mine, 1_800_000_000), 1_800_000_000);
+    try testing.expectEqual(@as(usize, 1), main.inboxLenForTest());
+
+    // A different account sees an empty inbox, not the previous reader's mail.
+    main.setIdentityForTest([_]u8{0xB7} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+    var buf: [16]main.InboxItem = undefined;
+    try testing.expectEqual(@as(usize, 0), main.inboxItems(&buf, false).len);
+}
+
+test "the notifications sheet renders what it holds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xB8} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+
+    // Empty: the sheet says so in its own words rather than showing nothing.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Notifications") != null);
+        try testing.expect(findAnyText(tree.root, "Mark all read") != null);
+        try testing.expect(findAnyText(tree.root, "read state stays on this Mac") != null);
+        try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") != null);
+    }
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    _ = main.inboxAddForTest(inboxEvent(1, 0xCA, &mine, 1_800_000_000), 1_800_000_000);
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
+}
