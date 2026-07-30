@@ -6579,15 +6579,69 @@ test "nothing that calls itself a button is dead" {
 
 /// Counts widgets that announce a button role but carry no handler of any kind.
 fn countDeadButtons(tree: AppUi.Tree, widget: canvas.Widget, out: *usize) void {
-    if (widget.semantics.role == .button) {
+    // Every role that PROMISES the reader something happens. A button is the
+    // obvious one; a checkbox, a radio and a tab make the same promise in a
+    // different shape, and a dead control could otherwise slip past simply by
+    // wearing one of those instead.
+    const interactive = switch (widget.semantics.role) {
+        .button, .checkbox, .radio, .tab => true,
+        else => false,
+    };
+    if (interactive) {
         var wired = false;
         for (tree.handlers) |h| {
             if (h.id == widget.id) wired = true;
         }
         if (!wired) {
             out.* += 1;
-            std.debug.print("  DEAD: label='{s}' kind={s}\n", .{ widget.semantics.label, @tagName(widget.kind) });
+            std.debug.print("  DEAD: label='{s}' kind={s} role={s}\n", .{ widget.semantics.label, @tagName(widget.kind), @tagName(widget.semantics.role) });
         }
     }
     for (widget.children) |child| countDeadButtons(tree, child, out);
+}
+
+test "the client-tag switch is wired, and flipping it sticks" {
+    // The automation harness cannot drive a `.checkbox`: its snapshot advertises
+    // `actions=[focus,toggle]` and `widget-action ... toggle` reports "delivered"
+    // while nothing moves. That is true of the media-previews checkbox this one
+    // sits beside, so it is the harness, not this switch. It does mean the switch
+    // cannot be proven by driving the real app, which is exactly the case where a
+    // control quietly turns out to be wired to nothing. So it is proven here
+    // instead: the widget carries a toggle handler, and the message behind it
+    // changes what gets published.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setClientTag(false);
+    defer main.setClientTag(false);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+
+    const box = findByLabel(tree.root, "Say notes were written in Plaza") orelse return error.SwitchMissing;
+    var wired = false;
+    for (tree.handlers) |h| {
+        if (h.id == box.id and h.event == .toggle) wired = true;
+    }
+    try testing.expect(wired);
+
+    // And the message behind it does what the label says.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.clientTag());
+    main.update(&model, .client_tag_toggle, &fx);
+    try testing.expect(main.clientTag());
+
+    // Which is visible in what a note would carry.
+    const base = [_]nostr.event.Tag{&.{ "e", "ab" ** 32 }};
+    const out = main.withClientTag(testing.allocator, 1, &base);
+    defer {
+        testing.allocator.free(out[out.len - 1]);
+        testing.allocator.free(out);
+    }
+    try testing.expectEqual(@as(usize, 2), out.len);
+
+    main.update(&model, .client_tag_toggle, &fx);
+    try testing.expect(!main.clientTag());
 }
