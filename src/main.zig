@@ -3306,16 +3306,33 @@ var g_seen_len: usize = 0;
 // split those decisions ended up with a badge that disagreed with its own list.
 
 /// The kinds a relay is asked for on the reader's behalf.
-const inbox_kinds = [_]u16{ 1, 6, 7, 9735 };
+pub const inbox_kinds = [_]u16{ 1, 6, 7, 9735 };
 
 /// How many items are kept. The KV holds one rewritten blob, so this is what
 /// bounds it, and the oldest fall off the end.
-const inbox_cap = 200;
+pub const inbox_cap = 200;
 
 /// How many people may be p-tagged before an event is treated as a broadcast
 /// rather than a message. A note naming twenty people is a hellthread, and
 /// being one of the twenty is not a notification.
 const inbox_hellthread_max = 10;
+
+/// How many items any ONE author may hold at once.
+///
+/// The hellthread rule refuses a single event naming a crowd. This refuses the
+/// mirror image, which is cheaper to send and worse: many events each naming
+/// only the reader. Signing two hundred of those costs seconds and nothing else,
+/// and without a per-author bound they evict every notification the reader
+/// actually wanted, permanently, because `inboxSince` then resumes past them.
+pub const inbox_per_author_max = 20;
+
+/// The most a zap may claim before the amount is treated as noise.
+///
+/// `bolt11` is a string the sender writes, so the number in it is a claim, not a
+/// fact. Bitcoin's whole supply is 21e14 sats; anything above that is a parser
+/// artefact or a lie, and either way the honest thing to draw is no amount at
+/// all rather than eighteen quintillion.
+const inbox_max_claimable_msat: u64 = 21_000_000 * 100_000_000 * 1000;
 
 // `created_at` is written by whoever signed the event, so it is not a fact. One
 // event dated 2100 would push the read mark past everything that will ever
@@ -3333,12 +3350,19 @@ pub const InboxItem = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
     author: [32]u8 = [_]u8{0} ** 32,
-    /// The note this is about, when it is about one.
-    target: i64 = 0,
+    /// The note this is about, when it is about one. The WHOLE id, not the feed's
+    /// truncated handle: the note a notification points at is usually an old one
+    /// of the reader's own, which the follow-scoped feed window does not hold, so
+    /// the row has to be able to ask the store for it by name.
+    target_id: [32]u8 = [_]u8{0} ** 32,
     created_at: i64 = 0,
     verb: InboxVerb = .mention,
     /// Millisats, for a zap.
     msat: u64 = 0,
+
+    pub fn hasTarget(self: InboxItem) bool {
+        return !std.mem.allEqual(u8, &self.target_id, 0);
+    }
 };
 
 var g_inbox = [_]InboxItem{.{}} ** inbox_cap;
@@ -3427,25 +3451,105 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
         if (std.mem.eql(u8, &item.id, &ev.id)) return false;
     }
 
+    // A zap whose payer cannot be established is not filed at all. Falling back
+    // to the receipt's own author would put a payment server's key where a
+    // person's name goes, and inventing "someone" for it would give a forgery a
+    // row to sit in.
+    const author = if (ev.kind == 9735) (zapPayer(ev, me) orelse return false) else ev.pubkey;
+
+    var target: [32]u8 = [_]u8{0} ** 32;
+    if (engagementTarget(ev)) |t| {
+        if (t.len == 64) _ = std.fmt.hexToBytes(&target, t) catch {};
+    }
+
+    const claimed: u64 = if (ev.kind == 9735) zapMsat(ev) else 0;
     const item = InboxItem{
         .used = true,
         .id = ev.id,
-        .author = if (ev.kind == 9735) zapSender(ev) orelse ev.pubkey else ev.pubkey,
-        .target = if (engagementTarget(ev)) |t| noteIdFromHex(t) orelse 0 else 0,
+        .author = author,
+        .target_id = target,
         .created_at = believableStamp(ev.created_at, now_s),
         .verb = verb,
-        .msat = if (ev.kind == 9735) zapMsat(ev) else 0,
+        .msat = if (claimed > inbox_max_claimable_msat) 0 else claimed,
     };
 
-    // Newest first, oldest off the end.
-    if (g_inbox_len < g_inbox.len) g_inbox_len += 1;
-    var i: usize = g_inbox_len - 1;
-    while (i > 0) : (i -= 1) g_inbox[i] = g_inbox[i - 1];
-    g_inbox[0] = item;
-    // Keep it ordered even when a backfill arrives out of order.
-    sortInboxLocked();
+    if (!inboxAdmitLocked(item)) return false;
     g_inbox_dirty = true;
     return true;
+}
+
+/// Finds this item a slot, or refuses it. Returns whether it was filed.
+///
+/// The array is a fixed two hundred, so every arrival past that is a CHOICE about
+/// what to delete, and the version this shipped with made that choice before it
+/// had looked at the arrival: it shifted every slot down (dropping the oldest),
+/// wrote the newcomer at the front, and only then sorted. So a backfilled item
+/// from last year displaced an unread reply from this morning, and a stranger who
+/// signed two hundred events deleted the reader's whole history of being spoken
+/// to. Both are decided here instead, against the item actually arriving.
+fn inboxAdmitLocked(item: InboxItem) bool {
+    // No one author may own more than their share, however many they send.
+    var by_author: usize = 0;
+    var oldest_same: ?usize = null;
+    for (g_inbox[0..g_inbox_len], 0..) |it, i| {
+        if (!std.mem.eql(u8, &it.author, &item.author)) continue;
+        by_author += 1;
+        if (oldest_same == null or it.created_at < g_inbox[oldest_same.?].created_at) oldest_same = i;
+    }
+    if (by_author >= inbox_per_author_max) {
+        const victim = oldest_same orelse return false;
+        // Their own oldest, and only if this one is newer: a flood cannot walk
+        // its way through the reader's history one slot at a time either.
+        if (g_inbox[victim].created_at >= item.created_at) return false;
+        inboxRemoveLocked(victim);
+    }
+
+    if (g_inbox_len >= g_inbox.len) {
+        const victim = inboxEvictionCandidateLocked() orelse return false;
+        const victim_is_stranger = !isFollowing(g_inbox[victim].author);
+        const mine = isFollowing(item.author);
+        // Someone the reader follows always outranks someone they do not.
+        // Otherwise the newer of the two wins, so nothing already held is ever
+        // traded away for something older than it.
+        if (!(mine and victim_is_stranger) and g_inbox[victim].created_at >= item.created_at) return false;
+        inboxRemoveLocked(victim);
+    }
+
+    g_inbox[g_inbox_len] = item;
+    g_inbox_len += 1;
+    // Newest first, whatever order the relays delivered in.
+    sortInboxLocked();
+    return true;
+}
+
+/// Who is dropped when the inbox is full: the oldest STRANGER, and only when
+/// there is no stranger left, the oldest item at all.
+///
+/// A flood is cheap to send and always arrives from someone the reader has never
+/// followed. Spending the reader's last slots on people they chose, rather than
+/// on whoever signed most recently, is the difference between an inbox that
+/// degrades and one that can be erased on demand.
+///
+/// Takes the follows lock while the inbox lock is held. That is the same order
+/// `inboxItems` already uses, and nothing anywhere takes them the other way
+/// round.
+fn inboxEvictionCandidateLocked() ?usize {
+    var oldest_stranger: ?usize = null;
+    var oldest: ?usize = null;
+    for (g_inbox[0..g_inbox_len], 0..) |it, i| {
+        if (oldest == null or it.created_at < g_inbox[oldest.?].created_at) oldest = i;
+        if (isFollowing(it.author)) continue;
+        if (oldest_stranger == null or it.created_at < g_inbox[oldest_stranger.?].created_at) oldest_stranger = i;
+    }
+    return oldest_stranger orelse oldest;
+}
+
+fn inboxRemoveLocked(index: usize) void {
+    if (index >= g_inbox_len) return;
+    var i = index;
+    while (i + 1 < g_inbox_len) : (i += 1) g_inbox[i] = g_inbox[i + 1];
+    g_inbox_len -= 1;
+    g_inbox[g_inbox_len] = .{};
 }
 
 fn resetInboxLocked(owner: [32]u8) void {
@@ -3463,22 +3567,67 @@ fn sortInboxLocked() void {
     std.mem.sort(InboxItem, g_inbox[0..g_inbox_len], {}, Cmp.lt);
 }
 
-/// Who actually sent a zap. The RECEIPT is authored by the payment server, so
-/// its pubkey is not the person: the payer is inside the embedded request.
-fn zapSender(ev: nostr.event.Event) ?[32]u8 {
+/// Who actually sent a zap, established rather than taken on trust.
+///
+/// The RECEIPT is authored by a payment server, so its pubkey is not the person:
+/// the payer is named inside the embedded zap request. That request arrives as a
+/// STRING inside a stranger's tag, and parsing a string does not make its claims
+/// true. Reading `pubkey` straight out of it, which is the obvious implementation
+/// and the one this shipped with, lets anyone in the world publish a receipt whose
+/// embedded request names someone the reader follows: the row then draws that
+/// person's real cached name and avatar next to an amount the same stranger chose.
+/// A trusted face saying "I sent you money" is the most valuable lie this surface
+/// can carry, so it is the one that has to be paid for.
+///
+/// Three checks, all local and all cheap:
+///   the embedded event must be a zap REQUEST (kind 9734), not any event at all,
+///   its signature must verify, so the named payer really did sign it, and
+///   it must name the reader, so a request signed for somebody else cannot be
+///   lifted out of their receipt and replayed into this inbox.
+///
+/// What this still does NOT prove is that money moved: the full NIP-57 check
+/// wants the receipt to come from the recipient's own LNURL server, which means
+/// fetching and remembering that server's key. Until then an attacker can invent
+/// a zap under THEIR OWN name and any amount they like, which is a stranger
+/// talking to the reader rather than a friend impersonated, and is the same
+/// weight as any other message from a stranger.
+fn zapPayer(ev: nostr.event.Event, me: [32]u8) ?[32]u8 {
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "description")) continue;
         const gpa = std.heap.page_allocator;
         var parsed = nostr.event.fromJson(gpa, tag[1]) catch return null;
         defer parsed.deinit();
-        return parsed.value.pubkey;
+        const req = parsed.value;
+        if (req.kind != 9734) return null;
+
+        var signer = nostr.keys.Signer.init();
+        defer signer.deinit();
+        if (!(nostr.event.verify(gpa, signer, req) catch false)) return null;
+
+        // Signed by the payer, but for whom? A receipt is public, so a request
+        // naming somebody else can be copied verbatim into a receipt aimed here.
+        var hex: [64]u8 = undefined;
+        hexLower(&hex, me);
+        var names_me = false;
+        for (req.tags) |t| {
+            if (t.len < 2 or !std.mem.eql(u8, t[0], "p")) continue;
+            if (std.ascii.eqlIgnoreCase(t[1], &hex)) names_me = true;
+        }
+        if (!names_me) return null;
+
+        return req.pubkey;
     }
     return null;
 }
 
-/// How many items the reader has not seen. Counted in ROWS, the same unit the
-/// sheet draws, so the number on the bell is the number of things they will
-/// find behind it.
+/// How many items the reader has not seen.
+///
+/// Replies and mentions only: somebody writing TO the reader is worth a number
+/// on a tile, and a like is worth reading without being summoned to. So the bell
+/// deliberately counts FEWER things than the sheet lists, never more. That
+/// direction matters: a badge that counts things the sheet then declines to show
+/// sends the reader to an empty list and teaches them to distrust it, which is
+/// exactly what the follows-only default used to do to every stranger's reply.
 pub fn inboxUnread() usize {
     lockInbox();
     defer unlockInbox();
@@ -3541,6 +3690,32 @@ pub fn inboxNewest() i64 {
     defer unlockInbox();
     if (!inboxIsOwnedLocked() or g_inbox_len == 0) return 0;
     return g_inbox[0].created_at;
+}
+
+/// Asks this relay for what other people aimed at the reader, or stops asking.
+///
+/// Called at dial AND whenever the identity changes, because a connection lives
+/// as long as the relay keeps it alive: on a healthy socket there is no reconnect
+/// to heal a subscription that was never opened.
+pub fn subscribeInbox(relay: anytype) void {
+    const me = activePubkey() orelse {
+        // Signed out. The filter names a person who is no longer here, so it is
+        // withdrawn rather than left running: a relay should stop being told
+        // which pubkey this connection cares about the moment it stops being
+        // true.
+        relay.unsubscribe("plaza-inbox") catch {};
+        return;
+    };
+    const hex = inboxMeHex(me);
+    const inbox_tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &.{&hex} }};
+    const since = inboxSince();
+    const inbox_filters = [_]nostr.filter.Filter{.{
+        .kinds = &inbox_kinds,
+        .tags = &inbox_tags,
+        .limit = inbox_backfill_cap,
+        .since = if (since > 0) since else null,
+    }};
+    relay.subscribe("plaza-inbox", &inbox_filters) catch {};
 }
 
 /// The reader's own pubkey as hex, for a filter that names them.
@@ -3617,11 +3792,13 @@ fn saveInbox() void {
         hexLower(&hex, item.id);
         var ahex: [64]u8 = undefined;
         hexLower(&ahex, item.author);
-        out.print(gpa, "{s} {s} {d} {d} {s} {d}\n", .{
+        var thex: [64]u8 = undefined;
+        hexLower(&thex, item.target_id);
+        out.print(gpa, "{s} {s} {d} {s} {s} {d}\n", .{
             hex[0..],
             ahex[0..],
             item.created_at,
-            item.target,
+            thex[0..],
             @tagName(item.verb),
             item.msat,
         }) catch break;
@@ -3664,7 +3841,11 @@ fn loadInbox() void {
         if (ahex.len != 64) continue;
         _ = std.fmt.hexToBytes(&item.author, ahex) catch continue;
         item.created_at = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
-        item.target = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
+        // A field that is not a whole id leaves the item with no target rather
+        // than discarding the item: a notification the reader cannot follow
+        // through to is still a notification they should be told about.
+        const thex = parts.next() orelse continue;
+        if (thex.len == 64) _ = std.fmt.hexToBytes(&item.target_id, thex) catch {};
         const verb = parts.next() orelse continue;
         item.verb = if (std.mem.eql(u8, verb, "reply"))
             .reply
@@ -4397,11 +4578,24 @@ pub const Model = struct {
     note_menu: bool = false,
     // Whether the notifications sheet is up, and which tab it shows.
     notifications_open: bool = false,
-    notifications_everyone: bool = false,
+    /// Which notifications the sheet shows. EVERYONE by default, because that is
+    /// what the bell counts.
+    ///
+    /// Defaulting to the follows-only view meant a stranger's reply lit the badge
+    /// and then opened onto "Nothing from the people you follow yet", and opening
+    /// marked it read on the way past, so the reader was told about something,
+    /// shown nothing, and never told again. Someone the reader has never followed
+    /// replying to them is not an edge case: for an inbox it is the ordinary
+    /// case, and it is most of the reason to have one. Narrowing to follows is
+    /// still one press away, as a filter the reader chooses rather than one
+    /// applied silently underneath a number.
+    notifications_everyone: bool = true,
     // How many pages of the inbox are shown. A page replaces rather than
     // appends, the same way a thread's does, because a sheet is a plain column
     // and an unbounded one would refuse the whole view.
-    notifications_page: usize = 1,
+    /// Which page of the sheet is showing, counted from zero. Pages REPLACE each
+    /// other rather than accumulating, so this is an index, not a depth.
+    notifications_page: usize = 0,
     // Whether the compose sheet is open. Compose is on demand from the "New
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
@@ -6794,7 +6988,8 @@ pub const Msg = union(enum) {
     toggle_notifications,
     close_notifications,
     notifications_tab: u8,
-    notifications_more,
+    notifications_older,
+    notifications_newer,
     notifications_read_all,
     toggle_note_menu,
     close_note_menu,
@@ -7665,24 +7860,14 @@ fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: [
 /// that vanishes. A page is capped and replaced rather than appended, which is
 /// the same answer the thread reached for the same reason.
 fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
-    var buf: [inbox_page * inbox_max_pages]InboxItem = undefined;
+    var buf: [inbox_cap]InboxItem = undefined;
     const shown = inboxItems(&buf, !model.notifications_everyone);
-    const page = @min(model.notifications_page * inbox_page, shown.len);
-    const rows = ui.arena.alloc(AppUi.Node, page + 1) catch return ui.spacer(0);
-    for (0..page) |i| rows[i] = notificationRow(ui, &shown[i]);
-    rows[page] = if (page < shown.len)
-        ui.el(.data_row, .{
-            .padding = 12,
-            .cross = .center,
-            .on_press = Msg.notifications_more,
-            .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "Show older", .focusable = true },
-        }, .{
-            ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Show older", .scale = menu_scale }}),
-        })
-    else
-        ui.spacer(0);
+    const pages = if (shown.len == 0) 1 else (shown.len + inbox_page - 1) / inbox_page;
+    const page = @min(model.notifications_page, pages - 1);
+    const first = page * inbox_page;
+    const last = @min(first + inbox_page, shown.len);
+    const rows = ui.arena.alloc(AppUi.Node, last - first) catch return ui.spacer(0);
+    for (rows, first..) |*row, i| row.* = notificationRow(ui, &shown[i]);
 
     return ui.el(.dialog, .{
         .grow = 1,
@@ -7691,7 +7876,14 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Notifications" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+        // No `cross` override. The default is `.stretch`, and the card needs it:
+        // `modalCard` sets a width and no height, so under `.start` the card took
+        // its INTRINSIC height, the `grow = 1` scroll inside it resolved to zero,
+        // and every row was laid out and PAINTED outside the card, down the bare
+        // window, with the footer drawn on top of the first row and nothing
+        // scrollable. The tree was correct the whole time, which is why a test
+        // that asserts on the tree said so.
+        ui.row(.{ .grow = 1, .main = .center }, .{
             modalCard(ui, 480, ui.column(.{ .grow = 1, .gap = 0 }, .{
                 notificationsHeader(ui),
                 notificationsTabs(ui, model),
@@ -7699,19 +7891,68 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.scroll(.{ .grow = 1 }, .{
                     ui.column(.{ .gap = 0 }, .{rows}),
                 }),
+                notificationsPager(ui, page, pages),
                 notificationsFooter(ui, shown.len),
             })),
         }),
     });
 }
 
-/// How many rows one page holds, and how many pages the reader may open.
+/// How many rows the sheet draws at once.
 ///
-/// The product is what bounds the sheet: a row costs roughly fifteen nodes and a
-/// view past 1024 is refused whole, so this is the number that keeps the screen
-/// from disappearing rather than a preference about paging.
-const inbox_page = 12;
-const inbox_max_pages = 4;
+/// This is a NODE budget, not a taste in page sizes. The sheet is stacked over
+/// the feed rather than replacing it, because the feed's scroll offset lives in
+/// its mounted list, so both trees are priced against the same 1024-node view
+/// ceiling and a view past it is refused WHOLE: no frame at all, a window that
+/// stops updating. The base costs about 413 nodes on the feed and about 573 over
+/// a full back stack, the sheet's own chrome about 40, and a row eleven. Twenty
+/// rows is 832 in the worst case, which leaves real margin rather than the nine
+/// nodes the first arithmetic here left.
+///
+/// Pages REPLACE rather than accumulate, so this is the cost whether the reader
+/// holds five notifications or two hundred, and all two hundred are reachable
+/// instead of the first forty-eight.
+pub const inbox_page = 20;
+
+/// Older and newer, when there is more than one page.
+fn notificationsPager(ui: *AppUi, page: usize, pages: usize) AppUi.Node {
+    const p = theme.palette;
+    if (pages <= 1) return ui.spacer(0);
+    return ui.row(.{ .cross = .center, .padding = 10, .gap = 8, .style = .{ .background = p.surface_modal } }, .{
+        if (page > 0)
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .height = 20,
+                .cross = .center,
+                .on_press = Msg.notifications_newer,
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Newer", .focusable = true },
+            }, .{
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Newer", .scale = menu_scale }}),
+            })
+        else
+            ui.spacer(0),
+        ui.spacer(1),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{ .text = ui.fmt("{d} of {d}", .{ page + 1, pages }), .scale = menu_scale }},
+        ),
+        ui.spacer(1),
+        if (page + 1 < pages)
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .height = 20,
+                .cross = .center,
+                .on_press = Msg.notifications_older,
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Older", .focusable = true },
+            }, .{
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Older", .scale = menu_scale }}),
+            })
+        else
+            ui.spacer(0),
+    });
+}
 
 fn notificationsHeader(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
@@ -7746,8 +7987,8 @@ fn notificationsTabs(ui: *AppUi, model: *const Model) AppUi.Node {
     return ui.row(.{ .cross = .center, .gap = 6, .padding = 0.01 }, .{
         hgap(ui, 14),
         vgap(ui, 42),
-        profileTab(ui, "People you follow", !model.notifications_everyone, Msg{ .notifications_tab = 0 }),
         profileTab(ui, "Everyone", model.notifications_everyone, Msg{ .notifications_tab = 1 }),
+        profileTab(ui, "People you follow", !model.notifications_everyone, Msg{ .notifications_tab = 0 }),
         ui.spacer(1),
     });
 }
@@ -7757,7 +7998,7 @@ fn notificationsEmpty(ui: *AppUi, model: *const Model) AppUi.Node {
     const text: []const u8 = if (model.notifications_everyone)
         "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here."
     else
-        "Nothing from the people you follow yet. Everyone else is in the other tab.";
+        "Nothing from the people you follow yet. Everyone is in the other tab.";
     return ui.row(.{ .gap = 0, .padding = 14 }, .{
         ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_dim } }, &.{.{ .text = text, .scale = mono_hint_scale }}),
     });
@@ -7816,15 +8057,25 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         .repost => "reposted you",
         .zap => "zapped you",
     };
+    // Flattened deliberately: the four spacer nodes this used to hold, plus the
+    // inner column and its two vertical gaps, cost seven nodes A ROW for spacing
+    // that `padding` and `gap` already express. Twenty rows of that is a seventh
+    // of the whole view budget spent on whitespace.
     return ui.column(.{ .gap = 0 }, .{
         ui.el(.data_row, .{
-            .padding = 0.01,
+            .padding = 12,
+            .gap = 10,
             .cross = .center,
-            .on_press = if (item.target != 0) Msg{ .open_thread = item.target } else Msg{ .open_person = item.author },
+            // `open_event`, never `open_thread`. The thread route resolves an id
+            // against the LOADED FEED, which is scoped to follows and holds at
+            // most a few hundred notes; what a notification points at is almost
+            // always an older note of the reader's own, or a stranger's note the
+            // feed would never carry. So the obvious route made the common press
+            // a silent no-op. This one asks the store by name.
+            .on_press = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author },
             .style = .{ .quiet_hover = true },
             .semantics = .{ .role = .button, .label = verb_text, .focusable = true },
         }, .{
-            hgap(ui, 14),
             // The unread dot holds its width either way, so a row does not shift
             // sideways the moment it is read.
             ui.el(.panel, .{
@@ -7838,33 +8089,26 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
                     .stroke_width = 0,
                 },
             }, .{}),
-            hgap(ui, 10),
             ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
-            hgap(ui, 10),
-            ui.column(.{ .gap = 0, .grow = 1 }, .{
-                vgap(ui, 10),
-                ui.row(.{ .cross = .center, .gap = 5 }, .{
+            ui.row(.{ .cross = .center, .gap = 5, .grow = 1 }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_body_soft } },
+                    &.{.{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale }},
+                ),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = verb_text, .scale = nested_meta_scale }}),
+                if (item.verb == .zap and item.msat > 0)
                     ui.paragraph(
-                        .{ .style = .{ .foreground = p.text_body_soft } },
-                        &.{.{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale }},
-                    ),
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = verb_text, .scale = nested_meta_scale }}),
-                    if (item.verb == .zap and item.msat > 0)
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.status_warning } },
-                            &.{.{ .text = ui.fmt("{d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale }},
-                        )
-                    else
-                        ui.spacer(0),
-                    ui.spacer(1),
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.text_faint_alt } },
-                        &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
-                    ),
-                }),
-                vgap(ui, 10),
+                        .{ .style = .{ .foreground = p.status_warning } },
+                        &.{.{ .text = ui.fmt("{d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale }},
+                    )
+                else
+                    ui.spacer(0),
+                ui.spacer(1),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
+                ),
             }),
-            hgap(ui, 14),
         }),
         ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
     });
@@ -11111,18 +11355,32 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     // The data-window seam: the runtime resolves scroll offset and viewport
     // into a visible index range, and only those rows are built. A feed of any
     // length then costs what the handful on screen costs.
-    const options = feedOptions(model);
+    var options = feedOptions(model);
+    // Nothing to cover when nothing is drawn. The runtime re-runs the WHOLE build
+    // and layout a second time whenever a declared window reports fewer built
+    // rows than its item count and viewport imply, which an occluded list does by
+    // construction: it declares two hundred items and builds none, so it is
+    // permanently "undercovered" and every rebuild costs two. That is the exact
+    // opposite of what occluding it was for, and it lands on the most ordinary
+    // state in the app: one thread open over the feed, rebuilt on every tick,
+    // every scroll and every keystroke.
+    //
+    // A count of zero is the runtime's own early-out (`item_count == 0` skips the
+    // coverage check). The retained scroll offset rides on the list's ID and the
+    // extent table behind it, neither of which this touches, so the feed is still
+    // where the reader left it on the way back.
     const window = ui.virtualWindow(options);
+    const occluded = model.viewing_thread != 0 or model.viewing_profile != null;
+    if (occluded) options.item_count = 0;
     // A level drawn opaquely over the feed hides every one of these rows, and
     // building them anyway spent about a third of the whole 1024-node view
     // budget on things nobody can see. The thread and the profile have taken an
     // `occluded` parameter since they were written; the feed never did, because
     // for a long time it was the only list there was.
     //
-    // The list stays MOUNTED and keeps its item count, so its scroll offset
-    // survives exactly as an occluded level's does: the offset rides on the id
-    // and the content height, not on the rows.
-    const occluded = model.viewing_thread != 0 or model.viewing_profile != null;
+    // The list stays MOUNTED, so its scroll offset survives exactly as an occluded
+    // level's does: the offset rides on the id and the retained extents, not on
+    // the rows built this frame.
     const rows = if (occluded)
         &[_]AppUi.Node{}
     else blk: {
@@ -13639,7 +13897,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
-            model.notifications_page = 1;
+            model.notifications_page = 0;
             // Opening IS reading: the reader is looking at them. The mark moves
             // to the newest item held, never to the wall clock, so a backfill
             // arriving later with older stamps is not born already read.
@@ -13651,9 +13909,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_notifications => model.notifications_open = false,
         .notifications_tab => |which| {
             model.notifications_everyone = which == 1;
-            model.notifications_page = 1;
+            // The other tab holds a different set, so page four of this one is
+            // not page four of that one.
+            model.notifications_page = 0;
         },
-        .notifications_more => model.notifications_page += 1,
+        .notifications_older => model.notifications_page += 1,
+        .notifications_newer => model.notifications_page -|= 1,
         .notifications_read_all => {
             inboxMarkAllRead();
             markInboxDirty();
@@ -15420,6 +15681,11 @@ pub fn closeThreadForTest(model: *Model) void {
 /// Pushes whatever level is open, so Back returns to it. A no-op at the feed,
 /// and a no-op at the depth cap, which is the same rule threads always had.
 fn pushCurrentScreen(model: *Model) void {
+    // Going somewhere means the sheet that sent you there is done. Without this
+    // the new level opens UNDERNEATH a sheet still covering the screen, so the
+    // press reads as having done nothing, and pressing three rows quietly
+    // stacks three levels the reader never asked to be inside.
+    model.notifications_open = false;
     if (model.thread_stack_len >= model.thread_stack.len) return;
     if (model.viewing_profile) |pk| {
         model.thread_stack[model.thread_stack_len] = .{ .profile = pk };
@@ -16715,21 +16981,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
     // failure mode to notice.
-    if (reads) {
-        if (activePubkey()) |me| {
-            const inbox_authors = [_][32]u8{me};
-            const inbox_tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &.{&inboxMeHex(me)} }};
-            _ = inbox_authors;
-            const since = inboxSince();
-            const inbox_filters = [_]nostr.filter.Filter{.{
-                .kinds = &inbox_kinds,
-                .tags = &inbox_tags,
-                .limit = inbox_backfill_cap,
-                .since = if (since > 0) since else null,
-            }};
-            relay.subscribe("plaza-inbox", &inbox_filters) catch {};
-        }
-    }
+    if (reads) subscribeInbox(relay);
 
     // A relay marked write-only is not asked anything. It keeps its socket, so a
     // note goes out the moment it is written, but no filter of this reader's
@@ -16794,6 +17046,15 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 .{ .authors = authors[0..next_authors_len], .kinds = &profile_kinds, .limit = profile_cap },
             };
             relay.subscribe("plaza-feed", &next_filters) catch {};
+            // The inbox rides the SAME signal, and for a reason the feed's own
+            // comment above already explains: this counter moves on sign-in.
+            // Asking only at dial was the whole feature's undoing, because Plaza
+            // opens as a guest and dials every relay BEFORE anyone has signed in.
+            // The bell then read zero for the entire session, on a healthy
+            // connection, no matter who replied. Re-issuing here is also what
+            // heals a REQ that failed to send, and what stops a socket carrying
+            // the previous account's filter after a switch.
+            subscribeInbox(relay);
         }
         var msg = (try relay.receive()) orelse break;
         defer msg.deinit();
