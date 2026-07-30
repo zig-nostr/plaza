@@ -4381,3 +4381,795 @@ test "the store decides what a replacement is, not the backup" {
     const lost_url: []const u8 = if (std.mem.eql(u8, &first.id, &a.id)) "aaa.example.com" else "bbb.example.com";
     try testing.expect(std.mem.indexOf(u8, backup, lost_url) != null);
 }
+
+test "following writes the newest known list plus the change, and nothing else moves" {
+    // A contact list is REPLACEABLE: publishing one replaces who this reader
+    // follows, on every relay, at once. So a follow is the list they already
+    // have plus one name, and everything that list carried comes back with it:
+    // the petnames and relay hints on other people's p tags, tag types this app
+    // does not model, and the content blob, which on older clients is a relay
+    // map and on none of them is ours to discard.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{91} ** 32);
+    main.setIdentityForTest([_]u8{91} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/follow.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Their real list: two follows, one with a petname and a relay hint, plus a
+    // tag type this app has never heard of and a content blob.
+    const alice = "aa" ** 32;
+    const bob = "bb" ** 32;
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", alice, "wss://alice-relay.example.com", "Alice" },
+        &.{ "p", bob },
+        &.{ "t", "some-future-thing" },
+    };
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "{\"wss://legacy.example.com\":{\"read\":true}}", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+    main.noteOwnContactsAnsweredForTest(kp.public_key);
+
+    // Follow a third person.
+    var carol: [32]u8 = undefined;
+    @memset(&carol, 0xcc);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.writeFollowForTest(&fx, carol, true));
+
+    // The published list is the old one plus Carol.
+    const kinds = [_]u16{3};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.events.len);
+    const published = result.events[0];
+
+    var saw_alice_petname = false;
+    var saw_bob = false;
+    var saw_carol = false;
+    var saw_unknown_tag = false;
+    for (published.tags) |tag| {
+        if (tag.len >= 4 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], alice)) {
+            // The petname and the relay hint travelled with it.
+            if (std.mem.eql(u8, tag[3], "Alice") and std.mem.eql(u8, tag[2], "wss://alice-relay.example.com")) saw_alice_petname = true;
+        }
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], bob)) saw_bob = true;
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], "cc" ** 32)) saw_carol = true;
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "t")) saw_unknown_tag = true;
+    }
+    try testing.expect(saw_alice_petname);
+    try testing.expect(saw_bob);
+    try testing.expect(saw_carol);
+    try testing.expect(saw_unknown_tag);
+    // And the legacy relay map in the content is still there.
+    try testing.expect(std.mem.indexOf(u8, published.content, "legacy.example.com") != null);
+    // Stamped past the one it replaced, or every relay drops it in silence.
+    try testing.expect(published.created_at > 1_800_000_000);
+}
+
+test "unfollowing removes exactly one name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{92} ** 32);
+    main.setIdentityForTest([_]u8{92} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/unfollow.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "aa" ** 32 },
+        &.{ "p", "bb" ** 32 },
+        &.{ "p", "cc" ** 32 },
+    };
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+    main.noteOwnContactsAnsweredForTest(kp.public_key);
+
+    var bob: [32]u8 = undefined;
+    @memset(&bob, 0xbb);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.writeFollowForTest(&fx, bob, false));
+
+    const kinds = [_]u16{3};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+    defer result.deinit();
+    var count: usize = 0;
+    var saw_bob = false;
+    for (result.events[0].tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p")) {
+            count += 1;
+            if (std.mem.eql(u8, tag[1], "bb" ** 32)) saw_bob = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(!saw_bob);
+}
+
+test "no follow is written before a relay has said who you already follow" {
+    // The hard rule. "Nobody answered" and "you follow nobody" look identical
+    // from here, and publishing under the second reading replaces a list of
+    // hundreds with a handful of accounts this app chose.
+    main.setIdentityForTest([_]u8{93} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(false);
+    try testing.expect(!main.canWriteFollows());
+    var someone: [32]u8 = undefined;
+    @memset(&someone, 0xab);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.writeFollowForTest(&fx, someone, true));
+
+    // Relay silence is NOT evidence for an imported key. Every relay in the pool
+    // answering changes nothing, because on a cold import the pool is this app's
+    // bootstrap five, chosen before the reader's own kind:10002 was read: five
+    // clean answers happily coexist with eight hundred follows on relays this
+    // app has never dialed.
+    const me = main.activePubkeyForTest().?;
+    for (0..5) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(!main.canWriteFollows());
+    try testing.expect(main.followBlockedReason() != null);
+
+    // A key MINTED here is different in kind: it provably has no history, so
+    // there is nothing a write could destroy.
+    main.setIdentityMintedForTest(true);
+    try testing.expect(main.canWriteFollows());
+    try testing.expect(main.followBlockedReason() == null);
+
+    // And that fact belongs to the key, not the session.
+    main.setIdentityForTest([_]u8{94} ** 32);
+    main.setIdentityMintedForTest(false);
+    try testing.expect(!main.canWriteFollows());
+}
+
+test "a contact list read from a relay becomes the feed, and an empty one does not" {
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32 },
+        &.{ "p", "22" ** 32 },
+        // A duplicate and a malformed entry: neither should reach the feed.
+        &.{ "p", "11" ** 32 },
+        &.{ "p", "not-hex" },
+        &.{"p"},
+    };
+    var out: [128][32]u8 = undefined;
+    const n = main.followsFromTagsForTest(&tags, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // A list with no usable p tag is not a list: adopting it would empty the
+    // reader's feed on the word of one malformed event.
+    const empty_tags = [_]nostr.event.Tag{&.{ "p", "nope" }};
+    try testing.expectEqual(@as(usize, 0), main.followsFromTagsForTest(&empty_tags, &out));
+}
+
+test "one reader's follows are never another's" {
+    main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{95} ** 32);
+    defer main.clearIdentityForTest();
+    var list: [2][32]u8 = undefined;
+    @memset(&list[0], 0x11);
+    @memset(&list[1], 0x22);
+    try testing.expect(main.setFollowsForTest(&list, 1_800_000_000));
+    try testing.expectEqual(@as(usize, 2), main.followSetForTest().len);
+
+    // A different account, the same table: back to the pack until their own
+    // list arrives. Showing them a stranger's follows would be showing them
+    // somebody else's reading.
+    main.setIdentityForTest([_]u8{96} ** 32);
+    try testing.expectEqual(@as(usize, 9), main.followSetForTest().len);
+}
+
+test "a follow changes the generation, so the live subscriptions re-ask" {
+    // Without this a follow shows nothing new until the socket happens to drop,
+    // which reads as a broken button.
+    main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{97} ** 32);
+    defer main.clearIdentityForTest();
+    const before = main.followGeneration();
+    var list: [1][32]u8 = undefined;
+    @memset(&list[0], 0x33);
+    try testing.expect(main.setFollowsForTest(&list, 1_800_000_000));
+    try testing.expect(main.followGeneration() != before);
+
+    // The same list again is not a change, and must not churn every relay.
+    const after = main.followGeneration();
+    try testing.expect(!main.setFollowsForTest(&list, 1_800_000_000));
+    try testing.expectEqual(after, main.followGeneration());
+}
+
+test "the feed's scope line stops calling your own follows hand-picked" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetFollowsForTest();
+    var guest = main.initialModel();
+    try testing.expectEqualStrings("Starter pack", guest.scope_name());
+    try testing.expect(std.mem.indexOf(u8, guest.scope_voices(arena), "hand-picked") != null);
+
+    main.setIdentityForTest([_]u8{98} ** 32);
+    defer main.clearIdentityForTest();
+    var list: [3][32]u8 = undefined;
+    for (&list, 0..) |*e, i| @memset(e, @intCast(i + 1));
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+
+    var mine = main.initialModel();
+    try testing.expectEqualStrings("Following", mine.scope_name());
+    const voices = mine.scope_voices(arena);
+    try testing.expect(std.mem.indexOf(u8, voices, "hand-picked") == null);
+    try testing.expect(std.mem.indexOf(u8, voices, "3 accounts") != null);
+}
+
+test "a full follow list rebuilds the feed fast enough to do it every second" {
+    // The store opens ONE LMDB cursor per author and then, for every event it
+    // emits, linearly picks the newest across all live streams. Its own comment
+    // says "stream counts are small". That is true at nine and the reason this
+    // test exists: the feed rebuilds whenever the store's event count moves,
+    // which the live pool makes about once a second, so a linear-per-event pick
+    // over a full follow list is a frame hitch the reader feels rather than a
+    // number in a benchmark.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    main.setIdentityForTest([_]u8{99} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/perf.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // A full list, each with a handful of notes, which is the shape a real
+    // reader's feed has.
+    const follows = 128;
+    var list: [follows][32]u8 = undefined;
+    var i: usize = 0;
+    while (i < follows) : (i += 1) {
+        var secret: [32]u8 = undefined;
+        @memset(&secret, @intCast((i % 200) + 1));
+        secret[31] = @intCast(i & 0xff);
+        secret[30] = @intCast((i >> 8) & 0xff);
+        const kp = signer.keyPairFromSecretKey(secret) catch continue;
+        list[i] = kp.public_key;
+        var n: usize = 0;
+        while (n < 4) : (n += 1) {
+            const body = try std.fmt.allocPrint(arena, "note {d} from {d}", .{ n, i });
+            const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i * 10 + n)), 1, &.{}, body, null);
+            _ = try store.ingest(arena, ev, .{});
+        }
+    }
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    try testing.expectEqual(@as(usize, follows), main.followSetForTest().len);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    // One rebuild to warm the page cache, then time a run of them.
+    main.reconcileForTest(&model, &store, 1_800_002_000);
+    try testing.expect(model.notes_len > 0);
+
+    // `std.time.Timer` is gone in 0.16; the awake clock is what the app itself
+    // times relay round trips with.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const started = std.Io.Timestamp.now(io, .awake);
+    const rounds = 10;
+    var r: usize = 0;
+    while (r < rounds) : (r += 1) {
+        main.invalidateFeedForTest();
+        main.reconcileForTest(&model, &store, 1_800_002_000);
+    }
+    const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
+    const per_rebuild_ns = @as(u64, @intCast(@max(elapsed.toNanoseconds(), 0))) / rounds;
+
+    // The budget is one frame at 60Hz, which is the honest bar: this runs on
+    // the UI thread on a timer, so anything slower is a visible stutter every
+    // second rather than a slow benchmark. Generous enough not to be flaky on a
+    // loaded CI box, tight enough to catch the cliff.
+    const budget_ns = 16 * std.time.ns_per_ms;
+    std.debug.print("\n[perf] {d} follows: {d}us per feed rebuild (budget {d}us)\n", .{ follows, per_rebuild_ns / 1000, budget_ns / 1000 });
+    if (per_rebuild_ns > budget_ns) {
+        std.debug.print(
+            "\nfeed rebuild with {d} follows took {d}us, budget {d}us\n",
+            .{ follows, per_rebuild_ns / 1000, budget_ns / 1000 },
+        );
+        return error.FeedRebuildTooSlow;
+    }
+}
+
+test "the note menu says which way it goes, and refuses when it cannot know" {
+    // The one control that writes a contact list. Every state it can be in is
+    // asserted here, because the harness cannot open a thread by pressing a row
+    // (true on main too), and because the dangerous state is the one that must
+    // NOT offer a press: a Follow that fires before the app has been told who
+    // the reader already follows replaces that list with this app's guesses.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const author = [_]u8{0x55} ** 32;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = author;
+    model.note_menu = true;
+
+    // A guest: the menu offers Follow, and pressing it raises the join sheet
+    // rather than failing quietly.
+    main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Follow") != null);
+    }
+
+    // Signed in, but nobody has said who they follow yet: the menu says what it
+    // is waiting for instead of offering a press.
+    main.setIdentityForTest([_]u8{0x66} ** 32);
+    main.setIdentityMintedForTest(false);
+    defer main.clearIdentityForTest();
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Looking for your follow list…") != null);
+        try testing.expect(findAnyText(tree.root, "Unfollow") == null);
+    }
+
+    // A key minted here has no history to lose: Follow.
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Follow") != null);
+        try testing.expect(findAnyText(tree.root, "Looking for your follow list…") == null);
+    }
+
+    // Already following: the menu offers the way back out.
+    var list: [1][32]u8 = undefined;
+    list[0] = author;
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Unfollow") != null);
+    }
+
+    // Their own note: no follow control at all, in either direction.
+    model.thread_root.pubkey = main.activePubkeyForTest().?;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "This is you") != null);
+        try testing.expect(findAnyText(tree.root, "Unfollow") == null);
+    }
+}
+
+test "a guest pressing follow is offered the join sheet, not a silent failure" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = [_]u8{0x77} ** 32;
+    main.clearIdentityForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .follow_author = 0 }, &fx);
+    try testing.expect(model.joining);
+    try testing.expect(!model.note_menu);
+}
+
+test "a contact list arriving from a relay becomes the feed's scope" {
+    // The whole chain in one place: a signed kind:3 goes through the same
+    // funnel every relay-fed event goes through, is recognised as the reader's
+    // own, becomes the live follow set, and the feed's scope line stops saying
+    // the app picked it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{101} ** 32);
+    main.setIdentityForTest([_]u8{101} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.setIdentityMintedForTest(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/scope.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Before: the pack, and nothing may be written.
+    var before = main.initialModel();
+    try testing.expectEqualStrings("Starter pack", before.scope_name());
+    try testing.expect(!main.canWriteFollows());
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d" },
+        &.{ "p", "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2" },
+        &.{ "p", "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.ingestContactListForTest(ev);
+
+    // After: theirs, three accounts, and a write is now allowed because a relay
+    // has actually said what the list is.
+    try testing.expectEqual(@as(usize, 3), main.followSetForTest().len);
+    try testing.expect(main.canWriteFollows());
+    var after = main.initialModel();
+    try testing.expectEqualStrings("Following", after.scope_name());
+    const voices = after.scope_voices(arena);
+    try testing.expect(std.mem.indexOf(u8, voices, "3 accounts · yours") != null);
+
+    // And a stale list arriving later does not undo it.
+    const older_tags = [_]nostr.event.Tag{&.{ "p", "aa" ** 32 }};
+    const older = try nostr.event.create(arena, signer, kp, 1_700_000_000, 3, &older_tags, "", null);
+    main.ingestContactListForTest(older);
+    try testing.expectEqual(@as(usize, 3), main.followSetForTest().len);
+}
+
+test "a follow list longer than the feed reads says so" {
+    // The feed reads at most `max_follows` authors, because the store opens one
+    // cursor per author. The list is still WRITTEN back in full, so nothing is
+    // lost; but telling somebody who follows five hundred that they follow 128
+    // is a lie about their own data.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{102} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var many: [300][32]u8 = undefined;
+    for (&many, 0..) |*e, i| {
+        @memset(e, @intCast(i % 251));
+        e[31] = @intCast(i & 0xff);
+        e[30] = @intCast((i >> 8) & 0xff);
+    }
+    _ = main.setFollowsForTest(&many, 1_800_000_000);
+
+    // The feed reads a bounded slice.
+    try testing.expectEqual(@as(usize, 128), main.followSetForTest().len);
+    // And the line says both numbers rather than the flattering one.
+    var model = main.initialModel();
+    const voices = model.scope_voices(arena);
+    try testing.expect(std.mem.indexOf(u8, voices, "128 of 300 accounts") != null);
+
+    // A list that fits states one number, without the arithmetic.
+    var few: [3][32]u8 = undefined;
+    for (&few, 0..) |*e, i| @memset(e, @intCast(i + 40));
+    _ = main.setFollowsForTest(&few, 1_800_000_000);
+    const small = model.scope_voices(arena);
+    try testing.expect(std.mem.indexOf(u8, small, "3 accounts · yours") != null);
+    try testing.expect(std.mem.indexOf(u8, small, " of ") == null);
+}
+
+test "one relay's silence never authorizes replacing a contact list" {
+    // The failure this whole feature is built to avoid, and the one my first
+    // gate let through. EOSE means "that is all I have", not "you have none".
+    // A reader follows 2000 accounts whose list lives on two relays. A third
+    // relay, which simply does not carry it, finishes first. If that unlocked
+    // the write, pressing Follow would publish nine hard-coded accounts over
+    // the real list, on every relay, and 1991 follows would be gone.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{103} ** 32);
+    main.setIdentityForTest([_]u8{103} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    // An IMPORTED key: this app cannot know what it already follows.
+    main.setIdentityMintedForTest(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/silence.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    var someone: [32]u8 = undefined;
+    @memset(&someone, 0xde);
+    var fx: main.EffectsForTest = undefined;
+
+    // Every relay answers with nothing, and it still proves nothing: the pool
+    // here is the app's bootstrap five, and the reader's list lives wherever
+    // their own kind:10002 points, which has not been read either.
+    for (0..5) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(main.contactsConfirmedAbsentForTest());
+    try testing.expect(!main.canWriteFollows());
+    try testing.expect(!main.writeFollowForTest(&fx, someone, true));
+    // Nothing was published.
+    {
+        const kinds = [_]u16{3};
+        const authors = [_][32]u8{kp.public_key};
+        var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 0), result.events.len);
+    }
+
+    // Then the slow relay delivers the real list. Having it is the OTHER way to
+    // be allowed to write, and the safe one: the write splices into it.
+    var tags: [200]nostr.event.Tag = undefined;
+    var hexes: [200][64]u8 = undefined;
+    for (0..200) |i| {
+        _ = try std.fmt.bufPrint(&hexes[i], "{x:0>2}{s}", .{ @as(u8, @intCast(i)), "ab" ** 31 });
+        const pair = try arena.alloc([]const u8, 2);
+        pair[0] = "p";
+        pair[1] = &hexes[i];
+        tags[i] = pair;
+    }
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+    main.ingestContactListForTest(real);
+
+    try testing.expect(main.haveOwnContactListForTest());
+    try testing.expect(main.canWriteFollows());
+    try testing.expect(main.writeFollowForTest(&fx, someone, true));
+
+    // And the published list is 201 names, not 10.
+    const kinds = [_]u16{3};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+    defer result.deinit();
+    var p_count: usize = 0;
+    for (result.events[0].tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p")) p_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 201), p_count);
+}
+
+test "membership is right for every follow, not only the ones the feed reads" {
+    // The feed reads a bounded slice, because the store opens one cursor per
+    // author. Membership is not bounded: offering to follow somebody who is
+    // already on the list, and then doing nothing when pressed, is worse than
+    // not offering.
+    main.setIdentityForTest([_]u8{104} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var many: [400][32]u8 = undefined;
+    for (&many, 0..) |*e, i| {
+        @memset(e, @intCast(i % 251));
+        e[31] = @intCast(i & 0xff);
+        e[30] = @intCast((i >> 8) & 0xff);
+    }
+    _ = main.setFollowsForTest(&many, 1_800_000_000);
+
+    // The feed reads 128 of them.
+    try testing.expectEqual(@as(usize, 128), main.followSetForTest().len);
+    // But all 400 are followed, including the last.
+    try testing.expectEqual(@as(usize, 400), main.followTotal());
+    try testing.expect(main.isFollowing(many[399]));
+    try testing.expect(main.isFollowing(many[200]));
+    try testing.expect(main.isFollowing(many[0]));
+    var stranger: [32]u8 = undefined;
+    @memset(&stranger, 0xff);
+    stranger[0] = 0xfe;
+    try testing.expect(!main.isFollowing(stranger));
+}
+
+test "an older contact list never undoes a newer one" {
+    main.setIdentityForTest([_]u8{105} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    const newer_tags = [_]nostr.event.Tag{ &.{ "p", "11" ** 32 }, &.{ "p", "22" ** 32 } };
+    const newer = nostr.event.Event{
+        .id = [_]u8{1} ** 32,
+        .pubkey = main.activePubkeyForTest().?,
+        .created_at = 2_000,
+        .kind = 3,
+        .tags = &newer_tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    var older = newer;
+    const older_tags = [_]nostr.event.Tag{&.{ "p", "33" ** 32 }};
+    older.created_at = 1_000;
+    older.tags = &older_tags;
+
+    main.ingestContactListForTest(newer);
+    try testing.expectEqual(@as(usize, 2), main.followTotal());
+    // A slower relay's older copy arrives second and is refused.
+    main.ingestContactListForTest(older);
+    try testing.expectEqual(@as(usize, 2), main.followTotal());
+}
+
+test "the follow list survives a restart" {
+    // A local-first app that forgets who you follow every launch is not local
+    // first. The store already holds the newest kind:3 from last session.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{106} ** 32);
+    main.setIdentityForTest([_]u8{106} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/restart.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const tags = [_]nostr.event.Tag{ &.{ "p", "44" ** 32 }, &.{ "p", "55" ** 32 }, &.{ "p", "66" ** 32 } };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    // A restart: the in-memory list is gone, the store is not.
+    main.forgetFollowsForTest();
+    try testing.expectEqual(@as(usize, 9), main.followSetForTest().len);
+    main.loadFollowsFromStoreForTest();
+    try testing.expectEqual(@as(usize, 3), main.followTotal());
+    // And the app can write immediately, without waiting on any relay.
+    try testing.expect(main.canWriteFollows());
+}
+
+test "an imported key is never assumed to follow nobody, however quiet the relays" {
+    // The hole every relay-completion gate has, and the reason this one is not
+    // a relay gate at all. On a cold import the app has not read the reader's
+    // kind:10002 yet, so the relays it is asking are its own bootstrap five.
+    // They can all answer cleanly while the real list sits on relays this app
+    // has never dialed. Silence from the wrong relays is not evidence.
+    main.setIdentityForTest([_]u8{107} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    main.setIdentityMintedForTest(false);
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(!main.canWriteFollows());
+    // And the reader is told why, rather than handed a button that does nothing.
+    try testing.expectEqualStrings("Looking for your follow list…", main.followBlockedReason().?);
+
+    // A key minted here is the one case where "no list" is knowledge, not a
+    // guess, because the key did not exist a minute ago.
+    main.setIdentityMintedForTest(true);
+    try testing.expect(main.canWriteFollows());
+    try testing.expect(main.followBlockedReason() == null);
+}
+
+test "a write that would drop more names than the press implies is refused" {
+    // The shrink guard. No client in the ecosystem has one. A follow adds a
+    // name and an unfollow removes exactly one, so a write that loses more is
+    // this app's own bug, a stale base, or a rebase onto somebody else's
+    // truncation. Refusing beats publishing and finding out later.
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32 },
+        &.{ "p", "22" ** 32 },
+        &.{ "p", "33" ** 32 },
+        &.{ "t", "not-a-person" },
+        // The same person twice, which some clients emit. Removing both is
+        // removing ONE person, so the count is of distinct people.
+        &.{ "p", "33" ** 32 },
+    };
+    try testing.expectEqual(@as(usize, 3), main.countPeopleForTest(&tags));
+
+    // Following may not lose anyone.
+    try testing.expect(main.shrinkAllowedForTest(100, 101, true));
+    try testing.expect(main.shrinkAllowedForTest(100, 100, true));
+    try testing.expect(!main.shrinkAllowedForTest(100, 99, true));
+    // Unfollowing may lose exactly one.
+    try testing.expect(main.shrinkAllowedForTest(100, 99, false));
+    try testing.expect(!main.shrinkAllowedForTest(100, 98, false));
+    // The case this exists for: a stale base losing hundreds.
+    try testing.expect(!main.shrinkAllowedForTest(2000, 9, false));
+    try testing.expect(!main.shrinkAllowedForTest(2000, 10, true));
+}
+
+test "the follow splice matches on the p tag, not on any tag carrying that value" {
+    // Amethyst's unfollow filters on tag[1] == pubkey without checking tag[0],
+    // so it silently deletes an unrelated tag that happens to carry the same
+    // value, and drops short tags like the ["-"] protected marker entirely.
+    // Not copying that.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{108} ** 32);
+    main.setIdentityForTest([_]u8{108} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/splice.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const victim = "cc" ** 32;
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32 },
+        &.{ "p", victim },
+        // A different tag type carrying the same value, and a one-element tag.
+        &.{ "e", victim },
+        &.{"-"},
+    };
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+
+    var target: [32]u8 = undefined;
+    @memset(&target, 0xcc);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.writeFollowForTest(&fx, target, false));
+
+    const kinds = [_]u16{3};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+    defer result.deinit();
+    var saw_e = false;
+    var saw_short = false;
+    var saw_p_victim = false;
+    for (result.events[0].tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) saw_e = true;
+        if (tag.len == 1 and std.mem.eql(u8, tag[0], "-")) saw_short = true;
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], victim)) saw_p_victim = true;
+    }
+    // The person is gone; the unrelated tag and the short marker are not.
+    try testing.expect(!saw_p_victim);
+    try testing.expect(saw_e);
+    try testing.expect(saw_short);
+}
