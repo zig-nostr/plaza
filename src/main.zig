@@ -10092,7 +10092,12 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
             }),
             ui.column(.{ .gap = 0 }, .{
                 vgap(ui, profile_banner_height - profile_avatar_lift),
-                ui.row(.{ .cross = .start, .gap = 0 }, .{
+                // Bottom-aligned, not top. The disc is the tallest thing here
+                // and it deliberately overhangs the banner, so aligning the
+                // cluster to the TOP of this row put it ON the band, over the
+                // subject's own picture. Against the bottom it lands in the
+                // overhang, clear of the banner and level with the face.
+                ui.row(.{ .cross = .end, .gap = 0 }, .{
                     hgap(ui, 20),
                     personAvatar(ui, pubkey, profile_avatar_size),
                     ui.spacer(1),
