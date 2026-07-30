@@ -50,6 +50,30 @@ fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
     return null;
 }
 
+/// How many widgets carry this exact label. A row count, when the rows are
+/// alike: `findByLabel` says one exists, this says how many were built.
+fn countByLabel(widget: canvas.Widget, label: []const u8) usize {
+    var n: usize = if (std.mem.eql(u8, widget.semantics.label, label)) 1 else 0;
+    for (widget.children) |child| n += countByLabel(child, label);
+    return n;
+}
+
+/// The frame of the first widget carrying this exact text.
+fn frameOfText(p: painted.Painted, text: []const u8) ?native_sdk.geometry.RectF {
+    for (p.layout.nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, text)) return node.widget.frame;
+    }
+    return null;
+}
+
+/// The frame of the first widget of this kind, in painted order.
+fn frameOfKind(p: painted.Painted, kind: canvas.WidgetKind) ?native_sdk.geometry.RectF {
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind == kind) return node.widget.frame;
+    }
+    return null;
+}
+
 /// Finds a widget by its accessibility label (for icon-only controls like the
 /// rail tiles, which carry no text).
 fn findByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
@@ -5355,4 +5379,988 @@ test "the follow count counts people, not tags" {
         &.{ "t", "not-a-person" },
     };
     try testing.expectEqual(@as(usize, 2), main.countPeopleForTest(&tags));
+}
+
+fn inboxEvent(kind: u16, author: u8, tags: []const nostr.event.Tag, created_at: i64) nostr.event.Event {
+    return inboxEventBy(kind, [_]u8{author} ** 32, tags, created_at);
+}
+
+fn inboxEventBy(kind: u16, author: [32]u8, tags: []const nostr.event.Tag, created_at: i64) nostr.event.Event {
+    return .{
+        .id = author,
+        .pubkey = author,
+        .created_at = created_at,
+        .kind = kind,
+        .tags = tags,
+        .content = "+",
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+test "a p tag alone is not a notification" {
+    // An inbox is the first surface where a stranger decides what the reader
+    // sees, so what does NOT get in matters as much as what does.
+    main.setIdentityForTest([_]u8{0xB1} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // Naming somebody else is not naming me, however loudly.
+    const other = [_]nostr.event.Tag{&.{ "p", "aa" ** 32 }};
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &other, 100), me) == null);
+
+    // Naming me IS a mention.
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(inboxEvent(1, 0xC1, &mine, 100), me).?);
+
+    // A note naming twenty people is a broadcast, and being one of the twenty
+    // is not a message. This is the cheapest filter that works.
+    var many: [12]nostr.event.Tag = undefined;
+    var hexes: [12][64]u8 = undefined;
+    for (0..12) |i| {
+        for (0..32) |b| _ = std.fmt.bufPrint(hexes[i][b * 2 ..][0..2], "{x:0>2}", .{@as(u8, @intCast(i + 1))}) catch {};
+        many[i] = &.{ "p", &hexes[i] };
+    }
+    many[11] = &.{ "p", &me_hex };
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &many, 100), me) == null);
+
+    // My own note is not news to me. (Built from the real pubkey: the identity
+    // helper takes a SECRET key, and the two are not the same bytes.)
+    try testing.expect(main.inboxVerbForTest(inboxEventBy(1, me, &mine, 100), me) == null);
+}
+
+test "a reaction that is not a like is not a notification" {
+    main.setIdentityForTest([_]u8{0xB2} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    var like = inboxEvent(7, 0xC2, &mine, 100);
+    try testing.expectEqual(main.InboxVerb.like, main.inboxVerbForTest(like, me).?);
+    // A downvote is not something to celebrate in a bell.
+    like.content = "-";
+    try testing.expect(main.inboxVerbForTest(like, me) == null);
+
+    // Reposts and zaps are their own verbs.
+    try testing.expectEqual(main.InboxVerb.repost, main.inboxVerbForTest(inboxEvent(6, 0xC2, &mine, 100), me).?);
+    try testing.expectEqual(main.InboxVerb.zap, main.inboxVerbForTest(inboxEvent(9735, 0xC2, &mine, 100), me).?);
+}
+
+test "one event dated in the future does not kill the bell forever" {
+    // created_at is written by whoever signed the event, so it is not a fact.
+    // Believing one dated 2100 pushes the read mark past everything that will
+    // ever arrive and the bell never lights again. Nostur ships this bug with
+    // the TODO still in the file.
+    main.setIdentityForTest([_]u8{0xB3} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    // Dated seventy years out.
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC3, &mine, now + 2_000_000_000), now);
+    main.inboxMarkAllRead();
+
+    // The absurd stamp was clamped to the moment it arrived, so the mark sits at
+    // `now` rather than seventy years out. A genuine mention a minute later is
+    // therefore still unread, which is the whole point.
+    try testing.expectEqual(now, main.inboxReadThrough());
+    var second = inboxEvent(1, 0xC4, &mine, now + 60);
+    second.id = [_]u8{0xD4} ** 32;
+    _ = main.inboxAddForTest(second, now + 60);
+    try testing.expect(main.inboxUnread() > 0);
+}
+
+test "marking read uses the newest item held, never the clock" {
+    // Marking at now() means anything arriving later with an older stamp, which
+    // is every backfill and every slow relay, is born already read.
+    main.setIdentityForTest([_]u8{0xB4} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC5, &mine, now - 100), now);
+    main.inboxMarkAllRead();
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+    // The mark sits on the item, not on the clock, so an older one that shows
+    // up afterwards is still counted.
+    try testing.expectEqual(now - 100, main.inboxReadThrough());
+
+    var older = inboxEvent(1, 0xC6, &mine, now - 50);
+    older.id = [_]u8{0xD6} ** 32;
+    _ = main.inboxAddForTest(older, now);
+    try testing.expectEqual(@as(usize, 1), main.inboxUnread());
+}
+
+test "the bell counts what it can speak for" {
+    // A like is worth reading and is not worth a number on a tile. The bell and
+    // the sheet read the same list, so they cannot disagree about what is in it.
+    main.setIdentityForTest([_]u8{0xB5} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const now: i64 = 1_800_000_000;
+    var like = inboxEvent(7, 0xC7, &mine, now);
+    like.id = [_]u8{0xE1} ** 32;
+    _ = main.inboxAddForTest(like, now);
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+
+    var mention = inboxEvent(1, 0xC8, &mine, now);
+    mention.id = [_]u8{0xE2} ** 32;
+    _ = main.inboxAddForTest(mention, now);
+    try testing.expectEqual(@as(usize, 1), main.inboxUnread());
+
+    // Both are in the sheet, though: the bell is quieter than the list, not a
+    // different list.
+    var buf: [16]main.InboxItem = undefined;
+    try testing.expectEqual(@as(usize, 2), main.inboxItems(&buf, false).len);
+}
+
+test "one reader's notifications are never another's" {
+    main.setIdentityForTest([_]u8{0xB6} ** 32);
+    main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    _ = main.inboxAddForTest(inboxEvent(1, 0xC9, &mine, 1_800_000_000), 1_800_000_000);
+    try testing.expectEqual(@as(usize, 1), main.inboxLenForTest());
+
+    // A different account sees an empty inbox, not the previous reader's mail.
+    main.setIdentityForTest([_]u8{0xB7} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+    var buf: [16]main.InboxItem = undefined;
+    try testing.expectEqual(@as(usize, 0), main.inboxItems(&buf, false).len);
+}
+
+/// Fills the inbox with `n` mentions of the reader from distinct authors.
+fn seedInbox(n: usize, first_byte: u8, base_time: i64) void {
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    for (0..n) |i| {
+        const who: u8 = first_byte +% @as(u8, @intCast(i % 200));
+        var ev = inboxEvent(1, who, &mine, base_time + @as(i64, @intCast(i)));
+        // Distinct ids, so the dedupe does not swallow them.
+        ev.id[0] = who;
+        ev.id[1] = @intCast(i % 256);
+        _ = main.inboxAddForTest(ev, base_time + 100_000);
+    }
+}
+
+/// A relay that only remembers what it was asked, so the wire can be tested
+/// without one.
+const RecordingRelay = struct {
+    subscribed: bool = false,
+    withdrawn: bool = false,
+    kinds_len: usize = 0,
+    p_value: [64]u8 = [_]u8{0} ** 64,
+    since: ?i64 = null,
+
+    pub fn subscribe(self: *RecordingRelay, id: []const u8, filters: []const nostr.filter.Filter) !void {
+        if (!std.mem.eql(u8, id, "plaza-inbox")) return;
+        self.subscribed = true;
+        self.kinds_len = if (filters[0].kinds) |k| k.len else 0;
+        self.since = filters[0].since;
+        if (filters[0].tags) |tags| {
+            if (tags.len > 0 and tags[0].values.len > 0 and tags[0].values[0].len == 64)
+                @memcpy(&self.p_value, tags[0].values[0]);
+        }
+    }
+    pub fn unsubscribe(self: *RecordingRelay, id: []const u8) !void {
+        if (std.mem.eql(u8, id, "plaza-inbox")) self.withdrawn = true;
+    }
+};
+
+test "a relay is asked about the reader by name, and stops being asked when they leave" {
+    // The subscription used to be issued only at DIAL, guarded on there being an
+    // identity. Plaza opens as a guest and dials every relay before anyone has
+    // signed in, and a healthy socket never reconnects, so the bell read zero for
+    // the whole session no matter who replied. That the filter is right matters
+    // less than that it is asked for at all, at the moment the reader arrives.
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+
+    // Signed out: nothing is asked, and any standing question is withdrawn. A
+    // relay should stop being told which pubkey this connection cares about the
+    // moment that stops being true.
+    {
+        var relay = RecordingRelay{};
+        main.subscribeInbox(&relay);
+        try testing.expect(!relay.subscribed);
+        try testing.expect(relay.withdrawn);
+    }
+
+    main.setIdentityForTest([_]u8{0xE8} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    var relay = RecordingRelay{};
+    main.subscribeInbox(&relay);
+    try testing.expect(relay.subscribed);
+    try testing.expectEqual(main.inbox_kinds.len, relay.kinds_len);
+    try testing.expectEqualSlices(u8, &me_hex, &relay.p_value);
+    // Nothing held yet, so no `since`: the limit does the bounding, which is what
+    // relays are good at.
+    try testing.expectEqual(@as(?i64, null), relay.since);
+
+    // With something held, the next ask resumes from just before it rather than
+    // re-reading everything.
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    var ev = inboxEvent(1, 0x5A, &mine, 1_800_000_000);
+    ev.id[0] = 0x5A;
+    try testing.expect(main.inboxAddForTest(ev, 1_800_000_000));
+    var again = RecordingRelay{};
+    main.subscribeInbox(&again);
+    try testing.expect(again.since != null);
+    try testing.expect(again.since.? < 1_800_000_000);
+}
+
+test "the inbox survives a restart, targets and all" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.setIdentityForTest([_]u8{0xE9} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/inbox.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const target_hex = "cd" ** 32;
+    var reply = inboxEvent(1, 0x6B, &.{
+        &.{ "p", &me_hex },
+        &.{ "e", target_hex },
+    }, 1_800_000_000);
+    reply.id[0] = 0x6B;
+    try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
+    main.inboxMarkAllRead();
+    const read_through = main.inboxReadThrough();
+    main.saveInboxForTest();
+
+    // A new launch: nothing in memory, everything on disk.
+    main.resetInboxForTest();
+    try testing.expectEqual(@as(usize, 0), main.inboxLenForTest());
+    main.loadInboxForTest();
+
+    var buf: [8]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, target_hex);
+    // The target rides across the restart too: a row that cannot say what it is
+    // about is a row that does nothing when pressed.
+    try testing.expectEqualSlices(u8, &want, &items[0].target_id);
+    try testing.expectEqual(read_through, main.inboxReadThrough());
+    // And what was read stays read, which is the whole reason to write it down.
+    try testing.expectEqual(@as(usize, 0), main.inboxUnread());
+}
+
+test "a zap names the person who signed for it, or it is not shown at all" {
+    // The one row in this app that can say "somebody you trust sent you money",
+    // built entirely out of bytes a stranger chose. The receipt is authored by a
+    // payment server, so the payer is named INSIDE it, and reading that name
+    // without checking it lets anyone publish a receipt claiming to be from
+    // whoever the reader most wants to hear from, with the impersonated person's
+    // real cached name and face drawn beside it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    main.setIdentityForTest([_]u8{0xE1} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const payer = try signer.keyPairFromSecretKey([_]u8{0x0A} ** 32);
+    const other = try signer.keyPairFromSecretKey([_]u8{0x0B} ** 32);
+    var other_hex: [64]u8 = undefined;
+    for (other.public_key, 0..) |b, i| _ = std.fmt.bufPrint(other_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const to_me = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    const to_other = [_]nostr.event.Tag{&.{ "p", &other_hex }};
+
+    // A real request: signed by the payer, naming the reader.
+    const good_req = try nostr.event.create(arena, signer, payer, 1_800_000_000, 9734, &to_me, "", null);
+    const good_json = try nostr.event.toJson(arena, good_req);
+
+    // The same shape, but signed for somebody ELSE. A receipt is public, so this
+    // one can simply be lifted out of their inbox and replayed into this one.
+    const elsewhere = try nostr.event.create(arena, signer, payer, 1_800_000_000, 9734, &to_other, "", null);
+    const elsewhere_json = try nostr.event.toJson(arena, elsewhere);
+
+    // And a request that was never signed at all, which is what an attacker
+    // actually writes: any pubkey they like, no key needed.
+    const forged_json = try std.fmt.allocPrint(arena,
+        \\{{"id":"{s}","pubkey":"{s}","created_at":1800000000,"kind":9734,"tags":[["p","{s}"]],"content":"","sig":"{s}"}}
+    , .{ "aa" ** 32, "11" ** 32, &me_hex, "00" ** 64 });
+
+    // A request that is not a request: a signed note, wearing the tag's clothes.
+    const wrong_kind = try nostr.event.create(arena, signer, payer, 1_800_000_000, 1, &to_me, "hi", null);
+    const wrong_kind_json = try nostr.event.toJson(arena, wrong_kind);
+
+    const cases = [_]struct { json: []const u8, filed: bool, why: []const u8 }{
+        .{ .json = good_json, .filed = true, .why = "signed by the payer, naming the reader" },
+        .{ .json = forged_json, .filed = false, .why = "nobody signed it" },
+        .{ .json = elsewhere_json, .filed = false, .why = "signed for somebody else" },
+        .{ .json = wrong_kind_json, .filed = false, .why = "not a zap request" },
+    };
+
+    for (cases, 0..) |c, i| {
+        main.resetInboxForTest();
+        // The receipt itself is signed by a THROWAWAY key, as a real one would be
+        // signed by a payment server: it proves nothing about who paid.
+        var receipt = inboxEvent(9735, 0x77, &.{
+            &.{ "p", &me_hex },
+            &.{ "description", c.json },
+        }, 1_800_000_000);
+        receipt.id[0] = @intCast(i);
+        const filed = main.inboxAddForTest(receipt, 1_800_000_100);
+        if (filed != c.filed) {
+            std.debug.print("zap case '{s}': filed={} wanted={}\n", .{ c.why, filed, c.filed });
+            return error.WrongZapVerdict;
+        }
+        if (!filed) continue;
+        // Filed under the key that SIGNED, never the receipt's author and never
+        // the name the string claimed.
+        var buf: [8]main.InboxItem = undefined;
+        const items = main.inboxItems(&buf, false);
+        try testing.expectEqual(@as(usize, 1), items.len);
+        try testing.expectEqualSlices(u8, &payer.public_key, &items[0].author);
+    }
+}
+
+test "a zap that is replayed is still one zap, for the amount its payer signed" {
+    // A zap request is PUBLIC by construction: NIP-57 makes every receipt carry
+    // the signed request inside it, so one genuine request from somebody the
+    // reader follows is sitting on relays in plaintext, ready to be lifted. The
+    // first fix proved WHO signed and then took the amount, the time and the
+    // identity from the receipt around it, which anyone may write. So a stranger
+    // could mint twenty receipts carrying Alice's real request, and the sheet
+    // would draw twenty rows in Alice's name for whatever figure the stranger
+    // liked, while the per-author rule quietly evicted Alice's real history to
+    // make room for them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    main.setIdentityForTest([_]u8{0xEA} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const alice = try signer.keyPairFromSecretKey([_]u8{0x1A} ** 32);
+    // What Alice actually signed: a thousand millisats, at a time of her choosing.
+    const req_tags = [_]nostr.event.Tag{
+        &.{ "p", &me_hex },
+        &.{ "amount", "1000" },
+    };
+    const req = try nostr.event.create(arena, signer, alice, 1_800_000_000, 9734, &req_tags, "", null);
+    const req_json = try nostr.event.toJson(arena, req);
+
+    // Twenty receipts carrying it, each signed by a different throwaway key, each
+    // with a fresh id, an invented invoice and a current timestamp.
+    for (0..20) |i| {
+        var receipt = inboxEvent(9735, @intCast(0x90 + i), &.{
+            &.{ "p", &me_hex },
+            &.{ "description", req_json },
+            &.{ "bolt11", "lnbc10m1invented" },
+        }, 1_800_090_000);
+        receipt.id[0] = @intCast(i);
+        receipt.id[1] = 0xAB;
+        _ = main.inboxAddForTest(receipt, 1_800_090_000);
+    }
+
+    var buf: [64]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    // One payment, however many wrappers were written around it.
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualSlices(u8, &alice.public_key, &items[0].author);
+    // The figure Alice signed, not the one the wrapper claimed.
+    try testing.expectEqual(@as(u64, 1000), items[0].msat);
+    // And her time, so a replay cannot pose as something that just happened.
+    try testing.expectEqual(@as(i64, 1_800_000_000), items[0].created_at);
+}
+
+test "zapping your own note is not somebody zapping you" {
+    // The own-author gate is skipped for receipts, correctly, because a receipt
+    // is authored by a payment server. Nothing put it back once the real payer
+    // was known, and the request names the reader either way, because the reader
+    // is the recipient.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = [_]u8{0xEB} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    var me_hex: [64]u8 = undefined;
+    for (kp.public_key, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const req_tags = [_]nostr.event.Tag{ &.{ "p", &me_hex }, &.{ "amount", "21000" } };
+    const req = try nostr.event.create(arena, signer, kp, 1_800_000_000, 9734, &req_tags, "", null);
+    const req_json = try nostr.event.toJson(arena, req);
+    const receipt = inboxEvent(9735, 0x79, &.{
+        &.{ "p", &me_hex },
+        &.{ "description", req_json },
+    }, 1_800_000_000);
+    try testing.expect(!main.inboxAddForTest(receipt, 1_800_000_100));
+    try testing.expectEqual(@as(usize, 0), main.inboxLenForTest());
+}
+
+test "an e tag that is not an id leaves no target rather than a broken one" {
+    // `hexToBytes` decodes as far as it can before it errors, so writing straight
+    // into the target left a real prefix and a zero tail, which reads as a
+    // perfectly good note id and presses into nothing forever.
+    main.setIdentityForTest([_]u8{0xEC} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // Sixty-three hex characters and one that is not. Relays do not check this.
+    const junk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeZ";
+    var ev = inboxEvent(1, 0x4D, &.{
+        &.{ "p", &me_hex },
+        &.{ "e", junk },
+    }, 1_800_000_000);
+    ev.id[0] = 0x4D;
+    try testing.expect(main.inboxAddForTest(ev, 1_800_000_000));
+
+    var buf: [8]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    // No target at all, so the row presses to the person instead of to nowhere.
+    try testing.expect(!items[0].hasTarget());
+}
+
+test "a press closes the sheet even when it cannot go anywhere" {
+    // Every route out of the sheet has an early return in front of it: a store
+    // miss for a note nobody fetched, an identity check for a person already on
+    // screen. Closing on ARRIVAL therefore left the sheet up in exactly the cases
+    // where the reader has least idea why nothing moved.
+    main.setIdentityForTest([_]u8{0xED} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetInboxForTest();
+
+    // A note the store has never heard of.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notifications_open = true;
+        var fx: main.EffectsForTest = undefined;
+        main.update(&model, .{ .open_event = [_]u8{0x5E} ** 32 }, &fx);
+        try testing.expect(!model.notifications_open);
+        // And it says something, rather than swallowing the press.
+        try testing.expect(model.toast_until != 0);
+    }
+
+    // The person whose page is already open.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const alice = [_]u8{0x6F} ** 32;
+        var fx: main.EffectsForTest = undefined;
+        main.update(&model, .{ .open_person = alice }, &fx);
+        model.notifications_open = true;
+        main.update(&model, .{ .open_person = alice }, &fx);
+        try testing.expect(!model.notifications_open);
+    }
+}
+
+test "a keyboard shortcut fired under the sheet does not arm something invisible" {
+    // These are declared shortcuts, so the shell delivers them whatever is on
+    // screen, and the sheet is drawn above both destinations.
+    main.setIdentityForTest([_]u8{0xEE} ** 32);
+    defer main.clearIdentityForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notifications_open = true;
+        main.update(&model, .open_compose, &fx);
+        // Otherwise the composer arms itself unseen and appears on its own the
+        // moment the sheet is dismissed.
+        try testing.expect(!model.notifications_open);
+        try testing.expect(model.composing);
+    }
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notifications_open = true;
+        main.update(&model, .open_settings, &fx);
+        try testing.expect(!model.notifications_open);
+        try testing.expect(model.stage == .settings);
+    }
+}
+
+test "the page the reader is on stays inside the pages that exist" {
+    // The set moves underneath: a fresh contact list narrows the follows tab, an
+    // eviction shortens both. Clamping only where it is drawn meant the model
+    // stayed past the end, and Newer then did nothing visible once per page the
+    // reader had drifted by.
+    main.setIdentityForTest([_]u8{0xEF} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+
+    seedInbox(main.inbox_page * 3, 0xA0, 1_800_000_000);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+
+    var fx: main.EffectsForTest = undefined;
+    // Walk past the end: it stops at the last page rather than running away.
+    for (0..10) |_| main.update(&model, .notifications_older, &fx);
+    try testing.expectEqual(@as(usize, 2), model.notifications_page);
+    // And one press back moves one page, not none.
+    main.update(&model, .notifications_newer, &fx);
+    try testing.expectEqual(@as(usize, 1), model.notifications_page);
+}
+
+test "an amount no one could have sent is not an amount" {
+    // `bolt11` is a string the sender writes. The first version read it into a
+    // u64 and drew whatever came out, which for a junk prefix was eighteen
+    // quintillion sats: more than will ever exist, printed as fact.
+    main.setIdentityForTest([_]u8{0xE2} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const payer = try signer.keyPairFromSecretKey([_]u8{0x0C} ** 32);
+    const to_me = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    const req = try nostr.event.create(arena, signer, payer, 1_800_000_000, 9734, &to_me, "", null);
+    const req_json = try nostr.event.toJson(arena, req);
+
+    const receipt = inboxEvent(9735, 0x78, &.{
+        &.{ "p", &me_hex },
+        &.{ "description", req_json },
+        &.{ "bolt11", "lnbc99999999999999999999999999p1xxxx" },
+    }, 1_800_000_000);
+    try testing.expect(main.inboxAddForTest(receipt, 1_800_000_100));
+
+    var buf: [8]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    // The row still says somebody zapped, because somebody did sign for it. It
+    // just declines to repeat a number that cannot be true: more millisats than
+    // there will ever be bitcoin. What this does NOT do is make the amount
+    // trustworthy, which needs the receipt checked against the reader's own LNURL
+    // server; until then a plausible number from a stranger is still a claim.
+    try testing.expectEqual(@as(u64, 0), items[0].msat);
+}
+
+test "a flood from a stranger cannot delete what the people you follow said" {
+    // Signing two hundred events costs seconds and nothing else. The first
+    // version kept a flat two hundred and dropped the oldest on every arrival, so
+    // that was the whole price of erasing a reader's inbox, permanently: the
+    // backfill window then resumes past everything the flood pushed out.
+    main.setIdentityForTest([_]u8{0xE3} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    // Somebody the reader chose, who said something an hour ago.
+    const friend = [_]u8{0xF1} ** 32;
+    _ = main.setFollowsForTest(&.{friend}, 1_800_000_000);
+    var from_friend = inboxEvent(1, 0xF1, &mine, 1_799_996_400);
+    from_friend.id[0] = 0xF1;
+    try testing.expect(main.inboxAddForTest(from_friend, 1_800_000_000));
+
+    // Then one key signs three hundred, all newer.
+    const spammer: u8 = 0x0D;
+    for (0..300) |i| {
+        var ev = inboxEvent(1, spammer, &mine, 1_800_000_000 + @as(i64, @intCast(i)));
+        ev.id[0] = @intCast(i % 256);
+        ev.id[1] = @intCast(i / 256);
+        _ = main.inboxAddForTest(ev, 1_800_001_000);
+    }
+
+    var buf: [256]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+
+    // No one author owns more than their share, however many they send.
+    var by_spammer: usize = 0;
+    var friend_survived = false;
+    for (items) |it| {
+        if (it.author[0] == spammer) by_spammer += 1;
+        if (std.mem.eql(u8, &it.author, &friend)) friend_survived = true;
+    }
+    try testing.expect(by_spammer <= main.inbox_per_author_max);
+    try testing.expect(friend_survived);
+}
+
+test "a full inbox never trades a newer notification for an older one" {
+    main.setIdentityForTest([_]u8{0xE4} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    // Fill it, from enough distinct authors that the per-author rule is not what
+    // is being measured here.
+    seedInbox(main.inbox_cap, 0x10, 1_800_000_000);
+    try testing.expectEqual(main.inbox_cap, main.inboxLenForTest());
+
+    // A relay backfills something from a year ago. The array is full, so this is
+    // a question about what to DELETE, and the answer must not be "something
+    // newer than the thing arriving".
+    var ancient = inboxEvent(1, 0xEE, &mine, 1_700_000_000);
+    ancient.id[0] = 0xEE;
+    ancient.id[1] = 0xEE;
+    _ = main.inboxAddForTest(ancient, 1_800_100_000);
+
+    var buf: [256]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    try testing.expectEqual(main.inbox_cap, items.len);
+    for (items) |it| {
+        try testing.expect(it.created_at >= 1_800_000_000);
+    }
+}
+
+test "the bell opens onto the notifications it counted" {
+    // The badge counted every reply and mention; the sheet opened on a tab that
+    // showed only people the reader follows. A stranger replying is not an edge
+    // case for an inbox, it is most of the point of one, so the ordinary result
+    // was: badge says 1, sheet says "nothing from the people you follow", and
+    // opening marked it read on the way past.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xE5} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    var stranger = inboxEvent(1, 0x2C, &mine, 1_800_000_000);
+    stranger.id[0] = 0x2C;
+    try testing.expect(main.inboxAddForTest(stranger, 1_800_000_000));
+    try testing.expectEqual(@as(usize, 1), main.inboxUnread());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    // Whatever the sheet opens on by default, not what this test would prefer.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyText(tree.root, "Nothing from the people you follow yet. Everyone is in the other tab.") == null);
+}
+
+test "a notification press asks the store, not the feed" {
+    // What a notification points at is almost always an older note of the
+    // reader's own, or a stranger's note in a thread they were named in. The feed
+    // is scoped to follows and holds a few hundred rows, so resolving the press
+    // against it made the ordinary press do nothing whatsoever: no thread, no
+    // error, no feedback.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xE6} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const target_hex = "ab" ** 32;
+    var reply = inboxEvent(1, 0x3C, &.{
+        &.{ "p", &me_hex },
+        &.{ "e", target_hex },
+    }, 1_800_000_000);
+    reply.id[0] = 0x3C;
+    try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
+
+    var buf: [8]main.InboxItem = undefined;
+    const items = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    // The WHOLE id, which is what the store can be asked for.
+    try testing.expect(items[0].hasTarget());
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, target_hex);
+    try testing.expectEqualSlices(u8, &want, &items[0].target_id);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    const tree = try buildTree(arena, &model);
+    const row = findByLabel(tree.root, "replied to you") orelse findByLabel(tree.root, "mentioned you") orelse return error.RowMissing;
+    for (tree.handlers) |h| {
+        if (h.id != row.id or h.event != .press) continue;
+        switch (h.action) {
+            .message => |m| switch (m) {
+                .open_event => |id| {
+                    try testing.expectEqualSlices(u8, &want, &id);
+                    return;
+                },
+                else => return error.PressGoesNowhere,
+            },
+            else => return error.PressGoesNowhere,
+        }
+    }
+    return error.RowHasNoPress;
+}
+
+test "walking somewhere from the sheet closes the sheet" {
+    main.setIdentityForTest([_]u8{0xE7} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetInboxForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .{ .open_person = [_]u8{0x44} ** 32 }, &fx);
+    // Otherwise the person opens UNDERNEATH a sheet still covering the screen,
+    // and the press reads as having done nothing at all.
+    try testing.expect(!model.notifications_open);
+    try testing.expect(model.viewing_profile != null);
+}
+
+test "the notifications sheet lays its rows out INSIDE its card" {
+    // The tree said this screen was right for as long as it was wrong. `modalCard`
+    // sets a width and no height, so under a `.start` cross-alignment the card took
+    // its intrinsic height, the `grow = 1` scroll inside it resolved to ZERO, and
+    // the rows were laid out and painted down the bare window below the card with
+    // the footer drawn on top of the first one. Every assertion about the widget
+    // tree passed throughout. So this one asks the geometry instead.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD4} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+    seedInbox(12, 0x40, 1_800_000_000);
+
+    const p = try painted.Painted.render(arena, &model);
+    const card = p.fillRectOf(theme.palette.surface_modal) orelse return error.CardNotPainted;
+
+    // The card is a panel, not a strip: it has to be tall enough to hold a list.
+    try testing.expect(card.height > main.window_height / 2);
+
+    // The scroll region has somewhere to put them. This is the assertion that
+    // fails on the bug and passes here: the region laid out at height ZERO, so
+    // there was no viewport, nothing scrolled, and the rows below the first
+    // handful were unreachable however far the reader dragged.
+    const view = frameOfKind(p, .scroll_view) orelse return error.ScrollNotLaidOut;
+    try testing.expect(view.height > 200);
+    try testing.expect(view.y >= card.y - 1);
+
+    // The first row starts inside the viewport rather than at the top of the
+    // window, and the footer sits BELOW the region instead of on top of row one.
+    const rows = p.framesOf("mentioned you");
+    try testing.expect(rows.len > 0);
+    try testing.expect(rows[0].y >= view.y - 1);
+    const footer = frameOfText(p, "read state stays on this Mac") orelse return error.FooterNotPainted;
+    try testing.expect(footer.y >= view.y + view.height - 1);
+    try testing.expect(footer.y + footer.height <= card.y + card.height + 1);
+}
+
+test "the sheet fits the view budget over the deepest thing under it" {
+    // The sheet is STACKED over whatever the reader was reading, so both trees are
+    // priced against the same 1024-node ceiling, and a view past it is refused
+    // whole: no frame, a window that stops updating. The first version of this
+    // screen was measured on its own and shipped a page count that could not be
+    // drawn at all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD5} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+    // A full page, which is the most the sheet ever draws at once.
+    seedInbox(main.inbox_page, 0x60, 1_800_000_000);
+
+    // Over a busy thread at the deepest the back stack goes.
+    const author = [_]u8{0x55} ** 32;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = author;
+    var n: usize = 0;
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        model.thread_notes[n] = threadNote(0x10 + i, 200 + @as(i64, i), 0xAA);
+        model.thread_notes[n].pubkey = author;
+        model.thread_notes[n].id = @as(i64, i) + 10;
+        n += 1;
+    }
+    model.thread_notes_len = n;
+    for (0..main.thread_depth_max) |d| {
+        model.thread_stack[d] = .{ .note = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0) };
+        model.thread_stack[d].note.id = 500 + @as(i64, @intCast(d));
+        model.thread_stack[d].note.pubkey = author;
+    }
+    model.thread_stack_len = main.thread_depth_max;
+
+    const p = painted.Painted.render(arena, &model) catch |err| {
+        std.debug.print("sheet over a full back stack refused: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
+}
+
+test "pages replace rather than pile up, and every notification is reachable" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD6} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    defer main.resetInboxForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+    seedInbox(main.inbox_page * 2, 0x80, 1_800_000_000);
+
+    // One page's worth of rows, however many are held.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
+        try testing.expect(findAnyText(tree.root, "1 of 2") != null);
+    }
+    // The second page REPLACES the first: the cost is the same either way, and
+    // the older items are reachable instead of being cut off at a page limit.
+    model.notifications_page = 1;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
+        try testing.expect(findAnyText(tree.root, "2 of 2") != null);
+    }
+    // A page number means nothing once the set under it changes.
+    var m2 = model;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&m2, .{ .notifications_tab = 0 }, &fx);
+    try testing.expectEqual(@as(usize, 0), m2.notifications_page);
+}
+
+test "the notifications sheet renders what it holds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xB8} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    main.forgetFollowsForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+
+    // Empty: the sheet says so in its own words rather than showing nothing.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Notifications") != null);
+        try testing.expect(findAnyText(tree.root, "Mark all read") != null);
+        try testing.expect(findAnyText(tree.root, "read state stays on this Mac") != null);
+        try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") != null);
+    }
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    _ = main.inboxAddForTest(inboxEvent(1, 0xCA, &mine, 1_800_000_000), 1_800_000_000);
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
 }
