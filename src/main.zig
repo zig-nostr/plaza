@@ -3634,6 +3634,9 @@ pub const Model = struct {
     // whether the app has the reader's current profile to merge into.
     editing_profile: bool = false,
     profile_stage: ProfileStage = .fetching,
+    // When the sheet started waiting, so a relay that never answers becomes a
+    // stated fact rather than a spinner nobody can leave.
+    profile_asked_at: i64 = 0,
     // Which key the name was read from, so the edit rewrites THAT key.
     profile_name_key: ProfileNameKey = .display_name,
     // Whether the sheet has been seeded from the reader's own profile, so the
@@ -3925,6 +3928,10 @@ pub const Model = struct {
         return switch (self.profile_stage) {
             .fetching => "Reading your current profile from your relays…",
             .absent => "You have no profile yet. Saving publishes your first one.",
+            // Deliberately NOT "you have no profile". Not hearing back is not
+            // the same as being told there is nothing, and only one of those is
+            // safe to publish over.
+            .unread => "Could not read your current profile. Nothing will be published over it until it loads.",
             .have => "",
             .saving => "Signing…",
             .sent => "Saved here and sent to your relays. Other clients will show it as they pass it on.",
@@ -3946,7 +3953,7 @@ pub const Model = struct {
         // press is a sheet they have to close and reopen to use again.
         return switch (self.profile_stage) {
             .have, .absent, .failed, .sent => true,
-            .fetching, .saving => false,
+            .fetching, .saving, .unread => false,
         };
     }
     /// The add-a-relay field's text.
@@ -5923,6 +5930,7 @@ pub const Msg = union(enum) {
     profile_about_edit: canvas.TextInputEvent,
     profile_picture_edit: canvas.TextInputEvent,
     profile_save,
+    profile_retry,
     /// Walks a relay through what it is for: both, read, write.
     relay_cycle: u8,
     /// Drops a relay from the pool.
@@ -6725,6 +6733,11 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.row(.{ .gap = 8, .cross = .center }, .{
                     ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_profile_edit }, "Close"),
                     ui.spacer(1),
+                    if (model.profile_stage == .unread)
+                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
+                    else
+                        ui.spacer(0),
+                    if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
                     ui.button(.{
                         .size = .sm,
                         .variant = .primary,
@@ -10981,6 +10994,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         model.profile_stage = .have;
                     } else if (ownProfileAnswered()) {
                         model.profile_stage = .absent;
+                    } else if (now - model.profile_asked_at > own_profile_wait_s) {
+                        model.profile_stage = .unread;
                     }
                 }
                 // Their published relay list, taken on this thread so no ingest
@@ -11098,6 +11113,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_about_edit => |edit| model.profile_about_buffer.apply(edit),
         .profile_picture_edit => |edit| model.profile_picture_buffer.apply(edit),
         .profile_save => saveProfile(model, fx),
+        .profile_retry => {
+            forgetOwnProfileAnswer();
+            model.profile_asked_at = nowSeconds();
+            model.profile_stage = .fetching;
+            startOwnProfileFetch();
+        },
         .relay_cycle => |i| {
             cycleRelay(i);
             // The ack bits name slots, and this slot's direction just changed.
@@ -11408,7 +11429,13 @@ fn enterSettings(model: *Model) void {
 /// this app models, which is how somebody's lightning address disappears. So the
 /// sheet asks every read relay first, and only calls it `absent` once they have
 /// all answered.
-pub const ProfileStage = enum { fetching, absent, have, saving, sent, failed };
+pub const ProfileStage = enum { fetching, absent, unread, have, saving, sent, failed };
+
+/// How long the sheet waits for a relay before saying it could not read the
+/// profile. `relay.receive()` has no deadline, so a relay that accepts the
+/// subscription and then says nothing would otherwise hold the round open for
+/// the rest of the session.
+const own_profile_wait_s: i64 = 12;
 
 /// Which key in the profile object the sheet's one Name field stands for. NIP-01
 /// has `name` (a handle) and `display_name` (a fuller name), and some clients
@@ -11521,6 +11548,7 @@ fn openProfileEdit(model: *Model) void {
     }
     // Nothing here yet. Ask before concluding anything.
     model.profile_seeded = false;
+    model.profile_asked_at = nowSeconds();
     model.profile_stage = if (ownProfileAnswered()) .absent else .fetching;
     if (model.profile_stage == .fetching) startOwnProfileFetch();
 }
@@ -11692,6 +11720,30 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
     // Straight onto the caller's allocator: the write seam holds this for the
     // life of the process, and the arena above dies with this function.
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
+}
+
+pub fn activePubkeyForTest() ?[32]u8 {
+    return activePubkey();
+}
+
+pub fn forgetOwnProfileAnswerForTest() void {
+    forgetOwnProfileAnswer();
+}
+
+/// Records an answer the way the worker's `defer` does.
+pub fn recordOwnProfileAnswerForTest(pk: [32]u8, answered: bool) void {
+    lockOwnProfile();
+    g_own_profile_asked_for = pk;
+    g_own_profile_answered.store(answered, .release);
+    unlockOwnProfile();
+}
+
+pub fn ownProfileAnsweredForTest() bool {
+    return ownProfileAnswered();
+}
+
+pub fn seedProfileFieldsForTest(model: *Model, json: []const u8) void {
+    seedProfileFields(model, json);
 }
 
 /// The merge, exposed so a test can prove what survives it. This is the whole

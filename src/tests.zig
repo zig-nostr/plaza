@@ -3911,3 +3911,121 @@ test "every text field in the app has a submit handler, because without one it i
     naming.naming = true;
     try assertFieldsEditable(try buildTree(arena, &naming), "name");
 }
+
+test "an unanswered relay round is never read as 'you have no profile'" {
+    // This is the wipe. "The store has no kind:0 for me" means either that the
+    // account has no profile or that nobody answered, and only one of those is
+    // safe to publish over. The answer therefore records WHO it is about and is
+    // only set when a relay actually replied.
+    // The identity hooks take a SECRET key; the answer is recorded against the
+    // PUBLIC one, which is what a relay was asked about.
+    main.forgetOwnProfileAnswerForTest();
+    main.setIdentityForTest([_]u8{1} ** 32);
+    defer main.clearIdentityForTest();
+    const a = main.activePubkeyForTest().?;
+    try testing.expect(!main.ownProfileAnsweredForTest());
+
+    // A round where every relay was offline, write-only or refused the dial
+    // proves nothing, even though the round finished.
+    main.recordOwnProfileAnswerForTest(a, false);
+    try testing.expect(!main.ownProfileAnsweredForTest());
+
+    // A relay that replied does prove it.
+    main.recordOwnProfileAnswerForTest(a, true);
+    try testing.expect(main.ownProfileAnsweredForTest());
+
+    // And it proves it about account A only. Signing in as B must not inherit
+    // A's conclusion, or B's Save publishes an empty object over B's profile.
+    main.setIdentityForTest([_]u8{2} ** 32);
+    try testing.expect(!main.ownProfileAnsweredForTest());
+}
+
+test "a relay that never answers leaves the sheet unable to save, not eager to" {
+    // `relay.receive()` has no deadline, so a relay that accepts a subscription
+    // and then says nothing would hold the round open forever. Waiting has to
+    // end in "could not read it", never in "you have no profile".
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(!model.profile_can_save());
+    model.profile_stage = .unread;
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "Could not read") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "no profile") == null);
+}
+
+test "a field too long to show is left alone rather than written back truncated" {
+    // The buffers hold 64, 280 and 200 bytes. A longer bio shown cut off, then
+    // saved untouched, writes the cut-off version back over the real one: data
+    // loss from merely opening a sheet.
+    var model = main.initialModel();
+    var long: [400]u8 = undefined;
+    @memset(&long, 'x');
+    const existing = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"name\":\"alice\",\"about\":\"{s}\",\"lud16\":\"a@b.com\"}}",
+        .{long},
+    );
+    defer testing.allocator.free(existing);
+
+    main.seedProfileFieldsForTest(&model, existing);
+    // Not shown at all, rather than shown cut in half.
+    try testing.expectEqualStrings("", model.profile_about());
+    try testing.expect(model.profile_about_long);
+
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+    // The real bio is still there, at its full length.
+    try testing.expect(std.mem.indexOf(u8, merged, long[0..400]) != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"a@b.com\"") != null);
+}
+
+test "the name edit rewrites the key it was read from" {
+    // The field is seeded from display_name, displayName or name, whichever the
+    // profile has. Always writing display_name would leave the value the reader
+    // edited exactly where it was, so the rename would silently do nothing.
+    var model = main.initialModel();
+
+    // A profile using the legacy camelCase key.
+    const legacy = "{\"displayName\":\"Old\",\"lud16\":\"a@b.com\"}";
+    main.seedProfileFieldsForTest(&model, legacy);
+    try testing.expectEqualStrings("Old", model.profile_name());
+    model.profile_name_buffer.set("New");
+    const m1 = main.mergeProfileJsonForTest(testing.allocator, legacy, &model).?;
+    defer testing.allocator.free(m1);
+    try testing.expect(std.mem.indexOf(u8, m1, "\"displayName\":\"New\"") != null);
+    try testing.expect(std.mem.indexOf(u8, m1, "\"Old\"") == null);
+
+    // A profile with only a handle: the handle is what the reader saw, so the
+    // handle is what they edited.
+    var m2model = main.initialModel();
+    const handle_only = "{\"name\":\"alice\",\"lud16\":\"a@b.com\"}";
+    main.seedProfileFieldsForTest(&m2model, handle_only);
+    try testing.expectEqualStrings("alice", m2model.profile_name());
+    m2model.profile_name_buffer.set("alice2");
+    const m2 = main.mergeProfileJsonForTest(testing.allocator, handle_only, &m2model).?;
+    defer testing.allocator.free(m2);
+    try testing.expect(std.mem.indexOf(u8, m2, "\"name\":\"alice2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, m2, "\"lud16\":\"a@b.com\"") != null);
+}
+
+test "a late profile does not overwrite what the reader is typing" {
+    // The fetch lands a few seconds after the sheet opens. Seeding then would
+    // replace the sentence they are in the middle of writing.
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(model.profile_untouched());
+    model.profile_about_buffer.set("halfway through a th");
+    try testing.expect(!model.profile_untouched());
+}
+
+test "saving says what is true, and stays available for the next correction" {
+    // Nothing here can know a relay took it: signAndPublish returns no verdict,
+    // the remote and helper paths have not even signed yet, and a kind:0 that
+    // reaches nobody is not retried. And a typo in the name just saved must be
+    // fixable without closing the sheet.
+    var model = main.initialModel();
+    model.profile_stage = .sent;
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "Published") == null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "sent to your relays") != null);
+    try testing.expect(model.profile_can_save());
+}
