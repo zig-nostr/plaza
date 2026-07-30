@@ -98,21 +98,58 @@ test "the settings screen shows the identity, key backup, and logout" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Signed in, because half this screen is about the identity: a guest has no
+    // profile to edit and no key to back up.
+    main.setIdentityForTest([_]u8{9} ** 32);
+    defer main.clearIdentityForTest();
     var model = main.initialModel();
     model.stage = .settings;
     const tree = try buildTree(arena, &model);
 
-    try testing.expect(findByText(tree.root, .text, "Settings") != null);
-    try testing.expect(findAnyText(tree.root, "Signed in as") != null);
-    // Default signer kind is a local key, so the key-backup card and its reveal
-    // control render.
-    try testing.expect(findAnyText(tree.root, "Local key") != null);
+    try testing.expect(findAnyText(tree.root, "Settings") != null);
+    // Every section the design names, in the order it names them.
+    try testing.expect(findAnyText(tree.root, "IDENTITY") != null);
+    try testing.expect(findAnyText(tree.root, "RELAYS") != null);
+    try testing.expect(findAnyText(tree.root, "APPEARANCE") != null);
+    try testing.expect(findAnyText(tree.root, "FEED") != null);
+    // The identity card says what signs, and offers the way into the profile.
+    try testing.expect(findAnyText(tree.root, "Signing with a local key") != null);
+    try testing.expect(findAnyText(tree.root, "Edit profile") != null);
+    try testing.expect(findAnyText(tree.root, "Copy npub") != null);
+    // The key-backup card has no home in the design and must not be dropped: a
+    // local key is the account, and this is the only way to take a copy of it.
     try testing.expect(findAnyText(tree.root, "Reveal secret key") != null);
+    // So is the media proxy, which is a privacy setting with no other UI.
+    try testing.expect(findAnyText(tree.root, "Media proxy") != null);
+    try testing.expect(findAnyText(tree.root, "Load media previews") != null);
     // The logout entry point is present; the confirmation is not yet.
     try testing.expect(findAnyText(tree.root, "Log out") != null);
     try testing.expect(findAnyText(tree.root, "Cancel") == null);
     // The version line renders.
     try testing.expect(findAnyText(tree.root, "Plaza 0.1.0") != null);
+}
+
+test "a guest is not offered a profile to edit" {
+    // A guest has no key: nothing to read their profile from and nothing that
+    // could sign an edit. Offering the sheet would sit on "Reading your current
+    // profile" for the rest of the session.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "IDENTITY") != null);
+    try testing.expect(findAnyText(tree.root, "Edit profile") == null);
+
+    // And reaching for it anyway routes to the join sheet rather than opening a
+    // sheet that can never finish.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(!model.editing_profile);
+    try testing.expect(model.joining);
 }
 
 test "a kind:0 profile gives an author a display name" {
@@ -3701,4 +3738,294 @@ test "signing out leaves the account's relay list with the account" {
     try testing.expectEqual(@as(usize, 5), main.relayCount());
     try testing.expectEqualStrings("wss://relay.damus.io", main.relayUrlAt(0));
     try testing.expectEqual(@as(usize, 0), main.relaySuggestionCount());
+}
+
+test "editing a profile keeps every field this app does not model" {
+    // kind:0 is REPLACEABLE: what is published replaces the whole profile. Real
+    // profiles carry a lightning address, a banner, a website and whatever else
+    // their owner's other clients wrote. This app models three fields, so it
+    // edits three keys and leaves the rest exactly where they were. Getting this
+    // wrong silently stops somebody being paid.
+    const existing =
+        \\{"name":"alice","display_name":"Alice","about":"old bio","picture":"https://old.example.com/a.png",
+        \\"lud16":"alice@getalby.com","banner":"https://ex.com/b.png","website":"https://alice.example",
+        \\"nip05":"alice@example.com","pronouns":"she/her"}
+    ;
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice Liddell");
+    model.profile_about_buffer.set("new bio");
+    model.profile_picture_buffer.set("https://new.example.com/a.png");
+
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+
+    // What the reader edited.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice Liddell\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"about\":\"new bio\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"picture\":\"https://new.example.com/a.png\"") != null);
+    // What they did not, and what this app cannot even see.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"banner\":\"https://ex.com/b.png\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"website\":\"https://alice.example\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
+    // The handle is not the display name, and an account that already has one
+    // keeps it: renaming yourself must not rename your @handle out from under
+    // everyone who mentions you.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\":\"alice\"") != null);
+}
+
+test "an emptied profile field removes its key rather than blanking it" {
+    // `"about": ""` reads to other clients as a bio deliberately blanked, which
+    // is a different statement from not having one.
+    const existing = "{\"name\":\"alice\",\"about\":\"old bio\",\"lud16\":\"alice@getalby.com\"}";
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice");
+    model.profile_about_buffer.set("   ");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "about") == null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+}
+
+test "a profile with no handle gets one, and prose survives being prose" {
+    // An account with no `name` at all gets one, so clients that read only
+    // `name` have something to show. And a name with a quote in it is ESCAPED,
+    // not stripped: dropping characters was a fixed-size buffer away from an
+    // overflow, and it silently renamed people.
+    var model = main.initialModel();
+    model.profile_name_buffer.set("A \"quoted\" name \\ here");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, "{}", &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\\\"quoted\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\"") != null);
+}
+
+test "the name beat merges too, so it can never publish a name as the whole profile" {
+    // The beat runs when there is nothing to merge into, but it goes through the
+    // merge anyway: the destructive shape is a name published as the WHOLE
+    // profile, and one path means that shape cannot come back.
+    const existing = "{\"about\":\"kept\",\"lud16\":\"me@example.com\"}";
+    const merged = main.mergeNameJsonForTest(testing.allocator, existing, "Bob").?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"name\":\"Bob\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"about\":\"kept\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"me@example.com\"") != null);
+}
+
+test "a profile that will not parse does not become a blank profile" {
+    // Garbage in the store must not turn into an empty object with three fields
+    // written over it. It falls back to an object the edit is applied to, and
+    // the caller's stage machine is what decides whether to publish at all.
+    var model = main.initialModel();
+    model.profile_name_buffer.set("Alice");
+    const merged = main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice\"") != null);
+}
+
+test "the sheet refuses to save until it has read the profile it would replace" {
+    // "The store has no kind:0 for me" means either that this account has no
+    // profile or that nobody has answered yet, and those look identical. Saving
+    // under the second reading replaces a real profile with three fields.
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(findAnyTextIn(model.profile_status(), "Reading your current profile"));
+
+    // Only once every read relay has answered does "absent" become a fact.
+    model.profile_stage = .absent;
+    try testing.expect(model.profile_can_save());
+
+    model.profile_stage = .have;
+    try testing.expect(model.profile_can_save());
+    try testing.expectEqualStrings("", model.profile_status());
+
+    model.profile_stage = .saving;
+    try testing.expect(!model.profile_can_save());
+}
+
+fn findAnyTextIn(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+/// Every editable field in a built tree, with whether it has a submit handler.
+fn assertFieldsEditable(tree: AppUi.Tree, where: []const u8) !void {
+    _ = where;
+    var stack: [64]canvas.Widget = undefined;
+    var depth: usize = 0;
+    stack[depth] = tree.root;
+    depth += 1;
+    while (depth > 0) {
+        depth -= 1;
+        const w = stack[depth];
+        if (w.kind == .textarea or w.kind == .text_field or w.kind == .input or w.kind == .search_field) {
+            var has_submit = false;
+            for (tree.handlers) |h| {
+                if (h.id == w.id and h.event == .submit) has_submit = true;
+            }
+            try testing.expect(has_submit);
+        }
+        for (w.children) |child| {
+            if (depth < stack.len) {
+                stack[depth] = child;
+                depth += 1;
+            }
+        }
+    }
+}
+
+test "every text field in the app has a submit handler, because without one it is not editable" {
+    // A textarea with `on_input` but NO `on_submit` renders, focuses, reports
+    // `set_text` in its actions, and accepts nothing: not a keystroke, not a
+    // paste, not an automated set_text. It reads as a live field and is inert.
+    // The Edit profile sheet shipped that way until it was driven for real, so
+    // this walks every screen rather than trusting a reading of one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var settings = main.initialModel();
+    settings.stage = .settings;
+    try assertFieldsEditable(try buildTree(arena, &settings), "settings");
+
+    var sheet = main.initialModel();
+    sheet.stage = .settings;
+    sheet.editing_profile = true;
+    sheet.profile_stage = .have;
+    try assertFieldsEditable(try buildTree(arena, &sheet), "edit profile");
+
+    var composing = main.initialModel();
+    composing.stage = .ready;
+    composing.composing = true;
+    try assertFieldsEditable(try buildTree(arena, &composing), "composer");
+
+    var joining = main.initialModel();
+    joining.stage = .ready;
+    joining.joining = true;
+    try assertFieldsEditable(try buildTree(arena, &joining), "join");
+
+    var naming = main.initialModel();
+    naming.stage = .ready;
+    naming.naming = true;
+    try assertFieldsEditable(try buildTree(arena, &naming), "name");
+}
+
+test "an unanswered relay round is never read as 'you have no profile'" {
+    // This is the wipe. "The store has no kind:0 for me" means either that the
+    // account has no profile or that nobody answered, and only one of those is
+    // safe to publish over. The answer therefore records WHO it is about and is
+    // only set when a relay actually replied.
+    // The identity hooks take a SECRET key; the answer is recorded against the
+    // PUBLIC one, which is what a relay was asked about.
+    main.forgetOwnProfileAnswerForTest();
+    main.setIdentityForTest([_]u8{1} ** 32);
+    defer main.clearIdentityForTest();
+    const a = main.activePubkeyForTest().?;
+    try testing.expect(!main.ownProfileAnsweredForTest());
+
+    // A round where every relay was offline, write-only or refused the dial
+    // proves nothing, even though the round finished.
+    main.recordOwnProfileAnswerForTest(a, false);
+    try testing.expect(!main.ownProfileAnsweredForTest());
+
+    // A relay that replied does prove it.
+    main.recordOwnProfileAnswerForTest(a, true);
+    try testing.expect(main.ownProfileAnsweredForTest());
+
+    // And it proves it about account A only. Signing in as B must not inherit
+    // A's conclusion, or B's Save publishes an empty object over B's profile.
+    main.setIdentityForTest([_]u8{2} ** 32);
+    try testing.expect(!main.ownProfileAnsweredForTest());
+}
+
+test "a relay that never answers leaves the sheet unable to save, not eager to" {
+    // `relay.receive()` has no deadline, so a relay that accepts a subscription
+    // and then says nothing would hold the round open forever. Waiting has to
+    // end in "could not read it", never in "you have no profile".
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(!model.profile_can_save());
+    model.profile_stage = .unread;
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "Could not read") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "no profile") == null);
+}
+
+test "a field too long to show is left alone rather than written back truncated" {
+    // The buffers hold 64, 280 and 200 bytes. A longer bio shown cut off, then
+    // saved untouched, writes the cut-off version back over the real one: data
+    // loss from merely opening a sheet.
+    var model = main.initialModel();
+    var long: [400]u8 = undefined;
+    @memset(&long, 'x');
+    const existing = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"name\":\"alice\",\"about\":\"{s}\",\"lud16\":\"a@b.com\"}}",
+        .{long},
+    );
+    defer testing.allocator.free(existing);
+
+    main.seedProfileFieldsForTest(&model, existing);
+    // Not shown at all, rather than shown cut in half.
+    try testing.expectEqualStrings("", model.profile_about());
+    try testing.expect(model.profile_about_long);
+
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+    // The real bio is still there, at its full length.
+    try testing.expect(std.mem.indexOf(u8, merged, long[0..400]) != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"a@b.com\"") != null);
+}
+
+test "the name edit rewrites the key it was read from" {
+    // The field is seeded from display_name, displayName or name, whichever the
+    // profile has. Always writing display_name would leave the value the reader
+    // edited exactly where it was, so the rename would silently do nothing.
+    var model = main.initialModel();
+
+    // A profile using the legacy camelCase key.
+    const legacy = "{\"displayName\":\"Old\",\"lud16\":\"a@b.com\"}";
+    main.seedProfileFieldsForTest(&model, legacy);
+    try testing.expectEqualStrings("Old", model.profile_name());
+    model.profile_name_buffer.set("New");
+    const m1 = main.mergeProfileJsonForTest(testing.allocator, legacy, &model).?;
+    defer testing.allocator.free(m1);
+    try testing.expect(std.mem.indexOf(u8, m1, "\"displayName\":\"New\"") != null);
+    try testing.expect(std.mem.indexOf(u8, m1, "\"Old\"") == null);
+
+    // A profile with only a handle: the handle is what the reader saw, so the
+    // handle is what they edited.
+    var m2model = main.initialModel();
+    const handle_only = "{\"name\":\"alice\",\"lud16\":\"a@b.com\"}";
+    main.seedProfileFieldsForTest(&m2model, handle_only);
+    try testing.expectEqualStrings("alice", m2model.profile_name());
+    m2model.profile_name_buffer.set("alice2");
+    const m2 = main.mergeProfileJsonForTest(testing.allocator, handle_only, &m2model).?;
+    defer testing.allocator.free(m2);
+    try testing.expect(std.mem.indexOf(u8, m2, "\"name\":\"alice2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, m2, "\"lud16\":\"a@b.com\"") != null);
+}
+
+test "a late profile does not overwrite what the reader is typing" {
+    // The fetch lands a few seconds after the sheet opens. Seeding then would
+    // replace the sentence they are in the middle of writing.
+    var model = main.initialModel();
+    model.profile_stage = .fetching;
+    try testing.expect(model.profile_untouched());
+    model.profile_about_buffer.set("halfway through a th");
+    try testing.expect(!model.profile_untouched());
+}
+
+test "saving says what is true, and stays available for the next correction" {
+    // Nothing here can know a relay took it: signAndPublish returns no verdict,
+    // the remote and helper paths have not even signed yet, and a kind:0 that
+    // reaches nobody is not retried. And a typo in the name just saved must be
+    // fixable without closing the sheet.
+    var model = main.initialModel();
+    model.profile_stage = .sent;
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "Published") == null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "sent to your relays") != null);
+    try testing.expect(model.profile_can_save());
 }
