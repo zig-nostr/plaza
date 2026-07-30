@@ -2121,7 +2121,7 @@ test "replies from outside the follow graph are held below, not dropped" {
         threadNote(0xA1, 100, 0xAA),
         threadNote(0xB1, 110, 0xAA),
     };
-    notes[0].pubkey = main.starterPackForTest()[0];
+    notes[0].pubkey = main.followSetForTest()[0];
     notes[1].pubkey = [_]u8{0x77} ** 32; // nobody followed
     // Whoever wrote the note being read: nobody followed here either, so the
     // test also pins that the split never holds a third party by accident.
@@ -3467,6 +3467,10 @@ test "their published relay list becomes the pool, once, and never over an edit"
         .sig = [_]u8{0} ** 64,
     };
 
+    // Ownership is meaningless without an account: it is the whole point of the
+    // record that it says WHOSE list this is.
+    main.setIdentityForTest([_]u8{5} ** 32);
+    defer main.clearIdentityForTest();
     main.resetRelaysForTest();
     main.stageOwnRelayListForTest(ev);
     try testing.expect(main.adoptRelayListForTest());
@@ -4028,4 +4032,352 @@ test "saving says what is true, and stays available for the next correction" {
     try testing.expect(std.mem.indexOf(u8, model.profile_status(), "Published") == null);
     try testing.expect(std.mem.indexOf(u8, model.profile_status(), "sent to your relays") != null);
     try testing.expect(model.profile_can_save());
+}
+
+test "a replaced relay list is kept, and can be read back" {
+    // The store enforces replaceable semantics the way relays do:
+    // `ingestReplaceable` DELETES the superseded event in the same transaction.
+    // That is right for other people's records and wrong for ours, because the
+    // version being destroyed may be the one the reader wants back. A copy
+    // nothing can read is not a copy, so this test reads it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{77} ** 32);
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/backup.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const first_tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://one.example.com" },
+        &.{ "r", "wss://two.example.com" },
+    };
+    const first = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &first_tags, "", null);
+    _ = try main.plazaIngestForTest(arena, first);
+
+    // The replacement. This is the moment the first one is destroyed.
+    const second_tags = [_]nostr.event.Tag{&.{ "r", "wss://replacement.example.com" }};
+    const second = try nostr.event.create(arena, signer, kp, 1_800_000_100, 10002, &second_tags, "", null);
+    _ = try main.plazaIngestForTest(arena, second);
+
+    // The store holds only the new one, exactly as a relay would.
+    const kinds = [_]u16{10002};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 10 });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.events.len);
+    try testing.expect(std.mem.indexOf(u8, result.events[0].tags[0][1], "replacement") != null);
+
+    // And the one it replaced is still here, in full, readable.
+    const backup = main.ownListBackups(testing.allocator, 10002).?;
+    defer testing.allocator.free(backup);
+    try testing.expect(std.mem.indexOf(u8, backup, "wss://one.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, backup, "wss://two.example.com") != null);
+    // It is the real event, not a summary: it can be republished as-is.
+    try testing.expect(std.mem.indexOf(u8, backup, "\"sig\"") != null);
+    try testing.expect(std.mem.indexOf(u8, backup, "\"kind\":10002") != null);
+}
+
+test "the backup keeps a few versions, not a history" {
+    // The store's KV has no cursor and no delete, so a growing key scheme could
+    // never be read back or pruned. One rewritten key holding the last few is
+    // the only shape that is both readable and bounded.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{78} ** 32);
+    main.setIdentityForTest([_]u8{78} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/keep.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    var i: i64 = 0;
+    while (i < 6) : (i += 1) {
+        const url = try std.fmt.allocPrint(arena, "wss://v{d}.example.com", .{i});
+        const tags = [_]nostr.event.Tag{&.{ "r", url }};
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + i, 10002, &tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+
+    const backup = main.ownListBackups(testing.allocator, 10002).?;
+    defer testing.allocator.free(backup);
+    // The most recent replacements are here.
+    try testing.expect(std.mem.indexOf(u8, backup, "wss://v4.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, backup, "wss://v3.example.com") != null);
+    // The oldest are not: this is a way back from the last mistake, not an
+    // archive that grows inside the feed's database forever.
+    try testing.expect(std.mem.indexOf(u8, backup, "wss://v0.example.com") == null);
+    var lines = std.mem.tokenizeScalar(u8, backup, '\n');
+    var count: usize = 0;
+    while (lines.next()) |_| count += 1;
+    try testing.expect(count <= 3);
+}
+
+test "someone else's replaced list is not backed up" {
+    // The backup exists because losing OUR list is unrecoverable. Another
+    // author's kind:0 is re-fetchable from any relay, and keeping every one
+    // would fill the reader's disk with other people's history.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const mine = try signer.keyPairFromSecretKey([_]u8{79} ** 32);
+    const theirs = try signer.keyPairFromSecretKey([_]u8{80} ** 32);
+    main.setIdentityForTest([_]u8{79} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/theirs.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    _ = mine;
+
+    const a = try nostr.event.create(arena, signer, theirs, 1_800_000_000, 0, &.{}, "{\"name\":\"old\"}", null);
+    _ = try main.plazaIngestForTest(arena, a);
+    const b = try nostr.event.create(arena, signer, theirs, 1_800_000_100, 0, &.{}, "{\"name\":\"new\"}", null);
+    _ = try main.plazaIngestForTest(arena, b);
+
+    try testing.expect(main.ownListBackups(testing.allocator, 0) == null);
+}
+
+test "the pool left behind by a sign-out is never published as the next account's list" {
+    // The wipe this ownership record exists to stop, in order:
+    //   1. signing out writes the BOOTSTRAP pool to ~/.plaza/relays
+    //   2. the next launch reads that file back
+    //   3. a bool called "these relays are mine" said yes
+    //   4. so the account that signs in next has its real kind:10002 REFUSED
+    //   5. and its first badge press publishes five default relays over it.
+    // A list belongs to whoever was signed in when it was saved, so the record
+    // is a pubkey, not a bool.
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://their-real-relay.example.com" },
+        &.{ "r", "wss://their-other-relay.example.com" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{31} ** 32,
+        .created_at = 9_000,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+
+    // Step 1 and 2: the bootstrap pool is in memory, as if just read from a file
+    // written while signed out. It has no owner.
+    main.resetRelaysForTest();
+    try testing.expectEqual(@as(?[32]u8, null), main.relayOwnerForTest());
+
+    // Step 3: signing in does NOT make that pool theirs.
+    main.setIdentityForTest([_]u8{31} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expect(!main.relayListIsOwnedForTest());
+
+    // Step 4: so their real list is adopted rather than refused.
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://their-real-relay.example.com", main.relayUrlAt(0));
+    try testing.expectEqual(@as(usize, 2), main.relayCount());
+
+    // And now it IS theirs, so a later stale event cannot undo it.
+    try testing.expect(main.relayListIsOwnedForTest());
+}
+
+test "one account's saved relay list is not another account's" {
+    // Two readers share a Mac. The first signs out, the second signs in. The
+    // file on disk is the first one's, and must not silence the second's list.
+    main.resetRelaysForTest();
+    main.setIdentityForTest([_]u8{41} ** 32);
+    _ = main.addRelayForTest("wss://first-reader.example.com", true, true);
+    main.markRelaysMineForTest();
+    try testing.expect(main.relayListIsOwnedForTest());
+
+    // The same pool, a different reader: not theirs.
+    main.setIdentityForTest([_]u8{42} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expect(!main.relayListIsOwnedForTest());
+
+    // Which means their own list is free to arrive.
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://second-reader.example.com" }};
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{42} ** 32,
+        .created_at = 9_000,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://second-reader.example.com", main.relayUrlAt(0));
+}
+
+test "a forged event cannot rotate the backup ring" {
+    // The backup used to be written on the way IN, before the signature was
+    // checked inside `ingest`. So three forged events carrying the reader's own
+    // pubkey and a future stamp would push three copies of the current version
+    // into a three-slot ring and destroy the real history, from across the
+    // network, for the cost of three frames. The copy is kept only when the
+    // store says it actually REPLACED something, which happens after verifying.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{88} ** 32);
+    main.setIdentityForTest([_]u8{88} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/forged.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Two real versions, so the ring holds something worth destroying.
+    const v0_tags = [_]nostr.event.Tag{&.{ "r", "wss://real-one.example.com" }};
+    const v0 = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &v0_tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, v0, signer);
+    const v1_tags = [_]nostr.event.Tag{&.{ "r", "wss://real-two.example.com" }};
+    const v1 = try nostr.event.create(arena, signer, kp, 1_800_000_100, 10002, &v1_tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, v1, signer);
+    {
+        const before = main.ownListBackups(testing.allocator, 10002).?;
+        defer testing.allocator.free(before);
+        try testing.expect(std.mem.indexOf(u8, before, "real-one") != null);
+    }
+
+    // Now the attack: our pubkey, a future stamp, and a signature of nothing.
+    var i: i64 = 1;
+    while (i <= 3) : (i += 1) {
+        const bad_tags = [_]nostr.event.Tag{&.{ "r", "wss://forged.example.com" }};
+        const forged = nostr.event.Event{
+            .id = [_]u8{@intCast(i)} ** 32,
+            .pubkey = kp.public_key,
+            .created_at = 1_800_000_100 + i,
+            .kind = 10002,
+            .tags = &bad_tags,
+            .content = "",
+            .sig = [_]u8{0} ** 64,
+        };
+        const result = try main.plazaIngestVerifiedForTest(arena, forged, signer);
+        // Rejected, as it always was.
+        try testing.expectEqual(nostr.store.IngestResult.invalid, result);
+    }
+
+    // And the real history is untouched: no forged copy, and the version the
+    // reader would actually want back is still there.
+    const after = main.ownListBackups(testing.allocator, 10002).?;
+    defer testing.allocator.free(after);
+    try testing.expect(std.mem.indexOf(u8, after, "forged.example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, after, "real-one.example.com") != null);
+}
+
+test "editing a relay list does not grant permission to publish it" {
+    // The hole this whole change exists to close, in its second disguise. An
+    // edit claims the pool for the account, which is what stops a stale event
+    // undoing it. Claiming is not reading: if an edit ALSO authorized its own
+    // publish, the first badge press on a bootstrap pool would still replace a
+    // real list nobody had looked at.
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityForTest([_]u8{61} ** 32);
+    defer main.clearIdentityForTest();
+
+    // An edit: now owned.
+    _ = main.addRelayForTest("wss://edited.example.com", true, true);
+    main.markRelaysMineForTest();
+    try testing.expect(main.relayListIsOwnedForTest());
+    // But nobody has said what their real list is, so nothing goes out. Driving
+    // the real publish, not just its predicates: "did not publish" IS the
+    // property, so a test that only reads the flags proves nothing.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.publishRelayListForTest(&fx));
+
+    // Once a relay has answered, the same edit does go out.
+    main.noteOwnRelaysAnsweredForTest(main.activePubkeyForTest().?);
+    try testing.expect(main.ownRelaysAnsweredForTest());
+    try testing.expect(main.publishRelayListForTest(&fx));
+
+    // And an answer about THIS account says nothing about the next one.
+    main.setIdentityForTest([_]u8{62} ** 32);
+    try testing.expect(!main.ownRelaysAnsweredForTest());
+}
+
+test "the store decides what a replacement is, not the backup" {
+    // NIP-01 breaks a created_at tie on the id, and the store implements it. The
+    // backup used to make its own call with `previous.created_at >= ev.created_at`
+    // and so skipped the copy for exactly the case where the store DID replace:
+    // equal stamps, lower id. Deciding after the store has spoken removes the
+    // second opinion entirely.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{89} ** 32);
+    main.setIdentityForTest([_]u8{89} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/tie.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Two events at the SAME second, differing only in content, so their ids
+    // differ and one of them is lexicographically lower.
+    const a_tags = [_]nostr.event.Tag{&.{ "r", "wss://aaa.example.com" }};
+    const b_tags = [_]nostr.event.Tag{&.{ "r", "wss://bbb.example.com" }};
+    const a = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &a_tags, "", null);
+    const b = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &b_tags, "", null);
+
+    // Ingest the one that will LOSE the tie first, so the other replaces it.
+    const first = if (std.mem.order(u8, &a.id, &b.id) == .lt) b else a;
+    const second = if (std.mem.order(u8, &a.id, &b.id) == .lt) a else b;
+    _ = try main.plazaIngestVerifiedForTest(arena, first, signer);
+    const result = try main.plazaIngestVerifiedForTest(arena, second, signer);
+    try testing.expectEqual(nostr.store.IngestResult.replaced, result);
+
+    // The store destroyed a version, so a copy of it exists.
+    const backup = main.ownListBackups(testing.allocator, 10002).?;
+    defer testing.allocator.free(backup);
+    const lost_url: []const u8 = if (std.mem.eql(u8, &first.id, &a.id)) "aaa.example.com" else "bbb.example.com";
+    try testing.expect(std.mem.indexOf(u8, backup, lost_url) != null);
 }
