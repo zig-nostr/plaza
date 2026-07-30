@@ -1090,6 +1090,18 @@ const rail_gap: f32 = 8;
 /// The scope title (13.5) and the mono metadata register (10.5), as multipliers
 /// of the 14.5 body, since the size enum only steps by one.
 const scope_title_scale: f32 = 13.5 / 14.5;
+// 11b's profile geometry.
+const profile_banner_height: f32 = 132;
+const profile_avatar_size: f32 = 72;
+/// How far the face rides up over the banner's lower edge.
+const profile_avatar_lift: f32 = 30;
+const profile_name_scale: f32 = 19.0 / 14.5;
+const profile_bio_line_height: f32 = 22;
+const profile_links_height: f32 = 28;
+/// Everything in the person card that is not the banner or the wrapping bio.
+const profile_card_chrome: f32 = 190;
+/// One quiet line, the height of a short row.
+const quiet_row_extent: f32 = 56;
 // 11c's Settings geometry: a 440 column, a 38px header band, and the section
 // rhythm (16 between sections, 8 from a label to its card).
 const settings_column_width: f32 = 440;
@@ -1250,17 +1262,44 @@ pub const engagement_row_height: f32 = 18.125;
 /// redesign's own number, so the estimate cannot drift from the layout.
 pub const feed_row_chrome: f32 = row_pad_top + avatar_size + 5 + 10 + engagement_row_height + row_pad_bottom + 1;
 
-pub const max_avatar_images = 10;
+pub const max_avatar_images = 9;
 const max_media_images = 6;
+/// The profile banner's own id, taken out of the avatar pool rather than
+/// borrowed from either LRU.
+///
+/// The block above argues for ONE allocator over all sixteen slots, and that is
+/// still the right end state. It is not this change. A banner is one image on a
+/// screen that occludes the feed: it never scrolls, never competes with a second
+/// banner, and is overwritten in place when the reader walks to another person.
+/// A reserved id therefore needs no eviction pass at all, and cannot take a
+/// picture the feed is using in ANY navigation order, which is exactly what
+/// borrowing from the media LRU could do. Unifying here would still be writing
+/// the allocator against imagined callers; a single non-scrolling consumer does
+/// not exercise one.
+///
+/// The cost is one avatar id, and it is not observable: ids are lent only to the
+/// visible window, and a 540pt window holds four or five rows, so the tenth id
+/// only ever lengthened the LRU tail. A reclaimed avatar returns from the disk
+/// cache, not the network.
+const banner_image_id: u64 = max_avatar_images + 1;
 comptime {
     // The split may never promise more ids than the registry owns: overshooting
     // shows up as a silent `error.ImageRegistryFull` at the 17th registration,
     // which reads as "this author has no avatar" rather than as a budget bug.
-    if (max_avatar_images + max_media_images > image_registry_slots) {
+    if (max_avatar_images + 1 + max_media_images > image_registry_slots) {
         @compileError("the image budget oversubscribes the canvas registry");
     }
 }
-const media_image_id_base: u64 = max_avatar_images + 1;
+const media_image_id_base: u64 = banner_image_id + 1;
+/// What a banner is asked for and bounded to.
+///
+/// 512 and not a pixel more: `decodeAndRegister` scales the LONG edge to this,
+/// so the worst case it can produce is `max_dim` squared, and 512x512x4 is
+/// exactly the registry's 1 MiB ceiling. A larger number here would refuse
+/// every banner a reader happens to have uploaded square. The band draws 660x132,
+/// so this is about 1.7x on the long edge, which is the honest ceiling: 2x would
+/// be 1320x264 and 1.33x over the cap.
+const banner_target_px: u32 = 512;
 // What each image is requested at. Avatars draw at 40pt, so asking for more
 // than a couple of hundred pixels is pure waste. Feed images are bounded as a
 // BOX, not just a width: the registry's budget is 1 MiB of decoded pixels, so a
@@ -2663,6 +2702,14 @@ fn scanLinkFetches(fx: *Effects, model: *const Model) void {
     if (!g_media_previews) return;
     g_link_clock += 1;
     var fired: usize = 0;
+    if (model.viewing_profile != null) {
+        // A person's page occludes the feed. Without this branch the hidden
+        // feed keeps reaching out to hosts nobody is looking at, and the page
+        // that IS being read gets no link cards at all.
+        const shown = @min(model.thread_notes_len, thread_link_scan_cap);
+        for (model.thread_notes[0..shown]) |*note| fireLink(fx, note, &fired);
+        return;
+    }
     if (model.viewing_thread != 0) {
         // The note being read, and the first screenful under it. Walking the
         // whole conversation would reach out to every host linked anywhere in
@@ -3951,8 +3998,14 @@ pub const Model = struct {
     // The back-stack of thread roots: opening a reply as a sub-thread pushes the
     // current root, so Back returns to it, and only the last Back returns to the
     // feed.
-    thread_stack: [thread_depth_max]Note = [_]Note{.{}} ** thread_depth_max,
+    thread_stack: [thread_depth_max]Screen = [_]Screen{.{}} ** thread_depth_max,
     thread_stack_len: usize = 0,
+    /// Whose profile the CURRENT level shows, when it shows one. A thread and a
+    /// profile are the same kind of thing to the back stack, so Back walks out
+    /// of either without knowing which it is leaving.
+    viewing_profile: ?[32]u8 = null,
+    /// Which of the profile's tabs is showing.
+    profile_tab: ProfileTab = .notes,
     // Whether the first reply fetch is still out with nothing in hand, so the
     // thread shows skeleton rows rather than looking empty under the root.
     thread_loading: bool = false,
@@ -4357,7 +4410,11 @@ pub const Model = struct {
         for (self.notes[0..self.notes_len]) |*note| {
             if (note.id == note_id) return note;
         }
-        if (self.viewing_thread != 0) {
+        // A profile's rows live in the same buffer, so they resolve the same way.
+        // Without this every press on a profile row (open, like, expand a
+        // picture) is a silent no-op, which is worse than an inert control
+        // because it looks live.
+        if (self.viewing_thread != 0 or self.viewing_profile != null) {
             if (self.thread_root.id == note_id) return &self.thread_root;
             for (self.thread_notes[0..self.thread_notes_len]) |*note| {
                 if (note.id == note_id) return note;
@@ -4377,6 +4434,49 @@ pub const Model = struct {
     /// e-tags the root, oldest first, into the `thread_notes` cache. Local-first,
     /// the same path the feed uses; cheap enough to run each tick so
     /// late-arriving replies appear and relative times stay fresh.
+    /// The open profile's notes, newest first, read from the local store. The
+    /// same shape as the thread's refresh: the store is the app, so the screen
+    /// fills from disk before any relay answers and the backfill only widens it.
+    fn refreshProfileNotes(self: *Model, now_s: i64) void {
+        const pk = self.viewing_profile orelse return;
+        const store = g_store orelse return;
+        const kinds = [_]u16{1};
+        const authors = [_][32]u8{pk};
+        var result = store.query(std.heap.page_allocator, .{
+            .authors = &authors,
+            .kinds = &kinds,
+            .limit = thread_reply_cap,
+        }) catch return;
+        defer result.deinit();
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= self.thread_notes.len) break;
+            self.thread_notes[n] = noteFrom(ev, now_s);
+            n += 1;
+        }
+        self.thread_notes_len = n;
+    }
+
+    /// Which of the profile's two tabs a note belongs to. "Notes" is what they
+    /// wrote; "Replies" is what they wrote at somebody. A tab that mixed them
+    /// would be a tab that lies about what it holds.
+    pub fn profileNotesFor(self: *const Model, out: []usize, pubkey: [32]u8) []const usize {
+        var n: usize = 0;
+        // Only THIS person's notes. `thread_notes` is one buffer shared with the
+        // thread screen, so a stacked level that is not the one being read holds
+        // somebody else's rows, and counting those would give the retained list
+        // a length that does not match what it draws.
+        for (self.thread_notes[0..self.thread_notes_len], 0..) |note, i| {
+            if (n >= out.len) break;
+            if (!std.mem.eql(u8, &note.pubkey, &pubkey)) continue;
+            const is_reply = note.has_reply_parent;
+            if ((self.profile_tab == .replies) != is_reply) continue;
+            out[n] = i;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     fn refreshThreadNotes(self: *Model, now_s: i64) void {
         if (self.viewing_thread == 0) return;
         const store = g_store orelse return;
@@ -4668,7 +4768,13 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         }
     }.f;
     if (activePubkey()) |pk| push(&onscreen, &n, pk);
-    if (model.viewing_thread != 0) {
+    if (model.viewing_profile) |pk| {
+        // A profile occludes the feed too, and its subject owns an id first:
+        // the 72px face is the largest thing on the screen and falling back to
+        // initials there reads as a broken page rather than a loading one.
+        push(&onscreen, &n, pk);
+        for (model.thread_notes[0..model.thread_notes_len]) |*note| push(&onscreen, &n, note.pubkey);
+    } else if (model.viewing_thread != 0) {
         // A thread occludes the feed, so its authors own the ids while it is up.
         push(&onscreen, &n, model.thread_root.pubkey);
         for (model.thread_notes[0..model.thread_notes_len]) |*note| push(&onscreen, &n, note.pubkey);
@@ -5259,6 +5365,22 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     var fired: usize = 0;
     g_media_clock += 1;
 
+    if (model.viewing_profile) |pk| {
+        // A profile occludes the feed the same way a thread does, and needs the
+        // same branch for the same reason. Without it BOTH passes fall through
+        // to the feed, which is still built (so its rows are still marked
+        // wanted every tick), leaving no slot the claim pass may lend: the
+        // profile's own pictures would deterministically never load.
+        //
+        // Only the tab that is SHOWING. Half these notes are behind the other
+        // tab, and spending the picture budget on rows nobody is looking at is
+        // how the visible ones end up as empty boxes.
+        var indices: [thread_reply_cap]usize = undefined;
+        const shown = model.profileNotesFor(&indices, pk);
+        for (shown) |i| markMediaWanted(model.thread_notes[i].id);
+        for (shown) |i| fireMedia(fx, &model.thread_notes[i], &fired, per_tick);
+        return;
+    }
     if (model.viewing_thread != 0) {
         // Mark, then fetch: marking every thread picture wanted first means the
         // claim pass can only evict the (now hidden) feed's slots, never a
@@ -6231,6 +6353,12 @@ pub const Msg = union(enum) {
     toggle_note_menu,
     close_note_menu,
     follow_author: u8,
+    /// Opens a person as a level of their own.
+    open_person: [32]u8,
+    /// Follow or unfollow the person whose profile is open: 1 follow, 2 unfollow.
+    follow_person: u8,
+    /// Which of a profile's two tabs: 0 notes, 1 replies.
+    profile_tab: u8,
     /// Opens the Edit profile sheet, and the three fields in it.
     open_profile_edit,
     close_profile_edit,
@@ -6309,6 +6437,7 @@ pub const Msg = union(enum) {
     helper_signed: native_sdk.EffectResponse,
     /// An avatar fetch finished: register the image or fall back to initials.
     avatar_fetched: native_sdk.EffectResponse,
+    banner_fetched: native_sdk.EffectResponse,
     /// A media fetch finished: decode, downscale if needed, and register it.
     media_fetched: native_sdk.EffectResponse,
     /// A NIP-05 well-known lookup finished: mark the author verified on a match.
@@ -6356,7 +6485,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -8034,9 +8163,9 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     // Back names WHERE it goes, never a bare "Thread" beside the "Thread" title:
     // the feed ("Following") at the root, else the parent post's author.
     const back_label = if (model.thread_stack_len > 0)
-        model.thread_stack[model.thread_stack_len - 1].author()
+        model.thread_stack[model.thread_stack_len - 1].backLabel()
     else
-        "Following";
+        model.scope_name();
     const count = model.threadReplyCount();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
@@ -8319,6 +8448,41 @@ pub fn followSetForTest() []const [32]u8 {
     return followSet();
 }
 
+/// A profile's two tabs. "Notes" is what they wrote; "Replies" is what they
+/// wrote at somebody else.
+pub const ProfileTab = enum { notes, replies };
+
+/// One level of the back stack: a thread, or a person.
+///
+/// Both are levels rather than layers because the SDK tracks at most 8 virtual
+/// windows per build and an OCCLUDED level still registers one: the feed plus
+/// six stacked levels plus the current is already exactly eight. A profile that
+/// layered ON TOP of a full thread stack would be a ninth window, silently
+/// dropped in a release build. Sharing the depth budget is what keeps that
+/// impossible rather than merely unlikely.
+pub const Screen = struct {
+    /// The thread's root note. Unused when this level is a profile.
+    note: Note = .{},
+    /// Whose profile this level shows, when it is one.
+    profile: ?[32]u8 = null,
+
+    pub fn isProfile(self: Screen) bool {
+        return self.profile != null;
+    }
+
+    /// What Back says it goes to: a person's name, or the author of the note
+    /// underneath. Back names WHERE it lands, never what it leaves.
+    pub fn backLabel(self: *const Screen) []const u8 {
+        if (self.profile) |pk| {
+            if (lookupProfile(pk)) |prof| {
+                if (prof.name_len > 0) return prof.name();
+            }
+            return "Profile";
+        }
+        return self.note.author();
+    }
+};
+
 /// The two tiers of a thread's replies, in their original order.
 pub const GraphSplit = struct { inside: []const ThreadBlock, outside: []const ThreadBlock };
 
@@ -8445,6 +8609,11 @@ pub fn followGeneration() u32 {
 /// slice the feed reads: offering to follow somebody already followed, and then
 /// doing nothing when pressed, is worse than not offering at all.
 pub fn isFollowing(pubkey: [32]u8) bool {
+    // A guest follows nobody. The starter pack is what the app READS on their
+    // behalf, not a list they chose, and showing "Following" on nine strangers
+    // to somebody with no key contradicts the note menu, which offers them
+    // Follow for the same person in the same moment.
+    if (activePubkey() == null) return false;
     lockFollows();
     defer unlockFollows();
     if (!followsAreOwned()) {
@@ -9513,6 +9682,711 @@ fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
 /// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
 /// top root in place, the new level gets a fresh key and opens at the top rather
 /// than inheriting the dropped thread's offset).
+/// The band, drawn from the registered image. `cover` so a wide picture fills
+/// the strip rather than letterboxing inside it.
+fn bannerImage(ui: *AppUi) AppUi.Node {
+    var node = ui.image(.{
+        .image = banner_image_id,
+        .height = profile_banner_height,
+        .grow = 1,
+        .semantics = .{ .label = "Profile banner" },
+    });
+    node.widget.image_fit = .cover;
+    return node;
+}
+
+/// The banner currently registered, and for whom. One at a time, because one
+/// screen shows one.
+var g_banner_for: ?[32]u8 = null;
+/// Who the in-flight fetch was started for, which is not always who is on
+/// screen by the time it lands.
+var g_banner_asked_for: ?[32]u8 = null;
+var g_banner_state: enum { idle, fetching, loaded, failed } = .idle;
+var g_banner_url_buf: [1024]u8 = undefined;
+var g_banner_url_len: u16 = 0;
+
+fn bannerUrl() []const u8 {
+    return g_banner_url_buf[0..g_banner_url_len];
+}
+
+/// Whether a banner is registered for `pubkey` right now.
+fn bannerReady(pubkey: [32]u8) bool {
+    const who = g_banner_for orelse return false;
+    return g_banner_state == .loaded and std.mem.eql(u8, &who, &pubkey);
+}
+
+/// Asks for the open profile's banner, once per person.
+fn scanBannerFetch(fx: *Effects, model: *const Model) void {
+    const pubkey = model.viewing_profile orelse {
+        // Left the screen: the next person starts clean.
+        g_banner_for = null;
+        g_banner_state = .idle;
+        return;
+    };
+    if (!g_media_previews) return;
+    const changed = if (g_banner_for) |who| !std.mem.eql(u8, &who, &pubkey) else true;
+    if (changed) {
+        g_banner_for = pubkey;
+        g_banner_state = .idle;
+        g_banner_url_len = 0;
+    }
+    if (g_banner_state != .idle) return;
+
+    const raw = personBanner(pubkey);
+    if (raw.len == 0) return;
+    var url_buf: [1024]u8 = undefined;
+    const url = mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const n = @min(url.len, g_banner_url_buf.len);
+    @memcpy(g_banner_url_buf[0..n], url[0..n]);
+    g_banner_url_len = @intCast(n);
+
+    if (loadCachedImage(fx, banner_image_id, bannerUrl(), banner_target_px)) |_| {
+        g_banner_state = .loaded;
+        return;
+    }
+    g_banner_state = .fetching;
+    g_banner_asked_for = pubkey;
+    fx.fetch(.{
+        .key = banner_fetch_key,
+        .url = bannerUrl(),
+        .on_response = Effects.responseMsg(.banner_fetched),
+    });
+}
+
+/// Deliberately not 4000: that is `link_fetch_key_base + 0`, and the runtime
+/// rejects a second fetch under a key already in flight, so a banner and the
+/// first link preview would refuse each other.
+const banner_fetch_key: u64 = 5000;
+
+fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key != banner_fetch_key) return;
+    // WHOSE banner this is. A fetch takes as long as it takes, and the reader
+    // may have walked to somebody else meanwhile: without this the bytes paint
+    // over the person now on screen AND are cached under their URL, so the wrong
+    // face persists across restarts.
+    const asked_for = g_banner_asked_for orelse return;
+    const showing = g_banner_for orelse return;
+    if (!std.mem.eql(u8, &asked_for, &showing)) {
+        g_banner_state = .idle;
+        return;
+    }
+    // Every effect slot was busy: ask again next tick.
+    if (response.outcome == .rejected) {
+        g_banner_state = .idle;
+        return;
+    }
+    // Anything but a clean, whole, OK image body leaves the flat band, which is
+    // a perfectly good banner.
+    if (response.outcome != .ok or response.status != 200 or response.truncated or
+        response.body.len == 0 or response.body.len > max_image_bytes)
+    {
+        g_banner_state = .failed;
+        return;
+    }
+    if (decodeAndRegister(fx, banner_image_id, response.body, banner_target_px)) |_| {
+        g_banner_state = .loaded;
+        storeCachedImage(bannerUrl(), response.body);
+    } else {
+        g_banner_state = .failed;
+    }
+}
+
+// ----------------------------------------------------------------- a person
+//
+// Everything the profile screen needs about somebody, read from the RAW kind:0
+// rather than the name-and-face cache. The cache models four fields and drops
+// the rest, which is right for a feed row and useless here: a profile is mostly
+// the fields it does not keep.
+//
+// Cached per pubkey for the life of a level, because a virtual list rebuilds its
+// visible rows every frame and a JSON parse per frame is not free.
+
+const PersonCard = struct {
+    used: bool = false,
+    pubkey: [32]u8 = [_]u8{0} ** 32,
+    /// The kind:0 these fields came from, so an unchanged event is parsed once.
+    meta_id: [32]u8 = [_]u8{0} ** 32,
+    /// The store's event count when this card was last filled. The store only
+    /// grows, so an unchanged count means nothing this card reads can have
+    /// changed either.
+    stamp: usize = std.math.maxInt(usize),
+    about_buf: [512]u8 = [_]u8{0} ** 512,
+    about_len: u16 = 0,
+    website_buf: [128]u8 = [_]u8{0} ** 128,
+    website_len: u8 = 0,
+    lud16_buf: [128]u8 = [_]u8{0} ** 128,
+    lud16_len: u8 = 0,
+    banner_buf: [256]u8 = [_]u8{0} ** 256,
+    banner_len: u16 = 0,
+    /// How many their own contact list names, or null when none has arrived.
+    following: ?usize = null,
+    /// Whether their contact list names the reader.
+    follows_me: bool = false,
+};
+
+/// One card per stack level, plus the one being looked at.
+var g_person_cards = [_]PersonCard{.{}} ** (thread_depth_max + 2);
+
+/// The card for `pubkey`, filled from the store when it is stale.
+fn personCard(pubkey: [32]u8) *const PersonCard {
+    var slot: ?*PersonCard = null;
+    for (&g_person_cards) |*c| {
+        if (c.used and std.mem.eql(u8, &c.pubkey, &pubkey)) {
+            slot = c;
+            break;
+        }
+    }
+    if (slot == null) {
+        // Oldest wins the seat: the levels below are what a reader walks back
+        // through, so evicting the least recently looked at is wrong here.
+        for (&g_person_cards) |*c| {
+            if (!c.used) {
+                slot = c;
+                break;
+            }
+        }
+        if (slot == null) slot = &g_person_cards[0];
+        slot.?.* = .{ .used = true, .pubkey = pubkey };
+    }
+    const card = slot.?;
+    // Only when the store has actually moved. This is called several times per
+    // frame (once per field the header shows) and each refresh ran two LMDB
+    // queries and deep-copied the subject's whole contact list, which for
+    // somebody with two thousand follows is a few hundred allocations per field
+    // per frame.
+    const stamp = if (g_store) |store| store.eventCount() catch 0 else 0;
+    if (card.stamp != stamp) {
+        card.stamp = stamp;
+        refreshPersonCard(card);
+    }
+    return card;
+}
+
+fn refreshPersonCard(card: *PersonCard) void {
+    const gpa = std.heap.page_allocator;
+    if (readRecord(gpa, card.pubkey, 0)) |own| {
+        defer freeOwnProfile(gpa, own);
+        if (!std.mem.eql(u8, &card.meta_id, &own.id)) {
+            card.meta_id = own.id;
+            parsePersonMetadata(card, own.json);
+        }
+    }
+    // Their contact list: how many they follow, and whether the reader is in it.
+    if (readRecord(gpa, card.pubkey, contact_list_kind)) |own| {
+        defer freeOwnProfile(gpa, own);
+        var mine = false;
+        const me = activePubkey();
+        for (own.tags) |tag| {
+            if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
+            if (tag[1].len != 64) continue;
+            if (me) |pk| {
+                var hex: [64]u8 = undefined;
+                hexLower(&hex, pk);
+                if (std.ascii.eqlIgnoreCase(tag[1], &hex)) mine = true;
+            }
+        }
+        // DISTINCT people. Some clients emit the same person twice, and this
+        // file already has one function that knows that; counting raw tags here
+        // would print a follow count nobody else shows.
+        card.following = countPeople(own.tags);
+        card.follows_me = mine;
+    } else {
+        card.following = null;
+        card.follows_me = false;
+    }
+}
+
+fn parsePersonMetadata(card: *PersonCard, json: []const u8) void {
+    card.about_len = 0;
+    card.website_len = 0;
+    card.lud16_len = 0;
+    card.banner_len = 0;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch return;
+    if (root != .object) return;
+    const obj = root.object;
+    if (stringField(obj, "about")) |v| {
+        const n = utf8SafeLen(v, card.about_buf.len);
+        @memcpy(card.about_buf[0..n], v[0..n]);
+        card.about_len = @intCast(n);
+    }
+    if (stringField(obj, "website")) |v| {
+        if (v.len <= card.website_buf.len) {
+            @memcpy(card.website_buf[0..v.len], v);
+            card.website_len = @intCast(v.len);
+        }
+    }
+    if (stringField(obj, "lud16")) |v| {
+        if (v.len <= card.lud16_buf.len) {
+            @memcpy(card.lud16_buf[0..v.len], v);
+            card.lud16_len = @intCast(v.len);
+        }
+    }
+    if (stringField(obj, "banner")) |v| {
+        // https only, and only what fits: a banner is a picture fetched
+        // unattended from a host the subject named, so it goes through the same
+        // gate every other unattended fetch does.
+        if (v.len <= card.banner_buf.len and std.mem.startsWith(u8, v, "https://")) {
+            @memcpy(card.banner_buf[0..v.len], v);
+            card.banner_len = @intCast(v.len);
+        }
+    }
+}
+
+pub fn personBanner(pubkey: [32]u8) []const u8 {
+    const c = personCard(pubkey);
+    return c.banner_buf[0..c.banner_len];
+}
+
+/// Any pubkey's newest event of `kind`, raw. `ownRecordJson` is this for the
+/// reader themselves; a profile needs it for somebody else.
+fn readRecord(gpa: std.mem.Allocator, pubkey: [32]u8, kind: u16) ?OwnProfile {
+    const store = g_store orelse return null;
+    const kinds = [_]u16{kind};
+    const authors = [_][32]u8{pubkey};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return null;
+    defer result.deinit();
+    if (result.events.len == 0) return null;
+    const copy = gpa.dupe(u8, result.events[0].content) catch return null;
+    const tags = dupeTags(gpa, result.events[0].tags);
+    return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
+}
+
+pub fn personAbout(pubkey: [32]u8) []const u8 {
+    const c = personCard(pubkey);
+    return c.about_buf[0..c.about_len];
+}
+
+pub fn personWebsite(pubkey: [32]u8) []const u8 {
+    const c = personCard(pubkey);
+    return c.website_buf[0..c.website_len];
+}
+
+pub fn personLud16(pubkey: [32]u8) []const u8 {
+    const c = personCard(pubkey);
+    return c.lud16_buf[0..c.lud16_len];
+}
+
+/// How many people they follow, or null when their list has not arrived. Null is
+/// not zero, and the screen says so rather than printing a confident 0.
+pub fn personFollowingCount(pubkey: [32]u8) ?usize {
+    return personCard(pubkey).following;
+}
+
+/// Whether their contact list names the reader.
+pub fn followsMe(pubkey: [32]u8) bool {
+    if (activePubkey() == null) return false;
+    return personCard(pubkey).follows_me;
+}
+
+/// Their display name, or a short npub until a kind:0 arrives. Never blank: a
+/// nameless header reads as a broken screen rather than an unfetched one.
+fn personName(ui: *AppUi, pubkey: [32]u8) []const u8 {
+    if (lookupProfile(pubkey)) |prof| {
+        if (prof.name_len > 0) return prof.name();
+    }
+    return personNpubShort(ui, pubkey);
+}
+
+fn personNpubShort(ui: *AppUi, pubkey: [32]u8) []const u8 {
+    const encoded = nostr.nip19.encodeNpub(ui.arena, pubkey) catch return "npub…";
+    if (encoded.len < 20) return encoded;
+    return ui.fmt("{s}…{s}", .{ encoded[0..10], encoded[encoded.len - 5 ..] });
+}
+
+/// The verified check, drawn only when their NIP-05 actually resolves to them.
+fn personCheck(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
+    const prof = lookupProfile(pubkey) orelse return ui.spacer(0);
+    if (prof.nip05_state != .verified) return ui.spacer(0);
+    return ui.icon(.{ .width = 14, .height = 14, .style = .{ .foreground = theme.palette.status_success } }, "check");
+}
+
+/// Their face at a stated size.
+fn personAvatar(ui: *AppUi, pubkey: [32]u8, size: f32) AppUi.Node {
+    const tint = avatarTint(pubkey);
+    const hexdigits = "0123456789abcdef";
+    return ui.avatar(.{
+        .width = size,
+        .height = size,
+        .image = if (lookupProfile(pubkey)) |prof| prof.image_id else 0,
+        .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 3 },
+    }, ui.fmt("{c}{c}", .{ hexdigits[pubkey[0] >> 4], hexdigits[pubkey[0] & 0x0f] }));
+}
+
+/// The 44px band above a person: Back, and who this is.
+fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const back_label = if (model.thread_stack_len > 0)
+        model.thread_stack[model.thread_stack_len - 1].backLabel()
+    else
+        model.scope_name();
+    return ui.column(.{}, .{
+        ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
+            ui.el(.data_row, .{ .on_press = Msg.close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
+                ui.row(.{ .cross = .center, .gap = 3 }, .{
+                    ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, back_label),
+                }),
+            }),
+            ui.spacer(1),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = personName(ui, pubkey), .weight = .medium, .scale = menu_scale }},
+            ),
+            ui.spacer(1),
+            hgap(ui, 48),
+        }),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
+    });
+}
+
+/// How tall the person card is. Measured, not guessed: a bio wraps and a links
+/// row may be absent, and a virtual list that mis-measures its first row scrolls
+/// to the wrong place for every row after it.
+fn profileCardExtent(rows: *const ProfileRows) f32 {
+    var h: f32 = profile_banner_height + profile_card_chrome;
+    const about = personAbout(rows.pubkey);
+    if (about.len > 0) {
+        // Roughly 62 characters to a line at the body scale, over the 660 column.
+        const lines: f32 = @floatFromInt(1 + about.len / 62);
+        h += lines * profile_bio_line_height + 9;
+    }
+    if (personWebsite(rows.pubkey).len > 0 or personLud16(rows.pubkey).len > 0) h += profile_links_height;
+    return h;
+}
+
+/// The person: their banner, their face, what they say about themselves, and
+/// what this app can honestly tell the reader about them.
+fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const about = personAbout(pubkey);
+    const website = personWebsite(pubkey);
+    const lud16 = personLud16(pubkey);
+    const is_me = if (activePubkey()) |me| std.mem.eql(u8, &me, &pubkey) else false;
+
+    return ui.column(.{ .gap = 0 }, .{
+        // The banner, with the face riding up over its lower edge. There is no
+        // negative margin on this engine, so the two are STACKED: one child is
+        // the banner plus the disc's overhang, the other is that same height
+        // made of a gap and then the disc. Equal heights, so the stack is
+        // exactly as tall as the band plus what hangs below it, and the name
+        // row after it starts clear of both.
+        ui.stack(.{}, .{
+            ui.column(.{ .gap = 0 }, .{
+                // A flat band until an image is afforded: an empty box that
+                // holds its height beats a jump when one arrives.
+                if (bannerReady(pubkey))
+                    bannerImage(ui)
+                else
+                    ui.el(.panel, .{
+                        .height = profile_banner_height,
+                        .padding = 0.01,
+                        .style = .{ .background = p.surface_stripe_a, .border = p.surface_stripe_a, .radius = 0, .stroke_width = 0 },
+                    }, .{}),
+                vgap(ui, profile_avatar_size - profile_avatar_lift),
+            }),
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, profile_banner_height - profile_avatar_lift),
+                // Bottom-aligned, not top. The disc is the tallest thing here
+                // and it deliberately overhangs the banner, so aligning the
+                // cluster to the TOP of this row put it ON the band, over the
+                // subject's own picture. Against the bottom it lands in the
+                // overhang, clear of the banner and level with the face.
+                ui.row(.{ .cross = .end, .gap = 0 }, .{
+                    hgap(ui, 20),
+                    personAvatar(ui, pubkey, profile_avatar_size),
+                    ui.spacer(1),
+                    profileActions(ui, model, pubkey, is_me),
+                    hgap(ui, 20),
+                }),
+            }),
+        }),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 20),
+            ui.column(.{ .gap = 0, .grow = 1 }, .{
+                vgap(ui, 8),
+                ui.row(.{ .cross = .center, .gap = 7 }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_primary } },
+                        &.{.{ .text = personName(ui, pubkey), .weight = .bold, .scale = profile_name_scale }},
+                    ),
+                    personCheck(ui, pubkey),
+                }),
+                vgap(ui, 5),
+                ui.row(.{ .cross = .center, .gap = 8 }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
+                    ),
+                    if (followsMe(pubkey))
+                        ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
+                    else
+                        ui.spacer(0),
+                }),
+                if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
+                if (about.len > 0)
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = p.text_body_soft } },
+                        &.{.{ .text = about, .scale = nested_body_scale }},
+                    )
+                else
+                    ui.spacer(0),
+                if (website.len > 0 or lud16.len > 0) profileLinks(ui, website, lud16) else ui.spacer(0),
+                vgap(ui, 9),
+                profileCounts(ui, pubkey),
+                if (!is_me and followBlockedReason() != null)
+                    ui.column(.{ .gap = 0 }, .{
+                        vgap(ui, 7),
+                        ui.paragraph(
+                            .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
+                            &.{.{ .text = "Still reading your own follow list. Following is off until it arrives, because writing before then would replace it.", .scale = mono_hint_scale }},
+                        ),
+                    })
+                else
+                    ui.spacer(0),
+                vgap(ui, 14),
+                profileTabs(ui, model),
+            }),
+            hgap(ui, 20),
+        }),
+    });
+}
+
+/// The action cluster: zap (inert), the overflow menu, and Follow.
+fn profileActions(ui: *AppUi, model: *const Model, pubkey: [32]u8, is_me: bool) AppUi.Node {
+    _ = model;
+    if (is_me) {
+        const p = theme.palette;
+        // Your own page. Editing lives in Settings, and a second door to it here
+        // would be a second thing to keep true.
+        return ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "This is you", .scale = meta_scale }});
+    }
+    const following = isFollowing(pubkey);
+    return ui.row(.{ .cross = .center, .gap = 8 }, .{
+        // Disabled rather than absent while the app is still reading the
+        // reader's own list: a control that vanishes is a control they will
+        // wonder about, and one that silently no-ops is worse. The sentence
+        // explaining it sits under the counts, where there is room for it.
+        if (followBlockedReason() != null)
+            ui.button(.{ .size = .sm, .variant = .primary, .disabled = true, .on_press = Msg{ .follow_person = 1 } }, "Follow")
+        else if (following)
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .follow_person = 2 } }, "Following")
+        else
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .follow_person = 1 } }, "Follow"),
+    });
+}
+
+/// Where they point people, when they point anywhere.
+fn profileLinks(ui: *AppUi, website: []const u8, lud16: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .cross = .center, .gap = 14 }, .{
+            if (website.len > 0)
+                ui.paragraph(.{ .style = .{ .foreground = p.accent_identity } }, &.{.{ .text = website, .scale = meta_scale }})
+            else
+                ui.spacer(0),
+            if (lud16.len > 0)
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = lud16, .monospace = true, .scale = mono_hint_scale }})
+            else
+                ui.spacer(0),
+            ui.spacer(1),
+        }),
+    });
+}
+
+/// What this app can honestly count.
+///
+/// Following is theirs to state: it is the length of their own contact list.
+/// FOLLOWERS is not. Nothing in a local store can know who follows somebody,
+/// and the honest options are an indexer's number or none. This app does not
+/// state numbers it cannot verify, so it says nothing rather than a figure the
+/// reader would reasonably believe.
+fn profileCounts(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
+    const p = theme.palette;
+    const following = personFollowingCount(pubkey);
+    return ui.row(.{ .cross = .center, .gap = 16 }, .{
+        if (following) |n|
+            ui.row(.{ .cross = .center, .gap = 5 }, .{
+                ui.paragraph(.{ .style = .{ .foreground = p.text_body_strong } }, &.{.{ .text = ui.fmt("{d}", .{n}), .weight = .medium, .scale = menu_scale }}),
+                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "following", .scale = menu_scale }}),
+            })
+        else
+            ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = "Their follow list has not arrived yet", .scale = mono_hint_scale }}),
+        ui.spacer(1),
+    });
+}
+
+/// Notes, or replies. Two tabs that mean exactly what they say.
+fn profileTabs(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.row(.{ .cross = .center, .gap = 6 }, .{
+        profileTab(ui, "Notes", model.profile_tab == .notes, Msg{ .profile_tab = 0 }),
+        profileTab(ui, "Replies", model.profile_tab == .replies, Msg{ .profile_tab = 1 }),
+        ui.spacer(1),
+    });
+}
+
+fn profileTab(ui: *AppUi, label: []const u8, active: bool, msg: Msg) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.list_item, .{
+        .padding = 0.01,
+        .height = 26,
+        .cross = .center,
+        .on_press = msg,
+        .style = .{
+            .background = if (active) p.surface_settings_card else p.surface_window,
+            .border = if (active) p.border_chip else p.surface_window,
+            .radius = 8,
+            .stroke_width = 1,
+        },
+        .semantics = .{ .role = .tab, .label = label, .focusable = true },
+    }, .{
+        hgap(ui, 11),
+        ui.paragraph(
+            .{ .style = .{ .foreground = if (active) p.text_primary else p.text_muted_alt } },
+            &.{.{ .text = label, .weight = if (active) .medium else .regular, .scale = menu_scale }},
+        ),
+        hgap(ui, 11),
+    });
+}
+
+/// The quiet line under an empty tab.
+fn profileEmptyRow(ui: *AppUi, rows: *const ProfileRows) AppUi.Node {
+    const p = theme.palette;
+    const text: []const u8 = if (rows.loading)
+        "Looking for what they have written…"
+    else if (rows.model.profile_tab == .replies)
+        "Nothing they have written at anyone is here yet."
+    else
+        "Nothing they have written is here yet.";
+    return ui.row(.{ .cross = .center, .gap = 0, .height = quiet_row_extent }, .{
+        hgap(ui, 20),
+        ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_dim } }, &.{.{ .text = text, .scale = mono_hint_scale }}),
+        hgap(ui, 20),
+    });
+}
+
+/// A profile level's key, in the same space as a thread's so the two never
+/// collide when they sit in one stack. The top bit marks it a person.
+fn profileLevelKey(level: usize, pubkey: [32]u8) u64 {
+    const hi = @as(u64, level) << 59;
+    const lo = std.mem.readInt(u64, pubkey[0..8], .big) & ((@as(u64, 1) << 58) - 1);
+    return hi | lo | (@as(u64, 1) << 58);
+}
+
+/// What a profile level draws: the person, then what they have written.
+///
+/// One virtual list, with the whole profile header as row 0. The header is tall
+/// and variable (a bio wraps, a links row may be absent) and it scrolls away
+/// with the notes, which is what the design asks for and what a column above a
+/// list cannot do. This is the same heterogeneous-row shape the thread already
+/// uses for its ancestors.
+fn profilePanel(
+    ui: *AppUi,
+    model: *const Model,
+    pubkey: [32]u8,
+    notes: []const Note,
+    loading: bool,
+    level_key: u64,
+    level: usize,
+    occluded: bool,
+) AppUi.Node {
+    const rows_ctx = ui.arena.create(ProfileRows) catch return ui.column(.{}, .{});
+    // From the ARENA, never the stack. The SDK RETAINS `extent_context` and calls
+    // the estimator again in a post-layout measure pass, long after this function
+    // has returned: a slice of a local here is read back out of a reclaimed frame,
+    // and the index it yields then indexes `notes` with whatever layout left on
+    // that word. The arena survives to the top of the next build, which is
+    // exactly as long as the retained table needs it.
+    const indices = ui.arena.alloc(usize, thread_reply_cap) catch return ui.column(.{}, .{});
+    // An occluded level still reports its REAL row count: the retained list keeps
+    // its scroll offset from the count and the extents, so claiming two rows here
+    // would collapse the person's scroll and Back would land at the top.
+    const shown = model.profileNotesFor(indices, pubkey);
+    rows_ctx.* = .{
+        .model = model,
+        .pubkey = pubkey,
+        .notes = notes,
+        .shown = shown,
+        .loading = loading,
+    };
+    const options: AppUi.VirtualListOptions = .{
+        .id = ui.fmt("person-{d}", .{level_key}),
+        .item_count = rows_ctx.count(),
+        .item_extent = 0,
+        .extent_estimate = profileRowExtent,
+        .extent_context = rows_ctx,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 3,
+        .grow = 1,
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Profile" },
+    };
+    const window = ui.virtualWindow(options);
+    // An occluded level builds no rows, for the same reason a thread's does not:
+    // the offset survives on the list's id and its content height, and six built
+    // levels of anything cross the 1024-node ceiling that refuses a view whole.
+    const rows = if (occluded)
+        &[_]AppUi.Node{}
+    else blk: {
+        const built = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.column(.{}, .{});
+        for (built, 0..) |*row, offset| row.* = profileRowAt(ui, rows_ctx, window.start_index + offset);
+        break :blk built;
+    };
+    _ = level;
+    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        if (occluded) ui.spacer(0) else profileHeaderBand(ui, model, pubkey),
+        ui.virtualList(options, window, .{rows}),
+    });
+}
+
+/// The rows a profile level holds: the person, then their notes.
+const ProfileRows = struct {
+    model: *const Model,
+    pubkey: [32]u8,
+    notes: []const Note,
+    shown: []const usize,
+    loading: bool,
+
+    const Row = union(enum) { person, note: usize, empty };
+
+    fn count(self: *const ProfileRows) usize {
+        // The person, then a row per note, or one quiet line when there are none.
+        return 1 + if (self.shown.len == 0) @as(usize, 1) else self.shown.len;
+    }
+
+    fn rowAt(self: *const ProfileRows, index: usize) Row {
+        if (index == 0) return .person;
+        if (self.shown.len == 0) return .empty;
+        const i = index - 1;
+        if (i >= self.shown.len) return .empty;
+        return .{ .note = self.shown[i] };
+    }
+};
+
+fn profileRowExtent(context: ?*const anyopaque, index: u64) f32 {
+    const rows: *const ProfileRows = @ptrCast(@alignCast(context orelse return quiet_row_extent));
+    return switch (rows.rowAt(@intCast(index))) {
+        .person => profileCardExtent(rows),
+        .note => |ni| noteRowEstimate(&rows.notes[ni], feed_row_chrome),
+        .empty => quiet_row_extent,
+    };
+}
+
+fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
+    return switch (rows.rowAt(index)) {
+        .person => profileCard(ui, rows.model, rows.pubkey),
+        .note => |ni| noteCard(ui, &rows.notes[ni]),
+        .empty => profileEmptyRow(ui, rows),
+    };
+}
+
 fn threadLevelKey(level: usize, root_id: i64) u64 {
     const hi = @as(u64, level) << 59;
     const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
@@ -9528,15 +10402,27 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     // every level keeps its own scroll offset and Back never lands a parent
     // thread at the top.
     const feed = feedContent(ui, model);
-    const content = if (model.viewing_thread != 0) blk: {
-        // feed + one panel per level: the back-stacked ancestors (oldest first),
-        // then the current thread on top.
+    const content = if (model.viewing_thread != 0 or model.viewing_profile != null) blk: {
+        // feed + one panel per level: the back-stacked levels (oldest first),
+        // then the current one on top. A level is a thread or a person; both
+        // spend one virtual window either way, which is why they share a stack.
         const kids = ui.arena.alloc(AppUi.Node, 2 + model.thread_stack_len) catch break :blk feed;
         kids[0] = feed;
         for (0..model.thread_stack_len) |d| {
-            const root = &model.thread_stack[d];
+            const screen = &model.thread_stack[d];
+            if (screen.profile) |pk| {
+                const lk = profileLevelKey(d, pk);
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, pk, &.{}, false, lk, d, true));
+                continue;
+            }
+            const root = &screen.note;
             const lk = threadLevelKey(d, root.id);
             kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
+        }
+        if (model.viewing_profile) |pk| {
+            const lk = profileLevelKey(model.thread_stack_len, pk);
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, pk, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+            break :blk ui.stack(.{ .grow = 1 }, .{kids});
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
         kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
@@ -9674,23 +10560,38 @@ fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
     const press: Msg = if (guest) .open_join else .open_settings;
     return ui.el(.data_row, .{
         .on_press = press,
+        // The tile's own box, stated. Left unsized, this row measured ZERO wide
+        // (a `data_row` hugs its content and the seat inside it is centred, not
+        // stretched), so the account seat floated free of the rail's column
+        // while every glyph tile sat squarely in its 36. It was the one tile on
+        // the rail that did not line up.
+        .width = 36,
+        .height = 36,
+        .main = .center,
+        .cross = .center,
         .padding = 0,
         .style = .{ .quiet_hover = true },
         .semantics = .{ .label = "You" },
     }, .{
-        if (guest)
-            // The seat reads as an outline waiting to be filled, so its ring is
-            // dashed. The canvas has no dashed strokes, so the ring is an icon
-            // whose dashes are baked into its geometry, with the label stacked
-            // over it.
-            ui.stack(.{ .width = 28, .height = 28 }, .{
-                ui.appIcon(.{ .width = 28, .height = 28, .style = .{ .foreground = p.border_dashed } }, "dashed-ring"),
-                ui.column(.{ .width = 28, .height = 28, .main = .center, .cross = .center }, .{
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "you", .monospace = true, .scale = 8.5 / 14.5 }}),
-                }),
-            })
-        else
-            youAvatar(ui),
+        // The same 36x36 centring box every other rail tile uses. Without it the
+        // 28px seat sat at the row's natural position while the 36px glyph tiles
+        // sat centred in theirs, so the account avatar hung 4px off the rail's
+        // shared centre line: the one tile on the rail that did not line up.
+        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{
+            if (guest)
+                // The seat reads as an outline waiting to be filled, so its ring
+                // is dashed. The canvas has no dashed strokes, so the ring is an
+                // icon whose dashes are baked into its geometry, with the label
+                // stacked over it.
+                ui.stack(.{ .width = 28, .height = 28 }, .{
+                    ui.appIcon(.{ .width = 28, .height = 28, .style = .{ .foreground = p.border_dashed } }, "dashed-ring"),
+                    ui.column(.{ .width = 28, .height = 28, .main = .center, .cross = .center }, .{
+                        ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "you", .monospace = true, .scale = 8.5 / 14.5 }}),
+                    }),
+                })
+            else
+                youAvatar(ui),
+        }),
     });
 }
 
@@ -10510,7 +11411,21 @@ fn vgap(ui: *AppUi, size: f32) AppUi.Node {
 /// picture has been registered. The size is the redesign's, and it is what the
 /// identity block beside it is pinned to.
 fn noteAvatar(ui: *AppUi, note: *const Note) AppUi.Node {
-    return avatarDisc(ui, note, avatar_size);
+    // The face is the way to the person. An `avatar` is not a hit target, so the
+    // press needs a box around it, and that box is sized to the disc EXACTLY:
+    // the reply rail hangs on the disc's centre line, computed as
+    // `thread_inset + avatar_size / 2`, so a wrapper even a pixel wider moves
+    // the rail off the avatars it is supposed to connect.
+    return ui.el(.list_item, .{
+        .width = avatar_size,
+        .height = avatar_size,
+        .padding = 0.01,
+        .on_press = Msg{ .open_person = note.pubkey },
+        .style = .{ .radius = avatar_size / 2, .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+    }, .{
+        avatarDisc(ui, note, avatar_size),
+    });
 }
 
 /// The same disc at an explicit size, for the surfaces that draw a smaller or
@@ -11827,6 +12742,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
                 model.refreshThreadNotes(now);
+                // And the open person's notes, for the same reason and with the
+                // same consequence if it is missed: without this the backfill
+                // this screen fires never appears, and the quiet line saying
+                // they have written nothing stays up over a store that has
+                // since filled with their notes.
+                model.refreshProfileNotes(now);
+                if (model.viewing_profile != null) {
+                    model.thread_loading = model.thread_notes_len == 0 and
+                        g_thread_done_seq.load(.acquire) < model.thread_seq;
+                }
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
@@ -11871,6 +12796,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // in refresh). The feed reads loaded images at render time.
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
+                scanBannerFetch(fx, model);
                 scanMediaFetches(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
@@ -11918,6 +12844,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_setup => |response| handleHelperSetup(model, response),
         .helper_signed => |response| handleHelperSigned(response),
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
+        .banner_fetched => |response| handleBannerFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
             // Marked, not written: the tick flushes it. Saving on CLOSE alone
@@ -11958,6 +12885,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
+        .open_person => |pk| enterProfile(model, pk),
+        .follow_person => |direction| {
+            if (model.is_guest()) {
+                model.joining = true;
+                return;
+            }
+            const who = model.viewing_profile orelse return;
+            _ = writeFollow(fx, who, direction == 1);
+        },
+        .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_note_menu => model.note_menu = !model.note_menu,
         .close_note_menu => model.note_menu = false,
         .follow_author => |direction| {
@@ -12439,6 +13376,9 @@ const OwnProfile = struct {
     json: []u8,
     tags: []const nostr.event.Tag,
     created_at: i64,
+    /// The event these came from, so a caller can tell an unchanged record from
+    /// a new one without re-parsing it.
+    id: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// The reader's own newest kind:0, raw. The RAW content is the source of truth,
@@ -12466,7 +13406,7 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     // arena, and the write seam holds what it is given past this frame.
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
     const tags = dupeTags(gpa, result.events[0].tags);
-    return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at };
+    return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
 /// Frees what `ownProfileJson` handed back.
@@ -13675,10 +14615,8 @@ fn openThread(model: *Model, note_id: i64) void {
 /// the back-stack, snapshots the new root, and fires its reply fetch. Shared by
 /// open-a-feed-note, open-a-reply, and open-a-quoted-note.
 fn enterThread(model: *Model, root: Note) void {
-    if (model.viewing_thread != 0 and model.thread_stack_len < model.thread_stack.len) {
-        model.thread_stack[model.thread_stack_len] = model.thread_root;
-        model.thread_stack_len += 1;
-    }
+    pushCurrentScreen(model);
+    model.viewing_profile = null;
     model.viewing_thread = root.id;
     model.thread_root = root;
     model.thread_notes_len = 0;
@@ -13714,6 +14652,49 @@ pub fn closeThreadForTest(model: *Model) void {
     closeThread(model);
 }
 
+/// Pushes whatever level is open, so Back returns to it. A no-op at the feed,
+/// and a no-op at the depth cap, which is the same rule threads always had.
+fn pushCurrentScreen(model: *Model) void {
+    if (model.thread_stack_len >= model.thread_stack.len) return;
+    if (model.viewing_profile) |pk| {
+        model.thread_stack[model.thread_stack_len] = .{ .profile = pk };
+        model.thread_stack_len += 1;
+        return;
+    }
+    if (model.viewing_thread != 0) {
+        model.thread_stack[model.thread_stack_len] = .{ .note = model.thread_root };
+        model.thread_stack_len += 1;
+    }
+}
+
+/// Opens a person as a level of their own.
+fn enterProfile(model: *Model, pubkey: [32]u8) void {
+    // Already here. Pressing a face on somebody's own page would otherwise push
+    // a second copy of the same person and cost a Back to undo.
+    if (model.viewing_profile) |current| {
+        if (std.mem.eql(u8, &current, &pubkey)) return;
+    }
+    pushCurrentScreen(model);
+    model.viewing_profile = pubkey;
+    model.viewing_thread = 0;
+    model.thread_notes_len = 0;
+    model.note_menu = false;
+    model.reply_buffer.clear();
+    wantProfile(pubkey);
+    model.profile_tab = .notes;
+    const now = nowSeconds();
+    const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+    model.thread_seq = seq;
+    model.thread_open_at = now;
+    model.refreshProfileNotes(now);
+    model.thread_loading = model.thread_notes_len == 0;
+    fetchProfileNotes(pubkey, seq);
+}
+
+pub fn enterProfileForTest(model: *Model, pubkey: [32]u8) void {
+    enterProfile(model, pubkey);
+}
+
 /// Opens an event (by its full id) as a thread, reading it straight from the
 /// store. `openThread` cannot: it resolves the render key through the feed and
 /// the open thread, and a quoted note or an ANCESTOR is in neither. Both press
@@ -13737,20 +14718,31 @@ fn closeThread(model: *Model) void {
     model.thread_outside_open[model.currentLevel()] = false;
     model.reply_buffer.clear();
     model.thread_notes_len = 0;
+    model.note_menu = false;
     if (model.thread_stack_len > 0) {
         model.thread_stack_len -= 1;
         const prev = model.thread_stack[model.thread_stack_len];
-        model.viewing_thread = prev.id;
-        model.thread_root = prev;
         // Same ordering as `enterThread`, and for the same reason.
         const now = nowSeconds();
         const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
         model.thread_seq = seq;
         model.thread_open_at = now;
-        model.refreshThreadNotes(now);
-        model.thread_loading = model.thread_notes_len == 0;
-        fetchThreadReplies(prev.event_id, seq);
+        if (prev.profile) |pk| {
+            model.viewing_profile = pk;
+            model.viewing_thread = 0;
+            model.refreshProfileNotes(now);
+            model.thread_loading = model.thread_notes_len == 0;
+            fetchProfileNotes(pk, seq);
+        } else {
+            model.viewing_profile = null;
+            model.viewing_thread = prev.note.id;
+            model.thread_root = prev.note;
+            model.refreshThreadNotes(now);
+            model.thread_loading = model.thread_notes_len == 0;
+            fetchThreadReplies(prev.note.event_id, seq);
+        }
     } else {
+        model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
     }
@@ -13764,6 +14756,103 @@ fn closeThread(model: *Model) void {
 // empty thread stops loading, but a stale late worker never clears a new thread).
 var g_thread_seq = std.atomic.Value(u64).init(0);
 var g_thread_done_seq = std.atomic.Value(u64).init(0);
+
+/// Fetches a person's recent notes (and their engagement) into the store, on a
+/// detached thread. Mirrors the thread's two-phase backfill exactly: one dial per
+/// read relay, their kind:1s, then on EOSE a second subscription for what those
+/// notes collected, folding into the same engagement table the feed and threads
+/// use. Without the second phase every row on a profile shows zero counts.
+fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
+    if (g_store == null) {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, fetchProfileWorker, .{ pubkey, seq }) catch {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    defer g_thread_done_seq.store(seq, .release);
+
+    const kinds = [_]u16{1};
+    const authors = [_][32]u8{pubkey};
+    // Their profile too: the screen needs an about, a banner and a lud16, none
+    // of which the name-and-face cache models.
+    const meta_kinds = [_]u16{ 0, contact_list_kind };
+    const filters = [_]nostr.filter.Filter{
+        .{ .authors = &authors, .kinds = &kinds, .limit = thread_reply_cap },
+        .{ .authors = &authors, .kinds = &meta_kinds, .limit = 2 },
+    };
+
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        defer relay.deinit();
+        relay.subscribe("plaza-person", &filters) catch continue;
+
+        var ids: [engagement_watch_cap][64]u8 = undefined;
+        var watch: [engagement_watch_cap]i64 = undefined;
+        var watch_len: usize = 0;
+        var id_count: usize = 0;
+        var engagement_open = false;
+        var seen: usize = 0;
+        // Bounded, because `relay.receive()` has no deadline and a relay that
+        // accepts a subscription and then goes quiet would hold this thread for
+        // the life of the process.
+        while (seen < profile_fetch_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    // Phase 2's answers are REACTIONS, and a reaction that is
+                    // only stored changes no count on any row: the table the
+                    // rows read is filled by `countEngagement`, which is the
+                    // whole reason phase 2 exists.
+                    if (engagement_open) {
+                        if (nostr.event.verify(gpa, signer, e.event) catch false)
+                            countEngagement(e.event, watch[0..watch_len]);
+                        continue;
+                    }
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind == 1 and id_count < ids.len) {
+                        hexLower(&ids[id_count], e.event.id);
+                        watch[watch_len] = noteIdOf(e.event);
+                        watch_len += 1;
+                        id_count += 1;
+                    }
+                },
+                .eose => {
+                    if (engagement_open or id_count == 0) break;
+                    engagement_open = true;
+                    var evals: [engagement_watch_cap][]const u8 = undefined;
+                    for (0..id_count) |i| evals[i] = &ids[i];
+                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
+                    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..id_count] }};
+                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+                    relay.subscribe("plaza-person-engagement", &eng_filters) catch break;
+                },
+                .closed => break,
+                else => continue,
+            }
+        }
+    }
+}
+
+/// How many frames one relay gets to answer a profile's backfill before this
+/// thread moves on. See the comment in `fetchProfileWorker`.
+const profile_fetch_messages = 400;
 
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so

@@ -2398,9 +2398,9 @@ test "a deep back-stack still lays out" {
     model.thread_notes_len = n;
 
     for (0..main.thread_depth_max) |d| {
-        model.thread_stack[d] = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0);
-        model.thread_stack[d].id = 500 + @as(i64, @intCast(d));
-        model.thread_stack[d].pubkey = author;
+        model.thread_stack[d] = .{ .note = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0) };
+        model.thread_stack[d].note.id = 500 + @as(i64, @intCast(d));
+        model.thread_stack[d].note.pubkey = author;
     }
     // Every depth the stack can reach, including full.
     for (0..main.thread_depth_max + 1) |depth| {
@@ -5172,4 +5172,187 @@ test "the follow splice matches on the p tag, not on any tag carrying that value
     try testing.expect(!saw_p_victim);
     try testing.expect(saw_e);
     try testing.expect(saw_short);
+}
+
+test "a profile is a level of the back stack, not a layer over it" {
+    // The SDK tracks at most 8 virtual windows per build, an OCCLUDED level
+    // still registers one, and Plaza is already at the cap: feed + 6 stacked +
+    // current. A profile that layered on top of a full thread stack would be a
+    // ninth window, silently dropped in a release build. Sharing the depth
+    // budget is what makes that impossible rather than merely unlikely.
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5a);
+
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(?[32]u8, who), model.viewing_profile);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+
+    // Opening a note from a profile pushes the profile, so Back returns to it.
+    var note = threadNote(0xAB, 100, 0);
+    note.id = 77;
+    main.enterThreadForTest(&model, note);
+    try testing.expectEqual(@as(usize, 1), model.thread_stack_len);
+    try testing.expect(model.thread_stack[0].isProfile());
+    try testing.expectEqual(@as(i64, 77), model.viewing_thread);
+    try testing.expect(model.viewing_profile == null);
+
+    // Back lands on the person, not the feed.
+    main.closeThreadForTest(&model);
+    try testing.expectEqual(@as(?[32]u8, who), model.viewing_profile);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+
+    // And Back again lands on the feed.
+    main.closeThreadForTest(&model);
+    try testing.expect(model.viewing_profile == null);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+}
+
+test "the profile's tabs mean exactly what they say" {
+    // Notes is what they wrote; Replies is what they wrote at somebody. A tab
+    // that mixed them would be a tab that lies about what it holds.
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5b);
+    model.viewing_profile = who;
+
+    model.thread_notes[0] = threadNote(0x01, 100, 0); // a note
+    model.thread_notes[1] = threadNote(0x02, 90, 0xAA); // a reply
+    model.thread_notes[2] = threadNote(0x03, 80, 0); // a note
+    // Somebody else's note, sharing the buffer the way a stacked level does.
+    model.thread_notes[3] = threadNote(0x04, 70, 0);
+    var other: [32]u8 = undefined;
+    @memset(&other, 0x99);
+    model.thread_notes[3].pubkey = other;
+    model.thread_notes_len = 4;
+    for (0..3) |i| model.thread_notes[i].pubkey = who;
+
+    var buf: [8]usize = undefined;
+    model.profile_tab = .notes;
+    const notes = model.profileNotesFor(&buf, who);
+    try testing.expectEqual(@as(usize, 2), notes.len);
+
+    model.profile_tab = .replies;
+    var buf2: [8]usize = undefined;
+    const replies = model.profileNotesFor(&buf2, who);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    try testing.expectEqual(@as(usize, 1), replies[0]);
+
+    // The stranger's row belongs to neither tab of THIS person.
+    model.profile_tab = .notes;
+    var buf3: [8]usize = undefined;
+    const mine = model.profileNotesFor(&buf3, who);
+    for (mine) |i| try testing.expect(!std.mem.eql(u8, &model.thread_notes[i].pubkey, &other));
+}
+
+test "a profile screen renders the person and their notes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5c);
+    model.viewing_profile = who;
+    model.thread_notes[0] = threadNote(0x01, 100, 0);
+    model.thread_notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    // Back, the tabs, and the counts row are all there.
+    try testing.expect(findAnyText(tree.root, "Notes") != null);
+    try testing.expect(findAnyText(tree.root, "Replies") != null);
+    // The follow count is unknown for a stranger with no contact list in the
+    // store, and the screen says so rather than printing a confident zero.
+    try testing.expect(findAnyText(tree.root, "Their follow list has not arrived yet") != null);
+}
+
+test "a number this app cannot know is not printed" {
+    // FOLLOWERS is not computable from a local store: nothing here can know who
+    // follows somebody. The design asks for the number; the honest answer is to
+    // leave it out rather than state a figure the reader would believe.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5d);
+    model.viewing_profile = who;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "followers") == null);
+}
+
+test "a press on a profile's own note row resolves" {
+    // `noteById` searched `thread_notes` only while a THREAD was open, so every
+    // per-note action on a profile (open it, like it, expand its picture) was a
+    // press that looked live and did nothing.
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x71);
+    model.viewing_profile = who;
+    model.thread_notes[0] = threadNote(0x01, 100, 0);
+    model.thread_notes[0].id = 4242;
+    model.thread_notes[0].pubkey = who;
+    model.thread_notes_len = 1;
+
+    try testing.expect(model.noteById(4242) != null);
+    try testing.expect(model.noteById(9999) == null);
+}
+
+test "opening the person already open does not stack a second copy of them" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x72);
+
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+    // Pressing a face on their own page is the reachable way to do this.
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+
+    // A different person still pushes.
+    var other: [32]u8 = undefined;
+    @memset(&other, 0x73);
+    main.enterProfileForTest(&model, other);
+    try testing.expectEqual(@as(usize, 1), model.thread_stack_len);
+}
+
+test "a guest is not told they follow the starter pack" {
+    // The pack is what the app reads on a guest's behalf, not a list they
+    // chose. Showing "Following" on nine strangers to somebody with no key also
+    // contradicts the note menu, which offers them Follow for the same person
+    // in the same moment.
+    main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    const packed_in = main.followSetForTest()[0];
+    try testing.expect(!main.isFollowing(packed_in));
+
+    // Signed in with no list of their own, the pack IS what they read, so the
+    // thread's ranking still treats them as inside the graph.
+    main.setIdentityForTest([_]u8{0x74} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expect(main.isFollowing(packed_in));
+}
+
+test "the follow count counts people, not tags" {
+    // Some clients emit the same person twice. This file already has a function
+    // that knows that; the profile's count has to use it or it prints a number
+    // nobody else shows.
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32 },
+        &.{ "p", "22" ** 32 },
+        &.{ "p", "11" ** 32 },
+        &.{ "t", "not-a-person" },
+    };
+    try testing.expectEqual(@as(usize, 2), main.countPeopleForTest(&tags));
 }
