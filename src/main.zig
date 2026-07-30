@@ -490,7 +490,7 @@ fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
 /// short: a backup for a kind nothing writes is a guess about the future, and
 /// this app writes exactly these.
 fn isOwnList(kind: u16) bool {
-    return kind == 0 or kind == relay_list_kind;
+    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind;
 }
 
 /// The one door into the store.
@@ -3913,6 +3913,8 @@ pub const Model = struct {
     relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
+    // Whether the open thread's note menu is showing.
+    note_menu: bool = false,
     // Whether the compose sheet is open. Compose is on demand from the "New
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
@@ -4292,8 +4294,9 @@ pub const Model = struct {
     /// is no separate spinner, the feed renders from disk before the window
     /// finishes opening.
     pub fn caught_up(self: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (self.notes_len == 0) return "Starter pack";
-        return std.fmt.allocPrint(arena, "Caught up · starter pack · {d} notes", .{self.notes_len}) catch "Starter pack";
+        const scope = self.scope_name();
+        if (self.notes_len == 0) return scope;
+        return std.fmt.allocPrint(arena, "Caught up · {s} · {d} notes", .{ lowerScope(scope), self.notes_len }) catch scope;
     }
 
     /// The status bar's relay health, drawn after the online dot.
@@ -4318,10 +4321,26 @@ pub const Model = struct {
         return self.is_guest() and !self.guest_strip_dismissed;
     }
 
-    /// The feed's scope line: how many hand-picked voices it is scoped to.
+    /// What the feed is scoped to. It stops being a hand-picked pack the moment
+    /// the reader has a follow list of their own, and the line has to stop
+    /// saying so: calling somebody's own follows "hand-picked" by this app is
+    /// exactly the kind of small lie that makes a reader distrust the big
+    /// statements too.
+    pub fn scope_name(self: *const Model) []const u8 {
+        _ = self;
+        return if (followsAreOwned()) "Following" else "Starter pack";
+    }
+
+    /// The feed's scope line: how many voices it is scoped to, and whose choice
+    /// that was.
     pub fn scope_voices(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{followSet().len}) catch "hand-picked";
+        const n = followSet().len;
+        if (followsAreOwned()) {
+            if (n == 1) return "1 account · yours";
+            return std.fmt.allocPrint(arena, "{d} accounts · yours", .{n}) catch "yours";
+        }
+        return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{n}) catch "hand-picked";
     }
 
     /// The note with this id, if it is still in the feed or the open thread. A
@@ -4540,6 +4559,12 @@ pub fn clearIdentityForTest() void {
 
 /// Reconciles profiles and notes against `store` directly, bypassing the
 /// count guard. For tests, which drive the store themselves.
+/// Forces the next reconcile to do the full work rather than take the
+/// unchanged-store fast path, so a benchmark measures a rebuild.
+pub fn invalidateFeedForTest() void {
+    g_last_count = std.math.maxInt(usize);
+}
+
 pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
     refreshProfiles(store);
     model.rebuildNotes(store, now_s);
@@ -6194,6 +6219,10 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
+    /// The note overflow menu, and the one action behind it. The payload says
+    /// which way: 0 means a guest reached for it, 1 follow, 2 unfollow.
+    toggle_note_menu,
+    follow_author: u8,
     /// Opens the Edit profile sheet, and the three fields in it.
     open_profile_edit,
     close_profile_edit,
@@ -7832,7 +7861,7 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
     const plan = rows_ctx.rowAt(index);
     const inner = switch (plan) {
         .ancestor => |ai| ancestorRow(ui, &rows_ctx.ancestors[ai], ai == 0),
-        .focal => threadRoot(ui, rows_ctx.root, rows_ctx.ancestors.len == 0),
+        .focal => threadRoot(ui, rows_ctx.model, rows_ctx.root, rows_ctx.ancestors.len == 0),
         .composer => replyComposer(ui, rows_ctx.model, rows_ctx.root),
         // `first` draws the full-width rule under the note being answered, and
         // `last` suppresses the trailing one: a rule with nothing under it is a
@@ -8069,7 +8098,7 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
 /// The focused root note: the same 40px avatar and 14px inset as the feed and
 /// the replies (so every row's avatar and text share one left edge), set apart
 /// by a slightly larger name, the name-over-handle stack, and the composer below.
-fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
+fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) AppUi.Node {
     const p = theme.palette;
     const c = engagementFor(note.id);
     // A fixed-width column, centred by the scroll column's `cross = .center`. No
@@ -8090,12 +8119,17 @@ fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
             hgap(ui, avatar_to_text_gap),
             identityBlock(ui, note),
             ui.spacer(1),
-            // Drawn, not wired: the overflow menu (mute, report, copy link) lands
-            // with the safety work. A pressable glyph that does nothing is the
-            // same lie the status bar was just cured of, so it stays inert until
-            // there is something behind it.
-            ui.row(.{ .padding = 4 }, .{
+            // Wired now, to the one thing behind it: following the author.
+            // Mute, report and copy-link land with the safety work.
+            ui.el(.list_item, .{
+                .padding = 4,
+                .cross = .center,
+                .on_press = Msg.toggle_note_menu,
+                .style = .{ .radius = 6 },
+                .semantics = .{ .role = .button, .label = "More", .focusable = true },
+            }, .{
                 ui.icon(.{ .width = 15, .height = 15, .style = .{ .foreground = p.text_faint_alt } }, "ellipsis"),
+                if (model.note_menu) noteMenu(ui, note.pubkey) else ui.spacer(0),
             }),
             hgap(ui, thread_inset),
         }),
@@ -8322,11 +8356,262 @@ fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) G
 /// a real list; this is the number the buffers are sized to until then.
 pub const max_follows = 128;
 
-/// Who this reader reads. The starter pack until following writes a contact
-/// list of their own, and one seam either way, so the day the list becomes
-/// theirs no caller has to learn a second shape.
+/// NIP-02's kind. A contact list is replaceable: publishing one replaces who
+/// this reader follows, everywhere, at once.
+const contact_list_kind: u16 = 3;
+
+/// The reader's own follow list, once one has been read or written. Fixed
+/// capacity, because a feed query opens one cursor per author and a relay
+/// filter naming thousands is a payload several relays close the connection
+/// over. A list longer than this is READ in full and kept in full when written
+/// back; it is only the reading that is capped.
+var g_follows: [max_follows][32]u8 = undefined;
+var g_follow_count: usize = 0;
+/// Whose list is in `g_follows`, for the same reason the relay pool records it:
+/// a list left behind by one account must never be read as another's.
+var g_follow_owner: ?[32]u8 = null;
+/// Bumped whenever the set changes. The ingest threads snapshot it at dial and
+/// re-subscribe when it moves, so a follow shows new notes without waiting for
+/// the socket to drop.
+var g_follow_gen = std.atomic.Value(u32).init(0);
+/// Guards the table. The UI thread writes it; ingest threads read it to build
+/// their filters.
+var g_follow_lock = std.atomic.Value(bool).init(false);
+
+fn lockFollows() void {
+    while (g_follow_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockFollows() void {
+    g_follow_lock.store(false, .release);
+}
+
+/// Whether the list in memory is THIS account's.
+fn followsAreOwned() bool {
+    const pk = activePubkey() orelse return false;
+    const owner = g_follow_owner orelse return false;
+    return std.mem.eql(u8, &owner, &pk);
+}
+
+/// Who this reader reads: their own follow list once one is known, and the
+/// starter pack until then. One seam either way, so no caller has to know which
+/// of the two it is looking at.
 pub fn followSet() []const [32]u8 {
+    if (followsAreOwned()) return g_follows[0..g_follow_count];
     return &starter_pack;
+}
+
+/// Copies the follow set for a caller on another thread. `followSet` hands back
+/// a slice of a table the UI thread rewrites, and an ingest thread holding one
+/// across a dial is the same hazard the relay pool already learned about.
+pub fn followSnapshot(out: *[max_follows][32]u8) usize {
+    lockFollows();
+    defer unlockFollows();
+    if (!followsAreOwned()) {
+        const n = @min(starter_pack.len, out.len);
+        @memcpy(out[0..n], starter_pack[0..n]);
+        return n;
+    }
+    const n = @min(g_follow_count, out.len);
+    @memcpy(out[0..n], g_follows[0..n]);
+    return n;
+}
+
+pub fn followGeneration() u32 {
+    return g_follow_gen.load(.acquire);
+}
+
+/// Whether this reader follows `pubkey`.
+pub fn isFollowing(pubkey: [32]u8) bool {
+    for (followSet()) |f| {
+        if (std.mem.eql(u8, &f, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Installs a follow set as this account's, from their own kind:3 or from a
+/// write made here. Returns whether anything actually changed.
+fn setFollows(list: []const [32]u8) bool {
+    const pk = activePubkey() orelse return false;
+    lockFollows();
+    const same = blk: {
+        if (!followsAreOwned()) break :blk false;
+        if (g_follow_count != @min(list.len, max_follows)) break :blk false;
+        for (list[0..@min(list.len, max_follows)], 0..) |f, i| {
+            if (!std.mem.eql(u8, &f, &g_follows[i])) break :blk false;
+        }
+        break :blk true;
+    };
+    if (same) {
+        unlockFollows();
+        return false;
+    }
+    const n = @min(list.len, max_follows);
+    @memcpy(g_follows[0..n], list[0..n]);
+    g_follow_count = n;
+    g_follow_owner = pk;
+    unlockFollows();
+    // Everything scoped to the follow set is now stale: the feed's query, the
+    // relay filters, the names being fetched.
+    _ = g_follow_gen.fetchAdd(1, .monotonic);
+    g_last_count = std.math.maxInt(usize);
+    return true;
+}
+
+/// Forgets whose list this is. Called on any identity change, so one account's
+/// follows are never read, published, or shown as another's.
+fn forgetFollows() void {
+    lockFollows();
+    defer unlockFollows();
+    g_follow_owner = null;
+    g_follow_count = 0;
+}
+
+/// Whether a follow write is safe to make right now.
+///
+/// The hard rule of this whole feature. A contact list is REPLACEABLE:
+/// publishing one replaces who this reader follows, on every relay, at once.
+/// So nothing is written until a relay has said who they already follow, and
+/// "no relay answered" is not the same sentence as "you follow nobody". Get
+/// that wrong and pressing Follow on one person replaces a list of hundreds
+/// with a handful of accounts this app chose.
+pub fn canWriteFollows() bool {
+    if (activePubkey() == null) return false;
+    return ownContactsAnswered();
+}
+
+/// Follows or unfollows `pubkey`, as newest-known-list plus the change.
+///
+/// Everything the reader's existing kind:3 carries comes forward untouched: the
+/// petnames and relay hints on other people's `p` tags, tag types this app does
+/// not model, and the content blob, which on older clients is a relay map and on
+/// none of them is ours to discard.
+fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
+    if (!canWriteFollows()) return false;
+    const me = activePubkey() orelse return false;
+    // Following yourself is not a thing, and an app that lets you is confusing
+    // about whose feed it is.
+    if (std.mem.eql(u8, &me, &pubkey)) return false;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, contact_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    defer tags.deinit(gpa);
+    var found = false;
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, pubkey);
+
+    if (previous) |prev| {
+        for (prev.tags) |tag| {
+            if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], &hex)) {
+                found = true;
+                // Unfollowing drops the tag; following keeps the one already
+                // there, petname, relay hint and all.
+                if (!following) continue;
+            }
+            const copy = gpa.alloc([]const u8, tag.len) catch return false;
+            for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return false;
+            tags.append(gpa, copy) catch return false;
+        }
+    } else {
+        // No list of their own yet, and a relay has said so. The pack they have
+        // been reading becomes the list they publish, so the feed they know
+        // travels with them to every other client.
+        for (followSet()) |f| {
+            if (std.mem.eql(u8, &f, &pubkey)) found = true;
+            if (!following and std.mem.eql(u8, &f, &pubkey)) continue;
+            var fhex: [64]u8 = undefined;
+            hexLower(&fhex, f);
+            const copy = gpa.alloc([]const u8, 2) catch return false;
+            copy[0] = gpa.dupe(u8, "p") catch return false;
+            copy[1] = gpa.dupe(u8, &fhex) catch return false;
+            tags.append(gpa, copy) catch return false;
+        }
+    }
+
+    if (following) {
+        if (found) return false; // already followed: nothing to write
+        const copy = gpa.alloc([]const u8, 2) catch return false;
+        copy[0] = gpa.dupe(u8, "p") catch return false;
+        copy[1] = gpa.dupe(u8, &hex) catch return false;
+        tags.append(gpa, copy) catch return false;
+    } else if (!found) {
+        return false; // not followed: nothing to write
+    }
+
+    const owned_tags = tags.toOwnedSlice(gpa) catch return false;
+    // The content is carried forward verbatim. On older clients it is a relay
+    // map, and emptying it would delete a record this app does not even read.
+    const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
+    const created = @max(nowSeconds(), ownRecordCreatedAt(contact_list_kind) + 1);
+
+    // The live list moves first, so the feed reflects the press immediately and
+    // the write seam is not what the UI waits on.
+    var next: [max_follows][32]u8 = undefined;
+    const n = followsFromTags(owned_tags, &next);
+    _ = setFollows(next[0..n]);
+
+    signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false);
+    return true;
+}
+
+pub fn writeFollowForTest(fx: *Effects, pubkey: [32]u8, following: bool) bool {
+    return writeFollow(fx, pubkey, following);
+}
+
+/// The reader's own kind:3, arriving from a relay. Adopted unless they have
+/// already written one here this session, on the same rule the relay list uses:
+/// their hands beat their history.
+fn ingestContactList(ev: nostr.event.Event) void {
+    const pk = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &pk, &ev.pubkey)) return;
+    noteOwnContactsAnswered(pk);
+    if (followsAreOwned()) return;
+    var list: [max_follows][32]u8 = undefined;
+    const n = followsFromTags(ev.tags, &list);
+    // A contact list with no usable `p` tag is not a list. Adopting it would
+    // empty the reader's feed on the word of one malformed event.
+    if (n == 0) return;
+    _ = setFollows(list[0..n]);
+}
+
+/// The pubkeys a kind:3's `p` tags name, in their published order, deduped.
+fn followsFromTags(tags: []const nostr.event.Tag, out: *[max_follows][32]u8) usize {
+    var n: usize = 0;
+    for (tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "p")) continue;
+        if (tag[1].len != 64) continue;
+        var pk: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk, tag[1]) catch continue;
+        var seen = false;
+        for (out[0..n]) |had| {
+            if (std.mem.eql(u8, &had, &pk)) seen = true;
+        }
+        if (seen) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn ingestContactListForTest(ev: nostr.event.Event) void {
+    ingestContactList(ev);
+}
+
+pub fn followsFromTagsForTest(tags: []const nostr.event.Tag, out: *[max_follows][32]u8) usize {
+    return followsFromTags(tags, out);
+}
+
+pub fn setFollowsForTest(list: []const [32]u8) bool {
+    return setFollows(list);
+}
+
+pub fn forgetFollowsForTest() void {
+    forgetFollows();
 }
 
 /// Whether a pubkey is inside the reader's follow graph: the accounts whose
@@ -9276,11 +9561,11 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
                 }, .{
                     ui.paragraph(
                         .{ .style = .{ .foreground = p.text_primary } },
-                        &.{.{ .text = "Starter pack", .weight = .bold, .scale = scope_title_scale }},
+                        &.{.{ .text = model.scope_name(), .weight = .bold, .scale = scope_title_scale }},
                     ),
                     ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_muted } }, "chevron-down"),
                 }),
-                if (model.menu == .scope) scopeMenu(ui) else ui.spacer(0),
+                if (model.menu == .scope) scopeMenu(ui, model.scope_name()) else ui.spacer(0),
             }),
             ui.spacer(1),
             ui.paragraph(
@@ -9323,11 +9608,43 @@ fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The scope menu. One entry today, and it is the current one, so this exists to
 /// say what the chevron means rather than to offer a choice: the reader learns
 /// where scopes live before there is a second one to pick.
-fn scopeMenu(ui: *AppUi) AppUi.Node {
+fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
     const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
-    rows[0] = menuRow(ui, "Starter pack", "check", null, .close_menu);
+    rows[0] = menuRow(ui, scope, "check", null, .close_menu);
     // The scope line sits at the top of the window, so its menu drops down.
     return menuSurfacePlaced(ui, 200, .below, .start, rows);
+}
+
+/// A scope name as it reads mid-sentence.
+fn lowerScope(scope: []const u8) []const u8 {
+    if (std.mem.eql(u8, scope, "Following")) return "following";
+    return "starter pack";
+}
+
+/// The note menu: what a reader can do about the person whose note this is.
+///
+/// One entry today. It says which way it goes and, when it cannot go either
+/// way yet, says that instead of offering a press that would replace a contact
+/// list nobody has read.
+fn noteMenu(ui: *AppUi, author: [32]u8) AppUi.Node {
+    const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
+    const me = activePubkey();
+    const is_me = if (me) |pk| std.mem.eql(u8, &pk, &author) else false;
+    if (is_me) {
+        rows[0] = menuRow(ui, "This is you", null, null, null);
+    } else if (me == null) {
+        rows[0] = menuRow(ui, "Follow", null, null, Msg{ .follow_author = 0 });
+    } else if (!canWriteFollows()) {
+        // Not "Follow", greyed. The reason is worth a sentence: the app is
+        // waiting to be told who they already follow, because writing before
+        // then replaces that list with this one.
+        rows[0] = menuRow(ui, "Reading your follows…", null, null, null);
+    } else if (isFollowing(author)) {
+        rows[0] = menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
+    } else {
+        rows[0] = menuRow(ui, "Follow", null, null, Msg{ .follow_author = 1 });
+    }
+    return menuSurfacePlaced(ui, 200, .below, .end, rows);
 }
 
 /// The chrome's floating surface: a menu anchored to the trigger it hangs off.
@@ -11392,6 +11709,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending_compose = true;
             } else model.composing = true;
         },
+        .toggle_note_menu => model.note_menu = !model.note_menu,
+        .follow_author => |direction| {
+            model.note_menu = false;
+            // A guest reaching for Follow is first intent, the same as reaching
+            // for the composer: the sheet rises rather than the press failing.
+            if (direction == 0 or model.is_guest()) {
+                model.joining = true;
+                return;
+            }
+            // The menu hangs off the focal note, so its author is the thread's
+            // root: the person whose note is being read.
+            if (model.viewing_thread == 0) return;
+            _ = writeFollow(fx, model.thread_root.pubkey, direction == 1);
+        },
         .open_profile_edit => openProfileEdit(model),
         .close_profile_edit => model.editing_profile = false,
         .profile_name_edit => |edit| model.profile_name_buffer.apply(edit),
@@ -11745,6 +12076,33 @@ var g_own_profile_asked_for: ?[32]u8 = null;
 /// bootstrap pool still replaces a real list nobody has looked at yet.
 var g_own_relays_asked_for: ?[32]u8 = null;
 var g_own_relays_answered = std.atomic.Value(bool).init(false);
+/// And the same for the CONTACT list, where getting it wrong is worse: a write
+/// made before hearing back replaces everyone this reader follows with a
+/// handful of accounts the app chose for them.
+var g_own_contacts_asked_for: ?[32]u8 = null;
+var g_own_contacts_answered = std.atomic.Value(bool).init(false);
+
+/// Whether a relay has told THIS account who they follow (including telling us
+/// they follow nobody).
+pub fn ownContactsAnswered() bool {
+    const pk = activePubkey() orelse return false;
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    const asked = g_own_contacts_asked_for orelse return false;
+    if (!std.mem.eql(u8, &asked, &pk)) return false;
+    return g_own_contacts_answered.load(.acquire);
+}
+
+fn noteOwnContactsAnswered(pk: [32]u8) void {
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    g_own_contacts_asked_for = pk;
+    g_own_contacts_answered.store(true, .release);
+}
+
+pub fn noteOwnContactsAnsweredForTest(pk: [32]u8) void {
+    noteOwnContactsAnswered(pk);
+}
 
 /// Whether a relay has told THIS account what their relay list is (including
 /// telling us there is none).
@@ -11776,6 +12134,8 @@ fn forgetOwnRecordAnswers() void {
     defer unlockOwnProfile();
     g_own_relays_asked_for = null;
     g_own_relays_answered.store(false, .release);
+    g_own_contacts_asked_for = null;
+    g_own_contacts_answered.store(false, .release);
 }
 var g_own_profile_asking = std.atomic.Value(bool).init(false);
 /// Set by the worker when at least one relay ANSWERED (EOSE), paired with the
@@ -11826,9 +12186,17 @@ const OwnProfile = struct {
 ///
 /// The returned slice is owned by the caller's allocator.
 fn ownProfileJson(gpa: std.mem.Allocator) ?OwnProfile {
+    return ownRecordJson(gpa, 0);
+}
+
+/// The reader's own newest event of `kind`, content and tags. The RAW record is
+/// the source of truth for every write this app makes over one of its own
+/// lists: the caches model a few fields and drop the rest, so rebuilding from
+/// one would publish a record with everything else deleted.
+fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     const store = g_store orelse return null;
     const pk = activePubkey() orelse return null;
-    const kinds = [_]u16{0};
+    const kinds = [_]u16{kind};
     const authors = [_][32]u8{pk};
     var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return null;
     defer result.deinit();
@@ -14104,6 +14472,9 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // any of it would let the next account be judged without being asked, and a
     // write would then go out over a list nobody has read.
     forgetOwnRecordAnswers();
+    // And who the leaving account followed, so the next reader is not shown a
+    // feed built from a stranger's list.
+    forgetFollows();
     model.editing_profile = false;
     model.profile_seeded = false;
 
@@ -14181,13 +14552,13 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // kind:0 metadata (and the user's own) so the feed can show real names and
     // avatars. Two filters share one subscription.
     var authors: [max_follows + 1][32]u8 = undefined;
-    var authors_len: usize = 0;
-    for (followSet()) |pk| {
-        if (authors_len >= max_follows) break;
-        authors[authors_len] = pk;
-        authors_len += 1;
-    }
+    // Snapshotted, not borrowed: `followSet` hands back a slice of a table the
+    // UI thread rewrites when a follow lands, and this filter outlives the frame.
+    var authors_len: usize = followSnapshot(@ptrCast(&authors));
     const follow_count = authors_len;
+    // The generation this subscription was built for. When it moves, this
+    // connection is asking the wrong question and re-asks below.
+    var subscribed_gen = followGeneration();
     if (activePubkey()) |pk| {
         authors[authors_len] = pk;
         authors_len += 1;
@@ -14196,7 +14567,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // kind:0 is who they are, kind:10002 is where they are: the reader's own
     // relay list, and the relays their follows write to, which is what makes a
     // suggestion under the add field a fact rather than a guess.
-    const profile_kinds = [_]u16{ 0, relay_list_kind };
+    // kind:0 is who they are, 10002 is where they are, and 3 is who the reader
+    // follows: their own contact list, which nothing may be written over until
+    // it has been read.
+    const profile_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
     const filters = [_]nostr.filter.Filter{
         .{ .authors = authors[0..follow_count], .kinds = &feed_kinds, .limit = feed_capacity },
         .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
@@ -14239,6 +14613,26 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         const now_entry = relaySnapshot(index, &now_buf) orelse return;
         if (!relayUrlEql(now_entry.url, url)) return;
         if (now_entry.read != reads) return;
+        // Following someone changes what this connection should be asking for.
+        // NIP-01 makes a REQ under an existing id a replacement, so the same
+        // subscription is simply re-issued: without this a follow shows nothing
+        // new until the socket happens to drop, which reads as a broken button.
+        if (reads and followGeneration() != subscribed_gen) {
+            subscribed_gen = followGeneration();
+            authors_len = followSnapshot(@ptrCast(&authors));
+            var next_authors_len = authors_len;
+            if (activePubkey()) |pk| {
+                if (next_authors_len < authors.len) {
+                    authors[next_authors_len] = pk;
+                    next_authors_len += 1;
+                }
+            }
+            const next_filters = [_]nostr.filter.Filter{
+                .{ .authors = authors[0..authors_len], .kinds = &feed_kinds, .limit = feed_capacity },
+                .{ .authors = authors[0..next_authors_len], .kinds = &profile_kinds, .limit = profile_cap },
+            };
+            relay.subscribe("plaza-feed", &next_filters) catch {};
+        }
         var msg = (try relay.receive()) orelse break;
         defer msg.deinit();
 
@@ -14271,6 +14665,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // a note is held rather than guess.
                     if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);
                     if (e.event.kind == relay_list_kind) ingestRelayList(e.event);
+                    if (e.event.kind == contact_list_kind) ingestContactList(e.event);
                     // Note this feed post so its engagement can be watched. Bounded
                     // to keep the `#e` filter a size relays accept.
                     if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {
@@ -14306,7 +14701,14 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 // answer: it is what lets a first edit be published at all,
                 // instead of the app waiting forever for a list nobody has.
                 if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
-                    if (activePubkey()) |me| noteOwnRelaysAnswered(me);
+                    if (activePubkey()) |me| {
+                        noteOwnRelaysAnswered(me);
+                        // And who they follow. A relay reaching the end without
+                        // sending a kind:3 has said it holds none, which is what
+                        // lets a first follow be written at all instead of the
+                        // app waiting forever on a list nobody has.
+                        noteOwnContactsAnswered(me);
+                    }
                 }
                 // Stored feed drained: now watch those notes' engagement.
                 if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
