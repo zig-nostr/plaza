@@ -10487,23 +10487,38 @@ fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
     const press: Msg = if (guest) .open_join else .open_settings;
     return ui.el(.data_row, .{
         .on_press = press,
+        // The tile's own box, stated. Left unsized, this row measured ZERO wide
+        // (a `data_row` hugs its content and the seat inside it is centred, not
+        // stretched), so the account seat floated free of the rail's column
+        // while every glyph tile sat squarely in its 36. It was the one tile on
+        // the rail that did not line up.
+        .width = 36,
+        .height = 36,
+        .main = .center,
+        .cross = .center,
         .padding = 0,
         .style = .{ .quiet_hover = true },
         .semantics = .{ .label = "You" },
     }, .{
-        if (guest)
-            // The seat reads as an outline waiting to be filled, so its ring is
-            // dashed. The canvas has no dashed strokes, so the ring is an icon
-            // whose dashes are baked into its geometry, with the label stacked
-            // over it.
-            ui.stack(.{ .width = 28, .height = 28 }, .{
-                ui.appIcon(.{ .width = 28, .height = 28, .style = .{ .foreground = p.border_dashed } }, "dashed-ring"),
-                ui.column(.{ .width = 28, .height = 28, .main = .center, .cross = .center }, .{
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "you", .monospace = true, .scale = 8.5 / 14.5 }}),
-                }),
-            })
-        else
-            youAvatar(ui),
+        // The same 36x36 centring box every other rail tile uses. Without it the
+        // 28px seat sat at the row's natural position while the 36px glyph tiles
+        // sat centred in theirs, so the account avatar hung 4px off the rail's
+        // shared centre line: the one tile on the rail that did not line up.
+        ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{
+            if (guest)
+                // The seat reads as an outline waiting to be filled, so its ring
+                // is dashed. The canvas has no dashed strokes, so the ring is an
+                // icon whose dashes are baked into its geometry, with the label
+                // stacked over it.
+                ui.stack(.{ .width = 28, .height = 28 }, .{
+                    ui.appIcon(.{ .width = 28, .height = 28, .style = .{ .foreground = p.border_dashed } }, "dashed-ring"),
+                    ui.column(.{ .width = 28, .height = 28, .main = .center, .cross = .center }, .{
+                        ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "you", .monospace = true, .scale = 8.5 / 14.5 }}),
+                    }),
+                })
+            else
+                youAvatar(ui),
+        }),
     });
 }
 
