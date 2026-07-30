@@ -2702,6 +2702,14 @@ fn scanLinkFetches(fx: *Effects, model: *const Model) void {
     if (!g_media_previews) return;
     g_link_clock += 1;
     var fired: usize = 0;
+    if (model.viewing_profile != null) {
+        // A person's page occludes the feed. Without this branch the hidden
+        // feed keeps reaching out to hosts nobody is looking at, and the page
+        // that IS being read gets no link cards at all.
+        const shown = @min(model.thread_notes_len, thread_link_scan_cap);
+        for (model.thread_notes[0..shown]) |*note| fireLink(fx, note, &fired);
+        return;
+    }
     if (model.viewing_thread != 0) {
         // The note being read, and the first screenful under it. Walking the
         // whole conversation would reach out to every host linked anywhere in
@@ -4402,7 +4410,11 @@ pub const Model = struct {
         for (self.notes[0..self.notes_len]) |*note| {
             if (note.id == note_id) return note;
         }
-        if (self.viewing_thread != 0) {
+        // A profile's rows live in the same buffer, so they resolve the same way.
+        // Without this every press on a profile row (open, like, expand a
+        // picture) is a silent no-op, which is worse than an inert control
+        // because it looks live.
+        if (self.viewing_thread != 0 or self.viewing_profile != null) {
             if (self.thread_root.id == note_id) return &self.thread_root;
             for (self.thread_notes[0..self.thread_notes_len]) |*note| {
                 if (note.id == note_id) return note;
@@ -4448,10 +4460,15 @@ pub const Model = struct {
     /// Which of the profile's two tabs a note belongs to. "Notes" is what they
     /// wrote; "Replies" is what they wrote at somebody. A tab that mixed them
     /// would be a tab that lies about what it holds.
-    pub fn profileNotesFor(self: *const Model, out: []usize) []const usize {
+    pub fn profileNotesFor(self: *const Model, out: []usize, pubkey: [32]u8) []const usize {
         var n: usize = 0;
+        // Only THIS person's notes. `thread_notes` is one buffer shared with the
+        // thread screen, so a stacked level that is not the one being read holds
+        // somebody else's rows, and counting those would give the retained list
+        // a length that does not match what it draws.
         for (self.thread_notes[0..self.thread_notes_len], 0..) |note, i| {
             if (n >= out.len) break;
+            if (!std.mem.eql(u8, &note.pubkey, &pubkey)) continue;
             const is_reply = note.has_reply_parent;
             if ((self.profile_tab == .replies) != is_reply) continue;
             out[n] = i;
@@ -5348,14 +5365,20 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     var fired: usize = 0;
     g_media_clock += 1;
 
-    if (model.viewing_profile != null) {
+    if (model.viewing_profile) |pk| {
         // A profile occludes the feed the same way a thread does, and needs the
         // same branch for the same reason. Without it BOTH passes fall through
         // to the feed, which is still built (so its rows are still marked
         // wanted every tick), leaving no slot the claim pass may lend: the
         // profile's own pictures would deterministically never load.
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| markMediaWanted(note.id);
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| fireMedia(fx, note, &fired, per_tick);
+        //
+        // Only the tab that is SHOWING. Half these notes are behind the other
+        // tab, and spending the picture budget on rows nobody is looking at is
+        // how the visible ones end up as empty boxes.
+        var indices: [thread_reply_cap]usize = undefined;
+        const shown = model.profileNotesFor(&indices, pk);
+        for (shown) |i| markMediaWanted(model.thread_notes[i].id);
+        for (shown) |i| fireMedia(fx, &model.thread_notes[i], &fired, per_tick);
         return;
     }
     if (model.viewing_thread != 0) {
@@ -8586,6 +8609,11 @@ pub fn followGeneration() u32 {
 /// slice the feed reads: offering to follow somebody already followed, and then
 /// doing nothing when pressed, is worse than not offering at all.
 pub fn isFollowing(pubkey: [32]u8) bool {
+    // A guest follows nobody. The starter pack is what the app READS on their
+    // behalf, not a list they chose, and showing "Following" on nine strangers
+    // to somebody with no key contradicts the note menu, which offers them
+    // Follow for the same person in the same moment.
+    if (activePubkey() == null) return false;
     lockFollows();
     defer unlockFollows();
     if (!followsAreOwned()) {
@@ -9670,6 +9698,9 @@ fn bannerImage(ui: *AppUi) AppUi.Node {
 /// The banner currently registered, and for whom. One at a time, because one
 /// screen shows one.
 var g_banner_for: ?[32]u8 = null;
+/// Who the in-flight fetch was started for, which is not always who is on
+/// screen by the time it lands.
+var g_banner_asked_for: ?[32]u8 = null;
 var g_banner_state: enum { idle, fetching, loaded, failed } = .idle;
 var g_banner_url_buf: [1024]u8 = undefined;
 var g_banner_url_len: u16 = 0;
@@ -9714,6 +9745,7 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
         return;
     }
     g_banner_state = .fetching;
+    g_banner_asked_for = pubkey;
     fx.fetch(.{
         .key = banner_fetch_key,
         .url = bannerUrl(),
@@ -9721,10 +9753,23 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     });
 }
 
-const banner_fetch_key: u64 = 4000;
+/// Deliberately not 4000: that is `link_fetch_key_base + 0`, and the runtime
+/// rejects a second fetch under a key already in flight, so a banner and the
+/// first link preview would refuse each other.
+const banner_fetch_key: u64 = 5000;
 
 fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.key != banner_fetch_key) return;
+    // WHOSE banner this is. A fetch takes as long as it takes, and the reader
+    // may have walked to somebody else meanwhile: without this the bytes paint
+    // over the person now on screen AND are cached under their URL, so the wrong
+    // face persists across restarts.
+    const asked_for = g_banner_asked_for orelse return;
+    const showing = g_banner_for orelse return;
+    if (!std.mem.eql(u8, &asked_for, &showing)) {
+        g_banner_state = .idle;
+        return;
+    }
     // Every effect slot was busy: ask again next tick.
     if (response.outcome == .rejected) {
         g_banner_state = .idle;
@@ -9761,6 +9806,10 @@ const PersonCard = struct {
     pubkey: [32]u8 = [_]u8{0} ** 32,
     /// The kind:0 these fields came from, so an unchanged event is parsed once.
     meta_id: [32]u8 = [_]u8{0} ** 32,
+    /// The store's event count when this card was last filled. The store only
+    /// grows, so an unchanged count means nothing this card reads can have
+    /// changed either.
+    stamp: usize = std.math.maxInt(usize),
     about_buf: [512]u8 = [_]u8{0} ** 512,
     about_len: u16 = 0,
     website_buf: [128]u8 = [_]u8{0} ** 128,
@@ -9800,7 +9849,16 @@ fn personCard(pubkey: [32]u8) *const PersonCard {
         slot.?.* = .{ .used = true, .pubkey = pubkey };
     }
     const card = slot.?;
-    refreshPersonCard(card);
+    // Only when the store has actually moved. This is called several times per
+    // frame (once per field the header shows) and each refresh ran two LMDB
+    // queries and deep-copied the subject's whole contact list, which for
+    // somebody with two thousand follows is a few hundred allocations per field
+    // per frame.
+    const stamp = if (g_store) |store| store.eventCount() catch 0 else 0;
+    if (card.stamp != stamp) {
+        card.stamp = stamp;
+        refreshPersonCard(card);
+    }
     return card;
 }
 
@@ -9816,20 +9874,21 @@ fn refreshPersonCard(card: *PersonCard) void {
     // Their contact list: how many they follow, and whether the reader is in it.
     if (readRecord(gpa, card.pubkey, contact_list_kind)) |own| {
         defer freeOwnProfile(gpa, own);
-        var n: usize = 0;
         var mine = false;
         const me = activePubkey();
         for (own.tags) |tag| {
             if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
             if (tag[1].len != 64) continue;
-            n += 1;
             if (me) |pk| {
                 var hex: [64]u8 = undefined;
                 hexLower(&hex, pk);
                 if (std.ascii.eqlIgnoreCase(tag[1], &hex)) mine = true;
             }
         }
-        card.following = n;
+        // DISTINCT people. Some clients emit the same person twice, and this
+        // file already has one function that knows that; counting raw tags here
+        // would print a follow count nobody else shows.
+        card.following = countPeople(own.tags);
         card.follows_me = mine;
     } else {
         card.following = null;
@@ -10233,8 +10292,17 @@ fn profilePanel(
     occluded: bool,
 ) AppUi.Node {
     const rows_ctx = ui.arena.create(ProfileRows) catch return ui.column(.{}, .{});
-    var indices: [thread_reply_cap]usize = undefined;
-    const shown = if (occluded) &[_]usize{} else model.profileNotesFor(&indices);
+    // From the ARENA, never the stack. The SDK RETAINS `extent_context` and calls
+    // the estimator again in a post-layout measure pass, long after this function
+    // has returned: a slice of a local here is read back out of a reclaimed frame,
+    // and the index it yields then indexes `notes` with whatever layout left on
+    // that word. The arena survives to the top of the next build, which is
+    // exactly as long as the retained table needs it.
+    const indices = ui.arena.alloc(usize, thread_reply_cap) catch return ui.column(.{}, .{});
+    // An occluded level still reports its REAL row count: the retained list keeps
+    // its scroll offset from the count and the extents, so claiming two rows here
+    // would collapse the person's scroll and Back would land at the top.
+    const shown = model.profileNotesFor(indices, pubkey);
     rows_ctx.* = .{
         .model = model,
         .pubkey = pubkey,
@@ -12669,6 +12737,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
                 model.refreshThreadNotes(now);
+                // And the open person's notes, for the same reason and with the
+                // same consequence if it is missed: without this the backfill
+                // this screen fires never appears, and the quiet line saying
+                // they have written nothing stays up over a store that has
+                // since filled with their notes.
+                model.refreshProfileNotes(now);
+                if (model.viewing_profile != null) {
+                    model.thread_loading = model.thread_notes_len == 0 and
+                        g_thread_done_seq.load(.acquire) < model.thread_seq;
+                }
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
@@ -14586,6 +14664,11 @@ fn pushCurrentScreen(model: *Model) void {
 
 /// Opens a person as a level of their own.
 fn enterProfile(model: *Model, pubkey: [32]u8) void {
+    // Already here. Pressing a face on somebody's own page would otherwise push
+    // a second copy of the same person and cost a Back to undo.
+    if (model.viewing_profile) |current| {
+        if (std.mem.eql(u8, &current, &pubkey)) return;
+    }
     pushCurrentScreen(model);
     model.viewing_profile = pubkey;
     model.viewing_thread = 0;
@@ -14714,6 +14797,8 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
         relay.subscribe("plaza-person", &filters) catch continue;
 
         var ids: [engagement_watch_cap][64]u8 = undefined;
+        var watch: [engagement_watch_cap]i64 = undefined;
+        var watch_len: usize = 0;
         var id_count: usize = 0;
         var engagement_open = false;
         var seen: usize = 0;
@@ -14725,10 +14810,21 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
             defer msg.deinit();
             switch (msg.value) {
                 .event => |e| {
+                    // Phase 2's answers are REACTIONS, and a reaction that is
+                    // only stored changes no count on any row: the table the
+                    // rows read is filled by `countEngagement`, which is the
+                    // whole reason phase 2 exists.
+                    if (engagement_open) {
+                        if (nostr.event.verify(gpa, signer, e.event) catch false)
+                            countEngagement(e.event, watch[0..watch_len]);
+                        continue;
+                    }
                     const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
                     if (result == .invalid) continue;
                     if (e.event.kind == 1 and id_count < ids.len) {
                         hexLower(&ids[id_count], e.event.id);
+                        watch[watch_len] = noteIdOf(e.event);
+                        watch_len += 1;
                         id_count += 1;
                     }
                 },
