@@ -203,6 +203,29 @@ pub fn relayUrlEql(a: []const u8, b: []const u8) bool {
 /// was born with. It gates the one moment a remote event may rewrite the pool:
 /// their published kind:10002 is their list, but only until they edit here.
 var g_relays_are_mine = false;
+/// WHOSE list is in `g_relays`. A bool could not tell "this account's list" from
+/// "a list", and the difference is a wipe: signing out writes the bootstrap pool
+/// to disk, the next launch reads it back as a saved list, and the account that
+/// signs in next then has its real kind:10002 refused and overwritten with the
+/// five relays the app was born with. Null means the pool belongs to nobody yet,
+/// which is a guest's pool and the bootstrap pool.
+var g_relay_owner: ?[32]u8 = null;
+
+/// Whether the pool in memory is THIS account's, as opposed to a leftover from a
+/// previous one or the list the app was born with. Only a yes here may refuse an
+/// incoming kind:10002, and only a yes may be published as one.
+fn relayListIsOwned() bool {
+    const pk = activePubkey() orelse return false;
+    const owner = g_relay_owner orelse return false;
+    return std.mem.eql(u8, &owner, &pk);
+}
+
+/// Marks the pool as this account's: they edited it here, or it came from their
+/// own kind:10002.
+fn claimRelayList() void {
+    g_relay_owner = activePubkey();
+    g_relays_are_mine = g_relay_owner != null;
+}
 
 /// A reader's own kind:10002, parsed and waiting for the UI thread to take it.
 /// An ingest thread must not swap the pool out from under the threads reading
@@ -223,7 +246,10 @@ var g_staged_created_at: i64 = 0;
 /// Only ever staged when the pool is still the one the app was born with, so a
 /// stale event from a relay cannot undo an edit made here.
 fn applyOwnRelayList(ev: nostr.event.Event) void {
-    if (g_relays_are_mine) return;
+    // Only THIS account's own edits get to refuse this. A pool inherited from a
+    // previous account, or the one the app was born with, must give way to the
+    // list the reader actually published.
+    if (relayListIsOwned()) return;
     // A newer list replaces one already staged; an older one is ignored. Equal
     // stamps keep what is staged, so a relay echoing the same event changes
     // nothing.
@@ -275,7 +301,7 @@ fn adoptRelayList() bool {
     g_staged_ready.store(false, .monotonic);
     // An edit made while the event was in flight wins: their hands beat their
     // history.
-    if (g_relays_are_mine) return false;
+    if (relayListIsOwned()) return false;
     lockRelayTable();
     g_relays = g_staged_relays;
     unlockRelayTable();
@@ -287,7 +313,7 @@ fn adoptRelayList() bool {
         if (e.used) n = @intCast(i + 1);
     }
     if (n > g_relay_count.load(.monotonic)) g_relay_count.store(n, .release);
-    g_relays_are_mine = true;
+    claimRelayList();
     forgetOutboxAcks();
     saveRelays();
     // Deliberately NOT marked dirty: this list came FROM their kind:10002, and
@@ -327,7 +353,7 @@ const relay_list_settle_s: i64 = 2;
 fn relayListEdited() void {
     saveRelays();
     forgetOutboxAcks();
-    g_relays_are_mine = true;
+    claimRelayList();
     g_relay_list_dirty = true;
     g_relay_list_touched = nowSeconds();
 }
@@ -377,6 +403,12 @@ fn isReaderNote(kind: u16) bool {
 fn publishRelayList(fx: *Effects) void {
     // A guest has no identity to sign with, and their list stays local.
     if (activePubkey() == null) return;
+    // NOTHING is published over a list that has not been read. A relay list is
+    // replaceable: publishing one replaces whatever the reader had, on every
+    // relay. The pool in memory is only safe to publish once it IS this
+    // account's, which means either they edited it here or it came from their
+    // own kind:10002.
+    if (!relayListIsOwned()) return;
     const gpa = std.heap.page_allocator;
     var tags = std.ArrayList(nostr.event.Tag).empty;
     for (0..relaySlots()) |i| {
@@ -391,9 +423,144 @@ fn publishRelayList(fx: *Effects) void {
     }
     const owned = tags.toOwnedSlice(gpa) catch return;
     if (owned.len == 0) return;
+    // Past whatever is already stored. A replaceable event whose stamp does not
+    // beat the stored one is dropped by this store and by every relay, so an
+    // edit could vanish everywhere while the app showed it applied.
+    const created = @max(nowSeconds(), ownRecordCreatedAt(relay_list_kind) + 1);
     // A relay list carries everything in its tags: the content is empty by
     // NIP-65, not by omission.
-    signAndPublish(fx, gpa, nowSeconds(), relay_list_kind, owned, "", false);
+    signAndPublish(fx, gpa, created, relay_list_kind, owned, "", false);
+}
+
+// ------------------------------------------------------- your own lists
+//
+// kind:0, kind:3 and kind:10002 are REPLACEABLE. The store enforces that the way
+// relays do: `ingestReplaceable` DELETES the superseded event and its indexes in
+// the same transaction. That is right for other people's records, and it means
+// that the moment a newer version of one of OUR OWN lists arrives, the version
+// it replaces is gone from this machine with no way back.
+//
+// Usually that is fine, because the newer one is ours too. It is not fine when
+// the newer one is wrong: a list published by a client with a bad clock, a list
+// this app itself published from a pool it should not have, a relay replaying
+// something ancient. Losing a contact list is not a display bug.
+//
+// So every ingest goes through one door, and that door keeps a copy of what is
+// about to be overwritten.
+
+/// How many superseded versions of each of our own lists to keep. Small on
+/// purpose: this is a way back from the last mistake, not an archive. The
+/// store's KV has no cursor and no delete, so a growing key scheme could never
+/// be read back or pruned; one rewritten key per (kind, pubkey) can be both.
+const own_backup_keep = 3;
+
+/// The key holding this account's replaced versions of `kind`.
+fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, pubkey);
+    return std.fmt.bufPrint(buf, "backup/{d}/{s}", .{ kind, hex[0..] }) catch buf[0..0];
+}
+
+/// Whether a kind is one of OUR lists worth keeping a copy of. Deliberately
+/// short: a backup for a kind nothing writes is a guess about the future, and
+/// this app writes exactly these.
+fn isOwnList(kind: u16) bool {
+    return kind == 0 or kind == relay_list_kind;
+}
+
+/// The one door into the store.
+///
+/// Every `store.ingest` in this app goes through here, because the backup has to
+/// happen BEFORE the write that destroys what it is backing up, and a single
+/// missed call site is a contact list lost while the app believes it has a copy.
+fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.store.IngestOptions) !nostr.store.IngestResult {
+    const store = g_store orelse return error.NoStore;
+    backupIfOwnList(gpa, store, ev);
+    return store.ingest(gpa, ev, options);
+}
+
+/// Keeps a copy of the version `ev` is about to replace, when `ev` is one of our
+/// own lists. Best effort by design: a backup that failed must never stop the
+/// event being stored, or a full disk would freeze the feed.
+fn backupIfOwnList(gpa: std.mem.Allocator, store: *nostr.store.Store, ev: nostr.event.Event) void {
+    if (!isOwnList(ev.kind)) return;
+    const pk = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &pk, &ev.pubkey)) return;
+
+    const kinds = [_]u16{ev.kind};
+    const authors = [_][32]u8{pk};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return;
+    defer result.deinit();
+    if (result.events.len == 0) return;
+    const previous = result.events[0];
+    // Not a replacement: the same event arriving twice, or an older one the
+    // store is about to refuse anyway.
+    if (std.mem.eql(u8, &previous.id, &ev.id)) return;
+    if (previous.created_at >= ev.created_at) return;
+
+    const json = nostr.event.toJson(gpa, previous) catch return;
+    defer gpa.free(json);
+
+    var key_buf: [96]u8 = undefined;
+    const key = ownBackupKey(&key_buf, ev.kind, pk);
+    if (key.len == 0) return;
+
+    // Newest first, oldest dropped: the reader wants the version from a minute
+    // ago, not the one from last year, and the KV cannot be pruned any other way.
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, json) catch return;
+    out.append(gpa, '\n') catch return;
+    if (store.get(gpa, key) catch null) |old| {
+        defer gpa.free(old);
+        var lines = std.mem.tokenizeScalar(u8, old, '\n');
+        var kept: usize = 1;
+        while (lines.next()) |line| {
+            if (kept >= own_backup_keep) break;
+            if (line.len == 0) continue;
+            out.appendSlice(gpa, line) catch return;
+            out.append(gpa, '\n') catch return;
+            kept += 1;
+        }
+    }
+    store.put(key, out.items) catch {};
+}
+
+/// Points the app's store at a test's own, so the funnel can be driven for real.
+pub fn setStoreForTest(store: ?*nostr.store.Store) void {
+    g_store = store;
+}
+
+pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
+    return plazaIngest(gpa, ev, .{});
+}
+
+/// The versions of `kind` this account has had replaced, newest first. This is
+/// the half that makes the backup real: a copy nothing can read back is not a
+/// copy, it is a belief.
+pub fn ownListBackups(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const store = g_store orelse return null;
+    const pk = activePubkey() orelse return null;
+    var key_buf: [96]u8 = undefined;
+    const key = ownBackupKey(&key_buf, kind, pk);
+    if (key.len == 0) return null;
+    return store.get(gpa, key) catch null;
+}
+
+/// When this account's newest stored event of `kind` was signed, or 0.
+///
+/// Every replaceable record this app writes needs this: a new one must beat the
+/// stored one or it is dropped silently, by this store and by every relay, while
+/// the app goes on showing the change as applied.
+fn ownRecordCreatedAt(kind: u16) i64 {
+    const store = g_store orelse return 0;
+    const pk = activePubkey() orelse return 0;
+    const kinds = [_]u16{kind};
+    const authors = [_][32]u8{pk};
+    var result = store.query(std.heap.page_allocator, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return 0;
+    defer result.deinit();
+    if (result.events.len == 0) return 0;
+    return result.events[0].created_at;
 }
 
 /// Where the reader's relay list lives on disk, for a guest and as the fallback
@@ -410,23 +577,35 @@ fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
         return;
     };
     defer dir.close(io);
-    var buf: [max_relays * 128]u8 = undefined;
+    var buf: [max_relays * 128 + 80]u8 = undefined;
     const raw = dir.readFile(io, relays_file, &buf) catch {
         seedBootstrapRelays();
         return;
     };
     var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
     var added: usize = 0;
+    var owner: ?[32]u8 = null;
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         var parts = std.mem.tokenizeScalar(u8, trimmed, ' ');
-        const url = parts.next() orelse continue;
-        if (!isRelayUrl(url)) continue;
+        const first = parts.next() orelse continue;
+        // `owner <hex>`: whose list this is. A file with no owner line is one
+        // this app wrote before it recorded that, or a guest's, and belongs to
+        // nobody: it seeds the pool but never refuses an incoming kind:10002.
+        if (std.mem.eql(u8, first, "owner")) {
+            const hex = parts.next() orelse continue;
+            var pk: [32]u8 = undefined;
+            if (hex.len == 64) {
+                if (std.fmt.hexToBytes(&pk, hex)) |_| owner = pk else |_| {}
+            }
+            continue;
+        }
+        if (!isRelayUrl(first)) continue;
         const marker = parts.next();
         const read = marker == null or std.mem.eql(u8, marker.?, "read");
         const write = marker == null or std.mem.eql(u8, marker.?, "write");
-        if (addRelay(url, read, write) != null) added += 1;
+        if (addRelay(first, read, write) != null) added += 1;
     }
     // A file that exists but holds nothing usable would leave the app with no
     // way to reach anyone, which is worse than ignoring it.
@@ -434,9 +613,12 @@ fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
         seedBootstrapRelays();
         return;
     }
-    // A saved list is theirs: a kind:10002 that arrives later does not get to
-    // undo it, because they may have edited it here since.
-    g_relays_are_mine = true;
+    // A saved list is its OWNER's. Logging out writes the bootstrap pool to this
+    // same file, so "a file exists" says nothing about whose relays are in it,
+    // and reading it as the signed-in account's would let five default relays be
+    // published over a real NIP-65 list.
+    g_relay_owner = owner;
+    g_relays_are_mine = owner != null;
 }
 
 /// Writes the list back in the same plain form.
@@ -445,8 +627,15 @@ fn saveRelays() void {
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-    var buf: [max_relays * 128]u8 = undefined;
+    var buf: [max_relays * 128 + 80]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
+    // Whose list this is, first. Without it a file written while signed out (the
+    // bootstrap pool) reads back as the next account's own list.
+    if (g_relay_owner) |owner| {
+        var hex: [64]u8 = undefined;
+        hexLower(&hex, owner);
+        w.print("owner {s}\n", .{hex[0..]}) catch return;
+    }
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
         const marker: []const u8 = if (e.read and e.write) "" else if (e.read) " read" else " write";
@@ -514,6 +703,7 @@ fn resetRelaysToBootstrap() void {
     unlockRelayTable();
     g_relay_count.store(0, .release);
     g_relays_are_mine = false;
+    g_relay_owner = null;
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     g_relay_list_dirty = false;
@@ -596,6 +786,15 @@ pub fn poolIsHealthyOfForTest(live: usize, total: usize) bool {
 
 pub fn markRelaysMineForTest() void {
     g_relays_are_mine = true;
+    g_relay_owner = activePubkey();
+}
+
+pub fn relayListIsOwnedForTest() bool {
+    return relayListIsOwned();
+}
+
+pub fn relayOwnerForTest() ?[32]u8 {
+    return g_relay_owner;
 }
 
 pub fn relayIsMineForTest() bool {
@@ -2128,10 +2327,7 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
             var msg = (relay.receive() catch break) orelse break;
             defer msg.deinit();
             switch (msg.value) {
-                .event => |e| {
-                    const store = g_store orelse continue;
-                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
-                },
+                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
                 // Everything stored has been sent; no need to hold the socket.
                 .eose => break,
                 else => {},
@@ -2748,10 +2944,7 @@ fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len
             var msg = (relay.receive() catch break) orelse break;
             defer msg.deinit();
             switch (msg.value) {
-                .event => |e| {
-                    const store = g_store orelse continue;
-                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
-                },
+                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
                 .eose => break,
                 else => {},
             }
@@ -4063,7 +4256,7 @@ pub const Model = struct {
     /// The feed's scope line: how many hand-picked voices it is scoped to.
     pub fn scope_voices(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{starter_pack.len}) catch "hand-picked";
+        return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{followSet().len}) catch "hand-picked";
     }
 
     /// The note with this id, if it is still in the feed or the open thread. A
@@ -4196,8 +4389,13 @@ pub const Model = struct {
         // notes, so it reads as a real follow feed, not a firehose. Filtering
         // here (not just at the subscription) also hides notes an earlier,
         // unscoped run may have left in the store.
-        var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
-        var authors_len: usize = starter_pack.len;
+        var authors: [max_follows + 1][32]u8 = undefined;
+        var authors_len: usize = 0;
+        for (followSet()) |pk| {
+            if (authors_len >= max_follows) break;
+            authors[authors_len] = pk;
+            authors_len += 1;
+        }
         if (activePubkey()) |pk| {
             authors[authors_len] = pk;
             authors_len += 1;
@@ -4301,19 +4499,27 @@ var g_notes_names_generation: u64 = 0;
 /// this always reflects the current metadata.
 fn refreshProfiles(store: *nostr.store.Store) void {
     const kinds = [_]u16{0};
-    var authors: [starter_pack.len + 1 + wanted_profiles_cap][32]u8 = undefined;
+    // Bounds-checked at every push. This array used to be sized off the
+    // comptime pack with no checks, so the first runtime follow list longer than
+    // nine would have written past it: silent stack corruption in a release
+    // build, from a feature that has nothing to do with profiles.
+    var authors: [max_follows + 1 + wanted_profiles_cap][32]u8 = undefined;
     var authors_len: usize = 0;
-    for (starter_pack) |pk| {
+    for (followSet()) |pk| {
+        if (authors_len >= authors.len) break;
         authors[authors_len] = pk;
         authors_len += 1;
     }
     if (activePubkey()) |pk| {
-        authors[authors_len] = pk;
-        authors_len += 1;
+        if (authors_len < authors.len) {
+            authors[authors_len] = pk;
+            authors_len += 1;
+        }
     }
     // Anyone a note mentioned, so their name resolves once it arrives.
     for (&g_wanted) |*w| {
         if (!w.used) continue;
+        if (authors_len >= authors.len) break;
         authors[authors_len] = w.pubkey;
         authors_len += 1;
     }
@@ -8002,8 +8208,8 @@ pub fn splitByFollowGraphForTest(ui: *AppUi, blocks: []const ThreadBlock, author
     return splitByFollowGraph(ui, blocks, author);
 }
 
-pub fn starterPackForTest() []const [32]u8 {
-    return &starter_pack;
+pub fn followSetForTest() []const [32]u8 {
+    return followSet();
 }
 
 /// The two tiers of a thread's replies, in their original order.
@@ -8044,6 +8250,20 @@ fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) G
     return .{ .inside = inside[0..ni], .outside = outside[0..no] };
 }
 
+/// The most accounts this app will read from. A follow list of a few thousand
+/// is normal on Nostr; a filter naming them all is roughly 130 KB of REQ, past
+/// the payload cap several relays close the connection over, and a store query
+/// opens one cursor per author. Both of those get solved when following writes
+/// a real list; this is the number the buffers are sized to until then.
+pub const max_follows = 128;
+
+/// Who this reader reads. The starter pack until following writes a contact
+/// list of their own, and one seam either way, so the day the list becomes
+/// theirs no caller has to learn a second shape.
+pub fn followSet() []const [32]u8 {
+    return &starter_pack;
+}
+
 /// Whether a pubkey is inside the reader's follow graph: the accounts whose
 /// replies rank first in a thread. That is the live follow list, which is the
 /// starter pack until following writes a contact list of its own, plus the reader.
@@ -8051,7 +8271,7 @@ pub fn inFollowGraph(pubkey: [32]u8) bool {
     if (activePubkey()) |me| {
         if (std.mem.eql(u8, &me, &pubkey)) return true;
     }
-    for (starter_pack) |followed| {
+    for (followSet()) |followed| {
         if (std.mem.eql(u8, &followed, &pubkey)) return true;
     }
     return false;
@@ -11820,8 +12040,7 @@ fn ownProfileWorker(pk: [32]u8) void {
             defer msg.deinit();
             switch (msg.value) {
                 .event => |e| {
-                    const store = g_store orelse continue;
-                    const result = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
                     // A relay can send any event down any subscription. Only a
                     // VERIFIED one counts as this account's own profile.
                     if (result != .invalid) answered = true;
@@ -12124,15 +12343,15 @@ fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) []const nostr
 /// process-lifetime allocation, since the detached publisher reads it after
 /// this returns.
 fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer) void {
-    const store = g_store orelse return;
+    if (g_store == null) return;
     if (verify) |signer| {
         // A note we did not produce: verification is the gate into the store
         // AND the pool, so a bad signature is dropped rather than propagated.
-        _ = store.ingest(gpa, ev, .{ .verify_with = signer }) catch return;
+        _ = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return;
     } else {
         // A note we just signed: a store failure (e.g. a duplicate id) must not
         // stop it reaching the pool.
-        _ = store.ingest(gpa, ev, .{}) catch {};
+        _ = plazaIngest(gpa, ev, .{}) catch {};
     }
     // Queued BEFORE the walk, so a note that never reaches a relay is still a
     // note the app knows it owes the reader. A queue with no room says so:
@@ -12864,8 +13083,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
             defer msg.deinit();
             switch (msg.value) {
                 .event => |e| {
-                    const store = g_store orelse continue;
-                    _ = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                    _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {};
                     // Queue the replier's profile so a name and face resolve.
                     wantProfile(e.event.pubkey);
                     if (id_count < thread_reply_cap) {
@@ -13858,8 +14076,14 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // Follow-scoped: the starter pack's recent notes for the feed, plus their
     // kind:0 metadata (and the user's own) so the feed can show real names and
     // avatars. Two filters share one subscription.
-    var authors: [starter_pack.len + 1][32]u8 = starter_pack ++ [_][32]u8{undefined};
-    var authors_len: usize = starter_pack.len;
+    var authors: [max_follows + 1][32]u8 = undefined;
+    var authors_len: usize = 0;
+    for (followSet()) |pk| {
+        if (authors_len >= max_follows) break;
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    const follow_count = authors_len;
     if (activePubkey()) |pk| {
         authors[authors_len] = pk;
         authors_len += 1;
@@ -13870,7 +14094,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // suggestion under the add field a fact rather than a guess.
     const profile_kinds = [_]u16{ 0, relay_list_kind };
     const filters = [_]nostr.filter.Filter{
-        .{ .authors = &starter_pack, .kinds = &feed_kinds, .limit = feed_capacity },
+        .{ .authors = authors[0..follow_count], .kinds = &feed_kinds, .limit = feed_capacity },
         .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
     };
     // A relay marked write-only is not asked anything. It keeps its socket, so a
@@ -13932,13 +14156,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         switch (msg.value) {
             .event => |e| {
                 if (std.mem.eql(u8, e.subscription_id, "plaza-feed")) {
-                    const store = g_store orelse continue;
                     // Verify (secp256k1) before storing; silently drop a bad event.
                     // `.invalid` is a RETURNED VALUE here, not an error: a
                     // forged event does not throw, it comes back saying it did
                     // not verify. Reading only the error channel let a relay
                     // hand this reader a relay list signed by nobody.
-                    const result = store.ingest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
                     if (result == .invalid) continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
