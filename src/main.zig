@@ -4470,7 +4470,7 @@ pub const Note = struct {
     /// Copied in rather than read at render time because it is foreign text on a
     /// borrowed event: the buffer is the sanitiser's output, bounded here so a
     /// name can never be longer than the row that draws it.
-    client_buf: [client_name_max]u8 = [_]u8{0} ** client_name_max,
+    client_buf: [client_name_bytes]u8 = [_]u8{0} ** client_name_bytes,
     client_len: u8 = 0,
     // Thread placement, stamped by `arrangeThread`: how deep this reply sits
     // under the root (1 = a direct reply). Meaningless outside an arranged
@@ -9381,11 +9381,15 @@ fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
             .{ .style = .{ .foreground = p.text_faint_alt } },
             &.{.{
                 .text = if (seen > 0)
-                    ui.fmt("{s} · {s}", .{ absoluteNoteTime(ui.arena, note.created_at), pluralize(ui, seen, "seen on {d} relay", "seen on {d} relays") })
+                    ui.fmt("{s} · {s}{s}", .{
+                        absoluteNoteTime(ui.arena, note.created_at),
+                        pluralize(ui, seen, "seen on {d} relay", "seen on {d} relays"),
+                        viaSuffix(ui, note),
+                    })
                 else
                     // Nothing delivered it this session (it came off disk), so the
-                    // line says when it was written and stops there.
-                    absoluteNoteTime(ui.arena, note.created_at),
+                    // line says when it was written and what wrote it, and stops.
+                    ui.fmt("{s}{s}", .{ absoluteNoteTime(ui.arena, note.created_at), viaSuffix(ui, note) }),
                 .monospace = true,
                 .scale = mono_hint_scale,
             }},
@@ -9487,7 +9491,7 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
             ui.spacer(1),
             focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
             ui.spacer(1),
-            focalStat(ui, "zap", @intCast(counts.zap_msat / 1000), "{d} sat", "{d} sats", p.text_verb),
+            focalStat(ui, "zap", counts.zap_msat / 1000, "{d} sat", "{d} sats", p.text_verb),
             ui.spacer(1),
             focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
             hgap(ui, 40),
@@ -9507,7 +9511,13 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
 fn focalStat(
     ui: *AppUi,
     glyph: []const u8,
-    n: u32,
+    // u64, like every sibling that prices the same numbers. A zap total is a
+    // saturating sum of amounts parsed out of strangers' `bolt11` strings, which
+    // nothing validates and nothing can: one receipt claiming an absurd figure
+    // used to be narrowed here with `@intCast`, which is a panic in a safety
+    // build and a silently truncated number in the shipped one. Anyone could
+    // publish that event.
+    n: u64,
     comptime one: []const u8,
     comptime many: []const u8,
     tint: canvas.Color,
@@ -10287,7 +10297,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 ui.row(.{ .gap = 6, .cross = .start }, .{
                     identityBlock(ui, note),
                     ui.spacer(1),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, note.time()),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, meta_scale)),
                 }),
                 vgap(ui, 5),
                 noteBody(ui, note, true),
@@ -10589,7 +10599,7 @@ fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                         ui.spacer(0),
                     nestedHandle(ui, note),
                     ui.spacer(1),
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = nested_meta_scale }}),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, nested_meta_scale)),
                 }),
                 vgap(ui, 3),
                 noteBodyAt(ui, note, true, nested_body_scale, p.text_nested),
@@ -10755,14 +10765,14 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                 .gap = 0,
                 .on_press = if (ready) Msg.reply_submit else null,
                 .style = .{ .quiet_hover = true },
-                // Not a button until there is something to send. The SDK's
-                // semantics have no "disabled" bit, so the honest choice between
-                // announcing an unavailable button and announcing no button is
-                // the second one: the word "Reply" is still on screen, visibly
-                // dimmed. This also keeps the rule that a button role always has
-                // something behind it exactly true, with no exception list to
-                // hide the next dead control in.
-                .semantics = .{ .role = if (ready) .button else .none, .label = "Reply", .focusable = ready },
+                // A button that is currently unavailable, said in the words the
+                // platform has for it. `disabled` empties the widget's advertised
+                // actions at the source (`semanticActions` returns nothing for a
+                // disabled widget), so it announces the true thing to a screen
+                // reader, "Reply, dimmed", rather than a button that is silent
+                // about why pressing it does nothing.
+                .disabled = !ready,
+                .semantics = .{ .role = .button, .label = "Reply", .focusable = ready },
             }, .{
                 ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = if (ready) p.accent else p.surface_rail_tile, .radius = 8, .stroke_width = 0 } }, .{
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
@@ -12059,7 +12069,14 @@ fn menuRow(ui: *AppUi, label: []const u8, glyph: ?[]const u8, hint: ?[]const u8,
         .cross = .center,
         .gap = 0,
         .on_press = press,
-        .semantics = .{ .role = .button, .label = label, .focusable = press != null },
+        // Some rows in this menu are statements, not choices: "This is you", and
+        // the line explaining why following is not offered yet. Those carry no
+        // press, so they are not buttons and must not say they are.
+        .semantics = .{
+            .role = if (press != null) .button else .none,
+            .label = label,
+            .focusable = press != null,
+        },
     }, .{
         hgap(ui, 9),
         vgap(ui, 25),
@@ -15208,25 +15225,65 @@ fn timeSpans(ui: *AppUi, note: *const Note, scale: f32) []const canvas.TextSpan 
     return two;
 }
 
+/// " · via X" for a line that is already a single string, empty when the note
+/// says nothing. The span form above is for the rows that draw the time on its
+/// own; the focal note builds one sentence, so it needs the text form.
+fn viaSuffix(ui: *AppUi, note: *const Note) []const u8 {
+    const name = note.client();
+    if (name.len == 0) return "";
+    return ui.fmt(" · via {s}", .{name});
+}
+
 /// What a note says it was written with, if it says anything.
 ///
 /// Foreign text from a stranger's event, so it is treated as such: a name longer
 /// than a label is not a label, and control characters in a meta row are how a
 /// row stops looking like a row. An absent or unusable tag draws nothing at all,
 /// never "via unknown", because what a note does not say is not a fact about it.
-const client_name_max = 24;
+/// In BYTES, which is what the buffer holds, and in CHARACTERS, which is what a
+/// reader sees. Both are needed: a byte cap alone is about eight characters of
+/// Japanese and twenty-four of English, so it silently refuses a legitimate name
+/// in one script and accepts a much wider one in another.
+/// 48 so that the CHARACTER cap is the one that binds in every script that
+/// matters here: fourteen three-byte characters fit, which is what makes the
+/// Japanese case behave like the English one rather than being cut a third
+/// shorter for no reason a reader could see.
+const client_name_bytes = 48;
+const client_name_chars = 14;
 
 pub fn clientOf(ev: nostr.event.Event) ?[]const u8 {
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "client")) continue;
         const name = std.mem.trim(u8, tag[1], " \t\r\n");
-        if (name.len == 0 or name.len > client_name_max) return null;
+        if (name.len == 0) return null;
         for (name) |c| {
             if (c < 0x20 or c == 0x7f) return null;
         }
-        return name;
+        // TRUNCATED, not refused. A name too long for the row is still evidence
+        // about the note; refusing it outright threw away the whole fact, and
+        // did so unevenly by script.
+        return clipToChars(name, client_name_chars, client_name_bytes);
     }
     return null;
+}
+
+/// The longest prefix of `s` that is at most `max_chars` codepoints and
+/// `max_bytes` bytes, cut on a UTF-8 boundary.
+///
+/// Codepoints rather than bytes because the cap exists to bound WIDTH, and a
+/// three-byte character is not three characters wide. Cutting mid-sequence would
+/// hand the renderer an invalid string, which is a different bug.
+fn clipToChars(s: []const u8, max_chars: usize, max_bytes: usize) []const u8 {
+    var i: usize = 0;
+    var chars: usize = 0;
+    while (i < s.len and chars < max_chars) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return s[0..i];
+        if (i + len > s.len or i + len > max_bytes) break;
+        _ = std.unicode.utf8Decode(s[i .. i + len]) catch return s[0..i];
+        i += len;
+        chars += 1;
+    }
+    return s[0..i];
 }
 
 /// Publishes the reply composer's text as a NIP-10 reply to the open thread's

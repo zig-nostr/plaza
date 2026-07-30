@@ -6419,12 +6419,17 @@ test "a note says nothing about what wrote it unless the reader asks" {
 }
 
 test "what a stranger's note claims about its client is treated as foreign text" {
-    const long = "x" ** 40;
     const cases = [_]struct { value: []const u8, shown: ?[]const u8 }{
         .{ .value = "Plaza", .shown = "Plaza" },
         .{ .value = "  Amethyst  ", .shown = "Amethyst" },
-        // Longer than a label is not a label.
-        .{ .value = long, .shown = null },
+        // Too long for the row is CUT, not thrown away: the name is still
+        // evidence about the note, and refusing it outright discarded the whole
+        // fact. Fourteen characters.
+        .{ .value = "x" ** 40, .shown = "x" ** 14 },
+        // And cut by CHARACTER, not by byte. A byte cap is about eight
+        // characters of Japanese and twenty-four of English, so it refused a
+        // legitimate name in one script and accepted a far wider one in another.
+        .{ .value = "クライアントの名前がとても長い", .shown = "クライアントの名前がとても長" },
         // A newline in a meta row is how a row stops looking like a row.
         .{ .value = "Damus\nHACKED", .shown = null },
         .{ .value = "", .shown = null },
@@ -6549,6 +6554,17 @@ test "nothing that calls itself a button is dead" {
                 m.composing = true;
             }
         }.f },
+        .{ .name = "note menu", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.viewing_thread = 1;
+                m.thread_root = threadNote(0xAA, 100, 0);
+                m.thread_root.id = 1;
+                // The state the first version of this test could not reach, and
+                // where its invariant was already false.
+                m.note_menu = true;
+            }
+        }.f },
         .{ .name = "notifications", .prepare = struct {
             fn f(m: *main.Model) void {
                 m.stage = .ready;
@@ -6579,15 +6595,20 @@ test "nothing that calls itself a button is dead" {
 
 /// Counts widgets that announce a button role but carry no handler of any kind.
 fn countDeadButtons(tree: AppUi.Tree, widget: canvas.Widget, out: *usize) void {
-    // Every role that PROMISES the reader something happens. A button is the
-    // obvious one; a checkbox, a radio and a tab make the same promise in a
-    // different shape, and a dead control could otherwise slip past simply by
-    // wearing one of those instead.
-    const interactive = switch (widget.semantics.role) {
-        .button, .checkbox, .radio, .tab => true,
-        else => false,
-    };
-    if (interactive) {
+    // Ask the SDK what this widget ADVERTISES, never what the app happened to
+    // declare. `semanticActions` is the same function the platform bridge calls
+    // to build the accessibility node, so it is the actual promise made to the
+    // reader: it folds in the widget's KIND (a `ui.button` announces a press
+    // without the app writing `.role = .button` anywhere), and it returns nothing
+    // at all for a disabled widget, which is how an unavailable control says so
+    // honestly.
+    //
+    // The first version of this guard read `widget.semantics.role` instead. Plaza
+    // declares that role almost nowhere, because the kinds already imply it, so
+    // the guard inspected a fraction of the controls it claimed to cover and
+    // matched zero checkboxes in an app with two.
+    const advertised = canvas.semanticActions(widget);
+    if (advertised.press or advertised.toggle) {
         var wired = false;
         for (tree.handlers) |h| {
             if (h.id == widget.id) wired = true;
@@ -6644,4 +6665,48 @@ test "the client-tag switch is wired, and flipping it sticks" {
 
     main.update(&model, .client_tag_toggle, &fx);
     try testing.expect(!main.clientTag());
+}
+
+test "a zap total no invoice could hold does not take the screen down with it" {
+    // `bolt11` is a string on somebody else's event. Nothing validates it, and
+    // nothing can: a zap receipt is a text field anyone may publish. The action
+    // bar narrowed that saturating u64 total into a u32 to draw it, which is an
+    // abort in a safety build and a silently wrong number in the shipped one, and
+    // the input costs an attacker one signature.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.event_id = [_]u8{0xAA} ** 32;
+    // The engagement table is keyed by the id DERIVED from the e tag, so the note
+    // has to carry that same key or the count lands nowhere.
+    model.thread_root.id = @intCast(std.mem.readInt(u64, model.thread_root.event_id[0..8], .big) & std.math.maxInt(i64));
+    model.viewing_thread = model.thread_root.id;
+
+    var e_hex: [64]u8 = undefined;
+    for (model.thread_root.event_id, 0..) |b, i| _ = std.fmt.bufPrint(e_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // One receipt claiming more millisats than there are millisats.
+    const receipt = nostr.event.Event{
+        .id = [_]u8{0x9F} ** 32,
+        .pubkey = [_]u8{0x77} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 9735,
+        .tags = &.{ &.{ "e", &e_hex }, &.{ "bolt11", "lnbc1000000000m1xxxx" } },
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.countEngagementForTest(receipt, &.{model.thread_root.id});
+    // Well past what a u32 of sats can hold.
+    try testing.expect(main.engagementFor(model.thread_root.id).zap_msat / 1000 > std.math.maxInt(u32));
+
+    // The screen still builds. Before, this line aborted the process.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(tree.root.children.len > 0);
 }
