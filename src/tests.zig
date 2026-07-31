@@ -7218,6 +7218,67 @@ test "a page with no name on it says the npub once" {
     try testing.expectEqual(@as(usize, 1), countAnyText(named.root, short));
 }
 
+test "a suppressed npub does not shove the line beside it out of true" {
+    // The npub row stands down for a nameless person. If it stands down by
+    // becoming a zero-width spacer, the row's gap is still charged for it and
+    // "follows you" lands 8px inside the left rule that the name, bio, links and
+    // counts all share. `handleLine` documents that trap for the note row; this
+    // is the profile card walking into it.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    main.setIdentityForTest([_]u8{0x4D} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/follows.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Somebody with a contact list naming me and NO kind:0 at all. A real state,
+    // not a contrived one: the two arrive as separate events, and a profile that
+    // only ever set a picture never gets a name.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x51} ** 32);
+    var me_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&me_hex, "{x}", .{&me}) catch unreachable;
+    const tags = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    const contacts = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, contacts);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .{ .open_person = kp.public_key }, &fx);
+
+    const p = try painted.Painted.render(arena, &model);
+    const follows = frameOfText(p, "follows you") orelse return error.NoFollowsLine;
+    // The npub appears twice: the header band centres it, and the card's name
+    // line carries it. The card's is the lower one, and it is the left rule that
+    // matters here.
+    const short = main.npubShortForTest(arena, kp.public_key);
+    var name: ?native_sdk.geometry.RectF = null;
+    for (p.layout.nodes) |node| {
+        if (!std.mem.eql(u8, node.widget.text, short)) continue;
+        if (name == null or node.widget.frame.y > name.?.y) name = node.widget.frame;
+    }
+    const name_line = name orelse return error.NoNameLine;
+    // Same left rule, to within a hair of rounding.
+    if (@abs(follows.x - name_line.x) > 1.0) {
+        std.debug.print("\"follows you\" starts at x={d}, the name line at x={d}\n", .{ follows.x, name_line.x });
+        return error.OutOfTrue;
+    }
+}
+
 test "your own page is written for you, not about you" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

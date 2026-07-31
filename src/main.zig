@@ -11585,6 +11585,11 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
     const lud16 = personLud16(pubkey);
     const is_me = isMe(pubkey);
     const named = personIsNamed(pubkey);
+    const follows_me = followsMe(pubkey);
+    // Nothing to show and no room to leave for it: with neither the npub nor the
+    // follows-you note, the row measures zero and its 5px lead-in would sit under
+    // the name as dead space. That is the freshly minted key's own page.
+    const identity_line = named or follows_me;
 
     return ui.column(.{ .gap = 0 }, .{
         // The banner, with the face riding up over its lower edge. There is no
@@ -11634,27 +11639,38 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                     ),
                     personCheck(ui, pubkey),
                 }),
-                vgap(ui, 5),
-                ui.row(.{ .cross = .center, .gap = 8 }, .{
-                    // Skipped when the name line IS this string. A key with no
-                    // kind:0 has no name, so `personName` hands back the short
-                    // npub, and printing it again directly underneath says
-                    // nothing twice. The reader most likely to see it is the one
-                    // whose key was minted a minute ago and who has not named it
-                    // yet, which is the same reader the rail's seat now opens
-                    // this page for.
-                    if (named)
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_muted } },
-                            &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
-                        )
-                    else
-                        ui.spacer(0),
-                    if (followsMe(pubkey))
-                        ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
-                    else
-                        ui.spacer(0),
-                }),
+                // The npub is skipped when the name line IS that string. A key
+                // with no kind:0 has no name, so `personName` hands back the
+                // short npub, and printing it again directly underneath says
+                // nothing twice. The reader most likely to see it is the one
+                // whose key was minted a minute ago and has not named it yet,
+                // which is the same reader the rail's seat now opens this page
+                // for.
+                //
+                // `.gap = 0` with the 8 spelled out, NOT a gap of 8 with a
+                // zero-width spacer standing in for the npub. A row gap is
+                // charged for every flow child whatever its extent, so the
+                // spacer would still push "follows you" 8px past the left rule
+                // that the name, bio, links and counts all share. `handleLine`
+                // documents this exact trap and I walked into it anyway.
+                if (identity_line) vgap(ui, 5) else ui.spacer(0),
+                if (identity_line)
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        if (named)
+                            ui.paragraph(
+                                .{ .style = .{ .foreground = p.text_muted } },
+                                &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
+                            )
+                        else
+                            ui.spacer(0),
+                        if (named and follows_me) hgap(ui, 8) else ui.spacer(0),
+                        if (follows_me)
+                            ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
+                        else
+                            ui.spacer(0),
+                    })
+                else
+                    ui.spacer(0),
                 if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
                 if (about.len > 0)
                     ui.paragraph(
