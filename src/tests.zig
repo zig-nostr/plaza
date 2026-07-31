@@ -50,6 +50,22 @@ fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
     return null;
 }
 
+/// Whether any widget's text CONTAINS this needle (span-joined paragraphs).
+fn findAnyTextContaining(widget: canvas.Widget, needle: []const u8) bool {
+    if (std.mem.indexOf(u8, widget.text, needle) != null) return true;
+    for (widget.children) |child| {
+        if (findAnyTextContaining(child, needle)) return true;
+    }
+    return false;
+}
+
+/// How many widgets the tree holds, which is what the view budget counts.
+fn countNodes(widget: canvas.Widget) usize {
+    var n: usize = 1;
+    for (widget.children) |child| n += countNodes(child);
+    return n;
+}
+
 /// How many widgets carry this exact label. A row count, when the rows are
 /// alike: `findByLabel` says one exists, this says how many were built.
 fn countByLabel(widget: canvas.Widget, label: []const u8) usize {
@@ -6363,4 +6379,337 @@ test "the notifications sheet renders what it holds" {
     const tree = try buildTree(arena, &model);
     try testing.expect(findAnyText(tree.root, "mentioned you") != null);
     try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
+}
+
+// ------------------------------------------------------- NIP-89 the client tag
+
+test "a note says nothing about what wrote it unless the reader asks" {
+    // OFF by default, which is the choice Sepehr made and NIP-89 hints at: the
+    // tag is a small permanent fact about the reader attached to everything they
+    // write, and it follows the note to every relay forever.
+    const gpa = testing.allocator;
+    main.setClientTag(false);
+    defer main.setClientTag(false);
+
+    const base = [_]nostr.event.Tag{&.{ "e", "ab" ** 32 }};
+    {
+        const out = main.withClientTag(gpa, 1, &base);
+        try testing.expectEqual(@as(usize, 1), out.len);
+    }
+
+    main.setClientTag(true);
+    // A note, and a repost of one: the things the reader actually wrote.
+    for ([_]u16{ 1, 6 }) |kind| {
+        const out = main.withClientTag(gpa, kind, &base);
+        defer {
+            gpa.free(out[out.len - 1]);
+            gpa.free(out);
+        }
+        try testing.expectEqual(@as(usize, 2), out.len);
+        try testing.expectEqualStrings("client", out[1][0]);
+        try testing.expectEqualStrings("Plaza", out[1][1]);
+    }
+    // Machinery is not writing. A reaction and a deletion carry nothing: they
+    // would broadcast the same fact more widely for nothing the reader can see,
+    // which is the opposite of what an opt-in privacy switch is for.
+    for ([_]u16{ 7, 5, 3, 0 }) |kind| {
+        const out = main.withClientTag(gpa, kind, &base);
+        try testing.expectEqual(@as(usize, 1), out.len);
+    }
+}
+
+test "what a stranger's note claims about its client is treated as foreign text" {
+    const cases = [_]struct { value: []const u8, shown: ?[]const u8 }{
+        .{ .value = "Plaza", .shown = "Plaza" },
+        .{ .value = "  Amethyst  ", .shown = "Amethyst" },
+        // Too long for the row is CUT, not thrown away: the name is still
+        // evidence about the note, and refusing it outright discarded the whole
+        // fact. Fourteen characters.
+        .{ .value = "x" ** 40, .shown = "x" ** 14 },
+        // And cut by CHARACTER, not by byte. A byte cap is about eight
+        // characters of Japanese and twenty-four of English, so it refused a
+        // legitimate name in one script and accepted a far wider one in another.
+        .{ .value = "クライアントの名前がとても長い", .shown = "クライアントの名前がとても長" },
+        // A newline in a meta row is how a row stops looking like a row.
+        .{ .value = "Damus\nHACKED", .shown = null },
+        .{ .value = "", .shown = null },
+        .{ .value = "   ", .shown = null },
+    };
+    for (cases) |c| {
+        const ev = nostr.event.Event{
+            .id = [_]u8{0} ** 32,
+            .pubkey = [_]u8{0} ** 32,
+            .created_at = 1_800_000_000,
+            .kind = 1,
+            .tags = &.{&.{ "client", c.value }},
+            .content = "hi",
+            .sig = [_]u8{0} ** 64,
+        };
+        if (c.shown) |want| {
+            try testing.expectEqualStrings(want, main.clientOf(ev) orelse return error.NothingShown);
+        } else {
+            try testing.expect(main.clientOf(ev) == null);
+        }
+    }
+    // A note with no tag at all draws nothing, never "via unknown": what a note
+    // does not say is not a fact about it.
+    const bare = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "hi",
+        .sig = [_]u8{0} ** 64,
+    };
+    try testing.expect(main.clientOf(bare) == null);
+}
+
+test "the feed draws via without spending a node on it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const plain = nostr.event.Event{
+        .id = [_]u8{0xC1} ** 32,
+        .pubkey = [_]u8{0x51} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "no client tag here",
+        .sig = [_]u8{0} ** 64,
+    };
+    var tagged = plain;
+    tagged.id = [_]u8{0xC2} ** 32;
+    tagged.tags = &.{&.{ "client", "Amethyst" }};
+    tagged.content = "written elsewhere";
+
+    model.notes[0] = main.noteFrom(plain, 1_800_000_000);
+    model.notes[1] = main.noteFrom(tagged, 1_800_000_000);
+    model.notes_len = 2;
+
+    const before = try buildTree(arena, &model);
+    const nodes_with = countNodes(before.root);
+    try testing.expect(findAnyTextContaining(before.root, "via Amethyst"));
+    // The note that says nothing gets no "via" of its own.
+    try testing.expect(!findAnyTextContaining(before.root, "via Plaza"));
+
+    // And the row costs the same either way: the name rides as a second SPAN of
+    // the paragraph the time already occupies, not as a node beside it. A feed
+    // row is priced against a per-view ceiling that refuses the whole screen.
+    model.notes[1] = main.noteFrom(plain, 1_800_000_000);
+    model.notes[1].id = 999;
+    const after = try buildTree(arena, &model);
+    try testing.expectEqual(nodes_with, countNodes(after.root));
+}
+
+test "nothing that calls itself a button is dead" {
+    // The recurring failure in this app is not a broken control, it is a control
+    // that LOOKS live and does nothing: a badge saying "W" while filters still
+    // went out, a textarea that renders and accepts no keys, a Repost verb drawn
+    // beside a working Like. Each was found by hand, late, and only after it had
+    // been reviewed and snapshot-checked. So the invariant is stated once here:
+    // if a widget announces itself to the reader as a button, something has to
+    // happen when it is pressed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+
+    // Every screen the app can be on, including the ones layered over others.
+    const Screen = struct { name: []const u8, prepare: *const fn (*main.Model) void };
+    const screens = [_]Screen{
+        .{ .name = "feed", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+            }
+        }.f },
+        .{ .name = "thread", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.viewing_thread = 1;
+                m.thread_root = threadNote(0xAA, 100, 0);
+                m.thread_root.id = 1;
+            }
+        }.f },
+        .{ .name = "profile", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.viewing_profile = [_]u8{0x33} ** 32;
+            }
+        }.f },
+        .{ .name = "settings", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .settings;
+            }
+        }.f },
+        .{ .name = "compose", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.composing = true;
+            }
+        }.f },
+        .{
+            .name = "note menu",
+            .prepare = struct {
+                fn f(m: *main.Model) void {
+                    m.stage = .ready;
+                    m.viewing_thread = 1;
+                    m.thread_root = threadNote(0xAA, 100, 0);
+                    m.thread_root.id = 1;
+                    // The state the first version of this test could not reach, and
+                    // where its invariant was already false.
+                    m.note_menu = true;
+                }
+            }.f,
+        },
+        .{ .name = "notifications", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.notifications_open = true;
+            }
+        }.f },
+        .{ .name = "onboarding", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .onboarding;
+            }
+        }.f },
+    };
+
+    for (screens) |screen| {
+        var per_screen = std.heap.ArenaAllocator.init(testing.allocator);
+        defer per_screen.deinit();
+        var model = main.initialModel();
+        screen.prepare(&model);
+        const tree = try buildTree(per_screen.allocator(), &model);
+        var dead: usize = 0;
+        countDeadButtons(tree, tree.root, &dead);
+        if (dead != 0) {
+            std.debug.print("{s}: {d} widget(s) announce a button role with nothing behind them\n", .{ screen.name, dead });
+            return error.DeadControl;
+        }
+    }
+}
+
+/// Counts widgets that announce a button role but carry no handler of any kind.
+fn countDeadButtons(tree: AppUi.Tree, widget: canvas.Widget, out: *usize) void {
+    // Ask the SDK what this widget ADVERTISES, never what the app happened to
+    // declare. `semanticActions` is the same function the platform bridge calls
+    // to build the accessibility node, so it is the actual promise made to the
+    // reader: it folds in the widget's KIND (a `ui.button` announces a press
+    // without the app writing `.role = .button` anywhere), and it returns nothing
+    // at all for a disabled widget, which is how an unavailable control says so
+    // honestly.
+    //
+    // The first version of this guard read `widget.semantics.role` instead. Plaza
+    // declares that role almost nowhere, because the kinds already imply it, so
+    // the guard inspected a fraction of the controls it claimed to cover and
+    // matched zero checkboxes in an app with two.
+    const advertised = canvas.semanticActions(widget);
+    if (advertised.press or advertised.toggle) {
+        var wired = false;
+        for (tree.handlers) |h| {
+            if (h.id == widget.id) wired = true;
+        }
+        if (!wired) {
+            out.* += 1;
+            std.debug.print("  DEAD: label='{s}' kind={s} role={s}\n", .{ widget.semantics.label, @tagName(widget.kind), @tagName(widget.semantics.role) });
+        }
+    }
+    for (widget.children) |child| countDeadButtons(tree, child, out);
+}
+
+test "the client-tag switch is wired, and flipping it sticks" {
+    // The automation harness cannot drive a `.checkbox`: its snapshot advertises
+    // `actions=[focus,toggle]` and `widget-action ... toggle` reports "delivered"
+    // while nothing moves. That is true of the media-previews checkbox this one
+    // sits beside, so it is the harness, not this switch. It does mean the switch
+    // cannot be proven by driving the real app, which is exactly the case where a
+    // control quietly turns out to be wired to nothing. So it is proven here
+    // instead: the widget carries a toggle handler, and the message behind it
+    // changes what gets published.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setClientTag(false);
+    defer main.setClientTag(false);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+
+    const box = findByLabel(tree.root, "Say notes were written in Plaza") orelse return error.SwitchMissing;
+    var wired = false;
+    for (tree.handlers) |h| {
+        if (h.id == box.id and h.event == .toggle) wired = true;
+    }
+    try testing.expect(wired);
+
+    // And the message behind it does what the label says.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.clientTag());
+    main.update(&model, .client_tag_toggle, &fx);
+    try testing.expect(main.clientTag());
+
+    // Which is visible in what a note would carry.
+    const base = [_]nostr.event.Tag{&.{ "e", "ab" ** 32 }};
+    const out = main.withClientTag(testing.allocator, 1, &base);
+    defer {
+        testing.allocator.free(out[out.len - 1]);
+        testing.allocator.free(out);
+    }
+    try testing.expectEqual(@as(usize, 2), out.len);
+
+    main.update(&model, .client_tag_toggle, &fx);
+    try testing.expect(!main.clientTag());
+}
+
+test "a zap total no invoice could hold does not take the screen down with it" {
+    // `bolt11` is a string on somebody else's event. Nothing validates it, and
+    // nothing can: a zap receipt is a text field anyone may publish. The action
+    // bar narrowed that saturating u64 total into a u32 to draw it, which is an
+    // abort in a safety build and a silently wrong number in the shipped one, and
+    // the input costs an attacker one signature.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.event_id = [_]u8{0xAA} ** 32;
+    // The engagement table is keyed by the id DERIVED from the e tag, so the note
+    // has to carry that same key or the count lands nowhere.
+    model.thread_root.id = @intCast(std.mem.readInt(u64, model.thread_root.event_id[0..8], .big) & std.math.maxInt(i64));
+    model.viewing_thread = model.thread_root.id;
+
+    var e_hex: [64]u8 = undefined;
+    for (model.thread_root.event_id, 0..) |b, i| _ = std.fmt.bufPrint(e_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // One receipt claiming more millisats than there are millisats.
+    const receipt = nostr.event.Event{
+        .id = [_]u8{0x9F} ** 32,
+        .pubkey = [_]u8{0x77} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 9735,
+        .tags = &.{ &.{ "e", &e_hex }, &.{ "bolt11", "lnbc1000000000m1xxxx" } },
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.countEngagementForTest(receipt, &.{model.thread_root.id});
+    // Well past what a u32 of sats can hold.
+    try testing.expect(main.engagementFor(model.thread_root.id).zap_msat / 1000 > std.math.maxInt(u32));
+
+    // The screen still builds. Before, this line aborted the process.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(tree.root.children.len > 0);
 }
