@@ -7416,7 +7416,7 @@ test "with no keyholder the create rung says why and stops being a button" {
     // And the reason sits under the card, where a wrapping line has room to be
     // three lines long. `the ladder's rungs hold their own copy` is what keeps
     // it from drifting back INTO the card, where it paints outside the border.
-    try testing.expect(findAnyTextContaining(tree.root, "missing the keyholder that would hold your key"));
+    try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
 
     // The two rungs that still work are untouched, and bringing a key gives up
     // its Signet promise, because with no daemon the paste lands in this
@@ -7548,7 +7548,7 @@ test "the fallback welcome screen stops selling a key it cannot make" {
 
     const create = findByText(tree.root, .button, "Create your identity") orelse return error.NoCreateButton;
     try testing.expect(create.state.disabled);
-    try testing.expect(findAnyTextContaining(tree.root, "missing the keyholder"));
+    try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
     try testing.expect(findAnyTextContaining(tree.root, "Sign in with a key you already have"));
     try testing.expect(!findAnyTextContaining(tree.root, "A second to set up"));
     try testing.expect(!findAnyTextContaining(tree.root, "Create an identity and Plaza sets you up"));
@@ -7560,5 +7560,80 @@ test "the fallback welcome screen stops selling a key it cannot make" {
     try testing.expect(!live.state.disabled);
     try testing.expect(findAnyTextContaining(whole.root, "A second to set up"));
     try testing.expect(findAnyTextContaining(whole.root, "Create an identity and Plaza sets you up"));
-    try testing.expect(!findAnyTextContaining(whole.root, "missing the keyholder"));
+    try testing.expect(!findAnyTextContaining(whole.root, "is missing from this install"));
+}
+
+test "the executable's own directory is where the probe looks" {
+    // The half of the resolver that `resolveSibling`'s test cannot reach. If
+    // this ever returns null, or a relative path, or a directory Plaza was not
+    // launched from, `resolveHelper` declares a missing keyholder on an install
+    // that is perfectly fine and the app tells the reader to reinstall it. That
+    // is the failure mode of trusting argv[0], which is what this replaced, so
+    // the replacement is worth pinning.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = main.exeDirForTest(std.testing.io, &buf) orelse return error.NoExecutableDir;
+    try testing.expect(dir.len > 0);
+    try testing.expectEqual(@as(u8, '/'), dir[0]);
+    // And it is a directory that exists, so formatting a sibling onto it and
+    // asking whether that file is there is a question with a real answer.
+    var probe: [std.fs.max_path_bytes + 64]u8 = undefined;
+    try testing.expectEqual(
+        @as(usize, 0),
+        main.resolveSiblingForTest(std.testing.io, &probe, dir, "a-binary-plaza-does-not-ship"),
+    );
+    try std.Io.Dir.cwd().access(std.testing.io, dir, .{});
+}
+
+test "the dead rung stops looking like it works" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+
+    // Normally it is THE recommendation: the one accent-filled rung on the
+    // ladder, a button, a focus stop.
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        const w = findByLabel(tree.root, "Create your identity") orelse return error.NoRung;
+        try testing.expectEqual(canvas.WidgetRole.button, w.semantics.role);
+        try testing.expect(w.semantics.focusable);
+        const p = try painted.Painted.render(arena_state.allocator(), &model);
+        const fill = p.fillAtCenterOf("Create your identity") orelse return error.RungPaintsNothing;
+        try testing.expect(painted.sameColor(fill, theme.palette.accent));
+    }
+
+    // With no keyholder it must not merely stop working. A rung that still
+    // wears the accent and still says button, while doing nothing, is worse
+    // than one that plainly cannot: the reader presses it, twice, and concludes
+    // the app is broken rather than the install. Press-and-text assertions
+    // cannot see any of this, which is why the paint is sampled.
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const w = findByLabel(tree.root, "Create your identity") orelse return error.NoRung;
+    try testing.expectEqual(canvas.WidgetRole.text, w.semantics.role);
+    try testing.expect(!w.semantics.focusable);
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+    if (p.fillAtCenterOf("Create your identity")) |fill| {
+        try testing.expect(!painted.sameColor(fill, theme.palette.accent));
+    }
+}
+
+test "a restored Signet session on an install with no Signet says so, and does not say starting" {
+    // The reader this is for signed in on a working install and updated into a
+    // broken one: `restoreSession` runs BEFORE the probe, so they are signed
+    // straight back in and the status bar is the only thing that can tell them.
+    // "Signet starting" is what an unwritten health state reads as, and it is a
+    // word that means wait a moment about a condition that never resolves.
+    main.setIdentityForTest([_]u8{0x3C} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+
+    try testing.expect(!main.signerIsHealthy());
+    try testing.expectEqualStrings("Signet is not installed", main.signerStatusLabelForTest());
 }

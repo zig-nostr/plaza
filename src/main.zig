@@ -1694,6 +1694,19 @@ fn keyholderMissing() bool {
     return g_keyholder == .missing;
 }
 
+/// Records that there is no keyholder.
+///
+/// Only the flag. It is tempting to settle `g_helper_state` here as well, since
+/// with no daemon the health check never runs and that state is pinned at its
+/// initial 0 forever. But every reader of it already treats 0 and "unreachable"
+/// alike, so the store would change nothing that any test could tell apart, and
+/// a second mechanism nothing can distinguish from its absence is not a
+/// safeguard. The one reader that DID read 0 wrongly is `signerStatus`, and it
+/// asks this question directly now.
+fn markKeyholderMissing() void {
+    g_keyholder = .missing;
+}
+
 /// `false` restores the unprobed state rather than claiming a keyholder was
 /// found, because in a test nothing has looked for one.
 pub fn setKeyholderMissingForTest(missing: bool) void {
@@ -1732,6 +1745,20 @@ pub fn resolveSiblingForTest(io: std.Io, out: []u8, dir: []const u8, name: []con
     return resolveSibling(io, out, dir, name);
 }
 
+pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
+    return exeDir(io, buf);
+}
+
+/// Adopts the Signet signer kind for the active test identity, so the status
+/// line can be asked what it says about a daemon that is not there.
+pub fn setSignerKindHelperForTest() void {
+    g_signer_kind = .helper;
+}
+
+pub fn signerStatusLabelForTest() []const u8 {
+    return signerStatus().label;
+}
+
 /// Resolves the daemon (a sibling of Plaza's own executable, so it works both
 /// from the dev tree and a packaged bundle), mints a fresh bearer token, and
 /// writes it 0600 under ~/.plaza.
@@ -1744,15 +1771,9 @@ pub fn resolveSiblingForTest(io: std.Io, out: []u8, dir: []const u8, name: []con
 fn resolveHelper(init: std.process.Init) void {
     // The daemon lives beside Plaza's own executable.
     var dir_buf: [1024]u8 = undefined;
-    const dir = exeDir(init.io, &dir_buf) orelse {
-        g_keyholder = .missing;
-        return;
-    };
+    const dir = exeDir(init.io, &dir_buf) orelse return markKeyholderMissing();
     g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "plaza-signer");
-    if (g_helper_bin_len == 0) {
-        g_keyholder = .missing;
-        return;
-    }
+    if (g_helper_bin_len == 0) return markKeyholderMissing();
     g_keyholder = .found;
 
     const home = init.environ_map.get("HOME") orelse ".";
@@ -5174,7 +5195,7 @@ pub const Model = struct {
     /// The line under the welcome screen's create button.
     pub fn create_hint(self: *const Model) []const u8 {
         _ = self;
-        if (keyholderMissing()) return "This copy of Plaza is missing the keyholder that would hold the key, so it cannot make one. Reinstalling Plaza fixes it, or bring a key you already have.";
+        if (keyholderMissing()) return "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it, or bring a key you already have.";
         return "A second to set up. No email, no signup.";
     }
     /// The welcome screen's opening line, which normally sells making a key.
@@ -8873,7 +8894,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
                 if (keyholderMissing())
                     ui.paragraph(
                         .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                        &.{.{ .text = "Plaza is missing the keyholder that would hold your key, so it cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
+                        &.{.{ .text = "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
                     )
                 else
                     ui.spacer(0),
@@ -13095,7 +13116,15 @@ fn signerStatus() SignerStatus {
     const p = theme.palette;
     return switch (g_signer_kind) {
         // Signet: a separate process, so its health is a real question.
-        .helper => switch (g_helper_state.load(.monotonic)) {
+        //
+        // Not installed is its own answer, ahead of the state machine. A session
+        // restored onto an install with no Signet in it signs back in before the
+        // probe has even run, and "unreachable" would send that reader looking
+        // for a daemon that has crashed or a port that is busy. Nothing is
+        // coming up; the install is short a file.
+        .helper => if (keyholderMissing())
+            .{ .label = "Signet is not installed", .glyph = "signet", .color = p.status_warning }
+        else switch (g_helper_state.load(.monotonic)) {
             2 => .{ .label = "Signet ready", .glyph = "signet", .color = p.status_success },
             1 => .{ .label = "Signet has no key", .glyph = "signet", .color = p.status_warning },
             3 => .{ .label = "Signet unreachable", .glyph = "signet", .color = p.text_faint_alt },
