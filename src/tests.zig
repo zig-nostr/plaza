@@ -51,6 +51,16 @@ fn findAnyText(widget: canvas.Widget, text: []const u8) ?canvas.Widget {
 }
 
 /// Whether any widget's text CONTAINS this needle (span-joined paragraphs).
+/// The first text in the tree containing `needle`, so a test can assert about
+/// the string itself rather than only its presence.
+fn findAnyTextContainingText(widget: canvas.Widget, needle: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, widget.text, needle) != null) return widget.text;
+    for (widget.children) |child| {
+        if (findAnyTextContainingText(child, needle)) |found| return found;
+    }
+    return null;
+}
+
 fn findAnyTextContaining(widget: canvas.Widget, needle: []const u8) bool {
     if (std.mem.indexOf(u8, widget.text, needle) != null) return true;
     for (widget.children) |child| {
@@ -1477,7 +1487,7 @@ test "the name beat renders and skipping replays the intent" {
     const tree = try buildTree(arena, &model);
     try testing.expect(findAnyText(tree.root, "Want a name on it?") != null);
     try testing.expect(findAnyText(tree.root, "Skip") != null);
-    try testing.expect(findAnyText(tree.root, "Save") != null);
+    try testing.expect(findAnyText(tree.root, "Done") != null);
 
     // Skip ends the beat and the remembered intent still replays.
     model.naming = false;
@@ -6579,6 +6589,35 @@ test "nothing that calls itself a button is dead" {
                 m.stage = .onboarding;
             }
         }.f },
+        // The first-intent sheet and what follows it. Not covered until now, and
+        // the ladder's three rungs are hand-built rows rather than `ui.button`,
+        // so nothing else would have noticed one losing its press.
+        .{ .name = "join sheet", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.joining = true;
+            }
+        }.f },
+        .{ .name = "join sheet with a waiting verb", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.joining = true;
+                m.pending = .{ .like = 7 };
+            }
+        }.f },
+        .{ .name = "bunker card", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.joining = true;
+                m.bunker_mode = true;
+            }
+        }.f },
+        .{ .name = "name card", .prepare = struct {
+            fn f(m: *main.Model) void {
+                m.stage = .ready;
+                m.naming = true;
+            }
+        }.f },
     };
 
     for (screens) |screen| {
@@ -6871,4 +6910,104 @@ test "the ceremony window is spent once, not held open for the next key" {
     second.stage = .onboarding;
     main.handleHelperPubkeyForTest(&second, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
     try testing.expect(!second.naming);
+}
+
+test "the ladder offers three ways in and the way back out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    const tree = try buildTree(arena, &model);
+
+    // Each rung says what it is AND what it costs, because "Bring your key" on
+    // its own does not tell a reader that the key goes somewhere other than this
+    // window, which is the single most important fact on this sheet.
+    try testing.expect(findAnyText(tree.root, "Create your identity") != null);
+    try testing.expect(findAnyText(tree.root, "Ready in seconds. Nothing to write down.") != null);
+    try testing.expect(findAnyText(tree.root, "Bring your key") != null);
+    try testing.expect(findAnyTextContaining(tree.root, "Plaza itself never sees it."));
+    try testing.expect(findAnyText(tree.root, "Use your own signer") != null);
+    try testing.expect(findAnyText(tree.root, "Keep browsing") != null);
+}
+
+test "the sheet names the verb it interrupted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    // No verb, no pill: a reader who opened this from the rail is not owed an
+    // explanation of something they did not do.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.joining = true;
+        try testing.expect(!findAnyTextContaining((try buildTree(arena, &model)).root, "is waiting."));
+    }
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.joining = true;
+        model.pending = .post;
+        try testing.expect(findAnyText((try buildTree(arena, &model)).root, "Your note is waiting.") != null);
+    }
+}
+
+test "a display name cannot push the pill out of the sheet" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    // The name in that sentence is a stranger's kind:0 field, so it has no length
+    // and no alphabet. The pill does not wrap, so an unclipped one walks out of
+    // the card and off the window.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    const who = [_]u8{0x2C} ** 32;
+    const prof = main.upsertProfile(who).?;
+    main.parseMetadataInto(prof, "{\"display_name\":\"" ++ "wide" ** 40 ++ "\"}");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    model.pending = .{ .follow = who };
+    const tree = try buildTree(arena, &model);
+    const line = findAnyTextContainingText(tree.root, "is waiting.") orelse return error.NoPill;
+    try testing.expect(line.len < 60);
+}
+
+test "the sheets' recommended actions actually paint" {
+    // Twice in one sitting a control was built as a `.list_item` carrying a
+    // background, which paints nothing: the white "Create your identity" card and
+    // the white "Done" both rendered as dim text on the sheet's own dark surface.
+    // The widget tree was correct both times, so every structural assertion in
+    // this file passed. Only a pixel can tell the difference.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.joining = true;
+        const p = try painted.Painted.render(arena, &model);
+        const fill = p.fillAtCenterOf("Create your identity") orelse return error.NoCreateCard;
+        try testing.expect(painted.sameColor(fill, theme.palette.accent));
+    }
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.naming = true;
+        const p = try painted.Painted.render(arena, &model);
+        const fill = p.fillAtCenterOf("Done") orelse return error.NoDoneButton;
+        try testing.expect(painted.sameColor(fill, theme.palette.accent));
+    }
 }

@@ -1184,6 +1184,18 @@ const picture_default_aspect: f32 = 0.66;
 /// The composer sheet (11l): its width, the header band, and how tall the editor
 /// stands before it scrolls (about eight lines of its own register).
 const compose_sheet_width: f32 = 560;
+/// The first-intent sheet, and the name card that can follow it. Different
+/// widths on purpose: the sheet holds three choices and has to lay them out as
+/// cards; the name card holds one field and one question, and a card that wide
+/// around a single input reads as a form.
+const join_sheet_width: f32 = 372;
+const name_card_width: f32 = 340;
+const join_title_scale: f32 = 17.0 / 14.5;
+const join_sub_scale: f32 = 11.5 / 14.5;
+const join_label_scale: f32 = 9.0 / 14.5;
+const join_card_title_scale: f32 = 13.5 / 14.5;
+const join_card_sub_scale: f32 = 11.0 / 14.5;
+const name_title_scale: f32 = 14.5 / 14.5;
 const compose_header_height: f32 = 38;
 const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
@@ -8003,23 +8015,63 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Name" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
+            modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = 1.3 }},
+                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
                 ),
-                ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Shown with your notes. Change it any time."),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
+                ),
                 ui.el(.textarea, .{
                     .text = model.name_draft(),
                     .placeholder = "A name people will see",
                     .on_input = AppUi.inputMsg(.name_edit),
                     .on_submit = .name_save,
-                    .height = 44,
+                    .height = 38,
+                    .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
                 }, .{}),
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .name_skip }, "Skip"),
-                    ui.spacer(1),
-                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.name_empty(), .on_press = .name_save }, "Save"),
+                ui.row(.{ .gap = 0, .cross = .center }, .{
+                    // Never disabled. Blank is a valid answer to "want a name on
+                    // it?", and it means the same thing as Skip, so Done takes it
+                    // and moves on rather than sitting there greyed out while the
+                    // reader wonders what is wrong with an empty field.
+                    // Painted by a `.panel`, pressed by the row around it. A
+                    // `.list_item` given a background draws none, so the first
+                    // version of this button was white text on the card's own
+                    // dark surface: present, pressable, and unreadable.
+                    ui.row(.{
+                        .grow = 1,
+                        .gap = 0,
+                        .on_press = Msg.name_save,
+                        .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                    }, .{
+                        ui.el(.panel, .{
+                            .grow = 1,
+                            .padding = 0.01,
+                            .style = .{ .background = p.accent, .radius = 8 },
+                        }, .{
+                            ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.on_accent } },
+                                    &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
+                                ),
+                            }),
+                        }),
+                    }),
+                    hgap(ui, 12),
+                    ui.el(.list_item, .{
+                        .padding = 0.01,
+                        .on_press = Msg.name_skip,
+                        .style = .{ .quiet_hover = true },
+                        .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
+                    }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
+                        ),
+                    }),
                 }),
             })),
         }),
@@ -8387,7 +8439,12 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Join" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+            // 40px down from the window, which is the design's offset: 16 of it is
+            // the dialog's own padding, so this is the rest.
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 24),
+                if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+            }),
         }),
     });
 }
@@ -8404,12 +8461,125 @@ fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
         .none => "",
         .post => "Your note is waiting.",
         .reply => "Your reply is waiting.",
+        // Clipped, because this sits in a pill that does not wrap and a display
+        // name is a stranger's string with no length in it. The unclipped version
+        // pushed the pill past the sheet the moment somebody had a long one.
         .like => |id| if (model.noteById(id)) |note|
-            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{note.author()}) catch "Your like is waiting."
+            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{clipToChars(note.author(), 14, 48)}) catch "Your like is waiting."
         else
             "Your like is waiting.",
-        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personName(ui, pk)}) catch "Your follow is waiting.",
+        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{clipToChars(personName(ui, pk), 14, 48)}) catch "Your follow is waiting.",
     };
+}
+
+/// The glyph for the verb that opened the sheet: the reader sees what they
+/// reached for before they read a word.
+///
+/// A switch rather than a name looked up from a table, because both icon
+/// builders take their name at COMPTIME (that is what compile-checks it), so a
+/// glyph chosen at runtime has to be chosen as a whole node.
+fn pendingGlyph(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const size = 11;
+    return switch (model.pending) {
+        .none, .post => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "edit"),
+        .reply => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "reply"),
+        .like => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_like } }, "like"),
+        .follow => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "plus"),
+    };
+}
+
+/// What the reader reached for, as a pill above the question.
+fn intentPill(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.panel, .{
+            .padding = 0.01,
+            .style = .{ .background = p.surface_chip, .border = p.border_hairline, .radius = 999, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 10),
+                vgap(ui, 22),
+                pendingGlyph(ui, model),
+                hgap(ui, 6),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_muted_alt } },
+                    &.{.{ .text = model.pending_text(ui), .scale = join_sub_scale }},
+                ),
+                hgap(ui, 10),
+            }),
+        }),
+        // The pill is as wide as its words and no wider, so the row it sits in
+        // takes the slack rather than the pill stretching across the card.
+        ui.spacer(1),
+    });
+}
+
+/// One rung of the ladder: a glyph, what it is, and what it costs you.
+///
+/// `filled` is the recommended one, and there is exactly one. The other two are
+/// outlines with a chevron, which is the shape this app uses everywhere else for
+/// "this leads somewhere".
+fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: []const u8, sub: []const u8, press: Msg, filled: bool) AppUi.Node {
+    const p = theme.palette;
+    const ink = if (filled) p.on_accent else p.text_body_strong;
+    const sub_ink = if (filled) p.text_dim_on_light else p.text_muted;
+    // The press is on the ROW and the paint is on a `.panel` inside it. A
+    // `.list_item` carrying a background draws nothing at all (the same rule
+    // `modalCard` is built around), so the first version of this card had the
+    // recommended rung rendering as invisible white-on-black text.
+    return ui.row(.{
+        .gap = 0,
+        .on_press = press,
+        .semantics = .{ .role = .button, .label = title, .focusable = true },
+    }, .{
+        ui.el(.panel, .{
+            .grow = 1,
+            .padding = 0.01,
+            .style = .{
+                .background = if (filled) p.accent else p.surface_card,
+                .border = if (filled) p.accent else p.border_control,
+                .radius = 11,
+                .stroke_width = 1,
+            },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 13),
+                if (app)
+                    ui.appIcon(.{ .width = 16, .height = 16, .style = .{ .foreground = ink } }, glyph)
+                else
+                    ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = ink } }, glyph),
+                hgap(ui, 11),
+                ui.column(.{ .grow = 1, .gap = 0 }, .{
+                    vgap(ui, 11),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = ink } },
+                        &.{.{ .text = title, .weight = .medium, .scale = join_card_title_scale }},
+                    ),
+                    vgap(ui, 3),
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = sub_ink } },
+                        &.{.{ .text = sub, .scale = join_card_sub_scale }},
+                    ),
+                    vgap(ui, 11),
+                }),
+                hgap(ui, 11),
+                // Only on the rungs that lead to another step. The filled card
+                // finishes here: pressing it makes a key.
+                if (filled) ui.spacer(0) else ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "chevron-right"),
+                hgap(ui, 13),
+            }),
+        }),
+    });
+}
+
+/// The mono section labels over each half of the ladder.
+fn joinLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.paragraph(
+        .{ .style = .{ .foreground = p.text_faint_alt } },
+        &.{.{ .text = text, .monospace = true, .weight = .medium, .scale = join_label_scale }},
+    );
 }
 
 /// The join ladder: three ways in, most confident first, always the way back.
@@ -8423,35 +8593,56 @@ fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
 
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
-        if (model.pending.waiting())
-            ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.status_warning } }, model.pending_text(ui))
-        else
-            ui.spacer(0),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_primary } },
-            &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = 1.3 }},
-        ),
-        ui.text(
-            .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } },
-            "Everything here is signed with a key of your own, not an account someone holds for you.",
-        ),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = "NEW HERE", .monospace = true, .scale = 0.85 }},
-        ),
-        ui.button(.{ .variant = .primary, .on_press = .join_create }, "Create your identity"),
-        ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Ready in seconds. Nothing to write down."),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
-        ),
-        ui.button(.{ .on_press = .open_signet_import }, "Bring your key"),
-        ui.button(.{ .on_press = .open_bunker }, "Use your own signer"),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
+    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
+        vgap(ui, 16),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 16),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                if (model.pending.waiting()) intentPill(ui, model) else ui.spacer(0),
+                if (model.pending.waiting()) vgap(ui, 11) else ui.spacer(0),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
+                ),
+                vgap(ui, 6),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
+                ),
+                vgap(ui, 13),
+                joinLabel(ui, "NEW HERE"),
+                vgap(ui, 6),
+                joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
+                vgap(ui, 13),
+                joinLabel(ui, "ALREADY ON NOSTR"),
+                vgap(ui, 6),
+                joinCard(ui, "download", false, "Bring your key", "Goes into Signet. Plaza itself never sees it.", .open_signet_import, false),
+                vgap(ui, 8),
+                joinCard(ui, "signet", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+                vgap(ui, 13),
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    ui.el(.list_item, .{
+                        .padding = 0.01,
+                        .on_press = Msg.close_join,
+                        .style = .{ .quiet_hover = true },
+                        .semantics = .{ .role = .button, .label = "Keep browsing", .focusable = true },
+                    }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_secondary } },
+                            &.{.{ .text = "Keep browsing", .weight = .medium, .underline = true, .scale = menu_scale }},
+                        ),
+                    }),
+                    hgap(ui, 10),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_dim } },
+                        &.{.{ .text = "reading never needs an identity", .monospace = true, .scale = mono_chip_scale }},
+                    ),
+                    ui.spacer(1),
+                }),
+            }),
+            hgap(ui, 16),
         }),
+        vgap(ui, 13),
     }));
 }
 
@@ -14402,8 +14593,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
-            publishName(model, fx);
             model.naming = false;
+            // Nothing typed means nothing to publish. Writing an empty kind:0
+            // would replace whatever profile the key already has with a blank
+            // one, which is the replaceable-event footgun in miniature.
+            if (model.name_empty()) {
+                replayPending(model);
+                return;
+            }
+            publishName(model, fx);
             setToast(model, "Name set");
             replayPending(model);
         },
