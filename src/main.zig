@@ -1184,6 +1184,18 @@ const picture_default_aspect: f32 = 0.66;
 /// The composer sheet (11l): its width, the header band, and how tall the editor
 /// stands before it scrolls (about eight lines of its own register).
 const compose_sheet_width: f32 = 560;
+/// The first-intent sheet, and the name card that can follow it. Different
+/// widths on purpose: the sheet holds three choices and has to lay them out as
+/// cards; the name card holds one field and one question, and a card that wide
+/// around a single input reads as a form.
+const join_sheet_width: f32 = 372;
+const name_card_width: f32 = 340;
+const join_title_scale: f32 = 17.0 / 14.5;
+const join_sub_scale: f32 = 11.5 / 14.5;
+const join_label_scale: f32 = 9.0 / 14.5;
+const join_card_title_scale: f32 = 13.5 / 14.5;
+const join_card_sub_scale: f32 = 11.0 / 14.5;
+const name_title_scale: f32 = 14.5 / 14.5;
 const compose_header_height: f32 = 38;
 const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
@@ -1723,18 +1735,120 @@ fn resolveSignetWindow(init: std.process.Init) void {
     } else |_| g_signet_win_len = 0;
 }
 
-/// Opens the Signet ceremony window (a separate process) for a key import, so
-/// the pasted key never enters Plaza. The window reads the token itself and
-/// talks to the daemon; Plaza adopts the identity when the key appears
-/// (see handleHelperPubkey). No args needed.
-fn spawnSignetWindow(fx: *Effects) void {
+/// Which ceremony the Signet window is being opened for.
+const Ceremony = enum { import_key, create_key };
+
+/// Opens the Signet ceremony window: a separate process, so key material never
+/// enters Plaza on either path. The window reads the token itself and talks to
+/// the daemon; Plaza adopts the identity when the key appears (see
+/// handleHelperPubkey).
+///
+/// The window OWNS its ceremony, including the create. It would be less code for
+/// Plaza to mint the key and let the window merely announce it, but only the side
+/// that made the request can tell a key it just minted from a key that was
+/// already sitting in the daemon: a window watching /pubkey sees "ready" either
+/// way, and would introduce somebody's leftover key as the reader's new identity.
+fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
     if (g_signet_win_len == 0) return;
-    fx.spawn(.{
-        .key = signet_spawn_key,
-        .argv = &.{g_signet_win_buf[0..g_signet_win_len]},
-        .output = .collect,
-    });
+    const bin = g_signet_win_buf[0..g_signet_win_len];
+    // Two calls rather than one with a computed argv: `&.{...}` over runtime
+    // values is a pointer to a temporary, and handing the effect layer one that
+    // outlives its scope is the kind of bug that shows up as a garbled argv on
+    // somebody else's machine.
+    // `on_exit` is not optional here. The SDK REJECTS a spawn whose key already
+    // has a live process, and a rejection is reported through this callback and
+    // nowhere else: without it, pressing "Create your identity" while a Signet
+    // window is already open did nothing at all, silently, and left the reader on
+    // the guest feed having pressed the app's primary call to action.
+    switch (ceremony) {
+        .import_key => fx.spawn(.{
+            .key = signet_spawn_key,
+            .argv = &.{bin},
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.signet_exited),
+        }),
+        .create_key => fx.spawn(.{
+            .key = signet_spawn_key,
+            .argv = &.{ bin, "--create" },
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.signet_exited),
+        }),
+    }
 }
+
+/// What the ceremony window did, learned when it goes.
+///
+/// Every route out of the window lands here: a mint, an import, a cancel, a
+/// failure, a crash, and a spawn that never started because one was already
+/// running. Only the first arms the name beat.
+fn handleSignetExited(model: *Model, e: native_sdk.EffectExit) void {
+    const was_running = g_ceremony;
+    g_ceremony = .none;
+
+    if (e.reason == .rejected) {
+        // A window is already open. Say so: this is a press the reader made and
+        // it is about to look like it did nothing.
+        if (was_running == .running) {
+            g_ceremony_adopted = false;
+            setToast(model, "A Signet window is already open");
+        }
+        return;
+    }
+
+    const created = e.reason == .exited and e.code == ceremony_created_code;
+    if (!created) {
+        g_ceremony_adopted = false;
+        return;
+    }
+
+    // Minted. The flag that lets a contact list be written without reading one
+    // back first is set HERE, on the confirmation, and never on the press: a key
+    // that was never made cannot have provably no history.
+    g_identity_minted_here = true;
+    if (g_ceremony_adopted) {
+        // The poll already signed the reader in, so the beat is owed now.
+        g_ceremony_adopted = false;
+        persistSession();
+        model.naming = true;
+        return;
+    }
+    g_ceremony = .created;
+}
+
+/// What the create ceremony has told us, which is the only thing that decides
+/// whether an appearing key is one the reader just made.
+///
+/// This was a 90-second timer, and a timer is not an answer. It said "a key that
+/// turns up soon after the Create press", which is a DIFFERENT statement from "the
+/// key the ceremony made", and the gap between them was reachable: press Create,
+/// have it fail (the daemon is not up yet, so the window says so and exits), then
+/// press "Bring your key" and import a real account. The imported key arrived
+/// inside the window, so Plaza treated it as freshly minted, offered "Want a name
+/// on it?" over an account that already had one, and publishing that name rewrote
+/// the account's kind:0 from an empty local profile. That is the exact shape of
+/// the rule this app is built around: never write a replaceable record over data
+/// you have not read back.
+///
+/// So the ceremony reports its own result instead. The window exits with
+/// `ceremony_created_code` if and only if it minted a key, and that exit is what
+/// arms the beat. A failed create, an import, a cancel and a crash all exit some
+/// other way and arm nothing.
+const CeremonyState = enum {
+    /// No create ceremony has been asked for.
+    none,
+    /// The window was spawned and has not reported yet.
+    running,
+    /// The window minted a key and Plaza has not yet adopted it.
+    created,
+};
+var g_ceremony: CeremonyState = .none;
+/// A key was adopted while the ceremony was still running, so the beat is owed
+/// once the window confirms what it did. The poll usually wins this race: the
+/// window holds its result on screen for two seconds and Plaza polls every one.
+var g_ceremony_adopted = false;
+
+/// The window's exit code when, and only when, it minted a key.
+const ceremony_created_code: i32 = 9;
 
 /// Tells the daemon to forget the key (wipe memory + delete the file), so a
 /// logout is not undone when the health-check next reads /pubkey. Fire and
@@ -1828,6 +1942,20 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
     persistSession();
     enterFeed(model);
+    switch (g_ceremony) {
+        // The window has confirmed a mint, so this key is that key: nothing else
+        // can be in a daemon that just accepted a create.
+        .created => {
+            g_ceremony = .none;
+            model.naming = true; // the name beat; replay follows it
+            return;
+        },
+        // A ceremony is open but has not said what it did yet. Sign in, and owe
+        // the beat until the window reports. NOT "assume it was a create": that
+        // assumption is the bug this replaced.
+        .running => g_ceremony_adopted = true,
+        .none => {},
+    }
     replayPending(model);
 }
 
@@ -1972,6 +2100,10 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     persistSession();
     switch (purpose) {
         .create => {
+            // Confirmed here, for the same reason the ceremony window's mint is
+            // confirmed on its exit: the daemon has answered, so a key exists and
+            // it is this one.
+            g_identity_minted_here = true;
             enterFeed(model);
             model.naming = true; // the name beat; replay follows it
         },
@@ -1984,6 +2116,28 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
         .migrate => deleteIdentityKeyFile(),
         .none => {},
     }
+}
+
+/// Starts making a key, in the Signet window when there is one.
+///
+/// The fallback is not a lesser version of the same thing, it is the path this
+/// app shipped with: Plaza asks the daemon directly and the daemon mints. The
+/// key never enters Plaza either way. What the window adds is that the reader
+/// SEES the separate process that holds their key, once, at the moment it starts
+/// holding it. Worth a window; not worth a dead button when the binary is absent
+/// (a dev tree with the sub-project unbuilt, a broken bundle).
+fn beginCreate(fx: *Effects) void {
+    if (g_signet_win_len == 0) {
+        queueHelperSetup(fx, .create, null);
+        return;
+    }
+    // The ceremony is the other process's now, so what queueHelperSetup would
+    // have done has to be done here: re-enable adopt-on-appear, which a logout
+    // latches off.
+    g_logged_out = false;
+    g_ceremony = .running;
+    g_ceremony_adopted = false;
+    spawnSignetWindow(fx, .create_key);
 }
 
 /// Deletes the legacy in-process key file, once its secret is safe in the daemon.
@@ -4406,6 +4560,19 @@ const QuoteRef = struct {
 /// abbreviated npub, a relative timestamp, and the (truncated) content. Strings
 /// are copied into fixed buffers so a card never aliases the query arena it was
 /// built from.
+/// The verb a guest reached for, held until they have a key.
+pub const Intent = union(enum) {
+    none,
+    post,
+    like: i64,
+    reply: i64,
+    follow: [32]u8,
+
+    pub fn waiting(self: Intent) bool {
+        return self != .none;
+    }
+};
+
 pub const Note = struct {
     // Non-negative i64: the markup engine holds a `for each` integer key as i64
     // then casts it to u64, so a raw u64 (or negative i64) from the id's high
@@ -4733,12 +4900,22 @@ pub const Model = struct {
     // key, use a signer). Rises when a guest presses a gated verb, or from the
     // strip and the Guest chip.
     joining: bool = false,
+    /// What the reader reached for before they had a key.
+    ///
+    /// One field, because there is one answer to "what happens after you sign
+    /// in". The app used to carry two ad-hoc ones, a bool for the composer and an
+    /// id for a like, and every verb added after them either grew a third or
+    /// quietly remembered nothing: pressing Follow as a guest opened the sheet,
+    /// signed you in, and dropped the follow on the floor, because there was
+    /// nowhere to put it. A union makes forgetting a compile error rather than an
+    /// omission.
+    pending: Intent = .none,
     // The remembered intent: the guest reached for the composer, so composing
     // opens by itself the moment an identity exists. The sheet says so.
-    pending_compose: bool = false,
+
     // The other remembered intent: the guest reached for a like. The note id is
     // held here (0 = none) so the like completes the moment an identity exists.
-    pending_like: i64 = 0,
+
     // Whether the join sheet is on its focused bunker-input step (chose "Use
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
@@ -4810,13 +4987,19 @@ pub const Model = struct {
         "identity",              "has_notes",        "empty",                  "status",           "empty_text",
         "footer",                "note_list",        "expanded_note",          "composing",        "caught_up",
         "relay_health",          "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip",
-        "guest_strip_dismissed", "joining",          "pending_compose",        "naming",           "name_buffer",
+        "guest_strip_dismissed", "joining",          "pending",                "naming",           "name_buffer",
         "name_draft",            "name_empty",       "toast_buf",              "toast_len",        "toast_until",
-        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_like",
+        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",
         "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
         "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
         "thread_seq",            "thread_open_at",
     };
+
+    /// Why the join sheet is up, in the reader's own terms. Empty when they
+    /// opened it themselves rather than being sent there by a verb.
+    pub fn pending_text(self: *const Model, ui: *AppUi) []const u8 {
+        return pendingText(ui, self);
+    }
 
     /// The name beat's current text.
     pub fn name_draft(self: *const Model) []const u8 {
@@ -7212,6 +7395,7 @@ pub const Msg = union(enum) {
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
     helper_exited: native_sdk.EffectExit,
+    signet_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
     /// A /setup (create) answered: adopt the new helper identity.
@@ -7269,7 +7453,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -7915,23 +8099,63 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Name" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
+            modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = 1.3 }},
+                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
                 ),
-                ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Shown with your notes. Change it any time."),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
+                ),
                 ui.el(.textarea, .{
                     .text = model.name_draft(),
                     .placeholder = "A name people will see",
                     .on_input = AppUi.inputMsg(.name_edit),
                     .on_submit = .name_save,
-                    .height = 44,
+                    .height = 38,
+                    .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
                 }, .{}),
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .name_skip }, "Skip"),
-                    ui.spacer(1),
-                    ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.name_empty(), .on_press = .name_save }, "Save"),
+                ui.row(.{ .gap = 0, .cross = .center }, .{
+                    // Never disabled. Blank is a valid answer to "want a name on
+                    // it?", and it means the same thing as Skip, so Done takes it
+                    // and moves on rather than sitting there greyed out while the
+                    // reader wonders what is wrong with an empty field.
+                    // Painted by a `.panel`, pressed by the row around it. A
+                    // `.list_item` given a background draws none, so the first
+                    // version of this button was white text on the card's own
+                    // dark surface: present, pressable, and unreadable.
+                    ui.row(.{
+                        .grow = 1,
+                        .gap = 0,
+                        .on_press = Msg.name_save,
+                        .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                    }, .{
+                        ui.el(.panel, .{
+                            .grow = 1,
+                            .padding = 0.01,
+                            .style = .{ .background = p.accent, .radius = 8 },
+                        }, .{
+                            ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.on_accent } },
+                                    &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
+                                ),
+                            }),
+                        }),
+                    }),
+                    hgap(ui, 12),
+                    ui.el(.list_item, .{
+                        .padding = 0.01,
+                        .on_press = Msg.name_skip,
+                        .style = .{ .quiet_hover = true },
+                        .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
+                    }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
+                        ),
+                    }),
                 }),
             })),
         }),
@@ -8299,19 +8523,171 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Join" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+            // 40px down from the window, which is the design's offset: 16 of it is
+            // the dialog's own padding, so this is the rest.
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 24),
+                if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+            }),
         }),
     });
 }
 
-/// The context line when a guest reached for a like: names whose note it was, so
-/// the sheet explains why it appeared. Falls back to a generic line if the note
-/// has scrolled out of the window.
-fn pendingLikeText(ui: *AppUi, model: *const Model) []const u8 {
-    if (model.noteById(model.pending_like)) |note| {
-        return std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{note.author()}) catch "Your like is waiting.";
-    }
-    return "Your like is waiting.";
+/// Why the sheet appeared, in the reader's own terms: the thing they reached for
+/// is waiting, and named where naming it is possible.
+///
+/// A note that has scrolled out of the loaded window falls back to the plain
+/// sentence rather than guessing, and a person whose kind:0 has not arrived reads
+/// as their short npub, which is what every other surface in the app calls them
+/// until it knows better.
+fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
+    return switch (model.pending) {
+        .none => "",
+        .post => "Your note is waiting.",
+        .reply => "Your reply is waiting.",
+        // Clipped, because a display name is a stranger's string with no length
+        // in it and no alphabet either. The pill wraps as well (see intentPill):
+        // a codepoint cap bounds COUNT, not WIDTH, and fourteen full-width CJK
+        // characters are about twice fourteen Latin ones, so the clip alone still
+        // overran the card in some scripts.
+        .like => |id| if (model.noteById(id)) |note|
+            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your like is waiting."
+        else
+            "Your like is waiting.",
+        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personLabel(ui, personName(ui, pk))}) catch "Your follow is waiting.",
+    };
+}
+
+/// A person's name, short enough for one line of a pill.
+///
+/// The npub fallback is passed through UNCLIPPED. It is already an abbreviation,
+/// `npub1abcdefghi…wxyz5`, and its whole job is the tail: clipping it to fourteen
+/// codepoints ate three of the five identifying characters at the end and left
+/// something that looks specific and is not.
+fn personLabel(ui: *AppUi, name: []const u8) []const u8 {
+    _ = ui;
+    // The abbreviated npub carries an ellipsis, and it is the only thing in this
+    // app that does. Substring, not scalar: the character is three bytes.
+    if (std.mem.indexOf(u8, name, "…") != null) return name;
+    return clipToChars(name, 14, 48);
+}
+
+/// The glyph for the verb that opened the sheet: the reader sees what they
+/// reached for before they read a word.
+///
+/// A switch rather than a name looked up from a table, because both icon
+/// builders take their name at COMPTIME (that is what compile-checks it), so a
+/// glyph chosen at runtime has to be chosen as a whole node.
+fn pendingGlyph(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const size = 11;
+    return switch (model.pending) {
+        .none, .post => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "edit"),
+        .reply => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "reply"),
+        .like => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_like } }, "like"),
+        .follow => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "plus"),
+    };
+}
+
+/// What the reader reached for, as a pill above the question.
+fn intentPill(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.panel, .{
+            .grow = 1,
+            .padding = 0.01,
+            .style = .{ .background = p.surface_chip, .border = p.border_hairline, .radius = 999, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 10),
+                vgap(ui, 22),
+                pendingGlyph(ui, model),
+                hgap(ui, 6),
+                // Bounded AND wrapping. `wrap` on its own does nothing to a
+                // paragraph that is a plain flow child of a row (it takes its
+                // intrinsic width and lays out past the card), and a clip on its
+                // own bounds characters rather than pixels. Both, so no name in
+                // any script can push this line out of the sheet.
+                ui.column(.{ .grow = 1, .gap = 0 }, .{
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = p.text_muted_alt } },
+                        &.{.{ .text = model.pending_text(ui), .scale = join_sub_scale }},
+                    ),
+                }),
+                hgap(ui, 10),
+            }),
+        }),
+        // The pill is as wide as its words and no wider, so the row it sits in
+        // takes the slack rather than the pill stretching across the card.
+        ui.spacer(1),
+    });
+}
+
+/// One rung of the ladder: a glyph, what it is, and what it costs you.
+///
+/// `filled` is the recommended one, and there is exactly one. The other two are
+/// outlines with a chevron, which is the shape this app uses everywhere else for
+/// "this leads somewhere".
+fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: []const u8, sub: []const u8, press: Msg, filled: bool) AppUi.Node {
+    const p = theme.palette;
+    const ink = if (filled) p.on_accent else p.text_body_strong;
+    const sub_ink = if (filled) p.text_dim_on_light else p.text_muted;
+    // The press is on the ROW and the paint is on a `.panel` inside it. A
+    // `.list_item` carrying a background draws nothing at all (the same rule
+    // `modalCard` is built around), so the first version of this card had the
+    // recommended rung rendering as invisible white-on-black text.
+    return ui.row(.{
+        .gap = 0,
+        .on_press = press,
+        .semantics = .{ .role = .button, .label = title, .focusable = true },
+    }, .{
+        ui.el(.panel, .{
+            .grow = 1,
+            .padding = 0.01,
+            .style = .{
+                .background = if (filled) p.accent else p.surface_card,
+                .border = if (filled) p.accent else p.border_control,
+                .radius = 11,
+                .stroke_width = 1,
+            },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 13),
+                if (app)
+                    ui.appIcon(.{ .width = 16, .height = 16, .style = .{ .foreground = ink } }, glyph)
+                else
+                    ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = ink } }, glyph),
+                hgap(ui, 11),
+                ui.column(.{ .grow = 1, .gap = 0 }, .{
+                    vgap(ui, 11),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = ink } },
+                        &.{.{ .text = title, .weight = .medium, .scale = join_card_title_scale }},
+                    ),
+                    vgap(ui, 3),
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = sub_ink } },
+                        &.{.{ .text = sub, .scale = join_card_sub_scale }},
+                    ),
+                    vgap(ui, 11),
+                }),
+                hgap(ui, 11),
+                // Only on the rungs that lead to another step. The filled card
+                // finishes here: pressing it makes a key.
+                if (filled) ui.spacer(0) else ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "chevron-right"),
+                hgap(ui, 13),
+            }),
+        }),
+    });
+}
+
+/// The mono section labels over each half of the ladder.
+fn joinLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.paragraph(
+        .{ .style = .{ .foreground = p.text_faint_alt } },
+        &.{.{ .text = text, .monospace = true, .weight = .medium, .scale = join_label_scale }},
+    );
 }
 
 /// The join ladder: three ways in, most confident first, always the way back.
@@ -8325,37 +8701,56 @@ fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
 
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
-        if (model.pending_compose)
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
-        else if (model.pending_like != 0)
-            ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.status_warning } }, pendingLikeText(ui, model))
-        else
-            ui.spacer(0),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_primary } },
-            &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = 1.3 }},
-        ),
-        ui.text(
-            .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } },
-            "Everything here is signed with a key of your own, not an account someone holds for you.",
-        ),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = "NEW HERE", .monospace = true, .scale = 0.85 }},
-        ),
-        ui.button(.{ .variant = .primary, .on_press = .join_create }, "Create your identity"),
-        ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, "Ready in seconds. Nothing to write down."),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = "ALREADY ON NOSTR", .monospace = true, .scale = 0.85 }},
-        ),
-        ui.button(.{ .on_press = .open_signet_import }, "Bring your key"),
-        ui.button(.{ .on_press = .open_bunker }, "Use your own signer"),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_join }, "Keep browsing"),
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, "Reading never needs an identity."),
+    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
+        vgap(ui, 16),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 16),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                if (model.pending.waiting()) intentPill(ui, model) else ui.spacer(0),
+                if (model.pending.waiting()) vgap(ui, 11) else ui.spacer(0),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
+                ),
+                vgap(ui, 6),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
+                ),
+                vgap(ui, 13),
+                joinLabel(ui, "NEW HERE"),
+                vgap(ui, 6),
+                joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
+                vgap(ui, 13),
+                joinLabel(ui, "ALREADY ON NOSTR"),
+                vgap(ui, 6),
+                joinCard(ui, "download", false, "Bring your key", "Goes into Signet. Plaza itself never sees it.", .open_signet_import, false),
+                vgap(ui, 8),
+                joinCard(ui, "signet", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+                vgap(ui, 13),
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    ui.el(.list_item, .{
+                        .padding = 0.01,
+                        .on_press = Msg.close_join,
+                        .style = .{ .quiet_hover = true },
+                        .semantics = .{ .role = .button, .label = "Keep browsing", .focusable = true },
+                    }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_secondary } },
+                            &.{.{ .text = "Keep browsing", .weight = .medium, .underline = true, .scale = menu_scale }},
+                        ),
+                    }),
+                    hgap(ui, 10),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_dim } },
+                        &.{.{ .text = "reading never needs an identity", .monospace = true, .scale = mono_chip_scale }},
+                    ),
+                    ui.spacer(1),
+                }),
+            }),
+            hgap(ui, 16),
         }),
+        vgap(ui, 13),
     }));
 }
 
@@ -13995,7 +14390,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 scanNip05Fetches(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
-                drivePendingLike(model, fx);
+                drivePendingIntent(model, fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -14029,6 +14424,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
+        .signet_exited => |e| handleSignetExited(model, e),
         .helper_pubkey => |response| {
             handleHelperPubkey(model, response);
             // A queued setup fires the moment the daemon is reachable.
@@ -14080,7 +14476,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // remembers what was reached for.
             if (model.is_guest()) {
                 model.joining = true;
-                model.pending_compose = true;
+                model.pending = .post;
             } else model.composing = true;
         },
         .open_person => |pk| {
@@ -14089,6 +14485,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .follow_person => |direction| {
             if (model.is_guest()) {
+                // REMEMBERED, not merely gated. This press used to open the sheet
+                // and forget what it was for, so signing in landed the reader on
+                // the feed still not following the person they had just asked to
+                // follow, with nothing to say why.
+                if (model.viewing_profile) |who| model.pending = .{ .follow = who };
                 model.joining = true;
                 return;
             }
@@ -14137,6 +14538,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // A guest reaching for Follow is first intent, the same as reaching
             // for the composer: the sheet rises rather than the press failing.
             if (direction == 0 or model.is_guest()) {
+                if (model.is_guest() and model.viewing_thread != 0)
+                    model.pending = .{ .follow = model.thread_root.pubkey };
                 model.joining = true;
                 return;
             }
@@ -14218,17 +14621,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
-            model.pending_compose = false;
-            model.pending_like = 0;
+            // Dismissing the sheet is an answer: they chose not to sign in, so
+            // the verb they reached for is dropped rather than lying in wait to
+            // fire at some later sign-in they made for another reason.
+            model.pending = .none;
         },
         .join_create => {
-            // Async: the daemon mints the key (the key never enters Plaza), the
-            // response adopts the identity and opens the name beat.
             model.joining = false;
-            // Minted HERE, so it provably has no history: creating a contact
-            // list for it later cannot destroy one.
-            g_identity_minted_here = true;
-            queueHelperSetup(fx, .create, null);
+            // `g_identity_minted_here` is NOT set here. It says the key provably
+            // has no history, which is what lets a contact list be published
+            // without reading one back first, and at this point there is no key
+            // at all: the ceremony can still fail, and the reader can still go
+            // and import an account with eight hundred follows instead. It is set
+            // when a mint is CONFIRMED, in handleSignetExited and in
+            // handleHelperSetup's create branch.
+            beginCreate(fx);
         },
         .open_signet_import => {
             // Key material never enters Plaza: the Signet window takes the
@@ -14236,13 +14643,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appears (handleHelperPubkey). If the window binary is missing,
             // fall back to the in-Plaza field rather than a dead button.
             model.joining = false;
-            if (g_signet_win_len > 0) spawnSignetWindow(fx) else model.stage = .onboarding;
+            // Whatever a previous press left behind, this is not a mint. Both
+            // flags are the reader's answer to "where does this key come from",
+            // and they just answered differently.
+            g_ceremony = .none;
+            g_ceremony_adopted = false;
+            g_identity_minted_here = false;
+            if (g_signet_win_len > 0) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
             model.stage = .ready;
-            model.pending_compose = false;
+            model.pending = .none;
         },
-        .open_bunker => model.bunker_mode = true,
+        .open_bunker => {
+            model.bunker_mode = true;
+            g_ceremony = .none;
+            g_ceremony_adopted = false;
+            g_identity_minted_here = false;
+        },
         .close_bunker => {
             model.bunker_mode = false;
             model.login_buffer.clear();
@@ -14299,8 +14717,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
-            publishName(model, fx);
             model.naming = false;
+            // Nothing typed means nothing to publish. Writing an empty kind:0
+            // would replace whatever profile the key already has with a blank
+            // one, which is the replaceable-event footgun in miniature.
+            if (model.name_empty()) {
+                replayPending(model);
+                return;
+            }
+            publishName(model, fx);
             setToast(model, "Name set");
             replayPending(model);
         },
@@ -14317,7 +14742,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.backup_nudge = false;
             model.backup_nudge_dismissed = true;
         },
-        .create_identity => queueHelperSetup(fx, .create, null),
+        .create_identity => beginCreate(fx),
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
@@ -14411,7 +14836,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             closeThread(model);
         },
         .reply_edit => |edit| model.reply_buffer.apply(edit),
-        .reply_submit => publishReply(model, fx),
+        .reply_submit => {
+            // The one verb that was gated nowhere: a guest could type a reply and
+            // press send, and `publishReply` would reach for a signer that does
+            // not exist and return, losing nothing but doing nothing and saying
+            // nothing either.
+            if (model.is_guest()) {
+                if (model.viewing_thread != 0) model.pending = .{ .reply = model.viewing_thread };
+                model.joining = true;
+                return;
+            }
+            publishReply(model, fx);
+        },
         .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
@@ -15035,8 +15471,8 @@ fn mergeNameJson(gpa: std.mem.Allocator, existing: []const u8, name: []const u8)
 /// Completes the remembered first intent once an identity exists: the guest
 /// reached for the composer, so it opens by itself. The welcome-in moment.
 fn replayPending(model: *Model) void {
-    if (model.pending_compose) {
-        model.pending_compose = false;
+    if (model.pending == .post) {
+        model.pending = .none;
         model.composing = true;
     }
 }
@@ -15049,6 +15485,45 @@ pub fn replayPendingForTest(model: *Model) void {
 /// Restores a helper identity from a session pubkey hex. For tests.
 pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
     return restoreHelperIdentity(pubkey_hex);
+}
+
+/// Sets what the create ceremony has reported, which is the only thing that
+/// tells an appearing key apart from any other. For tests.
+pub fn setCeremonyForTest(state: enum { none, running, created }) void {
+    g_ceremony = switch (state) {
+        .none => .none,
+        .running => .running,
+        .created => .created,
+    };
+    g_ceremony_adopted = false;
+}
+
+/// Parks the daemon health flag at "unreachable", so a queued setup stays queued
+/// instead of reaching for an effects layer a unit test does not have. For tests.
+pub fn setHelperUnreachableForTest() void {
+    g_helper_state.store(0, .release);
+    g_helper_setup = .none;
+    g_helper_pending_in_flight = .none;
+}
+
+pub fn ceremonyOwesNameForTest() bool {
+    return g_ceremony_adopted;
+}
+
+pub fn identityMintedForTest() bool {
+    return g_identity_minted_here;
+}
+
+/// Delivers the ceremony window's exit, which is how Plaza learns what it did.
+/// For tests.
+pub fn handleSignetExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
+    handleSignetExited(model, e);
+}
+
+/// Delivers a daemon /pubkey answer, which is how a key made or imported in the
+/// other process reaches Plaza. For tests.
+pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectResponse) void {
+    handleHelperPubkey(model, response);
 }
 
 /// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
@@ -15313,10 +15788,10 @@ fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.e
 }
 
 /// Toggles a like on `note_id`. A guest cannot sign, so the like is remembered
-/// and the join sheet opens; it completes after sign-in (`drivePendingLike`).
+/// and the join sheet opens; it completes after sign-in (`drivePendingIntent`).
 fn toggleLike(model: *Model, fx: *Effects, note_id: i64) void {
     if (model.is_guest()) {
-        model.pending_like = note_id;
+        model.pending = .{ .like = note_id };
         model.joining = true;
         return;
     }
@@ -15350,13 +15825,49 @@ fn unlike(fx: *Effects, note_id: i64) void {
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.
 /// Driven from the tick, where `fx` is in hand and the feed has just rebuilt.
-fn drivePendingLike(model: *Model, fx: *Effects) void {
-    if (model.pending_like == 0 or model.is_guest()) return;
-    const note_id = model.pending_like;
-    model.pending_like = 0;
-    if (isLiked(note_id)) return;
-    like(model, fx, note_id);
-    setToast(model, "Liked");
+fn drivePendingIntent(model: *Model, fx: *Effects) void {
+    if (!model.pending.waiting() or model.is_guest()) return;
+    const intent = model.pending;
+    // Cleared FIRST, whatever happens next. A verb that cannot be completed (the
+    // note scrolled away, the follow list has not loaded) must not be retried on
+    // every tick for the rest of the session.
+    model.pending = .none;
+    switch (intent) {
+        .none => {},
+        .post => model.composing = true,
+        .reply => |id| {
+            // Back to the conversation they were in, with what they wrote still
+            // in the box: `reply_buffer` survived the sheet.
+            if (model.viewing_thread != id) openEvent(model, noteEventId(model, id) orelse return);
+        },
+        .like => |id| {
+            if (isLiked(id)) return;
+            like(model, fx, id);
+            setToast(model, "Liked");
+        },
+        .follow => |pk| {
+            // The follow-safety gate still applies: this publishes a replaceable
+            // list, and nothing may be written over a contact list that has not
+            // been read back. When it is not yet safe the intent is dropped rather
+            // than queued, because a write that lands minutes later, silently, is
+            // exactly the shape this app refuses everywhere else.
+            if (!canWriteFollows()) {
+                setToast(model, "Could not follow yet. Try again in a moment.");
+                return;
+            }
+            if (writeFollow(fx, pk, true)) setToast(model, "Following");
+        },
+    }
+}
+
+pub fn drivePendingIntentForTest(model: *Model, fx: *Effects) void {
+    drivePendingIntent(model, fx);
+}
+
+/// The full event id of a loaded note, for reopening what a guest was reading.
+fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
+    if (model.noteById(note_id)) |note| return note.event_id;
+    return null;
 }
 
 /// Deep-copies `tags` into process-lifetime memory so the detached publisher can

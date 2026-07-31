@@ -13,8 +13,8 @@
             .{
                 .label = "main",
                 .title = "Signet · Plaza",
-                .width = 460,
-                .height = 420,
+                .width = 452,
+                .height = 512,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{
