@@ -1,5 +1,6 @@
 .native/
 zig-out/
+dist/
 .zig-cache/
 zig-pkg/
 .DS_Store
