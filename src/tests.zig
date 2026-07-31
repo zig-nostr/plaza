@@ -461,7 +461,7 @@ test "a guest like is remembered and routed to the join, never published" {
     // the heart does not fill (nothing was published).
     var fx: main.EffectsForTest = undefined;
     main.update(&model, Msg{ .like = id }, &fx);
-    try testing.expectEqual(id, model.pending_like);
+    try testing.expectEqual(id, model.pending.like);
     try testing.expect(model.joining);
     try testing.expect(!main.isLikedForTest(id));
 }
@@ -1418,7 +1418,7 @@ test "the join sheet renders the ladder and remembers a waiting note" {
     try testing.expect(findAnyText(bare.root, "Your note is waiting.") == null);
 
     // With a remembered intent, the sheet says so.
-    model.pending_compose = true;
+    model.pending = .post;
     const pending = try buildTree(arena, &model);
     try testing.expect(findAnyText(pending.root, "Your note is waiting.") != null);
 }
@@ -1426,12 +1426,12 @@ test "the join sheet renders the ladder and remembers a waiting note" {
 test "a remembered intent replays once and only once" {
     var model = main.initialModel();
     model.stage = .ready;
-    model.pending_compose = true;
+    model.pending = .post;
 
     // Identity arrives: the composer opens by itself, the intent is spent.
     main.replayPendingForTest(&model);
     try testing.expect(model.composing);
-    try testing.expect(!model.pending_compose);
+    try testing.expect(!model.pending.waiting());
 
     // A second replay is a no-op: closing the sheet stays closed.
     model.composing = false;
@@ -1472,7 +1472,7 @@ test "the name beat renders and skipping replays the intent" {
     var model = main.initialModel();
     model.stage = .ready;
     model.naming = true;
-    model.pending_compose = true;
+    model.pending = .post;
 
     const tree = try buildTree(arena, &model);
     try testing.expect(findAnyText(tree.root, "Want a name on it?") != null);
@@ -6712,4 +6712,109 @@ test "a zap total no invoice could hold does not take the screen down with it" {
     // The screen still builds. Before, this line aborted the process.
     const tree = try buildTree(arena, &model);
     try testing.expect(tree.root.children.len > 0);
+}
+
+test "what a guest reached for is remembered, whatever the verb was" {
+    // The app carried two ad-hoc pending fields, a bool for the composer and an
+    // id for a like. Every verb added after them either grew a third or quietly
+    // remembered nothing: pressing Follow as a guest opened the sheet, signed you
+    // in, and dropped the follow, and a guest could type a whole reply and press
+    // send to no effect at all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx: main.EffectsForTest = undefined;
+    main.clearIdentityForTest();
+
+    const alice = [_]u8{0x4A} ** 32;
+
+    // Reaching for the composer.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.update(&model, .open_compose, &fx);
+        try testing.expect(model.joining);
+        try testing.expect(model.pending == .post);
+        try testing.expect(!model.composing);
+    }
+
+    // Reaching for a like.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.update(&model, .{ .like = 77 }, &fx);
+        try testing.expect(model.joining);
+        try testing.expectEqual(@as(i64, 77), model.pending.like);
+    }
+
+    // Reaching for Follow on somebody's page. This one used to remember nothing.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.viewing_profile = alice;
+        main.update(&model, .{ .follow_person = 1 }, &fx);
+        try testing.expect(model.joining);
+        try testing.expectEqualSlices(u8, &alice, &model.pending.follow);
+    }
+
+    // Reaching for Reply. This one was gated nowhere: the press reached a signer
+    // that does not exist and returned, doing and saying nothing.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.viewing_thread = 42;
+        main.update(&model, .reply_submit, &fx);
+        try testing.expect(model.joining);
+        try testing.expectEqual(@as(i64, 42), model.pending.reply);
+    }
+
+    // And the sheet says which one it is waiting on, in the reader's terms.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.joining = true;
+        model.pending = .post;
+        try testing.expect(findAnyText((try buildTree(arena, &model)).root, "Your note is waiting.") != null);
+        model.pending = .{ .reply = 42 };
+        try testing.expect(findAnyText((try buildTree(arena, &model)).root, "Your reply is waiting.") != null);
+        model.pending = .{ .follow = alice };
+        try testing.expect(findAnyTextContaining((try buildTree(arena, &model)).root, "is waiting."));
+    }
+}
+
+test "closing the join sheet is an answer, so the verb is dropped" {
+    // Otherwise the thing they declined lies in wait and fires at whatever later
+    // sign-in they make for some other reason entirely.
+    var fx: main.EffectsForTest = undefined;
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.update(&model, .open_compose, &fx);
+    try testing.expect(model.pending.waiting());
+
+    main.update(&model, .close_join, &fx);
+    try testing.expect(!model.joining);
+    try testing.expect(!model.pending.waiting());
+}
+
+test "a remembered follow is never written over a contact list nobody has read" {
+    // The follow-safety rule outranks the convenience: this publishes a
+    // replaceable list, and completing a remembered intent is exactly the moment
+    // it would be tempting to skip the check, because the reader asked for it
+    // minutes ago and is not watching.
+    var fx: main.EffectsForTest = undefined;
+    main.setIdentityForTest([_]u8{0x5B} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.pending = .{ .follow = [_]u8{0x4A} ** 32 };
+    main.drivePendingIntentForTest(&model, &fx);
+
+    // Spent either way, so it cannot retry on every tick for the rest of the
+    // session, and the reader is told rather than left to guess.
+    try testing.expect(!model.pending.waiting());
+    try testing.expect(model.toast_until != 0);
 }

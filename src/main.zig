@@ -4406,6 +4406,19 @@ const QuoteRef = struct {
 /// abbreviated npub, a relative timestamp, and the (truncated) content. Strings
 /// are copied into fixed buffers so a card never aliases the query arena it was
 /// built from.
+/// The verb a guest reached for, held until they have a key.
+pub const Intent = union(enum) {
+    none,
+    post,
+    like: i64,
+    reply: i64,
+    follow: [32]u8,
+
+    pub fn waiting(self: Intent) bool {
+        return self != .none;
+    }
+};
+
 pub const Note = struct {
     // Non-negative i64: the markup engine holds a `for each` integer key as i64
     // then casts it to u64, so a raw u64 (or negative i64) from the id's high
@@ -4733,12 +4746,22 @@ pub const Model = struct {
     // key, use a signer). Rises when a guest presses a gated verb, or from the
     // strip and the Guest chip.
     joining: bool = false,
+    /// What the reader reached for before they had a key.
+    ///
+    /// One field, because there is one answer to "what happens after you sign
+    /// in". The app used to carry two ad-hoc ones, a bool for the composer and an
+    /// id for a like, and every verb added after them either grew a third or
+    /// quietly remembered nothing: pressing Follow as a guest opened the sheet,
+    /// signed you in, and dropped the follow on the floor, because there was
+    /// nowhere to put it. A union makes forgetting a compile error rather than an
+    /// omission.
+    pending: Intent = .none,
     // The remembered intent: the guest reached for the composer, so composing
     // opens by itself the moment an identity exists. The sheet says so.
-    pending_compose: bool = false,
+
     // The other remembered intent: the guest reached for a like. The note id is
     // held here (0 = none) so the like completes the moment an identity exists.
-    pending_like: i64 = 0,
+
     // Whether the join sheet is on its focused bunker-input step (chose "Use
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
@@ -4810,13 +4833,19 @@ pub const Model = struct {
         "identity",              "has_notes",        "empty",                  "status",           "empty_text",
         "footer",                "note_list",        "expanded_note",          "composing",        "caught_up",
         "relay_health",          "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip",
-        "guest_strip_dismissed", "joining",          "pending_compose",        "naming",           "name_buffer",
+        "guest_strip_dismissed", "joining",          "pending",                "naming",           "name_buffer",
         "name_draft",            "name_empty",       "toast_buf",              "toast_len",        "toast_until",
-        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_like",
+        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",
         "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
         "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
         "thread_seq",            "thread_open_at",
     };
+
+    /// Why the join sheet is up, in the reader's own terms. Empty when they
+    /// opened it themselves rather than being sent there by a verb.
+    pub fn pending_text(self: *const Model, ui: *AppUi) []const u8 {
+        return pendingText(ui, self);
+    }
 
     /// The name beat's current text.
     pub fn name_draft(self: *const Model) []const u8 {
@@ -8304,14 +8333,24 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The context line when a guest reached for a like: names whose note it was, so
-/// the sheet explains why it appeared. Falls back to a generic line if the note
-/// has scrolled out of the window.
-fn pendingLikeText(ui: *AppUi, model: *const Model) []const u8 {
-    if (model.noteById(model.pending_like)) |note| {
-        return std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{note.author()}) catch "Your like is waiting.";
-    }
-    return "Your like is waiting.";
+/// Why the sheet appeared, in the reader's own terms: the thing they reached for
+/// is waiting, and named where naming it is possible.
+///
+/// A note that has scrolled out of the loaded window falls back to the plain
+/// sentence rather than guessing, and a person whose kind:0 has not arrived reads
+/// as their short npub, which is what every other surface in the app calls them
+/// until it knows better.
+fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
+    return switch (model.pending) {
+        .none => "",
+        .post => "Your note is waiting.",
+        .reply => "Your reply is waiting.",
+        .like => |id| if (model.noteById(id)) |note|
+            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{note.author()}) catch "Your like is waiting."
+        else
+            "Your like is waiting.",
+        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personName(ui, pk)}) catch "Your follow is waiting.",
+    };
 }
 
 /// The join ladder: three ways in, most confident first, always the way back.
@@ -8326,10 +8365,8 @@ fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
-        if (model.pending_compose)
-            ui.text(.{ .size = .sm, .style = .{ .foreground = p.status_warning } }, "Your note is waiting.")
-        else if (model.pending_like != 0)
-            ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.status_warning } }, pendingLikeText(ui, model))
+        if (model.pending.waiting())
+            ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.status_warning } }, model.pending_text(ui))
         else
             ui.spacer(0),
         ui.paragraph(
@@ -13995,7 +14032,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 scanNip05Fetches(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
-                drivePendingLike(model, fx);
+                drivePendingIntent(model, fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -14080,7 +14117,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // remembers what was reached for.
             if (model.is_guest()) {
                 model.joining = true;
-                model.pending_compose = true;
+                model.pending = .post;
             } else model.composing = true;
         },
         .open_person => |pk| {
@@ -14089,6 +14126,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .follow_person => |direction| {
             if (model.is_guest()) {
+                // REMEMBERED, not merely gated. This press used to open the sheet
+                // and forget what it was for, so signing in landed the reader on
+                // the feed still not following the person they had just asked to
+                // follow, with nothing to say why.
+                if (model.viewing_profile) |who| model.pending = .{ .follow = who };
                 model.joining = true;
                 return;
             }
@@ -14137,6 +14179,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // A guest reaching for Follow is first intent, the same as reaching
             // for the composer: the sheet rises rather than the press failing.
             if (direction == 0 or model.is_guest()) {
+                if (model.is_guest() and model.viewing_thread != 0)
+                    model.pending = .{ .follow = model.thread_root.pubkey };
                 model.joining = true;
                 return;
             }
@@ -14218,8 +14262,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
-            model.pending_compose = false;
-            model.pending_like = 0;
+            // Dismissing the sheet is an answer: they chose not to sign in, so
+            // the verb they reached for is dropped rather than lying in wait to
+            // fire at some later sign-in they made for another reason.
+            model.pending = .none;
         },
         .join_create => {
             // Async: the daemon mints the key (the key never enters Plaza), the
@@ -14240,7 +14286,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .keep_browsing => {
             model.stage = .ready;
-            model.pending_compose = false;
+            model.pending = .none;
         },
         .open_bunker => model.bunker_mode = true,
         .close_bunker => {
@@ -14411,7 +14457,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             closeThread(model);
         },
         .reply_edit => |edit| model.reply_buffer.apply(edit),
-        .reply_submit => publishReply(model, fx),
+        .reply_submit => {
+            // The one verb that was gated nowhere: a guest could type a reply and
+            // press send, and `publishReply` would reach for a signer that does
+            // not exist and return, losing nothing but doing nothing and saying
+            // nothing either.
+            if (model.is_guest()) {
+                if (model.viewing_thread != 0) model.pending = .{ .reply = model.viewing_thread };
+                model.joining = true;
+                return;
+            }
+            publishReply(model, fx);
+        },
         .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
@@ -15035,8 +15092,8 @@ fn mergeNameJson(gpa: std.mem.Allocator, existing: []const u8, name: []const u8)
 /// Completes the remembered first intent once an identity exists: the guest
 /// reached for the composer, so it opens by itself. The welcome-in moment.
 fn replayPending(model: *Model) void {
-    if (model.pending_compose) {
-        model.pending_compose = false;
+    if (model.pending == .post) {
+        model.pending = .none;
         model.composing = true;
     }
 }
@@ -15313,10 +15370,10 @@ fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.e
 }
 
 /// Toggles a like on `note_id`. A guest cannot sign, so the like is remembered
-/// and the join sheet opens; it completes after sign-in (`drivePendingLike`).
+/// and the join sheet opens; it completes after sign-in (`drivePendingIntent`).
 fn toggleLike(model: *Model, fx: *Effects, note_id: i64) void {
     if (model.is_guest()) {
-        model.pending_like = note_id;
+        model.pending = .{ .like = note_id };
         model.joining = true;
         return;
     }
@@ -15350,13 +15407,49 @@ fn unlike(fx: *Effects, note_id: i64) void {
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.
 /// Driven from the tick, where `fx` is in hand and the feed has just rebuilt.
-fn drivePendingLike(model: *Model, fx: *Effects) void {
-    if (model.pending_like == 0 or model.is_guest()) return;
-    const note_id = model.pending_like;
-    model.pending_like = 0;
-    if (isLiked(note_id)) return;
-    like(model, fx, note_id);
-    setToast(model, "Liked");
+fn drivePendingIntent(model: *Model, fx: *Effects) void {
+    if (!model.pending.waiting() or model.is_guest()) return;
+    const intent = model.pending;
+    // Cleared FIRST, whatever happens next. A verb that cannot be completed (the
+    // note scrolled away, the follow list has not loaded) must not be retried on
+    // every tick for the rest of the session.
+    model.pending = .none;
+    switch (intent) {
+        .none => {},
+        .post => model.composing = true,
+        .reply => |id| {
+            // Back to the conversation they were in, with what they wrote still
+            // in the box: `reply_buffer` survived the sheet.
+            if (model.viewing_thread != id) openEvent(model, noteEventId(model, id) orelse return);
+        },
+        .like => |id| {
+            if (isLiked(id)) return;
+            like(model, fx, id);
+            setToast(model, "Liked");
+        },
+        .follow => |pk| {
+            // The follow-safety gate still applies: this publishes a replaceable
+            // list, and nothing may be written over a contact list that has not
+            // been read back. When it is not yet safe the intent is dropped rather
+            // than queued, because a write that lands minutes later, silently, is
+            // exactly the shape this app refuses everywhere else.
+            if (!canWriteFollows()) {
+                setToast(model, "Could not follow yet. Try again in a moment.");
+                return;
+            }
+            if (writeFollow(fx, pk, true)) setToast(model, "Following");
+        },
+    }
+}
+
+pub fn drivePendingIntentForTest(model: *Model, fx: *Effects) void {
+    drivePendingIntent(model, fx);
+}
+
+/// The full event id of a loaded note, for reopening what a guest was reading.
+fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
+    if (model.noteById(note_id)) |note| return note.event_id;
+    return null;
 }
 
 /// Deep-copies `tags` into process-lifetime memory so the detached publisher can
