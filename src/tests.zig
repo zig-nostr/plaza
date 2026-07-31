@@ -7108,6 +7108,121 @@ fn pressableByLabel(tree: AppUi.Tree, widget: canvas.Widget, label: []const u8) 
     return false;
 }
 
+/// The message behind the press on the widget carrying this accessibility label.
+///
+/// `pressableByLabel` asks whether SOMETHING is wired there. This asks what, which
+/// is the difference between "the seat still works" and "the seat still goes where
+/// it is supposed to".
+fn pressMsgByLabel(tree: AppUi.Tree, label: []const u8) ?Msg {
+    const w = findByLabel(tree.root, label) orelse return null;
+    for (tree.handlers) |h| {
+        if (h.id != w.id or h.event != .press) continue;
+        return switch (h.action) {
+            .message => |m| m,
+            else => null,
+        };
+    }
+    return null;
+}
+
+test "the rail's own seat opens your page, not your preferences" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A guest has no page to open, so the seat asks who they are. Unchanged.
+    main.clearIdentityForTest();
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const tree = try buildTree(arena, &model);
+        const msg = pressMsgByLabel(tree, "You") orelse return error.SeatHasNoPress;
+        switch (msg) {
+            .open_join => {},
+            else => return error.GuestSeatGoesSomewhereElse,
+        }
+    }
+
+    main.setIdentityForTest([_]u8{0x5A} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const tree = try buildTree(arena, &model);
+    const msg = pressMsgByLabel(tree, "You") orelse return error.SeatHasNoPress;
+    switch (msg) {
+        .open_person => |pk| try testing.expectEqualSlices(u8, &me, &pk),
+        else => return error.SeatGoesSomewhereElse,
+    }
+
+    // The page it opens has to KNOW whose it is. Carrying the right thirty-two
+    // bytes is not the same thing as landing on a screen that reads as yours,
+    // and the screen is the part a reader sees.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, msg, &fx);
+    try testing.expectEqualSlices(u8, &me, &(model.viewing_profile orelse return error.NoProfile));
+    const page = try buildTree(arena, &model);
+    try testing.expect(findAnyText(page.root, "This is you") != null);
+    // And offers no Follow. Following yourself writes your own contact list for
+    // no reason, which is the one thing this app is most careful with.
+    try testing.expect(findAnyText(page.root, "Follow") == null);
+}
+
+test "your own page is written for you, not about you" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x5A} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // Your own page, freshly minted: no notes, no contact list read yet. This is
+    // the exact state a reader who just pressed "Create your identity" arrives in,
+    // and it is entirely made of the sentences that used to say "they".
+    main.update(&model, .{ .open_person = me }, &fx);
+    const mine = try buildTree(arena, &model);
+    if (findAnyTextContainingText(mine.root, "they have written")) |s| {
+        std.debug.print("own page talks about the reader in the third person: \"{s}\"\n", .{s});
+        return error.WrongPerson;
+    }
+    try testing.expect(findAnyTextContainingText(mine.root, "you have written") != null);
+    try testing.expect(findAnyText(mine.root, "Your follow list has not arrived yet") != null);
+
+    // The line above is the LOADING one, and it is the only empty-tab string a
+    // freshly opened profile can reach: `enterProfile` sets `thread_loading` from
+    // an empty note count, and with no store it never clears. Settling it reaches
+    // the other two, which otherwise sit behind an assertion that cannot see them
+    // and could each be reverted to "they" with the suite still green.
+    model.thread_loading = false;
+    for ([_]struct { tab: @TypeOf(model.profile_tab), want: []const u8 }{
+        .{ .tab = .notes, .want = "Nothing you have written is here yet." },
+        .{ .tab = .replies, .want = "Nothing you have written at anyone is here yet." },
+    }) |c| {
+        model.profile_tab = c.tab;
+        const settled = try buildTree(arena, &model);
+        if (findAnyText(settled.root, c.want) == null) {
+            std.debug.print("own page is missing \"{s}\"\n", .{c.want});
+            return error.WrongPerson;
+        }
+        try testing.expect(findAnyTextContainingText(settled.root, "they have written") == null);
+    }
+    model.profile_tab = .notes;
+
+    // A stranger's page is unchanged: it is about somebody else, and saying "you"
+    // there would be the same mistake pointed the other way.
+    main.update(&model, .{ .open_person = [_]u8{0x33} ** 32 }, &fx);
+    const theirs = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContainingText(theirs.root, "they have written") != null);
+    try testing.expect(findAnyText(theirs.root, "Their follow list has not arrived yet") != null);
+    try testing.expect(findAnyTextContainingText(theirs.root, "you have written") == null);
+}
+
 test "every way into the app is wired, by name" {
     // Deleting `.on_press` from joinCard leaves three inert rectangles that still
     // say button, still focus, still paint, and still hold every string the other
