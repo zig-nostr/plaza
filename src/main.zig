@@ -9469,7 +9469,6 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
 fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const liked = likeEntry(note.id) != null;
-    const counts = engagementFor(note.id);
     // The mock's insets are 2 above, 40 each side, 4 below, and padding on this
     // engine is ONE number for all four edges, so each axis is stated where it
     // belongs: this column carries the 2 and the 4, the row carries the 40s as
@@ -9480,63 +9479,18 @@ fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
         vgap(ui, 2),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, 40),
-            // Repost and zap are READINGS here, not verbs: an icon and a number,
-            // no press, no hover, not in the focus order, and labelled as the
-            // count they are. Reposting needs its own milestone and zapping needs
-            // a wallet, and a control that draws like the live ones beside it and
-            // does nothing when pressed is a promise the app cannot keep. The
-            // number is still worth showing, because what other people did with
-            // this note is true and knowable today.
-            focalStat(ui, "repeat", counts.reposts, "{d} repost", "{d} reposts", p.text_verb),
-            ui.spacer(1),
+            // Only the verbs that work. Reposting needs its own milestone and
+            // zapping needs a wallet, and their numbers are already stated twelve
+            // pixels above in the stats row, which is where the design puts
+            // counts. Drawing them again under a glyph that cannot be pressed
+            // said the same thing twice in two registers, and the second saying
+            // looked like a control.
             focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
-            ui.spacer(1),
-            focalStat(ui, "zap", counts.zap_msat / 1000, "{d} sat", "{d} sats", p.text_verb),
             ui.spacer(1),
             focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
             hgap(ui, 40),
         }),
         vgap(ui, 4),
-    });
-}
-
-/// A reading on the action bar: what other people did, stated rather than
-/// offered.
-///
-/// Deliberately NOT a `focalVerb` with a null press. That shape draws the same
-/// box, keeps the same hover wash and still announces itself to the reader as a
-/// button, so it reads as something that ought to work and quietly does not.
-/// This one has no press, no hover, no focus, and its accessible name is the
-/// count rather than a verb, so nothing about it offers an action.
-fn focalStat(
-    ui: *AppUi,
-    glyph: []const u8,
-    // u64, like every sibling that prices the same numbers. A zap total is a
-    // saturating sum of amounts parsed out of strangers' `bolt11` strings, which
-    // nothing validates and nothing can: one receipt claiming an absurd figure
-    // used to be narrowed here with `@intCast`, which is a panic in a safety
-    // build and a silently truncated number in the shipped one. Anyone could
-    // publish that event.
-    n: u64,
-    comptime one: []const u8,
-    comptime many: []const u8,
-    tint: canvas.Color,
-) AppUi.Node {
-    const p = theme.palette;
-    return ui.row(.{
-        .padding = 6,
-        .cross = .center,
-        .gap = 6,
-        // Named as the count, not as a verb: a screen reader should hear "three
-        // reposts", which is what this is, and never "Repost", which is an offer
-        // this cannot honour.
-        .semantics = .{ .label = pluralize(ui, n, one, many) },
-    }, .{
-        ui.appIcon(.{ .width = 17, .height = 17, .style = .{ .foreground = tint } }, glyph),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_metric } },
-            &.{.{ .text = ui.fmt("{d}", .{n}), .scale = meta_scale }},
-        ),
     });
 }
 
