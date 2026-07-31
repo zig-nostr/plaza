@@ -71,8 +71,13 @@ native check   # validate the markup and manifest
 
 Plaza is a [Native SDK](https://github.com/vercel-labs/native) app: plain Zig
 for the logic and the feed (`src/main.zig`), declarative `.native` markup for
-the static screens, rendered natively, no browser, no Electron. Linux and
-Windows build and test in CI; packaged releases for them come later.
+the static screens, rendered natively, no browser, no Electron.
+
+Linux builds and tests in CI on every change. Windows is not in the matrix:
+the relay transport resolves hostnames through libc `getaddrinfo`, which Zig's
+standard library does not declare for Windows, so nothing depending on the
+library links there (`zig-nostr/nostr#59`). Packaged releases for either come
+later regardless.
 
 ## License
 
