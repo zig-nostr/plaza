@@ -6589,9 +6589,12 @@ test "nothing that calls itself a button is dead" {
                 m.stage = .onboarding;
             }
         }.f },
-        // The first-intent sheet and what follows it. Not covered until now, and
-        // the ladder's three rungs are hand-built rows rather than `ui.button`,
-        // so nothing else would have noticed one losing its press.
+        // The first-intent sheet and what follows it, which nothing covered until
+        // now. Note what this guard can and cannot see: for a hand-built row the
+        // SDK advertises `press` only BECAUSE `on_press` was set, which is the
+        // same condition that registers the handler, so deleting `.on_press` from
+        // `joinCard` makes all three rungs inert AND invisible to this walk. That
+        // is what "the ladder's three rungs are wired" below is for.
         .{ .name = "join sheet", .prepare = struct {
             fn f(m: *main.Model) void {
                 m.stage = .ready;
@@ -6858,18 +6861,20 @@ test "a remembered follow is never written over a contact list nobody has read" 
     try testing.expect(model.toast_until != 0);
 }
 
-test "a key made in the ceremony window still gets the name beat" {
-    // The create runs in the other process now, so its result reaches Plaza the
-    // same way a terminal import does: a key simply appears at /pubkey. Without
-    // something telling those two apart, creating an identity would drop a
-    // brand new reader into the feed as a nameless account with nothing
-    // offering to name it, which is the entire reason the beat exists.
+test "only the ceremony's own report opens the name beat" {
+    // The first version of this asked a 90-second TIMER whether an appearing key
+    // was freshly minted. That is a different question from the one that matters,
+    // and the gap was reachable: press Create, have it fail, then import a real
+    // account inside the window. Plaza offered "Want a name on it?" over an
+    // account that already had a name, and publishing that name rewrote its
+    // kind:0 from an empty local profile.
     main.clearIdentityForTest();
     defer main.clearIdentityForTest();
     const body = "{\"pubkey\":\"" ++ "5b" ** 32 ++ "\",\"state\":\"ready\"}";
 
+    // The window said it minted a key.
     {
-        main.setCreateCeremonyForTest(true);
+        main.setCeremonyForTest(.created);
         var model = main.initialModel();
         model.stage = .onboarding;
         main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
@@ -6877,13 +6882,22 @@ test "a key made in the ceremony window still gets the name beat" {
         try testing.expect(model.naming);
     }
 
-    // And a key that appears for any other reason does not: an import, a
-    // terminal, a ceremony abandoned long enough ago that the window expired.
-    // Asking an existing account to pick a name is asking about something it
-    // already has.
+    // A ceremony is open but has said nothing yet. Sign in; do NOT assume.
     {
         main.clearIdentityForTest();
-        main.setCreateCeremonyForTest(false);
+        main.setCeremonyForTest(.running);
+        var model = main.initialModel();
+        model.stage = .onboarding;
+        main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+        try testing.expect(main.activePubkeyForTest() != null);
+        try testing.expect(!model.naming);
+        try testing.expect(main.ceremonyOwesNameForTest());
+    }
+
+    // No ceremony at all: an import, a terminal, a restored daemon.
+    {
+        main.clearIdentityForTest();
+        main.setCeremonyForTest(.none);
         var model = main.initialModel();
         model.stage = .onboarding;
         main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
@@ -6892,24 +6906,86 @@ test "a key made in the ceremony window still gets the name beat" {
     }
 }
 
-test "the ceremony window is spent once, not held open for the next key" {
-    // A latch that survived its own ceremony would put the name card in front of
-    // whatever signed in next.
+test "a ceremony that did not mint arms nothing" {
+    // Every way out of that window except a mint: a failure, a cancel, a crash,
+    // and a spawn that never ran because one was already open.
     main.clearIdentityForTest();
     defer main.clearIdentityForTest();
-    main.setCreateCeremonyForTest(true);
+    main.setIdentityMintedForTest(false);
+
+    for ([_]native_sdk.EffectExit{
+        .{ .key = 0, .reason = .exited, .code = 0 },
+        .{ .key = 0, .reason = .exited, .code = 1 },
+        .{ .key = 0, .reason = .signaled, .code = 0 },
+        .{ .key = 0, .reason = .rejected, .code = 0 },
+    }) |exit| {
+        main.setCeremonyForTest(.running);
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.handleSignetExitedForTest(&model, exit);
+        try testing.expect(!model.naming);
+        // And it must not claim the key has no history: that flag is what lets a
+        // contact list be published without reading one back first.
+        try testing.expect(!main.identityMintedForTest());
+    }
+
+    // A rejected spawn is a press that did nothing, so the reader is told.
+    {
+        main.setCeremonyForTest(.running);
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+        try testing.expect(model.toast_until != 0);
+    }
+}
+
+test "a mint confirmed after the poll still gets its name beat" {
+    // The window holds its result on screen for two seconds and Plaza polls every
+    // one, so the key is normally adopted BEFORE the window exits. The beat is
+    // owed until the report arrives, and paid when it does.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    main.setCeremonyForTest(.running);
     const body = "{\"pubkey\":\"" ++ "6c" ** 32 ++ "\",\"state\":\"ready\"}";
 
     var model = main.initialModel();
     model.stage = .onboarding;
     main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
-    try testing.expect(model.naming);
+    try testing.expect(!model.naming);
 
+    main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .exited, .code = 9 });
+    try testing.expect(model.naming);
+    try testing.expect(main.identityMintedForTest());
+}
+
+test "a key that was never made never claims to have no history" {
+    // canWriteFollows() lets a contact list be published WITHOUT reading one back
+    // when the key was minted here, because a key with no history cannot have a
+    // list to destroy. Setting that on the button press rather than on a
+    // confirmed mint made the claim false: press Create, have the ceremony fail,
+    // import an account with eight hundred follows, and the remembered follow
+    // replays into a kind:3 holding the starter pack and nothing else.
     main.clearIdentityForTest();
-    var second = main.initialModel();
-    second.stage = .onboarding;
-    main.handleHelperPubkeyForTest(&second, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
-    try testing.expect(!second.naming);
+    defer main.clearIdentityForTest();
+    var fx: main.EffectsForTest = undefined;
+    main.setIdentityMintedForTest(false);
+    // With the daemon parked as unreachable the queued create stays queued, so
+    // this exercises the Msg arm without needing an effects layer.
+    main.setHelperUnreachableForTest();
+    defer main.setHelperUnreachableForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    main.update(&model, .join_create, &fx);
+    try testing.expect(!main.identityMintedForTest());
+
+    // And choosing the other rung disclaims it outright.
+    main.setIdentityMintedForTest(true);
+    main.setCeremonyForTest(.running);
+    main.update(&model, .open_signet_import, &fx);
+    try testing.expect(!main.identityMintedForTest());
 }
 
 test "the ladder offers three ways in and the way back out" {
@@ -7009,5 +7085,61 @@ test "the sheets' recommended actions actually paint" {
         const p = try painted.Painted.render(arena, &model);
         const fill = p.fillAtCenterOf("Done") orelse return error.NoDoneButton;
         try testing.expect(painted.sameColor(fill, theme.palette.accent));
+    }
+}
+
+/// Whether the widget carrying this accessibility label has a handler behind it.
+///
+/// The dead-control guard walks the tree asking what each widget ADVERTISES, which
+/// catches a `ui.button` or a `.checkbox` whose handler went missing. It cannot
+/// catch a hand-built row losing its `on_press`: for a plain row the SDK derives
+/// the advertised press FROM `on_press`, so removing it removes the advertisement
+/// too and the widget stops being a button the guard is looking for. Naming the
+/// control is the only way to assert it still exists AND still does something.
+fn pressableByLabel(tree: AppUi.Tree, widget: canvas.Widget, label: []const u8) bool {
+    if (std.mem.eql(u8, widget.semantics.label, label)) {
+        for (tree.handlers) |h| {
+            if (h.id == widget.id) return true;
+        }
+    }
+    for (widget.children) |child| {
+        if (pressableByLabel(tree, child, label)) return true;
+    }
+    return false;
+}
+
+test "every way into the app is wired, by name" {
+    // Deleting `.on_press` from joinCard leaves three inert rectangles that still
+    // say button, still focus, still paint, and still hold every string the other
+    // tests assert on. The whole suite passed with the ladder dead.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.joining = true;
+        const tree = try buildTree(arena, &model);
+        for ([_][]const u8{ "Create your identity", "Bring your key", "Use your own signer", "Keep browsing" }) |label| {
+            if (!pressableByLabel(tree, tree.root, label)) {
+                std.debug.print("join sheet: \"{s}\" is not pressable\n", .{label});
+                return error.DeadControl;
+            }
+        }
+    }
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.naming = true;
+        const tree = try buildTree(arena, &model);
+        for ([_][]const u8{ "Done", "Skip" }) |label| {
+            if (!pressableByLabel(tree, tree.root, label)) {
+                std.debug.print("name card: \"{s}\" is not pressable\n", .{label});
+                return error.DeadControl;
+            }
+        }
     }
 }

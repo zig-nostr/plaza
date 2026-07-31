@@ -68,6 +68,18 @@ var g_mode: Mode = .import_key;
 const hold_ms: u64 = 2_000;
 const beat_interval_ms: u64 = 80;
 
+/// The exit code this window uses to say "I minted a key", and the global that
+/// remembers whether it did.
+///
+/// This is the whole channel back to Plaza, and it is deliberately narrow. Plaza
+/// cannot tell a key the ceremony made from a key that simply appeared at the
+/// daemon's /pubkey (an import, a `plaza-signer import` in a terminal, a leftover
+/// from a session that did not shut down cleanly). Only this process knows, and
+/// only because it is the one that asked. Guessing from timing instead put "Want
+/// a name on it?" in front of imported accounts and rewrote their kind:0.
+const created_exit_code: u8 = 9;
+var g_created_key = false;
+
 const Stage = enum {
     /// Import: waiting for a key to be pasted.
     paste,
@@ -95,7 +107,7 @@ const Model = struct {
     /// bar that is not measuring anything is a lie with a rounded cap.
     held_ms: u64 = 0,
 
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "held_ms", "npub", "beat" };
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "held_ms", "npub", "beat" };
 
     pub fn key(self: *const Model) []const u8 {
         return std.mem.trim(u8, self.key_buffer.text(), " \t\r\n");
@@ -106,11 +118,36 @@ const Model = struct {
     pub fn is_ncryptsec(self: *const Model) bool {
         return std.mem.startsWith(u8, self.key(), "ncryptsec1");
     }
-    pub fn can_import(self: *const Model) bool {
+    /// Whether there is something here worth sending to the daemon.
+    ///
+    /// An nsec has to DECODE, not merely start with "nsec1". The prefix alone let
+    /// a paste that lost its last characters light the primary button up, and
+    /// pressing it walked the reader into the terminal failure state with their
+    /// typed key already wiped. An ncryptsec cannot be checked without its
+    /// passphrase, so that one is still confirmed on the far side.
+    pub fn can_import(self: *const Model, arena: std.mem.Allocator) bool {
         const k = self.key();
-        if (std.mem.startsWith(u8, k, "nsec1")) return true;
+        // `npub_hint` IS the decode: it returns the npub this key signs as, and
+        // empty when the bech32 does not decode. One check, and it is the same one
+        // the reader can see the result of.
+        if (std.mem.startsWith(u8, k, "nsec1")) return self.npub_hint(arena).len > 0;
         if (std.mem.startsWith(u8, k, "ncryptsec1")) return self.pass_buffer.text().len > 0;
         return false;
+    }
+
+    /// What to say about a key that is present but unusable. Empty when there is
+    /// nothing to say: an empty field is not an error, it is the starting state.
+    pub fn key_problem(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        const k = self.key();
+        if (k.len == 0) return "";
+        if (std.mem.startsWith(u8, k, "ncryptsec1")) return "";
+        if (!std.mem.startsWith(u8, k, "nsec1")) return "That is not an nsec or an ncryptsec.";
+        if (self.npub_hint(arena).len > 0) return "";
+        // Reached by the ordinary accident: a paste that lost its tail. Saying
+        // nothing here (which is what the first version of this window did after
+        // its error string was dropped) leaves an enabled button over a key that
+        // cannot work.
+        return "Not a valid nsec yet.";
     }
     pub fn npub(self: *const Model) []const u8 {
         return self.npub_buf[0..self.npub_len];
@@ -290,7 +327,11 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             requestCreate(model, fx);
         },
         .do_import => {
-            if (!model.can_import()) return;
+            // Re-checked here, not only where the button is drawn: a keyboard
+            // submit reaches this arm without passing the disabled state.
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            if (!model.can_import(scratch.allocator())) return;
             if (g_token_len == 0) {
                 model.stage = .failed;
                 setNotice(model, "Signet isn't running. Start Plaza first.");
@@ -337,6 +378,9 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             _ = adoptPubkey(model, response.body);
+            // Said once, here, where the daemon has just answered 200 to a create
+            // this process sent. Nothing else in either program can establish it.
+            g_created_key = true;
             holdThenClose(model, fx, .made);
         },
         .beat => |t| {
@@ -427,6 +471,7 @@ fn inset(ui: *AppUi, pad: f32, inner: AppUi.Node) AppUi.Node {
 
 fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
     const hint = model.npub_hint(ui.arena);
+    const problem = model.key_problem(ui.arena);
     return ui.column(.{ .grow = 1, .gap = 0 }, .{
         vgap(ui, 20),
         inset(ui, 22, ui.column(.{ .grow = 1, .gap = 11 }, .{
@@ -459,10 +504,15 @@ fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
                 }, .{})
             else if (hint.len > 0)
                 validKeyBox(ui, hint)
+            else if (problem.len > 0)
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = ink.bad } },
+                    &.{.{ .text = problem, .scale = px(11.5) }},
+                )
             else
                 ui.spacer(0),
             ui.row(.{ .cross = .center, .gap = 8 }, .{
-                ui.button(.{ .variant = .primary, .disabled = !model.can_import(), .on_press = .do_import }, "Import this key"),
+                ui.button(.{ .variant = .primary, .disabled = !model.can_import(ui.arena), .on_press = .do_import }, "Import this key"),
                 ui.spacer(1),
                 ui.button(.{ .variant = .ghost, .on_press = .close }, "Cancel"),
             }),
@@ -739,6 +789,11 @@ pub fn main(init: std.process.Init) !void {
         .js_window_api = false,
         .security = .{ .permissions = &app_permissions, .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } } },
     }, init);
+    // After the window is down and the app is torn down, so this is the last
+    // thing the process does. An import, a cancel, a failure and a crash all
+    // leave the code at 0 and tell Plaza nothing, which is correct: none of them
+    // made a key.
+    if (g_created_key) std.process.exit(created_exit_code);
 }
 
 // ---------------------------------------------------------------- tests
@@ -763,18 +818,55 @@ test "the beat never draws a negative remainder" {
 }
 
 test "the import button is only offered when there is something to import" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var model = Model{};
-    try testing.expect(!model.can_import());
+    try testing.expect(!model.can_import(arena));
+    // An empty field is the starting state, not a mistake, so it says nothing.
+    try testing.expectEqualStrings("", model.key_problem(arena));
 
     // An ncryptsec cannot be read without its passphrase, so offering the button
     // before one is typed would be offering a press that fails.
     model.key_buffer.set("ncryptsec1qqqqq");
-    try testing.expect(!model.can_import());
+    try testing.expect(!model.can_import(arena));
     model.pass_buffer.set("hunter2");
-    try testing.expect(model.can_import());
+    try testing.expect(model.can_import(arena));
 
     // Anything that is neither is not a key, whatever it looks like.
     model.key_buffer.set("npub1qqqqq");
     model.pass_buffer.clear();
-    try testing.expect(!model.can_import());
+    try testing.expect(!model.can_import(arena));
+    try testing.expectEqualStrings("That is not an nsec or an ncryptsec.", model.key_problem(arena));
+}
+
+test "an nsec that does not decode is refused, and said so" {
+    // The prefix is not the key. A paste that lost its tail still starts with
+    // "nsec1", and checking only that lit the primary button up over something
+    // the daemon would reject, after which the window's terminal failure state
+    // had already wiped what was typed. Worse, the line that used to say "Not a
+    // valid nsec yet." had been dropped, so the reader saw NOTHING: no
+    // confirmation, no error, and an enabled button.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The secret 0x00..01, encoded. A published constant, not anybody's key, and
+    // deterministic so this test does not depend on a generator.
+    const valid_nsec = "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgl";
+    var model = Model{};
+    model.key_buffer.set(valid_nsec);
+    const whole_valid = model.can_import(arena);
+
+    // The same key with its last character gone, which is what a clipped paste
+    // looks like.
+    model.key_buffer.set(valid_nsec[0 .. valid_nsec.len - 1]);
+    try testing.expect(!model.can_import(arena));
+    try testing.expectEqualStrings("Not a valid nsec yet.", model.key_problem(arena));
+    try testing.expectEqualStrings("", model.npub_hint(arena));
+
+    // And the intact one is still accepted, so the check is not simply refusing
+    // everything.
+    try testing.expect(whole_valid);
 }

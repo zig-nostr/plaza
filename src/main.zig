@@ -1755,25 +1755,100 @@ fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
     // values is a pointer to a temporary, and handing the effect layer one that
     // outlives its scope is the kind of bug that shows up as a garbled argv on
     // somebody else's machine.
+    // `on_exit` is not optional here. The SDK REJECTS a spawn whose key already
+    // has a live process, and a rejection is reported through this callback and
+    // nowhere else: without it, pressing "Create your identity" while a Signet
+    // window is already open did nothing at all, silently, and left the reader on
+    // the guest feed having pressed the app's primary call to action.
     switch (ceremony) {
-        .import_key => fx.spawn(.{ .key = signet_spawn_key, .argv = &.{bin}, .output = .collect }),
-        .create_key => fx.spawn(.{ .key = signet_spawn_key, .argv = &.{ bin, "--create" }, .output = .collect }),
+        .import_key => fx.spawn(.{
+            .key = signet_spawn_key,
+            .argv = &.{bin},
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.signet_exited),
+        }),
+        .create_key => fx.spawn(.{
+            .key = signet_spawn_key,
+            .argv = &.{ bin, "--create" },
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.signet_exited),
+        }),
     }
 }
 
-/// Until when an adopted key should be treated as one the reader just made.
+/// What the ceremony window did, learned when it goes.
 ///
-/// The create ceremony runs in the other process, so its result reaches Plaza
-/// the same way a terminal import does: a key simply appears at /pubkey. This
-/// latch is how the two are told apart, which decides whether the name beat
-/// opens. It EXPIRES rather than persisting, so a ceremony the reader abandoned
-/// cannot put "Want a name on it?" in front of an import done ten minutes later.
-var g_create_ceremony_until: i64 = 0;
-const create_ceremony_grace_s: i64 = 90;
+/// Every route out of the window lands here: a mint, an import, a cancel, a
+/// failure, a crash, and a spawn that never started because one was already
+/// running. Only the first arms the name beat.
+fn handleSignetExited(model: *Model, e: native_sdk.EffectExit) void {
+    const was_running = g_ceremony;
+    g_ceremony = .none;
 
-fn createCeremonyRunning() bool {
-    return nowSeconds() < g_create_ceremony_until;
+    if (e.reason == .rejected) {
+        // A window is already open. Say so: this is a press the reader made and
+        // it is about to look like it did nothing.
+        if (was_running == .running) {
+            g_ceremony_adopted = false;
+            setToast(model, "A Signet window is already open");
+        }
+        return;
+    }
+
+    const created = e.reason == .exited and e.code == ceremony_created_code;
+    if (!created) {
+        g_ceremony_adopted = false;
+        return;
+    }
+
+    // Minted. The flag that lets a contact list be written without reading one
+    // back first is set HERE, on the confirmation, and never on the press: a key
+    // that was never made cannot have provably no history.
+    g_identity_minted_here = true;
+    if (g_ceremony_adopted) {
+        // The poll already signed the reader in, so the beat is owed now.
+        g_ceremony_adopted = false;
+        persistSession();
+        model.naming = true;
+        return;
+    }
+    g_ceremony = .created;
 }
+
+/// What the create ceremony has told us, which is the only thing that decides
+/// whether an appearing key is one the reader just made.
+///
+/// This was a 90-second timer, and a timer is not an answer. It said "a key that
+/// turns up soon after the Create press", which is a DIFFERENT statement from "the
+/// key the ceremony made", and the gap between them was reachable: press Create,
+/// have it fail (the daemon is not up yet, so the window says so and exits), then
+/// press "Bring your key" and import a real account. The imported key arrived
+/// inside the window, so Plaza treated it as freshly minted, offered "Want a name
+/// on it?" over an account that already had one, and publishing that name rewrote
+/// the account's kind:0 from an empty local profile. That is the exact shape of
+/// the rule this app is built around: never write a replaceable record over data
+/// you have not read back.
+///
+/// So the ceremony reports its own result instead. The window exits with
+/// `ceremony_created_code` if and only if it minted a key, and that exit is what
+/// arms the beat. A failed create, an import, a cancel and a crash all exit some
+/// other way and arm nothing.
+const CeremonyState = enum {
+    /// No create ceremony has been asked for.
+    none,
+    /// The window was spawned and has not reported yet.
+    running,
+    /// The window minted a key and Plaza has not yet adopted it.
+    created,
+};
+var g_ceremony: CeremonyState = .none;
+/// A key was adopted while the ceremony was still running, so the beat is owed
+/// once the window confirms what it did. The poll usually wins this race: the
+/// window holds its result on screen for two seconds and Plaza polls every one.
+var g_ceremony_adopted = false;
+
+/// The window's exit code when, and only when, it minted a key.
+const ceremony_created_code: i32 = 9;
 
 /// Tells the daemon to forget the key (wipe memory + delete the file), so a
 /// logout is not undone when the health-check next reads /pubkey. Fire and
@@ -1867,15 +1942,19 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
     persistSession();
     enterFeed(model);
-    // A key that appeared because the reader asked Signet to MAKE one gets the
-    // name beat, the same as when Plaza minted it itself. Without this the
-    // ceremony window's create would drop a reader into the feed as an account
-    // with no name and nothing offering to give it one, which is the whole
-    // reason the beat exists.
-    if (createCeremonyRunning()) {
-        g_create_ceremony_until = 0;
-        model.naming = true; // the name beat; replay follows it
-        return;
+    switch (g_ceremony) {
+        // The window has confirmed a mint, so this key is that key: nothing else
+        // can be in a daemon that just accepted a create.
+        .created => {
+            g_ceremony = .none;
+            model.naming = true; // the name beat; replay follows it
+            return;
+        },
+        // A ceremony is open but has not said what it did yet. Sign in, and owe
+        // the beat until the window reports. NOT "assume it was a create": that
+        // assumption is the bug this replaced.
+        .running => g_ceremony_adopted = true,
+        .none => {},
     }
     replayPending(model);
 }
@@ -2021,6 +2100,10 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     persistSession();
     switch (purpose) {
         .create => {
+            // Confirmed here, for the same reason the ceremony window's mint is
+            // confirmed on its exit: the daemon has answered, so a key exists and
+            // it is this one.
+            g_identity_minted_here = true;
             enterFeed(model);
             model.naming = true; // the name beat; replay follows it
         },
@@ -2048,12 +2131,12 @@ fn beginCreate(fx: *Effects) void {
         queueHelperSetup(fx, .create, null);
         return;
     }
-    // The ceremony is the other process's now, so the things queueHelperSetup
-    // would have done for us have to be done here: re-enable adopt-on-appear
-    // (a logout latches it off), and mark the window in which an appearing key
-    // is a key this reader just made.
+    // The ceremony is the other process's now, so what queueHelperSetup would
+    // have done has to be done here: re-enable adopt-on-appear, which a logout
+    // latches off.
     g_logged_out = false;
-    g_create_ceremony_until = nowSeconds() + create_ceremony_grace_s;
+    g_ceremony = .running;
+    g_ceremony_adopted = false;
     spawnSignetWindow(fx, .create_key);
 }
 
@@ -7312,6 +7395,7 @@ pub const Msg = union(enum) {
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
     helper_exited: native_sdk.EffectExit,
+    signet_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
     /// A /setup (create) answered: adopt the new helper identity.
@@ -7369,7 +7453,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -8461,15 +8545,31 @@ fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
         .none => "",
         .post => "Your note is waiting.",
         .reply => "Your reply is waiting.",
-        // Clipped, because this sits in a pill that does not wrap and a display
-        // name is a stranger's string with no length in it. The unclipped version
-        // pushed the pill past the sheet the moment somebody had a long one.
+        // Clipped, because a display name is a stranger's string with no length
+        // in it and no alphabet either. The pill wraps as well (see intentPill):
+        // a codepoint cap bounds COUNT, not WIDTH, and fourteen full-width CJK
+        // characters are about twice fourteen Latin ones, so the clip alone still
+        // overran the card in some scripts.
         .like => |id| if (model.noteById(id)) |note|
-            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{clipToChars(note.author(), 14, 48)}) catch "Your like is waiting."
+            std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your like is waiting."
         else
             "Your like is waiting.",
-        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{clipToChars(personName(ui, pk), 14, 48)}) catch "Your follow is waiting.",
+        .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personLabel(ui, personName(ui, pk))}) catch "Your follow is waiting.",
     };
+}
+
+/// A person's name, short enough for one line of a pill.
+///
+/// The npub fallback is passed through UNCLIPPED. It is already an abbreviation,
+/// `npub1abcdefghi…wxyz5`, and its whole job is the tail: clipping it to fourteen
+/// codepoints ate three of the five identifying characters at the end and left
+/// something that looks specific and is not.
+fn personLabel(ui: *AppUi, name: []const u8) []const u8 {
+    _ = ui;
+    // The abbreviated npub carries an ellipsis, and it is the only thing in this
+    // app that does. Substring, not scalar: the character is three bytes.
+    if (std.mem.indexOf(u8, name, "…") != null) return name;
+    return clipToChars(name, 14, 48);
 }
 
 /// The glyph for the verb that opened the sheet: the reader sees what they
@@ -8494,6 +8594,7 @@ fn intentPill(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return ui.row(.{ .gap = 0 }, .{
         ui.el(.panel, .{
+            .grow = 1,
             .padding = 0.01,
             .style = .{ .background = p.surface_chip, .border = p.border_hairline, .radius = 999, .stroke_width = 1 },
         }, .{
@@ -8502,10 +8603,17 @@ fn intentPill(ui: *AppUi, model: *const Model) AppUi.Node {
                 vgap(ui, 22),
                 pendingGlyph(ui, model),
                 hgap(ui, 6),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_muted_alt } },
-                    &.{.{ .text = model.pending_text(ui), .scale = join_sub_scale }},
-                ),
+                // Bounded AND wrapping. `wrap` on its own does nothing to a
+                // paragraph that is a plain flow child of a row (it takes its
+                // intrinsic width and lays out past the card), and a clip on its
+                // own bounds characters rather than pixels. Both, so no name in
+                // any script can push this line out of the sheet.
+                ui.column(.{ .grow = 1, .gap = 0 }, .{
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = p.text_muted_alt } },
+                        &.{.{ .text = model.pending_text(ui), .scale = join_sub_scale }},
+                    ),
+                }),
                 hgap(ui, 10),
             }),
         }),
@@ -14316,6 +14424,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
+        .signet_exited => |e| handleSignetExited(model, e),
         .helper_pubkey => |response| {
             handleHelperPubkey(model, response);
             // A queued setup fires the moment the daemon is reachable.
@@ -14519,9 +14628,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .join_create => {
             model.joining = false;
-            // Minted HERE, so it provably has no history: creating a contact
-            // list for it later cannot destroy one.
-            g_identity_minted_here = true;
+            // `g_identity_minted_here` is NOT set here. It says the key provably
+            // has no history, which is what lets a contact list be published
+            // without reading one back first, and at this point there is no key
+            // at all: the ceremony can still fail, and the reader can still go
+            // and import an account with eight hundred follows instead. It is set
+            // when a mint is CONFIRMED, in handleSignetExited and in
+            // handleHelperSetup's create branch.
             beginCreate(fx);
         },
         .open_signet_import => {
@@ -14530,13 +14643,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appears (handleHelperPubkey). If the window binary is missing,
             // fall back to the in-Plaza field rather than a dead button.
             model.joining = false;
+            // Whatever a previous press left behind, this is not a mint. Both
+            // flags are the reader's answer to "where does this key come from",
+            // and they just answered differently.
+            g_ceremony = .none;
+            g_ceremony_adopted = false;
+            g_identity_minted_here = false;
             if (g_signet_win_len > 0) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
             model.stage = .ready;
             model.pending = .none;
         },
-        .open_bunker => model.bunker_mode = true,
+        .open_bunker => {
+            model.bunker_mode = true;
+            g_ceremony = .none;
+            g_ceremony_adopted = false;
+            g_identity_minted_here = false;
+        },
         .close_bunker => {
             model.bunker_mode = false;
             model.login_buffer.clear();
@@ -15363,10 +15487,37 @@ pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
     return restoreHelperIdentity(pubkey_hex);
 }
 
-/// Arms or expires the create-ceremony window, which is the only thing that
+/// Sets what the create ceremony has reported, which is the only thing that
 /// tells an appearing key apart from any other. For tests.
-pub fn setCreateCeremonyForTest(running: bool) void {
-    g_create_ceremony_until = if (running) nowSeconds() + create_ceremony_grace_s else 0;
+pub fn setCeremonyForTest(state: enum { none, running, created }) void {
+    g_ceremony = switch (state) {
+        .none => .none,
+        .running => .running,
+        .created => .created,
+    };
+    g_ceremony_adopted = false;
+}
+
+/// Parks the daemon health flag at "unreachable", so a queued setup stays queued
+/// instead of reaching for an effects layer a unit test does not have. For tests.
+pub fn setHelperUnreachableForTest() void {
+    g_helper_state.store(0, .release);
+    g_helper_setup = .none;
+    g_helper_pending_in_flight = .none;
+}
+
+pub fn ceremonyOwesNameForTest() bool {
+    return g_ceremony_adopted;
+}
+
+pub fn identityMintedForTest() bool {
+    return g_identity_minted_here;
+}
+
+/// Delivers the ceremony window's exit, which is how Plaza learns what it did.
+/// For tests.
+pub fn handleSignetExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
+    handleSignetExited(model, e);
 }
 
 /// Delivers a daemon /pubkey answer, which is how a key made or imported in the
