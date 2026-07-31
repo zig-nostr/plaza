@@ -7368,3 +7368,272 @@ test "every way into the app is wired, by name" {
         }
     }
 }
+
+test "a keyholder that is not there is reported missing, not formatted into a path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    const dir = dir_buf[0..dir_len];
+
+    var out: [1024]u8 = undefined;
+    // Nothing beside us yet. Formatting a path is not finding a binary, and the
+    // version of this that only formatted is what shipped a bundle with no
+    // keyholder in it: the app spawned a file that was not there, said so on
+    // stderr, and carried on believing it had a daemon.
+    try testing.expectEqual(@as(usize, 0), main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer"));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plaza-signer", .data = "not really a binary" });
+    const n = main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer");
+    var want_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(&want_buf, "{s}/plaza-signer", .{dir}),
+        out[0..n],
+    );
+}
+
+test "with no keyholder the create rung says why and stops being a button" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    const tree = try buildTree(arena, &model);
+
+    // Still named, so the reader is not left hunting for where creating an
+    // identity went. Just not a button, and not a promise: "every way into the
+    // app is wired, by name" asserts the opposite of this on the same label, and
+    // between them they pin both states.
+    try testing.expect(findAnyText(tree.root, "Create your identity") != null);
+    try testing.expectEqual(@as(?Msg, null), pressMsgByLabel(tree, "Create your identity"));
+    try testing.expect(findAnyText(tree.root, "Not possible in this copy of Plaza.") != null);
+    try testing.expect(findAnyText(tree.root, "Ready in seconds. Nothing to write down.") == null);
+    // And the reason sits under the card, where a wrapping line has room to be
+    // three lines long. `the ladder's rungs hold their own copy` is what keeps
+    // it from drifting back INTO the card, where it paints outside the border.
+    try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
+
+    // The two rungs that still work are untouched, and bringing a key gives up
+    // its Signet promise, because with no daemon the paste lands in this
+    // process. Copy that sells isolation over a field that does not have it is
+    // the lie this app can least afford.
+    try testing.expect(pressableByLabel(tree, tree.root, "Bring your key"));
+    try testing.expect(pressableByLabel(tree, tree.root, "Use your own signer"));
+    try testing.expect(findAnyText(tree.root, "Goes into Signet. Plaza itself never sees it.") == null);
+    try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") != null);
+}
+
+test "with no keyholder nothing queues a mint that can never fire" {
+    main.clearIdentityForTest();
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    try testing.expect(!main.helperSetupQueuedForTest());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .join_create, &fx);
+
+    // `queueHelperSetup` parks an intent until the daemon answers, and a daemon
+    // that is not installed never answers. Without the guard in `beginCreate`
+    // this sits queued for the life of the process while the sheet closes over
+    // it, which is a press swallowed whole.
+    try testing.expect(!main.helperSetupQueuedForTest());
+}
+
+test "with no keyholder a pasted key goes to the field, not to a window that cannot take it" {
+    main.clearIdentityForTest();
+    defer main.setSignetWindowFoundForTest(false);
+
+    // The window is only the right destination when there is something behind
+    // it. Three of these four are the in-Plaza field.
+    main.setSignetWindowFoundForTest(true);
+    main.setKeyholderMissingForTest(false);
+    try testing.expect(main.ceremonyCanTakeKeyForTest());
+    main.setKeyholderMissingForTest(true);
+    try testing.expect(!main.ceremonyCanTakeKeyForTest());
+    main.setSignetWindowFoundForTest(false);
+    try testing.expect(!main.ceremonyCanTakeKeyForTest());
+    main.setKeyholderMissingForTest(false);
+    try testing.expect(!main.ceremonyCanTakeKeyForTest());
+
+    // And the branch that reads it lands somewhere the reader can actually
+    // finish: window present, keyholder absent, so the paste goes to the field.
+    main.setSignetWindowFoundForTest(true);
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_signet_import, &fx);
+    try testing.expect(model.stage == .onboarding);
+}
+
+/// Every line of text that STARTS inside one of the join ladder's rungs has to
+/// end inside it too.
+///
+/// A rung's subtitle is a wrapped paragraph in a column the surrounding row has
+/// already been sized against, so a subtitle long enough to take a third line
+/// runs past the card's own bottom edge and paints the last line half outside
+/// it. Nothing about the widget tree changes when that happens: the string is
+/// all present, in one node, correctly nested under the card, and every
+/// structural assertion in this file passed while it was rendering clipped. Only
+/// the laid-out frames say so, which is why this is a geometric assertion and
+/// why it runs over BOTH states of the ladder rather than the one that happened
+/// to be long.
+fn expectRungsHoldTheirCopy(p: painted.Painted) !void {
+    for ([_][]const u8{ "Create your identity", "Bring your key", "Use your own signer" }) |label| {
+        const rung = p.frameOf(label) orelse {
+            std.debug.print("join ladder: no rung labelled \"{s}\"\n", .{label});
+            return error.NoRung;
+        };
+        const floor = rung.y + rung.height;
+        for (p.layout.nodes) |node| {
+            const w = node.widget;
+            // Text only: an icon carries its GLYPH NAME as text, and the feed
+            // sits in the same layout under the sheet, so both would otherwise
+            // wander into a rung's y band and answer for copy they are not.
+            if (w.kind != .text or w.text.len == 0) continue;
+            if (w.frame.y < rung.y or w.frame.y >= floor) continue;
+            if (w.frame.x < rung.x - 0.5) continue;
+            if (w.frame.x + w.frame.width > rung.x + rung.width + 0.5) continue;
+            if (w.frame.y + w.frame.height > floor + 0.5) {
+                std.debug.print(
+                    "join ladder: \"{s}\" runs {d:.1}px past the bottom of the \"{s}\" rung\n",
+                    .{ w.text, w.frame.y + w.frame.height - floor, label },
+                );
+                return error.CopyOverflowsItsRung;
+            }
+        }
+    }
+}
+
+test "the ladder's rungs hold their own copy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    try expectRungsHoldTheirCopy(try painted.Painted.render(arena_state.allocator(), &model));
+
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    try expectRungsHoldTheirCopy(try painted.Painted.render(arena_state.allocator(), &model));
+}
+
+test "the fallback welcome screen stops selling a key it cannot make" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    // This screen is where a broken install sends "Bring your key", so it is the
+    // one a reader with no keyholder actually lands on. Its text is compiled
+    // markup and cannot be swapped node-for-node, so the two lines that would
+    // otherwise argue with the greyed button are bindings.
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    var model = main.initialModel();
+    model.stage = .onboarding;
+    const tree = try buildTree(arena, &model);
+
+    const create = findByText(tree.root, .button, "Create your identity") orelse return error.NoCreateButton;
+    try testing.expect(create.state.disabled);
+    try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
+    try testing.expect(findAnyTextContaining(tree.root, "Sign in with a key you already have"));
+    try testing.expect(!findAnyTextContaining(tree.root, "A second to set up"));
+    try testing.expect(!findAnyTextContaining(tree.root, "Create an identity and Plaza sets you up"));
+
+    // And with a keyholder it is the screen it has always been.
+    main.setKeyholderMissingForTest(false);
+    const whole = try buildTree(arena, &model);
+    const live = findByText(whole.root, .button, "Create your identity") orelse return error.NoCreateButton;
+    try testing.expect(!live.state.disabled);
+    try testing.expect(findAnyTextContaining(whole.root, "A second to set up"));
+    try testing.expect(findAnyTextContaining(whole.root, "Create an identity and Plaza sets you up"));
+    try testing.expect(!findAnyTextContaining(whole.root, "is missing from this install"));
+}
+
+test "the executable's own directory is where the probe looks" {
+    // The half of the resolver that `resolveSibling`'s test cannot reach. If
+    // this ever returns null, or a relative path, or a directory Plaza was not
+    // launched from, `resolveHelper` declares a missing keyholder on an install
+    // that is perfectly fine and the app tells the reader to reinstall it. That
+    // is the failure mode of trusting argv[0], which is what this replaced, so
+    // the replacement is worth pinning.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = main.exeDirForTest(std.testing.io, &buf) orelse return error.NoExecutableDir;
+    try testing.expect(dir.len > 0);
+    try testing.expectEqual(@as(u8, '/'), dir[0]);
+    // And it is a directory that exists, so formatting a sibling onto it and
+    // asking whether that file is there is a question with a real answer.
+    var probe: [std.fs.max_path_bytes + 64]u8 = undefined;
+    try testing.expectEqual(
+        @as(usize, 0),
+        main.resolveSiblingForTest(std.testing.io, &probe, dir, "a-binary-plaza-does-not-ship"),
+    );
+    try std.Io.Dir.cwd().access(std.testing.io, dir, .{});
+}
+
+test "the dead rung stops looking like it works" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+
+    // Normally it is THE recommendation: the one accent-filled rung on the
+    // ladder, a button, a focus stop.
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        const w = findByLabel(tree.root, "Create your identity") orelse return error.NoRung;
+        try testing.expectEqual(canvas.WidgetRole.button, w.semantics.role);
+        try testing.expect(w.semantics.focusable);
+        const p = try painted.Painted.render(arena_state.allocator(), &model);
+        const fill = p.fillAtCenterOf("Create your identity") orelse return error.RungPaintsNothing;
+        try testing.expect(painted.sameColor(fill, theme.palette.accent));
+    }
+
+    // With no keyholder it must not merely stop working. A rung that still
+    // wears the accent and still says button, while doing nothing, is worse
+    // than one that plainly cannot: the reader presses it, twice, and concludes
+    // the app is broken rather than the install. Press-and-text assertions
+    // cannot see any of this, which is why the paint is sampled.
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const w = findByLabel(tree.root, "Create your identity") orelse return error.NoRung;
+    try testing.expectEqual(canvas.WidgetRole.text, w.semantics.role);
+    try testing.expect(!w.semantics.focusable);
+    const p = try painted.Painted.render(arena_state.allocator(), &model);
+    if (p.fillAtCenterOf("Create your identity")) |fill| {
+        try testing.expect(!painted.sameColor(fill, theme.palette.accent));
+    }
+}
+
+test "a restored Signet session on an install with no Signet says so, and does not say starting" {
+    // The reader this is for signed in on a working install and updated into a
+    // broken one: `restoreSession` runs BEFORE the probe, so they are signed
+    // straight back in and the status bar is the only thing that can tell them.
+    // "Signet starting" is what an unwritten health state reads as, and it is a
+    // word that means wait a moment about a condition that never resolves.
+    main.setIdentityForTest([_]u8{0x3C} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+
+    try testing.expect(!main.signerIsHealthy());
+    try testing.expectEqualStrings("Signet is not installed", main.signerStatusLabelForTest());
+}

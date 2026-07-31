@@ -1672,17 +1672,109 @@ fn helperToken() []const u8 {
     return g_helper_token_buf[0..g_helper_token_len];
 }
 
-/// Resolves the daemon path (a sibling of argv[0], so it works both from the
-/// dev tree and a packaged bundle), mints a fresh bearer token, and writes it
-/// 0600 under ~/.plaza. Best-effort: on any failure the helper simply never
-/// comes up and signing keeps to its current in-process path.
+/// Whether the launch probe found the keyholder daemon beside Plaza.
+///
+/// `.unprobed` is not a third answer, it is "nobody has looked yet", and it
+/// reads as present on purpose: the probe runs in `main` before the first view,
+/// so the only build that sees this value is the test binary, and a suite that
+/// never launches an app should not render every join screen as a broken
+/// install.
+const KeyholderProbe = enum { unprobed, found, missing };
+var g_keyholder: KeyholderProbe = .unprobed;
+
+/// True when the daemon that would hold the key is not installed beside Plaza.
+///
+/// Worth a separate word from the daemon being unreachable, which is what
+/// `g_helper_state` tracks. Unreachable is a moment: the daemon takes a beat to
+/// come up, and `g_helper_setup` exists to hold an intent until it answers.
+/// Missing is permanent and known at launch, so anything that queues and waits
+/// on it is a button that does nothing, forever, with no way for the reader to
+/// find out why.
+fn keyholderMissing() bool {
+    return g_keyholder == .missing;
+}
+
+/// Records that there is no keyholder.
+///
+/// Only the flag. It is tempting to settle `g_helper_state` here as well, since
+/// with no daemon the health check never runs and that state is pinned at its
+/// initial 0 forever. But every reader of it already treats 0 and "unreachable"
+/// alike, so the store would change nothing that any test could tell apart, and
+/// a second mechanism nothing can distinguish from its absence is not a
+/// safeguard. The one reader that DID read 0 wrongly is `signerStatus`, and it
+/// asks this question directly now.
+fn markKeyholderMissing() void {
+    g_keyholder = .missing;
+}
+
+/// `false` restores the unprobed state rather than claiming a keyholder was
+/// found, because in a test nothing has looked for one.
+pub fn setKeyholderMissingForTest(missing: bool) void {
+    g_keyholder = if (missing) .missing else .unprobed;
+}
+
+/// The directory holding Plaza's own executable, which is where both helper
+/// binaries ship.
+///
+/// NOT `dirname(argv[0])`. argv[0] is whatever the launcher felt like passing:
+/// a PATH lookup hands over a bare name with no directory in it at all, and a
+/// symlink hands over the link's directory rather than the bundle's. Both send
+/// the probe below looking somewhere the helpers were never installed, and the
+/// answer it comes back with is "this install has no keyholder" about an install
+/// that is perfectly fine. `executableDirPath` asks the OS where this process
+/// actually came from, and follows symlinks to get there.
+fn exeDir(io: std.Io, buf: []u8) ?[]const u8 {
+    const n = std.process.executableDirPath(io, buf) catch return null;
+    return buf[0..n];
+}
+
+/// Writes `dir/name` into `out` if that file is there, and returns its length;
+/// 0 when it is not.
+///
+/// The access check is the whole point. Formatting a path is not finding a
+/// binary, and a spawn of a file that is not there is reported on stderr and
+/// nowhere else, so the app carries on believing it has a helper it does not
+/// have. That is precisely how a bundle shipped with no keyholder in it.
+fn resolveSibling(io: std.Io, out: []u8, dir: []const u8, name: []const u8) usize {
+    const path = std.fmt.bufPrint(out, "{s}/{s}", .{ dir, name }) catch return 0;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return 0;
+    return path.len;
+}
+
+pub fn resolveSiblingForTest(io: std.Io, out: []u8, dir: []const u8, name: []const u8) usize {
+    return resolveSibling(io, out, dir, name);
+}
+
+pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
+    return exeDir(io, buf);
+}
+
+/// Adopts the Signet signer kind for the active test identity, so the status
+/// line can be asked what it says about a daemon that is not there.
+pub fn setSignerKindHelperForTest() void {
+    g_signer_kind = .helper;
+}
+
+pub fn signerStatusLabelForTest() []const u8 {
+    return signerStatus().label;
+}
+
+/// Resolves the daemon (a sibling of Plaza's own executable, so it works both
+/// from the dev tree and a packaged bundle), mints a fresh bearer token, and
+/// writes it 0600 under ~/.plaza.
+///
+/// When the daemon is not there, this returns having set NOTHING: no path, no
+/// token, no state dir. Every caller downstream is already guarded on one of
+/// those being empty, so a missing keyholder becomes a quiet no-op at the effect
+/// layer and a said-out-loud one in the join ladder, rather than a spawn of a
+/// path that does not exist.
 fn resolveHelper(init: std.process.Init) void {
     // The daemon lives beside Plaza's own executable.
-    var args = std.process.Args.Iterator.init(init.minimal.args);
-    const argv0 = args.next() orelse return;
-    const dir = std.fs.path.dirname(argv0) orelse ".";
-    const bin = std.fmt.bufPrint(&g_helper_bin_buf, "{s}/plaza-signer", .{dir}) catch return;
-    g_helper_bin_len = bin.len;
+    var dir_buf: [1024]u8 = undefined;
+    const dir = exeDir(init.io, &dir_buf) orelse return markKeyholderMissing();
+    g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "plaza-signer");
+    if (g_helper_bin_len == 0) return markKeyholderMissing();
+    g_keyholder = .found;
 
     const home = init.environ_map.get("HOME") orelse ".";
     const state_dir = std.fmt.bufPrint(&g_helper_state_dir_buf, "{s}/.plaza", .{home}) catch return;
@@ -1719,20 +1811,38 @@ const helper_reset_key: u64 = 45;
 var g_logged_out: bool = false;
 
 fn resolveSignetWindow(init: std.process.Init) void {
-    var args = std.process.Args.Iterator.init(init.minimal.args);
-    const argv0 = args.next() orelse return;
-    const dir = std.fs.path.dirname(argv0) orelse ".";
-    // Packaged: a sibling. Dev: the sub-project's zig-out. Take whichever is
-    // there, sibling first (that is the shipped layout).
-    const sibling = std.fmt.bufPrint(&g_signet_win_buf, "{s}/signet-window", .{dir}) catch return;
-    if (std.Io.Dir.cwd().access(init.io, sibling, .{})) |_| {
-        g_signet_win_len = sibling.len;
-        return;
-    } else |_| {}
-    const dev = std.fmt.bufPrint(&g_signet_win_buf, "{s}/../../signet-window/zig-out/bin/signet-window", .{dir}) catch return;
-    if (std.Io.Dir.cwd().access(init.io, dev, .{})) |_| {
-        g_signet_win_len = dev.len;
-    } else |_| g_signet_win_len = 0;
+    var dir_buf: [1024]u8 = undefined;
+    const dir = exeDir(init.io, &dir_buf) orelse return;
+    // Packaged: a sibling. Dev: the sub-project's own zig-out, because unlike
+    // the daemon it is built by a separate build.zig and never lands in Plaza's
+    // bin directory. Sibling first, that being the shipped layout.
+    g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "signet-window");
+    if (g_signet_win_len != 0) return;
+    g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "../../signet-window/zig-out/bin/signet-window");
+}
+
+/// Whether the ceremony window is the right place to take a pasted key. Not
+/// when there is no window, and not when there is no daemon behind it either:
+/// handing the paste to the keyholder is the window's entire job, so with no
+/// keyholder it is a window that can only fail, over a key the reader typed
+/// correctly. The in-Plaza field is the honest destination then.
+fn ceremonyCanTakeKey() bool {
+    return g_signet_win_len > 0 and !keyholderMissing();
+}
+
+pub fn ceremonyCanTakeKeyForTest() bool {
+    return ceremonyCanTakeKey();
+}
+
+/// Pretends the ceremony window was (or was not) found beside Plaza.
+pub fn setSignetWindowFoundForTest(found: bool) void {
+    g_signet_win_len = if (found) "/nonexistent/signet-window".len else 0;
+    if (found) @memcpy(g_signet_win_buf[0.."/nonexistent/signet-window".len], "/nonexistent/signet-window");
+}
+
+/// Whether a helper setup is sitting queued, waiting for the daemon to answer.
+pub fn helperSetupQueuedForTest() bool {
+    return g_helper_setup != .none;
 }
 
 /// Which ceremony the Signet window is being opened for.
@@ -2127,6 +2237,15 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
 /// holding it. Worth a window; not worth a dead button when the binary is absent
 /// (a dev tree with the sub-project unbuilt, a broken bundle).
 fn beginCreate(fx: *Effects) void {
+    // Nothing can mint a key without the daemon that would hold it: Plaza has
+    // not held one itself since the key moved out of this process. The ladder
+    // says so in place of the card, but the guard belongs HERE, because this is
+    // the one function every create path goes through, and what it prevents is
+    // an intent queued against a binary that will never appear. `queueHelperSetup`
+    // waits for reachability, and a missing keyholder never becomes reachable,
+    // so without this the reader's press is swallowed whole and the sheet closes
+    // over nothing.
+    if (keyholderMissing()) return;
     if (g_signet_win_len == 0) {
         queueHelperSetup(fx, .create, null);
         return;
@@ -5064,6 +5183,28 @@ pub const Model = struct {
     /// The onboarding sign-in field text (what `text="{login_draft}"` binds).
     pub fn login_draft(self: *const Model) []const u8 {
         return self.login_buffer.text();
+    }
+    /// Whether this install can make a key at all, which disables the welcome
+    /// screen's create button. The join ladder swaps its whole card out; this
+    /// screen is compiled markup with fixed text, so it binds the two things
+    /// that can change: whether the button works, and the line under it.
+    pub fn no_keyholder(self: *const Model) bool {
+        _ = self;
+        return keyholderMissing();
+    }
+    /// The line under the welcome screen's create button.
+    pub fn create_hint(self: *const Model) []const u8 {
+        _ = self;
+        if (keyholderMissing()) return "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it, or bring a key you already have.";
+        return "A second to set up. No email, no signup.";
+    }
+    /// The welcome screen's opening line, which normally sells making a key.
+    /// With no keyholder it cannot be made, and an invitation printed directly
+    /// over a greyed-out button is the screen arguing with itself.
+    pub fn welcome_lead(self: *const Model) []const u8 {
+        _ = self;
+        if (keyholderMissing()) return "Sign in with a key you already have and Plaza sets you up with a starter feed of great accounts. Your notes stay on your device and publish straight to the network.";
+        return "Create an identity and Plaza sets you up with a starter feed of great accounts. Your notes stay on your device and publish straight to the network.";
     }
     /// Whether the sign-in field is blank, which disables Continue.
     pub fn login_empty(self: *const Model) bool {
@@ -8628,9 +8769,17 @@ fn intentPill(ui: *AppUi, model: *const Model) AppUi.Node {
 /// `filled` is the recommended one, and there is exactly one. The other two are
 /// outlines with a chevron, which is the shape this app uses everywhere else for
 /// "this leads somewhere".
-fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: []const u8, sub: []const u8, press: Msg, filled: bool) AppUi.Node {
+///
+/// A null `press` is a rung this install cannot climb (see `keyholderMissing`).
+/// It keeps the card's geometry so the ladder does not jump, and gives up
+/// everything that says "press me": the accent fill, the chevron, the button
+/// role, the focus stop. A rung that looks identical and does nothing is the
+/// exact failure this whole change is about, so it must not merely stop working,
+/// it has to stop LOOKING like it works.
+fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: []const u8, sub: []const u8, press: ?Msg, filled: bool) AppUi.Node {
     const p = theme.palette;
-    const ink = if (filled) p.on_accent else p.text_body_strong;
+    const live = press != null;
+    const ink = if (filled) p.on_accent else if (live) p.text_body_strong else p.text_muted;
     const sub_ink = if (filled) p.text_dim_on_light else p.text_muted;
     // The press is on the ROW and the paint is on a `.panel` inside it. A
     // `.list_item` carrying a background draws nothing at all (the same rule
@@ -8639,7 +8788,7 @@ fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: [
     return ui.row(.{
         .gap = 0,
         .on_press = press,
-        .semantics = .{ .role = .button, .label = title, .focusable = true },
+        .semantics = .{ .role = if (live) .button else .text, .label = title, .focusable = live },
     }, .{
         ui.el(.panel, .{
             .grow = 1,
@@ -8673,8 +8822,9 @@ fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: [
                 }),
                 hgap(ui, 11),
                 // Only on the rungs that lead to another step. The filled card
-                // finishes here: pressing it makes a key.
-                if (filled) ui.spacer(0) else ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "chevron-right"),
+                // finishes here: pressing it makes a key. A dead rung leads
+                // nowhere at all, so it gets no chevron either.
+                if (filled or !live) ui.spacer(0) else ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "chevron-right"),
                 hgap(ui, 13),
             }),
         }),
@@ -8720,11 +8870,47 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
                 vgap(ui, 13),
                 joinLabel(ui, "NEW HERE"),
                 vgap(ui, 6),
-                joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
+                // Making a key means the keyholder daemon making it, so with no
+                // keyholder installed there is no route to a new identity at
+                // all: this rung is not degraded, it is impossible. Say that,
+                // and say what fixes it, rather than leaving the app's primary
+                // call to action sitting there swallowing presses.
+                //
+                // The WHY goes under the card, not in it. A rung's subtitle is
+                // one line: the row that holds it centres a column it has
+                // already been sized against, so a subtitle that wraps to three
+                // lines runs 7px past the card's own bottom edge and paints the
+                // last line half outside it. The tree cannot see that (the
+                // string is all there, in one node, correctly nested) and every
+                // structural assertion passed over it. Only the frames say so,
+                // which is what "the ladder's rungs hold their own copy" now
+                // asserts. Down here it is a plain flow child of the sheet's
+                // column, where wrapping is bounded and behaves.
+                if (keyholderMissing())
+                    joinCard(ui, "plus", false, "Create your identity", "Not possible in this copy of Plaza.", null, false)
+                else
+                    joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
+                if (keyholderMissing()) vgap(ui, 7) else ui.spacer(0),
+                if (keyholderMissing())
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
+                    )
+                else
+                    ui.spacer(0),
                 vgap(ui, 13),
                 joinLabel(ui, "ALREADY ON NOSTR"),
                 vgap(ui, 6),
-                joinCard(ui, "download", false, "Bring your key", "Goes into Signet. Plaza itself never sees it.", .open_signet_import, false),
+                // Bringing a key still works with no keyholder: the paste lands
+                // in this process instead (see `.open_signet_import`). It is a
+                // weaker promise than the one this line normally makes, so the
+                // line changes with it. Selling Signet's isolation and then
+                // taking the nsec into a Plaza text field would be the copy
+                // lying about where the key went.
+                if (keyholderMissing())
+                    joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_signet_import, false)
+                else
+                    joinCard(ui, "download", false, "Bring your key", "Goes into Signet. Plaza itself never sees it.", .open_signet_import, false),
                 vgap(ui, 8),
                 joinCard(ui, "signet", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
                 vgap(ui, 13),
@@ -12930,7 +13116,15 @@ fn signerStatus() SignerStatus {
     const p = theme.palette;
     return switch (g_signer_kind) {
         // Signet: a separate process, so its health is a real question.
-        .helper => switch (g_helper_state.load(.monotonic)) {
+        //
+        // Not installed is its own answer, ahead of the state machine. A session
+        // restored onto an install with no Signet in it signs back in before the
+        // probe has even run, and "unreachable" would send that reader looking
+        // for a daemon that has crashed or a port that is busy. Nothing is
+        // coming up; the install is short a file.
+        .helper => if (keyholderMissing())
+            .{ .label = "Signet is not installed", .glyph = "signet", .color = p.status_warning }
+        else switch (g_helper_state.load(.monotonic)) {
             2 => .{ .label = "Signet ready", .glyph = "signet", .color = p.status_success },
             1 => .{ .label = "Signet has no key", .glyph = "signet", .color = p.status_warning },
             3 => .{ .label = "Signet unreachable", .glyph = "signet", .color = p.text_faint_alt },
@@ -14727,7 +14921,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_ceremony = .none;
             g_ceremony_adopted = false;
             g_identity_minted_here = false;
-            if (g_signet_win_len > 0) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
+            if (ceremonyCanTakeKey()) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -17307,7 +17501,10 @@ pub fn main(init: std.process.Init) !void {
     loadSettings(init.io, init.environ_map);
     _ = restoreSession(init.io, init.environ_map);
     // Resolve the keyholder daemon (its path and a fresh bearer token); boot
-    // spawns it. Best-effort, and non-fatal: signing still works in-process.
+    // spawns it. Non-fatal, but not free either: Plaza has not minted a key in
+    // this process since the key moved out of it, so an install that arrived
+    // without the daemon cannot make one, and `keyholderMissing` is how the join
+    // screens say so instead of offering a button that swallows the press.
     resolveHelper(init);
     resolveSignetWindow(init);
 
