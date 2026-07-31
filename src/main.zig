@@ -11541,6 +11541,18 @@ fn profileCardExtent(rows: *const ProfileRows) f32 {
     return h;
 }
 
+/// Whether this page belongs to the reader looking at it.
+///
+/// The profile was written for a stranger, because for a long time a stranger was
+/// the only person it could be about: the way onto it was pressing somebody's face
+/// in the feed. Now the rail's seat opens the reader's own, so every sentence that
+/// says "they" has to say "you" here, and the first reader through that door is a
+/// brand new account whose page is entirely empty states.
+fn isMe(pubkey: [32]u8) bool {
+    const me = activePubkey() orelse return false;
+    return std.mem.eql(u8, &me, &pubkey);
+}
+
 /// The person: their banner, their face, what they say about themselves, and
 /// what this app can honestly tell the reader about them.
 fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
@@ -11548,7 +11560,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
     const about = personAbout(pubkey);
     const website = personWebsite(pubkey);
     const lud16 = personLud16(pubkey);
-    const is_me = if (activePubkey()) |me| std.mem.eql(u8, &me, &pubkey) else false;
+    const is_me = isMe(pubkey);
 
     return ui.column(.{ .gap = 0 }, .{
         // The banner, with the face riding up over its lower edge. There is no
@@ -11619,7 +11631,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                     ui.spacer(0),
                 if (website.len > 0 or lud16.len > 0) profileLinks(ui, website, lud16) else ui.spacer(0),
                 vgap(ui, 9),
-                profileCounts(ui, pubkey),
+                profileCounts(ui, pubkey, is_me),
                 if (!is_me and followBlockedReason() != null)
                     ui.column(.{ .gap = 0 }, .{
                         vgap(ui, 7),
@@ -11688,7 +11700,7 @@ fn profileLinks(ui: *AppUi, website: []const u8, lud16: []const u8) AppUi.Node {
 /// and the honest options are an indexer's number or none. This app does not
 /// state numbers it cannot verify, so it says nothing rather than a figure the
 /// reader would reasonably believe.
-fn profileCounts(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
+fn profileCounts(ui: *AppUi, pubkey: [32]u8, is_me: bool) AppUi.Node {
     const p = theme.palette;
     const following = personFollowingCount(pubkey);
     return ui.row(.{ .cross = .center, .gap = 16 }, .{
@@ -11698,7 +11710,10 @@ fn profileCounts(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
                 ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "following", .scale = menu_scale }}),
             })
         else
-            ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = "Their follow list has not arrived yet", .scale = mono_hint_scale }}),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{
+                .text = if (is_me) "Your follow list has not arrived yet" else "Their follow list has not arrived yet",
+                .scale = mono_hint_scale,
+            }}),
         ui.spacer(1),
     });
 }
@@ -11739,12 +11754,15 @@ fn profileTab(ui: *AppUi, label: []const u8, active: bool, msg: Msg) AppUi.Node 
 /// The quiet line under an empty tab.
 fn profileEmptyRow(ui: *AppUi, rows: *const ProfileRows) AppUi.Node {
     const p = theme.palette;
+    // A key minted a minute ago has written nothing, so this is the ONE screen a
+    // new reader is most likely to see first, and "Nothing they have written" is
+    // the app talking about them behind their back on their own page.
+    const mine = isMe(rows.pubkey);
     const text: []const u8 = if (rows.loading)
-        "Looking for what they have written…"
+        if (mine) "Looking for what you have written…" else "Looking for what they have written…"
     else if (rows.model.profile_tab == .replies)
-        "Nothing they have written at anyone is here yet."
-    else
-        "Nothing they have written is here yet.";
+        if (mine) "Nothing you have written at anyone is here yet." else "Nothing they have written at anyone is here yet."
+    else if (mine) "Nothing you have written is here yet." else "Nothing they have written is here yet.";
     return ui.row(.{ .cross = .center, .gap = 0, .height = quiet_row_extent }, .{
         hgap(ui, 20),
         ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_dim } }, &.{.{ .text = text, .scale = mono_hint_scale }}),
@@ -12130,10 +12148,20 @@ fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label:
 
 /// The account seat at the bottom of the rail. A guest gets a dashed circle
 /// marked "you" that opens the join sheet; a signed-in user gets a small tinted
-/// initials avatar that opens Settings.
+/// initials avatar that opens their own page.
 fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
     const p = theme.palette;
-    const press: Msg = if (guest) .open_join else .open_settings;
+    // The seat is the reader's own face, so it goes where every other face in
+    // the app goes: that person's page. It pointed at Settings for as long as
+    // there was no profile screen to point at, which quietly taught that "you"
+    // means "your preferences". Settings keeps its own tile one row up, and
+    // editing still lives there, which is what the profile's own "This is you"
+    // says instead of standing up a second door to it.
+    //
+    // The key comes from `activePubkey` rather than from the `guest` flag so the
+    // branch and the payload cannot disagree: with no identity there is no
+    // `.open_person` carrying thirty-two bytes that belong to nobody.
+    const press: Msg = if (activePubkey()) |me| Msg{ .open_person = me } else .open_join;
     return ui.el(.data_row, .{
         .on_press = press,
         // The tile's own box, stated. Left unsized, this row measured ZERO wide
