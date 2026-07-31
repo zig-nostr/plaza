@@ -1723,17 +1723,44 @@ fn resolveSignetWindow(init: std.process.Init) void {
     } else |_| g_signet_win_len = 0;
 }
 
-/// Opens the Signet ceremony window (a separate process) for a key import, so
-/// the pasted key never enters Plaza. The window reads the token itself and
-/// talks to the daemon; Plaza adopts the identity when the key appears
-/// (see handleHelperPubkey). No args needed.
-fn spawnSignetWindow(fx: *Effects) void {
+/// Which ceremony the Signet window is being opened for.
+const Ceremony = enum { import_key, create_key };
+
+/// Opens the Signet ceremony window: a separate process, so key material never
+/// enters Plaza on either path. The window reads the token itself and talks to
+/// the daemon; Plaza adopts the identity when the key appears (see
+/// handleHelperPubkey).
+///
+/// The window OWNS its ceremony, including the create. It would be less code for
+/// Plaza to mint the key and let the window merely announce it, but only the side
+/// that made the request can tell a key it just minted from a key that was
+/// already sitting in the daemon: a window watching /pubkey sees "ready" either
+/// way, and would introduce somebody's leftover key as the reader's new identity.
+fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
     if (g_signet_win_len == 0) return;
-    fx.spawn(.{
-        .key = signet_spawn_key,
-        .argv = &.{g_signet_win_buf[0..g_signet_win_len]},
-        .output = .collect,
-    });
+    const bin = g_signet_win_buf[0..g_signet_win_len];
+    // Two calls rather than one with a computed argv: `&.{...}` over runtime
+    // values is a pointer to a temporary, and handing the effect layer one that
+    // outlives its scope is the kind of bug that shows up as a garbled argv on
+    // somebody else's machine.
+    switch (ceremony) {
+        .import_key => fx.spawn(.{ .key = signet_spawn_key, .argv = &.{bin}, .output = .collect }),
+        .create_key => fx.spawn(.{ .key = signet_spawn_key, .argv = &.{ bin, "--create" }, .output = .collect }),
+    }
+}
+
+/// Until when an adopted key should be treated as one the reader just made.
+///
+/// The create ceremony runs in the other process, so its result reaches Plaza
+/// the same way a terminal import does: a key simply appears at /pubkey. This
+/// latch is how the two are told apart, which decides whether the name beat
+/// opens. It EXPIRES rather than persisting, so a ceremony the reader abandoned
+/// cannot put "Want a name on it?" in front of an import done ten minutes later.
+var g_create_ceremony_until: i64 = 0;
+const create_ceremony_grace_s: i64 = 90;
+
+fn createCeremonyRunning() bool {
+    return nowSeconds() < g_create_ceremony_until;
 }
 
 /// Tells the daemon to forget the key (wipe memory + delete the file), so a
@@ -1828,6 +1855,16 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
     persistSession();
     enterFeed(model);
+    // A key that appeared because the reader asked Signet to MAKE one gets the
+    // name beat, the same as when Plaza minted it itself. Without this the
+    // ceremony window's create would drop a reader into the feed as an account
+    // with no name and nothing offering to give it one, which is the whole
+    // reason the beat exists.
+    if (createCeremonyRunning()) {
+        g_create_ceremony_until = 0;
+        model.naming = true; // the name beat; replay follows it
+        return;
+    }
     replayPending(model);
 }
 
@@ -1984,6 +2021,28 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
         .migrate => deleteIdentityKeyFile(),
         .none => {},
     }
+}
+
+/// Starts making a key, in the Signet window when there is one.
+///
+/// The fallback is not a lesser version of the same thing, it is the path this
+/// app shipped with: Plaza asks the daemon directly and the daemon mints. The
+/// key never enters Plaza either way. What the window adds is that the reader
+/// SEES the separate process that holds their key, once, at the moment it starts
+/// holding it. Worth a window; not worth a dead button when the binary is absent
+/// (a dev tree with the sub-project unbuilt, a broken bundle).
+fn beginCreate(fx: *Effects) void {
+    if (g_signet_win_len == 0) {
+        queueHelperSetup(fx, .create, null);
+        return;
+    }
+    // The ceremony is the other process's now, so the things queueHelperSetup
+    // would have done for us have to be done here: re-enable adopt-on-appear
+    // (a logout latches it off), and mark the window in which an appearing key
+    // is a key this reader just made.
+    g_logged_out = false;
+    g_create_ceremony_until = nowSeconds() + create_ceremony_grace_s;
+    spawnSignetWindow(fx, .create_key);
 }
 
 /// Deletes the legacy in-process key file, once its secret is safe in the daemon.
@@ -14268,13 +14327,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending = .none;
         },
         .join_create => {
-            // Async: the daemon mints the key (the key never enters Plaza), the
-            // response adopts the identity and opens the name beat.
             model.joining = false;
             // Minted HERE, so it provably has no history: creating a contact
             // list for it later cannot destroy one.
             g_identity_minted_here = true;
-            queueHelperSetup(fx, .create, null);
+            beginCreate(fx);
         },
         .open_signet_import => {
             // Key material never enters Plaza: the Signet window takes the
@@ -14282,7 +14339,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appears (handleHelperPubkey). If the window binary is missing,
             // fall back to the in-Plaza field rather than a dead button.
             model.joining = false;
-            if (g_signet_win_len > 0) spawnSignetWindow(fx) else model.stage = .onboarding;
+            if (g_signet_win_len > 0) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -14363,7 +14420,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.backup_nudge = false;
             model.backup_nudge_dismissed = true;
         },
-        .create_identity => queueHelperSetup(fx, .create, null),
+        .create_identity => beginCreate(fx),
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
@@ -15106,6 +15163,18 @@ pub fn replayPendingForTest(model: *Model) void {
 /// Restores a helper identity from a session pubkey hex. For tests.
 pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
     return restoreHelperIdentity(pubkey_hex);
+}
+
+/// Arms or expires the create-ceremony window, which is the only thing that
+/// tells an appearing key apart from any other. For tests.
+pub fn setCreateCeremonyForTest(running: bool) void {
+    g_create_ceremony_until = if (running) nowSeconds() + create_ceremony_grace_s else 0;
+}
+
+/// Delivers a daemon /pubkey answer, which is how a key made or imported in the
+/// other process reaches Plaza. For tests.
+pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectResponse) void {
+    handleHelperPubkey(model, response);
 }
 
 /// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,

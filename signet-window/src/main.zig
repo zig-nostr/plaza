@@ -1,13 +1,21 @@
-//! The Signet ceremony window. A small, separate SDK app Plaza spawns for the
-//! import ceremony: the nsec is typed HERE, in Signet's own process, and POSTed
-//! to the plaza-signer daemon over loopback. Plaza's UI process never sees it.
-//! Plaza watches the daemon's /pubkey and signs in the moment the key lands, so
-//! this window just does the ceremony and closes.
+//! The Signet ceremony window. A small, separate SDK app Plaza spawns whenever a
+//! key is about to exist: an import, where the nsec is typed HERE in Signet's own
+//! process and POSTed to the plaza-signer daemon over loopback, and a create,
+//! where the daemon mints a fresh key and this window is what says so.
+//!
+//! Plaza's UI process never sees key material on either path. Plaza watches the
+//! daemon's /pubkey and signs in the moment a key lands, so this window just does
+//! the ceremony and closes itself.
+//!
+//! Its own visual register on purpose: green-warm ink, its own titlebar, its own
+//! typeface. You have left Plaza, and it should look like it. That is the whole
+//! point of the separate process, so it is worth one window's worth of difference.
 
 const std = @import("std");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
+const signet_icons = @import("signet_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -17,7 +25,28 @@ const canvas_label = "main-canvas";
 const daemon_port: u16 = 8790;
 const import_key: u64 = 1;
 const copy_key: u64 = 2;
+const create_key: u64 = 3;
+const beat_timer_key: u64 = 4;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
+
+// 452 wide per the design, and one height for every state rather than a window
+// that resizes under the reader. A ceremony window that jumps size between its
+// steps reads as two windows.
+//
+// The height is the TALLEST state's, which is the import once a valid key is in
+// the field: the confirmation box appears between the field and the terminal
+// card and pushes everything down. Sized for the state without it, the card ran
+// off the bottom and the footer band painted straight over it, because a column
+// that overflows still lays its children out and still paints them. Measured at
+// 467px of content plus the 31px footer, so this is that with room to spare.
+const window_width: f32 = 452;
+const window_height: f32 = 512;
+
+/// The design's sizes are in px against Plaza's 14.5px body, so they are written
+/// as the ratio and stay legible next to the spec.
+fn px(size: f32) f32 {
+    return size / 14.5;
+}
 
 // The bearer token for the daemon, read once at boot from ~/.plaza/signer.token.
 var g_token_buf: [128]u8 = undefined;
@@ -26,7 +55,32 @@ fn token() []const u8 {
     return g_token_buf[0..g_token_len];
 }
 
-const Stage = enum { paste, importing, done, failed };
+/// Which ceremony this window was launched for. Set once from argv, before the
+/// app exists, because it decides the very first frame.
+const Mode = enum { import_key, create_key };
+var g_mode: Mode = .import_key;
+
+/// How long a finished ceremony stays on screen before the window closes itself.
+///
+/// Long enough to be read, short enough not to be a step. The terminal states
+/// carry no button by design: the ceremony is over, and the only honest thing
+/// left to do is get out of the way.
+const hold_ms: u64 = 2_000;
+const beat_interval_ms: u64 = 80;
+
+const Stage = enum {
+    /// Import: waiting for a key to be pasted.
+    paste,
+    /// Import: the key is on its way to the daemon.
+    importing,
+    /// Import: done, holding, then closing.
+    imported,
+    /// Create: the daemon is minting.
+    minting,
+    /// Create: done, holding, then closing.
+    made,
+    failed,
+};
 
 const Model = struct {
     stage: Stage = .paste,
@@ -36,8 +90,12 @@ const Model = struct {
     npub_len: usize = 0,
     msg_buf: [96]u8 = undefined,
     msg_len: usize = 0,
+    /// Milliseconds spent in a terminal state, which is what the beat draws and
+    /// what closes the window. Real elapsed time, not a decoration: a progress
+    /// bar that is not measuring anything is a lie with a rounded cap.
+    held_ms: u64 = 0,
 
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import" };
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "held_ms", "npub", "beat" };
 
     pub fn key(self: *const Model) []const u8 {
         return std.mem.trim(u8, self.key_buffer.text(), " \t\r\n");
@@ -54,17 +112,24 @@ const Model = struct {
         if (std.mem.startsWith(u8, k, "ncryptsec1")) return self.pass_buffer.text().len > 0;
         return false;
     }
+    pub fn npub(self: *const Model) []const u8 {
+        return self.npub_buf[0..self.npub_len];
+    }
+    /// How far through the hold the window is, 0 to 1. The beat's width.
+    pub fn beat(self: *const Model) f32 {
+        const t = @as(f32, @floatFromInt(self.held_ms)) / @as(f32, @floatFromInt(hold_ms));
+        return @min(t, 1.0);
+    }
     /// A live "signs as npub1..." for a valid nsec (an ncryptsec needs its
     /// passphrase, so it is confirmed at import instead).
     pub fn npub_hint(self: *const Model, arena: std.mem.Allocator) []const u8 {
         const k = self.key();
         if (!std.mem.startsWith(u8, k, "nsec1")) return "";
-        const secret = nostr.nip19.decodeNsec(arena, k) catch return "Not a valid nsec yet.";
+        const secret = nostr.nip19.decodeNsec(arena, k) catch return "";
         var signer = nostr.keys.Signer.init();
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return "";
-        const npub = nostr.nip19.encodeNpub(arena, kp.public_key) catch return "";
-        return std.fmt.allocPrint(arena, "Signs as {s}", .{npub}) catch "";
+        return nostr.nip19.encodeNpub(arena, kp.public_key) catch "";
     }
     pub fn notice(self: *const Model) []const u8 {
         return self.msg_buf[0..self.msg_len];
@@ -75,16 +140,51 @@ const Msg = union(enum) {
     key_edit: canvas.TextInputEvent,
     pass_edit: canvas.TextInputEvent,
     do_import,
+    do_create,
     copy_command,
     import_done: native_sdk.EffectResponse,
+    create_done: native_sdk.EffectResponse,
+    beat: native_sdk.EffectTimer,
     close,
 
-    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "copy_command", "close" };
+    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "close" };
 };
 
 pub const AppUi = canvas.Ui(Msg);
 const App = native_sdk.UiApp(Model, Msg);
 const Effects = App.Effects;
+
+// ---------------------------------------------------------------- the palette
+//
+// Signet's own, stated as the design states it. Not design tokens: the ceremony
+// window's whole job is to look like somewhere else, and a token set that tracks
+// Plaza's would quietly undo that on the next theme change.
+const C = canvas.Color;
+const ink = struct {
+    const bg = C.rgb8(11, 13, 12);
+    const border = C.rgb8(41, 48, 43);
+    const hairline = C.rgb8(28, 33, 29);
+    const chrome_text = C.rgb8(170, 181, 173);
+    const signet = C.rgb8(69, 193, 104);
+    const title = C.rgb8(207, 216, 209);
+    const body = C.rgb8(152, 162, 155);
+    const field_bg = C.rgb8(14, 17, 15);
+    const field_border = C.rgb8(44, 51, 46);
+    const good_bg = C.rgb8(16, 22, 15);
+    const good_border = C.rgb8(36, 53, 42);
+    const good_text = C.rgb8(143, 191, 158);
+    const card_bg = C.rgb8(13, 15, 14);
+    const card_border = C.rgb8(35, 41, 37);
+    const card_text = C.rgb8(143, 154, 146);
+    const command_bg = C.rgb8(9, 11, 10);
+    const command_border = C.rgb8(30, 36, 32);
+    const command_text = C.rgb8(194, 204, 197);
+    const footnote = C.rgb8(106, 117, 109);
+    const footer = C.rgb8(95, 106, 99);
+    const white = C.rgb8(242, 242, 244);
+    const on_white = C.rgb8(20, 20, 22);
+    const bad = C.rgb8(229, 115, 115);
+};
 
 fn setNotice(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.msg_buf.len);
@@ -94,25 +194,87 @@ fn setNotice(model: *Model, text: []const u8) void {
 
 fn tokensFn(model: *const Model) canvas.DesignTokens {
     _ = model;
-    const C = canvas.Color;
     var t = canvas.DesignTokens.theme(.{ .pack = .house, .color_scheme = .dark, .contrast = .standard });
-    // Signet's own register: green-warm ink, so the boundary with Plaza's cool
-    // grey is felt. You have left Plaza.
-    t.colors.background = C.rgb8(11, 13, 12);
-    t.colors.surface = C.rgb8(14, 17, 15);
-    t.colors.surface_subtle = C.rgb8(13, 15, 14);
-    t.colors.text = C.rgb8(207, 216, 209);
-    t.colors.text_muted = C.rgb8(152, 162, 155);
-    t.colors.border = C.rgb8(41, 48, 43);
-    t.colors.accent = C.rgb8(69, 193, 104); // Signet green
-    t.colors.accent_text = C.rgb8(11, 13, 12);
-    t.colors.focus_ring = C.rgb8(69, 193, 104);
+    // Same body size as Plaza, so a shared px figure means the same thing in both
+    // windows even though the faces differ.
+    t.typography.body_size = 14.5;
+    t.colors.background = ink.bg;
+    t.colors.surface = ink.field_bg;
+    t.colors.surface_subtle = ink.card_bg;
+    t.colors.text = ink.title;
+    t.colors.text_muted = ink.body;
+    t.colors.border = ink.border;
+    // The primary action is WHITE, not Signet green. Green here means identity:
+    // the mark, the key that checked out, the beat counting the window down. A
+    // green button would put the same signal on "press this", and the one place
+    // a reader must not misread is the button that hands over a key.
+    t.colors.accent = ink.white;
+    t.colors.accent_text = ink.on_white;
+    t.colors.focus_ring = ink.signet;
     return t;
 }
 
 fn boot(model: *Model, fx: *Effects) void {
-    _ = model;
-    _ = fx;
+    canvas.icons.registerAppIcons(&signet_icons.app_icons);
+    if (g_mode == .create_key) {
+        model.stage = .minting;
+        requestCreate(model, fx);
+    }
+}
+
+/// Asks the daemon for a fresh key. This window OWNS the create, rather than
+/// watching one Plaza started, because only the side that made the request can
+/// tell a key it just minted from a key that happened to already be there: a
+/// watcher polling /pubkey sees "ready" either way and would announce a stranger's
+/// leftover key as the reader's new identity. The response here is the answer.
+fn requestCreate(model: *Model, fx: *Effects) void {
+    if (g_token_len == 0) {
+        model.stage = .failed;
+        setNotice(model, "Signet isn't running. Start Plaza first.");
+        return;
+    }
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/setup", .{daemon_port}) catch return;
+    var auth_buf: [160]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token()}) catch return;
+    fx.fetch(.{
+        .key = create_key,
+        .url = url,
+        .method = .POST,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .body = "{\"method\":\"create\"}",
+        .on_response = Effects.responseMsg(.create_done),
+    });
+}
+
+/// Enters a terminal state and starts the beat that closes the window.
+fn holdThenClose(model: *Model, fx: *Effects, stage: Stage) void {
+    model.stage = stage;
+    model.held_ms = 0;
+    fx.startTimer(.{
+        .key = beat_timer_key,
+        .interval_ms = beat_interval_ms,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.beat),
+    });
+}
+
+/// Reads the pubkey the daemon reports back and remembers it as an npub. Returns
+/// false when the body is not a pubkey, which is the daemon answering something
+/// this window does not understand.
+fn adoptPubkey(model: *Model, body: []const u8) bool {
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, body) catch return false;
+    defer parsed.deinit();
+    if (parsed.value.pubkey.len != 64) return false;
+    var pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pk, parsed.value.pubkey) catch return false;
+    const npub = nostr.nip19.encodeNpub(gpa, pk) catch return false;
+    defer gpa.free(npub);
+    const n = @min(npub.len, model.npub_buf.len);
+    @memcpy(model.npub_buf[0..n], npub[0..n]);
+    model.npub_len = n;
+    return true;
 }
 
 fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -123,6 +285,10 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .pass_edit => |e| model.pass_buffer.apply(e),
         .copy_command => fx.writeClipboard(.{ .key = copy_key, .text = import_command }),
+        .do_create => {
+            model.stage = .minting;
+            requestCreate(model, fx);
+        },
         .do_import => {
             if (!model.can_import()) return;
             if (g_token_len == 0) {
@@ -156,85 +322,369 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 setNotice(model, if (response.status == 409) "A key is already set up." else "Could not import that key.");
                 return;
             }
-            // Read the pubkey the daemon now holds, to confirm which key landed.
-            const gpa = std.heap.page_allocator;
-            if (nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, response.body)) |p| {
-                var parsed = p;
-                defer parsed.deinit();
-                var pk: [32]u8 = undefined;
-                if (parsed.value.pubkey.len == 64 and (std.fmt.hexToBytes(&pk, parsed.value.pubkey) catch null) != null) {
-                    if (nostr.nip19.encodeNpub(gpa, pk)) |npub| {
-                        defer gpa.free(npub);
-                        const n = @min(npub.len, model.npub_buf.len);
-                        @memcpy(model.npub_buf[0..n], npub[0..n]);
-                        model.npub_len = n;
-                    } else |_| {}
-                }
-            } else |_| {}
-            model.stage = .done;
+            _ = adoptPubkey(model, response.body);
+            holdThenClose(model, fx, .imported);
+        },
+        .create_done => |response| {
+            if (response.outcome != .ok or response.status != 200) {
+                model.stage = .failed;
+                setNotice(model, if (response.status == 409)
+                    "A key is already set up."
+                else if (response.outcome != .ok)
+                    "Signet isn't answering yet."
+                else
+                    "Signet could not make a key.");
+                return;
+            }
+            _ = adoptPubkey(model, response.body);
+            holdThenClose(model, fx, .made);
+        },
+        .beat => |t| {
+            // A rejected timer means no clock at all, so the hold cannot be
+            // measured and the only honest thing is to stop holding.
+            if (t.outcome != .fired) return fx.closeWindow("main");
+            model.held_ms += beat_interval_ms;
+            if (model.held_ms >= hold_ms) {
+                fx.cancelTimer(beat_timer_key);
+                fx.closeWindow("main");
+            }
         },
         .close => fx.closeWindow("main"),
     }
 }
 
+// ---------------------------------------------------------------- the window
+
 fn view(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.column(.{ .grow = 1, .padding = 22, .gap = 12, .style_tokens = .{ .background = .background } }, .{
-        ui.text(.{ .size = .heading }, "Signet · Plaza"),
+    return ui.column(.{ .grow = 1, .gap = 0, .style = .{ .background = ink.bg } }, .{
+        titleBar(ui),
+        rule(ui),
         switch (model.stage) {
             .paste => pasteView(ui, model),
-            .importing => ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Handing your key to Signet…"),
-            .done => doneView(ui, model),
+            .importing => waitingView(ui, "Handing your key to Signet"),
+            .minting => waitingView(ui, "Making your key"),
+            .imported => importedView(ui, model),
+            .made => madeView(ui, model),
             .failed => failedView(ui, model),
         },
+        // The footer belongs to the ceremony, not to its result: on the terminal
+        // states the sentence has already been proved and repeating it there
+        // would be the window arguing with itself.
+        if (model.stage == .paste or model.stage == .importing) footerBand(ui) else ui.spacer(0),
     });
 }
+
+fn titleBar(ui: *AppUi) AppUi.Node {
+    return ui.row(.{ .height = 40, .cross = .center, .main = .center, .gap = 0 }, .{
+        ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = ink.signet } }, "signet"),
+        hgap(ui, 6),
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.chrome_text } },
+            &.{.{ .text = "Signet · Plaza", .monospace = true, .weight = .medium, .scale = px(11) }},
+        ),
+    });
+}
+
+fn footerBand(ui: *AppUi) AppUi.Node {
+    return ui.column(.{ .gap = 0 }, .{
+        rule(ui),
+        ui.row(.{ .height = 30, .cross = .center, .main = .center, .gap = 0 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = ink.footer } },
+                // Two clauses, not the design's three. The dropped one claimed
+                // "encrypted at rest", which the daemon does not do: the key is a
+                // raw 32-byte secret in a 0600 file. Process isolation IS the
+                // property this window provides, and it is the one worth stating.
+                //
+                // Short because this band does not wrap and the window is 452
+                // wide: a longer line does not shrink, it walks off the right
+                // edge, which the first draft's did. The clause it lost is
+                // already in the explainer above, where there is room for it.
+                &.{.{ .text = "isolated signer process · closes when done", .monospace = true, .scale = px(10) }},
+            ),
+        }),
+    });
+}
+
+fn rule(ui: *AppUi) AppUi.Node {
+    return ui.separator(.{ .style = .{ .foreground = ink.hairline, .background = ink.hairline } });
+}
+
+fn hgap(ui: *AppUi, size: f32) AppUi.Node {
+    return ui.el(.stack, .{ .width = size }, .{});
+}
+
+fn vgap(ui: *AppUi, size: f32) AppUi.Node {
+    return ui.el(.stack, .{ .height = size }, .{});
+}
+
+/// The body's horizontal inset, as a row that holds a growing column.
+fn inset(ui: *AppUi, pad: f32, inner: AppUi.Node) AppUi.Node {
+    return ui.row(.{ .gap = 0 }, .{ hgap(ui, pad), inner, hgap(ui, pad) });
+}
+
+// ---------------------------------------------------------------- IMPORT
 
 fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.column(.{ .gap = 10, .grow = 1 }, .{
-        ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "This key goes to Signet, Plaza's built-in signer. Plaza itself never sees it."),
-        ui.el(.textarea, .{
-            .text = model.key(),
-            .placeholder = "nsec1… or ncryptsec1…",
-            .on_input = AppUi.inputMsg(.key_edit),
-            .height = 60,
-        }, .{}),
-        if (model.is_ncryptsec())
-            ui.el(.textarea, .{ .text = model.pass(), .placeholder = "Passphrase", .on_input = AppUi.inputMsg(.pass_edit), .height = 36 }, .{})
-        else
-            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, model.npub_hint(ui.arena)),
-        ui.row(.{ .cross = .center, .gap = 8 }, .{
-            ui.button(.{ .variant = .primary, .disabled = !model.can_import(), .on_press = .do_import }, "Bring this key in"),
-            ui.spacer(1),
-            ui.button(.{ .variant = .ghost, .on_press = .close }, "Cancel"),
-        }),
-        ui.separator(.{}),
-        ui.text(.{ .size = .sm, .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "Prefer the terminal? Import without your key ever touching the clipboard or the screen:"),
-        ui.row(.{ .cross = .center, .gap = 8 }, .{
-            ui.text(.{ .size = .sm }, import_command),
-            ui.spacer(1),
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .copy_command }, "Copy"),
+    const hint = model.npub_hint(ui.arena);
+    return ui.column(.{ .grow = 1, .gap = 0 }, .{
+        vgap(ui, 20),
+        inset(ui, 22, ui.column(.{ .grow = 1, .gap = 11 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = ink.title } },
+                &.{.{ .text = "Bring your key in", .weight = .bold, .scale = px(18) }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = ink.body } },
+                &.{
+                    .{ .text = "This key goes to ", .scale = px(12.5) },
+                    .{ .text = "Signet", .weight = .bold, .color = .text, .scale = px(12.5) },
+                    .{ .text = ", the separate process that holds it and does the signing. Plaza's own window never sees it.", .scale = px(12.5) },
+                },
+            ),
+            ui.el(.textarea, .{
+                .text = model.key(),
+                .placeholder = "nsec1… or ncryptsec1…",
+                .on_input = AppUi.inputMsg(.key_edit),
+                .height = 56,
+                .style = .{ .background = ink.field_bg, .border = ink.field_border, .radius = 9, .stroke_width = 1 },
+            }, .{}),
+            if (model.is_ncryptsec())
+                ui.el(.textarea, .{
+                    .text = model.pass(),
+                    .placeholder = "Passphrase",
+                    .on_input = AppUi.inputMsg(.pass_edit),
+                    .height = 36,
+                    .style = .{ .background = ink.field_bg, .border = ink.field_border, .radius = 9, .stroke_width = 1 },
+                }, .{})
+            else if (hint.len > 0)
+                validKeyBox(ui, hint)
+            else
+                ui.spacer(0),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.button(.{ .variant = .primary, .disabled = !model.can_import(), .on_press = .do_import }, "Import this key"),
+                ui.spacer(1),
+                ui.button(.{ .variant = .ghost, .on_press = .close }, "Cancel"),
+            }),
+            terminalCard(ui),
+        })),
+        ui.spacer(1),
+    });
+}
+
+/// The live confirmation: which identity this key signs as, before it is handed
+/// over. Only for a plain nsec; an ncryptsec cannot be read without its
+/// passphrase, so that one is confirmed on the other side of the import.
+fn validKeyBox(ui: *AppUi, npub: []const u8) AppUi.Node {
+    return ui.el(.panel, .{
+        .padding = 0.01,
+        .style = .{ .background = ink.good_bg, .border = ink.good_border, .radius = 9, .stroke_width = 1 },
+    }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, 11),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                vgap(ui, 9),
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = ink.good_text } }, "check"),
+                    hgap(ui, 9),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = ink.title } },
+                        &.{.{ .text = "Valid key. It signs as", .scale = px(12) }},
+                    ),
+                }),
+                vgap(ui, 4),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = ink.good_text } },
+                    &.{.{ .text = npub, .monospace = true, .scale = px(11) }},
+                ),
+                vgap(ui, 9),
+            }),
+            hgap(ui, 11),
         }),
     });
 }
 
-fn doneView(ui: *AppUi, model: *const Model) AppUi.Node {
-    const line = if (model.npub_len > 0)
-        std.fmt.allocPrint(ui.arena, "Imported {s}", .{model.npub_buf[0..model.npub_len]}) catch "Imported"
-    else
-        "Imported";
-    return ui.column(.{ .gap = 10 }, .{
-        ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .success } }, line),
-        ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "You're all set. Plaza has picked it up."),
-        ui.button(.{ .variant = .primary, .on_press = .close }, "Done"),
+/// The stronger path, offered rather than hidden: a key typed into a terminal
+/// never touches the clipboard, the screen, or this window's text buffer.
+fn terminalCard(ui: *AppUi) AppUi.Node {
+    return ui.el(.panel, .{
+        .padding = 0.01,
+        .style = .{ .background = ink.card_bg, .border = ink.card_border, .radius = 10, .stroke_width = 1 },
+    }, .{
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 12),
+            ui.column(.{ .grow = 1, .gap = 7 }, .{
+                vgap(ui, 11),
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = ink.card_text } }, "terminal"),
+                    hgap(ui, 7),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = ink.card_text } },
+                        &.{.{ .text = "Prefer the terminal? Nothing is pasted anywhere:", .scale = px(11.5) }},
+                    ),
+                    ui.spacer(1),
+                    // Beside the LABEL, not beside the command. Sharing the
+                    // command's row left it about 300px, and the path is 58
+                    // monospace characters, so it wrapped: not at the one space
+                    // in it, but mid-token, splitting the binary's name across
+                    // two lines. A command a reader might retype has to be
+                    // readable as one string.
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .copy_command }, "Copy"),
+                }),
+                ui.el(.panel, .{
+                    .padding = 0.01,
+                    .style = .{ .background = ink.command_bg, .border = ink.command_border, .radius = 7, .stroke_width = 1 },
+                }, .{
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        hgap(ui, 9),
+                        ui.column(.{ .grow = 1, .gap = 0 }, .{
+                            vgap(ui, 7),
+                            ui.paragraph(
+                                .{ .wrap = true, .style = .{ .foreground = ink.command_text } },
+                                &.{.{ .text = import_command, .monospace = true, .scale = px(10) }},
+                            ),
+                            vgap(ui, 7),
+                        }),
+                        hgap(ui, 9),
+                    }),
+                }),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = ink.footnote } },
+                    &.{.{ .text = "Run it in Terminal while Plaza is open.", .monospace = true, .scale = px(10) }},
+                ),
+                vgap(ui, 11),
+            }),
+            hgap(ui, 12),
+        }),
+    });
+}
+
+// ---------------------------------------------------------------- the results
+
+/// The shape both terminal states share: a mark, a line, a sub, the beat, and
+/// the sentence saying the window is about to leave.
+fn resultView(ui: *AppUi, model: *const Model, mark: AppUi.Node, title: []const u8, sub: []const u8, tail: []const u8) AppUi.Node {
+    return ui.column(.{ .grow = 1, .gap = 0, .cross = .center }, .{
+        ui.spacer(1),
+        mark,
+        vgap(ui, 12),
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.title } },
+            &.{.{ .text = title, .weight = .medium, .scale = px(15) }},
+        ),
+        vgap(ui, 8),
+        // The 330px column the design gives this text, as a GROWING column between
+        // two fixed insets. `wrap` alone does nothing here: a paragraph that is a
+        // plain flow child of a row takes its intrinsic width, which for one long
+        // sentence is wider than the window, so it ran straight off the right edge
+        // with the wrap flag set and obeyed. Something has to bound it.
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 61),
+            ui.column(.{ .grow = 1, .gap = 8 }, .{
+                ui.paragraph(
+                    .{ .wrap = true, .text_alignment = .center, .style = .{ .foreground = ink.body } },
+                    &.{.{ .text = sub, .scale = px(12.5) }},
+                ),
+                // An npub is 63 monospace characters, which is wider than this
+                // window at any size it is legible at, so it always wraps.
+                if (model.npub_len > 0)
+                    ui.paragraph(
+                        .{ .wrap = true, .text_alignment = .center, .style = .{ .foreground = ink.good_text } },
+                        &.{.{ .text = model.npub(), .monospace = true, .scale = px(11) }},
+                    )
+                else
+                    ui.spacer(0),
+            }),
+            hgap(ui, 61),
+        }),
+        vgap(ui, 16),
+        beatBar(ui, model),
+        vgap(ui, 10),
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.footnote } },
+            &.{.{ .text = tail, .monospace = true, .scale = px(10) }},
+        ),
+        ui.spacer(1),
+    });
+}
+
+/// The 120x2 beat. Its fill is the hold actually elapsed, so it runs out exactly
+/// when the window goes.
+fn beatBar(ui: *AppUi, model: *const Model) AppUi.Node {
+    const filled = 120 * model.beat();
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.stack, .{ .width = filled, .height = 2, .style = .{ .background = ink.signet, .radius = 1 } }, .{}),
+        ui.el(.stack, .{ .width = 120 - filled, .height = 2, .style = .{ .background = ink.command_border, .radius = 1 } }, .{}),
+    });
+}
+
+fn importedView(ui: *AppUi, model: *const Model) AppUi.Node {
+    return resultView(
+        ui,
+        model,
+        ui.icon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "check-circle"),
+        "Your key is in Signet",
+        "Signet holds it now and does the signing. Plaza asks; it never has the key.",
+        "this window closes itself",
+    );
+}
+
+fn madeView(ui: *AppUi, model: *const Model) AppUi.Node {
+    return resultView(
+        ui,
+        model,
+        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "signet"),
+        "Your identity is ready",
+        "Signet made the key and keeps it. Nothing to write down, nothing to remember.",
+        "auto-continues to Plaza",
+    );
+}
+
+fn waitingView(ui: *AppUi, line: []const u8) AppUi.Node {
+    return ui.column(.{ .grow = 1, .gap = 0, .cross = .center }, .{
+        ui.spacer(1),
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.body } },
+            &.{.{ .text = line, .scale = px(12.5) }},
+        ),
+        ui.spacer(1),
     });
 }
 
 fn failedView(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.column(.{ .gap = 10 }, .{
-        ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .destructive } }, model.notice()),
-        ui.button(.{ .variant = .ghost, .on_press = .close }, "Close"),
+    return ui.column(.{ .grow = 1, .gap = 0, .cross = .center }, .{
+        ui.spacer(1),
+        ui.icon(.{ .width = 24, .height = 24, .style = .{ .foreground = ink.bad } }, "alert"),
+        vgap(ui, 12),
+        // Bounded, for the same reason the result view's sub is: a centered column
+        // gives its children their intrinsic width, and an unbounded sentence is
+        // as wide as it wants to be.
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, 61),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                ui.paragraph(
+                    .{ .wrap = true, .text_alignment = .center, .style = .{ .foreground = ink.bad } },
+                    &.{.{ .text = model.notice(), .scale = px(12.5) }},
+                ),
+            }),
+            hgap(ui, 61),
+        }),
+        vgap(ui, 14),
+        ui.row(.{ .cross = .center, .gap = 8 }, .{
+            // A create has nothing to go back to in this window, so the retry is
+            // here. An import still has the typed field behind this state, which
+            // is why it only offers the way out.
+            if (g_mode == .create_key)
+                ui.button(.{ .variant = .primary, .on_press = .do_create }, "Try again")
+            else
+                ui.spacer(0),
+            ui.button(.{ .variant = .ghost, .on_press = .close }, "Close"),
+        }),
+        ui.spacer(1),
     });
 }
+
+// ---------------------------------------------------------------- boot
 
 fn readToken(io: std.Io, environ: *const std.process.Environ.Map) void {
     const home = environ.get("HOME") orelse return;
@@ -251,13 +701,24 @@ fn readToken(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_token_len = len;
 }
 
+/// `--create` selects the create ceremony; anything else is the import. Read
+/// through `std.process.Args`, because `std.os.argv` no longer exists.
+fn readMode(init: std.process.Init) void {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.next(); // argv0
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--create")) g_mode = .create_key;
+    }
+}
+
 const app_permissions = [_][]const u8{ native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{.{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Signet canvas", .accessibility_label = "Signet", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true }};
-const shell_windows = [_]native_sdk.ShellWindow{.{ .label = "main", .title = "Signet · Plaza", .width = 460, .height = 420, .restore_state = false, .views = &shell_views }};
+const shell_windows = [_]native_sdk.ShellWindow{.{ .label = "main", .title = "Signet · Plaza", .width = window_width, .height = window_height, .restore_state = false, .views = &shell_views }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub fn main(init: std.process.Init) !void {
     readToken(init.io, init.environ_map);
+    readMode(init);
     const app_state = try App.create(std.heap.page_allocator, .{
         .name = "signet-window",
         .scene = shell_scene,
@@ -273,9 +734,47 @@ pub fn main(init: std.process.Init) !void {
         .app_name = "signet-window",
         .window_title = "Signet · Plaza",
         .bundle_id = "com.zig-nostr.signet-window",
-        .default_frame = geometry.RectF.init(0, 0, 460, 420),
+        .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = false,
         .js_window_api = false,
         .security = .{ .permissions = &app_permissions, .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } } },
     }, init);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "the beat never draws a negative remainder" {
+    // The bar is two boxes, `filled` and `120 - filled`. A beat past 1 would make
+    // the second one negative, which is not a narrower box, it is a layout the
+    // engine has no meaning for.
+    var model = Model{};
+    try testing.expectEqual(@as(f32, 0), model.beat());
+
+    model.held_ms = hold_ms / 2;
+    try testing.expect(model.beat() > 0.4 and model.beat() < 0.6);
+
+    // Ticks keep arriving in the frame between crossing the hold and the window
+    // actually going away.
+    model.held_ms = hold_ms * 4;
+    try testing.expectEqual(@as(f32, 1), model.beat());
+    try testing.expect(120 - 120 * model.beat() >= 0);
+}
+
+test "the import button is only offered when there is something to import" {
+    var model = Model{};
+    try testing.expect(!model.can_import());
+
+    // An ncryptsec cannot be read without its passphrase, so offering the button
+    // before one is typed would be offering a press that fails.
+    model.key_buffer.set("ncryptsec1qqqqq");
+    try testing.expect(!model.can_import());
+    model.pass_buffer.set("hunter2");
+    try testing.expect(model.can_import());
+
+    // Anything that is neither is not a key, whatever it looks like.
+    model.key_buffer.set("npub1qqqqq");
+    model.pass_buffer.clear();
+    try testing.expect(!model.can_import());
 }

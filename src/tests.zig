@@ -6818,3 +6818,57 @@ test "a remembered follow is never written over a contact list nobody has read" 
     try testing.expect(!model.pending.waiting());
     try testing.expect(model.toast_until != 0);
 }
+
+test "a key made in the ceremony window still gets the name beat" {
+    // The create runs in the other process now, so its result reaches Plaza the
+    // same way a terminal import does: a key simply appears at /pubkey. Without
+    // something telling those two apart, creating an identity would drop a
+    // brand new reader into the feed as a nameless account with nothing
+    // offering to name it, which is the entire reason the beat exists.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    const body = "{\"pubkey\":\"" ++ "5b" ** 32 ++ "\",\"state\":\"ready\"}";
+
+    {
+        main.setCreateCeremonyForTest(true);
+        var model = main.initialModel();
+        model.stage = .onboarding;
+        main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+        try testing.expect(main.activePubkeyForTest() != null);
+        try testing.expect(model.naming);
+    }
+
+    // And a key that appears for any other reason does not: an import, a
+    // terminal, a ceremony abandoned long enough ago that the window expired.
+    // Asking an existing account to pick a name is asking about something it
+    // already has.
+    {
+        main.clearIdentityForTest();
+        main.setCreateCeremonyForTest(false);
+        var model = main.initialModel();
+        model.stage = .onboarding;
+        main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+        try testing.expect(main.activePubkeyForTest() != null);
+        try testing.expect(!model.naming);
+    }
+}
+
+test "the ceremony window is spent once, not held open for the next key" {
+    // A latch that survived its own ceremony would put the name card in front of
+    // whatever signed in next.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    main.setCreateCeremonyForTest(true);
+    const body = "{\"pubkey\":\"" ++ "6c" ** 32 ++ "\",\"state\":\"ready\"}";
+
+    var model = main.initialModel();
+    model.stage = .onboarding;
+    main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+    try testing.expect(model.naming);
+
+    main.clearIdentityForTest();
+    var second = main.initialModel();
+    second.stage = .onboarding;
+    main.handleHelperPubkeyForTest(&second, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+    try testing.expect(!second.naming);
+}
