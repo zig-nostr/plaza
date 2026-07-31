@@ -43,10 +43,11 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src
 
-      - name: Signet window (check, build, format)
+      - name: Signet window (check, test, build, format)
         working-directory: signet-window
         run: |
           native check
+          native test
           native build
           zig fmt --check src
 
