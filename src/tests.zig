@@ -7194,6 +7194,26 @@ test "your own page is written for you, not about you" {
     try testing.expect(findAnyTextContainingText(mine.root, "you have written") != null);
     try testing.expect(findAnyText(mine.root, "Your follow list has not arrived yet") != null);
 
+    // The line above is the LOADING one, and it is the only empty-tab string a
+    // freshly opened profile can reach: `enterProfile` sets `thread_loading` from
+    // an empty note count, and with no store it never clears. Settling it reaches
+    // the other two, which otherwise sit behind an assertion that cannot see them
+    // and could each be reverted to "they" with the suite still green.
+    model.thread_loading = false;
+    for ([_]struct { tab: @TypeOf(model.profile_tab), want: []const u8 }{
+        .{ .tab = .notes, .want = "Nothing you have written is here yet." },
+        .{ .tab = .replies, .want = "Nothing you have written at anyone is here yet." },
+    }) |c| {
+        model.profile_tab = c.tab;
+        const settled = try buildTree(arena, &model);
+        if (findAnyText(settled.root, c.want) == null) {
+            std.debug.print("own page is missing \"{s}\"\n", .{c.want});
+            return error.WrongPerson;
+        }
+        try testing.expect(findAnyTextContainingText(settled.root, "they have written") == null);
+    }
+    model.profile_tab = .notes;
+
     // A stranger's page is unchanged: it is about somebody else, and saying "you"
     // there would be the same mistake pointed the other way.
     main.update(&model, .{ .open_person = [_]u8{0x33} ** 32 }, &fx);
