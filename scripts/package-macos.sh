@@ -52,27 +52,53 @@ native build .
 hits="$(strings zig-out/bin/plaza | grep -c "native-sdk-automation" || true)"
 [ "$hits" = "0" ] || die "the built binary carries the automation server ($hits marker(s)). Refusing to package it."
 
-# The key ceremony runs in its own process and its own window, so the bundle has
-# to carry that binary too. `resolveSignetWindow` looks for it as a SIBLING in
-# Contents/MacOS and falls back to the in-process path when it is missing, which
-# means a bundle without it does not fail, it just quietly stops showing the
-# ceremony. Nothing would have caught that but looking.
+# Plaza is three processes, not one: the app, `plaza-signer` (the isolated
+# keyholder daemon that actually holds the secret), and `signet-window` (the key
+# ceremony, in its own window). Both helpers are resolved as SIBLINGS of argv[0],
+# so both have to sit in Contents/MacOS, and `native package` carries exactly one
+# executable.
+#
+# The list is derived rather than typed out. My first version of this script
+# hand-copied the ceremony window, because that was the missing binary I happened
+# to be looking at, and shipped a bundle with no keyholder daemon at all:
+# `resolveHelper` formats the sibling path with no access check and no fallback,
+# so the app would have spawned a file that was not there, silently, and "Create
+# your identity" would have dead-ended in a released build. Whatever build.zig
+# installs belongs beside the app, so ask build.zig instead of remembering.
 say "Building the ceremony window..."
 (cd signet-window && rm -rf zig-out && native build .)
 
 # Packaged UNSIGNED on purpose. A signature covers the bundle's contents, so
-# copying a binary in afterwards invalidates it. Inject first, then sign
-# inside-out: the nested executable before the bundle that contains it.
-say "Packaging (unsigned, so the window can be injected)..."
+# copying binaries in afterwards invalidates it. Inject first, then sign
+# inside-out: every nested executable before the bundle that contains them.
+say "Packaging (unsigned, so the helpers can be injected)..."
 native package --target macos --signing none --output "$out"
 
-say "Injecting the ceremony window beside Plaza..."
+say "Injecting sibling binaries beside Plaza..."
+for bin in zig-out/bin/*; do
+  name="$(basename "$bin")"
+  # The app itself is already in place, put there by the packager.
+  if [ "$name" = "plaza" ]; then continue; fi
+  say "  + $name"
+  cp "$bin" "$out/Contents/MacOS/$name"
+done
+say "  + signet-window"
 cp signet-window/zig-out/bin/signet-window "$out/Contents/MacOS/signet-window"
 
 say "Signing inside-out..."
-codesign --force --sign - --timestamp=none "$out/Contents/MacOS/signet-window"
+for bin in "$out/Contents/MacOS/"*; do
+  if [ "$(basename "$bin")" = "plaza" ]; then continue; fi
+  codesign --force --sign - --timestamp=none "$bin"
+done
 codesign --force --sign - --timestamp=none "$out"
 
 codesign --verify --deep --strict "$out" || die "the bundle failed signature verification."
-[ -x "$out/Contents/MacOS/signet-window" ] || die "the ceremony window is missing from the bundle."
+
+# Assert what a working bundle needs, by name. The loop above is what keeps this
+# list from going stale, but the app degrades SILENTLY when a sibling is missing,
+# so the release is the wrong place to find out.
+for required in plaza plaza-signer signet-window; do
+  [ -x "$out/Contents/MacOS/$required" ] || die "$required is missing from the bundle."
+done
 say "Built $out"
+say "Carries: $(cd "$out/Contents/MacOS" && echo *)"

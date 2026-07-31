@@ -55,12 +55,17 @@ main() {
     *) die "GitHub answered HTTP $status. Try https://github.com/$repo/releases" ;;
   esac
 
+  # Each `|| true` matters. Under `set -e` with `pipefail`, a grep that matches
+  # nothing returns 1, the pipeline inherits it, and the assignment aborts the
+  # whole script on the spot with no message at all. The explicit check below,
+  # which exists to explain precisely that case, would never be reached: the
+  # reader would see the "Finding the latest release" line and then silence.
   local tag url digest
-  tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-  url="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*macos\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')"
-  digest="$(printf '%s' "$json" | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2)"
+  tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+  url="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*macos\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/' || true)"
+  digest="$(printf '%s' "$json" | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2 || true)"
 
-  [ -n "$url" ] || die "no macOS build found on the latest release (${tag:-unknown})."
+  [ -n "$url" ] || die "release ${tag:-unknown} has no macOS build attached. Try https://github.com/$repo/releases"
   say "Latest release: ${tag:-unknown}"
 
   # --- download + verify ---------------------------------------------------
