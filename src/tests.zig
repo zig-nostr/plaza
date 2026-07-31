@@ -6554,17 +6554,20 @@ test "nothing that calls itself a button is dead" {
                 m.composing = true;
             }
         }.f },
-        .{ .name = "note menu", .prepare = struct {
-            fn f(m: *main.Model) void {
-                m.stage = .ready;
-                m.viewing_thread = 1;
-                m.thread_root = threadNote(0xAA, 100, 0);
-                m.thread_root.id = 1;
-                // The state the first version of this test could not reach, and
-                // where its invariant was already false.
-                m.note_menu = true;
-            }
-        }.f },
+        .{
+            .name = "note menu",
+            .prepare = struct {
+                fn f(m: *main.Model) void {
+                    m.stage = .ready;
+                    m.viewing_thread = 1;
+                    m.thread_root = threadNote(0xAA, 100, 0);
+                    m.thread_root.id = 1;
+                    // The state the first version of this test could not reach, and
+                    // where its invariant was already false.
+                    m.note_menu = true;
+                }
+            }.f,
+        },
         .{ .name = "notifications", .prepare = struct {
             fn f(m: *main.Model) void {
                 m.stage = .ready;
