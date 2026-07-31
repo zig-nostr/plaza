@@ -1,0 +1,64 @@
+name: Release
+
+# On a version tag, build Plaza from that commit, package a single ad-hoc signed
+# (not notarized) macOS .app, and publish it as a GitHub release. The artifact is
+# reproducible: it is built here from the tagged source, and anyone can rebuild
+# it with scripts/package-macos.sh (see the README).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload the .app
+
+jobs:
+  macos-app:
+    name: package · ad-hoc sign · publish
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.5.3
+
+      # The tests run on every pull request, but a tag can be pushed at any
+      # commit, and a release is the one artifact nobody gets to re-check. So the
+      # suite runs again here and the release does not exist if it fails. Both
+      # halves, because the bundle carries both binaries.
+      - name: Test
+        run: native test
+
+      - name: Test the ceremony window
+        working-directory: signet-window
+        run: native test
+
+      # The script builds both binaries itself from cleared zig-outs, refuses to
+      # package a plaza carrying the automation server, injects the ceremony
+      # window and signs inside-out. See its comments: a bare `native package`
+      # signs whatever is already in zig-out/bin and carries no second binary.
+      - name: Package the app (ad-hoc signed)
+        run: scripts/package-macos.sh
+
+      - name: Zip the .app (ditto preserves the signature)
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Plaza.app" "Plaza-${{ github.ref_name }}-macos.zip"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          "Plaza-${{ github.ref_name }}-macos.zip"
+          --title "Plaza ${{ github.ref_name }}"
+          --notes-file .github/RELEASE_NOTES.md

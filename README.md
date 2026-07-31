@@ -16,8 +16,27 @@ client.
 > rendered straight from a local store that a pool of background threads keeps
 > filled, one process, no IPC. Composing signs a note (locally, or by a
 > round-trip to the signer) that is stored at once and published to the pool.
-> The outbox model, private messages and packaging land in the milestones
-> ahead. macOS first.
+> Private messages land in a milestone ahead. macOS first.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/install-macos.sh | bash
+```
+
+macOS on Apple Silicon. The installer verifies the download's SHA-256, installs
+`Plaza.app`, clears the download-quarantine flag so it opens without a Gatekeeper
+detour, and launches it. It touches the bundle and nothing else: your key,
+session and local store live in `~/.plaza` and survive every upgrade.
+
+Plaza is ad-hoc signed and not notarized on purpose. It signs notes with your
+key, so the trust anchor is a build you can reproduce rather than an Apple
+signature you cannot inspect. Read the
+[installer](scripts/install-macos.sh), or build the same artifact yourself:
+
+```sh
+scripts/package-macos.sh   # -> dist/Plaza.app, ad-hoc signed
+```
 
 ## Performance
 
