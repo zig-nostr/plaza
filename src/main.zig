@@ -11474,10 +11474,33 @@ fn personName(ui: *AppUi, pubkey: [32]u8) []const u8 {
     return personNpubShort(ui, pubkey);
 }
 
+/// Whether this person has a name of their own, as opposed to one this app made
+/// up for them out of their key.
+///
+/// `personName` falls back to the short npub, which is the right thing on a row
+/// that must say SOMETHING. On the profile it means the name line and the npub
+/// line can end up holding the identical string, which reads as a rendering fault
+/// rather than as an identity. The note row has guarded its handle against the
+/// same shape since it was written; the profile card never did.
+fn personIsNamed(pubkey: [32]u8) bool {
+    const prof = lookupProfile(pubkey) orelse return false;
+    return prof.name_len > 0;
+}
+
 fn personNpubShort(ui: *AppUi, pubkey: [32]u8) []const u8 {
-    const encoded = nostr.nip19.encodeNpub(ui.arena, pubkey) catch return "npub…";
+    return npubShortOf(ui.arena, pubkey);
+}
+
+fn npubShortOf(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
+    const encoded = nostr.nip19.encodeNpub(arena, pubkey) catch return "npub…";
     if (encoded.len < 20) return encoded;
-    return ui.fmt("{s}…{s}", .{ encoded[0..10], encoded[encoded.len - 5 ..] });
+    return std.fmt.allocPrint(arena, "{s}…{s}", .{ encoded[0..10], encoded[encoded.len - 5 ..] }) catch "npub…";
+}
+
+/// The abbreviated npub exactly as the view renders it, so a test can count how
+/// many times a screen says it without hard-coding the truncation. For tests.
+pub fn npubShortForTest(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
+    return npubShortOf(arena, pubkey);
 }
 
 /// The verified check, drawn only when their NIP-05 actually resolves to them.
@@ -11561,6 +11584,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
     const website = personWebsite(pubkey);
     const lud16 = personLud16(pubkey);
     const is_me = isMe(pubkey);
+    const named = personIsNamed(pubkey);
 
     return ui.column(.{ .gap = 0 }, .{
         // The banner, with the face riding up over its lower edge. There is no
@@ -11612,10 +11636,20 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 }),
                 vgap(ui, 5),
                 ui.row(.{ .cross = .center, .gap = 8 }, .{
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.text_muted } },
-                        &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
-                    ),
+                    // Skipped when the name line IS this string. A key with no
+                    // kind:0 has no name, so `personName` hands back the short
+                    // npub, and printing it again directly underneath says
+                    // nothing twice. The reader most likely to see it is the one
+                    // whose key was minted a minute ago and who has not named it
+                    // yet, which is the same reader the rail's seat now opens
+                    // this page for.
+                    if (named)
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
+                        )
+                    else
+                        ui.spacer(0),
                     if (followsMe(pubkey))
                         ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
                     else

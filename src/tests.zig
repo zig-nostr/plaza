@@ -7169,6 +7169,55 @@ test "the rail's own seat opens your page, not your preferences" {
     try testing.expect(findAnyText(page.root, "Follow") == null);
 }
 
+/// How many widgets in the tree carry exactly this text.
+fn countAnyText(widget: canvas.Widget, text: []const u8) usize {
+    var n: usize = if (std.mem.eql(u8, widget.text, text)) 1 else 0;
+    for (widget.children) |child| n += countAnyText(child, text);
+    return n;
+}
+
+test "a page with no name on it says the npub once" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    main.setIdentityForTest([_]u8{0x6C} ** 32);
+    defer main.clearIdentityForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const who = [_]u8{0x2B} ** 32;
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .{ .open_person = who }, &fx);
+
+    // The header band names whoever the page is about, which 11b asks for and
+    // which is not the duplication at issue. So the band is the one legitimate
+    // occurrence, and the question is whether the CARD says it again underneath
+    // its own name line.
+    const short = main.npubShortForTest(arena, who);
+    try testing.expect(short.len > 0);
+
+    // No kind:0, so `personName` hands back the short npub for the name line.
+    // The npub row must then stand down: band + name line is two, and the row
+    // would make three, the same string stacked on itself.
+    const nameless = try buildTree(arena, &model);
+    const said = countAnyText(nameless.root, short);
+    if (said != 2) {
+        std.debug.print("nameless page prints \"{s}\" {d} times, want 2 (band + name line)\n", .{ short, said });
+        return error.SaidTwice;
+    }
+
+    // Given a name, the two lines carry different strings and both belong: the
+    // band and the name line say "Grace", the row says the npub, once.
+    const prof = main.upsertProfile(who).?;
+    main.parseMetadataInto(prof, "{\"display_name\":\"Grace\"}");
+    const named = try buildTree(arena, &model);
+    try testing.expectEqual(@as(usize, 2), countAnyText(named.root, "Grace"));
+    try testing.expectEqual(@as(usize, 1), countAnyText(named.root, short));
+}
+
 test "your own page is written for you, not about you" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
