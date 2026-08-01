@@ -42,7 +42,9 @@ const canvas_label = "main-canvas";
 // never a longer line. Wider than tall: a reading column wants breathing room,
 // not a tower.
 pub const window_width: f32 = 760;
-pub const window_height: f32 = 540;
+// Square. A feed is a column of rows, and the wide-and-short default spent its
+// extra width on margin while showing four notes at a time.
+pub const window_height: f32 = 760;
 const feed_column_width: f32 = 620;
 // The thread's reading column matches the feed's: both are virtualLists now,
 // which reserve the same scrollbar gutter, so the two screens share one column
@@ -101,7 +103,6 @@ const bootstrap_relays = [_][]const u8{
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
-    "wss://relay.nostr.band",
     "wss://relay.snort.social",
 };
 
@@ -792,6 +793,12 @@ fn resetRelaysToBootstrap() void {
 
 /// Puts the pool back to the one the app was born with. For tests, which need a
 /// known pool: the real one is loaded from disk or from their kind:10002.
+/// How many relays the app is born with. Tests derive from this rather than
+/// naming a number, so changing the bootstrap list is one edit and not a hunt
+/// through the suite for every place that happened to say five.
+pub const bootstrap_relay_count_for_test = bootstrap_relays.len;
+pub const max_relays_for_test = max_relays;
+
 pub fn resetRelaysForTest() void {
     g_relays = [_]RelayEntry{.{}} ** max_relays;
     g_relay_count.store(0, .release);
@@ -7518,6 +7525,7 @@ pub const Msg = union(enum) {
     toggle_relays_paused,
     /// Jump the feed to its newest note.
     jump_to_newest,
+    go_home,
     /// Reveal the next page of a thread's replies.
     show_more_replies,
     /// Show or re-hide the replies from outside the follow graph.
@@ -12350,8 +12358,17 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
     // one uniform padding cannot state. The 10 on each side is exactly what
     // centring a 36px tile in the 56px rail leaves, so it stays as padding.
     return ui.column(.{ .width = 56, .cross = .center, .gap = 0, .padding = 10, .style_tokens = .{ .background = .background } }, .{
-        // Home: the mark on a raised plate, the active destination.
-        tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "Home", ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark")),
+        // Home: the mark on a raised plate, and the way back to the feed from
+        // wherever the reader has got to. It looked like the app's own button
+        // for a long time and did nothing when pressed, which is the one thing
+        // a mark in that position should never be.
+        ui.row(.{
+            .on_press = Msg.go_home,
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "Home", .focusable = true },
+        }, .{
+            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark")),
+        }),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
@@ -13114,17 +13131,21 @@ fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
         p.status_warning
     else
         p.status_success;
+    // No latency on the bar. A round-trip figure that swings with whichever
+    // relay answered last is a number nobody acts on, and it sat where the
+    // reader looks for whether the pool is up. The per-relay pings are still in
+    // the card this chip opens, next to the relay each one belongs to, which is
+    // the only place the number means anything.
     const label = if (settling)
         ui.fmt("pausing · {d}/{d} relays", .{ live, total })
     else if (paused)
         ui.fmt("paused · 0/{d} relays", .{total})
-    else if (poolLatencyMs()) |ms|
-        ui.fmt("{d}/{d} relays · {d} ms", .{ live, total, ms })
     else
         ui.fmt("{d}/{d} relays", .{ live, total });
-    // The chip carries its plate when the pool is healthy AND when it is paused:
-    // a deliberate pause is a state worth reading at a glance, not a fault.
-    const plated = paused or poolIsHealthyOf(live, total);
+    // And no plate. The dot already carries the pool's health, so the surface
+    // behind it was a second voice saying the same thing, in the busiest corner
+    // of the window.
+    const plated = false;
     // The trigger and its floating surface are siblings in a stack: that is the
     // sanctioned shape, and the anchored surface takes no space in the row.
     return ui.stack(.{}, .{
@@ -15195,6 +15216,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.note_menu = false;
             closeThread(model);
         },
+        .go_home => goHome(model),
         .reply_edit => |edit| model.reply_buffer.apply(edit),
         .reply_submit => {
             // The one verb that was gated nowhere: a guest could type a reply and
@@ -17148,6 +17170,35 @@ fn openEvent(model: *Model, id: [32]u8) void {
 
 /// Closes the open thread: pops the back-stack to the thread it was opened from,
 /// or returns to the feed (which kept its scroll offset) when the stack is empty.
+/// Back to the feed from wherever the reader has got to, in one press.
+///
+/// Not a Back: it drops the whole stack rather than one level, because the mark
+/// in the corner of the rail is a destination and not a step. Settings is left,
+/// any open person or thread is closed, and the overlays that live above the
+/// feed go with them, since landing on the feed behind a panel is not landing
+/// on the feed.
+///
+/// The sheets that ask the reader something (signing in, naming a fresh key)
+/// are deliberately NOT touched here. They are questions with an answer owed,
+/// and dismissing one as a side effect of navigating is how a remembered intent
+/// gets dropped.
+fn goHome(model: *Model) void {
+    model.thread_stack_len = 0;
+    model.viewing_profile = null;
+    model.viewing_thread = 0;
+    model.thread_loading = false;
+    model.thread_notes_len = 0;
+    model.reply_buffer.clear();
+    model.note_menu = false;
+    model.menu = .none;
+    model.notifications_open = false;
+    model.stage = .ready;
+}
+
+pub fn goHomeForTest(model: *Model) void {
+    goHome(model);
+}
+
 fn closeThread(model: *Model) void {
     // The level being left is the one that resets: the level underneath keeps
     // its pages, its held section and its arrival order, which is what makes the
