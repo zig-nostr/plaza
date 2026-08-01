@@ -4733,10 +4733,6 @@ const QuoteRef = struct {
     len: u16 = 0,
 };
 
-/// One note as the feed renders it: a two-letter avatar, the author's
-/// abbreviated npub, a relative timestamp, and the (truncated) content. Strings
-/// are copied into fixed buffers so a card never aliases the query arena it was
-/// built from.
 /// The verb a guest reached for, held until they have a key.
 pub const Intent = union(enum) {
     none,
@@ -4750,6 +4746,10 @@ pub const Intent = union(enum) {
     }
 };
 
+/// One note as the feed renders it: a two-letter avatar, the author's
+/// abbreviated npub, a relative timestamp, and the (truncated) content. Strings
+/// are copied into fixed buffers so a card never aliases the query arena it was
+/// built from.
 pub const Note = struct {
     // Non-negative i64: the markup engine holds a `for each` integer key as i64
     // then casts it to u64, so a raw u64 (or negative i64) from the id's high
@@ -5626,10 +5626,6 @@ pub const Model = struct {
         return @min(self.thread_stack_len, thread_depth_max);
     }
 
-    /// Rebuilds the open thread's replies from the store: every kind:1 that
-    /// e-tags the root, oldest first, into the `thread_notes` cache. Local-first,
-    /// the same path the feed uses; cheap enough to run each tick so
-    /// late-arriving replies appear and relative times stay fresh.
     /// The open profile's notes, newest first, read from the local store. The
     /// same shape as the thread's refresh: the store is the app, so the screen
     /// fills from disk before any relay answers and the backfill only widens it.
@@ -5673,6 +5669,10 @@ pub const Model = struct {
         return out[0..n];
     }
 
+    /// Rebuilds the open thread's replies from the store: every kind:1 that
+    /// e-tags the root, oldest first, into the `thread_notes` cache. Local-first,
+    /// the same path the feed uses; cheap enough to run each tick so
+    /// late-arriving replies appear and relative times stay fresh.
     fn refreshThreadNotes(self: *Model, now_s: i64) void {
         if (self.viewing_thread == 0) return;
         const store = g_store orelse return;
@@ -7221,10 +7221,6 @@ fn findQuoteRef(note: *Note) void {
     }
 }
 
-/// The aspect (height over width) the note's own NIP-92 `imeta` tag declares for
-/// `url`, or 0 when it says nothing. An `imeta` tag reads
-/// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
-/// written as floats, so both forms parse.
 /// A byte count as a reader reads it: `240 KB`, `1.4 MB`. Decimal units, because
 /// that is what the file's own host quotes and what the note author copied.
 fn byteSize(arena: std.mem.Allocator, bytes: u32) []const u8 {
@@ -7289,6 +7285,10 @@ pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
     return .{};
 }
 
+/// The aspect (height over width) the note's own NIP-92 `imeta` tag declares for
+/// `url`, or 0 when it says nothing. An `imeta` tag reads
+/// `["imeta", "url https://…", "dim 882x302", …]`; dimensions are sometimes
+/// written as floats, so both forms parse.
 pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
     for (tags) |tag| {
         if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
@@ -7550,8 +7550,6 @@ pub const Msg = union(enum) {
     /// Open one of the chrome's anchored menus (or close it, when it is already
     /// the open one, so a trigger toggles).
     toggle_menu: ChromeMenu,
-    /// The note overflow menu, and the one action behind it. The payload says
-    /// which way: 0 means a guest reached for it, 1 follow, 2 unfollow.
     /// The bell, and what is behind it.
     toggle_notifications,
     close_notifications,
@@ -7559,8 +7557,11 @@ pub const Msg = union(enum) {
     notifications_older,
     notifications_newer,
     notifications_read_all,
+    /// The note overflow menu.
     toggle_note_menu,
     close_note_menu,
+    /// The one action behind the note menu. The payload says which way: 0 means
+    /// a guest reached for it, 1 follow, 2 unfollow.
     follow_author: u8,
     /// Opens a person as a level of their own.
     open_person: [32]u8,
@@ -11074,19 +11075,20 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
     return ui.row(.{}, .{cells});
 }
 
-/// One reply in the thread: a feed-style row, with an "OP" chip when the
-/// replier is the thread's original author, seated under the note it answers by
-/// the nesting gutter. The WRAPPER row carries the press and the hover wash, so
-/// every horizontal pixel of the row (gutter included) opens this reply as
-/// its own thread and washes as one unit; the picture and the engagement
-/// controls keep their own presses as the deeper hit targets. The bottom
-/// hairline lives INSIDE the content column: it starts after the gutter (so it
-/// aligns with the content it separates) and the gutter's rails span the
-/// wrapper's full height across it, keeping a sibling run's rail continuous.
 /// One top-level reply and the level of conversation under it. The block draws
 /// the reply at note size against a rail, then each of its own replies at a
 /// smaller register hanging off that rail, then a line for whatever the branch
 /// continues into.
+///
+/// The reply itself is a feed-style row, with an "OP" chip when the replier is
+/// the thread's original author, seated under the note it answers by the nesting
+/// gutter. The WRAPPER row carries the press and the hover wash, so every
+/// horizontal pixel of the row (gutter included) opens this reply as its own
+/// thread and washes as one unit; the picture and the engagement controls keep
+/// their own presses as the deeper hit targets. The bottom hairline lives INSIDE
+/// the content column: it starts after the gutter (so it aligns with the content
+/// it separates) and the gutter's rails span the wrapper's full height across it,
+/// keeping a sibling run's rail continuous.
 ///
 /// The rail replaces the round-4 indent gutter: the redesign nests ONE level in
 /// place and sends the rest to their own thread, rather than stepping every reply
@@ -11641,8 +11643,6 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
     });
 }
 
-/// The feed screen: the rail, then the content, the feed, with a thread layered
-/// over it when one is open.
 /// Wraps a thread level's panel in a full-bleed opaque panel that occludes
 /// whatever is beneath it (a bare column does not reliably paint its background;
 /// the `.card` element does). Keyed by the level's root id so the whole level
@@ -11656,13 +11656,6 @@ fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
     return ui.el(.card, .{ .grow = 1, .padding = 0.01, .global_key = .{ .int = level_key }, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{panel});
 }
 
-/// A stable, collision-free scroll identity for a thread level: the level index
-/// in the high bits (distinct per position, so an ancestor keeps its key and
-/// offset while deeper levels push and pop, and two levels never collide even if
-/// the same note appears twice) and the root note id in the low bits (so when
-/// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
-/// top root in place, the new level gets a fresh key and opens at the top rather
-/// than inheriting the dropped thread's offset).
 /// The band, drawn from the registered image. `cover` so a wide picture fills
 /// the strip rather than letterboxing inside it.
 fn bannerImage(ui: *AppUi) AppUi.Node {
@@ -12443,6 +12436,13 @@ fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
     };
 }
 
+/// A stable, collision-free scroll identity for a thread level: the level index
+/// in the high bits (distinct per position, so an ancestor keeps its key and
+/// offset while deeper levels push and pop, and two levels never collide even if
+/// the same note appears twice) and the root note id in the low bits (so when
+/// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
+/// top root in place, the new level gets a fresh key and opens at the top rather
+/// than inheriting the dropped thread's offset).
 fn threadLevelKey(level: usize, root_id: i64) u64 {
     const hi = @as(u64, level) << 59;
     const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
@@ -12645,8 +12645,6 @@ fn tilePlate(ui: *AppUi, style: canvas.WidgetStyle, label: []const u8, glyph: Ap
     });
 }
 
-/// One pressable rail tile: a 36px plate with a centered icon. `bright` paints
-/// the accent fill (the compose verb); the rest are quiet with a muted glyph.
 /// The bell tile, with its count.
 ///
 /// No mock draws the badge anywhere, so this is the smallest thing that reads as
@@ -12699,6 +12697,8 @@ fn badgePill(ui: *AppUi, count: usize) AppUi.Node {
     });
 }
 
+/// One pressable rail tile: a 36px plate with a centered icon. `bright` paints
+/// the accent fill (the compose verb); the rest are quiet with a muted glyph.
 fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label: []const u8, bright: bool) AppUi.Node {
     const p = theme.palette;
     const tint = if (bright) p.on_accent else p.text_muted;
@@ -13214,9 +13214,6 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     return menuSurface(ui, 240, rows);
 }
 
-/// The relay zone: the pool's health, and the popover that explains it. The chip
-/// is highlighted while the pool is healthy, because that is when the number is
-/// worth reading at a glance; a degraded pool speaks through its dot instead.
 /// The banner 11p draws when no relay is answering. It says what still works,
 /// which is nearly everything: the store is the app, so reading continues, and a
 /// note written now is queued rather than refused. A spinner would say the
@@ -13348,6 +13345,9 @@ fn outboxMenu(ui: *AppUi) AppUi.Node {
     return menuSurface(ui, 240, rows);
 }
 
+/// The relay zone: the pool's health, and the popover that explains it. The chip
+/// is highlighted while the pool is healthy, because that is when the number is
+/// worth reading at a glance; a degraded pool speaks through its dot instead.
 fn relayZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const paused = model.relays_paused;
@@ -13550,9 +13550,6 @@ fn statusChip(ui: *AppUi, chip: StatusChip) AppUi.Node {
     }, .{inner});
 }
 
-/// One note: avatar, author line, content, and any inline image. Keyed by the
-/// note id so the list diff holds scroll position across reconciles. This is
-/// the per-row builder the windowed list will call in the milestone ahead.
 /// The warm avatar tint for an author, chosen deterministically from the
 /// pubkey so a face keeps the same color across sessions. Neutral graphite is
 /// the last entry and the natural fallback for an all-zero key.
@@ -15576,10 +15573,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     }
 }
 
-/// Switches to the feed and brings the store + ingest pool up if they are not
-/// already running. Shared by all sign-in paths (create, import, remote signer).
-/// A fresh identity means the feed's author filter changed, so force a rebuild
-/// on the next tick by invalidating the change guard.
 /// Shows a small confirming toast for a few seconds (the tick retires it).
 fn setToast(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.toast_buf.len);
@@ -16228,6 +16221,10 @@ pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
     } else g_identity_npub_len = 0;
 }
 
+/// Switches to the feed and brings the store + ingest pool up if they are not
+/// already running. Shared by all sign-in paths (create, import, remote signer).
+/// A fresh identity means the feed's author filter changed, so force a rebuild
+/// on the next tick by invalidating the change guard.
 fn enterFeed(model: *Model) void {
     model.stage = .ready;
     g_last_count = std.math.maxInt(usize);
