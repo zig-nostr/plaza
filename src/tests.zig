@@ -8368,3 +8368,228 @@ test "the window is square" {
     // width on margin while showing four notes at a time.
     try testing.expectEqual(main.window_width, main.window_height);
 }
+
+test "there is always something under a name" {
+    // The identity block is pinned to the avatar's height, so an empty second
+    // line is not restraint: it is a hole in the row that reads as a rendering
+    // bug. It was empty for anyone with no NIP-05 and no username distinct from
+    // their display name, which is a great many people.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const Case = struct { secret: u8, meta: []const u8, want: []const u8, violet: bool };
+    const cases = [_]Case{
+        // A NIP-05 is shown WHOLE. The domain is the half that says who vouched
+        // for the name, so dropping it threw away the part worth showing.
+        .{ .secret = 0x11, .meta = "{\"display_name\":\"Gigi\",\"nip05\":\"dergigi@primal.net\"}", .want = "dergigi@primal.net", .violet = true },
+        // The root form is the domain alone: `_@fiatjaf.com` is `fiatjaf.com`.
+        .{ .secret = 0x12, .meta = "{\"display_name\":\"fiatjaf\",\"nip05\":\"_@fiatjaf.com\"}", .want = "fiatjaf.com", .violet = true },
+        // No NIP-05: the username, muted, because violet has to keep meaning
+        // attested somewhere.
+        .{ .secret = 0x13, .meta = "{\"display_name\":\"Satoshi\",\"name\":\"nakamoto\"}", .want = "@nakamoto", .violet = false },
+        // A username that only echoes the name above it is not a handle, so the
+        // website stands in, as its host.
+        .{ .secret = 0x14, .meta = "{\"display_name\":\"jack\",\"name\":\"jack\",\"website\":\"https://www.cash.app/about\"}", .want = "cash.app", .violet = false },
+        // Nothing but a display name: the npub, which is the last honest handle
+        // and the case that used to render as a void.
+        .{ .secret = 0x15, .meta = "{\"display_name\":\"Anonymous\"}", .want = "", .violet = false },
+        // ORDER. Every row above reaches its rung by the ones before it being
+        // absent, which pins no precedence at all: a ladder that tried the
+        // website first would satisfy all of them. These two carry more than one
+        // rung's worth of data and say which wins.
+        .{
+            .secret = 0x17,
+            .meta = "{\"display_name\":\"Gigi\",\"name\":\"gigi\",\"website\":\"https://dergigi.com\",\"nip05\":\"dergigi@primal.net\"}",
+            .want = "dergigi@primal.net",
+            .violet = true,
+        },
+        .{
+            .secret = 0x18,
+            .meta = "{\"display_name\":\"Somebody\",\"name\":\"someone\",\"website\":\"https://example.com\"}",
+            .want = "@someone",
+            .violet = false,
+        },
+        // A website that is not a web address never reaches the line. kind:0 is
+        // a stranger's JSON and this string is rendered under their name.
+        .{
+            .secret = 0x19,
+            .meta = "{\"display_name\":\"Trickster\",\"website\":\"javascript:alert(1)\"}",
+            .want = "",
+            .violet = false,
+        },
+    };
+
+    for (cases) |c| {
+        const kp = try signer.keyPairFromSecretKey([_]u8{c.secret} ** 32);
+        const p = main.upsertProfile(kp.public_key).?;
+        main.parseMetadataInto(p, c.meta);
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+        const note = main.noteFrom(ev, 1_800_000_000);
+        const got = note.handleLabel(arena);
+
+        if (c.want.len > 0) {
+            try testing.expectEqualStrings(c.want, got.text);
+        } else {
+            // The npub case: whatever the exact string, it must be the npub and
+            // it must not be empty.
+            try testing.expect(got.text.len > 0);
+            try testing.expect(std.mem.startsWith(u8, got.text, "npub1"));
+        }
+        try testing.expectEqual(c.violet, got.nip05);
+    }
+
+    // And the one case where saying nothing is right: a stranger with no kind:0
+    // at all already has the short npub on the NAME line, so repeating it
+    // underneath would be the same string twice.
+    const stranger = try signer.keyPairFromSecretKey([_]u8{0x16} ** 32);
+    const ev = try signedNote(arena, signer, stranger, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expect(std.mem.startsWith(u8, note.author(), "npub1"));
+    try testing.expectEqualStrings("", note.handleLabel(arena).text);
+}
+
+test "an npub is shortened one way, everywhere" {
+    // There were two rules, twelve characters on the feed's name line and ten
+    // everywhere else, so the same key rendered as two different strings
+    // depending on which line it landed on. Anything comparing them to avoid
+    // repeating a handle compared unequal and printed it twice, in two
+    // spellings, which is worse than the duplication it was avoiding.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x2F} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // The name line falls back to the npub, and the shortener every other
+    // surface uses has to produce the same characters.
+    try testing.expectEqualStrings(note.author(), main.npubShortForTest(arena, kp.public_key));
+}
+
+test "one identity, one spelling, on the same screen" {
+    // `handleLabel` shows the whole NIP-05 and `Note.handle` shows `@local`.
+    // Both are fine, for different jobs: an identity LINE wants the domain,
+    // because that is the half saying who vouched for the name, and naming
+    // somebody INLINE in a sentence does not, because a whole address mid
+    // sentence reads as an email.
+    //
+    // What is not fine is both on the same screen for the same person, which is
+    // what a nested reply did: the row's line read "dergigi@primal.net" and the
+    // reply nested under it read "@dergigi".
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x21} ** 32);
+    const p = main.upsertProfile(kp.public_key).?;
+    main.parseMetadataInto(p, "{\"display_name\":\"Gigi\",\"nip05\":\"dergigi@primal.net\"}");
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // The identity line, wherever it is drawn, is the ladder's answer.
+    try testing.expectEqualStrings("dergigi@primal.net", note.handleLabel(arena).text);
+    // The inline form stays compact, and stays DIFFERENT on purpose, so this
+    // pins the distinction rather than letting the two drift back together.
+    try testing.expectEqualStrings("@dergigi", note.handle(arena));
+}
+
+test "a website that is not a web address never reaches the line" {
+    // kind:0 is a stranger's JSON, and this string is rendered under their name.
+    // `picture` has been gated on the scheme since it was added; `website`
+    // arrived without the same gate, and `websiteHost` trims only schemes it
+    // recognises, so anything else would have been stored and shown whole.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const hostile = [_][]const u8{
+        "javascript:alert(1)",
+        "data:text/html,<script>x</script>",
+        "file:///etc/passwd",
+        "not a url at all",
+        "//evil.example.com",
+    };
+    for (hostile, 0..) |bad, i| {
+        const kp = try signer.keyPairFromSecretKey([_]u8{@intCast(0x30 + i)} ** 32);
+        const p = main.upsertProfile(kp.public_key).?;
+        const meta = try std.fmt.allocPrint(arena, "{{\"display_name\":\"X\",\"website\":\"{s}\"}}", .{bad});
+        main.parseMetadataInto(p, meta);
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+        const note = main.noteFrom(ev, 1_800_000_000);
+        const got = note.handleLabel(arena).text;
+        // It falls through to the npub rung, which is the honest answer, and
+        // never to the string itself.
+        try testing.expect(std.mem.indexOf(u8, got, bad) == null);
+    }
+
+    // And a real one still gets through, trimmed to its host.
+    const ok_kp = try signer.keyPairFromSecretKey([_]u8{0x3F} ** 32);
+    const ok_p = main.upsertProfile(ok_kp.public_key).?;
+    main.parseMetadataInto(ok_p, "{\"display_name\":\"Y\",\"website\":\"https://www.example.com/a/b?c=d\"}");
+    const ok_ev = try signedNote(arena, signer, ok_kp, 1_800_000_000, "hi");
+    const ok_note = main.noteFrom(ok_ev, 1_800_000_000);
+    try testing.expectEqualStrings("example.com", ok_note.handleLabel(arena).text);
+}
+
+test "a nested reply spells its author the same way the row above does" {
+    // Both are identity lines, on the same screen, about the same person. One
+    // reading "dergigi@primal.net" and the other "@dergigi" is the app spelling
+    // one identity two ways inside a single thread.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const author = [_]u8{0x55} ** 32;
+    const p = main.upsertProfile(author).?;
+    main.parseMetadataInto(p, "{\"display_name\":\"Gigi\",\"nip05\":\"dergigi@primal.net\"}");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = author;
+    model.thread_notes[0] = threadNote(0x10, 200, 0xAA);
+    model.thread_notes[0].pubkey = author;
+    model.thread_notes[0].id = 10;
+    model.thread_notes[1] = threadNote(0x11, 300, 0x10);
+    model.thread_notes[1].pubkey = author;
+    model.thread_notes[1].id = 11;
+    model.thread_notes_len = 2;
+    main.arrangeThread(model.thread_notes[0..2], model.thread_root.event_id);
+    try testing.expectEqual(@as(u8, 2), model.thread_notes[1].depth);
+
+    // The whole NIP-05 has to be on screen at least twice, once for the reply
+    // and once for the reply nested under it, and the compact form nowhere.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(countAnyText(tree.root, "dergigi@primal.net") >= 2);
+    try testing.expect(findAnyText(tree.root, "@dergigi") == null);
+}
