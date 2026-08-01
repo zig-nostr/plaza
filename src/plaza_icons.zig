@@ -22,6 +22,10 @@ const svg_icon = canvas.svg_icon;
 const reply_icon = svg_icon.parseComptime(@embedFile("icons/app-reply.svg"));
 const like_icon = svg_icon.parseComptime(@embedFile("icons/app-heart.svg"));
 const zap_icon = svg_icon.parseComptime(@embedFile("icons/app-zap.svg"));
+// Save for later. Lucide's bookmark, in the same dialect as the rest: the SDK's
+// built-in set has no counterpart (its `save` is a floppy disk), and every other
+// client puts one in the verb row.
+const bookmark_icon = svg_icon.parseComptime(@embedFile("icons/app-bookmark.svg"));
 // The Signet mark: the signer's own boundary glyph, shown wherever a key
 // ceremony or the signer's health is in question.
 const signet_icon = svg_icon.parseComptime(@embedFile("icons/app-signet.svg"));
@@ -38,6 +42,7 @@ pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "reply", .icon = &reply_icon },
     .{ .name = "like", .icon = &like_icon },
     .{ .name = "zap", .icon = &zap_icon },
+    .{ .name = "bookmark", .icon = &bookmark_icon },
     .{ .name = "signet", .icon = &signet_icon },
     .{ .name = "bell", .icon = &bell_icon },
     .{ .name = "dashed-ring", .icon = &dashed_ring_icon },

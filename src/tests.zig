@@ -9207,3 +9207,108 @@ test "a settings card's content is as wide as the constant says" {
     // The card, less its own 12 either side, is what the content gets.
     try testing.expectApproxEqAbs(main.settings_content_width_for_test, widest - 24, 1.0);
 }
+
+// ---- P8: the verb row --------------------------------------------------------
+
+test "the verbs under a note line up down the whole feed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row used to be four controls with a gap between them and a count
+    // beside each glyph, so every count pushed everything after it along: the
+    // heart landed at a different x on every note and a column of rows could not
+    // agree where anything went. Each verb has a fixed slot now.
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // Five notes, each with a different number of replies, so the count beside
+    // the FIRST verb is a different width on every row. That is the shape that
+    // moved everything after it.
+    var feed: [5]i64 = undefined;
+    for (0..5) |i| {
+        var target = [_]u8{0} ** 32;
+        target[0] = @intCast(0x40 + i);
+        target[7] = 0x11;
+        model.notes[i] = main.Note{ .created_at = 1_800_000_000 - @as(i64, @intCast(i)) };
+        model.notes[i].event_id = target;
+        model.notes[i].id = @intCast(std.mem.readInt(u64, target[0..8], .big) & std.math.maxInt(i64));
+        feed[i] = model.notes[i].id;
+    }
+    model.notes_len = 5;
+    for (0..5) |i| {
+        const hex = std.fmt.bytesToHex(model.notes[i].event_id, .lower);
+        const e_tag = [_][]const u8{ "e", &hex };
+        const tags = [_]nostr.event.Tag{&e_tag};
+        // Row i gets 10^i replies: 1, 10, 100, 1000, 10000, so the count beside
+        // the reply glyph is one, two, three, four and five characters wide.
+        var made: usize = 0;
+        const want = std.math.pow(usize, 10, i);
+        while (made < want and made < 250) : (made += 1) {
+            main.countEngagementForTest(engagementEvent(@intCast(made % 250), 1, "r", &tags), &feed);
+        }
+    }
+
+    const p = try painted.Painted.render(arena, &model);
+    for ([_][]const u8{ "Reply", "Like" }) |verb| {
+        const frames = p.framesOf(verb);
+        if (frames.len < 3) {
+            std.debug.print("only {d} \"{s}\" controls on screen\n", .{ frames.len, verb });
+            return error.NotEnoughRows;
+        }
+        for (frames[1..]) |f| {
+            if (@abs(f.x - frames[0].x) > 0.5) {
+                std.debug.print(
+                    "\"{s}\" sits at x={d:.1} on one row and x={d:.1} on another\n",
+                    .{ verb, frames[0].x, f.x },
+                );
+                return error.VerbsWobble;
+            }
+        }
+    }
+}
+
+test "every verb people expect is under a note" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Show them all, including the ones with nothing behind them yet: a row
+    // missing repost or bookmark reads as a client that lost them, not one that
+    // has not written them. None of the unfinished ones takes a press, so
+    // nothing here answers a click with silence.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 1;
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    var found: usize = 0;
+    for ([_][]const u8{ "reply", "repeat", "like", "zap", "bookmark", "ellipsis" }) |name| {
+        for (p.layout.nodes) |node| {
+            // Two channels, because the SDK has two icon builders: `appIcon`
+            // puts the name in `Widget.icon` (so a missing app glyph draws the
+            // slashed circle rather than spelling itself out), and `icon`, which
+            // compile-checks a built-in name, puts it in `text`. A check that
+            // knew only one of them would report half the row missing.
+            const by_channel = node.widget.icon.len > 0 and std.mem.eql(u8, node.widget.icon, name);
+            const by_text = node.widget.kind == .icon and std.mem.eql(u8, node.widget.text, name);
+            if (!by_channel and !by_text) continue;
+            found += 1;
+            break;
+        } else {
+            std.debug.print("no \"{s}\" under a note\n", .{name});
+            return error.MissingVerb;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), found);
+}
