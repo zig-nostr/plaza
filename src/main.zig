@@ -4655,7 +4655,13 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
     profile.website_len = 0;
     if (md.website) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len > 0 and trimmed.len <= profile.website_buf.len) {
+        // Gated on the scheme, exactly as `picture` is twelve lines above. This
+        // string is a stranger's, it goes on the identity line under their name,
+        // and `websiteHost` trims a scheme it recognises: without the gate a
+        // `javascript:` or `data:` value would be stored and then rendered whole,
+        // because the trimmer would find no `//` to cut at.
+        const web = std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://");
+        if (web and trimmed.len <= profile.website_buf.len) {
             @memcpy(profile.website_buf[0..trimmed.len], trimmed);
             profile.website_len = @intCast(trimmed.len);
         }
@@ -4867,9 +4873,7 @@ pub const Note = struct {
     /// (or `@domain` for the root `_@domain` form). Empty when they have no
     /// NIP-05 (a bare npub is not a handle, so nothing is shown rather than
     /// `@npub…`. Allocated in the caller's arena for the frame.
-    /// The handle shown under the name, and whether it is a NIP-05 identity.
-    ///
-    /// Who this is, under their name. There is ALWAYS something here once the
+    /// Who this is, under their name, and whether it is a NIP-05 identity. There is ALWAYS something here once the
     /// profile has arrived, which is the point of the whole ladder below: the
     /// identity block is pinned to the avatar's height, so an empty second line
     /// is not restraint, it is a hole in the row that reads as a rendering bug.
@@ -4914,16 +4918,28 @@ pub const Note = struct {
                 return .{ .text = host, .nip05 = false };
             }
         }
-        // The npub, unless the line above is already showing it. `author()` falls
-        // back to exactly this string when there is no kind:0 name, so without
-        // the check a stranger's row would say the same short npub twice.
-        const short = npubShortOf(arena, self.pubkey);
+        // The npub the note already carries, not a fresh bech32 encode. This is
+        // built once per note in `setAuthor`, and this line runs per row per
+        // frame for everyone the ladder falls through to, so encoding here would
+        // be a bech32 conversion and an allocation on the feed's hot path for a
+        // string sitting in the struct.
+        //
+        // Using the SAME bytes also makes the check below exact by construction:
+        // `author()` returns this buffer when there is no kind:0 name, so a
+        // stranger's row cannot end up saying one shortening of their key on the
+        // name line and another underneath it.
+        const short = self.author_buf[0..self.author_len];
         if (short.len > 0 and !std.mem.eql(u8, short, self.author())) {
             return .{ .text = short, .nip05 = false };
         }
         return .{ .text = "", .nip05 = false };
     }
 
+    /// The compact `@local` form, for naming somebody INLINE in a sentence
+    /// ("Replying to @dergigi"). Deliberately not `handleLabel`: that is the
+    /// identity line under a name, where the domain is the half worth showing,
+    /// and a whole `dergigi@primal.net` mid-sentence reads as an email address.
+    /// The one caller that put this on an identity LINE now uses the ladder.
     pub fn handle(self: *const Note, arena: std.mem.Allocator) []const u8 {
         const p = lookupProfile(self.pubkey) orelse return "";
         if (p.nip05_len == 0) return "";
@@ -11288,8 +11304,13 @@ fn opChip(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
 }
 
 /// A nested reply's handle, one register below the reply it answers.
+///
+/// The same ladder the row above it uses, not `Note.handle`. These sit on the
+/// same screen, so an author whose NIP-05 reads `dergigi@primal.net` in one and
+/// `@dergigi` in the other is the app spelling one identity two ways within a
+/// thread.
 fn nestedHandle(ui: *AppUi, note: *const Note) AppUi.Node {
-    const handle = note.handle(ui.arena);
+    const handle = note.handleLabel(ui.arena).text;
     if (handle.len == 0) return ui.spacer(0);
     return ui.paragraph(
         .{ .style = .{ .foreground = theme.palette.accent_identity } },
