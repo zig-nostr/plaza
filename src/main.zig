@@ -16182,7 +16182,7 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     // note the app knows it owes the reader. A queue with no room says so:
     // publishing anyway would be a note nobody is tracking while the banner
     // promises that anything written is kept.
-    if (isReaderNote(ev.kind) and !enqueueOutbox(ev.id, nowSeconds())) {
+    if (isReaderNote(ev.kind) and !enqueueOutbox(ev.id, ev.pubkey, nowSeconds())) {
         g_outbox_overflow.store(true, .monotonic);
         return;
     }
@@ -16232,6 +16232,14 @@ fn markOutboxSending(id: [32]u8, sending: bool) void {
 pub const OutboxEntry = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
+    /// Who signed the note this entry owes. A queue entry is a promise to ONE
+    /// account, and the publisher, the counts and the popover all filter on it.
+    ///
+    /// Not persisted, and it does not need to be: `loadOutbox` already reads the
+    /// event back out of the store to check it still exists, and the event
+    /// carries its own author. Deriving it there keeps the on-disk format
+    /// unchanged, so a queue written by an older build still loads.
+    author: [32]u8 = [_]u8{0} ** 32,
     /// When it was queued, so the popover can say how long it has been waiting
     /// and the oldest entry can be dropped when the queue is full.
     queued_at: i64 = 0,
@@ -16303,6 +16311,26 @@ fn outboxUnlock() void {
     g_outbox_lock.store(false, .release);
 }
 
+/// Whether this entry belongs to whoever is signed in right now.
+///
+/// This is the whole safety property of the queue, so it is one function and
+/// everything that walks, counts or shows the outbox goes through it.
+///
+/// A queued note is a promise made to ONE account. Logging out does not empty
+/// the queue, deliberately: `sweepOutbox` refuses to erase a note nobody has
+/// taken, because that is the app destroying something the reader wrote, and a
+/// logout is not a reason to break that promise. So the note stays, and stops
+/// being walkable instead. Sign back in as its author and it resumes; sign in as
+/// somebody else and it is not theirs to send, not theirs to be counted, and not
+/// theirs to see.
+///
+/// Signed out, nothing is anybody's, which is why a null active key is false
+/// rather than a wildcard.
+fn outboxEntryIsMine(e: OutboxEntry) bool {
+    const me = activePubkey() orelse return false;
+    return std.mem.eql(u8, &me, &e.author);
+}
+
 /// Puts `id` in the queue, or returns the entry already there. The caller holds
 /// the lock.
 fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
@@ -16315,13 +16343,13 @@ fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
 /// Queues a note we have just signed and stored. Returns false when the queue is
 /// full of notes that have not been acknowledged, which is a state the reader can
 /// see rather than one the app hides.
-fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
+fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64) bool {
     outboxLock();
     defer outboxUnlock();
     if (outboxEntryFor(id) != null) return true;
     for (&g_outbox) |*e| {
         if (!e.used) {
-            e.* = .{ .used = true, .id = id, .queued_at = now_s };
+            e.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
             _ = g_outbox_rev.fetchAdd(1, .monotonic);
             return true;
         }
@@ -16334,7 +16362,7 @@ fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
         if (victim == null or e.queued_at < victim.?.queued_at) victim = e;
     }
     const slot = victim orelse return false;
-    slot.* = .{ .used = true, .id = id, .queued_at = now_s };
+    slot.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
     _ = g_outbox_rev.fetchAdd(1, .monotonic);
     return true;
 }
@@ -16358,6 +16386,9 @@ pub fn outboxSnapshot(out: []OutboxEntry) usize {
     var n: usize = 0;
     for (&g_outbox) |*e| {
         if (!e.used or n == out.len) continue;
+        // Same rule as the count above: the popover explains the count, so it
+        // has to be a list of the same notes.
+        if (!outboxEntryIsMine(e.*)) continue;
         out[n] = e.*;
         n += 1;
     }
@@ -16380,6 +16411,10 @@ pub fn outboxCounts() OutboxCounts {
     var counts: OutboxCounts = .{};
     for (&g_outbox) |*e| {
         if (!e.used or e.acked != 0) continue;
+        // The status bar speaks for the reader who is here now. Counting a note
+        // they did not write would have the app owe them something that is not
+        // theirs, and offer no way to act on it.
+        if (!outboxEntryIsMine(e.*)) continue;
         if (e.state() == .stuck) counts.stuck += 1 else counts.trying += 1;
     }
     return counts;
@@ -16426,8 +16461,8 @@ pub fn resetOutboxForTest() void {
     for (&g_outbox) |*e| e.* = .{};
 }
 
-pub fn enqueueOutboxForTest(id: [32]u8, now_s: i64) bool {
-    return enqueueOutbox(id, now_s);
+pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
+    return enqueueOutbox(id, author, now_s);
 }
 
 pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
@@ -16577,13 +16612,16 @@ fn loadOutbox() void {
         // The event has to still be there, or there is nothing to publish.
         const se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
         var owned = se;
+        // The author comes from the event, which is why it is not in the file.
+        // Read it BEFORE `deinit`, which tears down the arena behind it.
+        const author = owned.event.pubkey;
         owned.deinit();
         // A note is kept whatever the list did; only the CLAIMS about who has it
         // are dropped, so it is offered again rather than assumed delivered.
         parsed[n] = if (same_pool)
-            .{ .used = true, .id = id, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds }
+            .{ .used = true, .id = id, .author = author, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds }
         else
-            .{ .used = true, .id = id, .queued_at = queued_at };
+            .{ .used = true, .id = id, .author = author, .queued_at = queued_at };
         n += 1;
     }
     outboxLock();
@@ -16591,27 +16629,49 @@ fn loadOutbox() void {
     for (parsed[0..n], g_outbox[0..n]) |src, *dst| dst.* = src;
 }
 
+/// Which queued notes the next drain will actually send, stamping each one's
+/// attempt as it goes.
+///
+/// Split out of `drainOutbox` so the choice can be tested without a store and
+/// without spawning publishers. The choice IS the safety property: the drain
+/// itself is a loop that reads events and hands them to threads, and every
+/// question worth asking about who may publish what is answered here.
+fn collectOutboxDue(ids: *[outbox_cap][32]u8, now_s: i64) usize {
+    var n: usize = 0;
+    outboxLock();
+    defer outboxUnlock();
+    for (&g_outbox) |*e| {
+        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
+        // Somebody else's note. This is the line that stops the previous
+        // account's unsent writing going out over the next account's relays,
+        // and signed out it stops everything, because a queued note is a promise
+        // to one account and there is nobody here to keep it for.
+        if (!outboxEntryIsMine(e.*)) continue;
+        // Spaced out, and widening: the drain runs every tick, so without this a
+        // transient failure (a captive portal, a TLS error, a relay that takes
+        // the socket and refuses the publish) would burn every round in seconds
+        // and leave the note stuck a moment after it was written.
+        if (e.last_try_at != 0 and now_s - e.last_try_at < outboxRetryDelay(e.rounds)) continue;
+        if (n == ids.len) break;
+        e.last_try_at = now_s;
+        ids[n] = e.id;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn collectOutboxDueForTest(ids: *[outbox_cap][32]u8, now_s: i64) usize {
+    return collectOutboxDue(ids, now_s);
+}
+
+pub const outbox_cap_for_test = outbox_cap;
+
 /// Offers every note that nobody has taken to the relays again. Called when a
 /// relay comes back, which is the moment the answer might have changed.
 fn drainOutbox(gpa: std.mem.Allocator) void {
     const store = g_store orelse return;
     var ids: [outbox_cap][32]u8 = undefined;
-    var n: usize = 0;
-    const now = nowSeconds();
-    outboxLock();
-    for (&g_outbox) |*e| {
-        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
-        // Spaced out, and widening: the drain runs every tick, so without this a
-        // transient failure (a captive portal, a TLS error, a relay that takes
-        // the socket and refuses the publish) would burn every round in seconds
-        // and leave the note stuck a moment after it was written.
-        if (e.last_try_at != 0 and now - e.last_try_at < outboxRetryDelay(e.rounds)) continue;
-        if (n == ids.len) break;
-        e.last_try_at = now;
-        ids[n] = e.id;
-        n += 1;
-    }
-    outboxUnlock();
+    const n = collectOutboxDue(&ids, nowSeconds());
     for (ids[0..n]) |id| {
         var se = (store.getEvent(gpa, id) catch continue) orelse continue;
         defer se.deinit();
@@ -18014,6 +18074,18 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // thinking; leaving it would hand it to whoever signs in next, in their
     // composer, one keystroke from being published under THEIR key.
     saveDraft("");
+    // The OUTBOX is deliberately left alone, and that is not an oversight.
+    //
+    // A queued note is one the reader wrote and the app has not managed to
+    // deliver yet. Emptying the queue here would destroy it, and `sweepOutbox`
+    // already refuses to do that for exactly this reason. So it stays, and
+    // `outboxEntryIsMine` is what makes staying safe: signed out it belongs to
+    // nobody, and to the next account it is invisible, uncounted and unsendable.
+    // Sign back in as its author and it goes out.
+    //
+    // Getting this wrong is how the previous account's unsent note would ride
+    // out over the next account's relays, counted in their status bar as
+    // something the app owed THEM.
     model.logout_pending = false;
     model.reveal_nsec = false;
     model.notes_len = 0;

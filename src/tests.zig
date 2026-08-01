@@ -3236,8 +3236,13 @@ test "a note that no relay took is still owed" {
     // The whole point of the queue: a note written on a train and lost on
     // landing is the worst thing a client can do.
     main.resetOutboxForTest();
+    // The queue answers to whoever is signed in, so a test about counts has to
+    // BE somebody. See "a queued note belongs to the account that wrote it".
+    main.setIdentityForTest([_]u8{0x41} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const id = [_]u8{0xa7} ** 32;
-    try testing.expect(main.enqueueOutboxForTest(id, 1000));
+    try testing.expect(main.enqueueOutboxForTest(id, me, 1000));
     try testing.expectEqual(@as(usize, 1), main.outboxPending());
 
     // One relay takes it; the note is no longer owed, and the count says so.
@@ -3252,7 +3257,7 @@ test "a note that no relay took is still owed" {
 
     // A refusal is not an acknowledgement: the note is still owed.
     const other = [_]u8{0xb8} ** 32;
-    try testing.expect(main.enqueueOutboxForTest(other, 1001));
+    try testing.expect(main.enqueueOutboxForTest(other, me, 1001));
     main.recordOutboxAckForTest(other, 1, false);
     try testing.expectEqual(@as(usize, 1), main.outboxPending());
 }
@@ -3262,8 +3267,11 @@ test "the queue stops asking, and lets go of what landed" {
     // take stops asking rather than hammering strangers' servers forever, and a
     // note that landed is forgotten once the reader has had a chance to see it.
     main.resetOutboxForTest();
+    main.setIdentityForTest([_]u8{0x42} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const stuck = [_]u8{0xc9} ** 32;
-    try testing.expect(main.enqueueOutboxForTest(stuck, 1000));
+    try testing.expect(main.enqueueOutboxForTest(stuck, me, 1000));
     for (0..main.max_outbox_rounds_for_test) |_| main.countOutboxRoundForTest(stuck);
     // It stops ASKING, and it stays: erasing a note the reader wrote, because
     // no relay would take it, is the one thing this queue exists to prevent.
@@ -3278,7 +3286,7 @@ test "the queue stops asking, and lets go of what landed" {
     // A fresh queue for the other half: the stuck note above stays by design.
     main.resetOutboxForTest();
     const landed = [_]u8{0xda} ** 32;
-    try testing.expect(main.enqueueOutboxForTest(landed, 2000));
+    try testing.expect(main.enqueueOutboxForTest(landed, me, 2000));
     main.recordOutboxAckForTest(landed, 0, true);
     // Still shown a moment later, so the reader sees that it went.
     main.sweepOutboxForTest(2001);
@@ -3750,8 +3758,11 @@ test "an edit gives a note that gave up its rounds back" {
     // acked and refused are both zero. Skipping those was skipping exactly the
     // notes that adding a relay is meant to rescue.
     main.resetOutboxForTest();
+    main.setIdentityForTest([_]u8{0x43} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const id = [_]u8{3} ** 32;
-    try testing.expect(main.enqueueOutboxForTest(id, 100));
+    try testing.expect(main.enqueueOutboxForTest(id, me, 100));
     for (0..main.max_outbox_rounds_for_test) |_| main.markOutboxRoundForTest(id);
     try testing.expectEqual(@as(usize, 1), main.outboxCounts().stuck);
 
@@ -7636,4 +7647,71 @@ test "a restored Signet session on an install with no Signet says so, and does n
 
     try testing.expect(!main.signerIsHealthy());
     try testing.expectEqualStrings("Signet is not installed", main.signerStatusLabelForTest());
+}
+
+test "a queued note belongs to the account that wrote it, and to nobody else" {
+    // The scenario this exists for, in order: A signs in, writes a note that no
+    // relay takes, and logs out. B signs in. B must not publish A's note, must
+    // not be told the app owes THEM a note, and must not see it listed. A signs
+    // back in and it is owed again.
+    //
+    // The queue is NOT emptied by the logout, deliberately. Erasing a note the
+    // reader wrote because they signed out would be the app destroying their
+    // writing, which is the one thing this queue exists to prevent. So the note
+    // survives and stops being walkable instead.
+    main.resetOutboxForTest();
+
+    main.setIdentityForTest([_]u8{0x0A} ** 32);
+    const a = main.activePubkeyForTest() orelse return error.NoIdentity;
+    const note = [_]u8{0xAB} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(note, a, 1000));
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+
+    // Signed out: it belongs to nobody. Not gone, just nobody's to send.
+    main.clearIdentityForTest();
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+    try testing.expectEqual(@as(usize, 0), main.outboxCounts().trying);
+    var seen: [16]main.OutboxEntry = undefined;
+    try testing.expectEqual(@as(usize, 0), main.outboxSnapshot(&seen));
+
+    // B signs in. Still not theirs, on all three surfaces.
+    main.setIdentityForTest([_]u8{0x0B} ** 32);
+    const b = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    try testing.expectEqual(@as(usize, 0), main.outboxPending());
+    try testing.expectEqual(@as(usize, 0), main.outboxSnapshot(&seen));
+
+    // B writes their own. Now the count is one, and it is B's, not two.
+    const bs_note = [_]u8{0xBC} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(bs_note, b, 1100));
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+    try testing.expectEqual(@as(usize, 1), main.outboxSnapshot(&seen));
+    try testing.expectEqualSlices(u8, &bs_note, &seen[0].id);
+
+    // And the surface that matters most: what the PUBLISHER would send. The
+    // counts and the popover are what the reader is told; this is what actually
+    // leaves the machine, so a guard on the other two and not on this one would
+    // be a quiet app doing the dangerous thing.
+    var due: [main.outbox_cap_for_test][32]u8 = undefined;
+    const b_sends = main.collectOutboxDueForTest(&due, 1200);
+    try testing.expectEqual(@as(usize, 1), b_sends);
+    try testing.expectEqualSlices(u8, &bs_note, &due[0]);
+
+    // A comes back. Their note is still owed, and B's is not A's.
+    main.clearIdentityForTest();
+    main.setIdentityForTest([_]u8{0x0A} ** 32);
+    defer main.clearIdentityForTest();
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+    try testing.expectEqual(@as(usize, 1), main.outboxSnapshot(&seen));
+    try testing.expectEqualSlices(u8, &note, &seen[0].id);
+
+    // A's publisher sends A's note and only A's. `last_try_at` was stamped for
+    // B's note above and not for this one, so a fresh selection here is honest.
+    const a_sends = main.collectOutboxDueForTest(&due, 1300);
+    try testing.expectEqual(@as(usize, 1), a_sends);
+    try testing.expectEqualSlices(u8, &note, &due[0]);
+
+    // Signed out, the publisher sends nothing at all.
+    main.clearIdentityForTest();
+    try testing.expectEqual(@as(usize, 0), main.collectOutboxDueForTest(&due, 1400));
 }
