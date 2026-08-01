@@ -8005,3 +8005,87 @@ test "a relay that kept its seat keeps its connection" {
 
     main.resetRelaysToBootstrapForTest();
 }
+
+test "only the seats that changed hands lose their row" {
+    // The discrimination itself, which neither half of the test above reaches:
+    // one of them changes NO seat and the other changes EVERY seat, so an
+    // all-or-nothing rule would satisfy both. This pool changes some and keeps
+    // others, in the same swap.
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    main.resetRelaysForTest();
+
+    const kept_0 = main.relayUrlAt(0);
+    const kept_2 = main.relayUrlAt(2);
+    try testing.expect(kept_0.len > 0 and kept_2.len > 0);
+
+    // Everybody reporting in.
+    for (0..main.relayCount()) |i| main.setRelayStatusForTest(i, true);
+
+    // Their published list keeps seats 0 and 2 exactly as they are, puts a
+    // different relay in seat 1, and empties the rest.
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", kept_0 },
+        &.{ "r", "wss://swapped-in.example.com" },
+        &.{ "r", kept_2 },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0x51} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+
+    // Seats 0 and 2 kept their relay, so they kept their connection. Seat 1
+    // changed hands and seats 3 and 4 emptied, so those rows are gone. A rule
+    // that cleared everything gives 0 here; a rule that cleared nothing gives 5.
+    try testing.expect(main.relayStatusConnectedForTest(0));
+    try testing.expect(!main.relayStatusConnectedForTest(1));
+    try testing.expect(main.relayStatusConnectedForTest(2));
+    try testing.expect(!main.relayStatusConnectedForTest(3));
+    try testing.expect(!main.relayStatusConnectedForTest(4));
+}
+
+test "signing out drops the rows of the relays it is signing out of" {
+    // The KEEP half of the sign-out path is covered above, by a pool that is
+    // already the bootstrap list. This is the other half on the same path, and
+    // it is the one the whole guard could be deleted from while the suite
+    // stayed green: an account with a list of its OWN signs out, every seat
+    // changes hands, and every row has to go with them.
+    main.setIdentityForTest([_]u8{0x52} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    main.resetRelaysForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://only-mine-one.example.com" },
+        &.{ "r", "wss://only-mine-two.example.com" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0x52} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://only-mine-one.example.com", main.relayUrlAt(0));
+
+    for (0..main.relayCount()) |i| main.setRelayStatusForTest(i, true);
+    try testing.expectEqual(main.relayCount(), main.liveRelayCountForTest());
+
+    // Sign out. Not one of those relays is in the bootstrap list, so not one
+    // seat keeps its occupant, and the bar must not report a single live
+    // connection to relays this reader no longer talks to.
+    main.resetRelaysToBootstrapForTest();
+    try testing.expectEqual(@as(usize, 0), main.liveRelayCountForTest());
+}

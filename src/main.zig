@@ -762,8 +762,11 @@ pub fn writeRelayCount() usize {
     return n;
 }
 
-/// Puts the pool back to the one the app was born with, and forgets everything
-/// recorded against the old seats. Used on sign-out, where the list that is
+/// Puts the pool back to the one the app was born with, and forgets what was
+/// recorded against the seats that change hands. A seat still holding the same
+/// relay keeps its row, because the socket behind it never went anywhere: see
+/// `forgetChangedRelaySlotStates` for why clearing it would not go stale, it
+/// would simply stay wrong. Used on sign-out, where the list that is
 /// leaving belonged to the account that is leaving.
 fn resetRelaysToBootstrap() void {
     var before: [max_relays][96]u8 = undefined;
