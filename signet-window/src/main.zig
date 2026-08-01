@@ -26,7 +26,6 @@ const daemon_port: u16 = 8790;
 const import_key: u64 = 1;
 const copy_key: u64 = 2;
 const create_key: u64 = 3;
-const beat_timer_key: u64 = 4;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
 
 // 452 wide per the design, and one height for every state rather than a window
@@ -65,9 +64,6 @@ var g_mode: Mode = .import_key;
 /// Long enough to be read, short enough not to be a step. The terminal states
 /// carry no button by design: the ceremony is over, and the only honest thing
 /// left to do is get out of the way.
-const hold_ms: u64 = 2_000;
-const beat_interval_ms: u64 = 80;
-
 /// The exit code this window uses to say "I minted a key", and the global that
 /// remembers whether it did.
 ///
@@ -102,12 +98,7 @@ const Model = struct {
     npub_len: usize = 0,
     msg_buf: [96]u8 = undefined,
     msg_len: usize = 0,
-    /// Milliseconds spent in a terminal state, which is what the beat draws and
-    /// what closes the window. Real elapsed time, not a decoration: a progress
-    /// bar that is not measuring anything is a lie with a rounded cap.
-    held_ms: u64 = 0,
-
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "held_ms", "npub", "beat" };
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub" };
 
     pub fn key(self: *const Model) []const u8 {
         return std.mem.trim(u8, self.key_buffer.text(), " \t\r\n");
@@ -152,11 +143,6 @@ const Model = struct {
     pub fn npub(self: *const Model) []const u8 {
         return self.npub_buf[0..self.npub_len];
     }
-    /// How far through the hold the window is, 0 to 1. The beat's width.
-    pub fn beat(self: *const Model) f32 {
-        const t = @as(f32, @floatFromInt(self.held_ms)) / @as(f32, @floatFromInt(hold_ms));
-        return @min(t, 1.0);
-    }
     /// A live "signs as npub1..." for a valid nsec (an ncryptsec needs its
     /// passphrase, so it is confirmed at import instead).
     pub fn npub_hint(self: *const Model, arena: std.mem.Allocator) []const u8 {
@@ -181,7 +167,6 @@ const Msg = union(enum) {
     copy_command,
     import_done: native_sdk.EffectResponse,
     create_done: native_sdk.EffectResponse,
-    beat: native_sdk.EffectTimer,
     close,
 
     pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "close" };
@@ -242,9 +227,9 @@ fn tokensFn(model: *const Model) canvas.DesignTokens {
     t.colors.text_muted = ink.body;
     t.colors.border = ink.border;
     // The primary action is WHITE, not Signet green. Green here means identity:
-    // the mark, the key that checked out, the beat counting the window down. A
-    // green button would put the same signal on "press this", and the one place
-    // a reader must not misread is the button that hands over a key.
+    // the mark, and the key that checked out. A green button would put the same
+    // signal on "press this", and the one place a reader must not misread is the
+    // button that hands over a key.
     t.colors.accent = ink.white;
     t.colors.accent_text = ink.on_white;
     t.colors.focus_ring = ink.signet;
@@ -281,18 +266,6 @@ fn requestCreate(model: *Model, fx: *Effects) void {
         .headers = &.{.{ .name = "Authorization", .value = auth }},
         .body = "{\"method\":\"create\"}",
         .on_response = Effects.responseMsg(.create_done),
-    });
-}
-
-/// Enters a terminal state and starts the beat that closes the window.
-fn holdThenClose(model: *Model, fx: *Effects, stage: Stage) void {
-    model.stage = stage;
-    model.held_ms = 0;
-    fx.startTimer(.{
-        .key = beat_timer_key,
-        .interval_ms = beat_interval_ms,
-        .mode = .repeating,
-        .on_fire = Effects.timerMsg(.beat),
     });
 }
 
@@ -364,7 +337,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             _ = adoptPubkey(model, response.body);
-            holdThenClose(model, fx, .imported);
+            model.stage = .imported;
         },
         .create_done => |response| {
             if (response.outcome != .ok or response.status != 200) {
@@ -381,17 +354,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Said once, here, where the daemon has just answered 200 to a create
             // this process sent. Nothing else in either program can establish it.
             g_created_key = true;
-            holdThenClose(model, fx, .made);
-        },
-        .beat => |t| {
-            // A rejected timer means no clock at all, so the hold cannot be
-            // measured and the only honest thing is to stop holding.
-            if (t.outcome != .fired) return fx.closeWindow("main");
-            model.held_ms += beat_interval_ms;
-            if (model.held_ms >= hold_ms) {
-                fx.cancelTimer(beat_timer_key);
-                fx.closeWindow("main");
-            }
+            model.stage = .made;
         },
         .close => fx.closeWindow("main"),
     }
@@ -611,7 +574,7 @@ fn terminalCard(ui: *AppUi) AppUi.Node {
 
 // ---------------------------------------------------------------- the results
 
-/// The shape both terminal states share: a mark, a line, a sub, the beat, and
+/// The shape both terminal states share: a mark, a line, a sub, and
 /// the sentence saying the window is about to leave.
 fn resultView(ui: *AppUi, model: *const Model, mark: AppUi.Node, title: []const u8, sub: []const u8, tail: []const u8) AppUi.Node {
     return ui.column(.{ .grow = 1, .gap = 0, .cross = .center }, .{
@@ -647,24 +610,15 @@ fn resultView(ui: *AppUi, model: *const Model, mark: AppUi.Node, title: []const 
             }),
             hgap(ui, 61),
         }),
-        vgap(ui, 16),
-        beatBar(ui, model),
-        vgap(ui, 10),
-        ui.paragraph(
-            .{ .style = .{ .foreground = ink.footnote } },
-            &.{.{ .text = tail, .monospace = true, .scale = px(10) }},
-        ),
+        vgap(ui, 18),
+        // The way out is a press, not a countdown. This window exists so the key
+        // ceremony can be WATCHED happening outside Plaza, and it used to answer
+        // that by showing the result for two seconds and closing itself: from the
+        // reader's side a window appeared, flashed something, and was gone,
+        // followed by Plaza asking for a name. A ceremony you cannot finish
+        // reading is not one you were shown.
+        ui.button(.{ .variant = .primary, .on_press = .close }, tail),
         ui.spacer(1),
-    });
-}
-
-/// The 120x2 beat. Its fill is the hold actually elapsed, so it runs out exactly
-/// when the window goes.
-fn beatBar(ui: *AppUi, model: *const Model) AppUi.Node {
-    const filled = 120 * model.beat();
-    return ui.row(.{ .gap = 0 }, .{
-        ui.el(.stack, .{ .width = filled, .height = 2, .style = .{ .background = ink.signet, .radius = 1 } }, .{}),
-        ui.el(.stack, .{ .width = 120 - filled, .height = 2, .style = .{ .background = ink.command_border, .radius = 1 } }, .{}),
     });
 }
 
@@ -675,7 +629,7 @@ fn importedView(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.icon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "check-circle"),
         "Your key is in Signet",
         "Signet holds it now and does the signing. Plaza asks; it never has the key.",
-        "this window closes itself",
+        "Continue to Plaza",
     );
 }
 
@@ -686,7 +640,7 @@ fn madeView(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "signet"),
         "Your identity is ready",
         "Signet made the key and keeps it. Nothing to write down, nothing to remember.",
-        "auto-continues to Plaza",
+        "Continue to Plaza",
     );
 }
 
@@ -800,21 +754,47 @@ pub fn main(init: std.process.Init) !void {
 
 const testing = std.testing;
 
-test "the beat never draws a negative remainder" {
-    // The bar is two boxes, `filled` and `120 - filled`. A beat past 1 would make
-    // the second one negative, which is not a narrower box, it is a layout the
-    // engine has no meaning for.
-    var model = Model{};
-    try testing.expectEqual(@as(f32, 0), model.beat());
+/// Walks the built tree for a control with this accessibility label or these
+/// words on it, which is how a test asks whether the reader has a way out.
+fn hasControl(widget: canvas.Widget, label: []const u8) bool {
+    if (std.mem.eql(u8, widget.semantics.label, label)) return true;
+    if (widget.kind == .button and std.mem.eql(u8, widget.text, label)) return true;
+    for (widget.children) |child| {
+        if (hasControl(child, label)) return true;
+    }
+    return false;
+}
 
-    model.held_ms = hold_ms / 2;
-    try testing.expect(model.beat() > 0.4 and model.beat() < 0.6);
+test "a finished ceremony waits for the reader" {
+    // It used to show the result for two seconds and close itself, so from the
+    // reader's side a window appeared, flashed something, and was gone, with
+    // Plaza's "Want a name on it?" arriving in its place. This window exists so
+    // the key ceremony can be watched happening outside Plaza; a ceremony you
+    // cannot finish reading is not one you were shown.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // Ticks keep arriving in the frame between crossing the hold and the window
-    // actually going away.
-    model.held_ms = hold_ms * 4;
-    try testing.expectEqual(@as(f32, 1), model.beat());
-    try testing.expect(120 - 120 * model.beat() >= 0);
+    for ([_]Stage{ .made, .imported }) |stage| {
+        var model = Model{};
+        model.stage = stage;
+        var ui = AppUi.init(arena);
+        const tree = try ui.finalize(view(&ui, &model));
+        if (!hasControl(tree.root, "Continue to Plaza")) {
+            std.debug.print("the {s} state offers the reader no way on\n", .{@tagName(stage)});
+            return error.NoWayOut;
+        }
+    }
+
+    // And the states that are NOT finished do not offer it: a way out of a
+    // ceremony still in flight would close the window mid-mint.
+    for ([_]Stage{ .minting, .importing }) |stage| {
+        var model = Model{};
+        model.stage = stage;
+        var ui = AppUi.init(arena);
+        const tree = try ui.finalize(view(&ui, &model));
+        try testing.expect(!hasControl(tree.root, "Continue to Plaza"));
+    }
 }
 
 test "the import button is only offered when there is something to import" {
