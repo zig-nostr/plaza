@@ -14,9 +14,9 @@
                 .label = "main",
                 .title = "Plaza",
                 .width = 760,
-                .height = 540,
+                .height = 760,
                 .min_width = 680,
-                .min_height = 520,
+                .min_height = 680,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{

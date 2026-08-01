@@ -110,6 +110,12 @@ fn findByLabel(widget: canvas.Widget, label: []const u8) ?canvas.Widget {
     return null;
 }
 
+/// "N/M relays", with M the size of the pool the app is born with, so a change
+/// to the bootstrap list does not have to be chased through the assertions.
+fn ui_fmt_pool(arena: std.mem.Allocator, live: usize) []const u8 {
+    return std.fmt.allocPrint(arena, "{d}/{d} relays", .{ live, main.bootstrap_relay_count_for_test }) catch unreachable;
+}
+
 /// A signed kind:1 note with the given timestamp and content.
 fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, created_at: i64, content: []const u8) !nostr.event.Event {
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
@@ -1126,16 +1132,16 @@ test "the status bar summarises the relay pool" {
     live.live_relays = 3;
     live.relay_count = main.relayCount();
     const live_tree = try buildTree(arena, &live);
-    try testing.expect(findAnyText(live_tree.root, "3/5 relays") != null);
+    try testing.expect(findAnyText(live_tree.root, ui_fmt_pool(arena, 3)) != null);
 
     // The whole pool down: the empty body says so while the bar keeps the count.
     var down = main.initialModel();
     down.stage = .ready;
-    down.offline_relays = 5;
+    down.offline_relays = main.bootstrap_relay_count_for_test;
     down.relay_count = main.relayCount();
     const down_tree = try buildTree(arena, &down);
     try testing.expect(findAnyText(down_tree.root, "Can't reach any relay. Retrying…") != null);
-    try testing.expect(findAnyText(down_tree.root, "0/5 relays") != null);
+    try testing.expect(findAnyText(down_tree.root, ui_fmt_pool(arena, 0)) != null);
 }
 
 test "the view lays out through the canvas engine" {
@@ -2015,14 +2021,38 @@ test "only one chrome menu is open at a time" {
     try testing.expectEqual(main.ChromeMenu.none, model.menu);
 }
 
-test "the relay chip goes green at four fifths, the way the design's bar does" {
+test "one straggler is not a fault, at any pool size" {
     // The redesign's at-rest bar reads "4/5 relays" in green while its working
-    // bar reads "3/5" in amber, so the healthy line sits at four fifths, not at
-    // every relay. A bar that goes amber for one straggler is a bar nobody reads.
+    // bar reads "3/5" in amber. A bar that goes amber for one straggler is a bar
+    // nobody reads.
+    //
+    // That was written as four fifths, which says the same thing ONLY for a pool
+    // of five or more. At four relays four fifths demands four of four, so a
+    // single relay down leaves the dot amber for good, and this test kept passing
+    // while asserting exactly that, because the arithmetic moved under it when
+    // the bootstrap list lost a relay. Stated against the sizes now, so the next
+    // change to the list cannot quietly redefine health.
+    try testing.expect(main.poolIsHealthyOfForTest(5, 5));
+    try testing.expect(main.poolIsHealthyOfForTest(4, 5));
+    try testing.expect(!main.poolIsHealthyOfForTest(3, 5));
+
+    try testing.expect(main.poolIsHealthyOfForTest(4, 4));
+    try testing.expect(main.poolIsHealthyOfForTest(3, 4));
+    try testing.expect(!main.poolIsHealthyOfForTest(2, 4));
+
+    try testing.expect(main.poolIsHealthyOfForTest(2, 3));
+    try testing.expect(!main.poolIsHealthyOfForTest(1, 3));
+
+    // And nothing connected is never healthy, whatever the size. A one-relay
+    // pool with nothing up satisfies "one straggler" on its own, which is why
+    // the rule carries a second clause.
+    try testing.expect(!main.poolIsHealthyOfForTest(0, 1));
+    try testing.expect(main.poolIsHealthyOfForTest(1, 1));
+    try testing.expect(!main.poolIsHealthyOfForTest(0, 5));
+
+    // The pool the app is born with, with one relay down, has to be green.
     main.resetRelaysForTest();
-    try testing.expect(main.poolIsHealthyForTest(5));
-    try testing.expect(main.poolIsHealthyForTest(4));
-    try testing.expect(!main.poolIsHealthyForTest(3));
+    try testing.expect(main.poolIsHealthyForTest(main.bootstrap_relay_count_for_test - 1));
     try testing.expect(!main.poolIsHealthyForTest(0));
 }
 
@@ -3496,12 +3526,19 @@ test "the pool refuses what is not a relay, and refuses to overflow" {
     try testing.expect(!main.isRelayUrl("ws://relay.example.com"));
     try testing.expect(main.isRelayUrl("wss://relay.example.com"));
 
-    // The bootstrap five plus three more is the cap; the ninth is refused
-    // rather than silently dropped, because the card says so.
-    try testing.expect(main.addRelayForTest("wss://a.example.com", true, true) != null);
-    try testing.expect(main.addRelayForTest("wss://b.example.com", true, true) != null);
-    try testing.expect(main.addRelayForTest("wss://c.example.com", true, true) != null);
-    try testing.expect(main.addRelayForTest("wss://d.example.com", true, true) == null);
+    // The pool fills to its cap and then refuses, rather than silently
+    // dropping, because the card says so. Counted from the bootstrap list's own
+    // size and the cap, so changing either is one edit here and not a hunt for
+    // whichever letter of the alphabet happened to be the last accepted one.
+    const room = main.max_relays_for_test - main.bootstrap_relay_count_for_test;
+    const names = [_][]const u8{
+        "wss://a.example.com", "wss://b.example.com", "wss://c.example.com",
+        "wss://d.example.com", "wss://e.example.com", "wss://f.example.com",
+    };
+    try testing.expect(names.len > room);
+    for (names[0..room]) |url| try testing.expect(main.addRelayForTest(url, true, true) != null);
+    try testing.expectEqual(main.max_relays_for_test, main.relayCount());
+    try testing.expect(main.addRelayForTest(names[room], true, true) == null);
     // Adding one already in the pool returns its seat rather than taking a new one.
     try testing.expectEqual(@as(?usize, 0), main.addRelayForTest("wss://relay.damus.io", true, true));
 }
@@ -3558,7 +3595,7 @@ test "their published relay list becomes the pool, once, and never over an edit"
     main.resetRelaysForTest();
     main.stageOwnRelayListForTest(ev);
     try testing.expect(!main.adoptRelayListForTest());
-    try testing.expectEqual(@as(usize, 5), main.relayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test, main.relayCount());
 }
 
 test "a follow's relay list is a suggestion, and only where they write" {
@@ -3605,14 +3642,14 @@ test "the ack denominator counts only relays a note is actually sent to" {
     // set to read-only was never asked to hold the note, so counting it would
     // leave every note permanently short of its acks.
     main.resetRelaysForTest();
-    try testing.expectEqual(@as(usize, 5), main.writeRelayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test, main.writeRelayCount());
     main.cycleRelayForTest(0); // R·W -> R
-    try testing.expectEqual(@as(usize, 4), main.writeRelayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test - 1, main.writeRelayCount());
     main.cycleRelayForTest(0); // R -> W
-    try testing.expectEqual(@as(usize, 5), main.writeRelayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test, main.writeRelayCount());
     main.removeRelayForTest(0);
-    try testing.expectEqual(@as(usize, 4), main.writeRelayCount());
-    try testing.expectEqual(@as(usize, 4), main.relayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test - 1, main.writeRelayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test - 1, main.relayCount());
 }
 
 test "a burst of relay edits publishes one list, not one per press" {
@@ -3750,7 +3787,7 @@ test "one relay under two spellings takes one seat" {
     // relay and the app dials it twice.
     try testing.expectEqual(@as(?usize, first), main.addRelayForTest("wss://relay.example.com/", true, true));
     try testing.expectEqual(@as(?usize, first), main.addRelayForTest("WSS://Relay.example.com", true, true));
-    try testing.expectEqual(@as(usize, 6), main.relayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test + 1, main.relayCount());
 }
 
 test "an edit gives a note that gave up its rounds back" {
@@ -3800,7 +3837,7 @@ test "signing out leaves the account's relay list with the account" {
 
     main.resetRelaysToBootstrapForTest();
     try testing.expect(!main.relayIsMineForTest());
-    try testing.expectEqual(@as(usize, 5), main.relayCount());
+    try testing.expectEqual(main.bootstrap_relay_count_for_test, main.relayCount());
     try testing.expectEqualStrings("wss://relay.damus.io", main.relayUrlAt(0));
     try testing.expectEqual(@as(usize, 0), main.relaySuggestionCount());
 }
@@ -7487,8 +7524,7 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
     try testing.expect(model.stage == .onboarding);
 }
 
-/// Every line of text that STARTS inside one of the join ladder's rungs has to
-/// end inside it too.
+/// Every line of text INSIDE one of the join ladder's rungs has to end inside it.
 ///
 /// A rung's subtitle is a wrapped paragraph in a column the surrounding row has
 /// already been sized against, so a subtitle long enough to take a third line
@@ -7499,22 +7535,31 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
 /// the laid-out frames say so, which is why this is a geometric assertion and
 /// why it runs over BOTH states of the ladder rather than the one that happened
 /// to be long.
+///
+/// "Inside" is ANCESTRY, walked through `parent_index`, and not a box test. The
+/// first version of this asked whether a text node's frame fell within a rung's
+/// frame, which is a different question with the same answer most of the time:
+/// the join ladder is a sheet stacked OVER the feed, so a feed line behind it
+/// can sit squarely inside a rung's box while belonging to something else
+/// entirely. Making the window taller was enough to move one there.
 fn expectRungsHoldTheirCopy(p: painted.Painted) !void {
     for ([_][]const u8{ "Create your identity", "Bring your key", "Use your own signer" }) |label| {
-        const rung = p.frameOf(label) orelse {
+        var rung_index: ?usize = null;
+        for (p.layout.nodes, 0..) |node, i| {
+            if (!std.mem.eql(u8, node.widget.semantics.label, label)) continue;
+            rung_index = i;
+            break;
+        }
+        const rung_i = rung_index orelse {
             std.debug.print("join ladder: no rung labelled \"{s}\"\n", .{label});
             return error.NoRung;
         };
+        const rung = p.layout.nodes[rung_i].widget.frame;
         const floor = rung.y + rung.height;
-        for (p.layout.nodes) |node| {
+        for (p.layout.nodes, 0..) |node, i| {
             const w = node.widget;
-            // Text only: an icon carries its GLYPH NAME as text, and the feed
-            // sits in the same layout under the sheet, so both would otherwise
-            // wander into a rung's y band and answer for copy they are not.
             if (w.kind != .text or w.text.len == 0) continue;
-            if (w.frame.y < rung.y or w.frame.y >= floor) continue;
-            if (w.frame.x < rung.x - 0.5) continue;
-            if (w.frame.x + w.frame.width > rung.x + rung.width + 0.5) continue;
+            if (!isDescendantOf(p, i, rung_i)) continue;
             if (w.frame.y + w.frame.height > floor + 0.5) {
                 std.debug.print(
                     "join ladder: \"{s}\" runs {d:.1}px past the bottom of the \"{s}\" rung\n",
@@ -7524,6 +7569,19 @@ fn expectRungsHoldTheirCopy(p: painted.Painted) !void {
             }
         }
     }
+}
+
+/// Whether layout node `i` sits under node `ancestor`, following the parent
+/// links the layout records rather than comparing rectangles.
+fn isDescendantOf(p: painted.Painted, i: usize, ancestor: usize) bool {
+    var cursor = p.layout.nodes[i].parent_index;
+    var hops: usize = 0;
+    while (cursor) |parent| : (hops += 1) {
+        if (parent == ancestor) return true;
+        if (hops > 64) return false;
+        cursor = p.layout.nodes[parent].parent_index;
+    }
+    return false;
 }
 
 test "the ladder's rungs hold their own copy" {
@@ -8184,4 +8242,129 @@ test "a header's back control does not sit under the title" {
     // The title starts after the back control ends. Anything less and they are
     // painting over one another.
     try testing.expect(title.x >= back.x + back.width);
+}
+
+test "the mark in the rail goes home" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    // It looked like the app's own button in the corner of the rail and did
+    // nothing at all when pressed, which is the one thing a mark in that
+    // position must never do.
+    var model = main.initialModel();
+    model.stage = .ready;
+    const tree = try buildTree(arena, &model);
+    const msg = pressMsgByLabel(tree, "Home") orelse return error.MarkHasNoPress;
+    switch (msg) {
+        .go_home => {},
+        else => return error.MarkGoesSomewhereElse,
+    }
+
+    // And it is a destination, not a step back: from a person opened from a
+    // thread opened from the feed, one press lands on the feed, not one level up.
+    //
+    // The stack is built with `enterThreadForTest`, NOT by dispatching
+    // `.open_thread`. That message looks the note up in the model first and
+    // returns when it is not there, so a made-up id leaves the stack empty and
+    // this whole test passes against a one-level Back. Which it did.
+    var fx: main.EffectsForTest = undefined;
+    var root = main.Note{};
+    root.id = 0xAA;
+    main.enterThreadForTest(&model, root);
+    try testing.expectEqual(@as(i64, 0xAA), model.viewing_thread);
+    main.update(&model, .{ .open_person = [_]u8{0x2B} ** 32 }, &fx);
+    try testing.expect(model.viewing_profile != null);
+    // Two levels deep: the thread is on the stack under the person.
+    try testing.expect(model.thread_stack_len > 0);
+
+    main.update(&model, .go_home, &fx);
+    try testing.expect(model.viewing_profile == null);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+    try testing.expect(model.stage == .ready);
+
+    // Settings is a screen too, and Home leaves it.
+    main.update(&model, .open_settings, &fx);
+    main.update(&model, .go_home, &fx);
+    try testing.expect(model.stage == .ready);
+
+    // But a question the app has ASKED is not dismissed by navigating: the
+    // remembered intent behind it would go with it.
+    model.joining = true;
+    main.update(&model, .go_home, &fx);
+    try testing.expect(model.joining);
+}
+
+test "the relay chip is text on the bar, and says nothing about latency" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+    main.resetRelaysForTest();
+
+    // A live round trip on record, which is what used to be printed here. The
+    // popover only shows a ping for a relay it believes is connected, so the
+    // status goes with it.
+    main.recordRelayRttForTest(0, 337);
+    main.setRelayStatusForTest(0, true);
+    defer main.clearRelayRttForTest(0);
+    defer main.setRelayStatusForTest(0, false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.live_relays = main.relayCount();
+    model.relay_count = main.relayCount();
+    const tree = try buildTree(arena, &model);
+
+    // The count, and only the count. A round-trip figure that swings with
+    // whichever relay answered last is a number nobody acts on, and it sat where
+    // the reader looks to find out whether the pool is up.
+    try testing.expect(findAnyText(tree.root, ui_fmt_pool(arena, main.relayCount())) != null);
+    try testing.expect(!findAnyTextContaining(tree.root, "337 ms"));
+
+    // The per-relay pings are still in the card the chip opens, beside the relay
+    // each one belongs to, which is the only place the number means anything.
+    // The popover writes it tight ("337ms") and Settings spaced ("337 ms"), so
+    // both are asked for by their own spelling rather than a shared substring.
+    model.menu = .relays;
+    const open = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContaining(open.root, "337ms"));
+
+    // And no plate behind it. The dot already carries the pool's health, so the
+    // surface was a second voice saying the same thing.
+    // Unconditional: `fillAtCenterOf` returns null when nothing paints there,
+    // which is the answer this assertion wants, so wrapping it in `if` let the
+    // whole check pass by finding nothing at all.
+    const p = try painted.Painted.render(arena, &model);
+    try testing.expect(p.frameOf("Relays") != null);
+    if (p.fillAtCenterOf("Relays")) |fill| {
+        try testing.expect(!painted.sameColor(fill, theme.palette.surface_chip));
+    }
+}
+
+test "the pool the app is born with holds no retired relay" {
+    // relay.nostr.band was retired, and a bootstrap list is the one place a dead
+    // relay costs every first run a connection attempt that can never succeed.
+    // Written as a rule over the list rather than an assertion about one name,
+    // so the next one that goes is caught by the same line.
+    main.resetRelaysForTest();
+    const retired = [_][]const u8{"nostr.band"};
+    for (0..main.relayCount()) |i| {
+        const url = main.relayUrlAt(i);
+        for (retired) |dead| {
+            if (std.mem.indexOf(u8, url, dead) != null) {
+                std.debug.print("bootstrap pool still carries {s}\n", .{url});
+                return error.RetiredRelayInBootstrap;
+            }
+        }
+    }
+    try testing.expect(main.relayCount() >= 3);
+}
+
+test "the window is square" {
+    // A feed is a column of rows. The wide-and-short default spent its extra
+    // width on margin while showing four notes at a time.
+    try testing.expectEqual(main.window_width, main.window_height);
 }
