@@ -2021,14 +2021,38 @@ test "only one chrome menu is open at a time" {
     try testing.expectEqual(main.ChromeMenu.none, model.menu);
 }
 
-test "the relay chip goes green at four fifths, the way the design's bar does" {
+test "one straggler is not a fault, at any pool size" {
     // The redesign's at-rest bar reads "4/5 relays" in green while its working
-    // bar reads "3/5" in amber, so the healthy line sits at four fifths, not at
-    // every relay. A bar that goes amber for one straggler is a bar nobody reads.
+    // bar reads "3/5" in amber. A bar that goes amber for one straggler is a bar
+    // nobody reads.
+    //
+    // That was written as four fifths, which says the same thing ONLY for a pool
+    // of five or more. At four relays four fifths demands four of four, so a
+    // single relay down leaves the dot amber for good, and this test kept passing
+    // while asserting exactly that, because the arithmetic moved under it when
+    // the bootstrap list lost a relay. Stated against the sizes now, so the next
+    // change to the list cannot quietly redefine health.
+    try testing.expect(main.poolIsHealthyOfForTest(5, 5));
+    try testing.expect(main.poolIsHealthyOfForTest(4, 5));
+    try testing.expect(!main.poolIsHealthyOfForTest(3, 5));
+
+    try testing.expect(main.poolIsHealthyOfForTest(4, 4));
+    try testing.expect(main.poolIsHealthyOfForTest(3, 4));
+    try testing.expect(!main.poolIsHealthyOfForTest(2, 4));
+
+    try testing.expect(main.poolIsHealthyOfForTest(2, 3));
+    try testing.expect(!main.poolIsHealthyOfForTest(1, 3));
+
+    // And nothing connected is never healthy, whatever the size. A one-relay
+    // pool with nothing up satisfies "one straggler" on its own, which is why
+    // the rule carries a second clause.
+    try testing.expect(!main.poolIsHealthyOfForTest(0, 1));
+    try testing.expect(main.poolIsHealthyOfForTest(1, 1));
+    try testing.expect(!main.poolIsHealthyOfForTest(0, 5));
+
+    // The pool the app is born with, with one relay down, has to be green.
     main.resetRelaysForTest();
-    try testing.expect(main.poolIsHealthyForTest(5));
-    try testing.expect(main.poolIsHealthyForTest(4));
-    try testing.expect(!main.poolIsHealthyForTest(3));
+    try testing.expect(main.poolIsHealthyForTest(main.bootstrap_relay_count_for_test - 1));
     try testing.expect(!main.poolIsHealthyForTest(0));
 }
 
@@ -8240,13 +8264,25 @@ test "the mark in the rail goes home" {
 
     // And it is a destination, not a step back: from a person opened from a
     // thread opened from the feed, one press lands on the feed, not one level up.
+    //
+    // The stack is built with `enterThreadForTest`, NOT by dispatching
+    // `.open_thread`. That message looks the note up in the model first and
+    // returns when it is not there, so a made-up id leaves the stack empty and
+    // this whole test passes against a one-level Back. Which it did.
     var fx: main.EffectsForTest = undefined;
-    main.update(&model, .{ .open_thread = 0xAA }, &fx);
+    var root = main.Note{};
+    root.id = 0xAA;
+    main.enterThreadForTest(&model, root);
+    try testing.expectEqual(@as(i64, 0xAA), model.viewing_thread);
     main.update(&model, .{ .open_person = [_]u8{0x2B} ** 32 }, &fx);
     try testing.expect(model.viewing_profile != null);
+    // Two levels deep: the thread is on the stack under the person.
+    try testing.expect(model.thread_stack_len > 0);
+
     main.update(&model, .go_home, &fx);
     try testing.expect(model.viewing_profile == null);
     try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
     try testing.expect(model.stage == .ready);
 
     // Settings is a screen too, and Home leaves it.
@@ -8298,7 +8334,11 @@ test "the relay chip is text on the bar, and says nothing about latency" {
 
     // And no plate behind it. The dot already carries the pool's health, so the
     // surface was a second voice saying the same thing.
+    // Unconditional: `fillAtCenterOf` returns null when nothing paints there,
+    // which is the answer this assertion wants, so wrapping it in `if` let the
+    // whole check pass by finding nothing at all.
     const p = try painted.Painted.render(arena, &model);
+    try testing.expect(p.frameOf("Relays") != null);
     if (p.fillAtCenterOf("Relays")) |fill| {
         try testing.expect(!painted.sameColor(fill, theme.palette.surface_chip));
     }
