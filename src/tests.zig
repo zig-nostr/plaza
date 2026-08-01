@@ -7947,3 +7947,61 @@ test "a note the queue had no room for is said out loud" {
     const tree = try buildTree(arena, &model);
     try testing.expect(findAnyText(tree.root, "a note could not be queued") != null);
 }
+
+test "a relay that kept its seat keeps its connection" {
+    // Signing out reads `0/5 relays` forever, on a pool where nothing is wrong.
+    //
+    // The status table is written by the ingest threads, and each of them spends
+    // almost all of its life parked in a blocking read. Clearing a slot's status
+    // from the UI thread is therefore not a value that goes stale and refreshes:
+    // it is a value nothing will ever put back, because the thread only looks up
+    // when its relay speaks, and a quiet relay does not. So a pool reset that
+    // wiped every row left the bar reading nothing-is-connected over five live
+    // sockets.
+    main.resetRelaysToBootstrapForTest();
+    const total = main.relayCount();
+    try testing.expect(total >= 2);
+
+    // Every relay reporting in, the way the threads do once dialed.
+    for (0..total) |i| main.setRelayStatusForTest(i, true);
+    try testing.expectEqual(total, main.liveRelayCountForTest());
+
+    // A sign-out resets the pool to the bootstrap list. It ALREADY is the
+    // bootstrap list, so not one seat changes hands and not one socket is
+    // touched. The count has to survive that.
+    main.resetRelaysToBootstrapForTest();
+    try testing.expectEqual(total, main.liveRelayCountForTest());
+    try testing.expectEqual(total, main.relayCount());
+
+    // And the rule still holds where it should. Adopting the reader's own
+    // kind:10002 puts DIFFERENT relays in those seats, so every row recorded
+    // against them is about the previous occupant and has to go: a status left
+    // at connected would count a socket that was never opened.
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://mine-one.example.com" },
+        &.{ "r", "wss://mine-two.example.com" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{9} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.setIdentityForTest([_]u8{9} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetRelaysForTest();
+    for (0..main.relayCount()) |i| main.setRelayStatusForTest(i, true);
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://mine-one.example.com", main.relayUrlAt(0));
+    var live_after: usize = 0;
+    for (0..main.relaySlots()) |i| {
+        if (main.relayStatusConnectedForTest(i)) live_after += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), live_after);
+
+    main.resetRelaysToBootstrapForTest();
+}
