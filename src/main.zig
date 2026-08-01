@@ -1855,6 +1855,16 @@ pub fn ceremonyCanTakeKeyForTest() bool {
     return ceremonyCanTakeKey();
 }
 
+/// Pretends the key is held by Signet, by a remote signer, or by Plaza itself.
+pub fn setSignerKindForTest(kind: []const u8) void {
+    g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
+        .helper
+    else if (std.mem.eql(u8, kind, "remote"))
+        .remote
+    else
+        .local;
+}
+
 /// Pretends the ceremony window was (or was not) found beside Plaza.
 pub fn setSignetWindowFoundForTest(found: bool) void {
     g_signet_win_len = if (found) "/nonexistent/signet-window".len else 0;
@@ -1866,8 +1876,11 @@ pub fn helperSetupQueuedForTest() bool {
     return g_helper_setup != .none;
 }
 
-/// Which ceremony the Signet window is being opened for.
-const Ceremony = enum { import_key, create_key };
+/// What the Signet window is being opened for. `status` is not a ceremony at
+/// all: it makes no key, takes none and resets none, it only asks the daemon
+/// what it is holding. It shares the spawn key with the two that are ceremonies,
+/// so there is never more than one Signet window on screen.
+const Ceremony = enum { import_key, create_key, status };
 
 /// Opens the Signet ceremony window: a separate process, so key material never
 /// enters Plaza on either path. The window reads the token itself and talks to
@@ -1904,6 +1917,12 @@ fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
             .output = .collect,
             .on_exit = Effects.exitMsg(.signet_exited),
         }),
+        .status => fx.spawn(.{
+            .key = signet_spawn_key,
+            .argv = &.{ bin, "--status" },
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.signet_exited),
+        }),
     }
 }
 
@@ -1917,12 +1936,12 @@ fn handleSignetExited(model: *Model, e: native_sdk.EffectExit) void {
     g_ceremony = .none;
 
     if (e.reason == .rejected) {
-        // A window is already open. Say so: this is a press the reader made and
-        // it is about to look like it did nothing.
-        if (was_running == .running) {
-            g_ceremony_adopted = false;
-            setToast(model, "A Signet window is already open");
-        }
+        // A window is already open. Say so, whatever was being opened: a
+        // rejection only ever follows a press, and an unanswered press is the
+        // thing this whole list of fixes is about. It used to be said only while
+        // a CEREMONY was running, so pressing "Open Signet" twice was silent.
+        if (was_running == .running) g_ceremony_adopted = false;
+        setToast(model, "A Signet window is already open");
         return;
     }
 
@@ -1975,7 +1994,10 @@ const CeremonyState = enum {
 var g_ceremony: CeremonyState = .none;
 /// A key was adopted while the ceremony was still running, so the beat is owed
 /// once the window confirms what it did. The poll usually wins this race: the
-/// window holds its result on screen for two seconds and Plaza polls every one.
+/// window holds its result until the reader dismisses it and Plaza polls every
+/// second, so in practice the poll always wins. The other branch is still real
+/// and still tested: a reader who presses Continue inside the first second gets
+/// their name beat from the exit instead.
 var g_ceremony_adopted = false;
 
 /// The window's exit code when, and only when, it minted a key.
@@ -5404,6 +5426,15 @@ pub const Model = struct {
             .helper => "Signing via Signet",
         };
     }
+    /// Whether Signet is what holds this account's key, and whether there is a
+    /// window to show it in. Both halves matter: a remote signer is somebody
+    /// else's process on somebody else's machine and Signet has nothing to say
+    /// about it, and an install that arrived without the window would offer a
+    /// press that opens nothing.
+    pub fn can_open_signet(self: *const Model) bool {
+        _ = self;
+        return g_signer_kind == .helper and g_signet_win_len > 0;
+    }
     /// Where the key actually is, which is the part worth knowing.
     pub fn signer_sub(self: *const Model) []const u8 {
         _ = self;
@@ -7703,6 +7734,8 @@ pub const Msg = union(enum) {
     load_image: i64,
     /// Dismiss the expanded picture.
     close_image,
+    /// Open the Signet window on what it is holding, from Settings.
+    open_signet_window,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
     /// deletion to un-like. A guest press is remembered and routed to the join.
     like: i64,
@@ -7732,7 +7765,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -7942,6 +7975,12 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
         // differently, and the control for that is at the bottom of the screen
         // wearing the word it deserves. A gentler-looking link that opens a
         // confirmation about removing your key is the dishonest option.
+        //
+        // What DOES belong in that seat is a way to go and look at the thing this
+        // row is a sentence about. Signet is a separate process holding the key
+        // this account is, and until now the only time a reader ever saw it was
+        // the few seconds of the ceremony that made the key.
+        if (model.can_open_signet()) settingsLink(ui, "Open Signet", Msg.open_signet_window) else ui.spacer(0),
     });
     n += 1;
 
@@ -8503,6 +8542,14 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
         // opens and closes the editor it was opened from.
         if (model.editing_profile) {
             return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), profileSheet(ui, model) });
+        }
+        // The toast rides over Settings as well as over the feed. It was gated on
+        // the feed alone, from when nothing in Settings could raise one; the
+        // "Open Signet" control can, and its whole job on a refused press is to
+        // say why nothing happened. A message that only appears on a screen the
+        // reader is not looking at is the silent press it exists to prevent.
+        if (model.toast_until != 0) {
+            return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), toastOverlay(ui, model) });
         }
         return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model) });
     }
@@ -15564,6 +15611,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanMediaFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
+        .open_signet_window => spawnSignetWindow(fx, .status),
         // Deliberately empty: see `Msg.absorb_press`. The press has already done
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},

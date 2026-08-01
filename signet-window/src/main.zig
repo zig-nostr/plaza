@@ -1,11 +1,13 @@
-//! The Signet ceremony window. A small, separate SDK app Plaza spawns whenever a
-//! key is about to exist: an import, where the nsec is typed HERE in Signet's own
-//! process and POSTed to the plaza-signer daemon over loopback, and a create,
-//! where the daemon mints a fresh key and this window is what says so.
+//! The Signet window. A small, separate SDK app Plaza spawns whenever a key is
+//! about to exist, or whenever the reader wants to look at the one that does: an
+//! import, where the nsec is typed HERE in Signet's own process and POSTed to the
+//! plaza-signer daemon over loopback; a create, where the daemon mints a fresh
+//! key and this window is what says so; and a read-only status, opened from
+//! Plaza's settings, which asks the daemon whose key it holds and shows it.
 //!
-//! Plaza's UI process never sees key material on either path. Plaza watches the
+//! Plaza's UI process never sees key material on any path. Plaza watches the
 //! daemon's /pubkey and signs in the moment a key lands, so this window just does
-//! the ceremony and closes itself.
+//! the ceremony and waits to be dismissed.
 //!
 //! Its own visual register on purpose: green-warm ink, its own titlebar, its own
 //! typeface. You have left Plaza, and it should look like it. That is the whole
@@ -26,6 +28,7 @@ const daemon_port: u16 = 8790;
 const import_key: u64 = 1;
 const copy_key: u64 = 2;
 const create_key: u64 = 3;
+const status_key: u64 = 4;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
 
 // 452 wide per the design, and one height for every state rather than a window
@@ -56,7 +59,7 @@ fn token() []const u8 {
 
 /// Which ceremony this window was launched for. Set once from argv, before the
 /// app exists, because it decides the very first frame.
-const Mode = enum { import_key, create_key };
+const Mode = enum { import_key, create_key, status };
 var g_mode: Mode = .import_key;
 
 /// How long a finished ceremony stays on screen before the window closes itself.
@@ -85,8 +88,12 @@ const Stage = enum {
     imported,
     /// Create: the daemon is minting.
     minting,
-    /// Create: done, holding, then closing.
+    /// Create: done, waiting to be read.
     made,
+    /// Status: asking the daemon what it holds.
+    looking,
+    /// Status: it holds a key, and this is whose.
+    holding,
     failed,
 };
 
@@ -167,6 +174,7 @@ const Msg = union(enum) {
     copy_command,
     import_done: native_sdk.EffectResponse,
     create_done: native_sdk.EffectResponse,
+    status_done: native_sdk.EffectResponse,
     close,
 
     pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "close" };
@@ -242,6 +250,10 @@ fn boot(model: *Model, fx: *Effects) void {
         model.stage = .minting;
         requestCreate(model, fx);
     }
+    if (g_mode == .status) {
+        model.stage = .looking;
+        requestStatus(model, fx);
+    }
 }
 
 /// Asks the daemon for a fresh key. This window OWNS the create, rather than
@@ -266,6 +278,28 @@ fn requestCreate(model: *Model, fx: *Effects) void {
         .headers = &.{.{ .name = "Authorization", .value = auth }},
         .body = "{\"method\":\"create\"}",
         .on_response = Effects.responseMsg(.create_done),
+    });
+}
+
+/// Asks the daemon whose key it is holding, for the window opened from Plaza's
+/// settings rather than from a ceremony. Read-only: this mode never sets a key
+/// up, imports one or resets one, so the worst it can do is report.
+fn requestStatus(model: *Model, fx: *Effects) void {
+    if (g_token_len == 0) {
+        model.stage = .failed;
+        setNotice(model, "Signet isn't running. Start Plaza first.");
+        return;
+    }
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{daemon_port}) catch return;
+    var auth_buf: [160]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token()}) catch return;
+    fx.fetch(.{
+        .key = status_key,
+        .url = url,
+        .method = .GET,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.status_done),
     });
 }
 
@@ -356,6 +390,20 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_created_key = true;
             model.stage = .made;
         },
+        .status_done => |response| {
+            // A daemon that is up but holding nothing answers 200 with no key,
+            // or 404, depending on how it says "not set up". Either way there is
+            // no npub to show, and saying so is the honest report.
+            if (response.outcome != .ok or response.status != 200 or !adoptPubkey(model, response.body)) {
+                model.stage = .failed;
+                setNotice(model, if (response.outcome != .ok)
+                    "Signet isn't answering."
+                else
+                    "Signet is running, and holds no key yet.");
+                return;
+            }
+            model.stage = .holding;
+        },
         .close => fx.closeWindow("main"),
     }
 }
@@ -372,6 +420,8 @@ fn view(ui: *AppUi, model: *const Model) AppUi.Node {
             .minting => waitingView(ui, "Making your key"),
             .imported => importedView(ui, model),
             .made => madeView(ui, model),
+            .looking => waitingView(ui, "Asking Signet"),
+            .holding => holdingView(ui, model),
             .failed => failedView(ui, model),
         },
         // The footer belongs to the ceremony, not to its result: on the terminal
@@ -644,6 +694,20 @@ fn madeView(ui: *AppUi, model: *const Model) AppUi.Node {
     );
 }
 
+/// What Signet holds, for a reader who came to look rather than to do anything.
+/// The same shape as a finished ceremony, because it is the same fact: this
+/// process has the key, and here is whose it is.
+fn holdingView(ui: *AppUi, model: *const Model) AppUi.Node {
+    return resultView(
+        ui,
+        model,
+        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "signet"),
+        "Signet is holding your key",
+        "It signs when Plaza asks. The key is on this Mac, in this process, and has never been in Plaza.",
+        "Close",
+    );
+}
+
 fn waitingView(ui: *AppUi, line: []const u8) AppUi.Node {
     return ui.column(.{ .grow = 1, .gap = 0, .cross = .center }, .{
         ui.spacer(1),
@@ -705,13 +769,15 @@ fn readToken(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_token_len = len;
 }
 
-/// `--create` selects the create ceremony; anything else is the import. Read
+/// `--create` selects the create ceremony, `--status` the read-only look at what
+/// Signet is holding, and anything else is the import. Read
 /// through `std.process.Args`, because `std.os.argv` no longer exists.
 fn readMode(init: std.process.Init) void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // argv0
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--create")) g_mode = .create_key;
+        if (std.mem.eql(u8, arg, "--status")) g_mode = .status;
     }
 }
 

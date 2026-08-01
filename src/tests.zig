@@ -7107,9 +7107,9 @@ test "a ceremony that did not mint arms nothing" {
 }
 
 test "a mint confirmed after the poll still gets its name beat" {
-    // The window holds its result on screen for two seconds and Plaza polls every
-    // one, so the key is normally adopted BEFORE the window exits. The beat is
-    // owed until the report arrives, and paid when it does.
+    // The window holds its result until the reader dismisses it and Plaza polls
+    // every second, so the key is all but always adopted BEFORE the window
+    // exits. The beat is owed until the report arrives, and paid when it does.
     main.clearIdentityForTest();
     defer main.clearIdentityForTest();
     main.setIdentityMintedForTest(false);
@@ -9393,5 +9393,89 @@ test "a quote card with nothing to read is not a blank card" {
     if (@abs(rows[0].height - priced) > 0.5 * main.body_line_height) {
         std.debug.print("\nrow with a picture chip draws {d}, priced {d}\n", .{ rows[0].height, priced });
         return error.ChipNotPriced;
+    }
+}
+
+// ---- P13: a door to the thing holding the key --------------------------------
+
+test "Settings offers a look at Signet, and only when there is one to look at" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.setSignerKindForTest("local");
+    defer main.setSignetWindowFoundForTest(false);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    // Signet holds the key and the window is installed beside Plaza: the row
+    // that says so gets a way to go and look.
+    main.setSignerKindForTest("helper");
+    main.setSignetWindowFoundForTest(true);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        const msg = pressMsgByLabel(p.tree, "Open Signet") orelse {
+            std.debug.print("no way to open Signet from Settings\n", .{});
+            return error.NoDoor;
+        };
+        try testing.expectEqualStrings(@tagName(Msg.open_signet_window), @tagName(msg));
+    }
+
+    // A remote signer is somebody else's process on somebody else's machine, so
+    // Signet has nothing to show about it.
+    main.setSignerKindForTest("remote");
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(p.frameOf("Open Signet") == null);
+    }
+
+    // And an install that arrived without the window must not offer a press that
+    // opens nothing, which is the whole class of fault this release is about.
+    main.setSignerKindForTest("helper");
+    main.setSignetWindowFoundForTest(false);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(p.frameOf("Open Signet") == null);
+    }
+}
+
+test "a second Signet window is refused out loud, ceremony or not" {
+    // The toast used to be said only while a CEREMONY was running, because that
+    // was the only thing that could spawn this window. Opening it from Settings
+    // twice was a press that did nothing, silently, which is exactly what the
+    // toast exists to prevent.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "none", "running" }) |state| {
+        main.setCeremonyForTest(if (std.mem.eql(u8, state, "running")) .running else .none);
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+        if (model.toast_until == 0) {
+            std.debug.print("a refused spawn said nothing with the ceremony {s}\n", .{state});
+            return error.SilentRefusal;
+        }
+    }
+
+    // And it is said where the press was MADE. The control that raises this
+    // lives in Settings, and the toast was drawn on the feed screen only: the
+    // model held a message nobody could see, which is the same silence with a
+    // passing unit test in front of it.
+    main.setCeremonyForTest(.none);
+    var model = main.initialModel();
+    model.stage = .settings;
+    main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+    const p = try painted.Painted.render(arena, &model);
+    if (findAnyText(p.tree.root, "A Signet window is already open") == null) {
+        std.debug.print("the refusal is in the model but not on the screen\n", .{});
+        return error.ToastNotDrawn;
     }
 }
