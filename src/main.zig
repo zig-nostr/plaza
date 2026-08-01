@@ -3410,6 +3410,11 @@ const Profile = struct {
     // the name back to this pubkey, never on mere presence of the string.
     nip05_buf: [128]u8 = [_]u8{0} ** 128,
     nip05_len: u8 = 0,
+    /// kind:0 `website`, kept for the handle line's last fallback before the
+    /// npub. Shown as its host, because a full URL under a name is a link the
+    /// row has no room for and nobody reads.
+    website_buf: [128]u8 = [_]u8{0} ** 128,
+    website_len: u8 = 0,
     nip05_state: enum { idle, fetching, verified, failed } = .idle,
     picture_buf: [200]u8 = [_]u8{0} ** 200,
     picture_len: u8 = 0,
@@ -3437,6 +3442,19 @@ const Profile = struct {
     }
     pub fn username(self: *const Profile) []const u8 {
         return self.username_buf[0..self.username_len];
+    }
+    fn website(self: *const Profile) []const u8 {
+        return self.website_buf[0..self.website_len];
+    }
+    /// The host on its own: `https://fiatjaf.com/about` reads as `fiatjaf.com`.
+    fn websiteHost(self: *const Profile) []const u8 {
+        var rest = self.website();
+        inline for ([_][]const u8{ "https://", "http://" }) |scheme| {
+            if (std.mem.startsWith(u8, rest, scheme)) rest = rest[scheme.len..];
+        }
+        if (std.mem.startsWith(u8, rest, "www.")) rest = rest["www.".len..];
+        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+        return rest;
     }
     fn nip05(self: *const Profile) []const u8 {
         return self.nip05_buf[0..self.nip05_len];
@@ -4588,6 +4606,7 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
         displayName: ?[]const u8 = null,
         picture: ?[]const u8 = null,
         nip05: ?[]const u8 = null,
+        website: ?[]const u8 = null,
     };
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -4627,6 +4646,18 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
                 profile.picture_len = @intCast(trimmed.len);
                 if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
             }
+        }
+    }
+
+    // The website, for the handle line's last fallback before an npub. Stored
+    // whole and trimmed to its host at render time, so a profile that changes
+    // its path does not have to be re-parsed.
+    profile.website_len = 0;
+    if (md.website) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0 and trimmed.len <= profile.website_buf.len) {
+            @memcpy(profile.website_buf[0..trimmed.len], trimmed);
+            profile.website_len = @intCast(trimmed.len);
         }
     }
 
@@ -4838,12 +4869,29 @@ pub const Note = struct {
     /// `@npub…`. Allocated in the caller's arena for the frame.
     /// The handle shown under the name, and whether it is a NIP-05 identity.
     ///
-    /// A NIP-05 is the real thing and reads in the identity violet: `@user`, or
-    /// `@domain` for the root `_@domain` form. Without one there is still a
-    /// second line, because the identity block is pinned to the disc's height and
-    /// an empty half looks like a loading bug: the kind:0 name stands in, and
-    /// failing that a short npub, both MUTED so the violet keeps meaning "this
-    /// name is attested somewhere".
+    /// Who this is, under their name. There is ALWAYS something here once the
+    /// profile has arrived, which is the point of the whole ladder below: the
+    /// identity block is pinned to the avatar's height, so an empty second line
+    /// is not restraint, it is a hole in the row that reads as a rendering bug.
+    /// It stayed empty for anyone with no NIP-05 and no username distinct from
+    /// their display name, which is a great many people.
+    ///
+    /// In order:
+    ///
+    ///  1. the NIP-05, WHOLE (`dergigi@primal.net`), and just the domain for the
+    ///     root `_@domain` form. The domain is the half that says who vouched for
+    ///     this name, so dropping it threw away the part worth showing. Reads in
+    ///     the identity violet.
+    ///  2. the kind:0 username, `@user`, muted. Skipped when it would only echo
+    ///     the name line above it, because the same string twice reads as a
+    ///     rendering bug rather than as a handle.
+    ///  3. the website, as its host. Not attested by anybody, so muted too, but
+    ///     it is something the person chose to say about themselves.
+    ///  4. a short npub. Last, and skipped when the name line is ALREADY the
+    ///     npub, which is what it falls back to for a profile nobody has.
+    ///
+    /// Only the first is violet. Violet has to keep meaning "attested somewhere"
+    /// or it means nothing.
     pub fn handleLabel(self: *const Note, arena: std.mem.Allocator) struct { text: []const u8, nip05: bool } {
         if (lookupProfile(self.pubkey)) |p| {
             if (p.nip05_len > 0) {
@@ -4851,21 +4899,27 @@ pub const Note = struct {
                 if (std.mem.indexOfScalar(u8, id, '@')) |at| {
                     const local = id[0..at];
                     const domain = id[at + 1 ..];
-                    const shown = if (std.mem.eql(u8, local, "_")) domain else local;
-                    if (shown.len > 0) {
-                        return .{ .text = std.fmt.allocPrint(arena, "@{s}", .{shown}) catch "", .nip05 = true };
+                    if (domain.len > 0) {
+                        const shown = if (std.mem.eql(u8, local, "_")) domain else id;
+                        return .{ .text = shown, .nip05 = true };
                     }
                 }
             }
-            // No NIP-05, so the kind:0 username stands in, muted: violet is
-            // reserved for an identity attested somewhere. It is skipped when it
-            // would only echo the name line above it (a profile whose display
-            // name IS its username), because the same string twice reads as a
-            // rendering bug rather than as a handle.
             const user = p.username();
             if (user.len > 0 and !std.mem.eql(u8, user, p.name())) {
                 return .{ .text = std.fmt.allocPrint(arena, "@{s}", .{user}) catch "", .nip05 = false };
             }
+            const host = p.websiteHost();
+            if (host.len > 0 and !std.mem.eql(u8, host, p.name())) {
+                return .{ .text = host, .nip05 = false };
+            }
+        }
+        // The npub, unless the line above is already showing it. `author()` falls
+        // back to exactly this string when there is no kind:0 name, so without
+        // the check a stranger's row would say the same short npub twice.
+        const short = npubShortOf(arena, self.pubkey);
+        if (short.len > 0 and !std.mem.eql(u8, short, self.author())) {
+            return .{ .text = short, .nip05 = false };
         }
         return .{ .text = "", .nip05 = false };
     }
@@ -11755,10 +11809,18 @@ fn personNpubShort(ui: *AppUi, pubkey: [32]u8) []const u8 {
     return npubShortOf(ui.arena, pubkey);
 }
 
+/// The abbreviated npub, allocating. ONE truncation rule, shared with the feed's
+/// name line through `abbreviateNpub`.
+///
+/// There were two. The name line cut at twelve characters and this cut at ten,
+/// so the same key rendered as two different strings depending on which line it
+/// landed on, and any code comparing them to avoid saying it twice compared
+/// unequal and said it twice, in two spellings. That is worse than the
+/// duplication it was trying to prevent.
 fn npubShortOf(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
-    const encoded = nostr.nip19.encodeNpub(arena, pubkey) catch return "npub…";
-    if (encoded.len < 20) return encoded;
-    return std.fmt.allocPrint(arena, "{s}…{s}", .{ encoded[0..10], encoded[encoded.len - 5 ..] }) catch "npub…";
+    var buf: [128]u8 = undefined;
+    const s = abbreviateNpub(&buf, pubkey);
+    return arena.dupe(u8, s) catch "npub…";
 }
 
 /// The abbreviated npub exactly as the view renders it, so a test can count how

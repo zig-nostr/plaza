@@ -8368,3 +8368,89 @@ test "the window is square" {
     // width on margin while showing four notes at a time.
     try testing.expectEqual(main.window_width, main.window_height);
 }
+
+test "there is always something under a name" {
+    // The identity block is pinned to the avatar's height, so an empty second
+    // line is not restraint: it is a hole in the row that reads as a rendering
+    // bug. It was empty for anyone with no NIP-05 and no username distinct from
+    // their display name, which is a great many people.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const Case = struct { secret: u8, meta: []const u8, want: []const u8, violet: bool };
+    const cases = [_]Case{
+        // A NIP-05 is shown WHOLE. The domain is the half that says who vouched
+        // for the name, so dropping it threw away the part worth showing.
+        .{ .secret = 0x11, .meta = "{\"display_name\":\"Gigi\",\"nip05\":\"dergigi@primal.net\"}", .want = "dergigi@primal.net", .violet = true },
+        // The root form is the domain alone: `_@fiatjaf.com` is `fiatjaf.com`.
+        .{ .secret = 0x12, .meta = "{\"display_name\":\"fiatjaf\",\"nip05\":\"_@fiatjaf.com\"}", .want = "fiatjaf.com", .violet = true },
+        // No NIP-05: the username, muted, because violet has to keep meaning
+        // attested somewhere.
+        .{ .secret = 0x13, .meta = "{\"display_name\":\"Satoshi\",\"name\":\"nakamoto\"}", .want = "@nakamoto", .violet = false },
+        // A username that only echoes the name above it is not a handle, so the
+        // website stands in, as its host.
+        .{ .secret = 0x14, .meta = "{\"display_name\":\"jack\",\"name\":\"jack\",\"website\":\"https://www.cash.app/about\"}", .want = "cash.app", .violet = false },
+        // Nothing but a display name: the npub, which is the last honest handle
+        // and the case that used to render as a void.
+        .{ .secret = 0x15, .meta = "{\"display_name\":\"Anonymous\"}", .want = "", .violet = false },
+    };
+
+    for (cases) |c| {
+        const kp = try signer.keyPairFromSecretKey([_]u8{c.secret} ** 32);
+        const p = main.upsertProfile(kp.public_key).?;
+        main.parseMetadataInto(p, c.meta);
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+        const note = main.noteFrom(ev, 1_800_000_000);
+        const got = note.handleLabel(arena);
+
+        if (c.want.len > 0) {
+            try testing.expectEqualStrings(c.want, got.text);
+        } else {
+            // The npub case: whatever the exact string, it must be the npub and
+            // it must not be empty.
+            try testing.expect(got.text.len > 0);
+            try testing.expect(std.mem.startsWith(u8, got.text, "npub1"));
+        }
+        try testing.expectEqual(c.violet, got.nip05);
+    }
+
+    // And the one case where saying nothing is right: a stranger with no kind:0
+    // at all already has the short npub on the NAME line, so repeating it
+    // underneath would be the same string twice.
+    const stranger = try signer.keyPairFromSecretKey([_]u8{0x16} ** 32);
+    const ev = try signedNote(arena, signer, stranger, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expect(std.mem.startsWith(u8, note.author(), "npub1"));
+    try testing.expectEqualStrings("", note.handleLabel(arena).text);
+}
+
+test "an npub is shortened one way, everywhere" {
+    // There were two rules, twelve characters on the feed's name line and ten
+    // everywhere else, so the same key rendered as two different strings
+    // depending on which line it landed on. Anything comparing them to avoid
+    // repeating a handle compared unequal and printed it twice, in two
+    // spellings, which is worse than the duplication it was avoiding.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x2F} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "hi");
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // The name line falls back to the npub, and the shortener every other
+    // surface uses has to produce the same characters.
+    try testing.expectEqualStrings(note.author(), main.npubShortForTest(arena, kp.public_key));
+}
