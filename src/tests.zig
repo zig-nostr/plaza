@@ -7715,3 +7715,235 @@ test "a queued note belongs to the account that wrote it, and to nobody else" {
     main.clearIdentityForTest();
     try testing.expectEqual(@as(usize, 0), main.collectOutboxDueForTest(&due, 1400));
 }
+
+test "another account's notes do not sit in the slots this account needs" {
+    // The trap the first version of the ownership fix walked into. Refusing to
+    // SEND a foreign entry is not enough: nothing can ack it, so nothing can
+    // sweep it and nothing can evict it either, and sixteen of them stop the
+    // person at the keyboard publishing at all. Silently, because the same
+    // ownership filter hides them from the count and the popover.
+    //
+    // So the slots change hands with the account. The leaving account's queue is
+    // parked in its own record, not deleted, and the array holds only whoever is
+    // signed in.
+    main.resetOutboxForTest();
+    main.clearOutboxOwnerForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/outbox.mdb", .{dir_buf[0..dir_len]});
+    var store = try nostr.store.Store.open(path.ptr, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A signs in and fills every slot with notes no relay took. Real signed
+    // events in the store, because the queue is an INDEX: a restart reads each
+    // id back out of the store, and an id with no event behind it is dropped.
+    main.setIdentityForTest([_]u8{0x0A} ** 32);
+    main.syncOutboxOwnerForTest();
+    const a = main.activePubkeyForTest() orelse return error.NoIdentity;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x0A} ** 32);
+    for (0..main.outbox_cap_for_test) |i| {
+        const body = try std.fmt.allocPrint(arena, "owed note {d}", .{i});
+        const ev = try nostr.event.create(arena, signer, kp, @intCast(1000 + i), 1, &.{}, body, null);
+        _ = try store.ingest(testing.allocator, ev, .{});
+        try testing.expect(main.enqueueOutboxForTest(ev.id, a, 1000));
+    }
+    try testing.expectEqual(main.outbox_cap_for_test, main.outboxUsedSlotsForTest());
+
+    // A logs out. The slots come back; the notes are not destroyed.
+    main.clearIdentityForTest();
+    main.syncOutboxOwnerForTest();
+    try testing.expectEqual(@as(usize, 0), main.outboxUsedSlotsForTest());
+    try testing.expectEqual(@as(?[32]u8, null), main.outboxOwnerForTest());
+
+    // B signs in to an empty queue and can post. Without the handover this is
+    // where `enqueueOutbox` returns false and the note reaches no relay at all,
+    // with nothing on screen to say so.
+    main.setIdentityForTest([_]u8{0x0B} ** 32);
+    main.syncOutboxOwnerForTest();
+    const b = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expectEqual(@as(usize, 0), main.outboxUsedSlotsForTest());
+    const bs = [_]u8{0xBB} ** 32;
+    try testing.expect(main.enqueueOutboxForTest(bs, b, 1100));
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+
+    // A comes back to every one of their notes, still owed, none of B's.
+    main.clearIdentityForTest();
+    main.setIdentityForTest([_]u8{0x0A} ** 32);
+    defer main.clearIdentityForTest();
+    main.syncOutboxOwnerForTest();
+    try testing.expectEqual(main.outbox_cap_for_test, main.outboxUsedSlotsForTest());
+    try testing.expectEqual(main.outbox_cap_for_test, main.outboxPending());
+    for (0..main.outbox_cap_for_test) |i| {
+        const author = main.outboxAuthorAtForTest(i) orelse return error.EmptySlot;
+        try testing.expectEqualSlices(u8, &a, &author);
+    }
+    main.clearOutboxOwnerForTest();
+}
+
+test "a queue that survived a restart remembers who wrote each note" {
+    // `loadOutbox` is the ONLY place an author is recovered for a queue that
+    // outlived the process, which is exactly the path a real logout-and-restart
+    // takes. It reads the author back off the stored event, so this drives a
+    // real store rather than the in-memory helpers.
+    main.resetOutboxForTest();
+    main.clearOutboxOwnerForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/reload.mdb", .{dir_buf[0..dir_len]});
+    var store = try nostr.store.Store.open(path.ptr, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A real signed note, so the store holds an event whose pubkey is the answer
+    // this test is about.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5E} ** 32);
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 1, &.{}, "written offline", null);
+    _ = try store.ingest(testing.allocator, ev, .{});
+
+    main.setIdentityForTest([_]u8{0x5E} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expectEqualSlices(u8, &kp.public_key, &me);
+
+    // Queue it and write the record, the way the tick does.
+    main.syncOutboxOwnerForTest();
+    try testing.expect(main.enqueueOutboxForTest(ev.id, me, 1000));
+    main.saveOutboxForTest();
+
+    // Now lose the array, as a restart does, and read it back.
+    main.resetOutboxForTest();
+    try testing.expectEqual(@as(usize, 0), main.outboxUsedSlotsForTest());
+    main.loadOutboxForTest(me);
+    try testing.expectEqual(@as(usize, 1), main.outboxUsedSlotsForTest());
+
+    // The author survived, which is what makes the entry sendable by its owner
+    // and by nobody else. A zeroed author here would match no real key and the
+    // note would be owed to a person who does not exist.
+    const author = main.outboxAuthorAtForTest(0) orelse return error.EmptySlot;
+    try testing.expectEqualSlices(u8, &me, &author);
+    try testing.expectEqual(@as(usize, 1), main.outboxPending());
+
+    // And a stranger reading the same record takes nothing from it.
+    const stranger = [_]u8{0x77} ** 32;
+    main.loadOutboxForTest(stranger);
+    try testing.expectEqual(@as(usize, 0), main.outboxUsedSlotsForTest());
+    main.clearOutboxOwnerForTest();
+}
+
+test "the pre-account queue record is split by author, not taken wholesale" {
+    // The one record written by builds before the queue was per-account can hold
+    // notes from more than one person, because it never asked. Each account
+    // claims its own share of it the first time it signs in and leaves the rest
+    // where it is, so migrating does not hand somebody else's unsent writing to
+    // whoever happens to open the app first.
+    main.resetOutboxForTest();
+    main.clearOutboxOwnerForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/legacy.mdb", .{dir_buf[0..dir_len]});
+    var store = try nostr.store.Store.open(path.ptr, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp_a = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const kp_b = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const ev_a = try nostr.event.create(arena, signer, kp_a, 1000, 1, &.{}, "A wrote this", null);
+    const ev_b = try nostr.event.create(arena, signer, kp_b, 1001, 1, &.{}, "B wrote this", null);
+    _ = try store.ingest(testing.allocator, ev_a, .{});
+    _ = try store.ingest(testing.allocator, ev_b, .{});
+
+    // The old shape: one record, both notes, no author anywhere in it.
+    var rec = std.ArrayList(u8).empty;
+    defer rec.deinit(testing.allocator);
+    for ([_]nostr.event.Event{ ev_a, ev_b }) |ev| {
+        var hex: [64]u8 = undefined;
+        for (ev.id, 0..) |byte, i| {
+            const digits = "0123456789abcdef";
+            hex[i * 2] = digits[byte >> 4];
+            hex[i * 2 + 1] = digits[byte & 0x0f];
+        }
+        try rec.appendSlice(testing.allocator, &hex);
+        try rec.appendSlice(testing.allocator, ":1000:0:0:0\n");
+    }
+    try store.put("outbox", rec.items);
+
+    // A reads it and gets A's note. Only A's.
+    main.loadOutboxForTest(kp_a.public_key);
+    try testing.expectEqual(@as(usize, 1), main.outboxUsedSlotsForTest());
+    const got_a = main.outboxAuthorAtForTest(0) orelse return error.EmptySlot;
+    try testing.expectEqualSlices(u8, &kp_a.public_key, &got_a);
+
+    // B reads the same record and gets B's, which is still there for them.
+    main.loadOutboxForTest(kp_b.public_key);
+    try testing.expectEqual(@as(usize, 1), main.outboxUsedSlotsForTest());
+    const got_b = main.outboxAuthorAtForTest(0) orelse return error.EmptySlot;
+    try testing.expectEqualSlices(u8, &kp_b.public_key, &got_b);
+
+    // And a third party gets nothing out of it at all.
+    main.loadOutboxForTest([_]u8{0x33} ** 32);
+    try testing.expectEqual(@as(usize, 0), main.outboxUsedSlotsForTest());
+    main.clearOutboxOwnerForTest();
+    main.resetOutboxForTest();
+}
+
+test "a note the queue had no room for is said out loud" {
+    // `g_outbox_overflow` was set here and read nowhere, so the one case it
+    // exists for, a note written to this machine and offered to nobody, was the
+    // one case the status bar stayed silent about. That is the promise under the
+    // offline banner broken exactly where it matters.
+    var model = main.initialModel();
+    model.outbox_pending = 0;
+    model.outbox_stuck = 0;
+    model.outbox_overflowed = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("a note could not be queued", model.outbox_label(arena));
+
+    // And it outranks the others: a queue that is both busy and overflowing has
+    // one thing worth saying.
+    model.outbox_pending = 3;
+    try testing.expectEqualStrings("a note could not be queued", model.outbox_label(arena));
+
+    // It also has to REACH the bar. The zone returns a spacer when it thinks
+    // there is nothing to report, and overflow used to count as nothing.
+    model.stage = .ready;
+    model.outbox_pending = 0;
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "a note could not be queued") != null);
+}
