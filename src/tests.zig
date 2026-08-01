@@ -8089,3 +8089,99 @@ test "signing out drops the rows of the relays it is signing out of" {
     main.resetRelaysToBootstrapForTest();
     try testing.expectEqual(@as(usize, 0), main.liveRelayCountForTest());
 }
+
+/// Every widget that can be pressed has to occupy room on screen.
+///
+/// A control laid out at zero width is not merely invisible. Its siblings are
+/// positioned after it as though it were not there, so the next thing in the row
+/// is drawn on top of whatever the control painted outside its own box. That is
+/// what turned the thread header into one smear of "Starter pack", "Thread" and
+/// the reply count in the same place, and what left the bunker card's way back
+/// looking like a stray mark next to its own title.
+///
+/// Nothing structural can see it. The tree is correctly nested either way, and
+/// mouse input works either way, because a press hit-tests to the deepest widget
+/// and walks UP to the nearest ancestor claiming one. Only a laid-out frame says
+/// so, which is why this measures.
+fn expectNoZeroSizedPressables(arena: std.mem.Allocator, name: []const u8, m: *main.Model) !void {
+    const tree = try buildTree(arena, m);
+    const p = try painted.Painted.render(arena, m);
+    for (p.layout.nodes) |n| {
+        const w = n.widget;
+        if (w.frame.width > 0.5 and w.frame.height > 0.5) continue;
+        var pressable = false;
+        for (tree.handlers) |h| {
+            if (h.id == w.id and h.event == .press) pressable = true;
+        }
+        if (!pressable) continue;
+        std.debug.print(
+            "{s}: a pressable {s} labelled \"{s}\" is laid out at {d:.1}x{d:.1}\n",
+            .{ name, @tagName(w.kind), w.semantics.label, w.frame.width, w.frame.height },
+        );
+        return error.ZeroSizedControl;
+    }
+}
+
+test "no control that can be pressed is laid out at nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    // One model walked through the screens, because a Model is far too large to
+    // hold several of on the stack.
+    var m = main.initialModel();
+    m.stage = .ready;
+    try expectNoZeroSizedPressables(arena, "feed", &m);
+
+    m.viewing_thread = 12345;
+    try expectNoZeroSizedPressables(arena, "thread", &m);
+    m.viewing_thread = 0;
+
+    m.joining = true;
+    try expectNoZeroSizedPressables(arena, "join ladder", &m);
+    m.bunker_mode = true;
+    try expectNoZeroSizedPressables(arena, "bunker card", &m);
+    m.joining = false;
+    m.bunker_mode = false;
+
+    m.naming = true;
+    try expectNoZeroSizedPressables(arena, "name card", &m);
+    m.naming = false;
+
+    m.notifications_open = true;
+    try expectNoZeroSizedPressables(arena, "notifications", &m);
+    m.notifications_open = false;
+
+    m.viewing_profile = [_]u8{0x2B} ** 32;
+    try expectNoZeroSizedPressables(arena, "profile", &m);
+    m.viewing_profile = null;
+
+    m.stage = .settings;
+    try expectNoZeroSizedPressables(arena, "settings", &m);
+    m.stage = .onboarding;
+    try expectNoZeroSizedPressables(arena, "welcome", &m);
+}
+
+test "a header's back control does not sit under the title" {
+    // The consequence, stated as geometry: the thread header's three pieces are
+    // laid out one after another, not on top of each other. Before the back
+    // control took up room, "Thread" began at the back control's own x plus the
+    // row gap, i.e. inside the chevron and across the label.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.clearIdentityForTest();
+
+    var m = main.initialModel();
+    m.stage = .ready;
+    m.viewing_thread = 12345;
+    const p = try painted.Painted.render(arena_state.allocator(), &m);
+
+    const back = p.frameOf("Back") orelse return error.NoBackControl;
+    try testing.expect(back.width > 0);
+
+    const title = frameOfText(p, "Thread") orelse return error.NoTitle;
+    // The title starts after the back control ends. Anything less and they are
+    // painting over one another.
+    try testing.expect(title.x >= back.x + back.width);
+}
