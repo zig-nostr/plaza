@@ -8593,3 +8593,317 @@ test "a nested reply spells its author the same way the row above does" {
     try testing.expect(countAnyText(tree.root, "dergigi@primal.net") >= 2);
     try testing.expect(findAnyText(tree.root, "@dergigi") == null);
 }
+
+// ---- P1: a click outside a modal closes it ----------------------------------
+
+/// One modal the app can raise: how to open it, what it is called, what closing
+/// it means, and one control inside it that has to keep working.
+const ModalCase = struct {
+    name: []const u8,
+    /// The dialog's accessibility label, which is how the backdrop is found.
+    label: []const u8,
+    dismiss: Msg,
+    /// A control inside the card, by accessibility label. Absorbing the press on
+    /// the card is what stops a click there reaching the backdrop, and an
+    /// absorber that also swallowed the buttons would satisfy the dismissal rule
+    /// perfectly while leaving the sheet impossible to use.
+    control: []const u8,
+    open: *const fn (*Model) void,
+};
+
+const modal_cases = [_]ModalCase{
+    .{
+        .name = "join",
+        .label = "Join",
+        .dismiss = .close_join,
+        .control = "Keep browsing",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.joining = true;
+            }
+        }.f,
+    },
+    .{
+        // The same sheet, second step: a distinct card behind the same label, and
+        // the one the reader is on while pasting a bunker URL.
+        .name = "bunker",
+        .label = "Join",
+        .dismiss = .close_join,
+        .control = "Back",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.joining = true;
+                m.bunker_mode = true;
+            }
+        }.f,
+    },
+    .{
+        .name = "name",
+        .label = "Name",
+        .dismiss = .name_skip,
+        .control = "Skip",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.naming = true;
+            }
+        }.f,
+    },
+    .{
+        .name = "notifications",
+        .label = "Notifications",
+        .dismiss = .close_notifications,
+        .control = "Everyone",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.notifications_open = true;
+            }
+        }.f,
+    },
+    .{
+        .name = "compose",
+        .label = "New note",
+        .dismiss = .close_compose,
+        .control = "Cancel",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.composing = true;
+            }
+        }.f,
+    },
+    .{
+        .name = "edit profile",
+        .label = "Edit profile",
+        .dismiss = .close_profile_edit,
+        .control = "Close",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .settings;
+                m.editing_profile = true;
+            }
+        }.f,
+    },
+};
+
+/// The outermost `.card` inside the dialog labelled `label`: the modal's own
+/// surface, which is the boundary "outside" is measured against.
+fn modalCardFrame(p: painted.Painted, label: []const u8) ?native_sdk.geometry.RectF {
+    var dialog: ?usize = null;
+    for (p.layout.nodes, 0..) |node, i| {
+        if (node.widget.kind != .dialog) continue;
+        if (!std.mem.eql(u8, node.widget.semantics.label, label)) continue;
+        dialog = i;
+        break;
+    }
+    const root = dialog orelse return null;
+    for (p.layout.nodes, 0..) |node, i| {
+        if (node.widget.kind != .card) continue;
+        if (!isDescendantOf(p, i, root)) continue;
+        return node.widget.frame;
+    }
+    return null;
+}
+
+/// A control by the words on it, however it carries them: `ui.button` puts its
+/// words in the widget's TEXT, while a hand-built row carries them as an
+/// accessibility label. A lookup that knows only one of the two silently misses
+/// half the controls in the app, and a miss here reads as "no such control".
+fn controlNode(p: painted.Painted, name: []const u8) ?canvas.Widget {
+    for (p.layout.nodes) |node| {
+        const w = node.widget;
+        if (std.mem.eql(u8, w.semantics.label, name) or std.mem.eql(u8, w.text, name)) {
+            for (p.tree.handlers) |h| {
+                if (h.id == w.id and h.event == .press) return w;
+            }
+        }
+    }
+    return null;
+}
+
+fn pressMsgById(p: painted.Painted, id: canvas.ObjectId) ?Msg {
+    for (p.tree.handlers) |h| {
+        if (h.id != id or h.event != .press) continue;
+        return switch (h.action) {
+            .message => |m| m,
+            else => null,
+        };
+    }
+    return null;
+}
+
+test "a press outside a modal's card closes it, and a press inside never does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    for (modal_cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const p = try painted.Painted.render(arena, &model);
+
+        const card = modalCardFrame(p, c.label) orelse {
+            std.debug.print("{s}: no card inside the dialog labelled \"{s}\"\n", .{ c.name, c.label });
+            return error.NoModalCard;
+        };
+        // Cards are centred and far narrower than the window, so the band to the
+        // left of one is backdrop at every height.
+        try testing.expect(card.x > 8);
+
+        // Outside: halfway between the window edge and the card, at three
+        // heights, so a rule that happens to hold level with the card's middle
+        // is not mistaken for one that holds.
+        const outside_x = card.x / 2;
+        for ([_]f32{ 0.25, 0.5, 0.75 }) |fraction| {
+            const y = main.window_height * fraction;
+            const msg = p.pressMsgAt(outside_x, y) orelse {
+                std.debug.print(
+                    "{s}: a press at ({d:.0}, {d:.0}), outside the card, dispatches NOTHING\n",
+                    .{ c.name, outside_x, y },
+                );
+                return error.BackdropIsDead;
+            };
+            try testing.expectEqualStrings(@tagName(c.dismiss), @tagName(msg));
+        }
+
+        // Inside: a grid over the whole card, asking where each press LANDS
+        // rather than what it dispatches. The rule is that it never reaches the
+        // backdrop; what a control inside the card does with a press aimed at it
+        // is that control's own business, and a modal is allowed to carry a
+        // close control of its own (this ladder's "Keep browsing" is one).
+        //
+        // A grid rather than the centre alone: whether the centre happens to sit
+        // on a control is an accident of the layout, and the rule is about every
+        // point on the card.
+        var absorbed: usize = 0;
+        for (1..8) |ix| {
+            for (1..8) |iy| {
+                const x = card.x + card.width * (@as(f32, @floatFromInt(ix)) / 8.0);
+                const y = card.y + card.height * (@as(f32, @floatFromInt(iy)) / 8.0);
+                const target = p.pressTargetAt(x, y) orelse continue;
+                if (target.kind == .dialog) {
+                    std.debug.print(
+                        "{s}: a press at ({d:.0}, {d:.0}), INSIDE the card, reaches the backdrop\n",
+                        .{ c.name, x, y },
+                    );
+                    return error.CardFallsThrough;
+                }
+                if (target.kind == .card) absorbed += 1;
+            }
+        }
+        // And the absorbing is actually exercised: a card whose every sampled
+        // point sat on a control would pass the rule above without the card ever
+        // having to stop anything.
+        if (absorbed == 0) {
+            std.debug.print("{s}: no sampled point landed on the card itself\n", .{c.name});
+            return error.NothingAbsorbed;
+        }
+
+        // And the card still works: the control named for this modal answers to
+        // its own message where it is drawn. An absorber that swallowed the
+        // buttons too would satisfy every rule above and leave the sheet inert.
+        const control = controlNode(p, c.control) orelse {
+            std.debug.print("{s}: no control called \"{s}\"\n", .{ c.name, c.control });
+            return error.NoSuchControl;
+        };
+        const wired = pressMsgById(p, control.id) orelse {
+            std.debug.print("{s}: \"{s}\" has no press bound\n", .{ c.name, c.control });
+            return error.ControlNotWired;
+        };
+        const landed = p.pressMsgAt(
+            control.frame.x + control.frame.width / 2,
+            control.frame.y + control.frame.height / 2,
+        ) orelse {
+            std.debug.print("{s}: a press on \"{s}\" dispatches nothing\n", .{ c.name, c.control });
+            return error.ControlSwallowed;
+        };
+        try testing.expectEqualStrings(@tagName(wired), @tagName(landed));
+    }
+}
+
+test "the expanded picture closes on a press anywhere it is not a control" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No card here, and that is the point: the viewer fills the window, so
+    // "outside the picture" is the whole dark surround and there is nothing to
+    // absorb. Neither an image nor plain text claims a press, so every point
+    // that is not a button walks up to the viewer itself.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 1;
+    const url = "https://example.com/a.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = url.len;
+    model.notes_len = 1;
+    model.expanded_note = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const centre = p.pressMsgAt(main.window_width / 2, main.window_height / 2) orelse
+        return error.ViewerBackdropIsDead;
+    try testing.expectEqualStrings(@tagName(Msg.close_image), @tagName(centre));
+
+    // The two controls it carries still answer for themselves.
+    for ([_][]const u8{ "Close", "Open original" }) |name| {
+        const control = controlNode(p, name) orelse {
+            std.debug.print("the viewer has no control called \"{s}\"\n", .{name});
+            return error.NoSuchControl;
+        };
+        const wired = pressMsgById(p, control.id) orelse return error.ControlNotWired;
+        const landed = p.pressMsgAt(
+            control.frame.x + control.frame.width / 2,
+            control.frame.y + control.frame.height / 2,
+        ) orelse {
+            std.debug.print("a press on \"{s}\" dispatches nothing\n", .{name});
+            return error.ControlSwallowed;
+        };
+        try testing.expectEqualStrings(@tagName(wired), @tagName(landed));
+    }
+}
+
+test "a card that absorbs presses states its own surface" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Binding a press makes the card a HOVER target as well as a press claimer,
+    // and the renderer resolves a card's fill through the button state channel:
+    // pressed or hovered picks a different surface from the token set. An
+    // explicit `style.background` wins outright over that channel
+    // (`widgetBackgroundColor` is `style.background orelse fallback`), so a card
+    // that states its own colour cannot flash under the pointer, and one that
+    // does not will wash grey the moment the reader's cursor crosses it.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var checked: usize = 0;
+    for (modal_cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const p = try painted.Painted.render(arena, &model);
+        for (p.layout.nodes) |node| {
+            const w = node.widget;
+            if (w.kind != .card) continue;
+            var absorbs = false;
+            for (p.tree.handlers) |h| {
+                if (h.id == w.id and h.event == .press) absorbs = true;
+            }
+            if (!absorbs) continue;
+            checked += 1;
+            if (w.style.background == null) {
+                std.debug.print("{s}: a pressable card paints no surface of its own\n", .{c.name});
+                return error.CardWashesOnHover;
+            }
+        }
+    }
+    // One per modal at least, or the loop above proved nothing.
+    try testing.expect(checked >= modal_cases.len);
+}

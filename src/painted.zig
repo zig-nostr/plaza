@@ -40,6 +40,12 @@ const theme = @import("theme.zig");
 pub const Painted = struct {
     commands: []const canvas.CanvasCommand,
     layout: canvas.WidgetLayoutTree,
+    /// The SOURCE tree this layout came from, so a test can go from a laid-out
+    /// node back to the Msg bound on it. Kept from the SAME build rather than
+    /// rebuilt beside it: the two would have to agree about ids for a lookup to
+    /// mean anything, and a lookup that silently misses reads as "nothing is
+    /// wired there", which is the answer these tests exist to disprove.
+    tree: main.AppUi.Tree,
 
     /// Builds, lays out and renders `model` at the app's own window size. The
     /// arena owns everything returned.
@@ -67,7 +73,7 @@ pub const Painted = struct {
         var builder = canvas.Builder.init(commands);
         try canvas.emitWidgetLayout(&builder, layout, tokens);
 
-        return .{ .commands = commands[0..builder.len], .layout = layout };
+        return .{ .commands = commands[0..builder.len], .layout = layout, .tree = tree };
     }
 
     /// The same, for ONE piece of the view rather than the whole window: the
@@ -101,7 +107,7 @@ pub const Painted = struct {
         var builder = canvas.Builder.init(commands);
         try canvas.emitWidgetLayout(&builder, layout, tokens);
 
-        return .{ .commands = commands[0..builder.len], .layout = layout };
+        return .{ .commands = commands[0..builder.len], .layout = layout, .tree = tree };
     }
 
     /// The same view with the widget labelled `label` PRESSED. Binding the hover
@@ -260,6 +266,40 @@ pub const Painted = struct {
     pub fn fillAtCenterOf(self: Painted, label: []const u8) ?canvas.Color {
         const frame = self.frameOf(label) orelse return null;
         return self.fillAt(frame.x + frame.width / 2, frame.y + frame.height / 2);
+    }
+
+    /// The widget a press at (`x`, `y`) actually lands on, resolved by the SDK's
+    /// OWN routing rather than by a containment guess here.
+    ///
+    /// This matters because a press does NOT land where it hits: the engine hit
+    /// tests to the deepest widget under the point and then walks UP to the
+    /// nearest ancestor that CLAIMS presses. Text, icons and plain rows claim
+    /// nothing, so a click on a label reaches whatever surface encloses it,
+    /// which is how a click on a modal's own card can end up dismissing the
+    /// modal, and why "is the control wired?" is a different question from
+    /// "where does this click go?".
+    pub fn pressTargetAt(self: Painted, x: f32, y: f32) ?canvas.WidgetHit {
+        var entries: [canvas.max_widget_depth]canvas.WidgetEventRouteEntry = undefined;
+        const route = self.layout.routePointerEvent(
+            .{ .phase = .down, .point = geometry.PointF.init(x, y) },
+            &entries,
+        ) catch return null;
+        return route.press_target;
+    }
+
+    /// The Msg a press at (`x`, `y`) dispatches, or null where the press lands on
+    /// something with nothing bound (which INCLUDES a surface that claims the
+    /// press only to stop it falling through).
+    pub fn pressMsgAt(self: Painted, x: f32, y: f32) ?main.Msg {
+        const target = self.pressTargetAt(x, y) orelse return null;
+        for (self.tree.handlers) |h| {
+            if (h.id != target.id or h.event != .press) continue;
+            return switch (h.action) {
+                .message => |m| m,
+                else => null,
+            };
+        }
+        return null;
     }
 };
 

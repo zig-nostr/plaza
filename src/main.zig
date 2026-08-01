@@ -7679,10 +7679,19 @@ pub const Msg = union(enum) {
     toggle_expand: i64,
     /// The reader reached the end of the feed: ask the store for another page.
     load_older,
+    /// A press that landed on a modal's own card rather than on a control in it.
+    ///
+    /// It does nothing, and that IS the job. A press does not land where it
+    /// hits: the engine hit tests to the deepest widget and then walks UP to the
+    /// nearest ancestor that claims presses, and a `.card` claims none, so a
+    /// click on a sheet's own background used to walk straight past it to the
+    /// full-window dialog behind and close the sheet the reader was using.
+    /// Binding this is what makes the card claim the press and stop the walk.
+    absorb_press,
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -8362,6 +8371,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = .name_skip,
+        .on_press = .name_skip,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Name" },
     }, .{
@@ -8442,6 +8452,7 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = Msg.close_profile_edit,
+        .on_press = Msg.close_profile_edit,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Edit profile" },
     }, .{
@@ -8527,6 +8538,7 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = Msg.close_notifications,
+        .on_press = Msg.close_notifications,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Notifications" },
     }, .{
@@ -8786,6 +8798,7 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = .close_join,
+        .on_press = .close_join,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Join" },
     }, .{
@@ -8966,15 +8979,24 @@ fn joinLabel(ui: *AppUi, text: []const u8) AppUi.Node {
     );
 }
 
-/// The join ladder: three ways in, most confident first, always the way back.
 /// The shared modal card: the SDK `.card` element paints the rounded, bordered
 /// surface (a plain column does not paint its background at all), holding a
 /// single content column so the sheet reads as a raised, bordered panel.
+///
+/// The press it absorbs is load-bearing, not decoration: the sheet around it is
+/// a full-window dialog that closes when pressed, and a `.card` claims no press
+/// of its own, so without this a click on the sheet's own background walks past
+/// the card to the dialog and closes the sheet mid-use. See `Msg.absorb_press`.
 fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.card, .{ .width = width, .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 } }, .{inner});
+    return ui.el(.card, .{
+        .width = width,
+        .on_press = Msg.absorb_press,
+        .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 },
+    }, .{inner});
 }
 
+/// The join ladder: three ways in, most confident first, always the way back.
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
@@ -9100,6 +9122,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = .close_compose,
+        .on_press = .close_compose,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "New note" },
     }, .{
@@ -9107,6 +9130,10 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.el(.card, .{
                 .width = compose_sheet_width,
                 .padding = 0.01,
+                // Its own card rather than `modalCard`, so it needs the same
+                // absorbing press: a click on the composer's background must not
+                // reach the backdrop and put the sheet away mid-sentence.
+                .on_press = Msg.absorb_press,
                 .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
             }, .{
                 ui.column(.{ .gap = 0 }, .{
@@ -9361,6 +9388,7 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
         .grow = 1,
         .padding = 16,
         .on_dismiss = .close_image,
+        .on_press = .close_image,
         .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Expanded image" },
     }, .{
@@ -15275,6 +15303,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanMediaFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
+        // Deliberately empty: see `Msg.absorb_press`. The press has already done
+        // its work by the time it arrives here, which was to stop somewhere.
+        .absorb_press => {},
         .like => |note_id| toggleLike(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
         .open_event => |id| {
