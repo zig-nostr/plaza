@@ -8704,7 +8704,14 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 /// Pages REPLACE rather than accumulate, so this is the cost whether the reader
 /// holds five notifications or two hundred, and all two hundred are reachable
 /// instead of the first forty-eight.
-pub const inbox_page = 20;
+///
+/// Twenty, until the verb row under a note grew from four glyphs to six and the
+/// base under this sheet grew with it. That is what this number IS: a budget,
+/// not a taste in page sizes, and a budget whose inputs moved. Measured rather
+/// than estimated this time, over every frame the app can draw: at twenty this
+/// sheet over the deepest thread came to 922 of 1024, which is inside the
+/// ceiling and outside the tenth of it the suite insists stays free.
+pub const inbox_page = 16;
 
 /// Older and newer, when there is more than one page.
 fn notificationsPager(ui: *AppUi, page: usize, pages: usize) AppUi.Node {
@@ -13687,29 +13694,86 @@ fn handleLine(ui: *AppUi, note: *const Note) AppUi.Node {
     });
 }
 
-/// The engagement row: reply, repost, like, zap, in that fixed order, each an
-/// icon and its crowd count (the count omitted at zero). Only the like is
-/// pressable and only it carries an active state; reply, repost, and zap show
-/// their tallies but stay non-actionable this pass.
+/// How wide one verb's slot is, and how big its glyph is.
+///
+/// A SLOT, not a gap, and that is the whole point. The verbs used to sit in a
+/// row with a 30px gap and a count beside each glyph, so the width of every
+/// count pushed everything after it along: the heart landed at a different x on
+/// every note in the feed, and a column of notes read as a column of rows that
+/// could not agree where anything went. A fixed slot per verb puts every glyph
+/// in the same column down the whole feed, whatever the counts do inside it.
+///
+/// 64 holds the glyph, its gap and the widest count `formatCount` can produce
+/// (`999.9k`) without the next slot moving.
+const verb_slot_width: f32 = 64;
+const verb_icon_size: f32 = 15;
+
+/// The engagement row: reply, repost, like, zap, bookmark, more, in that fixed
+/// order, each an icon and its crowd count (the count omitted at zero).
+///
+/// Every icon people expect is drawn, including the ones with nothing behind
+/// them yet: this is a deliberate call for the first release, so the row reads
+/// as the row every other client has rather than as a shorter one that has lost
+/// something. Reply and like work. Repost and zap carry REAL counts and no
+/// action, so they keep the full tint (dimming them would misreport the crowd
+/// to say something about the app). Bookmark and more carry nothing at all and
+/// are drawn quieter to say so. None of the four takes hover, focus or a press,
+/// so nothing here answers a click with silence.
 fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    const glyph = AppUi.ElementOptions{ .width = 15, .height = 15, .style = .{ .foreground = theme.palette.text_metric } };
+    const glyph = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_metric } };
+    const quiet = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_dim } };
     const c = engagementFor(note.id);
-    return ui.row(.{ .gap = 30, .cross = .center }, .{
+    return ui.row(.{ .gap = 0, .cross = .center }, .{
         // Reply opens the note's thread, where the pinned composer answers it.
         // A plain pressable row, never a `.list_item`: that kind carries a 28px
         // intrinsic height floor and its padding walks the cluster off the rail
         // the disc, name and body share.
-        ui.row(.{ .gap = 6, .cross = .center, .on_press = Msg{ .open_thread = note.id }, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Reply" } }, .{
-            ui.appIcon(glyph, "reply"),
-            countLabel(ui, c.replies, p.text_metric),
-        }),
-        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.icon(glyph, "repeat"), countLabel(ui, c.reposts, p.text_metric) }),
-        likeAction(ui, note),
+        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), c.replies, p.text_metric, .{
+            .on_press = Msg{ .open_thread = note.id },
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "Reply" },
+        })),
+        verbSlot(ui, verbWithCount(ui, ui.icon(glyph, "repeat"), c.reposts, p.text_metric, .{})),
+        verbSlot(ui, likeAction(ui, note)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        ui.row(.{ .gap = 6, .cross = .center }, .{ ui.appIcon(glyph, "zap"), countLabel(ui, @intCast(c.zap_msat / 1000), p.text_metric) }),
+        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), c.zap_msat / 1000, p.text_metric, .{})),
+        verbSlot(ui, ui.appIcon(quiet, "bookmark")),
+        verbSlot(ui, ui.icon(quiet, "ellipsis")),
     });
+}
+
+/// One verb in its slot: the control at the left, the rest of the slot empty.
+///
+/// The slot is a fixed-width container rather than a fixed-width CONTROL, so a
+/// press still has to land on the glyph and its count. A 64-wide hit target
+/// would reach across the space between two verbs and answer for its neighbour,
+/// and the neighbour of the heart is a glyph that does nothing yet: aiming at
+/// the inert one and landing on the live one would publish a reaction.
+fn verbSlot(ui: *AppUi, inner: AppUi.Node) AppUi.Node {
+    return ui.row(.{ .width = verb_slot_width, .cross = .center, .gap = 0 }, .{inner});
+}
+
+/// A verb's glyph and its count, as one control.
+///
+/// The count is left OUT of the children rather than substituted with an empty
+/// node when it is zero. Both a row gap and a widget node are charged per flow
+/// child whether or not it draws anything, and most notes in a feed carry zero
+/// on most of these: a placeholder per empty count came to a tenth of the
+/// window's whole widget budget across a screen of rows.
+fn verbWithCount(ui: *AppUi, glyph: AppUi.Node, count: u64, color: canvas.Color, options: AppUi.ElementOptions) AppUi.Node {
+    var kids: [2]AppUi.Node = undefined;
+    kids[0] = glyph;
+    var n: usize = 1;
+    if (count > 0) {
+        kids[1] = metaText(ui, formatCount(ui.arena, count), color);
+        n = 2;
+    }
+    var opts = options;
+    opts.gap = 6;
+    opts.cross = .center;
+    return ui.row(opts, .{kids[0..n]});
 }
 
 /// A count beside an action icon, or nothing at zero (so the icon stands alone
@@ -13733,15 +13797,10 @@ fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
     const liked = my_reaction != null;
     const count = likeCountFor(note.id, my_reaction);
     const tint = if (liked) theme.palette.status_like else theme.palette.text_metric;
-    return ui.row(.{
-        .gap = 6,
-        .cross = .center,
+    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), count, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
-    }, .{
-        ui.appIcon(.{ .width = 15, .height = 15, .style = .{ .foreground = tint } }, "like"),
-        countLabel(ui, count, tint),
     });
 }
 
