@@ -26,6 +26,9 @@ const zap_icon = svg_icon.parseComptime(@embedFile("icons/app-zap.svg"));
 // built-in set has no counterpart (its `save` is a floppy disk), and every other
 // client puts one in the verb row.
 const bookmark_icon = svg_icon.parseComptime(@embedFile("icons/app-bookmark.svg"));
+// A picture, for saying that a note carries one where the picture itself cannot
+// be drawn. Lucide's image, in the same dialect; the built-in set has none.
+const image_icon = svg_icon.parseComptime(@embedFile("icons/app-image.svg"));
 // The Signet mark: the signer's own boundary glyph, shown wherever a key
 // ceremony or the signer's health is in question.
 const signet_icon = svg_icon.parseComptime(@embedFile("icons/app-signet.svg"));
@@ -43,6 +46,7 @@ pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "like", .icon = &like_icon },
     .{ .name = "zap", .icon = &zap_icon },
     .{ .name = "bookmark", .icon = &bookmark_icon },
+    .{ .name = "image", .icon = &image_icon },
     .{ .name = "signet", .icon = &signet_icon },
     .{ .name = "bell", .icon = &bell_icon },
     .{ .name = "dashed-ring", .icon = &dashed_ring_icon },

@@ -9312,3 +9312,86 @@ test "every verb people expect is under a note" {
     }
     try testing.expectEqual(@as(usize, 6), found);
 }
+
+// ---- P10: a quoted picture ---------------------------------------------------
+
+test "a quoted note that is only a picture says so" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The fill path cuts the image URL out of the body deliberately (a raw URL
+    // is not something to read) and used to record nothing in its place, so a
+    // note whose whole content is one picture came out with an empty body and
+    // drew a card with a name, a time and a blank line under them.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{61} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quoted.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const shot = try signedNote(arena, signer, kp, 1_800_000_000, "https://i.nostr.build/aBcD1234.jpg");
+    _ = try store.ingest(arena, shot, .{});
+
+    main.dropQuoteForTest(shot.id);
+    main.wantQuoteForTest(shot.id);
+    main.refreshQuotesForTest(&store);
+
+    const e = main.quoteForTest(shot.id) orelse return error.NoQuote;
+    try testing.expectEqual(main.QuoteState.loaded, e.state);
+    // The body really is empty: the whole note was the URL, and the URL is cut.
+    try testing.expectEqual(@as(u16, 0), e.text_len);
+    // So the card has to have something else to say.
+    try testing.expectEqualStrings("i.nostr.build", e.image_host_buf[0..e.image_host_len]);
+}
+
+test "a quote card with nothing to read is not a blank card" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const quoted_id = [_]u8{0x6f} ** 32;
+    main.dropQuoteForTest(quoted_id);
+    main.seedQuoteForTest(quoted_id, [_]u8{0x2b} ** 32, 100, "");
+    const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+    const host = "i.nostr.build";
+    @memcpy(e.image_host_buf[0..host.len], host);
+    e.image_host_len = host.len;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    // The card says what it holds, by name and by host.
+    if (findAnyText(p.tree.root, "Picture from i.nostr.build") == null) {
+        std.debug.print("the quote card says nothing about the picture in it\n", .{});
+        return error.SilentAboutMedia;
+    }
+    // And the row is priced for the line it draws, or a feed of these scrolls
+    // against a scrollbar that is measuring a different page.
+    //
+    // Held to half a line rather than the usual line and a half. That slack
+    // exists because every estimate here counts CHARACTERS against a column
+    // where the engine measures glyphs and breaks at words; this quote has no
+    // characters to disagree about, so the estimate should be exact and the only
+    // thing the slack could hide is a line charged for a body that is not there.
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    if (@abs(rows[0].height - priced) > 0.5 * main.body_line_height) {
+        std.debug.print("\nrow with a picture chip draws {d}, priced {d}\n", .{ rows[0].height, priced });
+        return error.ChipNotPriced;
+    }
+}

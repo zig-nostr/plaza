@@ -2794,6 +2794,20 @@ const QuoteEntry = struct {
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
+    /// The HOST of the picture the quoted note carries, when it carries one.
+    ///
+    /// The URL itself is deliberately cut out of `text_buf` (a raw image URL is
+    /// not something to read), and nothing recorded that it had ever been there:
+    /// a quoted note whose whole content is one picture came out of this cache
+    /// with an empty body and drew a card with a name, a time and nothing else,
+    /// which reads as a rendering fault rather than as a picture.
+    ///
+    /// The host and not the URL, because the card cannot show the picture: all
+    /// sixteen registry slots are spoken for (nine avatars, a banner, six feed
+    /// pictures) and taking one here would mean taking it from those. Pressing
+    /// the card opens the quoted note, where the picture draws with a real slot.
+    image_host_buf: [48]u8 = [_]u8{0} ** 48,
+    image_host_len: u8 = 0,
     /// What the quoted note itself quotes, if anything. Depth stops here (11g):
     /// one hop is a pill saying where it goes, never a third nested body. The
     /// reference is decoded from the event's own content at fill time, because
@@ -3299,6 +3313,10 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         q.created_at = se.event.created_at;
         var tmp: [note_content_cap]u8 = undefined;
         const omit = firstImageUrl(se.event.content) orelse "";
+        const host = urlHost(omit);
+        const host_len = @min(host.len, q.image_host_buf.len);
+        @memcpy(q.image_host_buf[0..host_len], host[0..host_len]);
+        q.image_host_len = @intCast(host_len);
         const wrote = renderContent(&tmp, se.event.content, omit);
         const keep = utf8SafeLen(tmp[0..wrote], q.text_buf.len);
         @memcpy(q.text_buf[0..keep], tmp[0..keep]);
@@ -3463,13 +3481,7 @@ const Profile = struct {
     }
     /// The host on its own: `https://fiatjaf.com/about` reads as `fiatjaf.com`.
     fn websiteHost(self: *const Profile) []const u8 {
-        var rest = self.website();
-        inline for ([_][]const u8{ "https://", "http://" }) |scheme| {
-            if (std.mem.startsWith(u8, rest, scheme)) rest = rest[scheme.len..];
-        }
-        if (std.mem.startsWith(u8, rest, "www.")) rest = rest["www.".len..];
-        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
-        return rest;
+        return urlHost(self.website());
     }
     fn nip05(self: *const Profile) []const u8 {
         return self.nip05_buf[0..self.nip05_len];
@@ -7324,6 +7336,19 @@ pub fn looksLikeImageUrl(url: []const u8) bool {
 
 /// The first image URL in `content`, or null. Recognised by extension, which is
 /// what Nostr media hosts serve; a link without one stays ordinary text.
+/// A URL's host, as a reader says it: no scheme, no `www.`, no path. One
+/// spelling, because two of them drift and then two places disagree about what
+/// the same address is called.
+pub fn urlHost(url: []const u8) []const u8 {
+    var rest = url;
+    inline for ([_][]const u8{ "https://", "http://" }) |scheme| {
+        if (std.mem.startsWith(u8, rest, scheme)) rest = rest[scheme.len..];
+    }
+    if (std.mem.startsWith(u8, rest, "www.")) rest = rest["www.".len..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    return rest;
+}
+
 pub fn firstImageUrl(content: []const u8) ?[]const u8 {
     const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
     var i: usize = 0;
@@ -9665,12 +9690,17 @@ fn quoteAsideExtent(id: [32]u8) f32 {
         // The depth-1 pill, when the quoted note quotes something itself: it is
         // a row of its own under the body, and the row around it is priced.
         .loaded => quote_aside_chrome + quoteBodyLines(e) * body_line_height +
-            (if (e.has_quote_of) quote_pill_height + 4 else 0),
+            (if (e.has_quote_of) quote_pill_height + 4 else 0) +
+            (if (e.image_host_len > 0) quote_pill_height + 4 else 0),
     };
 }
 
 /// The lines a cached quote's body draws, counted the way the clamp cuts them.
 fn quoteBodyLines(e: *const QuoteEntry) f32 {
+    // No body, no line. A quoted note that is nothing but a picture draws no
+    // body at all, and charging it one line reserved a blank row under the name
+    // that nothing ever filled.
+    if (e.text_len == 0) return 0;
     var lines: usize = 1;
     var column: usize = 0;
     for (e.text_buf[0..e.text_len]) |c| {
@@ -14034,7 +14064,9 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         }),
         // Four lines of the quoted note, and no more: a quote is an aside, and
         // its height has to be known where the outer row is priced.
-        quoteBody(ui, note),
+        if (q.text_len > 0) quoteBody(ui, note) else ui.spacer(0),
+        // What the card cannot draw, said rather than left blank.
+        if (q.image_host_len > 0) quoteMediaChip(ui, q.image_host_buf[0..q.image_host_len]) else ui.spacer(0),
         // A quote of a quote stops here. One more body would be a third voice in
         // a row, so the second hop is a pill that says where it goes.
         if (q.has_quote_of) quotingPill(ui, q.quote_of) else ui.spacer(0),
@@ -14050,6 +14082,35 @@ fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
     var node = textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
     node.widget.semantics.label = "Quoted note body";
     return node;
+}
+
+/// A picture the quote card cannot draw, named instead of left out.
+///
+/// Not a control: pressing the CARD already opens the quoted note, and that is
+/// where the picture renders with a registry slot of its own. A second press
+/// target here would offer a shorter way to the same place and take a slot to
+/// do it.
+fn quoteMediaChip(ui: *AppUi, host: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.panel, .{
+            .height = quote_pill_height,
+            .padding = 0.01,
+            .style = .{ .background = p.surface_pill, .border = p.border_pill, .radius = 999, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 8),
+                ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "image"),
+                hgap(ui, 6),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = ui.fmt("Picture from {s}", .{host}), .scale = meta_scale }},
+                ),
+                hgap(ui, 8),
+            }),
+        }),
+        ui.spacer(1),
+    });
 }
 
 /// 11g's pill: where the quoted note's own quote goes, one hop, as a line rather
@@ -14231,6 +14292,16 @@ pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []con
     @memcpy(e.text_buf[0..keep], text[0..keep]);
     e.text_len = @intCast(keep);
     e.state = .loaded;
+}
+
+pub fn wantQuoteForTest(id: [32]u8) void {
+    wantQuote(id);
+}
+
+/// The real fill path, over a real store: what a quote card knows about the
+/// note it draws comes from here and nowhere else.
+pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
+    refreshQuotes(store);
 }
 
 pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
