@@ -9011,9 +9011,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
         ui.row(.{ .cross = .center, .gap = 6 }, .{
-            ui.el(.data_row, .{ .on_press = .close_bunker, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .label = "Back" } }, .{
-                ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
-            }),
+            backControl(ui, "Back", .close_bunker),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Connect your signer", .weight = .bold, .scale = 1.3 }},
@@ -9876,6 +9874,35 @@ fn threadEmptyNote(ui: *AppUi) AppUi.Node {
     });
 }
 
+/// A back control: a chevron, where it goes, and a press.
+///
+/// `ui.row`, NOT `ui.el(.data_row, ...)`, and that is the whole point of this
+/// function existing. A `.data_row` does not take its width from its children:
+/// it lays out at ZERO wide while its chevron and label paint outside it. The
+/// row containing it then places the next sibling at the back control's own x
+/// plus the gap, so the screen's title is drawn ON TOP of the thing that goes
+/// back. Three headers did this, and the thread's read as one unbroken smear of
+/// "Starter pack", "Thread" and "3 replies" in the same place.
+///
+/// The zero width is invisible to the widget tree and to mouse input, which
+/// hit-tests to the label and walks UP to whatever claims the press. Only a
+/// laid-out frame shows it, which is why `no control that can be pressed is
+/// laid out at nothing` measures rather than inspects.
+fn backControl(ui: *AppUi, label: []const u8, press: Msg) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{
+        .cross = .center,
+        .gap = 3,
+        .padding = 4,
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Back", .focusable = true },
+    }, .{
+        ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+        ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, label),
+    });
+}
+
 /// The thread header: a Back affordance (to the parent thread, or the feed), the
 /// "Thread" label, and the reply count (known from the crowd count up front, so
 /// it reads right before the replies are fetched).
@@ -9890,12 +9917,7 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const count = model.threadReplyCount();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
-            ui.el(.data_row, .{ .on_press = .close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
-                ui.row(.{ .cross = .center, .gap = 3 }, .{
-                    ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, back_label),
-                }),
-            }),
+            backControl(ui, back_label, .close_thread),
             ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = "Thread", .weight = .bold }}),
             // The count reads once replies are known; before then it says nothing
             // rather than a misleading "0 replies" on a note that has some.
@@ -11782,12 +11804,7 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
         model.scope_name();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
-            ui.el(.data_row, .{ .on_press = Msg.close_thread, .padding = 4, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = "Back" } }, .{
-                ui.row(.{ .cross = .center, .gap = 3 }, .{
-                    ui.icon(.{ .width = 16, .height = 16, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
-                    ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_muted } }, back_label),
-                }),
-            }),
+            backControl(ui, back_label, Msg.close_thread),
             ui.spacer(1),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
