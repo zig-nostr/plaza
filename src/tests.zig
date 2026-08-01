@@ -9479,3 +9479,59 @@ test "a second Signet window is refused out loud, ceremony or not" {
         return error.ToastNotDrawn;
     }
 }
+
+// ---- P5b: the status bar sits on the floor -----------------------------------
+
+test "the status bar is on the floor of the canvas at every height" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Reported as an intermittent crop of the bottom bar. It is NOT the layout:
+    // this holds the bar to the floor of whatever canvas the app is handed, at
+    // every height from below the window's own minimum to well past its default,
+    // with the pool healthy and with it dead (the offline banner is extra height
+    // above the bar, which is the shape most likely to push it off). If the crop
+    // is ever traced to Plaza rather than to the size the platform hands it, this
+    // is the line that should have caught it.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysForTest();
+
+    for ([_]bool{ true, false }) |pool_up| {
+        main.resetRelaysForTest();
+        for (0..main.max_relays_for_test) |r| main.setRelayStatusForTest(r, pool_up);
+        var model = main.initialModel();
+        model.stage = .ready;
+
+        var first_gap: ?f32 = null;
+        var h: f32 = 600;
+        while (h <= 900) : (h += 25) {
+            const p = try painted.Painted.renderAt(arena, &model, main.window_width, h);
+            const chip = p.frameOf("Relays") orelse {
+                std.debug.print("no relay chip at height {d:.0}\n", .{h});
+                return error.NoStatusBar;
+            };
+            const gap = h - (chip.y + chip.height);
+            if (gap < 0) {
+                std.debug.print(
+                    "at height {d:.0} the status bar ends at {d:.1}, past the floor\n",
+                    .{ h, chip.y + chip.height },
+                );
+                return error.StatusBarOffTheFloor;
+            }
+            // And it is the SAME distance from the floor every time: a bar that
+            // drifts up as the window grows is one the reader loses at some
+            // other size, which is what "sometimes" would look like.
+            if (first_gap) |g0| {
+                if (@abs(gap - g0) > 0.5) {
+                    std.debug.print(
+                        "the status bar sits {d:.1} above the floor at {d:.0} and {d:.1} at 600\n",
+                        .{ gap, h, g0 },
+                    );
+                    return error.StatusBarDrifts;
+                }
+            } else first_gap = gap;
+        }
+    }
+}
