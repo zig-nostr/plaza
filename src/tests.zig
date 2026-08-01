@@ -2482,14 +2482,133 @@ test "a deep back-stack still lays out" {
         model.thread_stack[d].note.id = 500 + @as(i64, @intCast(d));
         model.thread_stack[d].note.pubkey = author;
     }
-    // Every depth the stack can reach, including full.
-    for (0..main.thread_depth_max + 1) |depth| {
-        model.thread_stack_len = depth;
-        const p = painted.Painted.render(arena, &model) catch |err| {
-            std.debug.print("back-stack depth {d} refused: {s}\n", .{ depth, @errorName(err) });
-            return err;
-        };
-        try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
+    // Settings at its LARGEST, not its default: eight relays is the cap, six
+    // suggestions is the cap, and a local key adds the backup card with the
+    // secret revealed. Measuring the sheet a fresh install happens to build
+    // would be measuring the easy case, and the ceiling is not crossed by the
+    // easy case.
+    main.resetRelaysForTest();
+    for (0..main.max_relays_for_test) |r| {
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "wss://relay-{d}.a-fairly-long-hostname.example.com", .{r});
+        _ = main.addRelayForTest(url, true, true);
+    }
+    const suggestion_tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://suggested-one.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-two.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-three.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-four.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-five.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-six.a-fairly-long-hostname.example.com", "write" },
+    };
+    main.ingestRelayListForTest(.{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{9} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &suggestion_tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    });
+    main.setIdentityForTest([_]u8{0x33} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysForTest();
+    model.reveal_nsec = true;
+
+    // Every depth the stack can reach, including full, and with the Settings
+    // sheet over it. Settings is a SHEET now rather than a screen, so it no
+    // longer replaces this tree, it is added to it: the deepest stack plus the
+    // largest sheet is the worst frame the app can be asked to build, and it is
+    // the one that has to fit.
+    main.resetInboxForTest();
+    seedInbox(main.inbox_page * 2, 0xB0, 1_800_000_000);
+    defer main.resetInboxForTest();
+    // A feed as long as the buffer holds, under the thread. The windowed list
+    // is supposed to build only what the viewport needs, and a thread over it
+    // occludes even that, so this should cost nothing; it is here so that if
+    // either ever stops being true, this is where it is caught.
+    for (0..200) |k| {
+        model.notes[k] = threadNote(0x77, 1_800_000_000, 0);
+        model.notes[k].id = @intCast(k + 5000);
+        model.notes[k].pubkey = author;
+    }
+    model.notes_len = 200;
+
+    // Everything that can be on screen at once, over every depth the stack can
+    // reach. A sheet is LAYERED on the feed rather than swapping it out, so the
+    // frame the app has to draw is the base plus the sheet, and the base at
+    // depth six is the most expensive tree in the app.
+    const Frame = struct { name: []const u8, arm: *const fn (*Model) void };
+    const frames = [_]Frame{
+        .{ .name = "feed", .arm = struct {
+            fn f(_: *Model) void {}
+        }.f },
+        .{ .name = "settings", .arm = struct {
+            fn f(m: *Model) void {
+                m.stage = .settings;
+            }
+        }.f },
+        .{ .name = "notifications", .arm = struct {
+            fn f(m: *Model) void {
+                m.notifications_open = true;
+            }
+        }.f },
+        .{ .name = "compose", .arm = struct {
+            fn f(m: *Model) void {
+                m.composing = true;
+            }
+        }.f },
+        .{ .name = "join", .arm = struct {
+            fn f(m: *Model) void {
+                m.joining = true;
+            }
+        }.f },
+        .{ .name = "edit profile", .arm = struct {
+            fn f(m: *Model) void {
+                m.stage = .settings;
+                m.editing_profile = true;
+            }
+        }.f },
+    };
+
+    const thread_root = model.thread_root;
+    for (frames) |frame| {
+        // Depth 0 here means NO thread at all, not a thread at the bottom of the
+        // stack: with a thread open the feed's own rows are occluded and cost
+        // nothing, so a sweep that always has one open never measures the feed.
+        // Live, a sheet over a plain loaded feed is the second most expensive
+        // frame in the app, and it was the one this loop could not see.
+        for (0..main.thread_depth_max + 2) |step| {
+            model.stage = .ready;
+            model.notifications_open = false;
+            model.composing = false;
+            model.joining = false;
+            model.editing_profile = false;
+            const depth = if (step == 0) 0 else step - 1;
+            model.viewing_thread = if (step == 0) 0 else 1;
+            model.thread_root = if (step == 0) .{} else thread_root;
+            model.thread_stack_len = depth;
+            frame.arm(&model);
+            const p = painted.Painted.render(arena, &model) catch |err| {
+                std.debug.print("{s} at step {d} refused: {s}\n", .{ frame.name, step, @errorName(err) });
+                return err;
+            };
+            // A tenth of the ceiling has to be left over. Not because the
+            // eleventh-hour node is special, but because the ceiling is a CLIFF
+            // (the view is refused whole, so the window stops drawing) and a
+            // frame that clears it by fifty nodes is one relay row, one section
+            // or one more list item away from the app going blank in a state
+            // nobody will think to test. The most expensive frame here is
+            // notifications over the deepest thread, and it clears by 133.
+            const headroom = native_sdk.runtime.max_canvas_widget_nodes_per_view / 10;
+            if (p.layout.nodes.len + headroom >= native_sdk.runtime.max_canvas_widget_nodes_per_view) {
+                std.debug.print(
+                    "{s} at step {d}: {d} nodes, ceiling is {d}, and {d} of it has to stay free\n",
+                    .{ frame.name, step, p.layout.nodes.len, native_sdk.runtime.max_canvas_widget_nodes_per_view, headroom },
+                );
+                return error.NodeCeilingCrossed;
+            }
+        }
     }
 }
 
@@ -8676,6 +8795,17 @@ const modal_cases = [_]ModalCase{
         }.f,
     },
     .{
+        .name = "settings",
+        .label = "Settings",
+        .dismiss = .close_settings,
+        .control = "Copy npub",
+        .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .settings;
+            }
+        }.f,
+    },
+    .{
         .name = "edit profile",
         .label = "Edit profile",
         .dismiss = .close_profile_edit,
@@ -8689,21 +8819,23 @@ const modal_cases = [_]ModalCase{
     },
 };
 
-/// The outermost `.card` inside the dialog labelled `label`: the modal's own
-/// surface, which is the boundary "outside" is measured against.
-fn modalCardFrame(p: painted.Painted, label: []const u8) ?native_sdk.geometry.RectF {
-    var dialog: ?usize = null;
+/// The node index of the dialog labelled `label`.
+fn modalDialogIndex(p: painted.Painted, label: []const u8) ?usize {
     for (p.layout.nodes, 0..) |node, i| {
         if (node.widget.kind != .dialog) continue;
         if (!std.mem.eql(u8, node.widget.semantics.label, label)) continue;
-        dialog = i;
-        break;
+        return i;
     }
-    const root = dialog orelse return null;
+    return null;
+}
+
+/// The outermost `.card` inside the dialog at `root`: the modal's own surface,
+/// which is the boundary "outside" is measured against.
+fn modalCardIndex(p: painted.Painted, root: usize) ?usize {
     for (p.layout.nodes, 0..) |node, i| {
         if (node.widget.kind != .card) continue;
         if (!isDescendantOf(p, i, root)) continue;
-        return node.widget.frame;
+        return i;
     }
     return null;
 }
@@ -8712,9 +8844,15 @@ fn modalCardFrame(p: painted.Painted, label: []const u8) ?native_sdk.geometry.Re
 /// words in the widget's TEXT, while a hand-built row carries them as an
 /// accessibility label. A lookup that knows only one of the two silently misses
 /// half the controls in the app, and a miss here reads as "no such control".
-fn controlNode(p: painted.Painted, name: []const u8) ?canvas.Widget {
-    for (p.layout.nodes) |node| {
+fn controlNode(p: painted.Painted, root: usize, name: []const u8) ?canvas.Widget {
+    for (p.layout.nodes, 0..) |node, i| {
         const w = node.widget;
+        // Scoped to the sheet under test, not the whole window. Two sheets can
+        // be on screen at once (edit profile sits over Settings) and both carry
+        // a button called "Close"; an unscoped lookup found the one BEHIND the
+        // sheet and then asked what a press at its coordinates did, which is a
+        // question about the sheet on top.
+        if (!isDescendantOf(p, i, root)) continue;
         if (std.mem.eql(u8, w.semantics.label, name) or std.mem.eql(u8, w.text, name)) {
             for (p.tree.handlers) |h| {
                 if (h.id == w.id and h.event == .press) return w;
@@ -8748,10 +8886,15 @@ test "a press outside a modal's card closes it, and a press inside never does" {
         c.open(&model);
         const p = try painted.Painted.render(arena, &model);
 
-        const card = modalCardFrame(p, c.label) orelse {
+        const root = modalDialogIndex(p, c.label) orelse {
+            std.debug.print("{s}: no dialog labelled \"{s}\"\n", .{ c.name, c.label });
+            return error.NoModalDialog;
+        };
+        const card_index = modalCardIndex(p, root) orelse {
             std.debug.print("{s}: no card inside the dialog labelled \"{s}\"\n", .{ c.name, c.label });
             return error.NoModalCard;
         };
+        const card = p.layout.nodes[card_index].widget.frame;
         // Cards are centred and far narrower than the window, so the band to the
         // left of one is backdrop at every height.
         try testing.expect(card.x > 8);
@@ -8762,7 +8905,7 @@ test "a press outside a modal's card closes it, and a press inside never does" {
         const outside_x = card.x / 2;
         for ([_]f32{ 0.25, 0.5, 0.75 }) |fraction| {
             const y = main.window_height * fraction;
-            const msg = p.pressMsgAt(outside_x, y) orelse {
+            const msg = try p.pressMsgAt(outside_x, y) orelse {
                 std.debug.print(
                     "{s}: a press at ({d:.0}, {d:.0}), outside the card, dispatches NOTHING\n",
                     .{ c.name, outside_x, y },
@@ -8773,42 +8916,47 @@ test "a press outside a modal's card closes it, and a press inside never does" {
         }
 
         // Inside: a grid over the whole card, asking where each press LANDS
-        // rather than what it dispatches. The rule is that it never reaches the
-        // backdrop; what a control inside the card does with a press aimed at it
-        // is that control's own business, and a modal is allowed to carry a
-        // close control of its own (this ladder's "Keep browsing" is one).
+        // rather than what it dispatches. The rule is that it stops at the card
+        // or at something the card contains; what a control inside then does
+        // with a press aimed at it is that control's own business, and a modal
+        // is allowed to carry a close control of its own (this ladder's "Keep
+        // browsing" is one).
+        //
+        // Stated as containment rather than "is not the dialog" because a card
+        // is not always the thing that stops the press: Settings is a scroll
+        // filling its card, and a scroll view claims presses on its own. Either
+        // answer is correct; escaping the card is not.
         //
         // A grid rather than the centre alone: whether the centre happens to sit
         // on a control is an accident of the layout, and the rule is about every
         // point on the card.
-        var absorbed: usize = 0;
+        var landed_inside: usize = 0;
         for (1..8) |ix| {
             for (1..8) |iy| {
                 const x = card.x + card.width * (@as(f32, @floatFromInt(ix)) / 8.0);
                 const y = card.y + card.height * (@as(f32, @floatFromInt(iy)) / 8.0);
-                const target = p.pressTargetAt(x, y) orelse continue;
-                if (target.kind == .dialog) {
+                const target = try p.pressTargetAt(x, y) orelse continue;
+                if (target.index != card_index and !isDescendantOf(p, target.index, card_index)) {
                     std.debug.print(
-                        "{s}: a press at ({d:.0}, {d:.0}), INSIDE the card, reaches the backdrop\n",
-                        .{ c.name, x, y },
+                        "{s}: a press at ({d:.0}, {d:.0}), INSIDE the card, lands on a {s} outside it\n",
+                        .{ c.name, x, y, @tagName(target.kind) },
                     );
                     return error.CardFallsThrough;
                 }
-                if (target.kind == .card) absorbed += 1;
+                landed_inside += 1;
             }
         }
-        // And the absorbing is actually exercised: a card whose every sampled
-        // point sat on a control would pass the rule above without the card ever
-        // having to stop anything.
-        if (absorbed == 0) {
-            std.debug.print("{s}: no sampled point landed on the card itself\n", .{c.name});
-            return error.NothingAbsorbed;
+        // And the grid actually sampled something: a card laid out at nothing
+        // would satisfy the rule above by never entering the loop body.
+        if (landed_inside == 0) {
+            std.debug.print("{s}: no sampled point landed anywhere at all\n", .{c.name});
+            return error.NothingSampled;
         }
 
         // And the card still works: the control named for this modal answers to
         // its own message where it is drawn. An absorber that swallowed the
         // buttons too would satisfy every rule above and leave the sheet inert.
-        const control = controlNode(p, c.control) orelse {
+        const control = controlNode(p, root, c.control) orelse {
             std.debug.print("{s}: no control called \"{s}\"\n", .{ c.name, c.control });
             return error.NoSuchControl;
         };
@@ -8816,7 +8964,7 @@ test "a press outside a modal's card closes it, and a press inside never does" {
             std.debug.print("{s}: \"{s}\" has no press bound\n", .{ c.name, c.control });
             return error.ControlNotWired;
         };
-        const landed = p.pressMsgAt(
+        const landed = try p.pressMsgAt(
             control.frame.x + control.frame.width / 2,
             control.frame.y + control.frame.height / 2,
         ) orelse {
@@ -8847,18 +8995,19 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     model.expanded_note = 1;
 
     const p = try painted.Painted.render(arena, &model);
-    const centre = p.pressMsgAt(main.window_width / 2, main.window_height / 2) orelse
+    const viewer = modalDialogIndex(p, "Expanded image") orelse return error.NoViewer;
+    const centre = try p.pressMsgAt(main.window_width / 2, main.window_height / 2) orelse
         return error.ViewerBackdropIsDead;
     try testing.expectEqualStrings(@tagName(Msg.close_image), @tagName(centre));
 
     // The two controls it carries still answer for themselves.
     for ([_][]const u8{ "Close", "Open original" }) |name| {
-        const control = controlNode(p, name) orelse {
+        const control = controlNode(p, viewer, name) orelse {
             std.debug.print("the viewer has no control called \"{s}\"\n", .{name});
             return error.NoSuchControl;
         };
         const wired = pressMsgById(p, control.id) orelse return error.ControlNotWired;
-        const landed = p.pressMsgAt(
+        const landed = try p.pressMsgAt(
             control.frame.x + control.frame.width / 2,
             control.frame.y + control.frame.height / 2,
         ) orelse {
@@ -8906,4 +9055,155 @@ test "a card that absorbs presses states its own surface" {
     }
     // One per modal at least, or the loop above proved nothing.
     try testing.expect(checked >= modal_cases.len);
+}
+
+// ---- P3: settings is a sheet -------------------------------------------------
+
+/// Settings with everything in it that can be in it: eight relays, six
+/// suggestions with hostnames long enough to overrun a row, and a local key.
+fn openFullSettings(model: *Model) void {
+    main.resetRelaysForTest();
+    for (0..main.max_relays_for_test) |r| {
+        var url_buf: [64]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "wss://relay-{d}.a-fairly-long-hostname.example.com", .{r}) catch continue;
+        _ = main.addRelayForTest(url, true, true);
+    }
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://suggested-one.a-fairly-long-hostname.example.com", "write" },
+        &.{ "r", "wss://suggested-two.a-fairly-long-hostname.example.com", "write" },
+        // Longer than a row of its own can hold. A relay URL is accepted up to
+        // 96 bytes, so this is representable data, not a stunt: without it the
+        // shortening below is code no test can tell from its absence.
+        &.{ "r", "wss://a-suggested-relay-with-an-absurdly-long-hostname.somewhere.deep.example.com", "write" },
+        &.{ "r", "wss://four.example.com", "write" },
+        &.{ "r", "wss://five.example.org", "write" },
+        &.{ "r", "wss://six.example.net", "write" },
+    };
+    main.ingestRelayListForTest(.{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{9} ** 32,
+        .created_at = 0,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    });
+    model.stage = .settings;
+    model.reveal_nsec = true;
+}
+
+test "the settings sheet paints its own surface the whole way down" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // As a screen, the grey behind the settings column was a panel inside the
+    // scroll, and the scroll handed it the VIEWPORT's height: it stopped dead at
+    // 760 while the sections ran on to 1253, so scrolling down left the rest of
+    // Settings sitting on bare window. The sheet cannot do that, because the
+    // scroll is inside the card rather than the card inside the scroll.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysForTest();
+
+    var model = main.initialModel();
+    openFullSettings(&model);
+    const p = try painted.Painted.render(arena, &model);
+
+    const root = modalDialogIndex(p, "Settings") orelse return error.NoSettingsSheet;
+    const card_index = modalCardIndex(p, root) orelse return error.NoSettingsCard;
+    const card = p.layout.nodes[card_index].widget.frame;
+    try testing.expect(card.height > 400);
+
+    // Every height inside the sheet, down its middle: something has to paint.
+    // The bug was not a wrong colour, it was nothing at all past the fold.
+    var y = card.y + 2;
+    while (y < card.y + card.height - 2) : (y += 8) {
+        if (p.fillAt(card.x + card.width / 2, y) == null) {
+            std.debug.print("the settings sheet paints nothing at y={d:.0} (card {d:.0}..{d:.0})\n", .{ y, card.y, card.y + card.height });
+            return error.SurfaceStopsShort;
+        }
+    }
+
+    // And it does not run past the window, which is the other half of the same
+    // fault: a surface that reaches its content by growing off the screen.
+    try testing.expect(card.y + card.height <= main.window_height);
+}
+
+test "no relay suggestion is drawn outside the card that holds it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Rows in this engine never flow-wrap, whatever `wrap` says on them, so a
+    // row of chips is exactly as wide as its chips: six suggested relays used to
+    // reach x=1372 in a 760 window. They are packed into rows here, and this is
+    // the rule that says the packing agrees with the layout.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysForTest();
+
+    var model = main.initialModel();
+    openFullSettings(&model);
+    const p = try painted.Painted.render(arena, &model);
+
+    const root = modalDialogIndex(p, "Settings") orelse return error.NoSettingsSheet;
+    const card_index = modalCardIndex(p, root) orelse return error.NoSettingsCard;
+    const sheet = p.layout.nodes[card_index].widget.frame;
+
+    var seen: usize = 0;
+    for (p.layout.nodes, 0..) |node, i| {
+        // Found by the message they carry, not by the words on them: a label
+        // filter here would silently match nothing the day the wording changes,
+        // and a rule that matches nothing passes.
+        const msg = pressMsgById(p, node.widget.id) orelse continue;
+        if (msg != .relay_suggest) continue;
+        if (!isDescendantOf(p, i, card_index)) continue;
+        const label = node.widget.semantics.label;
+        seen += 1;
+        const right = node.widget.frame.x + node.widget.frame.width;
+        if (right > sheet.x + sheet.width or node.widget.frame.x < sheet.x) {
+            std.debug.print(
+                "\"{s}\" spans {d:.0}..{d:.0}, the sheet spans {d:.0}..{d:.0}\n",
+                .{ label, node.widget.frame.x, right, sheet.x, sheet.x + sheet.width },
+            );
+            return error.ChipOverflows;
+        }
+    }
+    // Every suggestion the table holds is on screen: packing must not drop one.
+    try testing.expectEqual(main.relaySuggestionCount(), seen);
+}
+
+test "a settings card's content is as wide as the constant says" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `settings_content_width` is derived from four separate insets, and the
+    // chip packing trusts it. If any of them moves and this does not, the chips
+    // pack against a width the layout does not give them, which is how the row
+    // overflowed in the first place: an arithmetic that nobody checked against
+    // a laid-out frame.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.resetRelaysForTest();
+
+    var model = main.initialModel();
+    openFullSettings(&model);
+    const p = try painted.Painted.render(arena, &model);
+
+    // The relay card is the widest content a settings section holds.
+    const row = p.frameOf("Change what wss://relay-0.a-fairly-long-hostname.example.com is for") orelse
+        return error.NoRelayRow;
+    var widest: f32 = 0;
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind != .card) continue;
+        const f = node.widget.frame;
+        // The section card holding that row, found by containment on the y axis.
+        if (row.y < f.y or row.y > f.y + f.height) continue;
+        if (f.width > widest and f.width < main.settings_column_width_for_test) widest = f.width;
+    }
+    try testing.expect(widest > 0);
+    // The card, less its own 12 either side, is what the content gets.
+    try testing.expectApproxEqAbs(main.settings_content_width_for_test, widest - 24, 1.0);
 }

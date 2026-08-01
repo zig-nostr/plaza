@@ -278,20 +278,28 @@ pub const Painted = struct {
     /// which is how a click on a modal's own card can end up dismissing the
     /// modal, and why "is the control wired?" is a different question from
     /// "where does this click go?".
-    pub fn pressTargetAt(self: Painted, x: f32, y: f32) ?canvas.WidgetHit {
-        var entries: [canvas.max_widget_depth]canvas.WidgetEventRouteEntry = undefined;
-        const route = self.layout.routePointerEvent(
+    /// The route buffer holds the CAPTURE pass and the BUBBLE pass, so it needs
+    /// twice the depth, not the depth. A buffer of `max_widget_depth` overflowed
+    /// on the first tree deep enough to need it (Settings, at fourteen levels)
+    /// and the error read exactly like "nothing is here": every rule asking
+    /// where a press lands went quietly green over the deep half of the app.
+    /// The error is returned rather than swallowed for the same reason.
+    const route_capacity = canvas.max_widget_depth * 2 + 1;
+
+    pub fn pressTargetAt(self: Painted, x: f32, y: f32) !?canvas.WidgetHit {
+        var entries: [route_capacity]canvas.WidgetEventRouteEntry = undefined;
+        const route = try self.layout.routePointerEvent(
             .{ .phase = .down, .point = geometry.PointF.init(x, y) },
             &entries,
-        ) catch return null;
+        );
         return route.press_target;
     }
 
     /// The Msg a press at (`x`, `y`) dispatches, or null where the press lands on
     /// something with nothing bound (which INCLUDES a surface that claims the
     /// press only to stop it falling through).
-    pub fn pressMsgAt(self: Painted, x: f32, y: f32) ?main.Msg {
-        const target = self.pressTargetAt(x, y) orelse return null;
+    pub fn pressMsgAt(self: Painted, x: f32, y: f32) !?main.Msg {
+        const target = try self.pressTargetAt(x, y) orelse return null;
         for (self.tree.handlers) |h| {
             if (h.id != target.id or h.event != .press) continue;
             return switch (h.action) {
