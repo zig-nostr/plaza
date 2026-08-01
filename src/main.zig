@@ -302,12 +302,16 @@ fn adoptRelayList() bool {
     // An edit made while the event was in flight wins: their hands beat their
     // history.
     if (relayListIsOwned()) return false;
+    var before: [max_relays][96]u8 = undefined;
+    var lens: [max_relays]u8 = undefined;
+    snapshotRelayUrls(&before, &lens);
     lockRelayTable();
     g_relays = g_staged_relays;
     unlockRelayTable();
-    // Every slot may now hold a different relay, so everything recorded against
-    // a slot index is about the previous occupant and is dropped.
-    for (0..max_relays) |i| forgetRelaySlotState(i);
+    // A slot MAY now hold a different relay, in which case everything recorded
+    // against it is about the previous occupant and is dropped. A slot that kept
+    // its relay keeps its row: the connection behind it never went anywhere.
+    forgetChangedRelaySlotStates(&before, &lens);
     var n: u8 = 0;
     for (g_relays, 0..) |e, i| {
         if (e.used) n = @intCast(i + 1);
@@ -758,10 +762,16 @@ pub fn writeRelayCount() usize {
     return n;
 }
 
-/// Puts the pool back to the one the app was born with, and forgets everything
-/// recorded against the old seats. Used on sign-out, where the list that is
+/// Puts the pool back to the one the app was born with, and forgets what was
+/// recorded against the seats that change hands. A seat still holding the same
+/// relay keeps its row, because the socket behind it never went anywhere: see
+/// `forgetChangedRelaySlotStates` for why clearing it would not go stale, it
+/// would simply stay wrong. Used on sign-out, where the list that is
 /// leaving belonged to the account that is leaving.
 fn resetRelaysToBootstrap() void {
+    var before: [max_relays][96]u8 = undefined;
+    var lens: [max_relays]u8 = undefined;
+    snapshotRelayUrls(&before, &lens);
     lockRelayTable();
     g_relays = [_]RelayEntry{.{}} ** max_relays;
     g_staged_created_at = 0;
@@ -772,8 +782,10 @@ fn resetRelaysToBootstrap() void {
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     g_relay_list_dirty = false;
-    for (0..max_relays) |i| forgetRelaySlotState(i);
+    // Seeded FIRST, so the comparison below is against the pool that is actually
+    // in place rather than the momentary empty table.
     seedBootstrapRelays();
+    forgetChangedRelaySlotStates(&before, &lens);
     forgetOutboxAcks();
     saveRelays();
 }
@@ -839,6 +851,10 @@ pub fn liveRelayCountForTest() usize {
 
 pub fn setRelayStatusForTest(i: usize, connected: bool) void {
     setRelayStatus(i, if (connected) .connected else .offline);
+}
+
+pub fn relayStatusConnectedForTest(i: usize) bool {
+    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .connected;
 }
 
 pub fn isReaderNoteForTest(kind: u16) bool {
@@ -8041,6 +8057,44 @@ fn forgetRelaySlotState(i: usize) void {
     setRelayStatus(i, .offline);
     clearRelayRtt(i);
     forgetRelaySeen(i);
+}
+
+/// The URLs currently in the slots, so a table swap can tell which seats
+/// actually changed hands.
+fn snapshotRelayUrls(out: *[max_relays][96]u8, lens: *[max_relays]u8) void {
+    lockRelayTable();
+    defer unlockRelayTable();
+    for (&g_relays, 0..) |*e, i| {
+        lens[i] = if (e.used) e.url_len else 0;
+        if (e.used) @memcpy(out[i][0..e.url_len], e.url_buf[0..e.url_len]);
+    }
+}
+
+/// Drops what was recorded against every slot whose OCCUPANT changed, and
+/// leaves alone the slots still holding the same relay.
+///
+/// The whole-table version of this was `for (0..max_relays) |i|
+/// forgetRelaySlotState(i)`, and it is why the pool read `0/5` forever after a
+/// sign-out. Status, latency and seen-ness describe a LIVE CONNECTION, and the
+/// thread that owns that connection is parked in a blocking read almost all of
+/// the time: it cannot put a status back that somebody else cleared until its
+/// relay next says something, and a quiet relay never does. So clearing the row
+/// for a relay that is still perfectly connected does not go stale, it stays
+/// wrong, and the bar reads nothing-is-working over a pool that is working.
+///
+/// The seat metaphor the per-slot state is built on still holds: it is about the
+/// occupant, so it is dropped when the occupant changes and kept when it does
+/// not. Signing out replaces a list with the bootstrap five, and most of the
+/// time most of those seats do not change hands at all.
+fn forgetChangedRelaySlotStates(before: *const [max_relays][96]u8, lens: *const [max_relays]u8) void {
+    for (0..max_relays) |i| {
+        const was: []const u8 = before[i][0..lens[i]];
+        const now: []const u8 = if (relayAt(i)) |e| e.url() else "";
+        // Same relay in the same seat: its connection, its latency and its
+        // status all still describe something true.
+        if (was.len != 0 and now.len != 0 and relayUrlEql(was, now)) continue;
+        forgetRelaySlotState(i);
+    }
 }
 
 /// The relay list: which relays this app talks to, and in which direction.
