@@ -1130,7 +1130,22 @@ const quiet_row_extent: f32 = 56;
 // 11c's Settings geometry: a 440 column, a 38px header band, and the section
 // rhythm (16 between sections, 8 from a label to its card).
 const settings_column_width: f32 = 440;
+/// The padding a bare `.card` injects when `padding` is left unset, which is
+/// what `modalCard` does: zero IS the unset sentinel, so a card that states no
+/// padding gets the house inset rather than none.
+const modal_card_inset: f32 = 24;
+/// How wide the content of a settings card actually is: the sheet's column,
+/// less the modal card's house inset, the sheet's own 18 either side, and the
+/// section card's 12 either side. Derived rather than measured, so moving any
+/// one of them moves this with it, and held against the real layout by a test.
+const settings_content_width: f32 = settings_column_width - modal_card_inset * 2 - 18 * 2 - 12 * 2;
+/// How far the settings sheet sits in from the window's edges. Wider than the
+/// other sheets' 16: this one is as tall as the window allows, and a thin
+/// margin around a full-height card reads as a screen that failed to fill.
+const settings_sheet_inset: f32 = 28;
 const settings_header_height: f32 = 38;
+pub const settings_column_width_for_test = settings_column_width;
+pub const settings_content_width_for_test = settings_content_width;
 const settings_section_gap: f32 = 16;
 const settings_label_gap: f32 = 8;
 const settings_card_radius: f32 = 11;
@@ -4988,7 +5003,7 @@ pub const Note = struct {
 };
 
 /// Which top-level screen the app shows.
-const Stage = enum { onboarding, ready, settings };
+pub const Stage = enum { onboarding, ready, settings };
 
 pub const Model = struct {
     notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
@@ -7708,7 +7723,15 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 /// carries its own index into three different messages, which a binding cannot
 /// express: the same wall the feed hit. Cards below read top to bottom the way
 /// the screen does.
-fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
+///
+/// It is a SHEET over the feed rather than a screen instead of it. As a screen
+/// it had two faults that were really one fault: a 440 column centred on a bare
+/// window reads as a modal that forgot to be one, and the grey behind that
+/// column was a panel stretched by the scroll viewport, so it stopped dead at
+/// the window's height and everything past the fold sat on bare black. A card
+/// with the scroll INSIDE it cannot do that: the surface is the card's own, and
+/// the scroll is bounded by it rather than the other way round.
+fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     var sections: [6]AppUi.Node = undefined;
     var n: usize = 0;
@@ -7733,20 +7756,24 @@ fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     n += 1;
 
-    // The screen is a COLUMN of a stated width, centred: at 440 the sections read
-    // as one document rather than as cards stretched across a 760px window.
-    return ui.column(.{ .gap = 0, .grow = 1, .style = .{ .background = p.surface_window } }, .{
-        settingsHeader(ui),
-        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
-        ui.scroll(.{ .grow = 1 }, .{
-            ui.row(.{ .gap = 0 }, .{
-                ui.spacer(1),
-                ui.el(.panel, .{
-                    .width = settings_column_width,
-                    .padding = 0.01,
-                    .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .radius = 0, .stroke_width = 0 },
-                }, .{
-                    ui.column(.{ .gap = settings_section_gap, .padding = 0.01 }, .{
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = settings_sheet_inset,
+        .on_dismiss = Msg.close_settings,
+        .on_press = Msg.close_settings,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "Settings" },
+    }, .{
+        // No `cross` override, for the reason the notifications sheet spells
+        // out: `modalCard` states a width and no height, so under `.start` the
+        // card takes its intrinsic height and the `grow = 1` scroll inside it
+        // resolves to nothing.
+        ui.row(.{ .grow = 1, .main = .center }, .{
+            modalCard(ui, settings_column_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
+                settingsHeader(ui),
+                ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+                ui.scroll(.{ .grow = 1 }, .{
+                    ui.column(.{ .gap = settings_section_gap }, .{
                         vgap(ui, 16),
                         ui.row(.{ .gap = 0 }, .{
                             hgap(ui, 18),
@@ -7756,26 +7783,28 @@ fn settingsView(ui: *AppUi, model: *const Model) AppUi.Node {
                         vgap(ui, 18),
                     }),
                 }),
-                ui.spacer(1),
-            }),
+            })),
         }),
     });
 }
 
-/// The 38px header band. "Settings" sits centred in it, with Back on the left,
-/// so the title belongs to the window rather than to the column beneath it.
+/// The 38px header band. "Settings" sits centred in it, with the way out on the
+/// left, so the title belongs to the sheet rather than to the column beneath it.
 fn settingsHeader(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     return ui.row(.{ .cross = .center, .gap = 0, .height = settings_header_height, .padding = 0.01 }, .{
         hgap(ui, 10),
-        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Back"),
+        // "Close", not "Back": this is a sheet over the feed now, and Back is
+        // what the thread and profile headers say when there is a place behind
+        // to return to. There is nothing behind this but the feed it covers.
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Close"),
         ui.spacer(1),
         ui.paragraph(
             .{ .style = .{ .foreground = p.text_sheet_title } },
             &.{.{ .text = "Settings", .weight = .medium, .scale = settings_title_scale }},
         ),
         ui.spacer(1),
-        // The same width the Back button takes, so the title is centred in the
+        // The same width the Close button takes, so the title is centred in the
         // band rather than in what is left of it.
         hgap(ui, 62),
     });
@@ -8255,30 +8284,45 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
 /// The relays this reader's follows write to, offered as one press each. Empty
 /// until a follow's kind:10002 has actually been read, because a suggestion the
 /// app invented would just be another default wearing a recommendation's face.
+///
+/// The chips are packed into rows HERE rather than left to the layout, because
+/// rows and columns in this engine never flow-wrap their children: `wrap` is a
+/// line policy for text leaves and is silently inert on a container. This row
+/// carried `.wrap = true` and a comment describing wrapping that never
+/// happened, so six suggested relays ran to x=1372 in a 760 window, straight
+/// off the right edge of the card and the window with it.
 fn relaySuggestions(ui: *AppUi, model: *const Model) AppUi.Node {
-    _ = model;
     const p = theme.palette;
     const count = relaySuggestionCount();
     if (count == 0) return ui.spacer(0);
     const chips = ui.arena.alloc(AppUi.Node, count) catch return ui.spacer(0);
+    const widths = ui.arena.alloc(f32, count) catch return ui.spacer(0);
+    const tokens = theme.tokens(Model)(model);
     var n: usize = 0;
     for (0..count) |i| {
         var buf: [96]u8 = undefined;
         const url = relaySuggestionCopy(i, &buf) orelse continue;
         // The arena copy is what the frame renders: `buf` dies with this loop.
-        const shown = ui.arena.dupe(u8, relayShortName(url)) catch continue;
-        chips[n] = ui.el(.list_item, .{
-            .padding = 0.01,
-            .height = 22,
-            .cross = .center,
-            .on_press = Msg{ .relay_suggest = @intCast(i) },
-            .style = .{ .radius = 5, .border = p.border_chip, .stroke_width = 1 },
-            .semantics = .{ .role = .button, .label = ui.fmt("Add {s}", .{shown}), .focusable = true },
-        }, .{
-            hgap(ui, 7),
-            ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = ui.fmt("+ {s}", .{shown}), .monospace = true, .scale = mono_chip_scale }}),
-            hgap(ui, 7),
-        });
+        var shown: []const u8 = ui.arena.dupe(u8, relayShortName(url)) catch continue;
+        // Measured with the engine's own sizing, against the same tokens the
+        // frame is laid out with, so the packing below agrees with what the
+        // layout will actually do rather than with an estimate of it. A name too
+        // long for a row of its own is shortened until it fits, rather than
+        // allowed to hang off the card: the text is monospace, so cutting
+        // characters cuts width in proportion, and each cut is re-measured so
+        // the loop cannot talk itself into a width the engine disagrees with.
+        var chip = suggestionChip(ui, i, shown, tokens);
+        var attempts: usize = 0;
+        while (chip.width > settings_content_width and shown.len > 8 and attempts < 8) : (attempts += 1) {
+            const room: usize = @intFromFloat(@max(1, settings_content_width - relay_chip_chrome));
+            const have: usize = @intFromFloat(@max(1, chip.width - relay_chip_chrome));
+            const keep = @max(@as(usize, 7), (shown.len * room) / have -| 1);
+            if (keep >= shown.len) break;
+            shown = ui.fmt("{s}\u{2026}", .{shown[0..keep]});
+            chip = suggestionChip(ui, i, shown, tokens);
+        }
+        chips[n] = chip.node;
+        widths[n] = chip.width;
         n += 1;
     }
     if (n == 0) return ui.spacer(0);
@@ -8289,8 +8333,80 @@ fn relaySuggestions(ui: *AppUi, model: *const Model) AppUi.Node {
             &.{.{ .text = "Relays the people you read write to", .scale = mono_meta_scale }},
         ),
         vgap(ui, 6),
-        ui.row(.{ .gap = 6, .wrap = true }, .{chips[0..n]}),
+        chipRows(ui, chips[0..n], widths[0..n], settings_content_width, relay_chip_gap),
     });
+}
+
+/// A gap between suggestion chips, across and down.
+const relay_chip_gap: f32 = 6;
+
+/// Everything a chip is wider than its words: seven either side of the label
+/// and the hairline border. Stated rather than measured, because the engine
+/// does not measure a `.list_item` from its children at all: asking it for an
+/// intrinsic size returns the chrome alone, which is how the first version of
+/// this packing measured every chip at 24 points and put six of them on one
+/// row. The label is measured for real; this is added to it, and the rule in
+/// the suite holds the sum against a laid-out frame.
+const relay_chip_chrome: f32 = 15;
+
+/// One suggestion, as a chip, with the width it will actually take.
+fn suggestionChip(ui: *AppUi, index: usize, shown: []const u8, tokens: canvas.DesignTokens) struct { node: AppUi.Node, width: f32 } {
+    const p = theme.palette;
+    const label = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_muted_alt } },
+        &.{.{ .text = ui.fmt("+ {s}", .{shown}), .monospace = true, .scale = mono_chip_scale }},
+    );
+    const node = ui.el(.list_item, .{
+        .padding = 0.01,
+        .height = 22,
+        .cross = .center,
+        .on_press = Msg{ .relay_suggest = @intCast(index) },
+        .style = .{ .radius = 5, .border = p.border_chip, .stroke_width = 1 },
+        .semantics = .{ .role = .button, .label = ui.fmt("Add {s}", .{shown}), .focusable = true },
+    }, .{
+        hgap(ui, 7),
+        label,
+        hgap(ui, 7),
+    });
+    return .{ .node = node, .width = canvas.intrinsicWidgetSize(label.widget, tokens).width + relay_chip_chrome };
+}
+
+/// Packs pre-measured children into rows no wider than `limit`, greedily: the
+/// flow layout the engine does not do. A child wider than the limit on its own
+/// still gets a row to itself, because the alternative is dropping it.
+fn chipRows(ui: *AppUi, chips: []const AppUi.Node, widths: []const f32, limit: f32, gap: f32) AppUi.Node {
+    // At worst one chip per row, plus a gap row between each.
+    const lines = ui.arena.alloc(AppUi.Node, chips.len * 2) catch return ui.spacer(0);
+    var line_count: usize = 0;
+    var first: usize = 0;
+    var used: f32 = 0;
+    var i: usize = 0;
+    while (i < chips.len) {
+        const next = if (i == first) widths[i] else used + gap + widths[i];
+        if (i > first and next > limit) {
+            if (line_count > 0) {
+                lines[line_count] = vgap(ui, gap);
+                line_count += 1;
+            }
+            lines[line_count] = ui.row(.{ .gap = gap }, .{chips[first..i]});
+            line_count += 1;
+            first = i;
+            used = widths[i];
+            i += 1;
+            continue;
+        }
+        used = next;
+        i += 1;
+    }
+    if (first < chips.len) {
+        if (line_count > 0) {
+            lines[line_count] = vgap(ui, gap);
+            line_count += 1;
+        }
+        lines[line_count] = ui.row(.{ .gap = gap }, .{chips[first..chips.len]});
+        line_count += 1;
+    }
+    return ui.column(.{ .gap = 0 }, .{lines[0..line_count]});
 }
 
 /// A relay URL with the scheme and any trailing slash taken off. The scheme is
@@ -8331,8 +8447,12 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     const base = switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
-        .settings => settingsView(ui, model),
-        .ready => feedView(ui, model),
+        // Settings layers OVER the feed rather than replacing it, like every
+        // other sheet: the feed stays mounted and keeps its scroll offset, and
+        // it is what the sheet's scrim has to blur to look like glass. Without
+        // its thread levels, for the node-budget reason `feedView` states.
+        .settings => feedView(ui, model, false),
+        .ready => feedView(ui, model, true),
     };
     if (model.expanded_note) |note_id| {
         if (model.noteById(note_id)) |note| {
@@ -8351,8 +8471,14 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.notifications_open) {
         return ui.stack(.{ .grow = 1 }, .{ base, notificationsSheet(ui, model) });
     }
-    if (model.stage == .settings and model.editing_profile) {
-        return ui.stack(.{ .grow = 1 }, .{ base, profileSheet(ui, model) });
+    if (model.stage == .settings) {
+        // Both sheets, in order, when a profile is being edited: dropping the
+        // one underneath would make Settings blink out and back as the reader
+        // opens and closes the editor it was opened from.
+        if (model.editing_profile) {
+            return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), profileSheet(ui, model) });
+        }
+        return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model) });
     }
     if (model.stage == .ready and model.composing) {
         return ui.stack(.{ .grow = 1 }, .{ base, composeSheet(ui, model) });
@@ -12316,7 +12442,18 @@ fn threadLevelKey(level: usize, root_id: i64) u64 {
     return hi | lo;
 }
 
-fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
+/// The feed screen, and everything layered on it.
+///
+/// `levels` is what the Settings sheet passes false: see `settingsSheet`. The
+/// thread stack is the most expensive thing this app builds, and a view past
+/// `max_canvas_widget_nodes_per_view` is refused WHOLE, so the deepest stack
+/// under the largest sheet is the frame that decides whether the window can
+/// draw at all. Settings used to REPLACE this tree, which unmounted every level
+/// and lost its scroll offset anyway, so not building them behind the sheet
+/// costs nothing that was not already gone and buys back most of the ceiling.
+/// Every other sheet keeps its levels, because for those the offsets survive
+/// today and dropping them would be a real loss.
+fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     const p = theme.palette;
     // The feed is always built (so it is always mounted): a thread is layered
     // OVER it, not swapped in, so the feed's scroll offset survives and closing
@@ -12325,7 +12462,7 @@ fn feedView(ui: *AppUi, model: *const Model) AppUi.Node {
     // every level keeps its own scroll offset and Back never lands a parent
     // thread at the top.
     const feed = feedContent(ui, model);
-    const content = if (model.viewing_thread != 0 or model.viewing_profile != null) blk: {
+    const content = if (levels and (model.viewing_thread != 0 or model.viewing_profile != null)) blk: {
         // feed + one panel per level: the back-stacked levels (oldest first),
         // then the current one on top. A level is a thread or a person; both
         // spend one virtual window either way, which is why they share a stack.
@@ -15263,10 +15400,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
             }
         },
-        .open_settings => {
-            model.notifications_open = false;
-            enterSettings(model);
-        },
+        .open_settings => enterSettings(model),
         .proxy_edit => |edit| {
             model.proxy_buffer.apply(edit);
             model.proxy_saved = false;
@@ -15402,6 +15536,10 @@ fn setToast(model: *Model, text: []const u8) void {
 /// exactly that to the media proxy.
 fn enterSettings(model: *Model) void {
     model.menu = .none;
+    // One sheet at a time: Settings is a sheet now, and the notifications sheet
+    // is checked FIRST in the view, so leaving it open would open Settings into
+    // a window that never shows it.
+    model.notifications_open = false;
     model.proxy_buffer.set(mediaProxy());
     model.proxy_saved = false;
     model.editing_profile = false;
