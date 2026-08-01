@@ -4930,6 +4930,11 @@ pub const Model = struct {
     /// than the queue, and one frame never disagrees with itself.
     outbox_pending: usize = 0,
     outbox_stuck: usize = 0,
+    /// A note the queue had no room for. It was written to this machine and
+    /// offered to nobody, which is the one outcome the queue exists to make
+    /// impossible, so it is said out loud instead of left to the flag nobody
+    /// reads.
+    outbox_overflowed: bool = false,
     /// Whether a level is showing its replies from outside the follow graph, and
     /// how many pages of replies it has revealed. PER LEVEL, indexed like the
     /// back-stack: a level stays mounted while the reader walks into a reply and
@@ -5391,6 +5396,12 @@ pub const Model = struct {
     /// build, because the publisher writes the queue from its own thread and the
     /// view must see one answer for the whole frame.
     pub fn outbox_label(self: *const Model, arena: std.mem.Allocator) []const u8 {
+        // First, because it is the worst thing this zone can have to say: a note
+        // the reader wrote that was never offered to anybody. `g_outbox_overflow`
+        // was set for this and read nowhere, so the promise under the banner,
+        // that anything you write is kept until a relay takes it, was quietly
+        // untrue in the one case it was written for.
+        if (self.outbox_overflowed) return "a note could not be queued";
         // A note that gave up is not "posting". Saying so would be the same lie
         // the queue was built to stop telling.
         if (self.outbox_pending == 0 and self.outbox_stuck > 0) {
@@ -12939,8 +12950,8 @@ pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const
 /// brighter alert amber.
 fn outboxZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    if (model.outbox_pending == 0 and model.outbox_stuck == 0) return ui.spacer(0);
-    const stuck = model.outbox_pending == 0 and model.outbox_stuck > 0;
+    if (model.outbox_pending == 0 and model.outbox_stuck == 0 and !model.outbox_overflowed) return ui.spacer(0);
+    const stuck = model.outbox_overflowed or (model.outbox_pending == 0 and model.outbox_stuck > 0);
     return ui.row(.{ .cross = .center, .gap = 0 }, .{
         ui.el(.list_item, .{
             .padding = 0.01,
@@ -14556,8 +14567,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
     if (stashed.len > 0) model.draft_buffer = @TypeOf(model.draft_buffer).init(stashed);
     // What was owed when the app last closed. Read before the first frame, so a
     // note written offline yesterday is visible as owed rather than lost, and
-    // offered again as soon as a relay answers.
-    loadOutbox();
+    // offered again as soon as a relay answers. Whose queue that is comes from
+    // the session that was just restored; a guest starts with empty slots.
+    syncOutboxOwner();
     // Local-first, all the way to the first frame: cached avatars and pictures
     // are registered here, so a returning user gets faces WITH the notes rather
     // than a tick later. Only what is on disk resolves now; the rest is fetched
@@ -14638,6 +14650,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 flushRelayList(fx, now);
                 // At most one write a second, and only when something changed.
                 if (inboxNeedsSave()) saveInbox();
+                // Before anything reads or walks the queue: the slots belong
+                // to whoever is signed in now, and a sign-in or a logout since
+                // the last tick means they change hands here.
+                syncOutboxOwner();
                 if (liveRelayCount() > 0) drainOutbox(std.heap.page_allocator);
                 sweepOutbox(now);
                 // At most one write a second, and only when something changed.
@@ -14648,6 +14664,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 const counts = outboxCounts();
                 model.outbox_pending = counts.trying;
                 model.outbox_stuck = counts.stuck;
+                model.outbox_overflowed = g_outbox_overflow.load(.monotonic);
                 if (g_outbox_rev.load(.monotonic) != g_outbox_saved_rev) {
                     g_outbox_saved_rev = g_outbox_rev.load(.monotonic);
                     saveOutbox();
@@ -16182,7 +16199,7 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     // note the app knows it owes the reader. A queue with no room says so:
     // publishing anyway would be a note nobody is tracking while the banner
     // promises that anything written is kept.
-    if (isReaderNote(ev.kind) and !enqueueOutbox(ev.id, nowSeconds())) {
+    if (isReaderNote(ev.kind) and !enqueueOutbox(ev.id, ev.pubkey, nowSeconds())) {
         g_outbox_overflow.store(true, .monotonic);
         return;
     }
@@ -16232,6 +16249,14 @@ fn markOutboxSending(id: [32]u8, sending: bool) void {
 pub const OutboxEntry = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
+    /// Who signed the note this entry owes. A queue entry is a promise to ONE
+    /// account, and the publisher, the counts and the popover all filter on it.
+    ///
+    /// Not persisted, and it does not need to be: `loadOutbox` already reads the
+    /// event back out of the store to check it still exists, and the event
+    /// carries its own author. Deriving it there keeps the on-disk format
+    /// unchanged, so a queue written by an older build still loads.
+    author: [32]u8 = [_]u8{0} ** 32,
     /// When it was queued, so the popover can say how long it has been waiting
     /// and the oldest entry can be dropped when the queue is full.
     queued_at: i64 = 0,
@@ -16303,6 +16328,30 @@ fn outboxUnlock() void {
     g_outbox_lock.store(false, .release);
 }
 
+/// Whether this entry belongs to whoever is signed in right now.
+///
+/// The three places that ACT on the reader's behalf ask this: what the publisher
+/// sends, what the status bar counts, and what the popover lists. The bookkeeping
+/// that runs over the whole array (`sweepOutbox`, `forgetOutboxAcks`,
+/// `recordOutboxAck`, `markOutboxSending`) deliberately does not, because by the
+/// time any of it runs the array holds one account's entries and nobody else's:
+/// `syncOutboxOwner` hands the slots over when the account changes.
+///
+/// A queued note is a promise made to ONE account. Logging out does not empty
+/// the queue, deliberately: `sweepOutbox` refuses to erase a note nobody has
+/// taken, because that is the app destroying something the reader wrote, and a
+/// logout is not a reason to break that promise. So the note stays, and stops
+/// being walkable instead. Sign back in as its author and it resumes; sign in as
+/// somebody else and it is not theirs to send, not theirs to be counted, and not
+/// theirs to see.
+///
+/// Signed out, nothing is anybody's, which is why a null active key is false
+/// rather than a wildcard.
+fn outboxEntryIsMine(e: OutboxEntry) bool {
+    const me = activePubkey() orelse return false;
+    return std.mem.eql(u8, &me, &e.author);
+}
+
 /// Puts `id` in the queue, or returns the entry already there. The caller holds
 /// the lock.
 fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
@@ -16315,13 +16364,13 @@ fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
 /// Queues a note we have just signed and stored. Returns false when the queue is
 /// full of notes that have not been acknowledged, which is a state the reader can
 /// see rather than one the app hides.
-fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
+fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64) bool {
     outboxLock();
     defer outboxUnlock();
     if (outboxEntryFor(id) != null) return true;
     for (&g_outbox) |*e| {
         if (!e.used) {
-            e.* = .{ .used = true, .id = id, .queued_at = now_s };
+            e.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
             _ = g_outbox_rev.fetchAdd(1, .monotonic);
             return true;
         }
@@ -16334,7 +16383,7 @@ fn enqueueOutbox(id: [32]u8, now_s: i64) bool {
         if (victim == null or e.queued_at < victim.?.queued_at) victim = e;
     }
     const slot = victim orelse return false;
-    slot.* = .{ .used = true, .id = id, .queued_at = now_s };
+    slot.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
     _ = g_outbox_rev.fetchAdd(1, .monotonic);
     return true;
 }
@@ -16358,6 +16407,9 @@ pub fn outboxSnapshot(out: []OutboxEntry) usize {
     var n: usize = 0;
     for (&g_outbox) |*e| {
         if (!e.used or n == out.len) continue;
+        // The same rule `outboxCounts` applies: the popover explains the count,
+        // so it has to be a list of the same notes.
+        if (!outboxEntryIsMine(e.*)) continue;
         out[n] = e.*;
         n += 1;
     }
@@ -16380,6 +16432,10 @@ pub fn outboxCounts() OutboxCounts {
     var counts: OutboxCounts = .{};
     for (&g_outbox) |*e| {
         if (!e.used or e.acked != 0) continue;
+        // The status bar speaks for the reader who is here now. Counting a note
+        // they did not write would have the app owe them something that is not
+        // theirs, and offer no way to act on it.
+        if (!outboxEntryIsMine(e.*)) continue;
         if (e.state() == .stuck) counts.stuck += 1 else counts.trying += 1;
     }
     return counts;
@@ -16426,8 +16482,8 @@ pub fn resetOutboxForTest() void {
     for (&g_outbox) |*e| e.* = .{};
 }
 
-pub fn enqueueOutboxForTest(id: [32]u8, now_s: i64) bool {
-    return enqueueOutbox(id, now_s);
+pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
+    return enqueueOutbox(id, author, now_s);
 }
 
 pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
@@ -16493,16 +16549,45 @@ fn forgetOutboxAcks() void {
     if (changed) _ = g_outbox_rev.fetchAdd(1, .monotonic);
 }
 
-/// The queue's key in the store's generic table. The events themselves are in
-/// the store's own event tables (we ingest what we sign), so this holds only the
-/// index: which ids are owed, and what each relay said.
-const outbox_key = "outbox";
+/// The queue's key in the store's generic table, one record PER ACCOUNT. The
+/// events themselves are in the store's own event tables (we ingest what we
+/// sign), so this holds only the index: which ids are owed, and what each relay
+/// said.
+///
+/// Per account, because the sixteen slots in `g_outbox` are a scarce resource
+/// and they belong to whoever is signed in. An account that logs out has its
+/// queue written to its own record and its slots handed back; signing in reads
+/// that record and nothing else. The alternative, leaving another account's
+/// entries sitting in the array where they can never be sent, never acked and
+/// therefore never reclaimed, wedges the queue: sixteen of them and the person
+/// at the keyboard cannot publish at all, in silence.
+const outbox_key_prefix = "outbox:";
+
+/// The pre-account record, kept readable so a queue written by an older build is
+/// not stranded. Each account claims its own share of it the first time it signs
+/// in; whatever is left belongs to somebody else and stays put.
+const legacy_outbox_key = "outbox";
+
+fn outboxKeyFor(out: *[outbox_key_prefix.len + 64]u8, owner: [32]u8) []const u8 {
+    @memcpy(out[0..outbox_key_prefix.len], outbox_key_prefix);
+    var hex: [64]u8 = undefined;
+    writeHexId(&hex, owner);
+    @memcpy(out[outbox_key_prefix.len..][0..64], &hex);
+    return out[0 .. outbox_key_prefix.len + 64];
+}
+
+/// Whose entries are in `g_outbox` right now. Null while signed out, when the
+/// array is empty.
+var g_outbox_owner: ?[32]u8 = null;
 
 /// Writes the queue where a restart can find it. A note written on a train and
 /// lost on landing is the worst thing a client can do, so this runs on every
 /// change rather than at exit, which may never come.
 fn saveOutbox() void {
     const store = g_store orelse return;
+    // Nobody signed in means nothing of anybody's in the array, so there is no
+    // record to write and nowhere to write it.
+    const owner = g_outbox_owner orelse return;
     // Snapshotted under the lock, written outside it. `store.put` opens a write
     // transaction and commits it, which fsyncs and waits on LMDB's writer mutex
     // that the ingest threads hold: holding a SPINLOCK across that would burn a
@@ -16533,7 +16618,8 @@ fn saveOutbox() void {
         // all: a truncated index would silently lose notes on the next start.
         w.print("{s}:{d}:{d}:{d}:{d}\n", .{ hex[0..], e.queued_at, e.acked, e.refused, e.rounds }) catch return;
     }
-    store.put(outbox_key, w.buffered()) catch {};
+    var key_buf: [outbox_key_prefix.len + 64]u8 = undefined;
+    store.put(outboxKeyFor(&key_buf, owner), w.buffered()) catch {};
 }
 
 fn writeHexId(out: *[64]u8, id: [32]u8) void {
@@ -16544,12 +16630,26 @@ fn writeHexId(out: *[64]u8, id: [32]u8) void {
     }
 }
 
-/// Reads the queue back at boot. Anything whose event is no longer in the store
-/// is dropped: the index points at events, and an index without its event is not
-/// something the reader can be shown or the app can publish.
-fn loadOutbox() void {
+/// Reads `owner`'s queue into the array, replacing whatever was there.
+///
+/// Anything whose event is no longer in the store is dropped: the index points
+/// at events, and an index without its event is not something the reader can be
+/// shown or the app can publish. Anything signed by somebody else is dropped
+/// too, which only matters for the legacy record, and is the whole point of
+/// reading it: each account takes its own share and leaves the rest.
+fn loadOutbox(owner: [32]u8) void {
     const store = g_store orelse return;
-    const raw = (store.get(std.heap.page_allocator, outbox_key) catch return) orelse return;
+    var key_buf: [outbox_key_prefix.len + 64]u8 = undefined;
+    const raw = blk: {
+        if (store.get(std.heap.page_allocator, outboxKeyFor(&key_buf, owner)) catch null) |own| break :blk own;
+        if (store.get(std.heap.page_allocator, legacy_outbox_key) catch null) |legacy| break :blk legacy;
+        // No record at all is an ANSWER, not a reason to leave the array alone:
+        // this account's queue is empty, and whatever is in the slots belongs to
+        // somebody else. Returning here without clearing is how the previous
+        // account's notes stay in the next account's queue.
+        clearOutboxSlots();
+        return;
+    };
     defer std.heap.page_allocator.free(raw);
     // Parsed and resolved first, installed second: every `getEvent` below opens a
     // read transaction, and the lock may not span IO.
@@ -16577,18 +16677,144 @@ fn loadOutbox() void {
         // The event has to still be there, or there is nothing to publish.
         const se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
         var owned = se;
+        // The author comes from the event, which is why it is not in the file.
+        const author = owned.event.pubkey;
         owned.deinit();
+        // Somebody else's, which the legacy record can hold. Theirs to keep, so
+        // it is left in that record rather than taken or dropped.
+        if (!std.mem.eql(u8, &author, &owner)) continue;
         // A note is kept whatever the list did; only the CLAIMS about who has it
         // are dropped, so it is offered again rather than assumed delivered.
         parsed[n] = if (same_pool)
-            .{ .used = true, .id = id, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds }
+            .{ .used = true, .id = id, .author = author, .queued_at = queued_at, .acked = acked, .refused = refused, .rounds = rounds }
         else
-            .{ .used = true, .id = id, .queued_at = queued_at };
+            .{ .used = true, .id = id, .author = author, .queued_at = queued_at };
         n += 1;
     }
     outboxLock();
     defer outboxUnlock();
+    // The WHOLE array, not the first n. This replaces one account's queue with
+    // another's, so anything past the new entries has to go, or the tail of the
+    // previous account's queue survives in the slots nobody overwrote.
+    g_outbox = [_]OutboxEntry{.{}} ** outbox_cap;
     for (parsed[0..n], g_outbox[0..n]) |src, *dst| dst.* = src;
+    _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
+/// Empties the sixteen slots. The notes themselves are events in the store and
+/// their index is in a per-account record, so this hands slots back rather than
+/// destroying anything.
+fn clearOutboxSlots() void {
+    outboxLock();
+    g_outbox = [_]OutboxEntry{.{}} ** outbox_cap;
+    outboxUnlock();
+    _ = g_outbox_rev.fetchAdd(1, .monotonic);
+}
+
+/// Which queued notes the next drain will actually send, stamping each one's
+/// attempt as it goes.
+///
+/// Split out of `drainOutbox` so the choice can be tested without a store and
+/// without spawning publishers. The choice IS the safety property: the drain
+/// itself is a loop that reads events and hands them to threads, and every
+/// question worth asking about who may publish what is answered here.
+fn collectOutboxDue(ids: *[outbox_cap][32]u8, now_s: i64) usize {
+    var n: usize = 0;
+    outboxLock();
+    defer outboxUnlock();
+    for (&g_outbox) |*e| {
+        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
+        // Somebody else's note. This is the line that stops the previous
+        // account's unsent writing going out over the next account's relays,
+        // and signed out it stops everything, because a queued note is a promise
+        // to one account and there is nobody here to keep it for.
+        if (!outboxEntryIsMine(e.*)) continue;
+        // Spaced out, and widening: the drain runs every tick, so without this a
+        // transient failure (a captive portal, a TLS error, a relay that takes
+        // the socket and refuses the publish) would burn every round in seconds
+        // and leave the note stuck a moment after it was written.
+        if (e.last_try_at != 0 and now_s - e.last_try_at < outboxRetryDelay(e.rounds)) continue;
+        if (n == ids.len) break;
+        e.last_try_at = now_s;
+        ids[n] = e.id;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn collectOutboxDueForTest(ids: *[outbox_cap][32]u8, now_s: i64) usize {
+    return collectOutboxDue(ids, now_s);
+}
+
+pub fn syncOutboxOwnerForTest() void {
+    syncOutboxOwner();
+}
+
+pub fn loadOutboxForTest(owner: [32]u8) void {
+    loadOutbox(owner);
+}
+
+pub fn saveOutboxForTest() void {
+    saveOutbox();
+}
+
+pub fn outboxOwnerForTest() ?[32]u8 {
+    return g_outbox_owner;
+}
+
+pub fn clearOutboxOwnerForTest() void {
+    g_outbox_owner = null;
+}
+
+pub fn outboxAuthorAtForTest(i: usize) ?[32]u8 {
+    outboxLock();
+    defer outboxUnlock();
+    if (!g_outbox[i].used) return null;
+    return g_outbox[i].author;
+}
+
+pub fn outboxUsedSlotsForTest() usize {
+    outboxLock();
+    defer outboxUnlock();
+    var n: usize = 0;
+    for (&g_outbox) |*e| {
+        if (e.used) n += 1;
+    }
+    return n;
+}
+
+pub const outbox_cap_for_test = outbox_cap;
+
+/// Hands the sixteen slots to whoever is signed in, whenever that changes.
+///
+/// ONE place, called from the tick before anything reads the queue, because
+/// getting it wrong in two places is how the previous account's notes end up in
+/// the next account's queue. The leaving account's entries are written to their
+/// own record first and only then cleared, so nothing is dropped: they are
+/// parked, not deleted, and reading them back is what signing in again does.
+///
+/// This is what keeps `outboxEntryIsMine` an invariant rather than a load-
+/// bearing filter. Leaving foreign entries in the array and merely refusing to
+/// send them looks safe and is not: nothing can ever ack them, so nothing can
+/// ever sweep or evict them either, and sixteen of them stop the person at the
+/// keyboard publishing anything at all, with no counter, no popover row and no
+/// banner to say why.
+fn syncOutboxOwner() void {
+    const now_owner = activePubkey();
+    if (g_outbox_owner) |had| {
+        if (now_owner) |now| if (std.mem.eql(u8, &had, &now)) return;
+    } else if (now_owner == null) return;
+
+    // Park the leaving account's queue before the slots are handed over.
+    if (g_outbox_owner != null) {
+        saveOutbox();
+        clearOutboxSlots();
+    }
+    g_outbox_owner = now_owner;
+    if (now_owner) |owner| loadOutbox(owner) else clearOutboxSlots();
+    // The queue on disk is already current for both accounts, so the tick's
+    // save-on-change is told not to write the freshly loaded one straight back.
+    g_outbox_saved_rev = g_outbox_rev.load(.monotonic);
 }
 
 /// Offers every note that nobody has taken to the relays again. Called when a
@@ -16596,22 +16822,7 @@ fn loadOutbox() void {
 fn drainOutbox(gpa: std.mem.Allocator) void {
     const store = g_store orelse return;
     var ids: [outbox_cap][32]u8 = undefined;
-    var n: usize = 0;
-    const now = nowSeconds();
-    outboxLock();
-    for (&g_outbox) |*e| {
-        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
-        // Spaced out, and widening: the drain runs every tick, so without this a
-        // transient failure (a captive portal, a TLS error, a relay that takes
-        // the socket and refuses the publish) would burn every round in seconds
-        // and leave the note stuck a moment after it was written.
-        if (e.last_try_at != 0 and now - e.last_try_at < outboxRetryDelay(e.rounds)) continue;
-        if (n == ids.len) break;
-        e.last_try_at = now;
-        ids[n] = e.id;
-        n += 1;
-    }
-    outboxUnlock();
+    const n = collectOutboxDue(&ids, nowSeconds());
     for (ids[0..n]) |id| {
         var se = (store.getEvent(gpa, id) catch continue) orelse continue;
         defer se.deinit();
@@ -18014,6 +18225,21 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // thinking; leaving it would hand it to whoever signs in next, in their
     // composer, one keystroke from being published under THEIR key.
     saveDraft("");
+    // The OUTBOX is deliberately left alone, and that is not an oversight.
+    //
+    // A queued note is one the reader wrote and the app has not managed to
+    // deliver yet. Emptying the queue here would destroy it, and `sweepOutbox`
+    // already refuses to do that for exactly this reason. So it stays, and
+    // `syncOutboxOwner` is what makes staying safe: on the next tick the slots
+    // are handed to whoever is signed in, and these entries are parked in this
+    // account's own record. Sign back in as its author and it is read back and
+    // goes out. For a LOCAL key that is only possible if the reader kept a copy,
+    // because this function deletes the key file; the note is still theirs, and
+    // still here, which is the most an app can honestly promise at that point.
+    //
+    // Getting this wrong is how the previous account's unsent note would ride
+    // out over the next account's relays, counted in their status bar as
+    // something the app owed THEM.
     model.logout_pending = false;
     model.reveal_nsec = false;
     model.notes_len = 0;
