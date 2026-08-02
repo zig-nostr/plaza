@@ -5116,6 +5116,12 @@ pub const Model = struct {
     relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
+    /// Whether the mention picker has been dismissed for the query now in the
+    /// draft. It has no open flag of its own: it shows whenever the draft ends
+    /// in a `@word`, so Escape and a press outside had nothing to clear and it
+    /// came back on the next rebuild. Cleared by the next edit, because a new
+    /// query is a new question.
+    mention_dismissed: bool = false,
     /// WHICH note has its menu open, by id, or 0 for none. A bool was enough
     /// while the only menu in the app hung off the thread's focal note; every
     /// post carries one now, and a shared flag would open all of them at once.
@@ -7739,6 +7745,8 @@ pub const Msg = union(enum) {
     close_image,
     /// Copy a note's words to the clipboard (by id).
     copy_note_text: i64,
+    /// Put the mention picker away without choosing anybody.
+    close_mentions,
     /// Open the Signet window on what it is holding, from Settings.
     open_signet_window,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
@@ -7770,7 +7778,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -9522,6 +9530,7 @@ fn startsWithFold(haystack: []const u8, prefix: []const u8) bool {
 /// (0.5), so it hangs under the whole editor.
 fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
+    if (model.mention_dismissed) return ui.spacer(0);
     const query = mentionQuery(model.draft()) orelse return ui.spacer(0);
     const names = mentionCandidates(ui, query);
     if (names.len == 0) return ui.spacer(0);
@@ -9573,7 +9582,7 @@ fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
         }),
         vgap(ui, 3),
     });
-    return menuSurfacePlaced(ui, 320, .below, .start, rows);
+    return menuSurfacePlacedDismissing(ui, 320, .below, .start, Msg.close_mentions, rows);
 }
 
 /// How far a note will go, said before it goes rather than after: the relays
@@ -13032,7 +13041,12 @@ fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
     n += 1;
     rows[n] = followMenuRow(ui, note.pubkey);
     n += 1;
-    return menuSurfacePlaced(ui, 220, .below, .end, rows[0..n]);
+    // Its OWN dismiss, not the chrome's. `menuSurfacePlaced` sends `close_menu`,
+    // which clears `model.menu`, and this menu's open state is `model.note_menu`:
+    // Escape and a press outside hid it for one frame and the next rebuild put
+    // it straight back, because nothing had told the model. The helper that takes
+    // a dismiss message exists for exactly this, and says so.
+    return menuSurfacePlacedDismissing(ui, 220, .below, .end, Msg.close_note_menu, rows[0..n]);
 }
 
 /// The same actions as the note's menu, for a right-click anywhere on the row.
@@ -15315,6 +15329,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .banner_fetched => |response| handleBannerFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
+            // A new query is a new question, so a dismissal only covers the one
+            // the reader dismissed. Without this, putting the picker away once
+            // would put it away for the rest of the note.
+            model.mention_dismissed = false;
             // Marked, not written: the tick flushes it. Saving on CLOSE alone
             // was the wrong half, because the state a writer is in when the
             // machine sleeps or the app is killed is the sheet OPEN.
@@ -15589,6 +15607,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const url = std.fmt.bufPrint(&url_buf, "https://njump.me/{s}", .{addr}) catch return;
             openExternally(fx, url);
         },
+        .close_mentions => model.mention_dismissed = true,
         .copy_note_text => |id| {
             model.note_menu = 0;
             // The words as the note wrote them, not as the feed renders them:

@@ -9877,3 +9877,116 @@ test "a new account's inbox reads the starter pack as its own graph" {
     const everyone = main.inboxItems(&buf, false);
     try testing.expect(everyone.len >= 2);
 }
+
+// ---- a dismissal has to clear the state that opened it ------------------------
+
+/// The dismiss Msg of the surface that CONTAINS `text`, and nothing else.
+///
+/// Not every dismiss in the view: the mention picker floats inside the compose
+/// sheet, which has a dismiss of its own, and firing both closed the sheet and
+/// took the picker off screen with it. The test then passed with the picker's
+/// own dismissal doing nothing at all, which is the bug it was written for.
+fn dismissMsgOfSurfaceHolding(p: painted.Painted, text: []const u8) ?Msg {
+    var holder: ?usize = null;
+    for (p.layout.nodes, 0..) |node, i| {
+        if (!std.mem.eql(u8, node.widget.text, text)) continue;
+        holder = i;
+        break;
+    }
+    var cursor = holder orelse return null;
+    var hops: usize = 0;
+    while (hops < 64) : (hops += 1) {
+        const w = p.layout.nodes[cursor].widget;
+        switch (w.kind) {
+            .dialog, .drawer, .sheet, .popover, .menu_surface, .dropdown_menu => {
+                for (p.tree.handlers) |h| {
+                    if (h.id != w.id or h.event != .dismiss) continue;
+                    return switch (h.action) {
+                        .message => |m| m,
+                        else => null,
+                    };
+                }
+                return null;
+            },
+            else => {},
+        }
+        cursor = p.layout.nodes[cursor].parent_index orelse return null;
+    }
+    return null;
+}
+
+test "dismissing a surface clears the state that opened it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The engine hides a dismissed surface immediately and the next rebuild is
+    // truth again, so a dismiss wired to somebody ELSE's state hides the surface
+    // for one frame and puts it straight back. It looks like a flicker and it
+    // reads as a control that does not work.
+    //
+    // Found live on the note menu, which sent `close_menu` (the chrome's state)
+    // while its own open flag is `note_menu`, and then on the mention picker,
+    // which had no open flag at all. Both had the same shape: the surface is on
+    // screen after the dismiss it declared.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const Case = struct {
+        name: []const u8,
+        text: []const u8,
+        open: *const fn (*Model) void,
+    };
+    const cases = [_]Case{
+        .{ .name = "the note menu", .text = "Copy note address", .open = struct {
+            fn f(m: *Model) void {
+                m.stage = .ready;
+                m.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+                m.notes[0].id = 4242;
+                m.notes_len = 1;
+                m.note_menu = 4242;
+            }
+        }.f },
+        .{
+            .name = "the mention picker",
+            .text = "inserts a nostr: link, not just a name",
+            .open = struct {
+                fn f(m: *Model) void {
+                    m.stage = .ready;
+                    m.composing = true;
+                    // Somebody to offer: the picker draws nothing without a name it
+                    // could insert.
+                    const who = [_]u8{0x91} ** 32;
+                    if (main.upsertProfile(who)) |pr| {
+                        main.parseMetadataInto(pr, "{\"display_name\":\"Alice\"}");
+                    }
+                    m.draft_buffer.set("hello @Al");
+                }
+            }.f,
+        },
+    };
+
+    for (cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const before = try painted.Painted.render(arena, &model);
+        if (findAnyText(before.tree.root, c.text) == null) {
+            std.debug.print("{s} is not on screen to begin with\n", .{c.name});
+            return error.SurfaceNotOpen;
+        }
+
+        // The dismiss THIS surface declares, and only it.
+        const msg = dismissMsgOfSurfaceHolding(before, c.text) orelse {
+            std.debug.print("{s} declares no dismiss of its own\n", .{c.name});
+            return error.NoDismissDeclared;
+        };
+        var fx: main.EffectsForTest = undefined;
+        main.update(&model, msg, &fx);
+
+        const after = try painted.Painted.render(arena, &model);
+        if (findAnyText(after.tree.root, c.text) != null) {
+            std.debug.print("{s} is still on screen after its own dismiss\n", .{c.name});
+            return error.DismissDidNotClose;
+        }
+    }
+}
