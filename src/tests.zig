@@ -9990,3 +9990,47 @@ test "dismissing a surface clears the state that opened it" {
         }
     }
 }
+
+test "every sheet takes the keyboard when it opens" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Escape resolves from the FOCUSED widget up to the surface around it, with
+    // a fallback that only sees ANCHORED surfaces. A sheet is neither anchored
+    // nor focused by default, so Escape closed none of them, while three
+    // comments in this file said it did. Driving the app is what found it.
+    //
+    // So each sheet takes the keyboard on the way in: its first field where it
+    // has one (a composer you must click into before typing is a composer that
+    // opened for no reason), and otherwise its way out, which is the only thing
+    // safe to have under an accidental Return.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    for (modal_cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const p = try painted.Painted.render(arena, &model);
+        const root = modalDialogIndex(p, c.label) orelse {
+            std.debug.print("{s}: no dialog\n", .{c.name});
+            return error.NoModalDialog;
+        };
+        var focused: usize = 0;
+        for (p.layout.nodes, 0..) |node, i| {
+            if (!node.widget.autofocus) continue;
+            if (!isDescendantOf(p, i, root)) continue;
+            focused += 1;
+        }
+        if (focused == 0) {
+            std.debug.print("{s}: nothing in the sheet takes the keyboard\n", .{c.name});
+            return error.SheetTakesNoFocus;
+        }
+        // Exactly one: two things asking for the caret is a race whose winner is
+        // whichever the tree happens to reach first.
+        if (focused > 1) {
+            std.debug.print("{s}: {d} things ask for the keyboard\n", .{ c.name, focused });
+            return error.TwoFocusRequests;
+        }
+    }
+}

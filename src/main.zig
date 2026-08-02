@@ -7869,7 +7869,7 @@ fn settingsHeader(ui: *AppUi) AppUi.Node {
         // "Close", not "Back": this is a sheet over the feed now, and Back is
         // what the thread and profile headers say when there is a place behind
         // to return to. There is nothing behind this but the feed it covers.
-        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_settings }, "Close"),
+        ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_settings }, "Close"),
         ui.spacer(1),
         ui.paragraph(
             .{ .style = .{ .foreground = p.text_sheet_title } },
@@ -8601,6 +8601,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     .text = model.name_draft(),
                     .placeholder = "A name people will see",
                     .on_input = AppUi.inputMsg(.name_edit),
+                    .autofocus = true,
                     .on_submit = .name_save,
                     .height = 38,
                     .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
@@ -8689,7 +8690,7 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 else
                     ui.spacer(0),
                 ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_profile_edit }, "Close"),
+                    ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
                     ui.spacer(1),
                     if (model.profile_stage == .unread)
                         ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
@@ -8872,7 +8873,7 @@ fn notificationsTabs(ui: *AppUi, model: *const Model) AppUi.Node {
     return ui.row(.{ .cross = .center, .gap = 6, .padding = 0.01 }, .{
         hgap(ui, 14),
         vgap(ui, 42),
-        profileTab(ui, "Everyone", model.notifications_everyone, Msg{ .notifications_tab = 1 }),
+        profileTabFocused(ui, "Everyone", model.notifications_everyone, Msg{ .notifications_tab = 1 }, true),
         profileTab(ui, "People you follow", !model.notifications_everyone, Msg{ .notifications_tab = 0 }),
         ui.spacer(1),
     });
@@ -9286,6 +9287,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
                         .padding = 0.01,
                         .on_press = Msg.close_join,
                         .style = .{ .quiet_hover = true },
+                        .autofocus = true,
                         .semantics = .{ .role = .button, .label = "Keep browsing", .focusable = true },
                     }, .{
                         ui.paragraph(
@@ -9324,6 +9326,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
             .text = model.login_draft(),
             .placeholder = "bunker://…",
             .on_input = AppUi.inputMsg(.login_edit),
+            .autofocus = true,
             .on_submit = .login_submit,
             .height = 56,
         }, .{}),
@@ -9383,6 +9386,16 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                                 .on_input = AppUi.inputMsg(.draft_edit),
                                 .on_submit = .post,
                                 .height = compose_editor_height,
+                                // The caret starts here. A composer you have to
+                                // click into before you can type is a composer
+                                // that opened for no reason, and it is also what
+                                // made Escape dead on this sheet: the runtime
+                                // resolves Escape from the FOCUSED widget up to
+                                // the surface around it, and with nothing
+                                // focused there was no path to the dialog.
+                                // Edge-triggered on mount, so it never re-steals
+                                // the caret on a later rebuild.
+                                .autofocus = true,
                                 .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
                             }, .{}),
                             // Under the field, because the caret cannot be
@@ -9628,7 +9641,7 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
                 } else ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Still loading…"),
             }),
             ui.row(.{ .gap = 8, .cross = .center }, .{
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_image }, "Close"),
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .close_image }, "Close"),
                 ui.spacer(1),
                 ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageUrl() } }, "Open original"),
             }),
@@ -12341,11 +12354,20 @@ fn profileTabs(ui: *AppUi, model: *const Model) AppUi.Node {
 }
 
 fn profileTab(ui: *AppUi, label: []const u8, active: bool, msg: Msg) AppUi.Node {
+    return profileTabFocused(ui, label, active, msg, false);
+}
+
+/// The same tab, optionally taking the keyboard when it mounts. The
+/// notifications sheet has no way-out control of its own, so its first tab is
+/// what gives Escape a focused widget to resolve from; switching tabs is the
+/// worst an accidental Return can do from there.
+fn profileTabFocused(ui: *AppUi, label: []const u8, active: bool, msg: Msg, focus: bool) AppUi.Node {
     const p = theme.palette;
     return ui.el(.list_item, .{
         .padding = 0.01,
         .height = 26,
         .cross = .center,
+        .autofocus = focus,
         .on_press = msg,
         .style = .{
             .background = if (active) p.surface_settings_card else p.surface_window,
