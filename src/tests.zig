@@ -2726,8 +2726,9 @@ test "a reply block's rail paints too" {
     const Build = struct {
         var block: main.ThreadBlock = undefined;
         var parent: main.Note = undefined;
+        var of: main.Model = .{};
         fn row(ui: *main.AppUi) main.AppUi.Node {
-            return main.replyBlockForTest(ui, &block, [_]u8{0} ** 32, true, true);
+            return main.replyBlockForTest(ui, &of, &block, [_]u8{0} ** 32, true, true);
         }
     };
     const body = "A reply long enough to wrap past its own disc, so the rail below that disc has somewhere to run.";
@@ -4943,7 +4944,7 @@ test "the note menu says which way it goes, and refuses when it cannot know" {
     model.thread_root = threadNote(0xAA, 100, 0);
     model.thread_root.id = 1;
     model.thread_root.pubkey = author;
-    model.note_menu = true;
+    model.note_menu = model.thread_root.id;
 
     // A guest: the menu offers Follow, and pressing it raises the join sheet
     // rather than failing quietly.
@@ -5005,7 +5006,7 @@ test "a guest pressing follow is offered the join sheet, not a silent failure" {
     var fx: main.EffectsForTest = undefined;
     main.update(&model, Msg{ .follow_author = 0 }, &fx);
     try testing.expect(model.joining);
-    try testing.expect(!model.note_menu);
+    try testing.expectEqual(@as(i64, 0), model.note_menu);
 }
 
 test "a contact list arriving from a relay becomes the feed's scope" {
@@ -6741,7 +6742,7 @@ test "nothing that calls itself a button is dead" {
                     m.thread_root.id = 1;
                     // The state the first version of this test could not reach, and
                     // where its invariant was already false.
-                    m.note_menu = true;
+                    m.note_menu = m.thread_root.id;
                 }
             }.f,
         },
@@ -9533,5 +9534,165 @@ test "the status bar is on the floor of the canvas at every height" {
                 }
             } else first_gap = gap;
         }
+    }
+}
+
+// ---- the menu under every post -----------------------------------------------
+
+/// A feed of one note, with an identity, so a row's menu can be opened.
+fn oneNoteFeed(model: *Model) void {
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 4242;
+    model.notes[0].event_id = [_]u8{0x5a} ** 32;
+    model.notes[0].pubkey = [_]u8{0x2b} ** 32;
+    const body = "Something worth copying.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes_len = 1;
+}
+
+test "the last verb under a post opens that post's menu, and only that post's" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+    // A second note, so "opens the menu" can be told apart from "opens every
+    // menu": the state behind this was one shared bool until every post had one.
+    model.notes[1] = main.Note{ .created_at = 1_799_999_000 };
+    model.notes[1].id = 99;
+    model.notes[1].pubkey = [_]u8{0x3c} ** 32;
+    model.notes_len = 2;
+
+    {
+        const p = try painted.Painted.render(arena, &model);
+        const msg = pressMsgByLabel(p.tree, "More") orelse return error.NoMoreControl;
+        switch (msg) {
+            .toggle_note_menu => |id| try testing.expectEqual(@as(i64, 4242), id),
+            else => {
+                std.debug.print("the more verb sends {s}\n", .{@tagName(msg)});
+                return error.WrongMessage;
+            },
+        }
+        // Closed, so nothing of the menu is on screen.
+        try testing.expect(findAnyText(p.tree.root, "Copy note address") == null);
+    }
+
+    // Open the FIRST note's menu.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .toggle_note_menu = 4242 }, &fx);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        // Exactly one menu on screen, not one per row.
+        try testing.expectEqual(@as(usize, 1), countAnyText(p.tree.root, "Copy note address"));
+        try testing.expect(findAnyText(p.tree.root, "Copy text") != null);
+        try testing.expect(findAnyText(p.tree.root, "Open on the web") != null);
+    }
+
+    // The same press closes it again.
+    main.update(&model, Msg{ .toggle_note_menu = 4242 }, &fx);
+    try testing.expectEqual(@as(i64, 0), model.note_menu);
+}
+
+test "a post's address is in its menu, not under its body" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Sixty characters of bech32 sat under every focal note as a copyable pill.
+    // It is a thing to copy, not a thing to read, so it lives where a reader
+    // looks for something to copy.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+    model.viewing_thread = 1;
+    model.thread_root = model.notes[0];
+
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(p.frameOf("Copy nevent") == null);
+        if (findAnyTextContainingText(p.tree.root, "nevent1") != null) {
+            std.debug.print("a raw nevent is still drawn under the note\n", .{});
+            return error.AddressStillOnScreen;
+        }
+    }
+
+    model.note_menu = model.thread_root.id;
+    {
+        const p = try painted.Painted.render(arena, &model);
+        const msg = pressMsgByLabel(p.tree, "Copy note address") orelse {
+            std.debug.print("the menu offers no way to copy the address\n", .{});
+            return error.NoCopyAddress;
+        };
+        switch (msg) {
+            .copy_nevent => |id| try testing.expectEqual(model.thread_root.id, id),
+            else => return error.WrongMessage,
+        }
+    }
+}
+
+test "every post answers a right-click with the same actions as its menu" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+
+    const p = try painted.Painted.render(arena, &model);
+    var rows: usize = 0;
+    for (p.layout.nodes) |node| {
+        if (!std.mem.eql(u8, node.widget.semantics.label, "Open thread")) continue;
+        rows += 1;
+        const items = node.widget.context_menu;
+        if (items.len == 0) {
+            std.debug.print("a post offers nothing on a right-click\n", .{});
+            return error.NoContextMenu;
+        }
+        // The same actions, by name, as the menu behind the last verb.
+        for ([_][]const u8{ "Open thread", "Copy note address", "Copy text", "Open on the web" }) |want| {
+            for (items) |item| {
+                if (std.mem.eql(u8, item.label, want)) break;
+            } else {
+                std.debug.print("a right-click offers no \"{s}\"\n", .{want});
+                return error.MissingContextItem;
+            }
+        }
+    }
+    try testing.expect(rows >= 1);
+}
+
+test "a note has exactly one menu trigger" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The state is per NOTE, not per control, so a second trigger keyed on the
+    // same note does not toggle between them: it opens both menus at once, one
+    // over the note and one over whatever is below it. Caught live.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+    model.viewing_thread = 1;
+    model.thread_root = model.notes[0];
+    model.note_menu = model.thread_root.id;
+
+    const p = try painted.Painted.render(arena, &model);
+    const triggers = countAnyText(p.tree.root, "Copy note address");
+    if (triggers != 1) {
+        std.debug.print("{d} menus open over one note\n", .{triggers});
+        return error.TwoMenus;
     }
 }

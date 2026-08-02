@@ -1034,6 +1034,7 @@ else
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
 const copy_nevent_key: u64 = 103;
+const copy_note_text_key: u64 = 104;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
@@ -5115,8 +5116,10 @@ pub const Model = struct {
     relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
-    // Whether the open thread's note menu is showing.
-    note_menu: bool = false,
+    /// WHICH note has its menu open, by id, or 0 for none. A bool was enough
+    /// while the only menu in the app hung off the thread's focal note; every
+    /// post carries one now, and a shared flag would open all of them at once.
+    note_menu: i64 = 0,
     // Whether the notifications sheet is up, and which tab it shows.
     notifications_open: bool = false,
     /// Which notifications the sheet shows. EVERYONE by default, because that is
@@ -7614,7 +7617,7 @@ pub const Msg = union(enum) {
     notifications_newer,
     notifications_read_all,
     /// The note overflow menu.
-    toggle_note_menu,
+    toggle_note_menu: i64,
     close_note_menu,
     /// The one action behind the note menu. The payload says which way: 0 means
     /// a guest reached for it, 1 follow, 2 unfollow.
@@ -7734,6 +7737,8 @@ pub const Msg = union(enum) {
     load_image: i64,
     /// Dismiss the expanded picture.
     close_image,
+    /// Copy a note's words to the clipboard (by id).
+    copy_note_text: i64,
     /// Open the Signet window on what it is holding, from Settings.
     open_signet_window,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
@@ -7765,7 +7770,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -10024,8 +10029,8 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
         // dangling line, and its trailing space is what tips a thread that fits
         // into reporting more content than it draws. So the flags are about what
         // is ACTUALLY above and below the block, held replies included.
-        .block => |bi| replyBlock(ui, &rows_ctx.blocks[bi], rows_ctx.root.pubkey, bi == 0, bi + 1 == rows_ctx.shown and rows_ctx.hidden == 0 and rows_ctx.outside.len == 0),
-        .outside_block => |oi| replyBlock(ui, &rows_ctx.outside[oi], rows_ctx.root.pubkey, oi == 0 and rows_ctx.shown == 0, oi + 1 == rows_ctx.outside.len),
+        .block => |bi| replyBlock(ui, rows_ctx.model, &rows_ctx.blocks[bi], rows_ctx.root.pubkey, bi == 0, bi + 1 == rows_ctx.shown and rows_ctx.hidden == 0 and rows_ctx.outside.len == 0),
+        .outside_block => |oi| replyBlock(ui, rows_ctx.model, &rows_ctx.outside[oi], rows_ctx.root.pubkey, oi == 0 and rows_ctx.shown == 0, oi + 1 == rows_ctx.outside.len),
         .show_more => showMoreReplies(ui, rows_ctx.hidden_held),
         .outside_line => outsideGraphRow(ui, rows_ctx.outside_held, rows_ctx.outside_open),
         .footer => listeningFooter(ui),
@@ -10279,13 +10284,19 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
 /// the replies (so every row's avatar and text share one left edge), set apart
 /// by a slightly larger name, the name-over-handle stack, and the composer below.
 fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) AppUi.Node {
-    const p = theme.palette;
     const c = engagementFor(note.id);
     // A fixed-width column, centred by the scroll column's `cross = .center`. No
     // outer growing row: a `grow` child in the scroll's column grows vertically
     // and would overlap the next row. Every block inside sits 4px in, which is
     // the focal note's own inset within the reading column.
-    return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
+    return ui.column(.{
+        .width = thread_column_width,
+        .gap = 0,
+        // The focal note answers a right-click like every other post. `in_thread`
+        // drops "Open thread" from the list, which from the note the thread is
+        // ABOUT would be an offer to arrive where the reader already is.
+        .context_menu = noteContextItems(ui, note, true),
+    }, .{
         // The space above the focal note, unless an ancestor row is up there: its
         // own bottom pad is the rail's segment down to this disc, and adding both
         // would break the chain's rhythm exactly where the eye follows it.
@@ -10299,18 +10310,10 @@ fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) A
             hgap(ui, avatar_to_text_gap),
             identityBlock(ui, note),
             ui.spacer(1),
-            // Wired now, to the one thing behind it: following the author.
-            // Mute, report and copy-link land with the safety work.
-            ui.el(.list_item, .{
-                .padding = 4,
-                .cross = .center,
-                .on_press = Msg.toggle_note_menu,
-                .style = .{ .radius = 6 },
-                .semantics = .{ .role = .button, .label = "More", .focusable = true },
-            }, .{
-                ui.icon(.{ .width = 15, .height = 15, .style = .{ .foreground = p.text_faint_alt } }, "ellipsis"),
-                if (model.note_menu) noteMenu(ui, note.pubkey) else ui.spacer(0),
-            }),
+            // No overflow trigger up here any more. Every post carries its menu
+            // as the last verb under it now, this note included, and two
+            // triggers keyed on the same note opened two identical menus at
+            // once: the state is per NOTE, not per control.
             hgap(ui, thread_inset),
         }),
         vgap(ui, 9),
@@ -10329,7 +10332,7 @@ fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) A
         }),
         vgap(ui, 12),
         focalStats(ui, c),
-        focalVerbs(ui, note),
+        focalVerbs(ui, model, note),
     });
 }
 
@@ -10340,7 +10343,12 @@ fn focalBody(ui: *AppUi, note: *const Note) AppUi.Node {
     return noteBodyAt(ui, note, false, focal_body_scale, theme.palette.text_focal);
 }
 
-/// When the focal note was written, how widely it is held, and its nevent.
+/// When the focal note was written and how widely it is held.
+///
+/// The note's address used to sit here as a copyable pill, sixty characters of
+/// bech32 under every focal note. It is in the note's own menu now, under
+/// "Copy note address", which is where a reader looks for a thing to copy and
+/// is not where a reader looks while reading.
 fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const seen = relaysSeenFor(note.id);
@@ -10363,30 +10371,6 @@ fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
             }},
         ),
         ui.spacer(1),
-        neventPill(ui, note),
-    });
-}
-
-/// The copyable nevent: the note's own address, for sharing it anywhere.
-fn neventPill(ui: *AppUi, note: *const Note) AppUi.Node {
-    const p = theme.palette;
-    return ui.row(.{
-        .cross = .center,
-        .gap = 0,
-        .on_press = Msg{ .copy_nevent = note.id },
-        .style = .{ .quiet_hover = true },
-        .semantics = .{ .role = .button, .label = "Copy nevent" },
-    }, .{
-        ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = p.surface_chip, .border = p.border_chip, .radius = 999, .stroke_width = 1 } }, .{
-            ui.row(.{ .cross = .center, .gap = 0 }, .{
-                hgap(ui, 9),
-                vgap(ui, 20),
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = shortNevent(ui, note), .monospace = true, .scale = mono_meta_scale }}),
-                hgap(ui, 6),
-                ui.icon(.{ .width = 10, .height = 10, .style = .{ .foreground = p.text_faint } }, "copy"),
-                hgap(ui, 9),
-            }),
-        }),
     });
 }
 
@@ -10420,57 +10404,22 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
     });
 }
 
-/// The focal note's verbs: evenly spread, no counts. The numbers are the stats row
-/// above; these are the things a reader can do.
+/// The focal note's verbs: the SAME row every other note carries.
 ///
-/// Spread by GROW spacers between the pairs, with the 40px insets as the row's own
-/// padding. Two earlier shapes were wrong: an inset BOX is a flow child, so it
-/// takes a share of the free space and the whole stack drifts (this measured 67px
-/// of slack on the left against 28 on the right), and `main = .space_between` left
-/// the stack flush against the right edge instead of balancing it.
-///
-/// Four verbs, not the mock's five. The fifth is Reply, whose job in the mock is
-/// to reach the reply field: here that field is already on screen immediately
-/// below, and the caret cannot be moved to it from the model anyway (see the round
-/// plan's SDK walls). A glyph that does nothing is worse than an absent one, so it
-/// returns when the composer sheet learns to open in reply mode.
-fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
-    const p = theme.palette;
-    const liked = likeEntry(note.id) != null;
-    // The mock's insets are 2 above, 40 each side, 4 below, and padding on this
-    // engine is ONE number for all four edges, so each axis is stated where it
-    // belongs: this column carries the 2 and the 4, the row carries the 40s as
-    // fixed inset boxes, and the grow spacers between the verbs take the rest.
-    // Reaching for `padding = 40` to fix the sides, as the previous shape did, put
-    // 40px of dead air above and below the icons too.
+/// It used to be two glyphs, a like and an open-on-the-web, shoved to opposite
+/// ends of the column by a grow spacer. Two verbs is not the row a reader has
+/// just scrolled past a screenful of, and forty pixels of nothing between them
+/// reads as a row that lost its middle. The counts are left off, because the
+/// stats line directly above states them in words: this is the same builder,
+/// told not to repeat itself.
+fn focalVerbs(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 2),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
-            hgap(ui, 40),
-            // Only the verbs that work. Reposting needs its own milestone and
-            // zapping needs a wallet, and their numbers are already stated twelve
-            // pixels above in the stats row, which is where the design puts
-            // counts. Drawing them again under a glyph that cannot be pressed
-            // said the same thing twice in two registers, and the second saying
-            // looked like a control.
-            focalVerb(ui, "like", if (liked) "Unlike" else "Like", Msg{ .like = note.id }, if (liked) p.status_like else p.text_verb),
-            ui.spacer(1),
-            focalVerb(ui, "external-link", "Open on the web", Msg{ .open_web = note.id }, p.text_verb),
-            hgap(ui, 40),
+            hgap(ui, thread_inset),
+            engagementRowAt(ui, model, note, false),
         }),
         vgap(ui, 4),
-    });
-}
-
-fn focalVerb(ui: *AppUi, glyph: []const u8, label: []const u8, press: ?Msg, tint: canvas.Color) AppUi.Node {
-    return ui.row(.{
-        .padding = 6,
-        .cross = .center,
-        .on_press = press,
-        .style = .{ .quiet_hover = true },
-        .semantics = .{ .role = .button, .label = label, .focusable = press != null },
-    }, .{
-        ui.appIcon(.{ .width = 17, .height = 17, .style = .{ .foreground = tint } }, glyph),
     });
 }
 
@@ -11170,7 +11119,7 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
 /// The rail replaces the round-4 indent gutter: the redesign nests ONE level in
 /// place and sends the rest to their own thread, rather than stepping every reply
 /// further right until the text runs out of room.
-fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
     const p = theme.palette;
     const note = block.parent;
     const kids = ui.arena.alloc(AppUi.Node, block.children.len * 2) catch return ui.spacer(0);
@@ -11204,6 +11153,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
             .width = thread_column_width,
             .padding = 0.01,
             .on_press = Msg{ .open_thread = note.id },
+            .context_menu = noteContextItems(ui, note, false),
             .semantics = .{ .label = "Open thread" },
         }, .{
             hgap(ui, thread_inset),
@@ -11228,7 +11178,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
-                engagementRow(ui, note),
+                engagementRow(ui, model, note),
             }),
             hgap(ui, thread_inset),
         }),
@@ -11383,8 +11333,8 @@ pub fn ancestorRowForTest(ui: *AppUi, ancestor: *const Ancestor, first: bool) Ap
     return ancestorRow(ui, ancestor, first);
 }
 
-pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
-    return replyBlock(ui, block, root_author, first, last);
+pub fn replyBlockForTest(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+    return replyBlock(ui, model, block, root_author, first, last);
 }
 
 /// The rows a level can hold whose height is a fixed constant, so a test can
@@ -11506,6 +11456,7 @@ fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
             .padding = 0.01,
             .cross = .start,
             .on_press = Msg{ .open_thread = note.id },
+            .context_menu = noteContextItems(ui, note, false),
             .semantics = .{ .label = "Open thread" },
         }, .{
             avatarDisc(ui, note, nested_avatar_size),
@@ -12508,7 +12459,7 @@ fn profileRowExtent(context: ?*const anyopaque, index: u64) f32 {
 fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
     return switch (rows.rowAt(index)) {
         .person => profileCard(ui, rows.model, rows.pubkey),
-        .note => |ni| noteCard(ui, &rows.notes[ni]),
+        .note => |ni| noteCard(ui, rows.model, &rows.notes[ni]),
         .empty => profileEmptyRow(ui, rows),
     };
 }
@@ -12625,7 +12576,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.failed = true;
             return ui.column(.{}, .{});
         };
-        for (built, 0..) |*row, offset| row.* = noteCard(ui, &model.notes[window.start_index + offset]);
+        for (built, 0..) |*row, offset| row.* = noteCard(ui, model, &model.notes[window.start_index + offset]);
         break :blk built;
     };
 
@@ -13024,25 +12975,90 @@ fn lowerScope(scope: []const u8) []const u8 {
 /// One entry today. It says which way it goes and, when it cannot go either
 /// way yet, says that instead of offering a press that would replace a contact
 /// list nobody has read.
-fn noteMenu(ui: *AppUi, author: [32]u8) AppUi.Node {
-    const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
+/// What a note offers beyond its verbs: where it is, what it says, and what to
+/// do about whoever wrote it.
+///
+/// The same items back the right-click menu (`noteContextItems`), because two
+/// lists would be two lists to keep in step and the reader would find different
+/// actions depending on which way they reached for them.
+fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
+    const rows = ui.arena.alloc(AppUi.Node, 6) catch return ui.spacer(0);
+    var n: usize = 0;
+    rows[n] = menuRow(ui, "Copy note address", "copy", null, Msg{ .copy_nevent = note.id });
+    n += 1;
+    rows[n] = menuRow(ui, "Copy text", null, null, Msg{ .copy_note_text = note.id });
+    n += 1;
+    rows[n] = menuRow(ui, "Open on the web", "external-link", null, Msg{ .open_web = note.id });
+    n += 1;
+    rows[n] = menuSeparatorRow(ui);
+    n += 1;
+    rows[n] = followMenuRow(ui, note.pubkey);
+    n += 1;
+    return menuSurfacePlaced(ui, 220, .below, .end, rows[0..n]);
+}
+
+/// The same actions as the note's menu, for a right-click anywhere on the row.
+///
+/// One list, not two. A right-click that offered a different set from the `...`
+/// beside it would be two menus to keep in step, and the reader would find
+/// different actions depending on which way they reached for them. The runtime
+/// presents these as the platform's own menu where there is one, and as the same
+/// anchored surface everything else uses where there is not.
+fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppUi.ContextMenuItem {
+    const items = ui.arena.alloc(AppUi.ContextMenuItem, 6) catch return &.{};
+    var n: usize = 0;
+    if (!in_thread) {
+        items[n] = .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } };
+        n += 1;
+    }
+    items[n] = .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } };
+    n += 1;
+    items[n] = .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } };
+    n += 1;
+    items[n] = .{ .label = "Open on the web", .msg = Msg{ .open_web = note.id } };
+    n += 1;
+    items[n] = .{ .separator = true };
+    n += 1;
+    items[n] = followContextItem(note.pubkey);
+    n += 1;
+    return items[0..n];
+}
+
+/// The follow entry for a right-click, in the same states the menu row has.
+/// Disabled rather than absent where it cannot act, so the reason is visible
+/// instead of the action silently missing.
+fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
+    const me = activePubkey();
+    if (me) |pk| {
+        if (std.mem.eql(u8, &pk, &author)) return .{ .label = "This is you", .enabled = false };
+    } else return .{ .label = "Follow", .msg = Msg{ .follow_author = 0 } };
+    if (followBlockedReason()) |reason| return .{ .label = reason, .enabled = false };
+    if (isFollowing(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = 2 } };
+    return .{ .label = "Follow", .msg = Msg{ .follow_author = 1 } };
+}
+
+/// The follow line, in whatever state it is honestly in.
+fn followMenuRow(ui: *AppUi, author: [32]u8) AppUi.Node {
     const me = activePubkey();
     const is_me = if (me) |pk| std.mem.eql(u8, &pk, &author) else false;
-    if (is_me) {
-        rows[0] = menuRow(ui, "This is you", null, null, null);
-    } else if (me == null) {
-        rows[0] = menuRow(ui, "Follow", null, null, Msg{ .follow_author = 0 });
-    } else if (followBlockedReason()) |reason| {
-        // Not "Follow", greyed. The reason is worth saying: the app is still
-        // looking for a list it must not write over. A silently dead Follow
-        // button is what every client that got this safety right got wrong.
-        rows[0] = menuRow(ui, reason, null, null, null);
-    } else if (isFollowing(author)) {
-        rows[0] = menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
-    } else {
-        rows[0] = menuRow(ui, "Follow", null, null, Msg{ .follow_author = 1 });
-    }
-    return menuSurfacePlaced(ui, 200, .below, .end, rows);
+    if (is_me) return menuRow(ui, "This is you", null, null, null);
+    if (me == null) return menuRow(ui, "Follow", null, null, Msg{ .follow_author = 0 });
+    // Not "Follow", greyed. The reason is worth saying: the app is still
+    // looking for a list it must not write over. A silently dead Follow
+    // button is what every client that got this safety right got wrong.
+    if (followBlockedReason()) |reason| return menuRow(ui, reason, null, null, null);
+    if (isFollowing(author)) return menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
+    return menuRow(ui, "Follow", null, null, Msg{ .follow_author = 1 });
+}
+
+/// A rule between groups of menu items.
+fn menuSeparatorRow(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 4),
+        ui.el(.panel, .{ .height = 1, .padding = 0.01, .style = .{ .background = p.divider_card, .radius = 0, .stroke_width = 0 } }, .{}),
+        vgap(ui, 4),
+    });
 }
 
 /// The chrome's floating surface: a menu anchored to the trigger it hangs off.
@@ -13793,7 +13809,15 @@ const verb_icon_size: f32 = 15;
 /// to say something about the app). Bookmark and more carry nothing at all and
 /// are drawn quieter to say so. None of the four takes hover, focus or a press,
 /// so nothing here answers a click with silence.
-fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
+fn engagementRow(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
+    return engagementRowAt(ui, model, note, true);
+}
+
+/// The same row, told whether to carry its counts. The focal note in a thread
+/// does not: the stats line above it already states every one of them in words,
+/// and a number said twice in two registers is the second one looking like a
+/// control.
+fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: bool) AppUi.Node {
     const p = theme.palette;
     const glyph = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_metric } };
     const quiet = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_dim } };
@@ -13803,19 +13827,49 @@ fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
         // A plain pressable row, never a `.list_item`: that kind carries a 28px
         // intrinsic height floor and its padding walks the cluster off the rail
         // the disc, name and body share.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), c.replies, p.text_metric, .{
+        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts) c.replies else 0, p.text_metric, .{
             .on_press = Msg{ .open_thread = note.id },
             .style = .{ .quiet_hover = true },
             .semantics = .{ .role = .button, .label = "Reply" },
         })),
-        verbSlot(ui, verbWithCount(ui, ui.icon(glyph, "repeat"), c.reposts, p.text_metric, .{})),
-        verbSlot(ui, likeAction(ui, note)),
+        verbSlot(ui, verbWithCount(ui, ui.icon(glyph, "repeat"), if (counts) c.reposts else 0, p.text_metric, .{})),
+        verbSlot(ui, likeAction(ui, note, counts)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), c.zap_msat / 1000, p.text_metric, .{})),
+        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts) c.zap_msat / 1000 else 0, p.text_metric, .{})),
         verbSlot(ui, ui.appIcon(quiet, "bookmark")),
-        verbSlot(ui, ui.icon(quiet, "ellipsis")),
+        // The one unfinished-looking glyph that is not unfinished: it opens the
+        // note's menu, the same one the thread's header has always had, with the
+        // note's address, its words and its author behind it.
+        //
+        // The press sits on the SLOT rather than inside it, which is the one
+        // place in this row that is safe: it is the last slot, so a target the
+        // full 64 wide can only reach into the inert bookmark beside it, and a
+        // wrapper of its own cost a node on every row in the feed and put the
+        // app's worst frame over its node budget.
+        ui.row(.{
+            .width = verb_slot_width,
+            .cross = .center,
+            .gap = 0,
+            .on_press = Msg{ .toggle_note_menu = note.id },
+            .style = .{ .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "More", .focusable = true },
+        }, .{moreSlotChildren(ui, model, note, glyph)}),
     });
+}
+
+/// The more-slot's children: the glyph, and the menu only when it is THIS note's
+/// menu that is open.
+///
+/// A slice rather than `if (open) menu else spacer(0)`, because a placeholder is
+/// charged a widget node on every row whether or not it draws, and one per feed
+/// row was enough to put the app's worst frame over the budget the suite holds.
+fn moreSlotChildren(ui: *AppUi, model: *const Model, note: *const Note, glyph: AppUi.ElementOptions) []const AppUi.Node {
+    const kids = ui.arena.alloc(AppUi.Node, 2) catch return &.{};
+    kids[0] = ui.icon(glyph, "ellipsis");
+    if (model.note_menu != note.id) return kids[0..1];
+    kids[1] = noteMenu(ui, note);
+    return kids[0..2];
 }
 
 /// One verb in its slot: the control at the left, the rest of the slot empty.
@@ -13864,14 +13918,14 @@ fn countLabel(ui: *AppUi, n: u64, color: canvas.Color) AppUi.Node {
 /// is the crowd's likes plus this session's own optimistic +1, which is dropped
 /// once our own reaction comes back through the subscription (so it is not
 /// counted twice).
-fn likeAction(ui: *AppUi, note: *const Note) AppUi.Node {
+fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     // Our own reaction id (if we liked this note), so the count can retire the
     // optimistic +1 once the reaction is folded into the crowd total.
     const my_reaction: ?[32]u8 = if (likeEntry(note.id)) |e| e.reaction_id else null;
     const liked = my_reaction != null;
     const count = likeCountFor(note.id, my_reaction);
     const tint = if (liked) theme.palette.status_like else theme.palette.text_metric;
-    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), count, tint, .{
+    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), if (counts) count else 0, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
@@ -14471,16 +14525,6 @@ fn liveRelayCount() usize {
     return n;
 }
 
-/// A note's nevent, abbreviated for a chip: enough to recognise, short enough to
-/// sit beside a timestamp.
-fn shortNevent(ui: *AppUi, note: *const Note) []const u8 {
-    var scratch: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return "nevent";
-    if (addr.len <= 18) return ui.fmt("{s}", .{addr});
-    return ui.fmt("{s}…{s}", .{ addr[0..10], addr[addr.len - 4 ..] });
-}
-
 /// The quoted note's relative timestamp, computed for the frame.
 fn quoteTime(ui: *AppUi, created_at: i64) []const u8 {
     const dt = nowSeconds() - created_at;
@@ -14496,7 +14540,7 @@ fn quoteTime(ui: *AppUi, created_at: i64) []const u8 {
 /// and the engagement row. The content is a fixed reading column centered in
 /// the window, with a hairline under each row as the only separation. Keyed by
 /// the note id so the list diff holds scroll position across reconciles.
-fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
+fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
     var node = ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
             // A `list_item`, because that is the kind the renderer washes on
@@ -14515,7 +14559,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // cannot express any of that, and a `gap` on the row would also apply
             // around each inset box, which is what threw the first attempt 12px
             // off the reading rail.
-            ui.el(.data_row, .{ .width = feed_column_width, .padding = 0.01, .on_press = Msg{ .open_thread = note.id }, .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
+            ui.el(.data_row, .{ .width = feed_column_width, .padding = 0.01, .on_press = Msg{ .open_thread = note.id }, .context_menu = noteContextItems(ui, note, false), .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
                 vgap(ui, row_pad_top),
                 ui.row(.{ .gap = 0, .cross = .start }, .{
                     hgap(ui, row_pad_side),
@@ -14540,7 +14584,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
                         if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                         vgap(ui, 10),
-                        engagementRow(ui, note),
+                        engagementRow(ui, model, note),
                     }),
                     hgap(ui, row_pad_side),
                 }),
@@ -15328,10 +15372,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             inboxMarkAllRead();
             markInboxDirty();
         },
-        .toggle_note_menu => model.note_menu = !model.note_menu,
-        .close_note_menu => model.note_menu = false,
+        .toggle_note_menu => |id| model.note_menu = if (model.note_menu == id) 0 else id,
+        .close_note_menu => model.note_menu = 0,
         .follow_author => |direction| {
-            model.note_menu = false;
+            model.note_menu = 0;
             // A guest reaching for Follow is first intent, the same as reaching
             // for the composer: the sheet rises rather than the press failing.
             if (direction == 0 or model.is_guest()) {
@@ -15507,6 +15551,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const url = std.fmt.bufPrint(&url_buf, "https://njump.me/{s}", .{addr}) catch return;
             openExternally(fx, url);
         },
+        .copy_note_text => |id| {
+            model.note_menu = 0;
+            // The words as the note wrote them, not as the feed renders them:
+            // a paste that came back with `@name` where the author typed a
+            // `nostr:` reference is not the note, it is a screenshot of one.
+            const note = model.noteById(id) orelse return;
+            fx.writeClipboard(.{ .key = copy_note_text_key, .text = note.content() });
+            setToast(model, "Copied");
+        },
         .open_settings_logout => {
             model.menu = .none;
             model.logout_pending = true;
@@ -15630,7 +15683,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_thread => {
             // A menu left open would reopen over whatever the reader lands on.
-            model.note_menu = false;
+            model.note_menu = 0;
             closeThread(model);
         },
         .go_home => goHome(model),
@@ -17548,7 +17601,7 @@ fn enterProfile(model: *Model, pubkey: [32]u8) void {
     model.viewing_profile = pubkey;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
-    model.note_menu = false;
+    model.note_menu = 0;
     model.reply_buffer.clear();
     wantProfile(pubkey);
     model.profile_tab = .notes;
@@ -17608,7 +17661,7 @@ fn goHome(model: *Model) void {
     model.thread_loading = false;
     model.thread_notes_len = 0;
     model.reply_buffer.clear();
-    model.note_menu = false;
+    model.note_menu = 0;
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
@@ -17628,7 +17681,7 @@ fn closeThread(model: *Model) void {
     model.thread_outside_open[model.currentLevel()] = false;
     model.reply_buffer.clear();
     model.thread_notes_len = 0;
-    model.note_menu = false;
+    model.note_menu = 0;
     if (model.thread_stack_len > 0) {
         model.thread_stack_len -= 1;
         const prev = model.thread_stack[model.thread_stack_len];
