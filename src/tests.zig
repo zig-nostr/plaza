@@ -9696,3 +9696,87 @@ test "a note has exactly one menu trigger" {
         return error.TwoMenus;
     }
 }
+
+test "the status bar is on screen wherever the reader is" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // It was the last row of the FEED's own column, and every level layered over
+    // the feed is opaque, so opening a note took the pool's health, the outbox
+    // and the signer off screen. Those three are least dispensable exactly when
+    // a reader is reading something and about to answer it.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const author = [_]u8{0x55} ** 32;
+    const Where = struct { name: []const u8, arm: *const fn (*Model) void };
+    const places = [_]Where{
+        .{ .name = "the feed", .arm = struct {
+            fn f(_: *Model) void {}
+        }.f },
+        .{ .name = "a thread", .arm = struct {
+            fn f(m: *Model) void {
+                m.viewing_thread = 1;
+                m.thread_root.id = 1;
+            }
+        }.f },
+        .{ .name = "a person", .arm = struct {
+            fn f(m: *Model) void {
+                m.viewing_profile = [_]u8{0x55} ** 32;
+            }
+        }.f },
+        .{ .name = "a thread three levels deep", .arm = struct {
+            fn f(m: *Model) void {
+                m.viewing_thread = 1;
+                m.thread_root.id = 1;
+                for (0..3) |d| {
+                    m.thread_stack[d] = .{ .note = .{ .created_at = 100 } };
+                    m.thread_stack[d].note.id = @intCast(500 + d);
+                }
+                m.thread_stack_len = 3;
+            }
+        }.f },
+    };
+
+    for (places) |place| {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.thread_root.pubkey = author;
+        place.arm(&model);
+        const p = try painted.Painted.render(arena, &model);
+        const chip = p.frameOf("Relays") orelse {
+            std.debug.print("no status bar on {s}\n", .{place.name});
+            return error.StatusBarMissing;
+        };
+        // On the floor of the window rather than pushed off the bottom.
+        const bottom = chip.y + chip.height;
+        if (bottom > main.window_height or bottom < main.window_height - 60) {
+            std.debug.print(
+                "on {s} the status bar ends at {d:.1}, and the window is {d:.0} tall\n",
+                .{ place.name, bottom, main.window_height },
+            );
+            return error.StatusBarNotOnTheFloor;
+        }
+
+        // And NOT UNDER anything. Present and correctly placed is not the same
+        // as visible: a thread is an opaque card laid over the feed, and while
+        // the bar was the last row of the feed's own column it kept its frame,
+        // kept its position, and was painted over. The first version of this
+        // test asked the widget tree and passed on the broken code, which is the
+        // whole reason the painted layer exists.
+        for (p.layout.nodes) |node| {
+            if (node.widget.kind != .card) continue;
+            const f = node.widget.frame;
+            const covers = f.x <= chip.x and f.y <= chip.y and
+                f.x + f.width >= chip.x + chip.width and
+                f.y + f.height >= chip.y + chip.height;
+            if (!covers) continue;
+            std.debug.print(
+                "on {s} the status bar is under an opaque {d:.0}x{d:.0} surface\n",
+                .{ place.name, f.width, f.height },
+            );
+            return error.StatusBarCovered;
+        }
+    }
+}

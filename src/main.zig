@@ -12533,7 +12533,16 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
         // row that would stretch it along the WIDTH and eat the feed's space; it
         // fills the height on its own via the row's cross-axis stretch.
         ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
-        content,
+        // The bar sits BESIDE the rail and BELOW everything else, which is the
+        // only place it is always visible. It used to be the last row of the
+        // feed's own column, so every level layered over the feed (a thread, a
+        // person) covered it: the pool's health, the outbox and the signer
+        // vanished the moment a reader opened a note, which is not a moment to
+        // stop telling them whether their notes can go out.
+        ui.column(.{ .grow = 1, .gap = 0 }, .{
+            content,
+            statusBar(ui, model),
+        }),
     });
 }
 
@@ -12606,7 +12615,6 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
             // opening over it) without the model mirroring it.
             ui.virtualList(options, window, .{rows}),
         if (model.backup_nudge) backupNudge(ui) else ui.spacer(0),
-        statusBar(ui, model),
     });
 }
 
