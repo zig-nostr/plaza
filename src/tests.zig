@@ -5207,13 +5207,17 @@ test "membership is right for every follow, not only the ones the feed reads" {
     try testing.expectEqual(@as(usize, 128), main.followSetForTest().len);
     // But all 400 are followed, including the last.
     try testing.expectEqual(@as(usize, 400), main.followTotal());
-    try testing.expect(main.isFollowing(many[399]));
-    try testing.expect(main.isFollowing(many[200]));
-    try testing.expect(main.isFollowing(many[0]));
+    // With a list of the reader's OWN, the two questions agree: everybody on it
+    // is both read and followed.
+    for ([_]usize{ 399, 200, 0 }) |i| {
+        try testing.expect(main.isFollowedByMe(many[i]));
+        try testing.expect(main.isInReadGraph(many[i]));
+    }
     var stranger: [32]u8 = undefined;
     @memset(&stranger, 0xff);
     stranger[0] = 0xfe;
-    try testing.expect(!main.isFollowing(stranger));
+    try testing.expect(!main.isFollowedByMe(stranger));
+    try testing.expect(!main.isInReadGraph(stranger));
 }
 
 test "an older contact list never undoes a newer one" {
@@ -5545,21 +5549,25 @@ test "opening the person already open does not stack a second copy of them" {
     try testing.expectEqual(@as(usize, 1), model.thread_stack_len);
 }
 
-test "a guest is not told they follow the starter pack" {
-    // The pack is what the app reads on a guest's behalf, not a list they
-    // chose. Showing "Following" on nine strangers to somebody with no key also
-    // contradicts the note menu, which offers them Follow for the same person
-    // in the same moment.
+test "nobody is told they follow the starter pack" {
+    // The pack is what the app reads on a new account's behalf, not a list they
+    // chose, and nothing is ever published to say otherwise. Telling a reader
+    // they follow nine strangers offered them "Unfollow" on each, and pressing
+    // it did nothing at all, because the write path correctly refuses to remove
+    // somebody who is not on a list. Two questions, two answers.
     main.clearIdentityForTest();
     main.forgetFollowsForTest();
     const packed_in = main.followSetForTest()[0];
-    try testing.expect(!main.isFollowing(packed_in));
+    try testing.expect(!main.isFollowedByMe(packed_in));
+    try testing.expect(!main.isInReadGraph(packed_in));
 
-    // Signed in with no list of their own, the pack IS what they read, so the
-    // thread's ranking still treats them as inside the graph.
+    // Signed in with no list of their own: the pack IS what they read, so the
+    // thread's ranking and the inbox still treat those authors as inside the
+    // graph. They are still not followed, and the controls must not say so.
     main.setIdentityForTest([_]u8{0x74} ** 32);
     defer main.clearIdentityForTest();
-    try testing.expect(main.isFollowing(packed_in));
+    try testing.expect(main.isInReadGraph(packed_in));
+    try testing.expect(!main.isFollowedByMe(packed_in));
 }
 
 test "the follow count counts people, not tags" {
@@ -9779,4 +9787,93 @@ test "the status bar is on screen wherever the reader is" {
             return error.StatusBarCovered;
         }
     }
+}
+
+test "a new account is offered Follow on the starter pack, not Unfollow" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // What a reader saw the moment they made a key: nine people they had never
+    // chosen, each reported as followed, each offering "Unfollow", and each
+    // press doing nothing. The offer is the bug; the silence when pressed was
+    // the write path being right.
+    main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{0x74} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+
+    const packed_in = main.followSetForTest()[0];
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 77;
+    model.notes[0].pubkey = packed_in;
+    model.notes_len = 1;
+    model.note_menu = 77;
+
+    const p = try painted.Painted.render(arena, &model);
+    if (findAnyText(p.tree.root, "Unfollow") != null) {
+        std.debug.print("a starter-pack author is offered Unfollow\n", .{});
+        return error.OfferedUnfollow;
+    }
+    const msg = pressMsgByLabel(p.tree, "Follow") orelse {
+        std.debug.print("no way to follow a starter-pack author\n", .{});
+        return error.NoFollowOffer;
+    };
+    switch (msg) {
+        .follow_author => |direction| try testing.expectEqual(@as(u8, 1), direction),
+        else => return error.WrongMessage,
+    }
+
+    // And the feed still says whose choice the pack was, which is the other half
+    // of not claiming it: the header has always been honest and the controls
+    // were not.
+    try testing.expect(findAnyText(p.tree.root, "Starter pack") != null);
+    try testing.expect(findAnyTextContainingText(p.tree.root, "hand-picked") != null);
+}
+
+test "a new account's inbox reads the starter pack as its own graph" {
+    // The other half of the split, and the half no test held: the inbox and the
+    // thread's own-graph ranking ask whether an author is inside the graph the
+    // reader READS, which for an account with no list of its own is the pack.
+    // Answering that with the membership question instead would file every
+    // starter-pack author under strangers on the day the account was made.
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{0xC4} ** 32);
+    defer main.clearIdentityForTest();
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    const packed_in = main.followSetForTest()[0];
+    var stranger = [_]u8{0xFE} ** 32;
+    stranger[1] = 0x01;
+
+    _ = main.inboxAddForTest(inboxEventBy(7, packed_in, &mine, 1_800_000_100), 1_800_000_200);
+    _ = main.inboxAddForTest(inboxEventBy(7, stranger, &mine, 1_800_000_101), 1_800_000_200);
+
+    var buf: [main.inbox_cap]main.InboxItem = undefined;
+    // The "from people you read" tab: the pack is in, the stranger is not.
+    const only_follows = main.inboxItems(&buf, true);
+    var saw_pack = false;
+    var saw_stranger = false;
+    for (only_follows) |item| {
+        if (std.mem.eql(u8, &item.author, &packed_in)) saw_pack = true;
+        if (std.mem.eql(u8, &item.author, &stranger)) saw_stranger = true;
+    }
+    if (!saw_pack) {
+        std.debug.print("a starter-pack author is filed under strangers\n", .{});
+        return error.PackTreatedAsStranger;
+    }
+    try testing.expect(!saw_stranger);
+
+    // And everyone's tab holds both.
+    const everyone = main.inboxItems(&buf, false);
+    try testing.expect(everyone.len >= 2);
 }

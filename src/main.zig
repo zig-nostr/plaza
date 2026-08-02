@@ -3919,8 +3919,8 @@ fn inboxAdmitLocked(item: InboxItem) bool {
 
     if (g_inbox_len >= g_inbox.len) {
         const victim = inboxEvictionCandidateLocked() orelse return false;
-        const victim_is_stranger = !isFollowing(g_inbox[victim].author);
-        const mine = isFollowing(item.author);
+        const victim_is_stranger = !isInReadGraph(g_inbox[victim].author);
+        const mine = isInReadGraph(item.author);
         // Someone the reader follows always outranks someone they do not.
         // Otherwise the newer of the two wins, so nothing already held is ever
         // traded away for something older than it.
@@ -3951,7 +3951,7 @@ fn inboxEvictionCandidateLocked() ?usize {
     var oldest: ?usize = null;
     for (g_inbox[0..g_inbox_len], 0..) |it, i| {
         if (oldest == null or it.created_at < g_inbox[oldest.?].created_at) oldest = i;
-        if (isFollowing(it.author)) continue;
+        if (isInReadGraph(it.author)) continue;
         if (oldest_stranger == null or it.created_at < g_inbox[oldest_stranger.?].created_at) oldest_stranger = i;
     }
     return oldest_stranger orelse oldest;
@@ -4127,7 +4127,7 @@ pub fn inboxItems(out: []InboxItem, only_follows: bool) []const InboxItem {
     var n: usize = 0;
     for (g_inbox[0..g_inbox_len]) |item| {
         if (n >= out.len) break;
-        if (only_follows and !isFollowing(item.author)) continue;
+        if (only_follows and !isInReadGraph(item.author)) continue;
         out[n] = item;
         n += 1;
     }
@@ -10601,14 +10601,20 @@ pub fn followGeneration() u32 {
     return g_follow_gen.load(.acquire);
 }
 
-/// Whether this reader follows `pubkey`. Checked against EVERY follow, not the
-/// slice the feed reads: offering to follow somebody already followed, and then
-/// doing nothing when pressed, is worse than not offering at all.
-pub fn isFollowing(pubkey: [32]u8) bool {
-    // A guest follows nobody. The starter pack is what the app READS on their
-    // behalf, not a list they chose, and showing "Following" on nine strangers
-    // to somebody with no key contradicts the note menu, which offers them
-    // Follow for the same person in the same moment.
+/// Whether `pubkey` is inside the graph this reader is READING: their own follow
+/// list once it is known, and the starter pack until then.
+///
+/// This is the ranking question, not the membership one. The inbox uses it to
+/// tell somebody the reader reads from a stranger, and a thread uses it to split
+/// replies into the conversation and the crowd outside it. For those, the pack
+/// IS the graph while the pack is what fills the feed.
+///
+/// Not the same question as `isFollowedByMe`, and the difference is the whole
+/// point of having both. Checked against EVERY follow, not the slice the feed
+/// reads.
+pub fn isInReadGraph(pubkey: [32]u8) bool {
+    // A guest reads the pack, but the app has nothing to rank for them: no
+    // inbox, no own-graph split.
     if (activePubkey() == null) return false;
     lockFollows();
     defer unlockFollows();
@@ -10618,6 +10624,30 @@ pub fn isFollowing(pubkey: [32]u8) bool {
         }
         return false;
     }
+    for (g_follows[0..g_follow_count]) |f| {
+        if (std.mem.eql(u8, &f, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Whether this reader has actually FOLLOWED `pubkey`: their own kind:3 says so.
+///
+/// The starter pack is not a follow list. It is what the app reads on a new
+/// account's behalf until that account has one, nothing is ever published to say
+/// otherwise, and the feed's own header says as much ("Starter pack · hand-picked",
+/// against "Following · yours"). But every control that asks about following
+/// asked `isFollowing`, which counted the pack: a reader who had just made a key
+/// was told they followed nine strangers, offered "Unfollow" on each, and got
+/// nothing when they pressed it, because the write path correctly refuses to
+/// remove somebody who is not on a list.
+///
+/// So the controls ask this instead. It says Follow for the pack, which is true,
+/// and which is how a starter pack is supposed to turn into a list of your own.
+pub fn isFollowedByMe(pubkey: [32]u8) bool {
+    if (activePubkey() == null) return false;
+    lockFollows();
+    defer unlockFollows();
+    if (!followsAreOwned()) return false;
     for (g_follows[0..g_follow_count]) |f| {
         if (std.mem.eql(u8, &f, &pubkey)) return true;
     }
@@ -12233,7 +12263,7 @@ fn profileActions(ui: *AppUi, model: *const Model, pubkey: [32]u8, is_me: bool) 
         // would be a second thing to keep true.
         return ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "This is you", .scale = meta_scale }});
     }
-    const following = isFollowing(pubkey);
+    const following = isFollowedByMe(pubkey);
     return ui.row(.{ .cross = .center, .gap = 8 }, .{
         // Disabled rather than absent while the app is still reading the
         // reader's own list: a control that vanishes is a control they will
@@ -13041,7 +13071,7 @@ fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
         if (std.mem.eql(u8, &pk, &author)) return .{ .label = "This is you", .enabled = false };
     } else return .{ .label = "Follow", .msg = Msg{ .follow_author = 0 } };
     if (followBlockedReason()) |reason| return .{ .label = reason, .enabled = false };
-    if (isFollowing(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = 2 } };
+    if (isFollowedByMe(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = 2 } };
     return .{ .label = "Follow", .msg = Msg{ .follow_author = 1 } };
 }
 
@@ -13055,7 +13085,7 @@ fn followMenuRow(ui: *AppUi, author: [32]u8) AppUi.Node {
     // looking for a list it must not write over. A silently dead Follow
     // button is what every client that got this safety right got wrong.
     if (followBlockedReason()) |reason| return menuRow(ui, reason, null, null, null);
-    if (isFollowing(author)) return menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
+    if (isFollowedByMe(author)) return menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
     return menuRow(ui, "Follow", null, null, Msg{ .follow_author = 1 });
 }
 
