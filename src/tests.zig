@@ -3856,6 +3856,12 @@ test "a burst of relay edits publishes one list, not one per press" {
     // for, so the edit settles and the last state is what goes out.
     main.resetRelaysForTest();
     main.clearRelayListPublishForTest();
+    main.setIdentityForTest([_]u8{64} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    _ = main.addRelayForTest("wss://burst.example.com", true, true);
+    main.markRelaysMineForTest();
     try testing.expect(!main.relayListDueForTest(1_000));
 
     main.relayListEditedForTest(1_000);
@@ -3863,9 +3869,17 @@ test "a burst of relay edits publishes one list, not one per press" {
     try testing.expect(!main.relayListDueForTest(1_000));
     main.relayListEditedForTest(1_001);
     try testing.expect(!main.relayListDueForTest(1_002));
-    // Two seconds after the LAST press, once.
+    // Two seconds after the LAST press it is due, and it STAYS due: asking is
+    // not what settles it. This used to be consumed by the question, which is
+    // how an edit the publish then refused was lost for good.
     try testing.expect(main.relayListDueForTest(1_003));
-    try testing.expect(!main.relayListDueForTest(1_010));
+    try testing.expect(main.relayListDueForTest(1_010));
+
+    // The publish is what settles it, once, for the whole burst.
+    var fx: main.EffectsForTest = undefined;
+    main.flushRelayListForTest(&fx, 1_011);
+    try testing.expect(!main.relayListPendingForTest());
+    try testing.expect(!main.relayListDueForTest(1_020));
 
     // The file, though, is written on every edit: a crash must not lose one.
     main.relayListEditedForTest(2_000);
@@ -4611,25 +4625,198 @@ test "editing a relay list does not grant permission to publish it" {
     main.resetRelaysForTest();
     main.setIdentityForTest([_]u8{61} ** 32);
     defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
 
     // An edit: now owned.
     _ = main.addRelayForTest("wss://edited.example.com", true, true);
     main.markRelaysMineForTest();
     try testing.expect(main.relayListIsOwnedForTest());
-    // But nobody has said what their real list is, so nothing goes out. Driving
-    // the real publish, not just its predicates: "did not publish" IS the
-    // property, so a test that only reads the flags proves nothing.
+    // But their own list is not here, so nothing goes out. Driving the real
+    // publish, not just its predicates: "did not publish" IS the property, so a
+    // test that only reads the flags proves nothing.
     var fx: main.EffectsForTest = undefined;
     try testing.expect(!main.publishRelayListForTest(&fx));
 
-    // Once a relay has answered, the same edit does go out.
-    main.noteOwnRelaysAnsweredForTest(main.activePubkeyForTest().?);
-    try testing.expect(main.ownRelaysAnsweredForTest());
+    // A key minted in this app moments ago has no history to lose, and that is
+    // the ONE thing besides holding the list that opens the gate.
+    main.setIdentityMintedForTest(true);
+    try testing.expect(main.publishRelayListForTest(&fx));
+}
+
+test "one relay's EOSE is not permission to replace a relay list" {
+    // The gate used to be "some relay reached the end of its answer without
+    // sending a kind:10002, so they have none". On a cold import the relays
+    // being asked are the four this app was born with, which may hold none of
+    // the reader's. Four clean answers coexisted with a twelve-relay list
+    // somewhere else, and a single badge press published the four over it.
+    //
+    // There is nothing left to call: the flag and its setter are gone. What
+    // this pins is the consequence, which is what a future gate would have to
+    // keep true.
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityForTest([_]u8{63} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+
+    _ = main.addRelayForTest("wss://bootstrap.example.com", true, true);
+    main.markRelaysMineForTest();
+
+    // Every relay in the pool has now finished answering. That is not evidence.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.canWriteRelayListForTest());
+    try testing.expect(!main.publishRelayListForTest(&fx));
+}
+
+test "a relay list is spliced onto the one the reader published" {
+    // The publish used to build the whole event out of the pool, which holds
+    // eight. A reader with thirteen relays had five deleted from their NIP-65
+    // list by one badge press, along with every tag type this app does not
+    // model. The event is now what they published, plus what they changed here.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{77} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/splice.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.forgetRelayRemovalsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+
+    // Their real list: more relays than the pool has seats, plus a tag this app
+    // has never heard of. The store is the only thing that can hold it, because
+    // the pool structurally cannot.
+    const published = [_]nostr.event.Tag{
+        &.{ "r", "wss://kept-1.example.com" },
+        &.{ "r", "wss://kept-2.example.com" },
+        &.{ "r", "wss://kept-3.example.com" },
+        &.{ "r", "wss://kept-4.example.com" },
+        &.{ "r", "wss://kept-5.example.com" },
+        &.{ "r", "wss://kept-6.example.com" },
+        &.{ "r", "wss://kept-7.example.com" },
+        &.{ "r", "wss://kept-8.example.com" },
+        &.{ "r", "wss://overflow-9.example.com" },
+        &.{ "r", "wss://overflow-10.example.com", "read" },
+        &.{ "unmodelled", "something this app does not read" },
+    };
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &published, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+
+    // The pool as the app would hold it: the first eight, which is all it can.
+    for (published[0..8]) |tag| _ = main.addRelayForTest(tag[1], true, true);
+    main.markRelaysMineForTest();
+
+    // One badge press, then the publish it settles into.
+    var fx: main.EffectsForTest = undefined;
     try testing.expect(main.publishRelayListForTest(&fx));
 
-    // And an answer about THIS account says nothing about the next one.
-    main.setIdentityForTest([_]u8{62} ** 32);
-    try testing.expect(!main.ownRelaysAnsweredForTest());
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10002).?;
+    defer testing.allocator.free(written);
+    // The eight the pool holds.
+    try testing.expect(std.mem.indexOf(u8, written, "kept-1.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "kept-8.example.com") != null);
+    // THE PROPERTY: the two the pool had no seat for are still in their list,
+    // with their markers, and so is the tag this app does not model.
+    try testing.expect(std.mem.indexOf(u8, written, "overflow-9.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "overflow-10.example.com read") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "unmodelled") != null);
+}
+
+test "a removed relay is not put back by the splice that protects the rest" {
+    // The splice carries forward every relay the pool has no seat for, and a
+    // relay the reader just removed looks exactly like one of those. Without a
+    // ledger of removals the splice would undo every removal press.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{78} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/removed.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.forgetRelayRemovalsForTest();
+    main.setIdentityForTest([_]u8{78} ** 32);
+    defer main.clearIdentityForTest();
+
+    const published = [_]nostr.event.Tag{
+        &.{ "r", "wss://staying.example.com" },
+        &.{ "r", "wss://going.example.com" },
+    };
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &published, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+
+    _ = main.addRelayForTest("wss://staying.example.com", true, true);
+    const going = main.addRelayForTest("wss://going.example.com", true, true).?;
+    main.markRelaysMineForTest();
+
+    // The press. `removeRelayForTest` drives the same function the button does,
+    // so the ledger is written by the code under test rather than by the test.
+    main.removeRelayForTest(going);
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.publishRelayListForTest(&fx));
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10002).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "staying.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "going.example.com") == null);
+}
+
+test "an edit that could not be published is still pending" {
+    // The settle timer used to CONSUME the edit: it cleared the dirty flag and
+    // handed the publish a chance it could refuse. An edit made before this
+    // account's list had been read was refused, the flag was already gone, and
+    // nothing tried again, so the edit lived on this machine and nowhere else
+    // for the rest of the install.
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityForTest([_]u8{79} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+    main.clearRelayListPublishForTest();
+
+    _ = main.addRelayForTest("wss://typed-on-a-plane.example.com", true, true);
+    main.markRelaysMineForTest();
+    main.relayListEditedForTest(1_000);
+
+    // Two seconds later the tick fires and the publish is refused.
+    var fx: main.EffectsForTest = undefined;
+    main.flushRelayListForTest(&fx, 1_003);
+    try testing.expect(main.relayListPendingForTest());
+
+    // The reason clears, and the same edit goes out without another press.
+    main.setIdentityMintedForTest(true);
+    main.flushRelayListForTest(&fx, 1_004);
+    try testing.expect(!main.relayListPendingForTest());
 }
 
 test "the store decides what a replacement is, not the backup" {
@@ -9177,6 +9364,34 @@ fn openFullSettings(model: *Model) void {
     });
     model.stage = .settings;
     model.reveal_nsec = true;
+}
+
+test "a relay edit that will not be published says so on the screen" {
+    // The gate is the safe half; this is the honest half. An edit that stays on
+    // this device looks exactly like one that went out, and a reader who is
+    // never told will believe their relays moved with them to every other
+    // client. Asserting the SCREEN, because the model being right about a
+    // sentence nobody renders is the failure this repo keeps meeting.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x7a} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+    defer main.resetRelaysForTest();
+
+    var model = main.initialModel();
+    openFullSettings(&model);
+    const p = try painted.Painted.render(arena, &model);
+    try testing.expect(findAnyTextContaining(p.tree.root, "has not read your published relay list"));
+
+    // And it goes away once there is nothing to warn about: a key minted here
+    // has no list to lose, so the edit publishes and the line would be a lie.
+    main.setIdentityMintedForTest(true);
+    const after = try painted.Painted.render(arena, &model);
+    try testing.expect(!findAnyTextContaining(after.tree.root, "has not read your published relay list"));
 }
 
 test "the settings sheet paints its own surface the whole way down" {

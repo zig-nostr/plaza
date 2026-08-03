@@ -319,6 +319,9 @@ fn adoptRelayList() bool {
     }
     if (n > g_relay_count.load(.monotonic)) g_relay_count.store(n, .release);
     claimRelayList();
+    // The list that just arrived IS this account's list, so nothing recorded
+    // against the pool it replaced is about anything any more.
+    forgetRelayRemovals();
     forgetOutboxAcks();
     saveRelays();
     // Deliberately NOT marked dirty: this list came FROM their kind:10002, and
@@ -331,9 +334,9 @@ fn adoptRelayList() bool {
 fn ingestRelayList(ev: nostr.event.Event) void {
     if (activePubkey()) |pk| {
         if (std.mem.eql(u8, &pk, &ev.pubkey)) {
-            // Heard. Whatever happens to the pool now, a publish is no longer
-            // writing over something nobody has read.
-            noteOwnRelaysAnswered(pk);
+            // The event itself is what opens the write gate, and it does so by
+            // being STORED rather than by being seen: `canWriteRelayList` asks
+            // the store, so a publish always has the list it is splicing onto.
             applyOwnRelayList(ev);
             return;
         }
@@ -371,11 +374,15 @@ fn relayListEdited() void {
 
 /// Whether a settled edit is now due to go out. Split from the publish so a test
 /// can drive the clock without a signer or a relay.
+///
+/// It does NOT consume the edit. It used to, and that was how an edit made
+/// before this account's list had been read disappeared: the publish refused,
+/// the flag was already gone, and nothing ever tried again, so the edit lived on
+/// this machine and nowhere else for the rest of the install. Only a publish
+/// that actually went out clears it.
 fn relayListDue(now_s: i64) bool {
     if (!g_relay_list_dirty) return false;
-    if (now_s - g_relay_list_touched < relay_list_settle_s) return false;
-    g_relay_list_dirty = false;
-    return true;
+    return now_s - g_relay_list_touched >= relay_list_settle_s;
 }
 
 pub fn relayListDueForTest(now_s: i64) bool {
@@ -389,15 +396,42 @@ pub fn relayListEditedForTest(now_s: i64) void {
 }
 
 pub fn clearRelayListPublishForTest() void {
-    g_relay_list_dirty = false;
-    g_relay_list_touched = 0;
+    clearRelayListPublish();
+}
+
+/// Drives the settle-and-publish the frame tick drives, so a test can assert
+/// that a refused publish leaves the edit pending rather than losing it.
+pub fn flushRelayListForTest(fx: *Effects, now_s: i64) void {
+    flushRelayList(fx, now_s);
+}
+
+pub fn relayListPendingForTest() bool {
+    return g_relay_list_dirty;
+}
+
+pub fn noteRelayRemovedForTest(url: []const u8) void {
+    noteRelayRemoved(url);
+}
+
+pub fn forgetRelayRemovalsForTest() void {
+    forgetRelayRemovals();
 }
 
 /// Publishes a settled edit. Called from the frame tick, so a burst of presses
 /// costs one event rather than one per press.
 fn flushRelayList(fx: *Effects, now_s: i64) void {
     if (!relayListDue(now_s)) return;
-    publishRelayList(fx);
+    // Cleared by the publish, not by the attempt. A refusal leaves the edit
+    // pending, so the tick tries again once the reason clears: their list
+    // arriving from a relay is what usually clears it, and that can be minutes
+    // after the press on a bad connection.
+    if (publishRelayListReporting(fx)) clearRelayListPublish();
+}
+
+/// Marks the pending edit as delivered. Only a publish that went out calls this.
+fn clearRelayListPublish() void {
+    g_relay_list_dirty = false;
+    g_relay_list_touched = 0;
 }
 
 /// Whether a kind is a note the reader wrote, as opposed to a record the app
@@ -415,49 +449,135 @@ fn publishRelayList(fx: *Effects) void {
     _ = publishRelayListReporting(fx);
 }
 
+/// Whether this account's relay list may be published at all.
+///
+/// This used to be "some relay sent EOSE and did not mention a kind:10002, so
+/// they must not have one". That is the same inference `canWriteFollows` calls
+/// wrong, and dangerously so, and for the same reason: on a cold import the
+/// relays being asked are the four this app was born with, which may hold none
+/// of the reader's real ones. Four clean answers can coexist with a
+/// twelve-relay list sitting somewhere this app has never dialed, and the price
+/// of believing them was that list, replaced by the four we happened to know.
+///
+/// So the bar is the same as the contact list's. Either their list is HERE, in
+/// which case the publish splices onto it and nothing can be lost, or the key
+/// was minted in this app moments ago and provably has no history to lose.
+/// Everything else stays on this device, and `relayWriteBlockedReason` says so.
+fn canWriteRelayList() bool {
+    if (activePubkey() == null) return false;
+    if (haveOwnRelayList()) return true;
+    return g_identity_minted_here;
+}
+
+/// Whether this account's own kind:10002 is in the local store.
+fn haveOwnRelayList() bool {
+    const gpa = std.heap.page_allocator;
+    const own = ownRecordJson(gpa, relay_list_kind) orelse return false;
+    freeOwnProfile(gpa, own);
+    return true;
+}
+
+/// Why an edit is staying on this device, in the reader's terms, or null when
+/// it is going out. A pool that silently never publishes is the same unexplained
+/// dead control `followBlockedReason` exists to avoid.
+pub fn relayWriteBlockedReason() ?[]const u8 {
+    if (activePubkey() == null) return null;
+    if (canWriteRelayList()) return null;
+    return "Saved on this device. Plaza has not read your published relay list yet, so it will not replace it.";
+}
+
 /// Publishes, and says whether it did. The caller ignores the answer; a test
 /// cannot, because "did not publish" is the whole safety property.
 fn publishRelayListReporting(fx: *Effects) bool {
     // A guest has no identity to sign with, and their list stays local.
     if (activePubkey() == null) return false;
-    // NOTHING is published over a list that has not been READ. A relay list is
-    // replaceable: publishing one replaces whatever the reader had, on every
-    // relay.
-    //
-    // Ownership alone is not enough, and getting that wrong is how the original
-    // hole worked: editing in Settings claims the pool for this account, so an
-    // edit would self-authorize its own publish and the bootstrap five would go
-    // out over a real list nobody had looked at yet. So the gate is BOTH. Owned,
-    // meaning this account's, AND answered, meaning a relay has actually said
-    // what their list is (or that they have none).
+    // Owned, meaning this pool is this account's rather than a leftover or the
+    // one the app was born with. An edit grants this to itself, which is why it
+    // is not the whole gate.
     if (!relayListIsOwned()) return false;
-    if (!ownRelaysAnswered()) return false;
+    if (!canWriteRelayList()) return false;
     const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
     var tags = std.ArrayList(nostr.event.Tag).empty;
+    // Freed on every path that does not hand it to the write seam, which now
+    // includes the ordinary "nothing usable" bail below.
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+
+    // THE SPLICE. This used to build the whole event out of the pool, which is
+    // how a thirteen-relay list came back as eight: the pool holds `max_relays`
+    // and everything past that was simply not in the event any more. Same for a
+    // `ws://` relay, a URL too long for a seat, and every tag type this app does
+    // not model. A kind:10002 is replaceable, so each of those was a deletion.
+    //
+    // So the event is what they published, plus what the reader changed here.
+    // A relay is dropped only when the reader took it out (`relayWasRemoved`);
+    // one the pool holds is emitted below from the pool, which is where its
+    // current read/write markers live.
+    if (previous) |prev| {
+        for (prev.tags) |tag| {
+            if (tag.len == 0) continue;
+            if (std.mem.eql(u8, tag[0], "r") and tag.len >= 2) {
+                const url = std.mem.trim(u8, tag[1], " \t\r\n");
+                if (poolHoldsRelay(url)) continue;
+                if (relayWasRemoved(url)) continue;
+            }
+            const copy = gpa.alloc([]const u8, tag.len) catch return false;
+            for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return false;
+            tags.append(gpa, copy) catch return false;
+        }
+    }
+
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
         if (!e.read and !e.write) continue;
-        const url = gpa.dupe(u8, e.url()) catch return false;
         var parts = gpa.alloc([]const u8, if (e.read and e.write) 2 else 3) catch return false;
-        parts[0] = "r";
-        parts[1] = url;
-        if (!(e.read and e.write)) parts[2] = if (e.read) "read" else "write";
+        // Every field is allocated, including the literals: the cleanup above
+        // frees each one, and a static string handed to `free` is a crash that
+        // only happens on the error path nobody drives.
+        parts[0] = gpa.dupe(u8, "r") catch return false;
+        parts[1] = gpa.dupe(u8, e.url()) catch return false;
+        if (!(e.read and e.write)) {
+            parts[2] = gpa.dupe(u8, if (e.read) "read" else "write") catch return false;
+        }
         tags.append(gpa, parts) catch return false;
     }
+    // A list with no relays in it is not a list, it is a deletion. Refusing is
+    // the same rule `applyOwnRelayList` applies coming the other way, and it
+    // matters more here: the splice can leave tags behind (a carried `alt`, say)
+    // after the reader has emptied the pool, so "some tags" is not "some relays".
+    var relay_tags: usize = 0;
+    for (tags.items) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "r")) relay_tags += 1;
+    }
+    if (relay_tags == 0) return false;
     const owned = tags.toOwnedSlice(gpa) catch return false;
-    if (owned.len == 0) return false;
+    handed_off = true;
     // Past whatever is already stored. A replaceable event whose stamp does not
     // beat the stored one is dropped by this store and by every relay, so an
     // edit could vanish everywhere while the app showed it applied.
     const created = @max(nowSeconds(), ownRecordCreatedAt(relay_list_kind) + 1);
-    // A relay list carries everything in its tags: the content is empty by
-    // NIP-65, not by omission.
-    signAndPublish(fx, gpa, created, relay_list_kind, owned, "", false);
+    // NIP-65 puts everything in the tags and says nothing about the content, so
+    // this app has nothing to write there. That is not the same as having
+    // something to erase: whatever a previous client put there comes forward,
+    // for the same reason a contact list's legacy relay map does.
+    const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
+    signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false);
     return true;
 }
 
 /// Whether publishing the pool would go out right now. The safety property is
-/// that it does NOT, until a relay has said what this account's list is.
+/// that it does NOT, until this account's own relay list has been read.
 pub fn publishRelayListForTest(fx: *Effects) bool {
     return publishRelayListReporting(fx);
 }
@@ -593,12 +713,8 @@ pub fn plazaIngestVerifiedForTest(gpa: std.mem.Allocator, ev: nostr.event.Event,
     return plazaIngest(gpa, ev, .{ .verify_with = signer });
 }
 
-pub fn noteOwnRelaysAnsweredForTest(pk: [32]u8) void {
-    noteOwnRelaysAnswered(pk);
-}
-
-pub fn ownRelaysAnsweredForTest() bool {
-    return ownRelaysAnswered();
+pub fn canWriteRelayListForTest() bool {
+    return canWriteRelayList();
 }
 
 pub fn forgetOwnRecordAnswersForTest() void {
@@ -763,6 +879,54 @@ pub fn writeRelayCount() usize {
     return n;
 }
 
+/// Relays this reader has taken OUT of the pool since this account signed in.
+///
+/// A publish splices the pool onto the kind:10002 they already published, and
+/// the test that carries a relay forward is "the pool has no seat for it": that
+/// is what protects the relays past the pool's capacity, and a relay the reader
+/// just removed looks identical. Without this ledger every removal would be
+/// undone by the very splice that protects everything else.
+///
+/// A SESSION ledger on purpose. It exists to shape the next publish, and that
+/// publish rewrites the stored list, after which there is nothing left to
+/// carry. Overflowing it means one removal does not take and the relay comes
+/// back on the next publish, which is the harmless direction to fail in.
+const relay_removed_cap = max_relays * 2;
+var g_relay_removed: [relay_removed_cap][96]u8 = [_][96]u8{[_]u8{0} ** 96} ** relay_removed_cap;
+var g_relay_removed_len: [relay_removed_cap]u8 = [_]u8{0} ** relay_removed_cap;
+var g_relay_removed_n: usize = 0;
+
+fn noteRelayRemoved(url: []const u8) void {
+    if (url.len == 0 or url.len > 96) return;
+    if (relayWasRemoved(url)) return;
+    if (g_relay_removed_n >= relay_removed_cap) return;
+    @memcpy(g_relay_removed[g_relay_removed_n][0..url.len], url);
+    g_relay_removed_len[g_relay_removed_n] = @intCast(url.len);
+    g_relay_removed_n += 1;
+}
+
+fn relayWasRemoved(url: []const u8) bool {
+    for (0..g_relay_removed_n) |i| {
+        if (relayUrlEql(g_relay_removed[i][0..g_relay_removed_len[i]], url)) return true;
+    }
+    return false;
+}
+
+/// Forgets every removal. Called when the pool stops being the one those
+/// removals were about: a sign-out, or a list adopted from their own kind:10002.
+fn forgetRelayRemovals() void {
+    g_relay_removed_n = 0;
+}
+
+/// Whether the pool has a seat holding `url` right now.
+fn poolHoldsRelay(url: []const u8) bool {
+    for (0..relaySlots()) |i| {
+        const e = relayAt(i) orelse continue;
+        if (relayUrlEql(e.url(), url)) return true;
+    }
+    return false;
+}
+
 /// Puts the pool back to the one the app was born with, and forgets what was
 /// recorded against the seats that change hands. A seat still holding the same
 /// relay keeps its row, because the socket behind it never went anywhere: see
@@ -783,6 +947,7 @@ fn resetRelaysToBootstrap() void {
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     g_relay_list_dirty = false;
+    forgetRelayRemovals();
     // Seeded FIRST, so the comparison below is against the pool that is actually
     // in place rather than the momentary empty table.
     seedBootstrapRelays();
@@ -5578,6 +5743,11 @@ pub const Model = struct {
     pub fn relay_status(self: *const Model) []const u8 {
         if (self.relay_full) return "That's the most relays this app keeps. Remove one first.";
         if (self.relay_error) return "A relay address starts with wss:// and names a host.";
+        // Last, because the two above are about the press that just happened
+        // and this one is about the account. An edit that will not be published
+        // has to say so: silence here would read as "published", which is the
+        // one thing it is not.
+        if (relayWriteBlockedReason()) |why| return why;
         return "";
     }
     /// What the previews switch is, in the terms that matter: not bandwidth.
@@ -8344,6 +8514,11 @@ fn cycleRelay(i: usize) void {
 /// everything that recorded one, and its thread simply finds nothing to dial.
 fn removeRelay(i: usize) void {
     if (i >= g_relays.len) return;
+    // Recorded BEFORE the seat is wiped, because the publish splices onto the
+    // list this account already published and "the pool has no seat for it" is
+    // what decides a relay is carried forward. A removal looks exactly like
+    // that from the outside.
+    if (relayAt(i)) |e| noteRelayRemoved(e.url());
     lockRelayTable();
     g_relays[i] = .{};
     unlockRelayTable();
@@ -16346,13 +16521,6 @@ pub const ProfileNameKey = enum { display_name, display_name_legacy, name };
 /// answer records the pubkey it is about and is only set when a relay reached
 /// the end of its answer.
 var g_own_profile_asked_for: ?[32]u8 = null;
-/// The same question for the RELAY list: has a relay told this account what
-/// their kind:10002 is? An edit made in Settings claims the pool for this
-/// account, which is what stops a stale event undoing it, but claiming is not
-/// reading: publishing needs to have HEARD, or the first badge press on a
-/// bootstrap pool still replaces a real list nobody has looked at yet.
-var g_own_relays_asked_for: ?[32]u8 = null;
-var g_own_relays_answered = std.atomic.Value(bool).init(false);
 /// And the same for the CONTACT list, where getting it wrong is worse: a write
 /// made before hearing back replaces everyone this reader follows with a
 /// handful of accounts the app chose for them.
@@ -16381,26 +16549,11 @@ pub fn noteOwnContactsAnsweredForTest(pk: [32]u8) void {
     noteOwnContactsAnswered(pk);
 }
 
-/// Whether a relay has told THIS account what their relay list is (including
-/// telling us there is none).
-fn ownRelaysAnswered() bool {
-    const pk = activePubkey() orelse return false;
-    lockOwnProfile();
-    defer unlockOwnProfile();
-    const asked = g_own_relays_asked_for orelse return false;
-    if (!std.mem.eql(u8, &asked, &pk)) return false;
-    return g_own_relays_answered.load(.acquire);
-}
-
-/// Records that a relay answered about this account's relay list. Called from an
-/// ingest thread when a kind:10002 for us arrives, and from the pool's EOSE,
-/// which is a relay saying "that is all I have" and therefore an answer too.
-fn noteOwnRelaysAnswered(pk: [32]u8) void {
-    lockOwnProfile();
-    defer unlockOwnProfile();
-    g_own_relays_asked_for = pk;
-    g_own_relays_answered.store(true, .release);
-}
+// There was a `g_own_relays_answered` here, set by the first EOSE from any relay
+// and read as permission to publish a kind:10002. It is GONE rather than merely
+// unused: an inference that wrong, left sitting in the file under a reassuring
+// name, is one grep away from becoming a gate again. `canWriteRelayList` is the
+// rule now, and the reason is written there.
 
 /// Forgets every conclusion about this account's own records. Called on any
 /// identity change, so nothing decided about one account is read as a fact about
@@ -16409,8 +16562,6 @@ fn forgetOwnRecordAnswers() void {
     forgetOwnProfileAnswer();
     lockOwnProfile();
     defer unlockOwnProfile();
-    g_own_relays_asked_for = null;
-    g_own_relays_answered.store(false, .release);
     g_own_contacts_asked_for = null;
     g_own_contacts_answered.store(false, .release);
     // And WHICH relays answered. Leaving these set would let the next account
@@ -16490,6 +16641,24 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
     const tags = dupeTags(gpa, result.events[0].tags);
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
+}
+
+/// This account's newest stored event of `kind`, its tags flattened to one
+/// string. For tests that need to see what a publish actually WROTE rather than
+/// whether it returned true: a splice that quietly drops half the list still
+/// publishes, so the return value proves nothing about what went out.
+pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const own = ownRecordJson(gpa, kind) orelse return null;
+    defer freeOwnProfile(gpa, own);
+    var out = std.ArrayList(u8).empty;
+    for (own.tags) |tag| {
+        for (tag) |field| {
+            out.appendSlice(gpa, field) catch return null;
+            out.append(gpa, ' ') catch return null;
+        }
+        out.append(gpa, '\n') catch return null;
+    }
+    return out.toOwnedSlice(gpa) catch null;
 }
 
 /// Frees what `ownProfileJson` handed back.
@@ -17313,6 +17482,12 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
         g_outbox_overflow.store(true, .monotonic);
         return;
     }
+    // A test drives the write path, not the network. Its pool names hosts that
+    // do not resolve, and a detached dial thread for one of those outlives the
+    // test that started it and can take the process down on the way out, which
+    // reads as a failing suite with no failing assertion. Comptime, so the
+    // shipped binary has no branch here at all.
+    if (builtin.is_test) return;
     const thread = std.Thread.spawn(.{}, publishWorker, .{ gpa, ev }) catch {
         // No thread: the note stays queued and the next drain will carry it.
         return;
@@ -19629,11 +19804,6 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     if (elapsed >= 0) recordRelayRtt(index, @intCast(@min(elapsed, std.math.maxInt(u16))));
                     probe_at = 0;
                 }
-                // The feed subscription asks for this account's own kind:10002
-                // alongside everyone's kind:0. A relay reaching the end of that
-                // without sending one has told us they hold none, which is an
-                // answer: it is what lets a first edit be published at all,
-                // instead of the app waiting forever for a list nobody has.
                 if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
                     // Only when THIS subscription actually asked about the
                     // reader. A guest-era filter names nine strangers, and its
@@ -19641,8 +19811,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // afterwards.
                     if (asked_about_me) {
                         if (activePubkey()) |me| {
-                            noteOwnRelaysAnswered(me);
-                            // And who they follow, recorded against THIS relay.
+                            // Who they follow, recorded against THIS relay.
                             // EOSE means "that is all I have", never "you have
                             // none": one relay that does not carry this list
                             // must not be able to authorize replacing it.
