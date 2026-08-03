@@ -1127,7 +1127,7 @@ const profile_links_height: f32 = 28;
 /// Everything in the person card that is not the banner or the wrapping bio.
 const profile_card_chrome: f32 = 190;
 /// One quiet line, the height of a short row.
-const quiet_row_extent: f32 = 56;
+pub const quiet_row_extent: f32 = 56;
 // 11c's Settings geometry: a 440 column, a 38px header band, and the section
 // rhythm (16 between sections, 8 from a label to its card).
 const settings_column_width: f32 = 440;
@@ -9900,9 +9900,92 @@ const thread_page_size: usize = 20;
 const thread_skeleton_rows: usize = 3;
 
 /// A cheap height estimate for one thread row, sharing the feed's note math.
-fn threadExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
-    const rows: *const ThreadRows = @ptrCast(@alignCast(context orelse return thread_reply_chrome));
-    const i: usize = @intCast(index);
+/// A level's row heights, precomputed at build time and read back by the SDK
+/// whenever it wants them.
+///
+/// The SDK RETAINS `extent_context` and calls the estimator through it long
+/// after the build that supplied it returned: in a post-layout measure pass, and
+/// since 0.7.2 from inside `virtualWindow` on a LATER build. Both lists used to
+/// hand it an arena-allocated view context full of slices, on the reasoning that
+/// the arena outlives the build. It does not outlive two: the runtime rotates a
+/// small set of arenas and resets the one it is about to build into, so a
+/// context handed over on build N is read on build N+2 with its slices pointing
+/// at whatever the new build has since allocated there. That is a segfault in
+/// `noteRowEstimateWith`, reading a Note out of a reused index, and it is what
+/// took the app down on a mouse-up over a person's page.
+///
+/// So the retained context holds NO POINTERS. It is a table of numbers with
+/// process lifetime, filled from the real row structures while they are alive
+/// and valid, and read afterwards by an estimator that cannot dereference
+/// anything. There is nothing left in it that a later frame can invalidate.
+const RowExtents = struct {
+    /// A tag, because the other half of the pairing cannot be checked by the
+    /// compiler: `extent_context` is `?*const anyopaque` and accepts any
+    /// pointer, so wiring the estimator to a view context instead of a table
+    /// would read one struct as the other and hand the list garbage heights,
+    /// silently. This turns that into a fallback the suite can catch.
+    magic: u64 = row_extents_magic,
+    heights: [thread_reply_cap * 2]f32 = [_]f32{0} ** (thread_reply_cap * 2),
+    len: usize = 0,
+
+    fn reset(self: *RowExtents) void {
+        self.len = 0;
+    }
+
+    fn push(self: *RowExtents, height: f32) void {
+        if (self.len >= self.heights.len) return;
+        self.heights[self.len] = height;
+        self.len += 1;
+    }
+
+    fn at(self: *const RowExtents, index: usize) f32 {
+        if (index >= self.len) return quiet_row_extent;
+        return self.heights[index];
+    }
+};
+
+const row_extents_magic: u64 = 0x524f57455854_4142;
+
+/// One per mounted level, plus one for a person's page at that level. Levels are
+/// UI-thread only, like every other per-level cache in this file.
+var g_thread_extents: [thread_depth_max + 1]RowExtents = [_]RowExtents{.{}} ** (thread_depth_max + 1);
+var g_profile_extents: [thread_depth_max + 1]RowExtents = [_]RowExtents{.{}} ** (thread_depth_max + 1);
+
+/// Reads a precomputed height. The whole point is that this touches nothing but
+/// its own numbers.
+fn rowExtentFromTable(context: ?*const anyopaque, index: u64) f32 {
+    const table: *const RowExtents = @ptrCast(@alignCast(context orelse return quiet_row_extent));
+    if (table.magic != row_extents_magic) return quiet_row_extent;
+    return table.at(@intCast(index));
+}
+
+/// The retained tables, for a test that drops the build arena and then reads
+/// them exactly as the SDK does.
+pub fn threadExtentTableForTest(level: usize) *const anyopaque {
+    return &g_thread_extents[@min(level, g_thread_extents.len - 1)];
+}
+
+pub fn profileExtentTableForTest(level: usize) *const anyopaque {
+    return &g_profile_extents[@min(level, g_profile_extents.len - 1)];
+}
+
+pub fn rowExtentFromTableForTest(context: ?*const anyopaque, index: u64) f32 {
+    return rowExtentFromTable(context, index);
+}
+
+pub fn extentTableLenForTest(context: ?*const anyopaque) usize {
+    const table: *const RowExtents = @ptrCast(@alignCast(context orelse return 0));
+    return table.len;
+}
+
+/// One thread row's height, measured from the live row structures.
+///
+/// TYPED, and deliberately: it takes a `*const ThreadRows` rather than the
+/// SDK's `?*const anyopaque` callback shape, so it cannot be handed over as a
+/// retained estimator. Only `rowExtentFromTable` has that shape now, and it
+/// reads numbers. See `RowExtents` for what went wrong when this was the
+/// callback.
+fn threadRowHeight(rows: *const ThreadRows, i: usize) f32 {
     return switch (rows.rowAt(i)) {
         // An ancestor: the identity block pinned to its disc, a body clamped to
         // two lines, and the rail's segment down to the next disc.
@@ -10005,6 +10088,15 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
         // would only repeat it.
         .footer = !empty,
     };
+    // Filled from the context while it is alive and valid, and handed to the
+    // SDK in its place. See `RowExtents`.
+    const table = &g_thread_extents[@min(level, g_thread_extents.len - 1)];
+    table.reset();
+    if (!occluded) {
+        var row: usize = 0;
+        const total = rows_ctx.count();
+        while (row < total) : (row += 1) table.push(threadRowHeight(rows_ctx, row));
+    }
     const options: AppUi.VirtualListOptions = .{
         .id = ui.fmt("thread-{d}", .{level_key}),
         // Nothing to cover when nothing is drawn. A list that declares items and
@@ -10014,8 +10106,8 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
         // and at a back stack two deep or more there is always one occluded.
         .item_count = if (occluded) 0 else rows_ctx.count(),
         .item_extent = 0,
-        .extent_estimate = threadExtentEstimate,
-        .extent_context = rows_ctx,
+        .extent_estimate = rowExtentFromTable,
+        .extent_context = table,
         .gap = 0,
         .padding = 0,
         .overscan = 3,
@@ -12458,6 +12550,13 @@ fn profilePanel(
         .shown = shown,
         .loading = loading,
     };
+    const table = &g_profile_extents[@min(level, g_profile_extents.len - 1)];
+    table.reset();
+    if (!occluded) {
+        var row: usize = 0;
+        const total = rows_ctx.count();
+        while (row < total) : (row += 1) table.push(profileRowHeight(rows_ctx, row));
+    }
     const options: AppUi.VirtualListOptions = .{
         .id = ui.fmt("person-{d}", .{level_key}),
         // Nothing to cover when nothing is drawn, for the same reason the thread
@@ -12466,8 +12565,8 @@ fn profilePanel(
         // and re-laying out the whole view a second time, every time.
         .item_count = if (occluded) 0 else rows_ctx.count(),
         .item_extent = 0,
-        .extent_estimate = profileRowExtent,
-        .extent_context = rows_ctx,
+        .extent_estimate = rowExtentFromTable,
+        .extent_context = table,
         .gap = 0,
         .padding = 0,
         .overscan = 3,
@@ -12486,7 +12585,6 @@ fn profilePanel(
         for (built, 0..) |*row, offset| row.* = profileRowAt(ui, rows_ctx, window.start_index + offset);
         break :blk built;
     };
-    _ = level;
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         if (occluded) ui.spacer(0) else profileHeaderBand(ui, model, pubkey),
         ui.virtualList(options, window, .{rows}),
@@ -12517,9 +12615,10 @@ const ProfileRows = struct {
     }
 };
 
-fn profileRowExtent(context: ?*const anyopaque, index: u64) f32 {
-    const rows: *const ProfileRows = @ptrCast(@alignCast(context orelse return quiet_row_extent));
-    return switch (rows.rowAt(@intCast(index))) {
+/// One person-page row's height, from the live rows. Typed for the same reason
+/// `threadRowHeight` is.
+fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
+    return switch (rows.rowAt(index)) {
         .person => profileCardExtent(rows),
         .note => |ni| noteRowEstimate(&rows.notes[ni], feed_row_chrome),
         .empty => quiet_row_extent,
