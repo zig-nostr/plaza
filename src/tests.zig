@@ -10284,3 +10284,61 @@ test "picture slots follow the reader down a long thread" {
         }
     }
 }
+
+// ---- a note that could not be found is not written off forever ---------------
+
+test "a quote that could not be found is asked for again, and again" {
+    // Three unanswered tries used to mark an entry missing for good: nothing
+    // re-armed it, not a later round, not a reconnect, not reopening the thread.
+    // Three tries is nothing, and they can all land while the pool is still
+    // dialling, so a note sitting on the reader's OWN relays could be written
+    // off in the first seconds and read "not on your relays yet" for the rest of
+    // the session. That is what happened to the ancestor above a thread every
+    // other client showed, and I fetched that parent from those same four relays
+    // in under a second.
+    const id = [_]u8{0x4c} ** 32;
+    main.dropQuoteForTest(id);
+    main.wantQuoteForTest(id);
+
+    // Ask until well past the old cap of three, re-arming between rounds the way
+    // the timer does.
+    var tries: usize = 0;
+    for (0..40) |_| {
+        main.rearmWantedQuotesForTest();
+        main.advanceQuoteRoundForTest(main.quoteBackoffRoundsForTest(255));
+        main.requestWantedQuotesForTest();
+        const e = main.quoteForTest(id) orelse return error.QuoteEvicted;
+        if (e.attempts > tries) tries = e.attempts;
+    }
+    if (tries <= 3) {
+        std.debug.print("gave up after {d} tries\n", .{tries});
+        return error.GaveUpForGood;
+    }
+
+    // And it backs off rather than hammering: the first few rounds try every
+    // time, then the gap grows to a ceiling.
+    try testing.expectEqual(@as(u64, 1), main.quoteBackoffRoundsForTest(0));
+    try testing.expectEqual(@as(u64, 1), main.quoteBackoffRoundsForTest(2));
+    try testing.expect(main.quoteBackoffRoundsForTest(6) > 1);
+    try testing.expect(main.quoteBackoffRoundsForTest(200) <= 30);
+}
+
+test "a relay coming up puts every unfound note back in the queue" {
+    // The backoff alone would still make a reader wait out a gap for something
+    // that became findable the instant a relay finished dialling. A change in
+    // the pool is new information about every unanswered question.
+    const id = [_]u8{0x4d} ** 32;
+    main.dropQuoteForTest(id);
+    main.wantQuoteForTest(id);
+    main.requestWantedQuotesForTest();
+
+    const e = main.quoteForTest(id) orelse return error.QuoteEvicted;
+    // Pushed into the future by its own backoff.
+    main.advanceQuoteRoundForTest(0);
+    e.next_round = 999_999;
+    e.requested = true;
+
+    main.requeueMissingQuotesForTest();
+    try testing.expectEqual(@as(u64, 0), e.next_round);
+    try testing.expect(!e.requested);
+}
