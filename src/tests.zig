@@ -1790,14 +1790,14 @@ test "a feed row's estimated height is the sum of its measured parts" {
     // this pins. (It cannot catch the engine itself changing a metric: that shows
     // up as a live measurement mismatch, not a test failure.)
     const one_line = main.feed_row_chrome + main.body_line_height;
-    try testing.expectApproxEqAbs(@as(f32, 114.25), one_line, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 126.125), one_line, 0.001);
     // The chrome is 12 above, the 36px identity block, 5 to the body, 10 to the
     // verbs, the verb strip, 14 below, and the hairline.
-    try testing.expectApproxEqAbs(@as(f32, 96.125), main.feed_row_chrome, 0.001);
-    // The verb strip is the count's line box. It was 28 while the verbs were
-    // list_items, a kind with an intrinsic row-height floor that pushed every row
-    // 10px past the mock.
-    try testing.expectApproxEqAbs(@as(f32, 18.125), main.engagement_row_height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 108), main.feed_row_chrome, 0.001);
+    // The verb row is a STATED height now. It used to be exactly the count's
+    // line box, so the verbs sat hard against the rule above them and the row
+    // below: a strip of icons rather than a row of controls.
+    try testing.expectApproxEqAbs(@as(f32, 30), main.engagement_row_height, 0.001);
     // The metadata register is exactly 12px. `.size = .sm` would be 13.5, since
     // the size enum steps by one from the 14.5 body.
     try testing.expectApproxEqAbs(@as(f32, 12), main.meta_size, 0.001);
