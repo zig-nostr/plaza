@@ -1571,7 +1571,7 @@ test "a Signet sign that fails hands the note back instead of eating it" {
     // way to the built-in signer, which is why a note handed to Signet had
     // nothing holding it even after the slot existed.
     model.draft_buffer.set(note);
-    main.submitPostForTest(&model, &fx);
+    try testing.expect(main.submitPostForTest(&model, &fx));
     try testing.expect(main.helperSignPendingForTest());
     try testing.expect(main.helperSignRestorableForTest());
     try testing.expect(model.draft_empty());
@@ -1588,6 +1588,54 @@ test "a Signet sign that fails hands the note back instead of eating it" {
     try testing.expect(main.helperSignNoticeForTest());
     try testing.expect(!main.helperSignPendingForTest());
     try testing.expect(std.mem.indexOf(u8, model.identity(testing.allocator), "could not sign") != null);
+}
+
+test "a second sign in the same tick is refused, not swallowed" {
+    // Every helper sign goes out on ONE effect key, and the SDK refuses a second
+    // fetch while that key is held. The refusal used to be dropped on the first
+    // line of the response handler, so the second sign of a pair simply never
+    // happened, and the caller had already moved its state: the follow set
+    // carried a name that was never published and the UI said "Following".
+    //
+    // Not merely a race. The tick issues `flushRelayList` and
+    // `drivePendingIntent` in the same update call with no drain possible
+    // between them, so when both are due the second is rejected every time.
+    main.setIdentityForTest([_]u8{0x61} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    main.forgetFollowsForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    defer main.releaseHelperSignForTest();
+    main.releaseHelperSignForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.signerReadyForTest());
+
+    // One sign goes out and holds the key.
+    model.draft_buffer.set("the first thing");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expect(!main.signerReadyForTest());
+
+    // THE PROPERTY: every other write says no rather than moving its state and
+    // letting the sign be dropped underneath it.
+    var alice: [32]u8 = undefined;
+    @memset(&alice, 0xa1);
+    try testing.expect(!main.writeFollowForTest(&fx, alice, true));
+    try testing.expect(!main.publishRelayListForTest(&fx));
+
+    // A second post keeps its draft, rather than emptying the composer for a
+    // sign that never left the process.
+    model.draft_buffer.set("the second thing");
+    try testing.expect(!main.submitPostForTest(&model, &fx));
+    try testing.expectEqualStrings("the second thing", model.draft());
+
+    // The signature comes back, and everything works again.
+    main.releaseHelperSignForTest();
+    try testing.expect(main.signerReadyForTest());
+    try testing.expect(main.submitPostForTest(&model, &fx));
 }
 
 test "a note still being signed is not thrown away without saying so" {
