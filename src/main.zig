@@ -14566,9 +14566,14 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
     }
     const q = e.?;
     if (q.state == .missing) {
+        // "Yet", because that is now true. This card said "unavailable" from
+        // when three unanswered tries ended the search for good; the search does
+        // not end any more, so the card must not say it does. It is the same
+        // sentence the ancestor row above a thread has always used for the same
+        // situation, which is the other reason to use it.
         return quoteAside(ui, null, ui.paragraph(
             .{ .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = "Quoted note unavailable", .scale = nested_body_scale }},
+            &.{.{ .text = "Not on your relays yet", .scale = nested_body_scale }},
         ));
     }
 
