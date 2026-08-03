@@ -7,8 +7,8 @@
         // The Native SDK, pinned to the SAME commit as Plaza (../build.zig.zon).
         // Keep the two in lockstep: move both in one commit.
         .native_sdk = .{
-            .url = "git+https://github.com/vercel-labs/native.git#57bf56bc58058768d436099c1005bfc66bd55ac3",
-            .hash = "native_sdk-0.1.0-hzDzQpQckAGeCmVAbrh-HSbhfoPszOProz1IbrRXU6Du",
+            .url = "git+https://github.com/vercel-labs/native.git#e84ee28cbe513e75558957b1a18536546390e635",
+            .hash = "native_sdk-0.1.0-hzDzQvrg7QEzV-zdCEQqMhoyHCzPK3VMfrObH6Bl5jor",
         },
         // The nostr library, for nip19 (validate an nsec, derive the npub),
         // keystore (open an ncryptsec), and the signer_ipc wire types.

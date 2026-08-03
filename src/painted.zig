@@ -60,11 +60,16 @@ pub const Painted = struct {
         var ui = main.AppUi.init(arena);
         const node = main.appView(&ui, model);
         if (ui.failed) return error.ViewBuild;
-        const tree = try ui.finalize(node);
 
         // The SAME tokens the running app resolves, so a colour asserted here is
         // the colour the window shows, not a house default.
         const tokens = theme.tokens(main.Model)(model);
+        // Finalized WITH them, which is what the runtime does. A plain
+        // `finalize` resolves every `style_tokens` reference against the SDK's
+        // defaults instead, so `.background` came out white on a dark app. It
+        // was invisible until containers began painting their backgrounds
+        // (SDK 0.6.2), and then it was three white rectangles over the window.
+        const tree = try ui.finalizeWithTokens(node, tokens);
 
         const nodes = try arena.alloc(canvas.WidgetLayoutNode, native_sdk.runtime.max_canvas_widget_nodes_per_view);
         const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, geometry.RectF.init(0, 0, w, h), tokens, nodes);
@@ -97,8 +102,8 @@ pub const Painted = struct {
         // what it does in the app.
         const node = ui.column(.{}, .{build(&ui)});
         if (ui.failed) return error.ViewBuild;
-        const tree = try ui.finalize(node);
         const tokens = theme.tokens(main.Model)(model);
+        const tree = try ui.finalizeWithTokens(node, tokens);
 
         const nodes = try arena.alloc(canvas.WidgetLayoutNode, native_sdk.runtime.max_canvas_widget_nodes_per_view);
         const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, geometry.RectF.init(0, 0, w, h), tokens, nodes);
