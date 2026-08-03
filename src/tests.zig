@@ -1590,6 +1590,44 @@ test "a Signet sign that fails hands the note back instead of eating it" {
     try testing.expect(std.mem.indexOf(u8, model.identity(testing.allocator), "could not sign") != null);
 }
 
+test "a full queue keeps the note in the composer instead of dropping it" {
+    // `ingestAndPublish` refuses to publish what it cannot track, and it is
+    // right to: a note nobody is counting, under a banner promising that
+    // anything written is kept, is the lie the queue exists to stop telling.
+    // But the refusal happened AFTER the press had cleared the composer and
+    // deleted the draft file, so the note was simply gone: no queue row, no
+    // retry, and nothing on screen but a banner that then never cleared.
+    main.setIdentityForTest([_]u8{0x66} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
+
+    // Sixteen notes nobody has acknowledged. Eviction only takes a note that
+    // has already reached somebody, so this is a wedged queue, which is what a
+    // pool that all requires NIP-42 AUTH, or a laptop on a plane, produces.
+    var i: usize = 0;
+    while (i < main.outbox_cap_for_test) : (i += 1) {
+        var id: [32]u8 = undefined;
+        @memset(&id, @intCast(i + 1));
+        try testing.expect(main.enqueueOutboxForTest(id, main.activePubkeyForTest().?, 1_000));
+    }
+    try testing.expect(!main.outboxHasRoomForTest());
+
+    // The press keeps the note.
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    model.draft_buffer.set("the seventeenth note");
+    try testing.expect(!main.submitPostForTest(&model, &fx));
+    try testing.expectEqualStrings("the seventeenth note", model.draft());
+
+    // One relay takes one of them: there is room, and the note goes.
+    var first: [32]u8 = undefined;
+    @memset(&first, 1);
+    main.recordOutboxAckForTest(first, 0, true);
+    try testing.expect(main.outboxHasRoomForTest());
+    try testing.expect(main.submitPostForTest(&model, &fx));
+}
+
 test "a second sign in the same tick is refused, not swallowed" {
     // Every helper sign goes out on ONE effect key, and the SDK refuses a second
     // fetch while that key is held. The refusal used to be dropped on the first
