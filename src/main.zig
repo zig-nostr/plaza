@@ -545,6 +545,10 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // is not the whole gate.
     if (!relayListIsOwned()) return false;
     if (!canWriteRelayList()) return false;
+    // A refusal here keeps the edit pending, so the tick brings it back the
+    // moment the signer is free. This is the half of the same-tick collision the
+    // relay list was on the losing end of.
+    if (!signerReady()) return false;
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
@@ -2646,8 +2650,8 @@ var g_helper_sign_notice = std.atomic.Value(bool).init(false);
 /// The dispatch is the part that mattered: it forwarded `restorable` to the
 /// bunker and dropped it on the way to the built-in signer, so the flag arriving
 /// intact is not something a test of `requestHelperSign` alone can see.
-pub fn submitPostForTest(model: *Model, fx: *Effects) void {
-    submitPost(model, fx);
+pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
+    return submitPost(model, fx);
 }
 
 pub fn helperSignRestorableForTest() bool {
@@ -2678,6 +2682,35 @@ pub fn scanHelperSignForTest(model: *Model) void {
 
 pub fn helperSignNoticeForTest() bool {
     return g_helper_sign_notice.load(.acquire);
+}
+
+/// Whether the signer can be asked for a signature RIGHT NOW.
+///
+/// Every helper sign goes out on one effect key, and the SDK refuses a second
+/// fetch while that key is held. The refusal is delivered as a `.rejected`
+/// outcome, which used to be dropped on the first line of the response handler,
+/// so the second sign of a pair simply never happened.
+///
+/// It is not only a race. The tick issues `flushRelayList` and
+/// `drivePendingIntent` in the SAME update call, with no drain possible between
+/// them, so when both are due the second is rejected every time. The callers
+/// had already moved their state by then: the follow set had the new name in it
+/// and the UI said "Following" for a list that was never signed.
+///
+/// So the callers ask first, and a "not now" leaves everything where it was.
+/// Every one of them is retried by something: the relay list keeps its pending
+/// edit, a press can be pressed again, and the composer keeps its draft.
+fn signerReady() bool {
+    return switch (g_signer_kind) {
+        // One key, one sign. The bunker's table has eight slots keyed by request
+        // id, so it does not collide, and a local key signs inline.
+        .helper => !g_helper_sign.active,
+        .remote, .local => true,
+    };
+}
+
+pub fn signerReadyForTest() bool {
+    return signerReady();
 }
 
 /// Whether a note is with a signer right now, waiting for a signature. True for
@@ -11822,6 +11855,10 @@ pub fn haveOwnContactListForTest() bool {
 /// not model, and the content blob, which on older clients is a relay map and on
 /// none of them is ours to discard.
 fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
+    // Not while a signature is already out. Everything below moves state before
+    // it signs, and a rejected sign is silent, so pressing Follow during another
+    // sign used to leave the follow set carrying a name that was never published.
+    if (!signerReady()) return false;
     // No `canWriteFollows()` here on purpose, though it is the same question.
     // It runs its own store query, and this function then ran a SECOND one for
     // the list itself: a transient failure between the two answered "yes they
@@ -16579,7 +16616,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // machine without the reader seeing it in one.
             if (!model.composing or model.stage != .ready or model.is_guest()) return;
             if (model.draft_empty()) return;
-            submitPost(model, fx);
+            // Nothing after this runs unless the note actually went to a
+            // signer. It used to run regardless: the composer emptied, the draft
+            // file was deleted and the toast said "Posted" for a sign that had
+            // been refused before it left the process.
+            if (!submitPost(model, fx)) {
+                setToast(model, "Signet is busy for a moment. Try again.");
+                return;
+            }
             // The slot is emptied the moment its contents go to a signer.
             // Leaving it would restore an already-published note into the next
             // launch's composer, one keystroke from being posted twice.
@@ -17366,6 +17410,10 @@ fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 fn saveProfile(model: *Model, fx: *Effects) void {
     if (!model.profile_can_save()) return;
     if (activePubkey() == null) return;
+    // The sheet reports `.sent` as soon as it has handed the merge over, so a
+    // rejected sign would show a saved profile that was never signed. Refusing
+    // leaves the sheet exactly as it was, with Save still live.
+    if (!signerReady()) return;
     const gpa = std.heap.page_allocator;
 
     var prev_created_at: i64 = 0;
@@ -17758,19 +17806,25 @@ pub fn initialModel() Model {
 /// Posts the current draft: sign a kind:1 note, store it locally at once, and
 /// publish it to the pool in the background. A blank draft or a not-yet-ready
 /// identity is a no-op.
-fn submitPost(model: *Model, fx: *Effects) void {
+fn submitPost(model: *Model, fx: *Effects) bool {
     const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
-    if (text.len == 0) return;
+    if (text.len == 0) return false;
+    // The composer is cleared and the draft file deleted right after this
+    // returns, so a sign that never went out has to be reported rather than
+    // assumed. The one shape that reaches here is a relay-list flush on the same
+    // tick, which the SDK would reject and nothing would notice.
+    if (!signerReady()) return false;
     const gpa = std.heap.page_allocator;
 
     // A process-lifetime copy of the content: `event.create` references its
     // content slice rather than copying it, and the store write and either the
     // publisher or the NIP-46 round-trip read it after the draft is cleared.
-    const owned = gpa.dupe(u8, text) catch return;
+    const owned = gpa.dupe(u8, text) catch return false;
     // A composer draft: kind:1, no tags, restorable to the composer if a remote
     // signer never answers.
     signAndPublish(fx, gpa, nowSeconds(), 1, &.{}, owned, true);
     model.draft_buffer.clear();
+    return true;
 }
 
 /// Signs `content_owned` as an event of `kind` with `tags`, stamped `created`,
@@ -17980,6 +18034,10 @@ fn toggleLike(model: *Model, fx: *Effects, note_id: i64) void {
         model.joining = true;
         return;
     }
+    // A like and an un-like both move `g_my_likes` before they sign, and an
+    // un-like's kind:5 is a deletion. A rejected sign there would leave the heart
+    // empty and the reaction still standing on every relay.
+    if (!signerReady()) return;
     if (isLiked(note_id)) unlike(fx, note_id) else like(model, fx, note_id);
 }
 
