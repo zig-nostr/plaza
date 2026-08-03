@@ -4128,6 +4128,51 @@ test "the name beat merges too, so it can never publish a name as the whole prof
     try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"me@example.com\"") != null);
 }
 
+test "the name beat forwards the tags it read, the same as the sheet's save" {
+    // The beat only arms on a key this app just minted, which has no kind:0 and
+    // therefore no NIP-39 proofs to lose, so this is a landmine rather than a
+    // live loss: `publishName` read the stored profile and then handed the write
+    // seam `&.{}`. Its own doc comment says one path exists so the destructive
+    // shape cannot come back, and this is the half of the shape that was still
+    // there. Driving the whole write, because the merge helper never sees a tag.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5b} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/namebeat.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.setIdentityForTest([_]u8{0x5b} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "i", "github:someone", "a-proof-url" },
+        &.{ "i", "mastodon:someone@example.social", "another-proof" },
+    };
+    const before = try nostr.event.create(arena, signer, kp, 1_800_000_000, 0, &tags, "{\"about\":\"kept\"}", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, before, signer);
+
+    var model = main.initialModel();
+    model.name_buffer.set("Bob");
+    var fx: main.EffectsForTest = undefined;
+    main.publishNameForTest(&model, &fx);
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 0).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "github:someone") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "mastodon:someone@example.social") != null);
+}
+
 test "a profile that will not parse does not become a blank profile" {
     // Garbage in the store must not turn into an empty object with three fields
     // written over it. It falls back to an object the edit is applied to, and
@@ -4148,9 +4193,16 @@ test "the sheet refuses to save until it has read the profile it would replace" 
     try testing.expect(!model.profile_can_save());
     try testing.expect(findAnyTextIn(model.profile_status(), "Reading your current profile"));
 
-    // Only once every read relay has answered does "absent" become a fact.
+    // "Absent" is a fact only for a key this app minted. For an imported one it
+    // is what four bootstrap relays happened to say, and this line used to read
+    // "only once every read relay has answered does absent become a fact",
+    // which was never true of the code underneath it: one EOSE was enough.
     model.profile_stage = .absent;
+    main.setIdentityMintedForTest(false);
+    try testing.expect(!model.profile_can_save());
+    main.setIdentityMintedForTest(true);
     try testing.expect(model.profile_can_save());
+    main.setIdentityMintedForTest(false);
 
     model.profile_stage = .have;
     try testing.expect(model.profile_can_save());
@@ -4267,6 +4319,60 @@ test "a relay that never answers leaves the sheet unable to save, not eager to" 
     try testing.expect(std.mem.indexOf(u8, model.profile_status(), "no profile") == null);
 }
 
+test "typing while the profile is still arriving does not delete the rest of it" {
+    // The sheet opens on a cold store, the reader types a display name, and the
+    // real profile lands a second later. The seeding was all or nothing: one
+    // typed character skipped all three fields, and the stage flipped to `have`
+    // regardless, so Save lit up over an about and a picture that had never been
+    // read. The merge REMOVES a key whose field is empty, so pressing Save
+    // deleted the reader's bio and avatar from a profile the app had by then
+    // read correctly.
+    var model = main.initialModel();
+    const existing =
+        "{\"display_name\":\"old name\",\"about\":\"the bio they wrote years ago\"," ++
+        "\"picture\":\"https://example.com/face.png\",\"lud16\":\"a@b.com\"}";
+
+    // Mid-fetch, the reader has typed a new name and nothing else.
+    model.profile_name_buffer.set("new name");
+
+    // The profile arrives. Their sentence survives; the fields they never
+    // touched are filled from what actually arrived.
+    main.seedProfileFieldsForTest(&model, existing, true);
+    try testing.expectEqualStrings("new name", model.profile_name());
+    try testing.expectEqualStrings("the bio they wrote years ago", model.profile_about());
+    try testing.expectEqualStrings("https://example.com/face.png", model.profile_picture());
+
+    // And the save that follows keeps every one of them.
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "new name") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "the bio they wrote years ago") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "face.png") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"a@b.com\"") != null);
+}
+
+test "an imported key cannot publish a profile over one nobody has read" {
+    // `absent` means a relay answered without sending a kind:0. On a cold import
+    // the relays being asked are the four this app was born with, which may hold
+    // none of the reader's, so that answer is not evidence. Saving from there
+    // merged into a literal `{}`: a reader who typed a display name lost their
+    // lightning address, their NIP-05, their banner and every NIP-39 proof.
+    var model = main.initialModel();
+    model.profile_stage = .absent;
+
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "has not found your profile") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "publishes your first one") == null);
+
+    // A key minted in this app has no profile anywhere, which is the one case
+    // where absent really is absent.
+    main.setIdentityMintedForTest(true);
+    try testing.expect(model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "publishes your first one") != null);
+}
+
 test "a field too long to show is left alone rather than written back truncated" {
     // The buffers hold 64, 280 and 200 bytes. A longer bio shown cut off, then
     // saved untouched, writes the cut-off version back over the real one: data
@@ -4281,7 +4387,7 @@ test "a field too long to show is left alone rather than written back truncated"
     );
     defer testing.allocator.free(existing);
 
-    main.seedProfileFieldsForTest(&model, existing);
+    main.seedProfileFieldsForTest(&model, existing, false);
     // Not shown at all, rather than shown cut in half.
     try testing.expectEqualStrings("", model.profile_about());
     try testing.expect(model.profile_about_long);
@@ -4301,7 +4407,7 @@ test "the name edit rewrites the key it was read from" {
 
     // A profile using the legacy camelCase key.
     const legacy = "{\"displayName\":\"Old\",\"lud16\":\"a@b.com\"}";
-    main.seedProfileFieldsForTest(&model, legacy);
+    main.seedProfileFieldsForTest(&model, legacy, false);
     try testing.expectEqualStrings("Old", model.profile_name());
     model.profile_name_buffer.set("New");
     const m1 = main.mergeProfileJsonForTest(testing.allocator, legacy, &model).?;
@@ -4313,7 +4419,7 @@ test "the name edit rewrites the key it was read from" {
     // handle is what they edited.
     var m2model = main.initialModel();
     const handle_only = "{\"name\":\"alice\",\"lud16\":\"a@b.com\"}";
-    main.seedProfileFieldsForTest(&m2model, handle_only);
+    main.seedProfileFieldsForTest(&m2model, handle_only, false);
     try testing.expectEqualStrings("alice", m2model.profile_name());
     m2model.profile_name_buffer.set("alice2");
     const m2 = main.mergeProfileJsonForTest(testing.allocator, handle_only, &m2model).?;
