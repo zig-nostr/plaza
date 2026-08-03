@@ -2083,6 +2083,10 @@ pub fn setSignerKindHelperForTest() void {
     g_signer_kind = .helper;
 }
 
+pub fn setSignerKindLocalForTest() void {
+    g_signer_kind = .local;
+}
+
 pub fn signerStatusLabelForTest() []const u8 {
     return signerStatus().label;
 }
@@ -2551,9 +2555,156 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
 /// event, ingested and published like any other. `content_owned` and `tags` are
 /// process-lifetime (the local and remote paths reference them too), so this
 /// does not free them.
-fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8) void {
+// A helper sign that has gone out and not come back.
+//
+// The remote signer has had a pending table, a deadline and a restore since the
+// day it shipped. The helper had none of it, and `signAndPublish` dropped the
+// `restorable` flag on the way to it, so a Signet sign that failed for any
+// reason destroyed the note in silence: `submitPost` clears the composer, the
+// press deletes ~/.plaza/draft, the toast says "Posted", and the response
+// handler returned on its first line without a Model to restore anything into.
+// Nothing was stored and nothing was queued, because the outbox is fed from
+// `ingestAndPublish`, which the helper path only reaches AFTER a good signature.
+//
+// The daemon answers non-200 while perfectly alive: 401 with a stale token, 409
+// with no key yet, 400 on a malformed event, 500 on a signing failure. It also
+// dies without being respawned, and a dead port answers `connect_failed`.
+//
+// One slot, because the SDK refuses a second fetch on an occupied key and every
+// helper sign uses the same one.
+const HelperSign = struct {
+    active: bool = false,
+    restorable: bool = false,
+    failed: bool = false,
+    deadline_s: i64 = 0,
+    content: ?[]u8 = null,
+};
+var g_helper_sign: HelperSign = .{};
+
+/// How long a helper sign may be out before the note is handed back. The daemon
+/// is on loopback and answers in about a millisecond, so this is not a latency
+/// budget: it is the backstop for a response that never arrives at all.
+const helper_sign_timeout_s: i64 = 10;
+
+/// Remembers a note handed to the daemon, so a failure has something to give
+/// back. Called BEFORE the request is built, because building it can fail too
+/// and those paths used to lose the note just as quietly.
+fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool) void {
+    releaseHelperSign();
+    g_helper_sign = .{
+        .active = true,
+        .restorable = restorable,
+        .failed = false,
+        .deadline_s = nowSeconds() + helper_sign_timeout_s,
+        .content = if (restorable) gpa.dupe(u8, content) catch null else null,
+    };
+}
+
+/// Drops the slot without restoring: the signature came back.
+fn releaseHelperSign() void {
+    if (g_helper_sign.content) |c| std.heap.page_allocator.free(c);
+    g_helper_sign = .{};
+}
+
+/// Marks the sign as failed. The restore itself happens on the tick, where a
+/// Model is reachable, exactly as the remote path does it.
+fn failHelperSign() void {
+    if (!g_helper_sign.active) return;
+    g_helper_sign.failed = true;
+}
+
+/// Hands a failed sign's note back to the composer and says why. The mirror of
+/// `scanPendingRemote`, and called from the same tick.
+fn scanHelperSign(model: *Model) void {
+    if (!g_helper_sign.active) return;
+    if (!g_helper_sign.failed and nowSeconds() < g_helper_sign.deadline_s) return;
+    const restorable = g_helper_sign.restorable;
+    const content = g_helper_sign.content;
+    g_helper_sign = .{};
+    const gpa = std.heap.page_allocator;
+    if (content) |c| {
+        // The composer holds one draft. A reader who has started typing again
+        // keeps what they are typing; the restored one would overwrite it.
+        if (restorable and model.draft_empty()) {
+            model.draft_buffer.set(c);
+            saveDraft(c);
+        }
+        gpa.free(c);
+    }
+    if (restorable) g_helper_sign_notice.store(true, .release);
+}
+
+/// A helper sign that failed, surfaced once in the composer so a restored draft
+/// is explained rather than silently reappearing. Cleared on the next edit or a
+/// later success, the same as the remote signer's.
+var g_helper_sign_notice = std.atomic.Value(bool).init(false);
+
+/// Drives one helper sign the way `signAndPublish` does, without needing a live
+/// daemon behind it. The fetch itself goes nowhere in a test; what is under test
+/// is what happens to the note when it does not come back.
+/// Drives the whole post, from the composer down through the signer dispatch.
+/// The dispatch is the part that mattered: it forwarded `restorable` to the
+/// bunker and dropped it on the way to the built-in signer, so the flag arriving
+/// intact is not something a test of `requestHelperSign` alone can see.
+pub fn submitPostForTest(model: *Model, fx: *Effects) void {
+    submitPost(model, fx);
+}
+
+pub fn helperSignRestorableForTest() bool {
+    return g_helper_sign.active and g_helper_sign.restorable;
+}
+
+pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
+    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable);
+}
+
+pub fn handleHelperSignedForTest(response: native_sdk.EffectResponse) void {
+    handleHelperSigned(response);
+}
+
+pub fn releaseHelperSignForTest() void {
+    releaseHelperSign();
+}
+
+/// Puts the pending sign past its deadline, for the case where no terminal ever
+/// arrives: a daemon that accepts the socket and then says nothing.
+pub fn expireHelperSignForTest() void {
+    g_helper_sign.deadline_s = 0;
+}
+
+pub fn scanHelperSignForTest(model: *Model) void {
+    scanHelperSign(model);
+}
+
+pub fn helperSignNoticeForTest() bool {
+    return g_helper_sign_notice.load(.acquire);
+}
+
+/// Whether a note is with a signer right now, waiting for a signature. True for
+/// both the bunker's pending table and the built-in signer's slot.
+pub fn signInFlight() bool {
+    if (g_helper_sign.active and g_helper_sign.restorable) return true;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |slot| {
+        if (slot.active and slot.restorable) return true;
+    }
+    return false;
+}
+
+pub fn helperSignPendingForTest() bool {
+    return g_helper_sign.active;
+}
+
+fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
     const pk = activePubkey() orelse return;
-    const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch return;
+    // Recorded first. Every `catch return` below is a path that used to end with
+    // the note gone and the app saying "Posted".
+    rememberHelperSign(gpa, content_owned, restorable);
+    const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
+        failHelperSign();
+        return;
+    };
     const unsigned = nostr.event.Event{
         .id = id,
         .pubkey = pk,
@@ -2563,10 +2714,21 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
         .content = content_owned,
         .sig = [_]u8{0} ** 64,
     };
-    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch return;
+    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch {
+        failHelperSign();
+        return;
+    };
     defer gpa.free(unsigned_json);
-    const body = (nostr.signer_ipc.SignEvent{ .event = unsigned_json }).toJson(gpa) catch return;
+    const body = (nostr.signer_ipc.SignEvent{ .event = unsigned_json }).toJson(gpa) catch {
+        failHelperSign();
+        return;
+    };
     defer gpa.free(body);
+    // A test drives what happens to the NOTE, which is everything above and
+    // everything the response handler does. It cannot drive the loopback: an
+    // `Effects` is not constructible outside a running app, so this call would
+    // fault on undefined memory. Comptime, so the shipped binary has no branch.
+    if (builtin.is_test) return;
     helperFetch(fx, helper_sign_key, "/sign", body, Effects.responseMsg(.helper_signed));
 }
 
@@ -2678,13 +2840,29 @@ fn deleteIdentityKeyFile() void {
 /// came from our own daemon over authenticated loopback. A kind:0 seeds the
 /// profile cache so the name shows at once.
 fn handleHelperSigned(response: native_sdk.EffectResponse) void {
-    if (response.outcome != .ok or response.status != 200) return;
+    // A refusal, a timeout, a rejected effect, or a daemon that is not there.
+    // The tick hands the note back; this line used to be where it was dropped.
+    if (response.outcome != .ok or response.status != 200) {
+        failHelperSign();
+        return;
+    }
     const gpa = std.heap.page_allocator;
-    var wrapped = nostr.signer_ipc.parse(nostr.signer_ipc.SignEvent, gpa, response.body) catch return;
+    // Every failure below is the daemon answering with something this app cannot
+    // use, which is a failed sign like any other.
+    var wrapped = nostr.signer_ipc.parse(nostr.signer_ipc.SignEvent, gpa, response.body) catch {
+        failHelperSign();
+        return;
+    };
     defer wrapped.deinit();
-    var parsed = nostr.event.fromJson(gpa, wrapped.value.event) catch return;
+    var parsed = nostr.event.fromJson(gpa, wrapped.value.event) catch {
+        failHelperSign();
+        return;
+    };
     defer parsed.deinit();
-    const owned = gpa.dupe(u8, parsed.value.content) catch return;
+    const owned = gpa.dupe(u8, parsed.value.content) catch {
+        failHelperSign();
+        return;
+    };
     var out = parsed.value;
     out.content = owned;
     // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
@@ -2694,6 +2872,10 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
+    // Signed. The note is the store's and the outbox's problem now, so the copy
+    // held for a restore is dropped and any earlier failure notice retired.
+    releaseHelperSign();
+    g_helper_sign_notice.store(false, .release);
     ingestAndPublish(gpa, out, null);
 }
 // The listener runs for one connection generation. A logout or a reconnect
@@ -5736,6 +5918,10 @@ pub const Model = struct {
         // composer, so say why rather than let it silently reappear.
         if (g_signer_kind == .remote and g_remote_sign_notice.load(.acquire))
             return "Your signer didn't respond. Draft restored, try again.";
+        // The built-in signer, which is a separate process on loopback and can
+        // refuse, be busy, or not be running at all.
+        if (g_signer_kind == .helper and g_helper_sign_notice.load(.acquire))
+            return "Signet could not sign that. Draft restored, try again.";
         if (g_identity_npub_len == 0) return "Preparing your key…";
         // Show the user's own display name once their kind:0 is known, else npub.
         var who: []const u8 = g_identity_npub_buf[0..g_identity_npub_len];
@@ -5849,6 +6035,15 @@ pub const Model = struct {
     /// The logout confirmation warning, sharper for a local key (it is deleted).
     pub fn logout_warning(self: *const Model) []const u8 {
         _ = self;
+        // A note handed to a signer that has not answered exists in exactly one
+        // place: the slot the sign-out is about to free. It cannot be parked in
+        // the outbox the way a queued note is, because it has no signature and
+        // therefore no id, and it cannot be left in the composer, because that
+        // is the previous reader's writing sitting in front of the next account.
+        // So the reader is told, and the press is theirs to make.
+        if (signInFlight()) {
+            return "A note you just posted has not been signed yet. Signing out now will lose it.";
+        }
         return switch (g_signer_kind) {
             .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
@@ -16317,6 +16512,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
+                // The same question for the built-in signer, which had no
+                // answer to it at all: a sign that failed simply ended.
+                if (g_signer_kind == .helper) scanHelperSign(model);
                 // Health-check the signer daemon until the loopback IPC answers,
                 // then fire any queued key setup.
                 pollHelper(fx);
@@ -16370,6 +16568,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_draft_dirty = true;
             // The user is composing again: retire a stale "signer didn't respond".
             g_remote_sign_notice.store(false, .release);
+            g_helper_sign_notice.store(false, .release);
         },
         .post => {
             // Every precondition, before anything is signed or said. A message
@@ -17595,7 +17794,7 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
             ingestAndPublish(gpa, ev, null);
         },
         .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
-        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned),
+        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable),
     }
 }
 
@@ -19936,6 +20135,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
     _ = g_remote_generation.fetchAdd(1, .monotonic);
     clearPending();
     g_remote_sign_notice.store(false, .release);
+    // And the built-in signer's slot, for the same reason: it holds the leaving
+    // account's writing, and the confirmation said what that costs.
+    releaseHelperSign();
+    g_helper_sign_notice.store(false, .release);
 
     if (g_identity_signer) |*s| s.deinit();
     g_identity_signer = null;

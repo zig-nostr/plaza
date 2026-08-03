@@ -1546,6 +1546,99 @@ test "a refused remote sign restores the lost draft to the composer" {
     try testing.expect(main.takePendingContentForTest("req-x") == null);
 }
 
+test "a Signet sign that fails hands the note back instead of eating it" {
+    // The remote signer has had a pending slot, a deadline and a restore since
+    // it shipped. The built-in one had none of it, and `signAndPublish` dropped
+    // the restorable flag on the way to it. So a Signet sign that failed for any
+    // reason destroyed the note in silence: the composer was cleared, the draft
+    // file deleted, the toast said "Posted", and the response handler returned on
+    // its first line with no Model to give anything back to. Nothing was stored
+    // and nothing was queued, because the outbox is fed after a good signature.
+    //
+    // The daemon answers non-200 while perfectly alive: 401 on a stale token,
+    // 409 with no key yet, 400 on a malformed event, 500 on a signing failure.
+    main.setIdentityForTest([_]u8{0x4f} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    const note = "the sentence I actually wanted to publish";
+
+    // The press, driven from the composer so the signer DISPATCH is under test
+    // too: it forwarded the restorable flag to the bunker and dropped it on the
+    // way to the built-in signer, which is why a note handed to Signet had
+    // nothing holding it even after the slot existed.
+    model.draft_buffer.set(note);
+    main.submitPostForTest(&model, &fx);
+    try testing.expect(main.helperSignPendingForTest());
+    try testing.expect(main.helperSignRestorableForTest());
+    try testing.expect(model.draft_empty());
+
+    // And the daemon refuses. 409 is the concrete one: a helper session restored
+    // from disk while the daemon comes up with no signer.key.
+    main.handleHelperSignedForTest(.{ .key = 0, .outcome = .ok, .status = 409, .body = "" });
+
+    // The tick hands it back, into a composer the reader has not started using
+    // again, and says why rather than letting it silently reappear.
+    try testing.expect(model.draft_empty());
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings(note, model.draft());
+    try testing.expect(main.helperSignNoticeForTest());
+    try testing.expect(!main.helperSignPendingForTest());
+    try testing.expect(std.mem.indexOf(u8, model.identity(testing.allocator), "could not sign") != null);
+}
+
+test "a note still being signed is not thrown away without saying so" {
+    // A note handed to a signer that has not answered exists in exactly one
+    // place: the slot sign-out frees. It cannot be parked in the outbox the way
+    // a queued note is, because it has no signature and so no id, and it cannot
+    // be left in the composer, because that is the previous reader's writing
+    // sitting in front of the next account. So the confirmation says what the
+    // press costs.
+    main.setIdentityForTest([_]u8{0x50} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "has not been signed") == null);
+
+    main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "half a thought", true);
+    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "has not been signed") != null);
+
+    // Once it is signed there is nothing to warn about.
+    main.releaseHelperSignForTest();
+    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "has not been signed") == null);
+}
+
+test "a sign that never gets an answer at all still gives the note back" {
+    // `outcome != .ok` covers a refused connection, but a daemon that accepts
+    // the socket and then says nothing produces no terminal at all within the
+    // reader's patience. The deadline is the backstop, and without one the note
+    // would sit in a slot nobody ever reads.
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "a note into the void", true);
+
+    // Not yet: the sign is still legitimately out.
+    main.scanHelperSignForTest(&model);
+    try testing.expect(model.draft_empty());
+    try testing.expect(main.helperSignPendingForTest());
+
+    // Past the deadline, it comes back.
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("a note into the void", model.draft());
+}
+
 // ---- B3: guest-first launch ------------------------------------------------
 
 test "a guest feed shows the join strip; dismissing keeps the Guest chip" {
