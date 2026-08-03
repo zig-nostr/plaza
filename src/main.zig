@@ -5695,7 +5695,15 @@ pub const Model = struct {
     pub fn profile_status(self: *const Model) []const u8 {
         return switch (self.profile_stage) {
             .fetching => "Reading your current profile from your relays…",
-            .absent => "You have no profile yet. Saving publishes your first one.",
+            // Two different states wearing one name. For a key minted here,
+            // absent is a fact and the first save is a first profile. For an
+            // imported key it is only what the relays this app happens to dial
+            // have said, and publishing over it would delete a profile living
+            // somewhere they have not been asked.
+            .absent => if (g_identity_minted_here)
+                "You have no profile yet. Saving publishes your first one."
+            else
+                "Plaza has not found your profile on the relays it can reach. It will not publish over one it has not read.",
             // Deliberately NOT "you have no profile". Not hearing back is not
             // the same as being told there is nothing, and only one of those is
             // safe to publish over.
@@ -5726,12 +5734,24 @@ pub const Model = struct {
     }
     /// Saving is refused until the app HAS the profile it would be merging into.
     /// Publishing a merge of nothing is how a lightning address disappears.
+    ///
+    /// `.absent` is the case that needed the argument. It means "a relay
+    /// answered and did not send a kind:0", which reads as "you have none" and
+    /// is the same inference `canWriteFollows` and `canWriteRelayList` both
+    /// refuse: on a cold import the relays being asked are the four this app was
+    /// born with, and a clean answer from those is not evidence about a profile
+    /// living somewhere else. Saving from `.absent` merged into a literal `{}`
+    /// and published it, so a reader who typed a display name lost their
+    /// lightning address, their NIP-05, their banner, their website and every
+    /// NIP-39 proof in one press. A key minted in this app has no profile
+    /// anywhere and is the one case where absent really is absent.
     pub fn profile_can_save(self: *const Model) bool {
         // `.sent` stays savable: a reader who spots a typo in the name they just
         // saved must be able to fix it, and a sheet whose Save is dead after one
         // press is a sheet they have to close and reopen to use again.
         return switch (self.profile_stage) {
-            .have, .absent, .failed, .sent => true,
+            .have, .failed, .sent => true,
+            .absent => g_identity_minted_here,
             .fetching, .saving, .unread => false,
         };
     }
@@ -15893,12 +15913,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     const gpa = std.heap.page_allocator;
                     if (ownProfileJson(gpa)) |own| {
                         defer freeOwnProfile(gpa, own);
-                        // Only if the reader has not started writing. A profile
-                        // arriving a few seconds late must not replace the
-                        // sentence they are in the middle of typing.
-                        if (!model.profile_seeded and model.profile_untouched()) {
-                            seedProfileFields(model, own.json);
-                        }
+                        // A profile arriving a few seconds late must not replace
+                        // the sentence the reader is in the middle of typing,
+                        // which is what the second argument protects. It used to
+                        // be all or nothing: one typed character skipped the
+                        // seeding of ALL THREE fields, and the flip to `.have`
+                        // below ran anyway, so Save lit up over two empty fields
+                        // that had never been read and the merge deleted them.
+                        if (!model.profile_seeded) seedProfileFields(model, own.json, true);
                         model.profile_stage = .have;
                     } else if (ownProfileAnswered()) {
                         model.profile_stage = .absent;
@@ -16686,8 +16708,12 @@ fn openProfileEdit(model: *Model) void {
     model.profile_picture_buffer.clear();
     const gpa = std.heap.page_allocator;
     if (ownProfileJson(gpa)) |own| {
-        defer gpa.free(own.json);
-        seedProfileFields(model, own.json);
+        // The whole record, not just its content: freeing only `json` left every
+        // tag it carried behind on each open of the sheet.
+        defer freeOwnProfile(gpa, own);
+        // The three buffers were cleared two lines up, so there is nothing typed
+        // to preserve here.
+        seedProfileFields(model, own.json, false);
         model.profile_stage = .have;
         return;
     }
@@ -16706,7 +16732,7 @@ fn openProfileEdit(model: *Model) void {
 /// would write the cut-off version back over the real one: silent data loss from
 /// merely opening a sheet. Such a field is left empty and marked, and the merge
 /// then leaves that key exactly as it was.
-fn seedProfileFields(model: *Model, json: []const u8) void {
+fn seedProfileFields(model: *Model, json: []const u8, keep_typed: bool) void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -16732,9 +16758,26 @@ fn seedProfileFields(model: *Model, json: []const u8) void {
         name = v;
         model.profile_name_key = .name;
     }
-    model.profile_name_long = seedField(&model.profile_name_buffer, name);
-    model.profile_about_long = seedField(&model.profile_about_buffer, stringField(obj, "about"));
-    model.profile_picture_long = seedField(&model.profile_picture_buffer, stringField(obj, "picture"));
+    // A field the reader has already typed into keeps their text; every other
+    // field is filled from the profile that just arrived.
+    //
+    // It used to be all or nothing, and the tick flipped the stage to `.have`
+    // whether or not the seeding ran. So a reader who typed a display name while
+    // the fetch was still out got a savable sheet over two fields that had never
+    // been seeded and were still empty, and the merge REMOVES a key whose field
+    // is empty: pressing Save deleted their bio and their avatar from a profile
+    // the app had by then read correctly. Per field, every field is now either
+    // known or deliberately typed, which is the same rule the too-long-to-show
+    // fields already followed.
+    if (!(keep_typed and model.profile_name_buffer.text().len > 0)) {
+        model.profile_name_long = seedField(&model.profile_name_buffer, name);
+    }
+    if (!(keep_typed and model.profile_about_buffer.text().len > 0)) {
+        model.profile_about_long = seedField(&model.profile_about_buffer, stringField(obj, "about"));
+    }
+    if (!(keep_typed and model.profile_picture_buffer.text().len > 0)) {
+        model.profile_picture_long = seedField(&model.profile_picture_buffer, stringField(obj, "picture"));
+    }
     model.profile_seeded = true;
 }
 
@@ -16887,14 +16930,20 @@ pub fn ownProfileAnsweredForTest() bool {
     return ownProfileAnswered();
 }
 
-pub fn seedProfileFieldsForTest(model: *Model, json: []const u8) void {
-    seedProfileFields(model, json);
+pub fn seedProfileFieldsForTest(model: *Model, json: []const u8, keep_typed: bool) void {
+    seedProfileFields(model, json, keep_typed);
 }
 
 /// The merge, exposed so a test can prove what survives it. This is the whole
 /// safety argument of the Edit profile sheet in one function.
 pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
     return mergeProfileJson(gpa, existing, model);
+}
+
+/// Drives the name beat's whole write, not just its merge. The tags it forwards
+/// are invisible to `mergeNameJsonForTest`, which only sees the content.
+pub fn publishNameForTest(model: *Model, fx: *Effects) void {
+    publishName(model, fx);
 }
 
 pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
@@ -16966,9 +17015,15 @@ fn ownProfileWorker(pk: [32]u8) void {
             switch (msg.value) {
                 .event => |e| {
                     const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
-                    // A relay can send any event down any subscription. Only a
-                    // VERIFIED one counts as this account's own profile.
-                    if (result != .invalid) answered = true;
+                    // A relay can send ANY event down any subscription, so the
+                    // event has to be the thing that was asked for before it can
+                    // count as an answer about it. Verified was not enough: a
+                    // valid note from a stranger, pushed down "plaza-me", used to
+                    // decide that this account had no profile.
+                    if (result == .invalid) continue;
+                    if (e.event.kind != 0) continue;
+                    if (!std.mem.eql(u8, &e.event.pubkey, &pk)) continue;
+                    answered = true;
                 },
                 // A relay that says "that is all I have" has answered, and so
                 // has one that closes the subscription: both are a reply.
@@ -16996,18 +17051,26 @@ fn publishName(model: *Model, fx: *Effects) void {
     const gpa = std.heap.page_allocator;
 
     var prev_created_at: i64 = 0;
-    var existing: ?[]u8 = null;
+    var prev_tags: []const nostr.event.Tag = &.{};
+    var existing: ?OwnProfile = null;
     if (ownProfileJson(gpa)) |own| {
-        existing = own.json;
+        existing = own;
         prev_created_at = own.created_at;
+        prev_tags = own.tags;
     }
-    defer if (existing) |e| gpa.free(e);
+    defer if (existing) |e| freeOwnProfile(gpa, e);
 
     // Quotes and backslashes are ESCAPED, not dropped: a name is prose, and the
     // serializer knows how to carry prose. (Dropping them was a fixed 64-byte
     // buffer away from a longer field overflowing it.)
-    const json = mergeNameJson(gpa, existing orelse "{}", raw) orelse return;
-    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, &.{}, json, false);
+    const json = mergeNameJson(gpa, if (existing) |e| e.json else "{}", raw) orelse return;
+    // The TAGS come forward, the same as the sheet's save. The beat only arms on
+    // a key this app just minted, which has no kind:0 and therefore no NIP-39
+    // proofs to lose, so this is not a bug being fixed: it is the one line that
+    // stopped the doc comment above from being true, and the read of the stored
+    // profile two lines up says plainly that somebody already expected one.
+    const tags = dupeTags(gpa, prev_tags);
+    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
         if (upsertProfile(pk)) |prof| parseMetadataInto(prof, json);
