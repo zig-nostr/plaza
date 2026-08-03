@@ -1309,7 +1309,7 @@ const name_scale: f32 = 14.0 / 14.5;
 /// than the 15px glyphs beside it. It was 28 while the verbs were `.list_item`s,
 /// a kind that carries an intrinsic 28px row-height floor; they are plain
 /// pressable rows now, so the strip measures what it draws.
-pub const engagement_row_height: f32 = 18.125;
+pub const engagement_row_height: f32 = verb_slot_height;
 /// A feed row minus its body: the insets, the identity block pinned to the disc,
 /// the two vertical steps, the verbs, and the hairline. Every term is the
 /// redesign's own number, so the estimate cannot drift from the layout.
@@ -1841,6 +1841,15 @@ fn resolveSignetWindow(init: std.process.Init) void {
     g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "signet-window");
     if (g_signet_win_len != 0) return;
     g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "../../signet-window/zig-out/bin/signet-window");
+}
+
+/// Whether there is a Signet holding this account's key AND a window to show it
+/// in. Both halves matter: a remote signer is somebody else's process on
+/// somebody else's machine and Signet has nothing to say about it, and an
+/// install that arrived without the window would offer a press that opens
+/// nothing.
+pub fn openSignetAvailable() bool {
+    return g_signer_kind == .helper and g_signet_win_len > 0;
 }
 
 /// Whether the ceremony window is the right place to take a pasted key. Not
@@ -5442,7 +5451,7 @@ pub const Model = struct {
     /// press that opens nothing.
     pub fn can_open_signet(self: *const Model) bool {
         _ = self;
-        return g_signer_kind == .helper and g_signet_win_len > 0;
+        return openSignetAvailable();
     }
     /// Where the key actually is, which is the part worth knowing.
     pub fn signer_sub(self: *const Model) []const u8 {
@@ -13039,11 +13048,6 @@ fn lowerScope(scope: []const u8) []const u8 {
     return "starter pack";
 }
 
-/// The note menu: what a reader can do about the person whose note this is.
-///
-/// One entry today. It says which way it goes and, when it cannot go either
-/// way yet, says that instead of offering a press that would replace a contact
-/// list nobody has read.
 /// What a note offers beyond its verbs: where it is, what it says, and what to
 /// do about whoever wrote it.
 ///
@@ -13053,11 +13057,14 @@ fn lowerScope(scope: []const u8) []const u8 {
 fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
     const rows = ui.arena.alloc(AppUi.Node, 6) catch return ui.spacer(0);
     var n: usize = 0;
-    rows[n] = menuRow(ui, "Copy note address", "copy", null, Msg{ .copy_nevent = note.id });
+    // No glyphs. Two of these four had one and two did not, which reads as two
+    // items with something extra rather than as one list: a menu's items are
+    // alike, and a glyph on some of them is a difference that means nothing.
+    rows[n] = menuRow(ui, "Copy note address", null, null, Msg{ .copy_nevent = note.id });
     n += 1;
     rows[n] = menuRow(ui, "Copy text", null, null, Msg{ .copy_note_text = note.id });
     n += 1;
-    rows[n] = menuRow(ui, "Open on the web", "external-link", null, Msg{ .open_web = note.id });
+    rows[n] = menuRow(ui, "Open on the web", null, null, Msg{ .open_web = note.id });
     n += 1;
     rows[n] = menuSeparatorRow(ui);
     n += 1;
@@ -13357,7 +13364,7 @@ fn npubShort() []const u8 {
 /// the PR for review.
 fn accountMenu(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    const rows = ui.arena.alloc(AppUi.Node, 4) catch return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, 5) catch return ui.spacer(0);
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
         vgap(ui, 34),
@@ -13376,9 +13383,20 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
         hgap(ui, 9),
     });
     rows[1] = menuSeparator(ui);
-    rows[2] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
-    rows[3] = menuRow(ui, "Sign out", null, null, .open_settings_logout);
-    return menuSurface(ui, 240, rows);
+    var n: usize = 2;
+    // The chip this menu hangs off says "Signet ready", so the way to Signet
+    // belongs here as well as in Settings: this is where a reader looks when
+    // they are wondering about their signer, because it is the thing that just
+    // told them about it.
+    if (openSignetAvailable()) {
+        rows[n] = menuRow(ui, "Open Signet", null, null, .open_signet_window);
+        n += 1;
+    }
+    rows[n] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
+    n += 1;
+    rows[n] = menuRow(ui, "Sign out", null, null, .open_settings_logout);
+    n += 1;
+    return menuSurface(ui, 240, rows[0..n]);
 }
 
 /// The banner 11p draws when no relay is answering. It says what still works,
@@ -13870,6 +13888,11 @@ fn handleLine(ui: *AppUi, note: *const Note) AppUi.Node {
 /// 64 holds the glyph, its gap and the widest count `formatCount` can produce
 /// (`999.9k`) without the next slot moving.
 const verb_slot_width: f32 = 64;
+/// And how tall. The row used to be exactly as tall as its glyphs measured
+/// (18.125), so the verbs sat hard against the rule above them and the row
+/// below: a strip of icons rather than a row of controls. This is the same
+/// height the chrome gives its own pressable rows.
+const verb_slot_height: f32 = 30;
 const verb_icon_size: f32 = 15;
 
 /// The engagement row: reply, repost, like, zap, bookmark, more, in that fixed
@@ -13954,7 +13977,7 @@ fn moreSlotChildren(ui: *AppUi, model: *const Model, note: *const Note, glyph: A
 /// and the neighbour of the heart is a glyph that does nothing yet: aiming at
 /// the inert one and landing on the live one would publish a reaction.
 fn verbSlot(ui: *AppUi, inner: AppUi.Node) AppUi.Node {
-    return ui.row(.{ .width = verb_slot_width, .cross = .center, .gap = 0 }, .{inner});
+    return ui.row(.{ .width = verb_slot_width, .height = verb_slot_height, .cross = .center, .gap = 0 }, .{inner});
 }
 
 /// A verb's glyph and its count, as one control.
@@ -15611,6 +15634,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.menu = .none;
         },
         .copy_nevent => |id| {
+            model.note_menu = 0;
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
@@ -15621,6 +15645,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // njump renders any nostr event as a web page, which is how a note is
         // shared with someone who is not on nostr yet.
         .open_web => |id| {
+            model.note_menu = 0;
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
