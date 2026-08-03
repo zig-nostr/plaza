@@ -6025,16 +6025,15 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         }
     }.f;
     if (activePubkey()) |pk| push(&onscreen, &n, pk);
-    if (model.viewing_profile) |pk| {
-        // A profile occludes the feed too, and its subject owns an id first:
-        // the 72px face is the largest thing on the screen and falling back to
-        // initials there reads as a broken page rather than a loading one.
-        push(&onscreen, &n, pk);
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| push(&onscreen, &n, note.pubkey);
-    } else if (model.viewing_thread != 0) {
-        // A thread occludes the feed, so its authors own the ids while it is up.
-        push(&onscreen, &n, model.thread_root.pubkey);
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| push(&onscreen, &n, note.pubkey);
+    if (model.viewing_profile != null or model.viewing_thread != 0) {
+        // A level occludes the feed, so its authors own the ids while it is up,
+        // and only the ones ON SCREEN in it. Walking every note in the level
+        // instead meant the first nine authors of a long thread took every id
+        // and kept it: the claim pass never evicts anything marked wanted this
+        // pass, and marking all of them made every id unreclaimable. Everyone
+        // below kept initials for as long as the level was open.
+        const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
+        for (set.authors[0..set.author_count]) |pk| push(&onscreen, &n, pk);
     } else {
         const w = model.visibleRange();
         var i = w.first;
@@ -6453,6 +6452,42 @@ fn recalledAspect(note_id: i64) ?f32 {
 }
 
 /// Clears the media cache. For tests, which share the process globals.
+/// Whether the slot for `note_id` was marked wanted by the most recent pass.
+/// This is the thing the claim pass reads to decide what it may evict, so it is
+/// the thing a test about "which pictures the level is spending its slots on"
+/// has to ask about.
+pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.last_used == g_media_clock;
+}
+
+pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
+    scanMediaFetches(fx, model);
+}
+
+/// Pretends a build put exactly these notes on screen in the front level.
+pub fn recordVisibleNotesForTest(ids: []const i64) void {
+    const set = &g_level_visible[0];
+    set.reset();
+    g_visible_level = 0;
+    for (ids) |id| set.pushNote(id);
+}
+
+/// How many picture slots are currently held, and by which notes.
+pub fn mediaSlotNoteIdsForTest(out: []i64) usize {
+    var n: usize = 0;
+    for (&g_media) |*m| {
+        if (!m.used or n == out.len) continue;
+        out[n] = m.note_id;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn maxMediaImagesForTest() usize {
+    return max_media_images;
+}
+
 pub fn resetMediaForTest() void {
     g_media = [_]MediaSlot{.{}} ** max_media_images;
     g_media_clock = 0;
@@ -6622,30 +6657,22 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     var fired: usize = 0;
     g_media_clock += 1;
 
-    if (model.viewing_profile) |pk| {
-        // A profile occludes the feed the same way a thread does, and needs the
-        // same branch for the same reason. Without it BOTH passes fall through
-        // to the feed, which is still built (so its rows are still marked
-        // wanted every tick), leaving no slot the claim pass may lend: the
-        // profile's own pictures would deterministically never load.
+    if (model.viewing_profile != null or model.viewing_thread != 0) {
+        // A level occludes the feed, so the picture budget goes to the level,
+        // and only to the rows ON SCREEN in it. Marking every note in the level
+        // wanted meant the first six pictures held all six slots and nothing
+        // else could ever be lent one: the claim pass refuses to evict anything
+        // wanted this pass, and everything was. Every other picture in a long
+        // thread stayed an empty box for as long as the thread was open.
         //
-        // Only the tab that is SHOWING. Half these notes are behind the other
-        // tab, and spending the picture budget on rows nobody is looking at is
-        // how the visible ones end up as empty boxes.
-        var indices: [thread_reply_cap]usize = undefined;
-        const shown = model.profileNotesFor(&indices, pk);
-        for (shown) |i| markMediaWanted(model.thread_notes[i].id);
-        for (shown) |i| fireMedia(fx, &model.thread_notes[i], &fired, per_tick);
-        return;
-    }
-    if (model.viewing_thread != 0) {
-        // Mark, then fetch: marking every thread picture wanted first means the
-        // claim pass can only evict the (now hidden) feed's slots, never a
-        // thread picture needed later in this same pass.
-        markMediaWanted(model.thread_root.id);
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| markMediaWanted(note.id);
-        fireMedia(fx, &model.thread_root, &fired, per_tick);
-        for (model.thread_notes[0..model.thread_notes_len]) |*note| fireMedia(fx, note, &fired, per_tick);
+        // Mark, then fetch, as the feed does: marking first means the claim pass
+        // can only evict what has scrolled away, never a picture needed later in
+        // this same pass.
+        const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
+        for (set.notes[0..set.note_count]) |id| markMediaWanted(id);
+        for (set.notes[0..set.note_count]) |id| {
+            if (model.noteById(id)) |note| fireMedia(fx, note, &fired, per_tick);
+        }
         return;
     }
 
@@ -9946,6 +9973,66 @@ const RowExtents = struct {
 
 const row_extents_magic: u64 = 0x524f57455854_4142;
 
+/// Who and what is ON SCREEN in a level right now: the authors whose faces are
+/// being drawn, and the notes whose pictures are.
+///
+/// The canvas registry holds SIXTEEN images for the whole window, split nine
+/// faces, one banner and six pictures. That is ample, because only about a
+/// screenful of rows is ever visible at once, and the feed has always spent it
+/// that way: it marks and fetches `visibleRange()` and nothing else.
+///
+/// A thread and a person's page did not. They marked EVERY note in the level as
+/// on screen, so in a long thread the first nine authors and the first six
+/// pictures took every slot and held them: the allocator refuses to evict
+/// anything marked wanted this pass, and everything was marked. Every other
+/// author kept initials and every other picture stayed blank, for as long as the
+/// level was open, and the bigger the thread the worse it got. This is what
+/// "avatars and images do not load in big threads" was.
+///
+/// Filled during the build from the visible window, which is the only place that
+/// knows which rows are on screen, and read on the next tick by the two passes
+/// that lend slots. One frame stale, exactly like the feed's own range.
+const VisibleSet = struct {
+    authors: [visible_set_cap][32]u8 = undefined,
+    author_count: usize = 0,
+    notes: [visible_set_cap]i64 = undefined,
+    note_count: usize = 0,
+
+    fn reset(self: *VisibleSet) void {
+        self.author_count = 0;
+        self.note_count = 0;
+    }
+
+    fn pushAuthor(self: *VisibleSet, pubkey: [32]u8) void {
+        if (self.author_count >= self.authors.len) return;
+        for (self.authors[0..self.author_count]) |had| {
+            if (std.mem.eql(u8, &had, &pubkey)) return;
+        }
+        self.authors[self.author_count] = pubkey;
+        self.author_count += 1;
+    }
+
+    fn pushNote(self: *VisibleSet, id: i64) void {
+        if (self.note_count >= self.notes.len) return;
+        for (self.notes[0..self.note_count]) |had| {
+            if (had == id) return;
+        }
+        self.notes[self.note_count] = id;
+        self.note_count += 1;
+    }
+};
+
+/// A screenful of rows, with the overscan the lists declare and a block's own
+/// replies counted: comfortably more than can be on screen, and far fewer than a
+/// long thread holds.
+const visible_set_cap = 48;
+
+/// One per mounted level. UI-thread only, like every other per-level cache here.
+var g_level_visible: [thread_depth_max + 1]VisibleSet = [_]VisibleSet{.{}} ** (thread_depth_max + 1);
+/// Which level is the one being READ, so the passes that lend slots spend them
+/// on the level in front rather than on an occluded one underneath.
+var g_visible_level: usize = 0;
+
 /// One per mounted level, plus one for a person's page at that level. Levels are
 /// UI-thread only, like every other per-level cache in this file.
 var g_thread_extents: [thread_depth_max + 1]RowExtents = [_]RowExtents{.{}} ** (thread_depth_max + 1);
@@ -9953,6 +10040,72 @@ var g_profile_extents: [thread_depth_max + 1]RowExtents = [_]RowExtents{.{}} ** 
 
 /// Reads a precomputed height. The whole point is that this touches nothing but
 /// its own numbers.
+/// Records the authors and pictures on screen in a thread level.
+///
+/// A visible ROW is not one note: a block is a reply plus the replies drawn
+/// under it, and all of them are on screen together. The overscan the list
+/// declares is included, which is what makes a face arrive before the row
+/// carrying it does.
+fn recordThreadVisible(rows: *const ThreadRows, level: usize, first: usize, last: usize) void {
+    const set = &g_level_visible[@min(level, g_level_visible.len - 1)];
+    set.reset();
+    g_visible_level = @min(level, g_level_visible.len - 1);
+    var index = first;
+    while (index <= last and index < rows.count()) : (index += 1) {
+        switch (rows.rowAt(index)) {
+            .ancestor => |ai| if (ai < rows.ancestors.len) {
+                set.pushAuthor(rows.ancestors[ai].note.pubkey);
+                set.pushNote(rows.ancestors[ai].note.id);
+            },
+            .focal => {
+                set.pushAuthor(rows.root.pubkey);
+                set.pushNote(rows.root.id);
+            },
+            .block => |bi| if (bi < rows.blocks.len) pushBlock(set, &rows.blocks[bi]),
+            .outside_block => |oi| if (oi < rows.outside.len) pushBlock(set, &rows.outside[oi]),
+            else => {},
+        }
+    }
+}
+
+fn pushBlock(set: *VisibleSet, block: *const ThreadBlock) void {
+    set.pushAuthor(block.parent.pubkey);
+    set.pushNote(block.parent.id);
+    for (block.children) |*child| {
+        set.pushAuthor(child.pubkey);
+        set.pushNote(child.id);
+    }
+}
+
+/// The same for a person's page: the subject owns a face first, then whichever
+/// of their notes is on screen.
+fn recordProfileVisible(rows: *const ProfileRows, level: usize, first: usize, last: usize) void {
+    const set = &g_level_visible[@min(level, g_level_visible.len - 1)];
+    set.reset();
+    g_visible_level = @min(level, g_level_visible.len - 1);
+    // The 72px face is the largest thing on the page, so the subject is first in
+    // line whether or not their card is scrolled into view.
+    set.pushAuthor(rows.pubkey);
+    var index = first;
+    while (index <= last and index < rows.count()) : (index += 1) {
+        switch (rows.rowAt(index)) {
+            .note => |ni| if (ni < rows.notes.len) {
+                set.pushAuthor(rows.notes[ni].pubkey);
+                set.pushNote(rows.notes[ni].id);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Pretends a build put exactly these authors on screen in the front level.
+pub fn recordVisibleAuthorsForTest(authors: []const [32]u8) void {
+    const set = &g_level_visible[0];
+    set.reset();
+    g_visible_level = 0;
+    for (authors) |pk| set.pushAuthor(pk);
+}
+
 fn rowExtentFromTable(context: ?*const anyopaque, index: u64) f32 {
     const table: *const RowExtents = @ptrCast(@alignCast(context orelse return quiet_row_extent));
     if (table.magic != row_extents_magic) return quiet_row_extent;
@@ -10116,6 +10269,10 @@ fn threadPanel(ui: *AppUi, model: *const Model, root: *const Note, replies: []co
         .semantics = .{ .label = "Thread" },
     };
     const window = ui.virtualWindow(options);
+    // What is ACTUALLY on screen in this level, recorded where the row
+    // structures are alive. The two passes that lend registry slots read it on
+    // the next tick. See `VisibleSet`.
+    if (!occluded) recordThreadVisible(rows_ctx, level, window.first_visible_index, window.last_visible_index);
     // An OCCLUDED level is behind an opaque panel: it is mounted to keep its
     // scroll offset, and nothing it builds can be seen. So it builds nothing.
     // The offset survives on the list's id and its content height, which comes
@@ -12575,6 +12732,7 @@ fn profilePanel(
         .semantics = .{ .label = "Profile" },
     };
     const window = ui.virtualWindow(options);
+    if (!occluded) recordProfileVisible(rows_ctx, level, window.first_visible_index, window.last_visible_index);
     // An occluded level builds no rows, for the same reason a thread's does not:
     // the offset survives on the list's id and its content height, and six built
     // levels of anything cross the 1024-node ceiling that refuses a view whole.

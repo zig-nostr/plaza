@@ -998,18 +998,28 @@ test "a slot wanted on screen is never evicted for another visible picture" {
     try testing.expect(main.claimMediaSlotForTest(&fx, 7) == null);
 }
 
-test "avatar ids go to the top of a thread and never exceed the registry cap" {
+test "avatar ids go to the authors on screen, and never exceed the registry cap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     main.resetProfilesForTest();
     defer main.resetProfilesForTest();
 
+    // This used to say "the first `cap` authors IN READING ORDER of the whole
+    // thread", which is precisely the bug: a level marked every author it held
+    // as on screen, the claim pass never evicts anything marked wanted, so the
+    // first nine took every id and kept it while the level was open. Everyone
+    // below them showed initials no matter how far the reader scrolled.
+    //
+    // The rule is the one the feed always had: the authors ON SCREEN hold the
+    // ids. So this drives a real build, which is what fills the visible set.
     var model = main.initialModel();
     model.stage = .ready;
     model.viewing_thread = 1;
+    model.thread_root.id = 1;
 
-    // 15 distinct authors, each with a picture: the root plus 14 replies. More
-    // than the registry can hold, so the cap and the reading-order preference
-    // both come into play.
-    const count = 15;
+    const count = 40;
     var keys: [count][32]u8 = undefined;
     for (&keys, 0..) |*k, i| {
         k.* = [_]u8{0} ** 32;
@@ -1017,30 +1027,93 @@ test "avatar ids go to the top of a thread and never exceed the registry cap" {
         main.setProfilePictureForTest(k.*, true);
     }
     model.thread_root.pubkey = keys[0];
-    for (1..count) |i| model.thread_notes[i - 1].pubkey = keys[i];
+    for (1..count) |i| {
+        model.thread_notes[i - 1] = main.Note{ .created_at = 1_800_000_000 - @as(i64, @intCast(i)) };
+        model.thread_notes[i - 1].id = @intCast(700 + i);
+        model.thread_notes[i - 1].pubkey = keys[i];
+        model.thread_notes[i - 1].event_id = [_]u8{@intCast(i)} ** 32;
+    }
     model.thread_notes_len = count - 1;
 
+    _ = try painted.Painted.render(arena, &model);
     var fx: main.EffectsForTest = undefined;
     main.assignAvatarSlotsForTest(&fx, &model);
 
     const cap = main.max_avatar_images;
     var seen = [_]bool{false} ** (cap + 1);
     var lent: usize = 0;
-    for (keys, 0..) |k, i| {
+    for (keys) |k| {
         const id = main.avatarImageIdForTest(k);
-        if (i < cap) {
-            // The first `cap` authors in reading order each hold a distinct id.
-            try testing.expect(id >= 1 and id <= cap);
-            try testing.expect(!seen[@intCast(id)]);
-            seen[@intCast(id)] = true;
-            lent += 1;
-        } else {
-            // The overflow is starved gracefully (initials), never crashed and
-            // never given a duplicate id.
-            try testing.expectEqual(@as(u64, 0), id);
+        if (id == 0) continue;
+        // Never past the pool, and never the same id twice.
+        try testing.expect(id >= 1 and id <= cap);
+        if (seen[@intCast(id)]) {
+            std.debug.print("id {d} lent twice\n", .{id});
+            return error.DuplicateAvatarId;
         }
+        seen[@intCast(id)] = true;
+        lent += 1;
     }
-    try testing.expectEqual(cap, lent);
+    try testing.expect(lent <= cap);
+    // And it really did lend some: a pass that starves everybody would satisfy
+    // every line above.
+    if (lent == 0) {
+        std.debug.print("no author on screen was lent a face\n", .{});
+        return error.NothingLent;
+    }
+}
+
+test "an author deep in a thread gets a face once they are on screen" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    // THE BUG, stated as a rule. Somebody thirty replies down a thread could
+    // never hold a face, however far the reader scrolled: the ids were spoken
+    // for by the top of the thread and unreclaimable. Scrolling has to be able
+    // to hand a face to whoever is now being read.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root.id = 1;
+
+    const count = 40;
+    var keys: [count][32]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = [_]u8{0} ** 32;
+        k.*[0] = @intCast(i + 1);
+        main.setProfilePictureForTest(k.*, true);
+    }
+    model.thread_root.pubkey = keys[0];
+    for (1..count) |i| {
+        model.thread_notes[i - 1] = main.Note{ .created_at = 1_800_000_000 - @as(i64, @intCast(i)) };
+        model.thread_notes[i - 1].id = @intCast(700 + i);
+        model.thread_notes[i - 1].pubkey = keys[i];
+        model.thread_notes[i - 1].event_id = [_]u8{@intCast(i)} ** 32;
+    }
+    model.thread_notes_len = count - 1;
+
+    // At the top of the thread: the deep author is nowhere near the screen.
+    _ = try painted.Painted.render(arena, &model);
+    var fx: main.EffectsForTest = undefined;
+    main.assignAvatarSlotsForTest(&fx, &model);
+    const deep = keys[count - 1];
+    const before = main.avatarImageIdForTest(deep);
+
+    // Now they ARE on screen. Recorded the same way the build records it, which
+    // is the seam this fix put in.
+    main.recordVisibleAuthorsForTest(&.{deep});
+    main.assignAvatarSlotsForTest(&fx, &model);
+    const after = main.avatarImageIdForTest(deep);
+
+    if (after == 0) {
+        std.debug.print("an author on screen still holds no face (was {d})\n", .{before});
+        return error.DeepAuthorStarved;
+    }
+    try testing.expect(after >= 1 and after <= main.max_avatar_images);
 }
 
 test "the logout confirmation replaces the log-out button" {
@@ -10141,4 +10214,73 @@ test "an extent context that is not a table is refused, not read" {
     const table = main.threadExtentTableForTest(0);
     try testing.expect(main.extentTableLenForTest(table) > 0);
     try testing.expect(main.rowExtentFromTableForTest(table, 0) > 0);
+}
+
+test "picture slots follow the reader down a long thread" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The same fault as the faces, and the one that shows: a level marked EVERY
+    // picture it held as wanted, and the claim pass refuses to evict anything
+    // wanted, so the first six took the six slots and every other picture in the
+    // thread stayed an empty box for as long as the thread was open.
+    //
+    // What decides that is which ids the pass marks. A picture still marked is
+    // one the allocator may not reclaim; a picture no longer marked is one the
+    // rows now on screen can take. So that is what this asks about.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    // Previews OFF, so the pass marks and claims without reaching the network:
+    // a test cannot construct a usable effect table, and `fireMedia` returns
+    // before it needs one.
+    const previews_were = main.mediaPreviews();
+    main.setMediaPreviews(false);
+    defer main.setMediaPreviews(previews_were);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = [_]u8{0x55} ** 32;
+
+    const count = 30;
+    for (0..count) |i| {
+        model.thread_notes[i] = main.Note{ .created_at = 1_800_000_000 - @as(i64, @intCast(i)) };
+        model.thread_notes[i].id = @intCast(900 + i);
+        model.thread_notes[i].pubkey = [_]u8{0x55} ** 32;
+        model.thread_notes[i].event_id = [_]u8{@intCast(i + 1)} ** 32;
+        const url = "https://example.com/a.jpg";
+        @memcpy(model.thread_notes[i].image_url_buf[0..url.len], url);
+        model.thread_notes[i].image_url_len = url.len;
+    }
+    model.thread_notes_len = count;
+    _ = try painted.Painted.render(arena, &model);
+
+    var fx: main.EffectsForTest = undefined;
+
+    // Give the notes at the TOP of the thread the slots, as a reader arriving
+    // there would.
+    const top = [_]i64{ 900, 901, 902 };
+    for (top) |id| _ = main.claimMediaSlotForTest(&fx, id);
+    for (top) |id| try testing.expect(main.mediaSlotWantedForTest(id) != null);
+
+    // Now the reader is at the BOTTOM. The pass runs over what is on screen.
+    const bottom = [_]i64{ 925, 926, 927 };
+    main.recordVisibleNotesForTest(&bottom);
+    main.scanMediaFetchesForTest(&fx, &model);
+
+    // The pictures that scrolled away are no longer claimed as wanted, which is
+    // exactly what lets the ones now on screen be lent a slot. Before this fix
+    // every picture in the thread was marked on every pass and none of them
+    // could ever be reclaimed.
+    for (top) |id| {
+        const wanted = main.mediaSlotWantedForTest(id) orelse continue;
+        if (wanted) {
+            std.debug.print("picture {d} scrolled away and is still holding its slot\n", .{id});
+            return error.PicturesStuckAtTheTop;
+        }
+    }
 }
