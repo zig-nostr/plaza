@@ -16530,6 +16530,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 const counts = outboxCounts();
                 model.outbox_pending = counts.trying;
                 model.outbox_stuck = counts.stuck;
+                // The banner is about a note that was dropped, and a note can
+                // still be dropped by the paths that reach `ingestAndPublish`
+                // without going through the composer. It used to latch for the
+                // life of the process: the queue drained, later posts landed,
+                // and the status bar went on saying a note could not be queued
+                // for the rest of the run. It retires when there is room again,
+                // which is the condition it was reporting the absence of.
+                if (g_outbox_overflow.load(.monotonic) and outboxHasRoom()) {
+                    g_outbox_overflow.store(false, .monotonic);
+                }
                 model.outbox_overflowed = g_outbox_overflow.load(.monotonic);
                 if (g_outbox_rev.load(.monotonic) != g_outbox_saved_rev) {
                     g_outbox_saved_rev = g_outbox_rev.load(.monotonic);
@@ -16621,7 +16631,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // file was deleted and the toast said "Posted" for a sign that had
             // been refused before it left the process.
             if (!submitPost(model, fx)) {
-                setToast(model, "Signet is busy for a moment. Try again.");
+                setToast(model, if (!outboxHasRoom())
+                    "Still trying to send your last notes. This one is kept here."
+                else
+                    "Signet is busy for a moment. Try again.");
                 return;
             }
             // The slot is emptied the moment its contents go to a signer.
@@ -17814,6 +17827,10 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     // assumed. The one shape that reaches here is a relay-list flush on the same
     // tick, which the SDK would reject and nothing would notice.
     if (!signerReady()) return false;
+    // And a queue with room to track it. Refusing here keeps the note in the
+    // composer; refusing after the sign, which is where it used to happen,
+    // dropped it with no row, no retry and no way back.
+    if (!outboxHasRoom()) return false;
     const gpa = std.heap.page_allocator;
 
     // A process-lifetime copy of the content: `event.create` references its
@@ -18346,6 +18363,34 @@ fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64) bool {
     slot.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
     _ = g_outbox_rev.fetchAdd(1, .monotonic);
     return true;
+}
+
+/// Whether the queue could take another note right now.
+///
+/// Asked BEFORE the composer is emptied, which is the difference between a note
+/// the reader still has and one that is gone. `ingestAndPublish` refuses to
+/// publish what it cannot track, and it is right to: a note nobody is counting
+/// under a banner promising that anything written is kept is the lie the queue
+/// exists to stop telling. But the refusal happened after `.post` had cleared
+/// the composer and deleted the draft file, so the note was simply lost, with no
+/// queue row, no retry and no way back.
+///
+/// Sixteen slots, and eviction only takes a note that has already reached
+/// somebody. Sixteen unacked notes therefore wedge the queue for as long as the
+/// failure lasts, which for a pool that all requires NIP-42 AUTH, or a laptop on
+/// a plane, is a real state and not a corner.
+fn outboxHasRoom() bool {
+    outboxLock();
+    defer outboxUnlock();
+    for (&g_outbox) |*e| {
+        if (!e.used) return true;
+        if (e.acked != 0) return true;
+    }
+    return false;
+}
+
+pub fn outboxHasRoomForTest() bool {
+    return outboxHasRoom();
 }
 
 /// Records what one relay said about one note.
