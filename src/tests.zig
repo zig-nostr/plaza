@@ -10342,3 +10342,113 @@ test "a relay coming up puts every unfound note back in the queue" {
     try testing.expectEqual(@as(u64, 0), e.next_round);
     try testing.expect(!e.requested);
 }
+
+// ---- waiting, and failing, look like themselves -------------------------------
+
+test "a picture that will not load says so instead of waiting forever" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The view asked only whether the picture was LOADED, so every state that is
+    // not loaded drew the same striped waiting frame. A 404 waits in it forever.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 4242;
+    model.notes[0].pubkey = [_]u8{0x2b} ** 32;
+    const url = "https://haven.example.com/gone.jpg";
+    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
+    model.notes[0].image_url_len = url.len;
+    model.notes_len = 1;
+
+    // Still coming: no failure said, because none has happened.
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(findAnyText(p.tree.root, "This picture would not load") == null);
+    }
+
+    // The host answered 404.
+    var fx: main.EffectsForTest = undefined;
+    const slot = main.claimMediaSlotForTest(&fx, 4242) orelse return error.NoSlot;
+    main.markMediaFailedForTest(slot);
+    try testing.expect(main.mediaFailed(4242));
+
+    const p = try painted.Painted.render(arena, &model);
+    if (findAnyText(p.tree.root, "This picture would not load") == null) {
+        std.debug.print("a picture that answered 404 is still drawn as loading\n", .{});
+        return error.StillWaiting;
+    }
+    // And it names where it was, and offers the one thing that might still work.
+    try testing.expect(findAnyTextContainingText(p.tree.root, "haven.example.com") != null);
+    const msg = pressMsgByLabel(p.tree, "This picture could not be loaded, press to open the original") orelse
+        return error.NoWayToOpenIt;
+    switch (msg) {
+        .open_url => {},
+        else => return error.WrongMessage,
+    }
+}
+
+test "a host having a moment is not the same as a host saying no" {
+    // A 404 is an answer and the box says so. A timeout, a rate limit or a 5xx
+    // is the network having a moment, and marking a good picture permanently
+    // broken over one of those is the quote fetch's old mistake in a place the
+    // reader can see.
+    for ([_]u16{ 404, 410, 403, 400 }) |final| {
+        try testing.expect(main.mediaFailureIsFinalForTest(final));
+    }
+    for ([_]u16{ 0, 408, 429, 500, 502, 503 }) |transient| {
+        try testing.expect(!main.mediaFailureIsFinalForTest(transient));
+    }
+}
+
+test "a quote still loading looks like the card that will replace it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // It was one 34px bar, which says "something is loading" and nothing about
+    // what. A quote card is a face, a name and a line or two of somebody else's
+    // words, so the wait is shaped like that.
+    const quoted_id = [_]u8{0x7e} ** 32;
+    main.dropQuoteForTest(quoted_id);
+    main.wantQuoteForTest(quoted_id);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    var discs: usize = 0;
+    var bars: usize = 0;
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind != .skeleton) continue;
+        const f = node.widget.frame;
+        if (f.width > 0 and @abs(f.width - f.height) < 1.5) discs += 1 else bars += 1;
+    }
+    if (discs == 0 or bars < 2) {
+        std.debug.print("the waiting quote draws {d} disc(s) and {d} bar(s)\n", .{ discs, bars });
+        return error.NotACardShape;
+    }
+
+    // And the row is still priced for what it draws, or the feed jumps when the
+    // quote lands. That pricing is what the skeleton's fixed height is FOR.
+    const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+        std.debug.print("\nwaiting row draws {d}, priced {d}\n", .{ rows[0].height, priced });
+        return error.SkeletonNotPriced;
+    }
+}

@@ -6568,6 +6568,20 @@ fn mediaSlotFor(note_id: i64) ?*MediaSlot {
 /// than there are slots, the extras hold their reserved space rather than
 /// stealing each other's slot back and forth, which decoded images on the UI
 /// thread every pass and made a tall window feel heavy.
+/// Whether this note's picture was asked for and could not be had.
+pub fn mediaFailed(note_id: i64) bool {
+    const m = mediaSlotFor(note_id) orelse return false;
+    return m.state == .failed;
+}
+
+pub fn markMediaFailedForTest(slot: *MediaSlot) void {
+    slot.state = .failed;
+}
+
+pub fn mediaFailureIsFinalForTest(status: u16) bool {
+    return mediaFailureIsFinal(status);
+}
+
 pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
     return claimMediaSlot(fx, note_id);
 }
@@ -6796,6 +6810,17 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
     fired.* += 1;
 }
 
+/// Whether a failed picture fetch is worth another try later.
+///
+/// A 4xx other than "slow down" is the host answering: the picture is not there,
+/// or not for us, and asking again just makes the same round trip. Everything
+/// else (no status at all, a rate limit, a 5xx) is the network or the host
+/// having a moment, and those recover.
+fn mediaFailureIsFinal(status: u16) bool {
+    if (status == 408 or status == 429) return false;
+    return status >= 400 and status < 500;
+}
+
 /// Handles a feed-image fetch response, mirroring the avatar path.
 fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.key < media_fetch_key_base) return;
@@ -6809,7 +6834,12 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         return;
     }
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
-        slot.state = .failed;
+        // A host that said NO is different from a host that did not answer. A
+        // 404 or a 410 is an answer, and the box says so; a timeout, a 5xx or a
+        // rate limit is the network having a moment, and marking the picture
+        // permanently broken over one of those is the same mistake the quote
+        // fetch used to make, in a place the reader can see.
+        slot.state = if (mediaFailureIsFinal(response.status)) .failed else .idle;
         return;
     }
     // An animated GIF keeps all its frames; anything else (including a GIF with
@@ -14532,7 +14562,7 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // a newer quote lands here with no cache entry; re-queue it so the next
         // tick resolves it again instead of showing a skeleton forever.
         if (e == null) wantQuote(id);
-        return quoteAside(ui, null, ui.el(.skeleton, .{ .height = 34 }, .{}));
+        return quoteAside(ui, null, quoteSkeleton(ui));
     }
     const q = e.?;
     if (q.state == .missing) {
@@ -15146,6 +15176,11 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // and what pressing it costs, not a box of reserved space for a picture that
     // is not coming.
     if (!g_media_previews and !isMediaAsked(note.id) and image_id == 0) return pictureAskChip(ui, note);
+    // Asked for and not had. The striped box below means "still coming", and it
+    // meant that for a 404 too: the view only asked whether the picture was
+    // LOADED, so every state that is not loaded drew the same waiting frame and
+    // a picture that was never going to arrive waited forever.
+    if (image_id == 0 and mediaFailed(note.id)) return pictureFailedBox(ui, note, height);
     if (image_id == 0) {
         // The same box the picture will fill, striped: reserved space, not an
         // empty frame, and not a skeleton either, which reads as a row of text
@@ -15166,6 +15201,66 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
     return pictureBox(ui, note, height, picture);
+}
+
+/// A quoted note on its way: the SHAPE of the card that will replace it.
+///
+/// It used to be one 34px bar, which says "something is loading" and nothing
+/// about what. A quote card is a face, a name and a line or two of somebody
+/// else's words, so the wait looks like that: a disc, a short bar where the
+/// name goes, and two body lines, the second one short the way a last line is.
+/// Same height as the bar it replaces, so nothing about the row's pricing moves.
+fn quoteSkeleton(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .gap = 0, .cross = .start }, .{
+        ui.el(.skeleton, .{ .width = 18, .height = 18, .style = .{ .radius = 999, .background = p.surface_inset } }, .{}),
+        hgap(ui, 8),
+        ui.column(.{ .grow = 1, .gap = 0 }, .{
+            ui.el(.skeleton, .{ .width = 96, .height = 8, .style = .{ .radius = 4, .background = p.surface_inset } }, .{}),
+            vgap(ui, 7),
+            ui.el(.skeleton, .{ .height = 7, .style = .{ .radius = 4, .background = p.surface_inset } }, .{}),
+            vgap(ui, 5),
+            ui.el(.skeleton, .{ .width = 148, .height = 7, .style = .{ .radius = 4, .background = p.surface_inset } }, .{}),
+        }),
+    });
+}
+
+/// A picture that could not be had, in the space it would have taken.
+///
+/// The same box at the same height, because the row is priced for it and a
+/// picture failing must not make the feed jump. What is IN it is different: the
+/// picture glyph, a plain sentence, and the host it came from, because "this
+/// one host is not answering" is the useful half and it is often the whole
+/// story. Pressing opens the original, which is the one thing left that might
+/// work, rather than an expanded view of nothing.
+fn pictureFailedBox(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
+    const p = theme.palette;
+    const host = urlHost(note.imageUrl());
+    return ui.el(.data_row, .{
+        .width = pictureWidth(note),
+        .height = height,
+        .padding = 0,
+        .style = .{ .quiet_hover = true, .background = p.surface_inset, .radius = picture_radius, .border = p.border_hairline, .stroke_width = 1 },
+        .on_press = Msg{ .open_url = note.imageUrl() },
+        .semantics = .{ .role = .link, .label = "This picture could not be loaded, press to open the original", .focusable = true },
+    }, .{
+        ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = 0 }, .{
+            ui.appIcon(.{ .width = 18, .height = 18, .style = .{ .foreground = p.text_dim } }, "image"),
+            vgap(ui, 8),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = "This picture would not load", .scale = mono_hint_scale }},
+            ),
+            if (host.len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (host.len > 0)
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = ui.fmt("{s} · press to open it", .{host}), .monospace = true, .scale = mono_meta_scale }},
+                )
+            else
+                ui.spacer(0),
+        }),
+    });
 }
 
 /// The picture's frame: the reading column at the declared height, with the
