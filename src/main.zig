@@ -19836,6 +19836,30 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     }
 }
 
+/// How much address space the store may grow into.
+///
+/// LMDB never grows past its map size, and the library's default is 1 GiB. There
+/// is no pruning here and no retention window: the store only grows, at a
+/// measured 2.4 MB a day on a development machine with a modest follow set and
+/// the app not even running continuously. A reader on eight relays all day with
+/// a real follow list, taking kind:6 and kind:7 engagement as well, gets there
+/// materially faster.
+///
+/// Arriving is silent and it is the reader's own notes that pay. `plazaIngest`
+/// is `catch {}` at the write of a note this app just signed, deliberately, so a
+/// duplicate id cannot stop it reaching the pool, and a full map takes the same
+/// branch. `saveOutbox` fails the same way, so the queue index never lands, and
+/// `loadOutbox` drops on the next launch every entry whose event is not in the
+/// store. The banner goes on saying the app is posting them.
+///
+/// A map size is address space, not a file: LMDB reserves it and the file stays
+/// sparse. So the cheapest honest answer is to reserve far more of it than this
+/// app can plausibly use, which moves the wall from a few years out to further
+/// away than the format. Detecting MDB_MAP_FULL properly needs the library to
+/// tell it apart from every other LMDB error, and pruning is a feature; both are
+/// worth having and neither is a reason to leave the wall where it is.
+const feed_store_map_size: usize = 32 << 30;
+
 /// Opens (creating if needed) the feed store at `$HOME/.plaza/feed.mdb`.
 fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.store.Store {
     const home = environ.get("HOME") orelse ".";
@@ -19847,7 +19871,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 
     var path_buf: [512]u8 = undefined;
     const db_path = try std.fmt.bufPrintZ(&path_buf, "{s}/feed.mdb", .{dir_path});
-    return nostr.store.Store.open(db_path, .{});
+    return nostr.store.Store.open(db_path, .{ .map_size = feed_store_map_size });
 }
 
 // ----------------------------------------------------------------- identity
