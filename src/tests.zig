@@ -1822,12 +1822,17 @@ test "every chrome surface actually paints its fill" {
     // rail painting as bare window for the whole life of the rail.
     try painted.expectFillAt(p, 28, 28, pal.surface_rail_tile);
 
-    // A quiet rail tile paints NOTHING, so the window shows through. Worth
-    // asserting: a panel with no stated background falls back to the house card
-    // fill, which would draw a plate the design does not have. (The window's own
-    // colour is cleared by the host, not the canvas, so there is no fill here to
-    // compare against.)
-    try painted.expectNothingPaintedAt(p, 28, 506);
+    // A quiet rail tile has NO PLATE: what covers it is the rail's own colour,
+    // not a tile surface. Worth asserting, because a panel with no stated
+    // background falls back to the house card fill and would draw a plate the
+    // design does not have.
+    //
+    // This asked for NOTHING painted until SDK 0.6.2, which made explicit
+    // backgrounds on rows and columns paint for the first time: the rail column
+    // states the window colour and now draws it, where before the host's clear
+    // showed through instead. Identical on screen, and a different question to
+    // ask, so the question changed rather than the expectation being widened.
+    try painted.expectFillAt(p, 28, 506, pal.surface_window);
 }
 
 test "the compose tile is the one bright surface in the window" {
