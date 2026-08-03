@@ -1395,6 +1395,120 @@ test "a NIP-46 response is matched to its request by id, and unknown ids are dro
     try testing.expect(main.takePendingContentForTest("req-1") == null);
 }
 
+test "a heart filled by one account is not the next account's to un-like" {
+    // The like table was keyed by note id alone, which is identical under every
+    // account, and nothing ever cleared it. So a note liked as A showed a filled
+    // red heart to B, signed in on the same machine, who had never touched it,
+    // and B's first press took the UN-like branch: a kind:5 signed under B's key
+    // naming A's reaction. That is a permanent public link between two
+    // identities the reader was keeping apart, it destroys the app's only record
+    // of A's reaction, and B's intended like never publishes at all.
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    defer main.clearIdentityForTest();
+    const note: i64 = 0x5EED;
+    const a_reaction = [_]u8{0x71} ** 32;
+
+    main.setIdentityForTest([_]u8{0xa1} ** 32);
+    main.rememberLikeForTest(note, a_reaction);
+    try testing.expect(main.isLikedForTest(note));
+
+    // B signs in. The starter pack is shown to every account, so the same note
+    // being on screen under both is routine, not a stunt.
+    main.setIdentityForTest([_]u8{0xb2} ** 32);
+    try testing.expect(!main.isLikedForTest(note));
+
+    // B's own like is B's, and A still has theirs.
+    main.rememberLikeForTest(note, [_]u8{0xb7} ** 32);
+    try testing.expect(main.isLikedForTest(note));
+    main.setIdentityForTest([_]u8{0xa1} ** 32);
+    try testing.expect(main.isLikedForTest(note));
+    try testing.expectEqual(a_reaction, main.likeReactionIdForTest(note).?);
+
+    // And a guest has no likes at all.
+    main.clearIdentityForTest();
+    try testing.expect(!main.isLikedForTest(note));
+}
+
+test "nothing the previous account typed survives a sign-out" {
+    // Logout was thorough about the draft and said why, in a comment about the
+    // previous account's private thinking being one keystroke from going out
+    // under the next account's key. The reply box and the name field are the
+    // same thing and were both left behind: logout performs no navigation, so
+    // the next account landed inside the previous reader's open thread with
+    // their unsent sentence still in the composer.
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+
+    main.setIdentityForTest([_]u8{0xc3} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+
+    model.reply_buffer.set("something I was in the middle of saying");
+    model.name_buffer.set("Sepehr");
+    model.draft_buffer.set("an unfinished note");
+    model.viewing_thread = 0x1234;
+
+    main.performLogoutForTest(&model, &fx);
+
+    try testing.expectEqualStrings("", model.reply_draft());
+    try testing.expectEqualStrings("", model.name_draft());
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+
+    // And the one piece of evidence that authorizes building a list from
+    // nothing. It is persisted to the session file, so left set it outlived the
+    // account it was true about: mint here, log out, import an identity, and
+    // nine starter-pack names could replace a real eight-hundred-follow list.
+    try testing.expect(!main.identityMintedForTest());
+}
+
+test "the key that just signed out is not handed back by the health check" {
+    // `helperReset` is fire-and-forget with no response handler, and the SDK
+    // drops a rejected effect with no trace when every slot is busy. Reset lost,
+    // then "Create your identity" clears the logged-out latch before any new key
+    // exists, and one second later the poll re-adopts the key the reader just
+    // left. Their create fails with AlreadyInitialized, nothing says so, and the
+    // next note goes out under the old identity.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    main.setCeremonyForTest(.none);
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+
+    main.setIdentityForTest([_]u8{0xd4} ** 32);
+    // The pubkey the daemon would report, which is derived rather than the
+    // secret that was handed in.
+    const left = main.activePubkeyForTest().?;
+    var hex: [64]u8 = undefined;
+    for (left, 0..) |b, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    const same = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"pubkey\":\"{s}\",\"state\":\"ready\"}}",
+        .{hex[0..]},
+    );
+    defer testing.allocator.free(same);
+
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(main.loggedOutPubkeyForTest() != null);
+    try testing.expect(main.activePubkeyForTest() == null);
+
+    // The reader presses Create, which drops the general latch.
+    main.clearLoggedOutLatchForTest();
+
+    // The daemon still holds the old key, because the reset never landed.
+    main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = same });
+    try testing.expect(main.activePubkeyForTest() == null);
+
+    // The daemon says it holds nothing. That is the only honest evidence the
+    // reset landed, so whatever key appears next is a new one and is adopted.
+    const empty = "{\"pubkey\":\"\",\"state\":\"uninitialized\"}";
+    main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = empty });
+    try testing.expect(main.loggedOutPubkeyForTest() == null);
+    main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = same });
+    try testing.expect(main.activePubkeyForTest() != null);
+}
+
 test "logout empties the NIP-46 pending table so a new session inherits nothing" {
     main.clearPendingForTest();
     defer main.clearPendingForTest();
