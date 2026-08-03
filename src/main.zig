@@ -2128,6 +2128,29 @@ const helper_reset_key: u64 = 45;
 // the async /reset lands. Cleared when the user explicitly signs in again.
 var g_logged_out: bool = false;
 
+/// WHICH key signed out, held until the daemon confirms it no longer has it.
+///
+/// The bare latch above was the only thing keeping a signed-out key out, and
+/// `beginCreate` clears it before any new key exists. `helperReset` is
+/// fire-and-forget with no response handler, and the SDK drops a rejected effect
+/// with no trace when every slot is busy, which Plaza can reach on a frame that
+/// is also fetching avatars, NIP-05 checks and media. So: reset lost, latch
+/// dropped by pressing Create, and one second later the poll re-adopted the key
+/// the reader had just left. Their create fails with AlreadyInitialized, nothing
+/// says so, and the next note goes out under the old identity.
+///
+/// A pubkey is the precise version of that latch. It is cleared the moment the
+/// daemon reports itself uninitialized, which is the only honest evidence the
+/// reset actually landed, so re-importing the SAME key deliberately still works.
+var g_logged_out_pk: ?[32]u8 = null;
+/// How many times a lost reset is re-sent before giving up and staying signed
+/// out. Bounded because a daemon that refuses forever must not be asked forever.
+const logout_reset_retries = 5;
+var g_logout_reset_tries: u8 = 0;
+/// A lost reset waiting to be re-sent from the tick, which is where `Effects`
+/// is reachable. The health-check that notices only has the response.
+var g_logout_reset_due: bool = false;
+
 fn resolveSignetWindow(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return;
@@ -2389,13 +2412,37 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     defer parsed.deinit();
     const ready = std.mem.eql(u8, parsed.value.state, nostr.signer_ipc.state_ready);
     g_helper_state.store(if (ready) 2 else 1, .release);
-    if (!ready) return;
+    if (!ready) {
+        // The daemon says it holds nothing, which is the only real evidence the
+        // logout's reset landed. Whatever key appears next is a new one.
+        g_logged_out_pk = null;
+        g_logout_reset_tries = 0;
+        return;
+    }
 
     // The daemon holds a key and Plaza is a guest: adopt it. This is how a
     // terminal or window import (which Plaza did not initiate) signs the user
     // in live. A Plaza-initiated setup is left to handleHelperSetup, which owns
     // the name beat and the remembered intent.
     if (g_logged_out) return; // a just-logged-out session must stay out
+    // And the key that just left stays gone even after an explicit sign-in drops
+    // that latch, until the daemon has said it no longer holds it. Pressing
+    // "Create your identity" used to be enough to walk straight back into the
+    // account the reader had just signed out of.
+    if (g_logged_out_pk) |left| {
+        var still: [32]u8 = undefined;
+        if (std.fmt.hexToBytes(&still, parsed.value.pubkey)) |_| {
+            if (std.mem.eql(u8, &still, &left)) {
+                // The reset did not land. Ask again on the tick, which is where
+                // the effects live, a bounded number of times.
+                if (g_logout_reset_tries < logout_reset_retries) {
+                    g_logout_reset_tries += 1;
+                    g_logout_reset_due = true;
+                }
+                return;
+            }
+        } else |_| {}
+    }
     if (activePubkey() != null) return;
     if (g_helper_setup != .none or g_helper_pending_in_flight != .none) return;
     if (!restoreHelperIdentity(parsed.value.pubkey)) return;
@@ -3924,27 +3971,43 @@ pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
 }
 
 // The notes this session has liked, so the heart renders filled and an un-like
-// knows which reaction (kind:7) to delete. In-memory: a returning session
-// rediscovers its likes from the ingested crowd reactions (PR-7 dedupes by
-// reactor), so this is the optimistic layer, not the source of truth.
+// knows which reaction (kind:7) to delete. In-memory: this is the optimistic
+// layer, not the source of truth.
+//
+// Every entry records WHOSE like it is, and that is not decoration. The key was
+// the note id alone, which is identical under every account, and nothing ever
+// cleared the table. So a note liked as one account showed a filled red heart
+// to the next account signed in on the same machine, who had never touched it,
+// and their first press took the UN-like branch: Plaza signed a kind:5 under
+// THEIR key naming a reaction the other account authored. That is a public,
+// permanent, on-relay link between two identities the reader was keeping apart,
+// it destroys the app's only record of the first account's reaction, and their
+// intended like never publishes at all.
+//
+// An owner makes that impossible by construction rather than by remembering to
+// clear the table on every door out of an account, which is the version of this
+// fix that goes stale the first time somebody adds another door.
 const my_likes_cap = 512;
 const MyLike = struct {
     used: bool = false,
+    owner: [32]u8 = [_]u8{0} ** 32,
     note_id: i64 = 0,
     // The id of our own kind:7 reaction, e-tagged by the kind:5 that un-likes it.
     reaction_id: [32]u8 = [_]u8{0} ** 32,
 };
 var g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
 
-/// Whether this session has liked `note_id`.
+/// Whether the signed-in account has liked `note_id`.
 fn isLiked(note_id: i64) bool {
     return likeEntry(note_id) != null;
 }
 
-/// The like record for `note_id`, or null.
+/// The signed-in account's like record for `note_id`, or null. A guest has no
+/// likes, and neither does anyone else's entry.
 fn likeEntry(note_id: i64) ?*MyLike {
+    const me = activePubkey() orelse return null;
     for (&g_my_likes) |*e| {
-        if (e.used and e.note_id == note_id) return e;
+        if (e.used and e.note_id == note_id and std.mem.eql(u8, &e.owner, &me)) return e;
     }
     return null;
 }
@@ -3953,13 +4016,14 @@ fn likeEntry(note_id: i64) ?*MyLike {
 /// un-like can find the reaction. Silently drops when the table is full (the
 /// like still publishes; only the optimistic bookkeeping is skipped).
 fn rememberLike(note_id: i64, reaction_id: [32]u8) void {
+    const me = activePubkey() orelse return;
     if (likeEntry(note_id)) |e| {
         e.reaction_id = reaction_id;
         return;
     }
     for (&g_my_likes) |*e| {
         if (!e.used) {
-            e.* = .{ .used = true, .note_id = note_id, .reaction_id = reaction_id };
+            e.* = .{ .used = true, .owner = me, .note_id = note_id, .reaction_id = reaction_id };
             return;
         }
     }
@@ -3976,6 +4040,15 @@ fn forgetLike(note_id: i64) ?[32]u8 {
 }
 
 /// Clears the like table. For tests, which share the process globals.
+pub fn rememberLikeForTest(note_id: i64, reaction_id: [32]u8) void {
+    rememberLike(note_id, reaction_id);
+}
+
+pub fn likeReactionIdForTest(note_id: i64) ?[32]u8 {
+    const e = likeEntry(note_id) orelse return null;
+    return e.reaction_id;
+}
+
 pub fn resetLikesForTest() void {
     g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
 }
@@ -11497,6 +11570,12 @@ var g_contacts_answered_by = [_]bool{false} ** max_relays;
 /// clean answers can coexist with eight hundred follows sitting somewhere else.
 var g_identity_minted_here = false;
 
+/// What pressing "Create your identity" does to the sign-out latch: drops it
+/// before any new key exists. The pubkey latch is what has to hold after this.
+pub fn clearLoggedOutLatchForTest() void {
+    g_logged_out = false;
+}
+
 pub fn setIdentityMintedForTest(minted: bool) void {
     g_identity_minted_here = minted;
 }
@@ -16059,6 +16138,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         model.profile_stage = .unread;
                     }
                 }
+                // A logout's reset that never reached the daemon, re-sent. Left
+                // undone, the daemon keeps the key the reader just left and the
+                // health-check would sign them back into it.
+                if (g_logout_reset_due) {
+                    g_logout_reset_due = false;
+                    helperReset(fx);
+                }
                 // Their published relay list, taken on this thread so no ingest
                 // thread ever swaps the pool out from under the others.
                 _ = adoptRelayList();
@@ -16452,6 +16538,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .name_skip => {
             model.naming = false;
+            // Skipping is a decision not to publish this name, so the text goes
+            // with it. Kept, it came back in the sheet the next time the beat
+            // armed, on a DIFFERENT key, where Enter alone would publish it: the
+            // Done button is deliberately never disabled.
+            model.name_buffer.clear();
             replayPending(model);
         },
         .backup_now => {
@@ -19669,12 +19760,29 @@ fn loadDraft(out: []u8) []const u8 {
 /// who is signed in); a subsequent sign-in reuses them. The user is never locked
 /// in, a local key can always be copied from Settings first, and a remote
 /// signer keeps the user's key throughout.
+/// Drives the whole sign-out, so a test can assert what does NOT survive it. The
+/// list of things it clears is the interesting part, and every one of them was
+/// added after something of the previous account's turned up under the next
+/// account's key.
+pub fn performLogoutForTest(model: *Model, fx: *Effects) void {
+    performLogout(model, fx);
+}
+
+pub fn loggedOutPubkeyForTest() ?[32]u8 {
+    return g_logged_out_pk;
+}
+
 fn performLogout(model: *Model, fx: *Effects) void {
     // Forget the key in the daemon's MEMORY, not just on disk: without this the
     // health-check reads /pubkey, still sees the key, and re-adopts within a
     // tick. The latch holds until the async reset lands.
     if (g_signer_kind == .helper) helperReset(fx);
     g_logged_out = true;
+    // WHICH key left, so the health-check can refuse to hand it back even after
+    // an explicit sign-in drops the latch above.
+    g_logged_out_pk = activePubkey();
+    g_logout_reset_tries = 0;
+    g_logout_reset_due = false;
     if (g_io) |io| if (g_environ) |environ| {
         if (plazaDir(io, environ)) |dir_const| {
             var dir = dir_const;
@@ -19727,8 +19835,30 @@ fn performLogout(model: *Model, fx: *Effects) void {
     model.editing_profile = false;
     model.profile_seeded = false;
 
+    // And this key was not made here, whoever comes next. The flag is the ONE
+    // piece of evidence that authorizes building a contact list, a relay list or
+    // a profile from nothing, and it is persisted to the session file, so left
+    // set it outlived the account it was true about: mint here, log out, and an
+    // identity imported afterwards inherited permission to publish nine
+    // starter-pack names over a real eight-hundred-follow list.
+    g_identity_minted_here = false;
+
     model.login_buffer.clear();
     model.draft_buffer.clear();
+    // Every other thing the previous reader typed, for the same reason the draft
+    // is cleared: it is their private thinking, and it is one press from being
+    // published under the NEXT account's key.
+    //
+    // The reply box survived because logout performs no navigation, so the next
+    // account landed inside the previous reader's open thread with their unsent
+    // sentence still in the composer. The name field survived Skip as well as
+    // logout, so a freshly minted key could be given a permanent kind:0 carrying
+    // the previous person's typed name.
+    model.reply_buffer.clear();
+    model.name_buffer.clear();
+    model.viewing_thread = 0;
+    model.thread_stack_len = 0;
+    model.viewing_profile = null;
     // And off the disk. An unfinished note is the previous account's private
     // thinking; leaving it would hand it to whoever signs in next, in their
     // composer, one keystroke from being published under THEIR key.
