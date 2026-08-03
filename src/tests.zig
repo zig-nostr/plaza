@@ -3796,6 +3796,101 @@ test "their published relay list becomes the pool, once, and never over an edit"
     try testing.expectEqual(main.bootstrap_relay_count_for_test, main.relayCount());
 }
 
+test "a newer relay list from another client is adopted, not refused" {
+    // Ownership alone used to decide this, so the FIRST kind:10002 this app ever
+    // adopted froze the pool for good: `saveRelays` recorded the owner and
+    // nothing else, so every launch read the pool back as theirs and dropped
+    // their real list before its stamp was ever looked at. Add a relay in Damus,
+    // and the next badge press here republished Plaza's frozen copy at a stamp
+    // built to win. Their own newer list lost to their own older one, silently.
+    main.setIdentityForTest([_]u8{0x21} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetRelaysForTest();
+
+    const first = [_]nostr.event.Tag{&.{ "r", "wss://first.example.com" }};
+    var ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0x21} ** 32,
+        .created_at = 1_000,
+        .kind = 10002,
+        .tags = &first,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://first.example.com", main.relayUrlAt(0));
+    try testing.expectEqual(@as(i64, 1_000), main.relayListStampForTest());
+
+    // The same list again, and an OLDER one: both refused, which is the property
+    // the ownership check was there for.
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(!main.adoptRelayListForTest());
+    ev.created_at = 900;
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(!main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://first.example.com", main.relayUrlAt(0));
+
+    // THE PROPERTY: a list they signed later, somewhere else, wins.
+    const second = [_]nostr.event.Tag{&.{ "r", "wss://added-in-another-client.example.com" }};
+    ev.tags = &second;
+    ev.created_at = 2_000;
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://added-in-another-client.example.com", main.relayUrlAt(0));
+    try testing.expectEqual(@as(i64, 2_000), main.relayListStampForTest());
+}
+
+test "how new the saved pool is survives a restart" {
+    // The refusal above is only worth anything if it holds across launches: the
+    // file recorded WHOSE list it was and never WHEN, so every launch started
+    // with a stamp of zero and the pool was frozen by whichever event landed
+    // first. This drives the file's text rather than the disk, because the io is
+    // not reachable from a test and the format is the part that can rot.
+    main.setIdentityForTest([_]u8{0x22} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetRelaysForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://saved.example.com", "read" }};
+    const ev = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0x22} ** 32,
+        .created_at = 1_700_000_000,
+        .kind = 10002,
+        .tags = &tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    main.stageOwnRelayListForTest(ev);
+    try testing.expect(main.adoptRelayListForTest());
+
+    var buf: [2048]u8 = undefined;
+    const text = main.formatRelaysFileForTest(&buf).?;
+    try testing.expect(std.mem.indexOf(u8, text, "stamp 1700000000") != null);
+
+    // The relaunch: an empty pool, then the file read back.
+    const saved = try testing.allocator.dupe(u8, text);
+    defer testing.allocator.free(saved);
+    main.clearRelaysForTest();
+    try testing.expectEqual(@as(i64, 0), main.relayListStampForTest());
+    main.applyRelaysFileForTest(saved);
+    try testing.expectEqual(@as(i64, 1_700_000_000), main.relayListStampForTest());
+    try testing.expectEqualStrings("wss://saved.example.com", main.relayUrlAt(0));
+
+    // And the pool it read back refuses what it should and takes what it should.
+    var older = ev;
+    older.created_at = 1_600_000_000;
+    main.stageOwnRelayListForTest(older);
+    try testing.expect(!main.adoptRelayListForTest());
+    var newer = ev;
+    newer.created_at = 1_800_000_000;
+    const newer_tags = [_]nostr.event.Tag{&.{ "r", "wss://changed-elsewhere.example.com" }};
+    newer.tags = &newer_tags;
+    main.stageOwnRelayListForTest(newer);
+    try testing.expect(main.adoptRelayListForTest());
+    try testing.expectEqualStrings("wss://changed-elsewhere.example.com", main.relayUrlAt(0));
+}
+
 test "a follow's relay list is a suggestion, and only where they write" {
     const tags = [_]nostr.event.Tag{
         &.{ "r", "wss://writes.example.com", "write" },

@@ -228,6 +228,42 @@ fn claimRelayList() void {
     g_relays_are_mine = g_relay_owner != null;
 }
 
+/// WHEN the list in the pool was signed, and it is the half that was missing.
+///
+/// Ownership alone decided whether an incoming kind:10002 was refused, so the
+/// FIRST list this app ever adopted for an account froze the pool permanently,
+/// across restarts, because `saveRelays` recorded the owner and nothing else. A
+/// relay added in another client streamed in on every launch and was dropped
+/// before its stamp was ever looked at, and the next badge press here
+/// republished the frozen copy at a stamp built to win. The reader's own newer
+/// list lost to their older one, silently, forever.
+///
+/// A stamp makes the rule the same one `ingestContactList` uses for kind:3:
+/// refuse what is not newer, rather than refuse everything.
+var g_relay_list_stamp: i64 = 0;
+
+fn heldRelayListStamp() i64 {
+    return g_relay_list_stamp;
+}
+
+/// Records the stamp of the list now in the pool. On adopt it is the event's; on
+/// a publish from here it is what this app signed.
+fn setRelayListStamp(created_at: i64) void {
+    g_relay_list_stamp = created_at;
+}
+
+/// Whether an incoming kind:10002 for this account is allowed to replace the
+/// pool. Owned and not newer is the only refusal.
+fn relayListRefusesEvent(created_at: i64) bool {
+    if (!relayListIsOwned()) return false;
+    // An edit that has not gone out yet, and still can, beats their history: it
+    // publishes within a tick or two and would out-stamp this anyway. An edit
+    // this account is not allowed to publish has no future, so the list the
+    // relays actually hold wins instead of being locked out by it.
+    if (g_relay_list_dirty and canWriteRelayList()) return true;
+    return created_at <= heldRelayListStamp();
+}
+
 /// A reader's own kind:10002, parsed and waiting for the UI thread to take it.
 /// An ingest thread must not swap the pool out from under the threads reading
 /// it (nor write the file), so it stages the list here and `adoptRelayList`
@@ -247,10 +283,12 @@ var g_staged_created_at: i64 = 0;
 /// Only ever staged when the pool is still the one the app was born with, so a
 /// stale event from a relay cannot undo an edit made here.
 fn applyOwnRelayList(ev: nostr.event.Event) void {
-    // Only THIS account's own edits get to refuse this. A pool inherited from a
-    // previous account, or the one the app was born with, must give way to the
-    // list the reader actually published.
-    if (relayListIsOwned()) return;
+    // Only THIS account's own edits get to refuse this, and only when what they
+    // hold is at least as new. A pool inherited from a previous account, or the
+    // one the app was born with, must give way to the list the reader actually
+    // published, and so must a copy of their list that they have since changed
+    // somewhere else.
+    if (relayListRefusesEvent(ev.created_at)) return;
     // A newer list replaces one already staged; an older one is ignored. Equal
     // stamps keep what is staged, so a relay echoing the same event changes
     // nothing.
@@ -300,9 +338,13 @@ fn applyOwnRelayList(ev: nostr.event.Event) void {
 fn adoptRelayList() bool {
     if (!g_staged_ready.load(.acquire)) return false;
     g_staged_ready.store(false, .monotonic);
+    lockRelayTable();
+    const staged_at = g_staged_created_at;
+    unlockRelayTable();
     // An edit made while the event was in flight wins: their hands beat their
-    // history.
-    if (relayListIsOwned()) return false;
+    // history. Re-checked here because the pool may have been claimed between
+    // the staging and this frame.
+    if (relayListRefusesEvent(staged_at)) return false;
     var before: [max_relays][96]u8 = undefined;
     var lens: [max_relays]u8 = undefined;
     snapshotRelayUrls(&before, &lens);
@@ -319,6 +361,13 @@ fn adoptRelayList() bool {
     }
     if (n > g_relay_count.load(.monotonic)) g_relay_count.store(n, .release);
     claimRelayList();
+    setRelayListStamp(staged_at);
+    // A pending edit is discarded rather than published on top: this list is
+    // newer than anything that edit could have been based on, and republishing
+    // the pool now would out-stamp the change the reader made elsewhere. The
+    // refusal above is what keeps an edit that CAN still go out from reaching
+    // here at all.
+    clearRelayListPublish();
     // The list that just arrived IS this account's list, so nothing recorded
     // against the pool it replaced is about anything any more.
     forgetRelayRemovals();
@@ -573,6 +622,12 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // for the same reason a contact list's legacy relay map does.
     const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
     signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false);
+    // What the pool now represents. Without this the app's own event would come
+    // back from a relay and be adopted over the pool that produced it, and worse,
+    // a list the reader signed BEFORE this one would still be newer than the
+    // nothing the pool used to record.
+    setRelayListStamp(created);
+    saveRelays();
     return true;
 }
 
@@ -763,14 +818,27 @@ fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
         return;
     };
     defer dir.close(io);
-    var buf: [max_relays * 128 + 80]u8 = undefined;
+    var buf: [relays_file_cap]u8 = undefined;
     const raw = dir.readFile(io, relays_file, &buf) catch {
         seedBootstrapRelays();
         return;
     };
+    applyRelaysFile(raw);
+}
+
+/// The most the file can be. Worst case is the owner line, the stamp line, and
+/// every slot at its longest URL with a marker.
+const relays_file_cap = max_relays * 128 + 96;
+
+/// Reads the file's TEXT into the pool. Split from the io so the format has a
+/// test: the stamp line is what stops this account's own newer list from being
+/// refused across a restart, and a format nothing round-trips is a format that
+/// silently stops carrying it.
+fn applyRelaysFile(raw: []const u8) void {
     var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
     var added: usize = 0;
     var owner: ?[32]u8 = null;
+    var stamp: i64 = 0;
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
@@ -785,6 +853,15 @@ fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
             if (hex.len == 64) {
                 if (std.fmt.hexToBytes(&pk, hex)) |_| owner = pk else |_| {}
             }
+            continue;
+        }
+        // `stamp <created_at>`: when the list in this file was signed. A file
+        // written before this line existed has none, which reads as 0, which
+        // means the first kind:10002 to arrive wins. That is the right way to
+        // be wrong: the alternative is a pool nothing can ever correct.
+        if (std.mem.eql(u8, first, "stamp")) {
+            const digits = parts.next() orelse continue;
+            stamp = std.fmt.parseInt(i64, digits, 10) catch continue;
             continue;
         }
         if (!isRelayUrl(first)) continue;
@@ -805,6 +882,7 @@ fn loadRelays(io: std.Io, environ: *const std.process.Environ.Map) void {
     // published over a real NIP-65 list.
     g_relay_owner = owner;
     g_relays_are_mine = owner != null;
+    setRelayListStamp(stamp);
 }
 
 /// Writes the list back in the same plain form.
@@ -813,21 +891,33 @@ fn saveRelays() void {
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-    var buf: [max_relays * 128 + 80]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    var buf: [relays_file_cap]u8 = undefined;
+    const text = formatRelaysFile(&buf) orelse return;
+    dir.writeFile(io, .{ .sub_path = relays_file, .data = text, .flags = .{} }) catch {};
+}
+
+/// The file's TEXT, from the pool. Split from the io for the same reason
+/// `applyRelaysFile` is.
+fn formatRelaysFile(buf: []u8) ?[]const u8 {
+    var w = std.Io.Writer.fixed(buf);
     // Whose list this is, first. Without it a file written while signed out (the
     // bootstrap pool) reads back as the next account's own list.
     if (g_relay_owner) |owner| {
         var hex: [64]u8 = undefined;
         hexLower(&hex, owner);
-        w.print("owner {s}\n", .{hex[0..]}) catch return;
+        w.print("owner {s}\n", .{hex[0..]}) catch return null;
+    }
+    // And WHEN it was signed, so a launch can tell this account's own newer list
+    // from an older one a slow relay is still replaying.
+    if (g_relay_list_stamp != 0) {
+        w.print("stamp {d}\n", .{g_relay_list_stamp}) catch return null;
     }
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
         const marker: []const u8 = if (e.read and e.write) "" else if (e.read) " read" else " write";
-        w.print("{s}{s}\n", .{ e.url(), marker }) catch return;
+        w.print("{s}{s}\n", .{ e.url(), marker }) catch return null;
     }
-    dir.writeFile(io, .{ .sub_path = relays_file, .data = w.buffered(), .flags = .{} }) catch {};
+    return w.buffered();
 }
 
 /// Whether a string is a relay address this app will dial. Deliberately narrow:
@@ -944,6 +1034,10 @@ fn resetRelaysToBootstrap() void {
     g_relay_count.store(0, .release);
     g_relays_are_mine = false;
     g_relay_owner = null;
+    // The stamp goes with the owner. Left behind, the bootstrap pool the next
+    // account inherits would claim to be as new as the list the previous one
+    // published, and refuse theirs.
+    setRelayListStamp(0);
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     g_relay_list_dirty = false;
@@ -970,9 +1064,46 @@ pub fn resetRelaysForTest() void {
     g_relays = [_]RelayEntry{.{}} ** max_relays;
     g_relay_count.store(0, .release);
     g_relays_are_mine = false;
+    setRelayListStamp(0);
+    g_relay_list_dirty = false;
+    forgetRelayRemovals();
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     seedBootstrapRelays();
+}
+
+/// The file this pool would be saved as, and reading one back. The stamp line
+/// is what carries "how new is what we hold" across a restart.
+pub fn formatRelaysFileForTest(buf: []u8) ?[]const u8 {
+    return formatRelaysFile(buf);
+}
+
+pub fn applyRelaysFileForTest(raw: []const u8) void {
+    applyRelaysFile(raw);
+}
+
+/// An EMPTY pool, the way a launch starts before the file is read. Distinct from
+/// `resetRelaysForTest`, which seeds the bootstrap list: a test that means to
+/// reproduce a restart must not have four relays already sitting in the seats
+/// the file is about to fill.
+pub fn clearRelaysForTest() void {
+    g_relays = [_]RelayEntry{.{}} ** max_relays;
+    g_relay_count.store(0, .release);
+    g_relays_are_mine = false;
+    g_relay_owner = null;
+    setRelayListStamp(0);
+    g_relay_list_dirty = false;
+    forgetRelayRemovals();
+    g_staged_ready.store(false, .release);
+    g_suggested_count.store(0, .release);
+}
+
+pub fn relayListStampForTest() i64 {
+    return heldRelayListStamp();
+}
+
+pub fn setRelayListStampForTest(created_at: i64) void {
+    setRelayListStamp(created_at);
 }
 
 /// Applies a staged kind:10002 the way the frame loop does.
