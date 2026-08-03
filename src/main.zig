@@ -2806,7 +2806,21 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
 // the store as it grows and fetched from the pool when absent, mirroring the
 // profile cache. The render side reads it to draw an embedded quote card.
 const quote_cache_cap = 64;
-const max_quote_attempts = 3;
+/// After this many tries with no answer, a quote stops being asked for EVERY
+/// round and starts backing off. It never stops being asked for.
+///
+/// It used to stop for good. Three unanswered tries and the entry was marked
+/// missing, and nothing re-armed it: not a later round, not a reconnect, not the
+/// reader opening the thread again. Three tries is nothing, and they can all
+/// land while the pool is still dialling, so a note sitting on the reader's own
+/// relays could be written off in the first seconds of the session and read
+/// "not on your relays yet" for the rest of it. That is what happened to the
+/// ancestor above a thread that every other client showed.
+const quote_backoff_after = 3;
+/// The longest a quote waits between tries, in profile-timer rounds (2s each),
+/// so a note nobody has is asked for about once a minute rather than never or
+/// constantly.
+const quote_backoff_max_rounds: u32 = 30;
 const quote_fetch_batch = 16;
 /// Enough of a quoted note to fill the four lines 11f gives it (about 75
 /// characters a line at the quote's register), so the clamp decides where the
@@ -2821,6 +2835,8 @@ const QuoteEntry = struct {
     id: [32]u8 = [_]u8{0} ** 32,
     state: QuoteState = .idle,
     attempts: u8 = 0,
+    /// The round this entry may be asked for again. Zero means "now".
+    next_round: u64 = 0,
     requested: bool = false,
     pubkey: [32]u8 = [_]u8{0} ** 32,
     created_at: i64 = 0,
@@ -2850,6 +2866,11 @@ const QuoteEntry = struct {
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
 var g_quote_clock: u64 = 0;
+/// Ticks once per profile-timer round (2s). The backoff is counted in these.
+var g_quote_round: u64 = 0;
+/// The pool as the last tick saw it, so a change in it can be noticed.
+var g_last_live_relays: usize = std.math.maxInt(usize);
+var g_last_relay_count: usize = std.math.maxInt(usize);
 
 /// A link preview: what a page says about itself, for the card 11o draws under a
 /// note that links out. Small and fixed, like every other cache here.
@@ -3337,7 +3358,10 @@ fn refreshQuotes(store: *nostr.store.Store) void {
     for (&g_quotes) |*q| {
         if (!q.used or q.state == .loaded or q.state == .missing) continue;
         var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
-            if (q.attempts >= max_quote_attempts) q.state = .missing;
+            // `.missing` is what the ROW says, not a decision to stop looking:
+            // the card reads "not on your relays yet", which is true, and the
+            // backoff keeps asking in case it stops being true.
+            if (q.attempts >= quote_backoff_after) q.state = .missing;
             continue;
         };
         defer se.deinit();
@@ -3383,7 +3407,29 @@ fn refreshQuotes(store: *nostr.store.Store) void {
 /// Lets the still-unresolved quotes be asked for again on the next round.
 fn rearmWantedQuotes() void {
     for (&g_quotes) |*q| {
-        if (q.used and q.state != .loaded and q.state != .missing and q.attempts < max_quote_attempts) q.requested = false;
+        if (q.used and q.state != .loaded) q.requested = false;
+    }
+}
+
+/// How long a quote waits before the next try: every round until it has been
+/// asked `quote_backoff_after` times, then doubling to a ceiling.
+fn quoteBackoffRounds(attempts: u8) u64 {
+    if (attempts < quote_backoff_after) return 1;
+    const over = attempts - quote_backoff_after;
+    const shift: u6 = @intCast(@min(over, 5));
+    return @min(@as(u64, 1) << shift, quote_backoff_max_rounds);
+}
+
+/// Every unresolved quote may be asked for again, now.
+///
+/// The pool changed, so the answer may have too: a relay the reader just added,
+/// or one that just finished dialling, can hold exactly the note that was
+/// written off while nothing was connected.
+fn requeueMissingQuotes() void {
+    for (&g_quotes) |*q| {
+        if (!q.used or q.state == .loaded) continue;
+        q.next_round = 0;
+        q.requested = false;
     }
 }
 
@@ -3393,13 +3439,17 @@ fn requestWantedQuotes() void {
     var batch: [quote_fetch_batch][32]u8 = undefined;
     var n: usize = 0;
     for (&g_quotes) |*q| {
-        if (!q.used or q.state == .loaded or q.state == .missing) continue;
-        if (q.requested or q.attempts >= max_quote_attempts) continue;
+        if (!q.used or q.state == .loaded) continue;
+        if (q.requested or q.next_round > g_quote_round) continue;
         batch[n] = q.id;
         n += 1;
         q.requested = true;
-        q.attempts += 1;
-        q.state = .fetching;
+        if (q.attempts < std.math.maxInt(u8)) q.attempts += 1;
+        q.next_round = g_quote_round + quoteBackoffRounds(q.attempts);
+        // `.fetching` only while it has never been found: an entry already
+        // reported missing keeps saying so on the card while the retry is out,
+        // rather than flickering back to a skeleton every time it is retried.
+        if (q.state != .missing) q.state = .fetching;
         if (n == batch.len) break;
     }
     if (n == 0) return;
@@ -5816,6 +5866,17 @@ pub const Model = struct {
         // Sampled together, so a frame never mixes a fresh numerator with a
         // stale denominator and reads "4/3 relays".
         self.relay_count = relayCount();
+
+        // A relay came up, or the pool changed size: whatever could not be found
+        // a moment ago may be findable now, so everything still unresolved goes
+        // back in the queue immediately rather than waiting out its backoff. This
+        // is the case that produced the report: three tries spent while nothing
+        // was connected wrote a note off, and nothing ever asked again.
+        if (live != g_last_live_relays or self.relay_count != g_last_relay_count) {
+            g_last_live_relays = live;
+            g_last_relay_count = self.relay_count;
+            requeueMissingQuotes();
+        }
 
         const store = g_store orelse return;
 
@@ -14759,6 +14820,26 @@ pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
     refreshQuotes(store);
 }
 
+pub fn requeueMissingQuotesForTest() void {
+    requeueMissingQuotes();
+}
+
+pub fn requestWantedQuotesForTest() void {
+    requestWantedQuotes();
+}
+
+pub fn advanceQuoteRoundForTest(rounds: u64) void {
+    g_quote_round +%= rounds;
+}
+
+pub fn rearmWantedQuotesForTest() void {
+    rearmWantedQuotes();
+}
+
+pub fn quoteBackoffRoundsForTest(attempts: u8) u64 {
+    return quoteBackoffRounds(attempts);
+}
+
 pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
     return quoteFor(id);
 }
@@ -15608,6 +15689,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Re-arm the still-unnamed every so often: a relay that had
                 // nothing a moment ago may have it now.
                 g_profile_round +%= 1;
+                g_quote_round +%= 1;
                 if (g_profile_round % profile_rearm_rounds == 0) {
                     rearmWantedProfiles();
                     rearmWantedQuotes();
