@@ -694,6 +694,16 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
     if (result == .replaced) {
         if (previous) |prev| keepReplaced(gpa, store, ev.kind, prev.json);
     }
+    // A contact list this app was holding as the base for the next follow is
+    // released the moment one at least as new reaches the store. This is the one
+    // door every ingest goes through: `ingestContactList` only sees a relay
+    // ECHO, so a locally signed list would otherwise be held until the reader
+    // signed out.
+    if (ev.kind == contact_list_kind and result != .invalid) {
+        if (activePubkey()) |pk| {
+            if (std.mem.eql(u8, &pk, &ev.pubkey)) releasePendingFollowBase(ev.created_at);
+        }
+    }
     return result;
 }
 
@@ -11461,6 +11471,9 @@ fn forgetFollows() void {
     g_follow_count = 0;
     g_follow_created_at = 0;
     unlockFollows();
+    // A list signed but not yet seen belongs to the account that signed it. Left
+    // behind, it would be the base the NEXT account's first follow builds on.
+    clearPendingFollowBase();
     // The open subscriptions were built for the previous identity and are now
     // asking the wrong question. Without this a sign-in never gets its own
     // records requested on an already-open socket, and following stays disabled
@@ -11614,7 +11627,13 @@ pub fn haveOwnContactListForTest() bool {
 /// not model, and the content blob, which on older clients is a relay map and on
 /// none of them is ours to discard.
 fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
-    if (!canWriteFollows()) return false;
+    // No `canWriteFollows()` here on purpose, though it is the same question.
+    // It runs its own store query, and this function then ran a SECOND one for
+    // the list itself: a transient failure between the two answered "yes they
+    // have a list" and then "here is nothing", and nothing is the branch that
+    // publishes nine names over eight hundred. The gate below is decided from
+    // the one read this function actually uses. `canWriteFollows` stays as what
+    // the button asks, where being approximate costs nothing.
     const me = activePubkey() orelse return false;
     // Following yourself is not a thing, and an app that lets you is confusing
     // about whose feed it is.
@@ -11624,6 +11643,30 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     var previous: ?OwnProfile = null;
     if (ownRecordJson(gpa, contact_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
+    // A list this app signed moments ago and has not seen come back is newer
+    // than anything in the store, so it is the base. Without this, two presses
+    // inside one bunker round trip both build on the pre-press list and the
+    // second undoes the first, on every relay, with both saying "Following".
+    var base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    var base_content: []const u8 = if (previous) |prev| prev.json else "";
+    var have_base = previous != null;
+    var base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+    if (g_pending_follow_tags) |pending| {
+        if (g_pending_follow_created_at > base_created_at) {
+            base_tags = pending;
+            base_content = g_pending_follow_content orelse "";
+            base_created_at = g_pending_follow_created_at;
+            have_base = true;
+        }
+    }
+
+    // THE GATE, decided from the read above rather than from a second one.
+    // `canWriteFollows` runs its own store query, so a transient failure between
+    // the two turned "they have a list, splice onto it" into "they have none,
+    // publish the nine names this app chose" over a real list. A key minted here
+    // is the only case where having nothing is a fact rather than a read error.
+    if (!have_base and !g_identity_minted_here) return false;
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     // Freed on every path that does not hand it to the write seam. Two of those
@@ -11641,8 +11684,8 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     var hex: [64]u8 = undefined;
     hexLower(&hex, pubkey);
 
-    if (previous) |prev| {
-        for (prev.tags) |tag| {
+    if (have_base) {
+        for (base_tags) |tag| {
             if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and hexEqlIgnoreCase(tag[1], &hex)) {
                 found = true;
                 // Unfollowing drops the tag; following keeps the one already
@@ -11654,13 +11697,15 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
             tags.append(gpa, copy) catch return false;
         }
     } else {
-        // No list of their own, and EVERY readable relay has said so. The pack
-        // they have been reading becomes the list they publish, so the feed they
-        // know travels with them to every other client.
+        // No list of their own, and this app minted the key, so there provably
+        // is none anywhere. The pack they have been reading becomes the list
+        // they publish, so the feed they know travels with them to every other
+        // client.
         //
-        // This branch is the dangerous one, and `canWriteFollows` is what makes
-        // it safe: reaching here on a guess would replace a real contact list
-        // with nine accounts this app chose.
+        // This branch is the dangerous one, and the gate above is what makes it
+        // safe: reaching here on a guess, or on a store read that merely
+        // failed, would replace a real contact list with nine accounts this app
+        // chose.
         for (followSet()) |f| {
             if (std.mem.eql(u8, &f, &pubkey)) found = true;
             if (!following and std.mem.eql(u8, &f, &pubkey)) continue;
@@ -11689,16 +11734,22 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     // a stale base, or a rebase onto somebody else's truncation. It refuses
     // rather than publishing, because the alternative is losing follows to a
     // mistake this app made.
-    if (previous) |prev| {
-        if (!shrinkAllowed(countPeople(prev.tags), countPeople(tags.items), following)) return false;
+    // Measured against the base the write actually used, which for a signer that
+    // has not answered yet is the list this app signed rather than the older one
+    // still in the store.
+    if (have_base) {
+        if (!shrinkAllowed(countPeople(base_tags), countPeople(tags.items), following)) return false;
     }
 
     const owned_tags = tags.toOwnedSlice(gpa) catch return false;
     handed_off = true;
     // The content is carried forward verbatim. On older clients it is a relay
     // map, and emptying it would delete a record this app does not even read.
-    const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
-    const created = @max(nowSeconds(), ownRecordCreatedAt(contact_list_kind) + 1);
+    const content = gpa.dupe(u8, base_content) catch return false;
+    // Past the base too, not just past the store: a second press inside one
+    // signer round trip would otherwise stamp equal to the first, and NIP-01
+    // breaks that tie on the id, which is a coin flip over the reader's follows.
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(contact_list_kind) + 1), base_created_at + 1);
 
     // The live list moves first, so the feed reflects the press immediately.
     // Tracked in full, not capped: membership has to be right for every name or
@@ -11707,6 +11758,9 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     const n = followsFromTags(owned_tags, &next);
     _ = setFollows(next[0..n], created);
 
+    // Remembered as the base for the next press BEFORE the write seam is handed
+    // the originals, since it owns them from here and the remote path frees them.
+    setPendingFollowBase(owned_tags, content, created);
     signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false);
     return true;
 }
@@ -11732,6 +11786,82 @@ fn countPeople(tags: []const nostr.event.Tag) usize {
         n += 1;
     }
     return n;
+}
+
+// The contact list this app has SIGNED but has not seen come back yet.
+//
+// `writeFollow` takes its base from the store, and for a bunker or a Signet key
+// the store is not written until the signer answers: one to five seconds, longer
+// with an approval prompt in front of a human. Two follow presses inside that
+// window both read the SAME pre-press list, so the second one publishes a list
+// that does not contain the first, at an equal or newer stamp, and the first
+// follow is undone on every relay. The reader saw both say "Following".
+//
+// So a signed list becomes the base for the next write until the real one
+// arrives. It is a full copy of the tags, not the follow set: the follow set is
+// pubkeys, and rebasing on it would drop every petname, relay hint and tag type
+// this app does not model, which is the loss the splice exists to prevent.
+var g_pending_follow_tags: ?[]const nostr.event.Tag = null;
+var g_pending_follow_content: ?[]u8 = null;
+var g_pending_follow_created_at: i64 = 0;
+
+/// Frees the pending base. THE one place that does, so its lifetime is a rule
+/// rather than a habit.
+fn clearPendingFollowBase() void {
+    const gpa = std.heap.page_allocator;
+    if (g_pending_follow_tags) |tags| {
+        for (tags) |t| {
+            for (t) |field| gpa.free(field);
+            gpa.free(t);
+        }
+        gpa.free(tags);
+    }
+    if (g_pending_follow_content) |c| gpa.free(c);
+    g_pending_follow_tags = null;
+    g_pending_follow_content = null;
+    g_pending_follow_created_at = 0;
+}
+
+/// Remembers what was just signed, as the base the next press builds on. Takes
+/// its own copy: the write seam owns what it was handed and frees it.
+fn setPendingFollowBase(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
+    const gpa = std.heap.page_allocator;
+    clearPendingFollowBase();
+    const tag_copy = dupeTags(gpa, tags);
+    // `dupeTags` degrades to an empty set rather than failing, and an empty base
+    // is worse than no base: it would publish a list with nobody in it.
+    if (tag_copy.len == 0 and tags.len != 0) return;
+    g_pending_follow_tags = tag_copy;
+    g_pending_follow_content = gpa.dupe(u8, content) catch {
+        clearPendingFollowBase();
+        return;
+    };
+    g_pending_follow_created_at = created_at;
+}
+
+/// Drops the pending base once the store holds something at least as new, which
+/// is the signer's answer having come back and been ingested.
+fn releasePendingFollowBase(stored_at: i64) void {
+    if (g_pending_follow_tags == null) return;
+    if (stored_at < g_pending_follow_created_at) return;
+    clearPendingFollowBase();
+}
+
+/// Puts the app in the state a bunker or a Signet key leaves it in: a contact
+/// list signed, handed to the signer, and not yet in the store. That gap cannot
+/// be driven from a test, because the async paths need a live `Effects`, so the
+/// state they produce is set up directly and the write is then driven for real.
+pub fn setPendingFollowBaseForTest(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
+    setPendingFollowBase(tags, content, created_at);
+}
+
+pub fn clearPendingFollowBaseForTest() void {
+    clearPendingFollowBase();
+}
+
+pub fn pendingFollowCountForTest() ?usize {
+    const tags = g_pending_follow_tags orelse return null;
+    return countPeople(tags);
 }
 
 /// Whether a write may shrink the list this much.
@@ -11777,6 +11907,9 @@ fn ingestContactList(ev: nostr.event.Event) void {
     const owned = followsAreOwned();
     const held_at = g_follow_created_at;
     unlockFollows();
+    // The signer answered and the list came back: the copy this app was holding
+    // as a base has been superseded by the real one.
+    releasePendingFollowBase(ev.created_at);
     // Their hands beat their history, and history beats older history.
     if (owned and ev.created_at <= held_at) return;
     var list: [max_follows_tracked][32]u8 = undefined;
