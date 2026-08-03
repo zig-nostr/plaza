@@ -5917,6 +5917,95 @@ test "a write that would drop more names than the press implies is refused" {
     try testing.expect(!main.shrinkAllowedForTest(2000, 10, true));
 }
 
+test "a second follow before the signer answers does not undo the first" {
+    // `writeFollow` takes its base from the store, and a bunker or a Signet key
+    // does not write the store until the signer answers: one to five seconds,
+    // longer with an approval prompt in front of a human. Two presses inside
+    // that window both read the SAME pre-press list, so the second published a
+    // list without the first in it, at a newer stamp, and the first follow was
+    // undone on every relay while both said "Following".
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3c} ** 32);
+    main.setIdentityForTest([_]u8{0x3c} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.clearPendingFollowBaseForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/twofollows.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Their real list, with a petname on it so the splice has something to lose.
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32, "wss://their-relay.example.com", "an old friend" },
+    };
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+
+    // The first press, as a remote signer leaves it: the list is SIGNED, and the
+    // store still holds the pre-press one because the signer has not answered.
+    // A local key writes the store inside the press, which is why that path
+    // never had this bug and why the gap is set up rather than waited for.
+    const signed_first = [_]nostr.event.Tag{
+        &.{ "p", "11" ** 32, "wss://their-relay.example.com", "an old friend" },
+        &.{ "p", "a1" ** 32 },
+    };
+    main.setPendingFollowBaseForTest(&signed_first, "", 1_800_000_100);
+
+    // The second press, driven for real.
+    var bob: [32]u8 = undefined;
+    @memset(&bob, 0xb2);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.writeFollowForTest(&fx, bob, true));
+
+    // THE PROPERTY: the published list has BOTH, plus the friend it started
+    // with, petname and relay hint intact. Reading the STORE, because the local
+    // signer this test uses does write it, so this is what actually went out.
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 3).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "a1" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "b2" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "an old friend") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "wss://their-relay.example.com") != null);
+}
+
+test "a contact list that cannot be read is not a contact list of nine" {
+    // `canWriteFollows` asks the store whether this account has a kind:3, and
+    // `writeFollow` then asked it AGAIN for the list itself. A transient failure
+    // between the two reads turned "they have a list, splice onto it" into "they
+    // have none, publish the nine names this app chose" over a real one. The
+    // decision comes from the single read now, so nothing can disagree with it.
+    main.setIdentityForTest([_]u8{0x3d} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.clearPendingFollowBaseForTest();
+    // No store at all is the strongest form of "the read did not work".
+    main.setStoreForTest(null);
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+
+    var alice: [32]u8 = undefined;
+    @memset(&alice, 0xa1);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(!main.writeFollowForTest(&fx, alice, true));
+    try testing.expect(main.pendingFollowCountForTest() == null);
+
+    // A key minted in this app has provably never had a list, which is the one
+    // case where reading nothing IS the answer.
+    main.setIdentityMintedForTest(true);
+    try testing.expect(main.writeFollowForTest(&fx, alice, true));
+}
+
 test "the follow splice matches on the p tag, not on any tag carrying that value" {
     // Amethyst's unfollow filters on tag[1] == pubkey without checking tag[0],
     // so it silently deletes an unrelated tag that happens to carry the same
