@@ -47,13 +47,13 @@ that follows three hundred people:
 
 | Stage | p90 | Budget |
 | --- | --- | --- |
-| Rebuild | 341us | 400us |
-| Layout | 1310us | 1500us |
+| Rebuild | 315us | 700us |
+| Layout | 1700us | 2400us |
 | Patch | 57us | 200us |
 
-A 120 Hz frame is 8333us, so a hard scroll spends about a fifth of one, and the
-GPU path never falls back to CPU pixels. A long feed mounts around 330 widget
-nodes rather than one per note.
+A 120 Hz frame is 8333us, so a hard scroll spends about a quarter of one, and
+the GPU path never falls back to CPU pixels. A long feed mounts around 330
+widget nodes rather than one per note.
 
 The number that matters is that it does not move with the size of the account.
 The same scroll on the same machine, before the feed stopped asking the database

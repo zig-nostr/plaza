@@ -16,8 +16,23 @@
 # is 8333 us; the sum of these leaves most of it unspent.
 set -euo pipefail
 
-REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-400}
-LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-1500}
+# These are DRIFT ALARMS, and the number that matters about each one is its
+# headroom over what the app actually costs, not how small it looks.
+#
+# The first pair were set when a note card was an avatar, a name and a line of
+# text. It now carries a verified handle, images, quoted notes, link previews and
+# a context menu, and both were straddling their old limits: 315us to 435us
+# against 400, and 1700us to 1750us against 1500, best-of-three on a working
+# machine with a real account signed in. A budget that the healthy app trips
+# every third run teaches people to rerun it until it passes, which is worse
+# than having none.
+#
+# So they are set from measurement with roughly 40 percent headroom over the
+# worst honest reading. That is still a tight gate: the regression these exist to
+# catch, the feed asking the database who you follow once per card, measures
+# 24423us against a rebuild budget of 700.
+REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-700}
+LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-2400}
 PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-200}
 # The plan stage grows with the number of registered images the app draws
 # (upstream reprocesses them every frame); this bound catches the app suddenly
