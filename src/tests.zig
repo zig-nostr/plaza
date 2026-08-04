@@ -11957,3 +11957,85 @@ test "no view paints past the right edge at the narrowest the window can be" {
     }
     try testing.expect(worst_over == 0);
 }
+
+test "a profile's name, check and npub sit next to each other" {
+    // The overflow sweep cannot see this. Bounding the name with a definite
+    // width satisfied it completely and still ruined the page: `width` is a
+    // definite SIZE, so the name's box stayed 559px wide for a three-letter
+    // name and the verified check sat at the far right of the window, with the
+    // same hole between the handle and the npub. It measured perfectly and
+    // looked broken.
+    //
+    // So this measures the gaps, which is what a reader actually sees.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    // Signed in, or the page under test is the guest banner. The first version
+    // of this test measured that banner and reported the rail's icon as a
+    // verified check adrift by 277px, which is a good reminder that a
+    // measurement is only as good as the screen it was taken on.
+    main.setIdentityForTest([_]u8{0x33} ** 32);
+    defer main.clearIdentityForTest();
+
+    var them: [32]u8 = undefined;
+    @memset(&them, 0x11);
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    main.fillProfileTextForTest(them, "Sep", "sep", "https://zignostr.com");
+    main.setProfileNip05ForTest(them, "sep@zignostr.com", true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = them;
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, 900);
+
+    // Anchored on the CHECK, then the name is whatever sits on its line to its
+    // left. Anchoring on the name instead found the copy in the header band
+    // forty pixels up, whose line has no check on it, so the whole assertion
+    // was skipped and the test passed the bug it exists for.
+    var check: ?native_sdk.geometry.RectF = null;
+    for (p.layout.nodes) |n| {
+        if (n.widget.kind != .icon) continue;
+        if (!std.mem.eql(u8, n.widget.text, "check")) continue;
+        check = n.widget.frame;
+    }
+    const c = check orelse return error.NoVerifiedCheckOnThePage;
+
+    var name: ?native_sdk.geometry.RectF = null;
+    for (p.layout.nodes) |n| {
+        if (n.widget.text.len == 0 or n.widget.kind == .icon) continue;
+        if (n.widget.frame.y < c.y - 14 or n.widget.frame.y > c.y + 14) continue;
+        if (n.widget.frame.x >= c.x) continue;
+        if (name == null or n.widget.frame.x > name.?.x) name = n.widget.frame;
+    }
+    const nm = name orelse return error.NoNameBesideTheCheck;
+
+    // Measured from where the name STARTS, not from the far side of its box.
+    // Measuring from the box passes the exact bug this exists for: give the
+    // name a definite 559px width and the check sits 7px past the end of that
+    // box, dutifully adjacent to a rectangle that is almost entirely empty.
+    // The reader sees the distance from the word.
+    const from_word = c.x - nm.x;
+    if (from_word > 90) {
+        std.debug.print(
+            "\nthe verified check is {d:.0}px from the start of a three-letter name (its box is {d:.0} wide)\n",
+            .{ from_word, nm.width },
+        );
+        return error.CheckAdrift;
+    }
+
+    const handle = frameOfTextContaining(p, "sep@zignostr.com") orelse return error.NoHandle;
+
+    // And the npub follows the handle rather than starting a column of its own.
+    if (frameOfTextContaining(p, "npub1")) |npub| {
+        const npub_gap = npub.x - handle.x;
+        if (npub_gap > 160) {
+            std.debug.print(
+                "\nthe npub is {d:.0}px from the start of the handle (its box is {d:.0} wide)\n",
+                .{ npub_gap, handle.width },
+            );
+            return error.NpubAdrift;
+        }
+    }
+}
