@@ -2747,6 +2747,109 @@ fn avatarImageIn(widget: canvas.Widget) u64 {
     return 0;
 }
 
+test "a profile shows the address it was verified as, not just a tick" {
+    // The page drew a bare check next to the name and no address anywhere, so a
+    // verified profile said "verified" without ever saying verified as WHAT. The
+    // domain is the half that names who vouched, and this is the one screen a
+    // reader opens specifically to decide whether somebody is who they claim.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x7c);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = who;
+
+    // Verified: the address is on the page.
+    main.setProfileNip05ForTest(who, "someone@example.com", true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "someone@example.com"));
+    }
+
+    // The root form is shown as the bare domain, which is what `_@domain` means.
+    main.setProfileNip05ForTest(who, "_@example.com", true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "example.com"));
+        try testing.expect(!findAnyTextContaining(tree.root, "_@example.com"));
+    }
+
+    // THE PROPERTY THAT MATTERS: unverified shows NOTHING. An address the app has
+    // not checked, printed under a name, reads as an endorsement to everyone who
+    // has seen one anywhere else, which is the impersonation this guards against.
+    main.setProfileNip05ForTest(who, "impostor@example.com", false);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(!findAnyTextContaining(tree.root, "impostor@example.com"));
+    }
+    try testing.expectEqualStrings("", main.verifiedNip05ForTest(who));
+}
+
+test "the unread badge is a pill, not a sliver" {
+    // `.panel` is a stacking kind: it hands every child the whole content box and
+    // takes the MAX of them for its own size rather than the sum. The two
+    // four-point spacers either side of the digit were therefore layered BEHIND
+    // it and contributed nothing, so the pill's width was the glyph advance and
+    // the declared radius clamped to half of that. It painted as a narrow
+    // lozenge with the number running edge to edge.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.setIdentityForTest([_]u8{0x7d} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+
+    // One unread, and then more than the cap, so both the single digit and the
+    // "9+" case are pinned: the badge used to change shape with the count.
+    for ([_]usize{ 1, 12 }) |count| {
+        main.seedInboxUnreadForTest(count);
+        const label = if (count > 9) "9+" else "1";
+        const p = try painted.Painted.render(arena, &model);
+        const digit = smallestNodeWithText(p, label) orelse return error.NoBadge;
+        const pill = smallestPanelAround(p, digit) orelse return error.NoPill;
+        // The floor, and the thing that says it is a pill rather than the digit
+        // with a colour behind it.
+        try testing.expect(pill.width >= 19);
+        try testing.expect(pill.width > digit.width);
+    }
+}
+
+/// The frame of the smallest laid-out node carrying exactly `text`.
+fn smallestNodeWithText(p: painted.Painted, text: []const u8) ?native_sdk.geometry.RectF {
+    var best: ?native_sdk.geometry.RectF = null;
+    for (p.layout.nodes) |n| {
+        if (!std.mem.eql(u8, n.widget.text, text)) continue;
+        const f = n.widget.frame;
+        if (best == null or f.width < best.?.width) best = f;
+    }
+    return best;
+}
+
+/// The frame of the smallest `.panel` the digit sits inside HORIZONTALLY, and
+/// which overlaps it vertically.
+///
+/// Not strict containment: a text leaf's line box is taller than the pill it is
+/// centred in (18 against 13 here), so "the panel contains the glyph frame" is
+/// never true and asking for it finds nothing. Width is the axis under test.
+fn smallestPanelAround(p: painted.Painted, inner: native_sdk.geometry.RectF) ?native_sdk.geometry.RectF {
+    var best: ?native_sdk.geometry.RectF = null;
+    for (p.layout.nodes) |n| {
+        if (n.widget.kind != .panel) continue;
+        const f = n.widget.frame;
+        if (f.x > inner.x or f.x + f.width < inner.x + inner.width) continue;
+        if (f.y > inner.y + inner.height or f.y + f.height < inner.y) continue;
+        if (best == null or f.width < best.?.width) best = f;
+    }
+    return best;
+}
+
 test "a thread still loading is one batch, however the relays interleave it" {
     // The bug this pins: batching from the first build split a thread's OPENING
     // read into one batch per tick, so the conversation froze into the order the
@@ -6797,6 +6900,36 @@ test "a reaction that is not a like is not a notification" {
     // Reposts and zaps are their own verbs.
     try testing.expectEqual(main.InboxVerb.repost, main.inboxVerbForTest(inboxEvent(6, 0xC2, &mine, 100), me).?);
     try testing.expectEqual(main.InboxVerb.zap, main.inboxVerbForTest(inboxEvent(9735, 0xC2, &mine, 100), me).?);
+}
+
+test "somebody who turns up in your notifications gets a name fetched" {
+    // The profile round asks for kind:0 for three sets: the people the reader
+    // follows, the people a note mentions, and the reader themself. Somebody who
+    // replies to you, likes you or zaps you is in none of those, and nothing else
+    // ever asked. So the notifications page listed raw npubs for exactly the
+    // people it is about, which is the one screen where the name IS the row.
+    main.setIdentityForTest([_]u8{0xb8} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.forgetWantedProfilesForTest();
+    defer main.forgetWantedProfilesForTest();
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+
+    // A stranger replies to the reader. Nobody has ever asked who they are.
+    const stranger = [_]u8{0xb9} ** 32;
+    try testing.expect(!main.profileWantedForTest(stranger));
+
+    var ev = inboxEvent(1, 0xb9, &mine, 1_800_000_000);
+    ev.pubkey = stranger;
+    try testing.expect(main.inboxAddForTest(ev, 1_800_000_000));
+
+    // Filing the notification is what arms the question.
+    try testing.expect(main.profileWantedForTest(stranger));
 }
 
 test "one event dated in the future does not kill the bell forever" {
