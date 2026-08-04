@@ -4246,6 +4246,19 @@ pub fn setProfilePictureForTest(pubkey: [32]u8, present: bool) void {
 
 /// The registry image id currently lent to `pubkey`'s avatar (0 = none). For
 /// tests of the id LRU.
+/// Puts a profile in the state the avatar pipeline would leave it in, so a view
+/// test can ask what the widget does with it without a network round trip.
+pub fn setProfileAvatarForTest(pubkey: [32]u8, image_id: u64, state: enum { idle, fetching, loaded, failed }) void {
+    const p = upsertProfile(pubkey) orelse return;
+    p.image_id = image_id;
+    p.avatar_state = switch (state) {
+        .idle => .idle,
+        .fetching => .fetching,
+        .loaded => .loaded,
+        .failed => .failed,
+    };
+}
+
 pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
     const p = lookupProfile(pubkey) orelse return 0;
     return p.image_id;
@@ -5628,10 +5641,7 @@ pub const Note = struct {
     }
     /// The registered avatar image id for this author, or 0 to draw initials.
     pub fn avatar_id(self: *const Note) u64 {
-        if (lookupProfile(self.pubkey)) |p| {
-            if (p.avatar_state == .loaded) return p.image_id;
-        }
-        return 0;
+        return avatarImageId(self.pubkey);
     }
     /// The @handle for the identity line: the author's NIP-05, shown as `@name`
     /// (or `@domain` for the root `_@domain` form). Empty when they have no
@@ -11958,6 +11968,20 @@ pub fn isInReadGraph(pubkey: [32]u8) bool {
     // A guest reads the pack, but the app has nothing to rank for them: no
     // inbox, no own-graph split.
     if (activePubkey() == null) return false;
+    return inFollowedSet(pubkey);
+}
+
+/// Whether `pubkey` is in the set the feed is built from: the reader's whole
+/// contact list, or the starter pack while the pack is what they are reading.
+///
+/// EVERY follow, never `followSet()`. That one is capped at `max_follows`
+/// because it is the feed's author set and the feed pays a relay filter entry
+/// and a store cursor per author, so being a slice is the point of it. Asking a
+/// membership question of that slice told a reader with three hundred follows
+/// that follows 129 and up were strangers, and a new follow is APPENDED, so the
+/// people they had followed most recently were the ones most likely to be
+/// misfiled.
+fn inFollowedSet(pubkey: [32]u8) bool {
     lockFollows();
     defer unlockFollows();
     if (!followsAreOwned()) {
@@ -12196,6 +12220,10 @@ var g_identity_minted_here = false;
 
 /// What pressing "Create your identity" does to the sign-out latch: drops it
 /// before any new key exists. The pubkey latch is what has to hold after this.
+pub fn loggedOutForTest() bool {
+    return g_logged_out;
+}
+
 pub fn clearLoggedOutLatchForTest() void {
     g_logged_out = false;
 }
@@ -12577,16 +12605,28 @@ pub fn ingestContactListForTest(ev: nostr.event.Event) void {
 }
 
 /// Whether a pubkey is inside the reader's follow graph: the accounts whose
-/// replies rank first in a thread. That is the live follow list, which is the
-/// starter pack until following writes a contact list of its own, plus the reader.
+/// replies rank first in a thread. That is the reader themself, plus EVERY
+/// account on their contact list, plus the starter pack while the pack is what
+/// the feed reads.
+///
+/// Asked of the whole list, never of `followSet()`. That one is capped at
+/// `max_follows` because it is the FEED's author set, and the feed pays a relay
+/// filter entry and a store cursor per author, so it is deliberately a slice.
+/// Membership is a different question and has no reason to be capped: asking it
+/// of the slice told a reader with three hundred follows that follows 129 and up
+/// were strangers, in every thread, forever. Worse, a new follow is APPENDED, so
+/// the people most recently followed were the ones most likely to be misfiled.
+///
+/// Two differences from `isInReadGraph`, both deliberate. Your OWN replies are
+/// inside your conversation, though you do not follow yourself and the inbox
+/// would be wrong if you did. And a GUEST still has a graph here: they are
+/// reading the pack, so pack members are the conversation and everyone else is
+/// the crowd, where for the inbox a guest has nothing to rank at all.
 pub fn inFollowGraph(pubkey: [32]u8) bool {
     if (activePubkey()) |me| {
         if (std.mem.eql(u8, &me, &pubkey)) return true;
     }
-    for (followSet()) |followed| {
-        if (std.mem.eql(u8, &followed, &pubkey)) return true;
-    }
-    return false;
+    return inFollowedSet(pubkey);
 }
 
 /// Groups the arranged (depth-stamped, conversation-ordered) replies into blocks.
@@ -14385,8 +14425,28 @@ fn youAvatar(ui: *AppUi) AppUi.Node {
     return meAvatar(ui, 28);
 }
 
+/// The registered avatar image id for `pubkey`, or 0 to draw initials.
+///
+/// The `.loaded` gate is load-bearing rather than cautious. The renderer takes
+/// the image branch for ANY non-zero id and draws the initials only in the else,
+/// so an id that has been lent but whose bytes have not arrived paints an EMPTY
+/// disc instead of falling back. A slot is claimed before the fetch and survives
+/// a failed one, so both of those states have to report zero.
+fn avatarImageId(pubkey: [32]u8) u64 {
+    const p = lookupProfile(pubkey) orelse return 0;
+    if (p.avatar_state != .loaded) return 0;
+    return p.image_id;
+}
+
 /// The signed-in reader's own disc at a stated size: the rail seats a 28, the
 /// thread's reply row a 36 to match the note it answers.
+///
+/// It drew initials and only initials, because it never passed an image. Every
+/// other link already worked: the reader's own kind:0 is asked for by the feed
+/// subscription and by `ownProfileWorker`, `refreshProfiles` puts their pubkey
+/// in the author list explicitly, and `assignAvatarSlots` pushes them FIRST so
+/// they get one of the scarce ids ahead of any feed author. All of that ran, and
+/// then the widget was built without the id it had earned.
 fn meAvatar(ui: *AppUi, size: f32) AppUi.Node {
     const pk = activePubkey() orelse return ui.spacer(0);
     const tint = avatarTint(pk);
@@ -14394,6 +14454,7 @@ fn meAvatar(ui: *AppUi, size: f32) AppUi.Node {
     return ui.avatar(.{
         .width = size,
         .height = size,
+        .image = avatarImageId(pk),
         .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
     }, ui.fmt("{c}{c}", .{ hexdigits[pk[0] >> 4], hexdigits[pk[0] & 0x0f] }));
 }
@@ -17220,6 +17281,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_ceremony = .none;
             g_ceremony_adopted = false;
             g_identity_minted_here = false;
+            // And a sign-out earlier in this run latched adopt-on-appear off.
+            //
+            // The ceremony happens in the other process and exits 0 for an
+            // import, so `handleSignetExited` classifies it as "not a mint" and
+            // signs nobody in: the health check is the ONLY thing that carries
+            // the result back. A latch left over swallows the whole import. The
+            // key lands in the daemon, the poll refuses it once a second, and the
+            // reader sits in guest mode until they quit and reopen.
+            //
+            // `beginCreate` drops it for the create ceremony with a comment
+            // saying it has to do by hand what `queueHelperSetup` would have
+            // done. This is the third spawn site and it never got that line, so
+            // "Create your identity" after a sign-out worked and "Bring your key"
+            // was dead, which is what made it look intermittent: the latch is
+            // false at launch, so it only bites on a run where something signed
+            // out first. The pubkey latch below it is what still keeps the key
+            // that just LEFT from walking back in.
+            g_logged_out = false;
             if (ceremonyCanTakeKey()) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
