@@ -46,24 +46,55 @@ if [ -z "$LIST" ]; then
   exit 1
 fi
 
-echo "scrolling..."
-native automate profile on >/dev/null
-for _ in $(seq 1 16); do native automate widget-wheel main-canvas "$LIST" 420 >/dev/null 2>&1; done
-for _ in $(seq 1 16); do native automate widget-wheel main-canvas "$LIST" -420 >/dev/null 2>&1; done
-sleep 1
-native automate snapshot >/dev/null
-
 stat() { grep -oE "$1=[0-9]+" "$SNAPSHOT" | head -1 | cut -d= -f2; }
 
-REBUILD=$(stat rebuild_p90_us)
-LAYOUT=$(stat layout_p90_us)
-PATCH=$(stat patch_p90_us)
-PLAN=$(stat plan_p90_us)
-PRESENT=$(stat present_p90_us)
+# Measured several times, and the BEST round is the one reported.
+#
+# Not an average, and not one round. These numbers measure this app's share of a
+# frame, but the stopwatch runs on a whole machine, so anything else busy on it
+# is added to the reading and nothing is ever subtracted. The error is one-sided,
+# which makes the minimum the closest estimate of the real cost available here.
+#
+# Worth spelling out, because the alternative wasted an afternoon: one round put
+# the same commit at 322us, 365us, 471us and 787us on four runs while a video
+# call was going. Read as four different measurements they look exactly like a
+# regression bisecting to a rename, and the bisect duly "found" one. A budget
+# that a busy laptop trips on its own is not a budget, it is a coin flip that
+# people learn to ignore.
+ROUNDS=${FRAME_BUDGET_ROUNDS:-3}
+REBUILD=""; LAYOUT=""; PATCH=""; PLAN=""; PRESENT=""; FALLBACK=0
+best() { # current candidate -> the smaller, or the candidate if there is no current
+  if [ -z "$1" ] || [ "$2" -lt "$1" ]; then echo "$2"; else echo "$1"; fi
+}
+
+for round in $(seq 1 "$ROUNDS"); do
+  echo "scrolling (round $round of $ROUNDS)..."
+  # Turning the profile on starts a fresh sample window, so each round is
+  # measured on its own rather than blended into the ones before it.
+  native automate profile on >/dev/null
+  for _ in $(seq 1 16); do native automate widget-wheel main-canvas "$LIST" 420 >/dev/null 2>&1; done
+  for _ in $(seq 1 16); do native automate widget-wheel main-canvas "$LIST" -420 >/dev/null 2>&1; done
+  sleep 1
+  native automate snapshot >/dev/null
+
+  REBUILD=$(best "$REBUILD" "$(stat rebuild_p90_us)")
+  LAYOUT=$(best "$LAYOUT" "$(stat layout_p90_us)")
+  PATCH=$(best "$PATCH" "$(stat patch_p90_us)")
+  PLAN=$(best "$PLAN" "$(stat plan_p90_us)")
+  PRESENT=$(best "$PRESENT" "$(stat present_p90_us)")
+  # The one number taken at its WORST across rounds. A single frame that fell
+  # back to CPU pixels is a failure whichever round it happened in, and taking
+  # the best would be a way of not noticing.
+  rounds_fallback=$(stat present_fallback_frames)
+  # `|| true`, because a false test is a nonzero line and `set -e` would end the
+  # run here on every healthy round.
+  [ "${rounds_fallback:-0}" -gt "$FALLBACK" ] && FALLBACK="$rounds_fallback" || true
+done
+
 NODES=$(grep -oE 'widget_nodes=[0-9]+/[0-9]+' "$SNAPSHOT" | head -1)
-FALLBACK=$(stat present_fallback_frames)
 
 echo
+echo "  best of ${ROUNDS} rounds:"
 echo "  rebuild p90   ${REBUILD}us  (budget ${REBUILD_P90_BUDGET})"
 echo "  layout  p90   ${LAYOUT}us  (budget ${LAYOUT_P90_BUDGET})"
 echo "  patch   p90   ${PATCH}us  (budget ${PATCH_P90_BUDGET})"
