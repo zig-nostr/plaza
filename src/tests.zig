@@ -4300,6 +4300,62 @@ test "building the feed does not read the contact list once per card" {
     try testing.expectEqual(@as(usize, 0), reads);
 }
 
+test "the rows just off screen are warmed, and the ones on it are left alone" {
+    // Fetching was gated on holding one of the nine avatar ids or six picture
+    // ids, and those are lent only to rows already on screen. So every row
+    // arrived cold: blank, then a request, then a face a moment later, again and
+    // again for as long as the reader kept scrolling.
+    //
+    // Nothing about downloading an image needs a registry slot. Only showing it
+    // does. This pins the band that gets fetched anyway.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes_len = 200;
+    for (0..200) |i| model.notes[i].id = @intCast(i + 1);
+
+    main.setVisibleRangeForTest(80, 90);
+    const seen = model.visibleRange();
+    const warm = model.prefetchRange();
+    try testing.expectEqual(@as(usize, 80), seen.first);
+    try testing.expectEqual(@as(usize, 90), seen.last);
+    // A band either side, because scrolling back up is as common as scrolling
+    // down and a cache that only looks forward makes the way back feel broken.
+    try testing.expect(warm.first < seen.first);
+    try testing.expect(warm.last > seen.last);
+    try testing.expectEqual(seen.first - main.feed_prefetch_rows_for_test, warm.first);
+    try testing.expectEqual(seen.last + main.feed_prefetch_rows_for_test, warm.last);
+
+    // At the top of the feed it does not run off the front, and at the bottom it
+    // stops at the last row rather than warming notes that do not exist.
+    main.setVisibleRangeForTest(0, 5);
+    const top = model.prefetchRange();
+    try testing.expectEqual(@as(usize, 0), top.first);
+    main.setVisibleRangeForTest(195, 199);
+    const bottom = model.prefetchRange();
+    try testing.expectEqual(@as(usize, 199), bottom.last);
+}
+
+test "a warmed picture is asked for at the address the row will look up" {
+    // The disk cache is keyed by the URL, and two callers want one: the row that
+    // holds a slot, and the warm pass that does not. Ask for a different size, or
+    // forget the GIF branch, and the warmed bytes land under a name nothing looks
+    // up, so the download happens twice and the row still waits.
+    //
+    // They share one builder, so there are not two spellings to drift. What is
+    // worth pinning is that the builder still tells a GIF from a still: the sizes
+    // differ, so getting that wrong would reintroduce the same miss.
+    var a: [1024]u8 = undefined;
+    var b: [1024]u8 = undefined;
+    const gif = main.feedImageUrlForTest(&a, "https://example.com/a.gif");
+    const still = main.feedImageUrlForTest(&b, "https://example.com/a.jpg");
+    try testing.expect(gif.len > 0 and still.len > 0);
+    try testing.expect(!std.mem.eql(u8, gif, still));
+    // And a query string does not hide the extension from it.
+    var c: [1024]u8 = undefined;
+    const gif_q = main.feedImageUrlForTest(&c, "https://example.com/a.gif?w=1");
+    try testing.expect(std.mem.indexOf(u8, gif_q, "a.gif") != null);
+}
+
 test "a follow's relay list is a suggestion, and only where they write" {
     const tags = [_]nostr.event.Tag{
         &.{ "r", "wss://writes.example.com", "write" },

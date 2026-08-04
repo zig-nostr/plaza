@@ -1384,6 +1384,10 @@ const media_fetch_key_base: u64 = 2000;
 // NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
 const nip05_fetch_key_base: u64 = 3000;
 const link_fetch_key_base: u64 = 4000;
+// Warming: the same bytes, fetched for a row that is NOT on screen yet, and
+// written to the disk cache without claiming a registry id. See `warmAhead`.
+const avatar_warm_key_base: u64 = 6000;
+const media_warm_key_base: u64 = 7000;
 const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It must be
@@ -1659,6 +1663,19 @@ pub const feed_row_chrome: f32 = row_pad_top + avatar_size + 5 + 10 + engagement
 
 pub const max_avatar_images = 9;
 const max_media_images = 6;
+
+/// A span of feed rows, inclusive at both ends. Named rather than anonymous so
+/// the visible span and the warmed span are the same type and one can be built
+/// from the other.
+pub const RowRange = struct { first: usize, last: usize };
+
+/// How many rows either side of the viewport are warmed into the disk cache.
+///
+/// Not a registry budget: warming claims no image id, so this is bounded by
+/// bandwidth and by the per-tick fetch ceilings, not by the sixteen slots. Eight
+/// is about a screen either way at the feed's row height, which is the distance
+/// a flick covers before the next tick can react.
+const feed_prefetch_rows: usize = 16;
 /// The profile banner's own id, taken out of the avatar pool rather than
 /// borrowed from either LRU.
 ///
@@ -4150,6 +4167,11 @@ const Profile = struct {
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Whether this face's BYTES have been pulled into the disk cache ahead of
+    /// being needed. Separate from `avatar_state` because that one is about a
+    /// registry id and there are only nine of those: warming is what a row just
+    /// off the bottom of the viewport can do without one.
+    warm_state: enum { idle, fetching, done } = .idle,
     // The registered canvas-image id for this profile's avatar (0 = none). NOT
     // fixed per cache slot: there are only `max_avatar_images` registry ids for
     // far more cached authors, so ids are lent to whoever is on screen now and
@@ -6520,7 +6542,7 @@ pub const Model = struct {
     /// Card heights vary, so this estimates from the average (total content over
     /// note count) and pads generously; being a row or two wide only costs a
     /// prefetch. Before the first scroll event it reports the top of the feed.
-    pub fn visibleRange(self: *const Model) struct { first: usize, last: usize } {
+    pub fn visibleRange(self: *const Model) RowRange {
         if (self.notes_len == 0) return .{ .first = 0, .last = 0 };
         // The windowed list reports the exact rows it put on screen, so this is
         // no longer an estimate. Before the first build it reports the top.
@@ -6529,6 +6551,28 @@ pub const Model = struct {
             return .{ .first = 0, .last = @min(last_row, max_media_images - 1) };
         }
         return .{ .first = @min(g_visible_first, last_row), .last = @min(g_visible_last, last_row) };
+    }
+
+    /// The rows to have READY, which is wider than the rows on screen.
+    ///
+    /// A face or a picture is fetched only for a row the viewport already holds,
+    /// so scrolling meant watching them arrive: the row lands blank, asks the
+    /// network, and fills in a moment later, over and over, for as long as you
+    /// keep moving. The bytes are what take time, and nothing about fetching them
+    /// requires the row to be visible.
+    ///
+    /// So a band either side of the viewport is warmed into the disk cache
+    /// ahead of arriving. Either side on purpose: scrolling back up is as common
+    /// as scrolling down, and a cache that only ever looks forward makes the way
+    /// back feel broken in a way the way down does not.
+    pub fn prefetchRange(self: *const Model) RowRange {
+        const w = self.visibleRange();
+        if (self.notes_len == 0) return w;
+        const last_row = self.notes_len - 1;
+        return .{
+            .first = w.first -| feed_prefetch_rows,
+            .last = @min(last_row, w.last + feed_prefetch_rows),
+        };
     }
 
     /// Reconciles the feed with the store. Updates the connection line every
@@ -6830,6 +6874,192 @@ fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
     p.image_id = reclaimed;
 }
 
+/// Pulls the bytes for rows NEAR the viewport into the disk cache, without
+/// claiming a registry id for any of them.
+///
+/// The two are separable and were not separated. Fetching was gated on holding
+/// one of the nine avatar ids or six picture ids, and those are lent only to rows
+/// already on screen, so every row arrived cold: blank, then a request, then a
+/// face a moment later. Scroll and it happens again, forever, which is what makes
+/// a feed feel like it is dragging even when the frame time is fine.
+///
+/// Nothing about downloading an image needs a slot. Only DISPLAYING it does. So a
+/// band either side of the viewport is fetched and written to `~/.plaza/media`
+/// ahead of time, and the local-first path that already exists (`loadCachedImage`
+/// on claim, "registered before the first paint") turns that into an instant
+/// face when the row does arrive.
+fn warmAhead(fx: *Effects, model: *const Model) void {
+    if (!g_media_previews) return;
+    // Only the feed. A thread or a profile is a bounded level whose rows are all
+    // fetched by the pass that owns it, and widening those would spend bandwidth
+    // on rows that do not exist.
+    if (model.viewing_profile != null or model.viewing_thread != 0) return;
+
+    const warm = model.prefetchRange();
+    const seen = model.visibleRange();
+    // Budgets of their own, under the ceilings the on-screen passes use: warming
+    // must never crowd out the row the reader is looking at. Faces are small and
+    // there is one per row, so they get the larger share; a picture can be a
+    // megabyte, and warming a stack of them for rows nobody reaches is how a
+    // prefetch turns into somebody's data bill.
+    const face_per_tick = 8;
+    const picture_per_tick = 3;
+    var faces: usize = 0;
+    var pictures: usize = 0;
+
+    var i = warm.first;
+    while (i <= warm.last and i < model.notes_len) : (i += 1) {
+        // The rows on screen are the other passes' business; they hold slots and
+        // are already being fetched properly.
+        if (i >= seen.first and i <= seen.last) continue;
+        const note = &model.notes[i];
+        if (faces < face_per_tick) {
+            if (lookupProfile(note.pubkey)) |p| {
+                if (warmAvatar(fx, p)) faces += 1;
+            }
+        }
+        if (pictures < picture_per_tick and note.hasImage()) {
+            if (warmPicture(fx, note)) pictures += 1;
+        }
+    }
+}
+
+/// Warms one face. Returns whether a fetch actually went out.
+fn warmAvatar(fx: *Effects, p: *Profile) bool {
+    if (p.warm_state != .idle or p.picture_len == 0) return false;
+    // A face that HOLDS a registry id is the on-screen path's business, and
+    // warming it would be a second request for the same bytes. Everything else is
+    // warmable: a `.failed` fetch from a previous pass is worth one more try from
+    // the cache's side, and `.idle` with no id is the ordinary case this exists
+    // for. What is NOT warmable is a face already in the cache, which the check
+    // below settles.
+    if (p.image_id != 0 or p.avatar_state == .loaded) return false;
+
+    var url_buf: [1024]u8 = undefined;
+    const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+    if (cachedImageExists(url)) {
+        p.warm_state = .done;
+        return false;
+    }
+    const index = profileIndexOf(p) orelse return false;
+    p.warm_state = .fetching;
+    fx.fetch(.{
+        .key = avatar_warm_key_base + index,
+        .url = url,
+        .on_response = Effects.responseMsg(.avatar_warmed),
+    });
+    return true;
+}
+
+/// Warms one picture. Keyed by the note's own id rather than a slot, since the
+/// whole point is that it has no slot.
+fn warmPicture(fx: *Effects, note: *const Note) bool {
+    const raw = note.imageUrl();
+    if (raw.len == 0) return false;
+    var url_buf: [1024]u8 = undefined;
+    const url = feedImageUrl(&url_buf, raw);
+    if (warmedAlready(url)) return false;
+    if (cachedImageExists(url)) {
+        _ = rememberWarmed(url);
+        return false;
+    }
+    // A slot's worth of key space, indexed by the ring position rather than by a
+    // media slot, which this deliberately does not hold.
+    const index = rememberWarmed(url);
+    fx.fetch(.{
+        .key = media_warm_key_base + index,
+        .url = url,
+        .on_response = Effects.responseMsg(.media_warmed),
+    });
+    return true;
+}
+
+/// The URLs warmed recently, so a row hovering just off screen is not re-fetched
+/// every tick. A ring rather than a set: it only has to stop a repeat within the
+/// few seconds a row spends near the edge, and a cache hit is the backstop for
+/// anything it forgets.
+const warm_ring_len = 32;
+const WarmEntry = struct {
+    hash: u64 = 0,
+    url_buf: [1024]u8 = [_]u8{0} ** 1024,
+    url_len: u16 = 0,
+
+    fn url(self: *const WarmEntry) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
+var g_warm_ring: [warm_ring_len]WarmEntry = [_]WarmEntry{.{}} ** warm_ring_len;
+var g_warm_ring_next: u64 = 0;
+
+fn warmedAlready(url: []const u8) bool {
+    const h = std.hash.Wyhash.hash(0, url);
+    for (&g_warm_ring) |*seen| {
+        if (seen.hash == h and seen.url_len != 0) return true;
+    }
+    return false;
+}
+
+/// Records the attempt AND the URL, because the effect response carries a key
+/// and a body but not the address it came from, and the cache is keyed by the
+/// address.
+fn rememberWarmed(url: []const u8) u64 {
+    const slot = g_warm_ring_next % warm_ring_len;
+    const e = &g_warm_ring[@intCast(slot)];
+    e.hash = std.hash.Wyhash.hash(0, url);
+    const n = @min(url.len, e.url_buf.len);
+    @memcpy(e.url_buf[0..n], url[0..n]);
+    e.url_len = @intCast(n);
+    g_warm_ring_next +%= 1;
+    return slot;
+}
+
+/// The index of `p` within the profile table, which is what the avatar fetch
+/// keys are built from.
+fn profileIndexOf(p: *const Profile) ?u64 {
+    for (&g_profiles, 0..) |*q, i| {
+        if (q == p) return @intCast(i);
+    }
+    return null;
+}
+
+/// A warmed face's bytes: written to the cache, never registered. The row that
+/// eventually shows it claims an id and loads it from disk.
+fn handleAvatarWarmed(response: native_sdk.EffectResponse) void {
+    if (response.key < avatar_warm_key_base) return;
+    const index = response.key - avatar_warm_key_base;
+    if (index >= g_profiles.len) return;
+    const p = &g_profiles[@intCast(index)];
+    if (!p.used) return;
+    // A rejection is a busy effect table, not a bad URL: leave it warmable.
+    if (response.outcome == .rejected) {
+        p.warm_state = .idle;
+        return;
+    }
+    p.warm_state = .done;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) return;
+    if (response.body.len == 0 or response.body.len > max_image_bytes) return;
+    var url_buf: [1024]u8 = undefined;
+    const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+    storeCachedImage(url, response.body);
+}
+
+/// The same for a picture. There is no per-note state to update: the ring already
+/// recorded the attempt, and the file is the result.
+fn handleMediaWarmed(response: native_sdk.EffectResponse) void {
+    if (response.key < media_warm_key_base) return;
+    const slot = response.key - media_warm_key_base;
+    if (slot >= g_warm_ring.len) return;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) return;
+    if (response.body.len == 0 or response.body.len > max_image_bytes) return;
+    // The ring is what remembers the address: a response carries a key and a
+    // body, and the cache is keyed by the URL. A slot reused by a later warm
+    // before this answer arrived writes the newer URL's name, so the hash is
+    // checked rather than assumed.
+    const e = &g_warm_ring[@intCast(slot)];
+    if (e.url_len == 0) return;
+    storeCachedImage(e.url(), response.body);
+}
+
 /// Fires avatar fetches for cached profiles that have a picture and an image
 /// slot but no avatar yet, a few per tick to stay well inside the effect budget.
 /// The response lands on `avatar_fetched`.
@@ -7057,6 +7287,55 @@ fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?Decode
 
 /// Writes a freshly fetched image into the cache. Best-effort: a failure here
 /// only costs a re-download next launch.
+/// The address a feed picture is fetched from, wherever it is fetched from.
+///
+/// ONE builder, because the disk cache is keyed by this string and two callers
+/// derive it: the row that has a slot, and the warm pass that does not. Ask for
+/// a different size, or forget the GIF branch, and the warmed bytes land under a
+/// name nothing looks up: the download happens twice and the row still waits. A
+/// test could compare two spellings; sharing the function means there are not
+/// two to compare.
+fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
+    return if (isGifUrl(src))
+        mediaUrl(buf, src, gif_target_px, .animation)
+    else
+        mediaUrl(buf, src, media_target_px, .inside);
+}
+
+pub fn feedImageUrlForTest(buf: []u8, src: []const u8) []const u8 {
+    return feedImageUrl(buf, src);
+}
+
+pub const feed_prefetch_rows_for_test = feed_prefetch_rows;
+pub const gif_target_px_for_test = gif_target_px;
+pub const media_target_px_for_test = media_target_px;
+
+pub fn mediaUrlForTest(buf: []u8, src: []const u8, px: u32, fit: MediaFit) []const u8 {
+    return mediaUrl(buf, src, px, fit);
+}
+
+/// The address warming asks for, so a test can hold it against the one the row
+/// will look up. They are built in two places and must not drift.
+pub fn setVisibleRangeForTest(first: usize, last: usize) void {
+    g_visible_first = first;
+    g_visible_last = last;
+}
+
+/// Whether the disk cache already holds this URL's bytes. Cheaper than loading
+/// them: warming only needs to know whether to ask the network, and decoding is
+/// the expensive half.
+fn cachedImageExists(url: []const u8) bool {
+    const io = g_io orelse return false;
+    const environ = g_environ orelse return false;
+    var dir = mediaCacheDir(io, environ) catch return false;
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, url);
+    var file = dir.openFile(io, name, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
 fn storeCachedImage(url: []const u8, bytes: []const u8) void {
     const io = g_io orelse return;
     const environ = g_environ orelse return;
@@ -7477,10 +7756,7 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
 
     var url_buf: [1024]u8 = undefined;
     const gif = isGifUrl(note.imageUrl());
-    const url = if (gif)
-        mediaUrl(&url_buf, note.imageUrl(), gif_target_px, .animation)
-    else
-        mediaUrl(&url_buf, note.imageUrl(), media_target_px, .inside);
+    const url = feedImageUrl(&url_buf, note.imageUrl());
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
@@ -8529,6 +8805,8 @@ pub const Msg = union(enum) {
     helper_signed: native_sdk.EffectResponse,
     /// An avatar fetch finished: register the image or fall back to initials.
     avatar_fetched: native_sdk.EffectResponse,
+    avatar_warmed: native_sdk.EffectResponse,
+    media_warmed: native_sdk.EffectResponse,
     banner_fetched: native_sdk.EffectResponse,
     /// A media fetch finished: decode, downscale if needed, and register it.
     media_fetched: native_sdk.EffectResponse,
@@ -8593,7 +8871,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -16539,6 +16817,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
+    warmAhead(fx, model);
     scanLinkFetches(fx, model);
     scanNip05Fetches(fx);
     fx.startTimer(.{
@@ -16656,6 +16935,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 scanAvatarFetches(fx);
                 scanBannerFetch(fx, model);
                 scanMediaFetches(fx, model);
+                warmAhead(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
                 // Complete a like a guest reached for, now that they have signed
@@ -16707,6 +16987,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_setup => |response| handleHelperSetup(model, response),
         .helper_signed => |response| handleHelperSigned(response),
         .avatar_fetched => |response| handleAvatarFetched(fx, response),
+        .avatar_warmed => |response| handleAvatarWarmed(response),
+        .media_warmed => |response| handleMediaWarmed(response),
         .banner_fetched => |response| handleBannerFetched(fx, response),
         .draft_edit => |edit| {
             model.draft_buffer.apply(edit);
@@ -17107,6 +17389,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 retryFailedImages();
                 scanAvatarFetches(fx);
                 scanMediaFetches(fx, model);
+                warmAhead(fx, model);
                 scanLinkFetches(fx, model);
             }
         },
@@ -17165,6 +17448,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             assignAvatarSlots(fx, model);
             scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
+            // The band beyond the new viewport, which is the whole point of
+            // running this on a scroll rather than only on the tick.
+            warmAhead(fx, model);
             scanLinkFetches(fx, model);
         },
         .load_older => {
