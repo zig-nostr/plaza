@@ -15,7 +15,14 @@
                 .title = "Plaza",
                 .width = 760,
                 .height = 760,
-                .min_width = 680,
+                // The floor the window itself enforces (macOS contentMinSize).
+                // 687 is what the layout measures: the 56pt rail, the 620pt
+                // reading column, and the 11pt scrollbar gutter the virtualList
+                // reserves. This is 700 for a little slack. `zig build test`
+                // sweeps every screen from exactly this number and fails if the
+                // content outgrows it, which is what stopped being true when the
+                // feed became a virtualList and nothing moved the floor.
+                .min_width = 700,
                 .min_height = 680,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",

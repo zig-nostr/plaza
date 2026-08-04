@@ -11847,3 +11847,113 @@ test "a follow that could not be written says why instead of nothing" {
     main.update(&model, main.Msg{ .follow_person = 1 }, &fx);
     try testing.expect(main.isFollowedByMe(stranger));
 }
+
+// ---- nothing paints past the edge of the smallest window allowed ------------
+
+test "no view paints past the right edge at the narrowest the window can be" {
+    // The reported bug was "link previews overflow the window". The card was
+    // part of it and was bounded separately, but the rest was structural and
+    // would have clipped anything sitting at the column's right edge: a link
+    // preview is simply where a reader SEES it, because it is the only element
+    // there with a border of its own to be cut in half.
+    //
+    // Plaza's layout is a fixed 620px reading column by choice, so the honest
+    // guarantee is not that it reflows, it is that the window can never be made
+    // narrower than the column needs. That is a create-time floor in app.zon,
+    // and the layout it has to hold only exists in Zig, so nothing connected
+    // them and they drifted: the floor was set before the feed became a
+    // virtualList, the list then reserved an 11px scrollbar gutter, and the
+    // narrowest window the app allowed had been 7px too small ever since.
+    //
+    // So this sweeps from the floor the MANIFEST declares, passed in by
+    // build.zig, rather than from a number repeated here. Widen the column and
+    // this fails until the floor moves with it.
+    const floor = @import("window_floor").manifest_min_width;
+
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining };
+
+    main.clearLinkPreviewsForTest();
+    defer main.clearLinkPreviewsForTest();
+    const url = "https://github.com/zig-nostr/notary/pull/35";
+    main.setLinkPreviewForTest(
+        url,
+        "github.com",
+        "Notary is Notary by sepehr-safari, Pull Request #35, zig-nostr/notary",
+        "A native remote signer (NIP-46 bunker) for Nostr. Your key stays on a machine you control, and nothing else ever holds it.",
+    );
+
+    // Every stranger-supplied field filled to the capacity of the buffer that
+    // holds it. A row that fits a name is not the question; a row that fits a
+    // name of the sixty-four characters the buffer allows is, because that is
+    // what will eventually arrive.
+    const long_name = "N" ** 64;
+    const long_user = "u" ** 64;
+    const long_site = "https://" ++ ("a" ** 112) ++ ".example";
+    const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
+    const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
+
+    var worst_over: f32 = 0;
+    inline for (@typeInfo(States).@"enum".fields) |f| {
+        const st: States = @enumFromInt(f.value);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = main.noteWithLinkForTest(if (st == .feed) "" else url);
+        // A note body long enough to wrap several times, so the body's own
+        // wrapping is exercised alongside everything else.
+        const body = "A stranger wrote this and it goes on for a while https://example.com/a/rather/long/link ";
+        const b = @min(body.len, model.notes[0].content_buf.len);
+        @memcpy(model.notes[0].content_buf[0..b], body[0..b]);
+        model.notes[0].content_len = @intCast(b);
+        model.notes_len = 1;
+
+        main.resetProfilesForTest();
+        main.fillProfileTextForTest(model.notes[0].pubkey, long_name, long_user, long_site);
+        main.setProfileNip05ForTest(model.notes[0].pubkey, long_nip05, true);
+        main.clearRelaysForTest();
+        _ = main.addRelayForTest(long_relay, true, true);
+        _ = main.addRelayForTest("wss://relay.example.org", true, true);
+        main.seedInboxUnreadForTest(3);
+        switch (st) {
+            .feed, .feed_with_link => {},
+            .thread => {
+                model.viewing_thread = model.notes[0].id;
+                model.thread_root = model.notes[0];
+                model.thread_notes[0] = model.notes[0];
+                model.thread_notes_len = 1;
+            },
+            .profile => model.viewing_profile = model.notes[0].pubkey,
+            .settings => model.stage = .settings,
+            .notifications => model.notifications_open = true,
+            .composing => model.composing = true,
+            .joining => model.joining = true,
+        }
+
+        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, floor, floor);
+
+        // Measuring painted geometry, not options. Every one of these nodes
+        // reports a perfectly reasonable width on its own; the defect only
+        // exists as a position.
+        for (p.layout.nodes) |n| {
+            const right = n.widget.frame.x + n.widget.frame.width;
+            const over = right - floor;
+            if (over > 0.5 and over > worst_over) {
+                worst_over = over;
+                const label = if (n.widget.text.len > 0) n.widget.text else n.widget.semantics.label;
+                std.debug.print(
+                    "\n{s}: a {s} reaches {d:.0} in a {d:.0}px window, {d:.0}px past the edge  \"{s}\"\n",
+                    .{ f.name, @tagName(n.widget.kind), right, floor, over, label[0..@min(label.len, 40)] },
+                );
+            }
+        }
+    }
+    if (worst_over > 0) {
+        std.debug.print(
+            "\nthe window's floor is {d:.0}px and its content needs {d:.0}px. Raise .min_width in app.zon.\n",
+            .{ floor, floor + worst_over },
+        );
+    }
+    try testing.expect(worst_over == 0);
+}
