@@ -3400,6 +3400,7 @@ fn requestWantedProfiles() void {
         if (n == batch.len) break;
     }
     if (n == 0) return;
+    if (!networkAllowed()) return;
     const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
     thread.detach();
 }
@@ -4103,6 +4104,23 @@ fn quoteBackoffRounds(attempts: u8) u64 {
 /// The pool changed, so the answer may have too: a relay the reader just added,
 /// or one that just finished dialling, can hold exactly the note that was
 /// written off while nothing was connected.
+/// Whether this build may open a socket of its own accord.
+///
+/// False under `zig build test`, and not as tidiness. The feed's background
+/// fetchers are reached from `reconcile`, so every test that reconciles was
+/// spawning a thread and completing TLS handshakes against public relays. It
+/// made the perf numbers a measurement of the network (a profiler found
+/// `relay.dial` and `handshake` at the top of a run that was supposed to be
+/// timing a feed rebuild), it made the suite slow and flaky, and it sent
+/// traffic from every machine that ran the tests.
+///
+/// Comptime, so the shipped binary has no branch. Anything that genuinely needs
+/// to exercise a fetcher should drive its ingest seam with an event, which is
+/// what the tests that care already do.
+fn networkAllowed() bool {
+    return !builtin.is_test;
+}
+
 fn requeueMissingQuotes() void {
     for (&g_quotes) |*q| {
         if (!q.used or q.state == .loaded) continue;
@@ -4131,6 +4149,7 @@ fn requestWantedQuotes() void {
         if (n == batch.len) break;
     }
     if (n == 0) return;
+    if (!networkAllowed()) return;
     const thread = std.Thread.spawn(.{}, fetchQuotesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
     thread.detach();
 }
