@@ -2619,6 +2619,134 @@ test "replies from outside the follow graph are held below, not dropped" {
     try testing.expect(!main.inFollowGraph(split.outside[0].parent.pubkey));
 }
 
+test "somebody you follow is in your graph however far down the list they are" {
+    // The thread split asked `followSet()`, which is capped at `max_follows`
+    // because it is the FEED's author set: the feed pays a relay filter entry and
+    // a store cursor per author, so being a slice is the point of it. Membership
+    // is a different question and has no business being capped.
+    //
+    // A reader with three hundred follows was told that follows 129 and up were
+    // strangers, in every thread, forever. And `writeFollow` APPENDS, so the
+    // people they had followed most recently were the ones most likely to be
+    // filed under "replies outside your graph".
+    main.setIdentityForTest([_]u8{0xe1} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+
+    const total = main.max_follows + 40;
+    var list: [main.max_follows + 40][32]u8 = undefined;
+    for (0..total) |i| {
+        @memset(&list[i], 0);
+        list[i][0] = @intCast(i / 256);
+        list[i][1] = @intCast(i % 256);
+        list[i][31] = 0xe2;
+    }
+    try testing.expect(main.setFollowsForTest(list[0..total], 1_800_000_000));
+
+    // Inside the feed's slice, which always worked.
+    try testing.expect(main.inFollowGraph(list[0]));
+    try testing.expect(main.inFollowGraph(list[main.max_follows - 1]));
+
+    // THE PROPERTY: past it, which did not. Both the last person they followed
+    // and one in the middle of the tail.
+    try testing.expect(main.inFollowGraph(list[main.max_follows]));
+    try testing.expect(main.inFollowGraph(list[total - 1]));
+
+    // And a stranger is still a stranger, so this is not just "always true".
+    const nobody = [_]u8{0x99} ** 32;
+    try testing.expect(!main.inFollowGraph(nobody));
+
+    // Your own replies are inside your conversation, though you do not follow
+    // yourself.
+    try testing.expect(main.inFollowGraph(main.activePubkeyForTest().?));
+}
+
+test "bringing a key through the Signet window signs you in after a sign-out" {
+    // The ceremony exits 0 for an import, so `handleSignetExited` reads it as
+    // "not a mint" and signs nobody in: the daemon health check is the only thing
+    // that carries the result back, and it opens with `if (g_logged_out) return`.
+    //
+    // Two of the three ceremony spawn sites drop that latch. This one never did,
+    // so a reader who had signed out earlier in the same run pasted their key,
+    // watched the window say it was done, and sat in guest mode until they quit.
+    // It looked intermittent because the latch is false at launch: it only bites
+    // on a run where something signed out first, which is why the second attempt
+    // from a fresh start worked.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    main.setCeremonyForTest(.none);
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+
+    // Sign out, which is the precondition. Then press "Bring your key".
+    main.setIdentityForTest([_]u8{0xe3} ** 32);
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(main.loggedOutForTest());
+    // The real message, through the real handler. With no Signet window found,
+    // `ceremonyCanTakeKey` is false and the arm takes its fallback rung without
+    // touching `Effects`, which is why the latch clear sits above the branch.
+    try testing.expect(!main.ceremonyCanTakeKeyForTest());
+    main.update(&model, .open_signet_import, &fx);
+    try testing.expect(!main.loggedOutForTest());
+    try testing.expectEqual(main.Stage.onboarding, model.stage);
+}
+
+test "the reader's own face goes in the rail seat, not their initials" {
+    // Every link already worked. The reader's own kind:0 is asked for by the feed
+    // subscription and by the dedicated profile round, `refreshProfiles` puts
+    // their pubkey in the author list explicitly, and `assignAvatarSlots` pushes
+    // them FIRST so they win one of the nine scarce ids ahead of any feed author.
+    // All of that ran, and then the widget was built without the id it had earned:
+    // `meAvatar` set width, height and style and never `.image`, so it took the
+    // initials branch on every frame forever.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xe4} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // No face known yet: initials, which is correct and is what it always did.
+    {
+        const tree = try buildTree(arena, &model);
+        const seat = findByLabel(tree.root, "You") orelse return error.NoRailSeat;
+        try testing.expectEqual(@as(u64, 0), avatarImageIn(seat));
+    }
+
+    // A loaded face. The `.loaded` gate is the load-bearing half: the renderer
+    // takes the image branch for ANY non-zero id and draws initials only in the
+    // else, so a claimed-but-not-arrived id would paint an EMPTY disc.
+    main.setProfileAvatarForTest(me, 3, .fetching);
+    {
+        const tree = try buildTree(arena, &model);
+        const seat = findByLabel(tree.root, "You") orelse return error.NoRailSeat;
+        try testing.expectEqual(@as(u64, 0), avatarImageIn(seat));
+    }
+
+    main.setProfileAvatarForTest(me, 3, .loaded);
+    {
+        const tree = try buildTree(arena, &model);
+        const seat = findByLabel(tree.root, "You") orelse return error.NoRailSeat;
+        try testing.expectEqual(@as(u64, 3), avatarImageIn(seat));
+    }
+}
+
+/// The image id on the avatar widget inside `widget`, or 0 if there is none.
+fn avatarImageIn(widget: canvas.Widget) u64 {
+    if (widget.kind == .avatar and widget.image_id != 0) return widget.image_id;
+    for (widget.children) |child| {
+        const found = avatarImageIn(child);
+        if (found != 0) return found;
+    }
+    return 0;
+}
+
 test "a thread still loading is one batch, however the relays interleave it" {
     // The bug this pins: batching from the first build split a thread's OPENING
     // read into one batch per tick, so the conversation froze into the order the
