@@ -3704,6 +3704,43 @@ fn wantLink(url: []const u8) ?*LinkPreview {
     return slot;
 }
 
+/// Puts a loaded link preview in the cache, so a view test can render a card
+/// without a network round trip. The long-description case is the one that
+/// matters: it is what used to run off the side of the window.
+/// A feed note carrying `url` as its link, for view tests.
+pub fn noteWithLinkForTest(url: []const u8) Note {
+    var n = Note{};
+    n.id = 1;
+    const u = @min(url.len, n.link_url_buf.len);
+    @memcpy(n.link_url_buf[0..u], url[0..u]);
+    n.link_url_len = @intCast(u);
+    return n;
+}
+
+pub fn setLinkPreviewForTest(url: []const u8, domain: []const u8, title: []const u8, description: []const u8) void {
+    for (&g_links) |*l| {
+        if (l.used) continue;
+        l.* = .{ .used = true, .state = .loaded };
+        const u = @min(url.len, l.url_buf.len);
+        @memcpy(l.url_buf[0..u], url[0..u]);
+        l.url_len = @intCast(u);
+        const d = @min(domain.len, l.domain_buf.len);
+        @memcpy(l.domain_buf[0..d], domain[0..d]);
+        l.domain_len = @intCast(d);
+        const t = @min(title.len, l.title_buf.len);
+        @memcpy(l.title_buf[0..t], title[0..t]);
+        l.title_len = @intCast(t);
+        const c = @min(description.len, l.desc_buf.len);
+        @memcpy(l.desc_buf[0..c], description[0..c]);
+        l.desc_len = @intCast(c);
+        return;
+    }
+}
+
+pub fn clearLinkPreviewsForTest() void {
+    for (&g_links) |*l| l.* = .{};
+}
+
 fn linkFor(url: []const u8) ?*LinkPreview {
     for (&g_links) |*l| {
         if (l.used and std.mem.eql(u8, l.url(), url)) return l;
@@ -16814,6 +16851,16 @@ fn pictureStripes(ui: *AppUi, height: f32) AppUi.Node {
 /// The tile is a letter, never a favicon: a favicon would want one of the
 /// sixteen image slots the whole runtime has, and those belong to faces and
 /// photographs.
+/// How wide the text beside a link preview's tile may be.
+///
+/// Spelled out from the parts rather than left to `grow`, because the row's
+/// other children are all fixed: the gap before the tile, the tile, the gap
+/// after it, and the gap at the end. What is left is what the title and the
+/// description have to live inside, and a test measures the result rather than
+/// trusting this arithmetic.
+const link_card_tile_size: f32 = 30;
+const link_card_text_width: f32 = picture_column_width - 12 - link_card_tile_size - 10 - 12;
+
 fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
     const url = note.linkUrl();
@@ -16853,7 +16900,16 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
                 }),
             }),
             hgap(ui, 10),
-            ui.column(.{ .grow = 1, .gap = 0 }, .{
+            // A STATED width, not `grow`. `grow` hands out SPARE space and never
+            // takes any back, so a child whose natural size already exceeds the
+            // row has nothing to grow into and is simply left at its natural
+            // size. A page title and description with `wrap = false` are as wide
+            // as the sentence, which for a link preview is far wider than the
+            // card, so the row overflowed the card, the card overflowed the
+            // column, and the description ran off the right of the window. The
+            // ellipsis never fired because ellipsis needs a box to be too small
+            // FOR, and the leaf was never given one.
+            ui.column(.{ .width = link_card_text_width, .gap = 0 }, .{
                 vgap(ui, 10),
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_dim } },
@@ -16863,7 +16919,6 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
                 ui.text(.{
                     .wrap = false,
                     .overflow = .ellipsis,
-                    .grow = 1,
                     .size = .sm,
                     .style = .{ .foreground = p.text_link_title },
                 }, link.title()),
@@ -16871,7 +16926,6 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
                 if (link.description().len == 0) ui.spacer(0) else ui.paragraph(.{
                     .wrap = false,
                     .overflow = .ellipsis,
-                    .grow = 1,
                     .style = .{ .foreground = p.text_muted },
                 }, &.{.{ .text = link.description(), .scale = mono_row_scale }}),
                 vgap(ui, 10),
