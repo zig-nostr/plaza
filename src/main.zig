@@ -4602,6 +4602,13 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     };
 
     if (!inboxAdmitLocked(item)) return false;
+    // And WHO it is from, for the same reason. Nothing else ever asked: the
+    // profile round fetches kind:0 for the people the reader follows, the people
+    // a note mentions, and the reader themself, and somebody who likes or zaps
+    // you is in none of those sets. So the notifications page listed raw npubs
+    // for exactly the people it is about, which is the one screen where a name
+    // is the entire content of the row.
+    wantProfile(author);
     // Fetch what it is about, if this is the first we have heard of it. The row
     // is pressable, so the note behind it should be on its way before the reader
     // ever gets there.
@@ -5080,6 +5087,42 @@ fn resetInbox() void {
     g_inbox_owner = null;
     g_inbox_read_through = 0;
     g_inbox_dirty = false;
+}
+
+/// Files `count` unread notifications, so a view test can ask what the rail's
+/// badge does with a number without standing up relays.
+pub fn seedInboxUnreadForTest(count: usize) void {
+    const me = activePubkey() orelse return;
+    lockInbox();
+    defer unlockInbox();
+    resetInboxLocked(me);
+    var i: usize = 0;
+    while (i < count and g_inbox_len < g_inbox.len) : (i += 1) {
+        var id: [32]u8 = [_]u8{0} ** 32;
+        id[0] = @intCast(i % 251 + 1);
+        g_inbox[g_inbox_len] = .{
+            .used = true,
+            .id = id,
+            .author = id,
+            .target_id = [_]u8{0} ** 32,
+            .created_at = 1_800_000_000,
+            .verb = .reply,
+            .msat = 0,
+        };
+        g_inbox_len += 1;
+    }
+}
+
+/// Whether a kind:0 has been asked for on this pubkey's behalf.
+pub fn profileWantedForTest(pubkey: [32]u8) bool {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
+    }
+    return false;
+}
+
+pub fn forgetWantedProfilesForTest() void {
+    for (&g_wanted) |*w| w.* = .{};
 }
 
 pub fn resetInboxForTest() void {
@@ -5672,17 +5715,8 @@ pub const Note = struct {
     /// or it means nothing.
     pub fn handleLabel(self: *const Note, arena: std.mem.Allocator) struct { text: []const u8, nip05: bool } {
         if (lookupProfile(self.pubkey)) |p| {
-            if (p.nip05_len > 0) {
-                const id = p.nip05();
-                if (std.mem.indexOfScalar(u8, id, '@')) |at| {
-                    const local = id[0..at];
-                    const domain = id[at + 1 ..];
-                    if (domain.len > 0) {
-                        const shown = if (std.mem.eql(u8, local, "_")) domain else id;
-                        return .{ .text = shown, .nip05 = true };
-                    }
-                }
-            }
+            const shown = nip05Display(p.nip05());
+            if (shown.len > 0) return .{ .text = shown, .nip05 = true };
             const user = p.username();
             if (user.len > 0 and !std.mem.eql(u8, user, p.name())) {
                 return .{ .text = std.fmt.allocPrint(arena, "@{s}", .{user}) catch "", .nip05 = false };
@@ -13626,6 +13660,53 @@ pub fn npubShortForTest(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
     return npubShortOf(arena, pubkey);
 }
 
+/// A NIP-05 as an identity line shows it: whole (`someone@example.com`), or the
+/// domain alone for the root `_@domain` form, which is what that form means.
+/// Empty when it is malformed, so a broken one is shown as nothing rather than
+/// as itself.
+///
+/// One rule, shared by the feed's handle line and the profile page, because two
+/// spellings of the same identity on two screens is its own small dishonesty.
+fn nip05Display(id: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, id, '@') orelse return "";
+    const local = id[0..at];
+    const domain = id[at + 1 ..];
+    if (domain.len == 0) return "";
+    return if (std.mem.eql(u8, local, "_")) domain else id;
+}
+
+/// Their NIP-05 for the profile page, and ONLY once the well-known lookup has
+/// actually mapped it back to this key.
+///
+/// The page used to draw a bare check next to the name and no address at all, so
+/// a verified profile said "verified" without ever saying verified as WHAT. The
+/// domain is the half that names who vouched, and the profile page is the one
+/// screen a reader opens specifically to decide whether this is the right person.
+///
+/// Unverified is shown as nothing rather than as plain text. An address the app
+/// has not checked, printed under a name, is read as an endorsement by everyone
+/// who has ever seen one anywhere else, and that is exactly the impersonation
+/// this is supposed to guard against.
+fn verifiedNip05(pubkey: [32]u8) []const u8 {
+    const prof = lookupProfile(pubkey) orelse return "";
+    if (prof.nip05_state != .verified) return "";
+    return nip05Display(prof.nip05());
+}
+
+/// Puts a NIP-05 on a cached profile in a stated verification state, so a view
+/// test can ask what the page shows without a well-known round trip.
+pub fn setProfileNip05ForTest(pubkey: [32]u8, id: []const u8, verified: bool) void {
+    const p = upsertProfile(pubkey) orelse return;
+    const n = @min(id.len, p.nip05_buf.len);
+    @memcpy(p.nip05_buf[0..n], id[0..n]);
+    p.nip05_len = @intCast(n);
+    p.nip05_state = if (verified) .verified else .failed;
+}
+
+pub fn verifiedNip05ForTest(pubkey: [32]u8) []const u8 {
+    return verifiedNip05(pubkey);
+}
+
 /// The verified check, drawn only when their NIP-05 actually resolves to them.
 fn personCheck(ui: *AppUi, pubkey: [32]u8) AppUi.Node {
     const prof = lookupProfile(pubkey) orelse return ui.spacer(0);
@@ -13707,7 +13788,11 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
     // Nothing to show and no room to leave for it: with neither the npub nor the
     // follows-you note, the row measures zero and its 5px lead-in would sit under
     // the name as dead space. That is the freshly minted key's own page.
-    const identity_line = named or follows_me;
+    // Their NIP-05, once it has actually been checked. It goes ahead of the npub
+    // because it is the identifier a person chose and can prove, where the npub
+    // is the one the maths chose.
+    const handle = verifiedNip05(pubkey);
+    const identity_line = named or follows_me or handle.len > 0;
 
     return ui.column(.{ .gap = 0 }, .{
         // The banner, with the face riding up over its lower edge. There is no
@@ -13774,6 +13859,14 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 if (identity_line) vgap(ui, 5) else ui.spacer(0),
                 if (identity_line)
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        if (handle.len > 0)
+                            ui.paragraph(
+                                .{ .style = .{ .foreground = p.accent_identity } },
+                                &.{.{ .text = handle, .scale = meta_scale }},
+                            )
+                        else
+                            ui.spacer(0),
+                        if (handle.len > 0 and named) hgap(ui, 8) else ui.spacer(0),
                         if (named)
                             ui.paragraph(
                                 .{ .style = .{ .foreground = p.text_muted } },
@@ -13781,7 +13874,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                             )
                         else
                             ui.spacer(0),
-                        if (named and follows_me) hgap(ui, 8) else ui.spacer(0),
+                        if ((named or handle.len > 0) and follows_me) hgap(ui, 8) else ui.spacer(0),
                         if (follows_me)
                             ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
                         else
@@ -14328,18 +14421,37 @@ fn badgePill(ui: *AppUi, count: usize) AppUi.Node {
     const p = theme.palette;
     const label = if (count > 9) "9+" else ui.fmt("{d}", .{count});
     return ui.column(.{ .width = 36, .height = 36, .main = .start, .cross = .end }, .{
+        // The digit sits in a ROW inside the panel, not in the panel.
+        //
+        // `.panel` is a stacking kind: it hands every child the whole content box
+        // and takes the MAX of them for its own size rather than the sum. The two
+        // four-pixel spacers were therefore layered behind the digit instead of
+        // inset either side of it, and contributed nothing at all. The pill's
+        // width was the glyph advance, about five and a half points, so the
+        // declared radius of 7 clamped to half of that and the "pill" painted as
+        // a narrow lozenge with the number running edge to edge.
         ui.el(.panel, .{
             .padding = 0.01,
             .height = 13,
-            .cross = .center,
+            // A floor, so one digit and two are the same shape rather than the
+            // badge changing width with the count. It sets only the minimum, so a
+            // wider label still grows: "9+" hugs to about nineteen, and anything
+            // longer has room inside the 36-point rail column.
+            .min_width = 19,
             .style = .{ .background = p.accent, .border = p.accent, .radius = 7, .stroke_width = 1 },
         }, .{
-            hgap(ui, 4),
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.on_accent } },
-                &.{.{ .text = label, .monospace = true, .weight = .medium, .scale = 9.0 / 14.5 }},
-            ),
-            hgap(ui, 4),
+            // Centred on purpose: the stack gives this row the panel's whole
+            // width, so once `min_width` exceeds what the digit needs, the row is
+            // what keeps the number in the middle instead of against the left
+            // edge.
+            ui.row(.{ .main = .center, .cross = .center, .gap = 0 }, .{
+                hgap(ui, 4),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.on_accent } },
+                    &.{.{ .text = label, .monospace = true, .weight = .medium, .scale = 9.0 / 14.5 }},
+                ),
+                hgap(ui, 4),
+            }),
         }),
     });
 }
