@@ -1676,6 +1676,36 @@ test "a second sign in the same tick is refused, not swallowed" {
     try testing.expect(main.submitPostForTest(&model, &fx));
 }
 
+test "the sign-out warning does not promise a backup that does not exist" {
+    // It said "Back it up first if you want to keep this identity", pointing at
+    // a control that does not exist for a Signet key: the reveal card is gated
+    // on a local key, the daemon's route table has no export and its own module
+    // doc says no endpoint returns the secret, and the ceremony window tells the
+    // reader there is nothing to write down. Since `createLocalIdentity` has no
+    // callers, every identity minted today is one of these, so the instruction
+    // was false for the default case.
+    var model = main.initialModel();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.setIdentityMintedForTest(false);
+
+    main.setIdentityMintedForTest(true);
+    const minted = model.logout_warning();
+    try testing.expect(std.mem.indexOf(u8, minted, "Back it up first") == null);
+    try testing.expect(std.mem.indexOf(u8, minted, "exists nowhere else") != null);
+    try testing.expect(std.mem.indexOf(u8, minted, "for good") != null);
+
+    // A key the reader pasted in themselves is a different fact, and saying the
+    // same thing about it would be its own kind of wrong.
+    main.setIdentityMintedForTest(false);
+    const imported = model.logout_warning();
+    try testing.expect(std.mem.indexOf(u8, imported, "sign in again with the same key") != null);
+
+    // A local key really can be copied first, from a card that is right there.
+    main.setSignerKindLocalForTest();
+    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "Copy it first") != null);
+}
+
 test "a note still being signed is not thrown away without saying so" {
     // A note handed to a signer that has not answered exists in exactly one
     // place: the slot sign-out frees. It cannot be parked in the outbox the way
