@@ -42,17 +42,23 @@ scripts/package-macos.sh   # -> dist/Plaza.app, ad-hoc signed
 
 The feed is a windowed list: it builds only the rows near the viewport, so what
 it costs follows the window rather than the length of the feed. Measured on the
-build that ships (ReleaseFast), while scrolling hard through a live feed:
+build that ships (ReleaseFast), scrolling hard through a live feed on an account
+that follows three hundred people:
 
 | Stage | p90 | Budget |
 | --- | --- | --- |
-| Rebuild | 54us | 400us |
-| Layout | 432us | 1500us |
-| Patch | 19us | 200us |
+| Rebuild | 341us | 400us |
+| Layout | 1310us | 1500us |
+| Patch | 57us | 200us |
 
-A 120 Hz frame is 8333us, so a hard scroll spends about a tenth of one. Sixty
-notes mount 63 widget nodes rather than roughly 500, and the GPU path never fell
-back to CPU pixels.
+A 120 Hz frame is 8333us, so a hard scroll spends about a fifth of one, and the
+GPU path never falls back to CPU pixels. A long feed mounts around 330 widget
+nodes rather than one per note.
+
+The number that matters is that it does not move with the size of the account.
+The same scroll on the same machine, before the feed stopped asking the database
+who you follow once per card, cost 24423us per rebuild: three whole frames to
+draw one, and worse the more people you followed.
 
 Measure it yourself, and fail on a regression:
 
@@ -68,6 +74,19 @@ native test    # run the test suite
 native build   # produce a ReleaseFast binary in zig-out/bin/
 native check   # validate the markup and manifest
 ```
+
+Before a release there is a second suite, which drives a real build the way a
+person drives it: a cold start filling a feed from the public internet, a
+packaged bundle launched through LaunchServices, and an account's contact list
+edited and read back off a relay with an independent tool.
+
+```sh
+scripts/acceptance.sh
+```
+
+It is not part of CI. It publishes signed events to public relays, so it needs a
+throwaway account rather than a checkout, and it says so and skips rather than
+guessing. The details are in the script.
 
 Plaza is a [Native SDK](https://github.com/vercel-labs/native) app: plain Zig
 for the logic and the feed (`src/main.zig`), declarative `.native` markup for
