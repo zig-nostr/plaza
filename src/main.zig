@@ -2553,12 +2553,6 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
     });
 }
 
-/// Sends one event of `kind` (with `tags`, stamped `created`) to the daemon to
-/// be signed. Builds the unsigned event against the helper's own pubkey so the
-/// returned id matches, wraps it, and POSTs /sign; the response is the signed
-/// event, ingested and published like any other. `content_owned` and `tags` are
-/// process-lifetime (the local and remote paths reference them too), so this
-/// does not free them.
 // A helper sign that has gone out and not come back.
 //
 // The remote signer has had a pending table, a deadline and a restore since the
@@ -2729,6 +2723,12 @@ pub fn helperSignPendingForTest() bool {
     return g_helper_sign.active;
 }
 
+/// Sends one event of `kind` (with `tags`, stamped `created`) to the daemon to
+/// be signed. Builds the unsigned event against the helper's own pubkey so the
+/// returned id matches, wraps it, and POSTs /sign; the response is the signed
+/// event, ingested and published like any other. `content_owned` and `tags` are
+/// process-lifetime (the local and remote paths reference them too), so this
+/// does not free them.
 fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
     const pk = activePubkey() orelse return;
     // Recorded first. Every `catch return` below is a path that used to end with
@@ -2815,6 +2815,13 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
             // confirmed on its exit: the daemon has answered, so a key exists and
             // it is this one.
             g_identity_minted_here = true;
+            // Persisted AGAIN, because the write above happened before the flag
+            // was set and therefore recorded `minted=0`. A restart then read
+            // this key back as an imported one, which is a weaker claim about a
+            // key that provably has no history, and it is the difference between
+            // the sign-out warning saying the key can be signed in with again
+            // and saying it cannot be recovered.
+            persistSession();
             enterFeed(model);
             model.naming = true; // the name beat; replay follows it
         },
@@ -6078,9 +6085,26 @@ pub const Model = struct {
             return "A note you just posted has not been signed yet. Signing out now will lose it.";
         }
         return switch (g_signer_kind) {
+            // Followable: the reveal-and-copy card in Settings is right there,
+            // and it is gated on exactly this kind.
             .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
-            .helper => "Your key will be removed from Signet on this device. Back it up first if you want to keep this identity.",
+            // Signet held it, and Signet is asked to forget it. The two cases
+            // are not the same thing and used to share one sentence that was
+            // false for both.
+            //
+            // The old text said "Back it up first if you want to keep this
+            // identity", pointing at a control that does not exist: the reveal
+            // card is local-key only, the daemon's route table has no export and
+            // its own module doc says no endpoint returns the secret, and the
+            // ceremony window tells the reader there is nothing to write down.
+            // A key minted here therefore ends here, and since `createLocalIdentity`
+            // has no callers, minted here is what every new identity is. Saying
+            // so is the least this can do until there is a real way to save one.
+            .helper => if (g_identity_minted_here)
+                "Signet made this key and it exists nowhere else. Signing out deletes it for good: your notes stay on relays, but nothing will ever be able to post, reply or edit your profile as this account again."
+            else
+                "Your key will be removed from Signet on this device. You can sign in again with the same key.",
         };
     }
     /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
