@@ -41,7 +41,7 @@ jobs:
         run: native test
 
       - name: Test the ceremony window
-        working-directory: signet-window
+        working-directory: notary-window
         run: native test
 
       # The script builds both binaries itself from cleared zig-outs, refuses to

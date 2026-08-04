@@ -1,6 +1,6 @@
-//! The Signet window. A small, separate SDK app Plaza spawns whenever a key is
+//! The Notary window. A small, separate SDK app Plaza spawns whenever a key is
 //! about to exist, or whenever the reader wants to look at the one that does: an
-//! import, where the nsec is typed HERE in Signet's own process and POSTed to the
+//! import, where the nsec is typed HERE in Notary's own process and POSTed to the
 //! plaza-signer daemon over loopback; a create, where the daemon mints a fresh
 //! key and this window is what says so; and a read-only status, opened from
 //! Plaza's settings, which asks the daemon whose key it holds and shows it.
@@ -17,7 +17,7 @@ const std = @import("std");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
-const signet_icons = @import("signet_icons.zig");
+const notary_icons = @import("notary_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -186,7 +186,7 @@ const Effects = App.Effects;
 
 // ---------------------------------------------------------------- the palette
 //
-// Signet's own, stated as the design states it. Not design tokens: the ceremony
+// Notary's own, stated as the design states it. Not design tokens: the ceremony
 // window's whole job is to look like somewhere else, and a token set that tracks
 // Plaza's would quietly undo that on the next theme change.
 const C = canvas.Color;
@@ -195,7 +195,7 @@ const ink = struct {
     const border = C.rgb8(41, 48, 43);
     const hairline = C.rgb8(28, 33, 29);
     const chrome_text = C.rgb8(170, 181, 173);
-    const signet = C.rgb8(69, 193, 104);
+    const notary = C.rgb8(69, 193, 104);
     const title = C.rgb8(207, 216, 209);
     const body = C.rgb8(152, 162, 155);
     const field_bg = C.rgb8(14, 17, 15);
@@ -234,18 +234,18 @@ fn tokensFn(model: *const Model) canvas.DesignTokens {
     t.colors.text = ink.title;
     t.colors.text_muted = ink.body;
     t.colors.border = ink.border;
-    // The primary action is WHITE, not Signet green. Green here means identity:
+    // The primary action is WHITE, not Notary green. Green here means identity:
     // the mark, and the key that checked out. A green button would put the same
     // signal on "press this", and the one place a reader must not misread is the
     // button that hands over a key.
     t.colors.accent = ink.white;
     t.colors.accent_text = ink.on_white;
-    t.colors.focus_ring = ink.signet;
+    t.colors.focus_ring = ink.notary;
     return t;
 }
 
 fn boot(model: *Model, fx: *Effects) void {
-    canvas.icons.registerAppIcons(&signet_icons.app_icons);
+    canvas.icons.registerAppIcons(&notary_icons.app_icons);
     if (g_mode == .create_key) {
         model.stage = .minting;
         requestCreate(model, fx);
@@ -264,7 +264,7 @@ fn boot(model: *Model, fx: *Effects) void {
 fn requestCreate(model: *Model, fx: *Effects) void {
     if (g_token_len == 0) {
         model.stage = .failed;
-        setNotice(model, "Signet isn't running. Start Plaza first.");
+        setNotice(model, "Notary isn't running. Start Plaza first.");
         return;
     }
     var url_buf: [48]u8 = undefined;
@@ -287,7 +287,7 @@ fn requestCreate(model: *Model, fx: *Effects) void {
 fn requestStatus(model: *Model, fx: *Effects) void {
     if (g_token_len == 0) {
         model.stage = .failed;
-        setNotice(model, "Signet isn't running. Start Plaza first.");
+        setNotice(model, "Notary isn't running. Start Plaza first.");
         return;
     }
     var url_buf: [48]u8 = undefined;
@@ -341,7 +341,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!model.can_import(scratch.allocator())) return;
             if (g_token_len == 0) {
                 model.stage = .failed;
-                setNotice(model, "Signet isn't running. Start Plaza first.");
+                setNotice(model, "Notary isn't running. Start Plaza first.");
                 return;
             }
             model.stage = .importing;
@@ -379,9 +379,9 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 setNotice(model, if (response.status == 409)
                     "A key is already set up."
                 else if (response.outcome != .ok)
-                    "Signet isn't answering yet."
+                    "Notary isn't answering yet."
                 else
-                    "Signet could not make a key.");
+                    "Notary could not make a key.");
                 return;
             }
             _ = adoptPubkey(model, response.body);
@@ -397,9 +397,9 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (response.outcome != .ok or response.status != 200 or !adoptPubkey(model, response.body)) {
                 model.stage = .failed;
                 setNotice(model, if (response.outcome != .ok)
-                    "Signet isn't answering."
+                    "Notary isn't answering."
                 else
-                    "Signet is running, and holds no key yet.");
+                    "Notary is running, and holds no key yet.");
                 return;
             }
             model.stage = .holding;
@@ -416,11 +416,11 @@ fn view(ui: *AppUi, model: *const Model) AppUi.Node {
         rule(ui),
         switch (model.stage) {
             .paste => pasteView(ui, model),
-            .importing => waitingView(ui, "Handing your key to Signet"),
+            .importing => waitingView(ui, "Handing your key to Notary"),
             .minting => waitingView(ui, "Making your key"),
             .imported => importedView(ui, model),
             .made => madeView(ui, model),
-            .looking => waitingView(ui, "Asking Signet"),
+            .looking => waitingView(ui, "Asking Notary"),
             .holding => holdingView(ui, model),
             .failed => failedView(ui, model),
         },
@@ -433,11 +433,11 @@ fn view(ui: *AppUi, model: *const Model) AppUi.Node {
 
 fn titleBar(ui: *AppUi) AppUi.Node {
     return ui.row(.{ .height = 40, .cross = .center, .main = .center, .gap = 0 }, .{
-        ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = ink.signet } }, "signet"),
+        ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = ink.notary } }, "notary"),
         hgap(ui, 6),
         ui.paragraph(
             .{ .style = .{ .foreground = ink.chrome_text } },
-            &.{.{ .text = "Signet · Plaza", .monospace = true, .weight = .medium, .scale = px(11) }},
+            &.{.{ .text = "Notary · Plaza", .monospace = true, .weight = .medium, .scale = px(11) }},
         ),
     });
 }
@@ -496,7 +496,7 @@ fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
                 .{ .wrap = true, .style = .{ .foreground = ink.body } },
                 &.{
                     .{ .text = "This key goes to ", .scale = px(12.5) },
-                    .{ .text = "Signet", .weight = .bold, .color = .text, .scale = px(12.5) },
+                    .{ .text = "Notary", .weight = .bold, .color = .text, .scale = px(12.5) },
                     .{ .text = ", the separate process that holds it and does the signing. Plaza's own window never sees it.", .scale = px(12.5) },
                 },
             ),
@@ -676,9 +676,9 @@ fn importedView(ui: *AppUi, model: *const Model) AppUi.Node {
     return resultView(
         ui,
         model,
-        ui.icon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "check-circle"),
-        "Your key is in Signet",
-        "Signet holds it now and does the signing. Plaza asks; it never has the key.",
+        ui.icon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.notary } }, "check-circle"),
+        "Your key is in Notary",
+        "Notary holds it now and does the signing. Plaza asks; it never has the key.",
         "Continue to Plaza",
     );
 }
@@ -687,22 +687,22 @@ fn madeView(ui: *AppUi, model: *const Model) AppUi.Node {
     return resultView(
         ui,
         model,
-        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "signet"),
+        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.notary } }, "notary"),
         "Your identity is ready",
-        "Signet made the key and keeps it. Nothing to write down, nothing to remember.",
+        "Notary made the key and keeps it. Nothing to write down, nothing to remember.",
         "Continue to Plaza",
     );
 }
 
-/// What Signet holds, for a reader who came to look rather than to do anything.
+/// What Notary holds, for a reader who came to look rather than to do anything.
 /// The same shape as a finished ceremony, because it is the same fact: this
 /// process has the key, and here is whose it is.
 fn holdingView(ui: *AppUi, model: *const Model) AppUi.Node {
     return resultView(
         ui,
         model,
-        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.signet } }, "signet"),
-        "Signet is holding your key",
+        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.notary } }, "notary"),
+        "Notary is holding your key",
         "It signs when Plaza asks. The key is on this Mac, in this process, and has never been in Plaza.",
         "Close",
     );
@@ -770,7 +770,7 @@ fn readToken(io: std.Io, environ: *const std.process.Environ.Map) void {
 }
 
 /// `--create` selects the create ceremony, `--status` the read-only look at what
-/// Signet is holding, and anything else is the import. Read
+/// Notary is holding, and anything else is the import. Read
 /// through `std.process.Args`, because `std.os.argv` no longer exists.
 fn readMode(init: std.process.Init) void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -782,15 +782,15 @@ fn readMode(init: std.process.Init) void {
 }
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
-const shell_views = [_]native_sdk.ShellView{.{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Signet canvas", .accessibility_label = "Signet", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true }};
-const shell_windows = [_]native_sdk.ShellWindow{.{ .label = "main", .title = "Signet · Plaza", .width = window_width, .height = window_height, .restore_state = false, .views = &shell_views }};
+const shell_views = [_]native_sdk.ShellView{.{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true }};
+const shell_windows = [_]native_sdk.ShellWindow{.{ .label = "main", .title = "Notary · Plaza", .width = window_width, .height = window_height, .restore_state = false, .views = &shell_views }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub fn main(init: std.process.Init) !void {
     readToken(init.io, init.environ_map);
     readMode(init);
     const app_state = try App.create(std.heap.page_allocator, .{
-        .name = "signet-window",
+        .name = "notary-window",
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .init_fx = boot,
@@ -801,9 +801,9 @@ pub fn main(init: std.process.Init) !void {
     defer app_state.destroy();
     app_state.model = .{};
     try runner.runWithOptions(app_state.app(), .{
-        .app_name = "signet-window",
-        .window_title = "Signet · Plaza",
-        .bundle_id = "com.zig-nostr.signet-window",
+        .app_name = "notary-window",
+        .window_title = "Notary · Plaza",
+        .bundle_id = "com.zig-nostr.notary-window",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = false,
         .js_window_api = false,

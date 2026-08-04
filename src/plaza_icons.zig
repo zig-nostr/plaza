@@ -3,7 +3,7 @@
 //! the view's foreground token, and parsed once at comptime.
 //!
 //! Registered at boot with `canvas.icons.registerAppIcons(app_icons)` and drawn
-//! with `ui.appIcon(options, "reply" | "like" | "zap" | "signet" | "bell")`.
+//! with `ui.appIcon(options, "reply" | "like" | "zap" | "notary" | "bell")`.
 //!
 //! The redesign's icon set turned out to BE the SDK's built-in set (the same
 //! 24x24, stroke-2, round-cap dialect, exported with explicit closing tags), so
@@ -29,9 +29,9 @@ const bookmark_icon = svg_icon.parseComptime(@embedFile("icons/app-bookmark.svg"
 // A picture, for saying that a note carries one where the picture itself cannot
 // be drawn. Lucide's image, in the same dialect; the built-in set has none.
 const image_icon = svg_icon.parseComptime(@embedFile("icons/app-image.svg"));
-// The Signet mark: the signer's own boundary glyph, shown wherever a key
+// The Notary mark: the signer's own boundary glyph, shown wherever a key
 // ceremony or the signer's health is in question.
-const signet_icon = svg_icon.parseComptime(@embedFile("icons/app-signet.svg"));
+const notary_icon = svg_icon.parseComptime(@embedFile("icons/app-notary.svg"));
 // The notifications bell.
 const bell_icon = svg_icon.parseComptime(@embedFile("icons/app-bell.svg"));
 // The empty seat's ring. The icon dialect has no stroke-dasharray and the canvas
@@ -47,7 +47,7 @@ pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "zap", .icon = &zap_icon },
     .{ .name = "bookmark", .icon = &bookmark_icon },
     .{ .name = "image", .icon = &image_icon },
-    .{ .name = "signet", .icon = &signet_icon },
+    .{ .name = "notary", .icon = &notary_icon },
     .{ .name = "bell", .icon = &bell_icon },
     .{ .name = "dashed-ring", .icon = &dashed_ring_icon },
     .{ .name = "mark", .icon = &mark_icon },
