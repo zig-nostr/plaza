@@ -6,11 +6,11 @@ Plaza is the flagship app of the [zig-nostr](https://github.com/zig-nostr)
 ecosystem, a native Nostr client where you browse and post within two minutes
 and the feed renders from disk. It's built on the
 [`nostr`](https://github.com/zig-nostr/nostr) protocol library, and can sign
-through [Signet](https://github.com/zig-nostr/signet) so your key never enters a
+through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
 > **Status: early.** A first run opens a welcome screen: create an identity,
-> bring an existing key, or connect an external signer (Signet) over NIP-46 so
+> bring an existing key, or connect an external signer (Notary) over NIP-46 so
 > your key never touches the app. Either way you land in a follow-based feed
 > seeded by a curated starter pack, with real names, avatars and pictures,
 > rendered straight from a local store that a pool of background threads keeps

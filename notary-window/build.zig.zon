@@ -1,6 +1,6 @@
 .{
-    .name = .signet_window,
-    .fingerprint = 0xda252d886e911c64,
+    .name = .notary_window,
+    .fingerprint = 0x53888de214610451,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

@@ -1546,10 +1546,10 @@ test "a refused remote sign restores the lost draft to the composer" {
     try testing.expect(main.takePendingContentForTest("req-x") == null);
 }
 
-test "a Signet sign that fails hands the note back instead of eating it" {
+test "a Notary sign that fails hands the note back instead of eating it" {
     // The remote signer has had a pending slot, a deadline and a restore since
     // it shipped. The built-in one had none of it, and `signAndPublish` dropped
-    // the restorable flag on the way to it. So a Signet sign that failed for any
+    // the restorable flag on the way to it. So a Notary sign that failed for any
     // reason destroyed the note in silence: the composer was cleared, the draft
     // file deleted, the toast said "Posted", and the response handler returned on
     // its first line with no Model to give anything back to. Nothing was stored
@@ -1568,7 +1568,7 @@ test "a Signet sign that fails hands the note back instead of eating it" {
 
     // The press, driven from the composer so the signer DISPATCH is under test
     // too: it forwarded the restorable flag to the bunker and dropped it on the
-    // way to the built-in signer, which is why a note handed to Signet had
+    // way to the built-in signer, which is why a note handed to Notary had
     // nothing holding it even after the slot existed.
     model.draft_buffer.set(note);
     try testing.expect(main.submitPostForTest(&model, &fx));
@@ -1678,7 +1678,7 @@ test "a second sign in the same tick is refused, not swallowed" {
 
 test "the sign-out warning does not promise a backup that does not exist" {
     // It said "Back it up first if you want to keep this identity", pointing at
-    // a control that does not exist for a Signet key: the reveal card is gated
+    // a control that does not exist for a Notary key: the reveal card is gated
     // on a local key, the daemon's route table has no export and its own module
     // doc says no endpoint returns the secret, and the ceremony window tells the
     // reader there is nothing to write down. Since `createLocalIdentity` has no
@@ -2147,7 +2147,7 @@ test "every registered app icon resolves, so no view draws the missing glyph" {
     // The names Plaza's views ask for by `ui.appIcon`. A typo or a dropped
     // registration would silently draw the slashed-circle fallback in the app,
     // so the resolution is asserted here instead.
-    for ([_][]const u8{ "reply", "like", "zap", "signet", "bell", "mark" }) |name| {
+    for ([_][]const u8{ "reply", "like", "zap", "notary", "bell", "mark" }) |name| {
         try testing.expect(canvas.icons.resolve(name) != null);
     }
     // The built-in names the Working set reuses (the redesign's icon set is the
@@ -2662,8 +2662,8 @@ test "somebody you follow is in your graph however far down the list they are" {
     try testing.expect(main.inFollowGraph(main.activePubkeyForTest().?));
 }
 
-test "bringing a key through the Signet window signs you in after a sign-out" {
-    // The ceremony exits 0 for an import, so `handleSignetExited` reads it as
+test "bringing a key through the Notary window signs you in after a sign-out" {
+    // The ceremony exits 0 for an import, so `handleNotaryExited` reads it as
     // "not a mint" and signs nobody in: the daemon health check is the only thing
     // that carries the result back, and it opens with `if (g_logged_out) return`.
     //
@@ -2684,11 +2684,11 @@ test "bringing a key through the Signet window signs you in after a sign-out" {
     main.setIdentityForTest([_]u8{0xe3} ** 32);
     main.performLogoutForTest(&model, &fx);
     try testing.expect(main.loggedOutForTest());
-    // The real message, through the real handler. With no Signet window found,
+    // The real message, through the real handler. With no Notary window found,
     // `ceremonyCanTakeKey` is false and the arm takes its fallback rung without
     // touching `Effects`, which is why the latch clear sits above the branch.
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
-    main.update(&model, .open_signet_import, &fx);
+    main.update(&model, .open_notary_import, &fx);
     try testing.expect(!main.loggedOutForTest());
     try testing.expectEqual(main.Stage.onboarding, model.stage);
 }
@@ -6500,7 +6500,7 @@ test "a write that would drop more names than the press implies is refused" {
 }
 
 test "a second follow before the signer answers does not undo the first" {
-    // `writeFollow` takes its base from the store, and a bunker or a Signet key
+    // `writeFollow` takes its base from the store, and a bunker or a Notary key
     // does not write the store until the signer answers: one to five seconds,
     // longer with an approval prompt in front of a human. Two presses inside
     // that window both read the SAME pre-press list, so the second published a
@@ -8379,7 +8379,7 @@ test "a ceremony that did not mint arms nothing" {
         main.setCeremonyForTest(.running);
         var model = main.initialModel();
         model.stage = .ready;
-        main.handleSignetExitedForTest(&model, exit);
+        main.handleNotaryExitedForTest(&model, exit);
         try testing.expect(!model.naming);
         // And it must not claim the key has no history: that flag is what lets a
         // contact list be published without reading one back first.
@@ -8391,7 +8391,7 @@ test "a ceremony that did not mint arms nothing" {
         main.setCeremonyForTest(.running);
         var model = main.initialModel();
         model.stage = .ready;
-        main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+        main.handleNotaryExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
         try testing.expect(model.toast_until != 0);
     }
 }
@@ -8411,7 +8411,7 @@ test "a mint confirmed after the poll still gets its name beat" {
     main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
     try testing.expect(!model.naming);
 
-    main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .exited, .code = 9 });
+    main.handleNotaryExitedForTest(&model, .{ .key = 0, .reason = .exited, .code = 9 });
     try testing.expect(model.naming);
     try testing.expect(main.identityMintedForTest());
 }
@@ -8441,7 +8441,7 @@ test "a key that was never made never claims to have no history" {
     // And choosing the other rung disclaims it outright.
     main.setIdentityMintedForTest(true);
     main.setCeremonyForTest(.running);
-    main.update(&model, .open_signet_import, &fx);
+    main.update(&model, .open_notary_import, &fx);
     try testing.expect(!main.identityMintedForTest());
 }
 
@@ -8876,12 +8876,12 @@ test "with no keyholder the create rung says why and stops being a button" {
     try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
 
     // The two rungs that still work are untouched, and bringing a key gives up
-    // its Signet promise, because with no daemon the paste lands in this
+    // its Notary promise, because with no daemon the paste lands in this
     // process. Copy that sells isolation over a field that does not have it is
     // the lie this app can least afford.
     try testing.expect(pressableByLabel(tree, tree.root, "Bring your key"));
     try testing.expect(pressableByLabel(tree, tree.root, "Use your own signer"));
-    try testing.expect(findAnyText(tree.root, "Goes into Signet. Plaza itself never sees it.") == null);
+    try testing.expect(findAnyText(tree.root, "Goes into Notary. Plaza itself never sees it.") == null);
     try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") != null);
 }
 
@@ -8906,30 +8906,30 @@ test "with no keyholder nothing queues a mint that can never fire" {
 
 test "with no keyholder a pasted key goes to the field, not to a window that cannot take it" {
     main.clearIdentityForTest();
-    defer main.setSignetWindowFoundForTest(false);
+    defer main.setNotaryWindowFoundForTest(false);
 
     // The window is only the right destination when there is something behind
     // it. Three of these four are the in-Plaza field.
-    main.setSignetWindowFoundForTest(true);
+    main.setNotaryWindowFoundForTest(true);
     main.setKeyholderMissingForTest(false);
     try testing.expect(main.ceremonyCanTakeKeyForTest());
     main.setKeyholderMissingForTest(true);
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
-    main.setSignetWindowFoundForTest(false);
+    main.setNotaryWindowFoundForTest(false);
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
     main.setKeyholderMissingForTest(false);
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
 
     // And the branch that reads it lands somewhere the reader can actually
     // finish: window present, keyholder absent, so the paste goes to the field.
-    main.setSignetWindowFoundForTest(true);
+    main.setNotaryWindowFoundForTest(true);
     main.setKeyholderMissingForTest(true);
     defer main.setKeyholderMissingForTest(false);
     var model = main.initialModel();
     model.stage = .ready;
     model.joining = true;
     var fx: main.EffectsForTest = undefined;
-    main.update(&model, .open_signet_import, &fx);
+    main.update(&model, .open_notary_import, &fx);
     try testing.expect(model.stage == .onboarding);
 }
 
@@ -9100,11 +9100,11 @@ test "the dead rung stops looking like it works" {
     }
 }
 
-test "a restored Signet session on an install with no Signet says so, and does not say starting" {
+test "a restored Notary session on an install with no Notary says so, and does not say starting" {
     // The reader this is for signed in on a working install and updated into a
     // broken one: `restoreSession` runs BEFORE the probe, so they are signed
     // straight back in and the status bar is the only thing that can tell them.
-    // "Signet starting" is what an unwritten health state reads as, and it is a
+    // "Notary starting" is what an unwritten health state reads as, and it is a
     // word that means wait a moment about a condition that never resolves.
     main.setIdentityForTest([_]u8{0x3C} ** 32);
     defer main.clearIdentityForTest();
@@ -9113,7 +9113,7 @@ test "a restored Signet session on an install with no Signet says so, and does n
     defer main.setKeyholderMissingForTest(false);
 
     try testing.expect(!main.signerIsHealthy());
-    try testing.expectEqualStrings("Signet is not installed", main.signerStatusLabelForTest());
+    try testing.expectEqualStrings("Notary is not installed", main.signerStatusLabelForTest());
 }
 
 test "a queued note belongs to the account that wrote it, and to nobody else" {
@@ -10656,7 +10656,7 @@ test "a link preview stays inside the card, however long the page's description"
     main.setLinkPreviewForTest(
         url,
         "github.com",
-        "Signet is Notary by sepehr-safari, Pull Request #35, zig-nostr/notary",
+        "Notary is Notary by sepehr-safari, Pull Request #35, zig-nostr/notary",
         "A native remote signer (NIP-46 bunker) for Nostr. Your key stays on a machine you control; every signing request is approved by you, and nothing else ever holds it.",
     );
 
@@ -10793,7 +10793,7 @@ test "a quote card with nothing to read is not a blank card" {
 
 // ---- P13: a door to the thing holding the key --------------------------------
 
-test "Settings offers a look at Signet, and only when there is one to look at" {
+test "Settings offers a look at Notary, and only when there is one to look at" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -10801,43 +10801,43 @@ test "Settings offers a look at Signet, and only when there is one to look at" {
     main.setIdentityForTest([_]u8{0x77} ** 32);
     defer main.clearIdentityForTest();
     defer main.setSignerKindForTest("local");
-    defer main.setSignetWindowFoundForTest(false);
+    defer main.setNotaryWindowFoundForTest(false);
 
     var model = main.initialModel();
     model.stage = .settings;
 
-    // Signet holds the key and the window is installed beside Plaza: the row
+    // Notary holds the key and the window is installed beside Plaza: the row
     // that says so gets a way to go and look.
     main.setSignerKindForTest("helper");
-    main.setSignetWindowFoundForTest(true);
+    main.setNotaryWindowFoundForTest(true);
     {
         const p = try painted.Painted.render(arena, &model);
-        const msg = pressMsgByLabel(p.tree, "Open Signet") orelse {
-            std.debug.print("no way to open Signet from Settings\n", .{});
+        const msg = pressMsgByLabel(p.tree, "Open Notary") orelse {
+            std.debug.print("no way to open Notary from Settings\n", .{});
             return error.NoDoor;
         };
-        try testing.expectEqualStrings(@tagName(Msg.open_signet_window), @tagName(msg));
+        try testing.expectEqualStrings(@tagName(Msg.open_notary_window), @tagName(msg));
     }
 
     // A remote signer is somebody else's process on somebody else's machine, so
-    // Signet has nothing to show about it.
+    // Notary has nothing to show about it.
     main.setSignerKindForTest("remote");
     {
         const p = try painted.Painted.render(arena, &model);
-        try testing.expect(p.frameOf("Open Signet") == null);
+        try testing.expect(p.frameOf("Open Notary") == null);
     }
 
     // And an install that arrived without the window must not offer a press that
     // opens nothing, which is the whole class of fault this release is about.
     main.setSignerKindForTest("helper");
-    main.setSignetWindowFoundForTest(false);
+    main.setNotaryWindowFoundForTest(false);
     {
         const p = try painted.Painted.render(arena, &model);
-        try testing.expect(p.frameOf("Open Signet") == null);
+        try testing.expect(p.frameOf("Open Notary") == null);
     }
 }
 
-test "a second Signet window is refused out loud, ceremony or not" {
+test "a second Notary window is refused out loud, ceremony or not" {
     // The toast used to be said only while a CEREMONY was running, because that
     // was the only thing that could spawn this window. Opening it from Settings
     // twice was a press that did nothing, silently, which is exactly what the
@@ -10853,7 +10853,7 @@ test "a second Signet window is refused out loud, ceremony or not" {
         main.setCeremonyForTest(if (std.mem.eql(u8, state, "running")) .running else .none);
         var model = main.initialModel();
         model.stage = .ready;
-        main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+        main.handleNotaryExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
         if (model.toast_until == 0) {
             std.debug.print("a refused spawn said nothing with the ceremony {s}\n", .{state});
             return error.SilentRefusal;
@@ -10867,9 +10867,9 @@ test "a second Signet window is refused out loud, ceremony or not" {
     main.setCeremonyForTest(.none);
     var model = main.initialModel();
     model.stage = .settings;
-    main.handleSignetExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
+    main.handleNotaryExitedForTest(&model, .{ .key = 0, .reason = .rejected, .code = 0 });
     const p = try painted.Painted.render(arena, &model);
-    if (findAnyText(p.tree.root, "A Signet window is already open") == null) {
+    if (findAnyText(p.tree.root, "A Notary window is already open") == null) {
         std.debug.print("the refusal is in the model but not on the screen\n", .{});
         return error.ToastNotDrawn;
     }

@@ -2,7 +2,7 @@
 //!
 //! A first run opens a welcome screen with three ways in: create a fresh
 //! identity, paste an existing `nsec` to import a key, or paste a `bunker://`
-//! link to connect an external signer (Signet) over NIP-46 so the secret key
+//! link to connect an external signer (Notary) over NIP-46 so the secret key
 //! never enters Plaza. The choice is persisted as a session, so a returning user
 //! is signed straight back in (a local key from disk, or a silent bunker
 //! reconnect). A Settings screen shows who you are signed in as, lets a local
@@ -1987,7 +1987,7 @@ var g_last_count: usize = std.math.maxInt(usize);
 // thread, and read only there, so no synchronisation is needed. The signer holds
 // a secp256k1 context (not shared across threads); the publish path never signs,
 // it forwards an already-signed event, so it needs neither. This is the
-// zero-config local signer; connecting an external signer (Signet, over NIP-46,
+// zero-config local signer; connecting an external signer (Notary, over NIP-46,
 // so the key never touches the client) is the next onboarding option, and swaps
 // in at `signAndPublish` below.
 var g_identity_signer: ?nostr.keys.Signer = null;
@@ -1996,7 +1996,7 @@ var g_identity_npub_buf: [24]u8 = undefined;
 var g_identity_npub_len: usize = 0;
 
 // How composed notes are signed: with the local key, or remotely over NIP-46 by
-// an external signer (Signet) so the secret key never enters Plaza. `submitPost`
+// an external signer (Notary) so the secret key never enters Plaza. `submitPost`
 // branches on this; it is set once during onboarding.
 const SignerKind = enum { local, remote, helper };
 var g_signer_kind: SignerKind = .local;
@@ -2022,7 +2022,7 @@ var g_req_counter = std.atomic.Value(u64).init(0);
 // plaza-signer holds the key in a separate PROCESS, reached over loopback HTTP.
 // Plaza spawns it at launch, writes it a 0600 bearer token, and (for now)
 // health-checks it; routing the actual signing through it comes next. The port
-// is Plaza-specific (not signet's 8787), so a standalone Signet and the
+// is Plaza-specific (not notary's 8787), so a standalone Notary and the
 // built-in one never collide.
 const helper_port: u16 = 8790;
 const helper_spawn_key: u64 = 40;
@@ -2130,7 +2130,7 @@ pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
     return exeDir(io, buf);
 }
 
-/// Adopts the Signet signer kind for the active test identity, so the status
+/// Adopts the Notary signer kind for the active test identity, so the status
 /// line can be asked what it says about a daemon that is not there.
 pub fn setSignerKindHelperForTest() void {
     g_signer_kind = .helper;
@@ -2185,11 +2185,11 @@ fn resolveHelper(init: std.process.Init) void {
     }) catch return;
 }
 
-// The Signet ceremony window binary. In a packaged app it sits beside Plaza in
+// The Notary ceremony window binary. In a packaged app it sits beside Plaza in
 // Contents/MacOS; in the dev tree it is the sub-project's own build output.
-var g_signet_win_buf: [1024]u8 = undefined;
-var g_signet_win_len: usize = 0;
-const signet_spawn_key: u64 = 44;
+var g_notary_win_buf: [1024]u8 = undefined;
+var g_notary_win_len: usize = 0;
+const notary_spawn_key: u64 = 44;
 const helper_reset_key: u64 = 45;
 // Set on logout, so the health-check does not re-adopt the daemon's key before
 // the async /reset lands. Cleared when the user explicitly signs in again.
@@ -2218,24 +2218,24 @@ var g_logout_reset_tries: u8 = 0;
 /// is reachable. The health-check that notices only has the response.
 var g_logout_reset_due: bool = false;
 
-fn resolveSignetWindow(init: std.process.Init) void {
+fn resolveNotaryWindow(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return;
     // Packaged: a sibling. Dev: the sub-project's own zig-out, because unlike
     // the daemon it is built by a separate build.zig and never lands in Plaza's
     // bin directory. Sibling first, that being the shipped layout.
-    g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "signet-window");
-    if (g_signet_win_len != 0) return;
-    g_signet_win_len = resolveSibling(init.io, &g_signet_win_buf, dir, "../../signet-window/zig-out/bin/signet-window");
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "notary-window");
+    if (g_notary_win_len != 0) return;
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "../../notary-window/zig-out/bin/notary-window");
 }
 
-/// Whether there is a Signet holding this account's key AND a window to show it
+/// Whether there is a Notary holding this account's key AND a window to show it
 /// in. Both halves matter: a remote signer is somebody else's process on
-/// somebody else's machine and Signet has nothing to say about it, and an
+/// somebody else's machine and Notary has nothing to say about it, and an
 /// install that arrived without the window would offer a press that opens
 /// nothing.
-pub fn openSignetAvailable() bool {
-    return g_signer_kind == .helper and g_signet_win_len > 0;
+pub fn openNotaryAvailable() bool {
+    return g_signer_kind == .helper and g_notary_win_len > 0;
 }
 
 /// Whether the ceremony window is the right place to take a pasted key. Not
@@ -2244,14 +2244,14 @@ pub fn openSignetAvailable() bool {
 /// keyholder it is a window that can only fail, over a key the reader typed
 /// correctly. The in-Plaza field is the honest destination then.
 fn ceremonyCanTakeKey() bool {
-    return g_signet_win_len > 0 and !keyholderMissing();
+    return g_notary_win_len > 0 and !keyholderMissing();
 }
 
 pub fn ceremonyCanTakeKeyForTest() bool {
     return ceremonyCanTakeKey();
 }
 
-/// Pretends the key is held by Signet, by a remote signer, or by Plaza itself.
+/// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
 pub fn setSignerKindForTest(kind: []const u8) void {
     g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
         .helper
@@ -2262,9 +2262,9 @@ pub fn setSignerKindForTest(kind: []const u8) void {
 }
 
 /// Pretends the ceremony window was (or was not) found beside Plaza.
-pub fn setSignetWindowFoundForTest(found: bool) void {
-    g_signet_win_len = if (found) "/nonexistent/signet-window".len else 0;
-    if (found) @memcpy(g_signet_win_buf[0.."/nonexistent/signet-window".len], "/nonexistent/signet-window");
+pub fn setNotaryWindowFoundForTest(found: bool) void {
+    g_notary_win_len = if (found) "/nonexistent/notary-window".len else 0;
+    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary-window".len], "/nonexistent/notary-window");
 }
 
 /// Whether a helper setup is sitting queued, waiting for the daemon to answer.
@@ -2272,13 +2272,13 @@ pub fn helperSetupQueuedForTest() bool {
     return g_helper_setup != .none;
 }
 
-/// What the Signet window is being opened for. `status` is not a ceremony at
+/// What the Notary window is being opened for. `status` is not a ceremony at
 /// all: it makes no key, takes none and resets none, it only asks the daemon
 /// what it is holding. It shares the spawn key with the two that are ceremonies,
-/// so there is never more than one Signet window on screen.
+/// so there is never more than one Notary window on screen.
 const Ceremony = enum { import_key, create_key, status };
 
-/// Opens the Signet ceremony window: a separate process, so key material never
+/// Opens the Notary ceremony window: a separate process, so key material never
 /// enters Plaza on either path. The window reads the token itself and talks to
 /// the daemon; Plaza adopts the identity when the key appears (see
 /// handleHelperPubkey).
@@ -2288,36 +2288,36 @@ const Ceremony = enum { import_key, create_key, status };
 /// that made the request can tell a key it just minted from a key that was
 /// already sitting in the daemon: a window watching /pubkey sees "ready" either
 /// way, and would introduce somebody's leftover key as the reader's new identity.
-fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
-    if (g_signet_win_len == 0) return;
-    const bin = g_signet_win_buf[0..g_signet_win_len];
+fn spawnNotaryWindow(fx: *Effects, ceremony: Ceremony) void {
+    if (g_notary_win_len == 0) return;
+    const bin = g_notary_win_buf[0..g_notary_win_len];
     // Two calls rather than one with a computed argv: `&.{...}` over runtime
     // values is a pointer to a temporary, and handing the effect layer one that
     // outlives its scope is the kind of bug that shows up as a garbled argv on
     // somebody else's machine.
     // `on_exit` is not optional here. The SDK REJECTS a spawn whose key already
     // has a live process, and a rejection is reported through this callback and
-    // nowhere else: without it, pressing "Create your identity" while a Signet
+    // nowhere else: without it, pressing "Create your identity" while a Notary
     // window is already open did nothing at all, silently, and left the reader on
     // the guest feed having pressed the app's primary call to action.
     switch (ceremony) {
         .import_key => fx.spawn(.{
-            .key = signet_spawn_key,
+            .key = notary_spawn_key,
             .argv = &.{bin},
             .output = .collect,
-            .on_exit = Effects.exitMsg(.signet_exited),
+            .on_exit = Effects.exitMsg(.notary_exited),
         }),
         .create_key => fx.spawn(.{
-            .key = signet_spawn_key,
+            .key = notary_spawn_key,
             .argv = &.{ bin, "--create" },
             .output = .collect,
-            .on_exit = Effects.exitMsg(.signet_exited),
+            .on_exit = Effects.exitMsg(.notary_exited),
         }),
         .status => fx.spawn(.{
-            .key = signet_spawn_key,
+            .key = notary_spawn_key,
             .argv = &.{ bin, "--status" },
             .output = .collect,
-            .on_exit = Effects.exitMsg(.signet_exited),
+            .on_exit = Effects.exitMsg(.notary_exited),
         }),
     }
 }
@@ -2327,7 +2327,7 @@ fn spawnSignetWindow(fx: *Effects, ceremony: Ceremony) void {
 /// Every route out of the window lands here: a mint, an import, a cancel, a
 /// failure, a crash, and a spawn that never started because one was already
 /// running. Only the first arms the name beat.
-fn handleSignetExited(model: *Model, e: native_sdk.EffectExit) void {
+fn handleNotaryExited(model: *Model, e: native_sdk.EffectExit) void {
     const was_running = g_ceremony;
     g_ceremony = .none;
 
@@ -2335,9 +2335,9 @@ fn handleSignetExited(model: *Model, e: native_sdk.EffectExit) void {
         // A window is already open. Say so, whatever was being opened: a
         // rejection only ever follows a press, and an unanswered press is the
         // thing this whole list of fixes is about. It used to be said only while
-        // a CEREMONY was running, so pressing "Open Signet" twice was silent.
+        // a CEREMONY was running, so pressing "Open Notary" twice was silent.
         if (was_running == .running) g_ceremony_adopted = false;
-        setToast(model, "A Signet window is already open");
+        setToast(model, "A Notary window is already open");
         return;
     }
 
@@ -2445,9 +2445,9 @@ fn pollHelper(fx: *Effects) void {
     if (g_helper_token_len == 0) return;
     // Signed OUT, this proves the IPC at startup and catches a key appearing
     // later (a terminal or window import), so Plaza adopts it live: poll every
-    // tick. Signed IN, the status bar now reports whether Signet can actually
+    // tick. Signed IN, the status bar now reports whether Notary can actually
     // sign, and a stale flag there would be a chip that lies, so keep polling,
-    // slowly. Only for a Signet identity: a local key or a bunker has nothing on
+    // slowly. Only for a Notary identity: a local key or a bunker has nothing on
     // the other end of this socket.
     if (activePubkey() != null) {
         if (g_signer_kind != .helper) return;
@@ -2606,7 +2606,7 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
 //
 // The remote signer has had a pending table, a deadline and a restore since the
 // day it shipped. The helper had none of it, and `signAndPublish` dropped the
-// `restorable` flag on the way to it, so a Signet sign that failed for any
+// `restorable` flag on the way to it, so a Notary sign that failed for any
 // reason destroyed the note in silence: `submitPost` clears the composer, the
 // press deletes ~/.plaza/draft, the toast says "Posted", and the response
 // handler returned on its first line without a Model to restore anything into.
@@ -2885,7 +2885,7 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     }
 }
 
-/// Starts making a key, in the Signet window when there is one.
+/// Starts making a key, in the Notary window when there is one.
 ///
 /// The fallback is not a lesser version of the same thing, it is the path this
 /// app shipped with: Plaza asks the daemon directly and the daemon mints. The
@@ -2903,7 +2903,7 @@ fn beginCreate(fx: *Effects) void {
     // so without this the reader's press is swallowed whole and the sheet closes
     // over nothing.
     if (keyholderMissing()) return;
-    if (g_signet_win_len == 0) {
+    if (g_notary_win_len == 0) {
         queueHelperSetup(fx, .create, null);
         return;
     }
@@ -2913,7 +2913,7 @@ fn beginCreate(fx: *Effects) void {
     g_logged_out = false;
     g_ceremony = .running;
     g_ceremony_adopted = false;
-    spawnSignetWindow(fx, .create_key);
+    spawnNotaryWindow(fx, .create_key);
 }
 
 /// Deletes the legacy in-process key file, once its secret is safe in the daemon.
@@ -3578,7 +3578,7 @@ pub fn urlDomain(url: []const u8) []const u8 {
 ///     to a host of the note author's choosing.
 ///   - No private, loopback or link-local address, and no name without a dot.
 ///     A note must not be able to make every reader's machine probe their own
-///     network. Signet's approval API listens on 127.0.0.1 in this very session.
+///     network. Notary's approval API listens on 127.0.0.1 in this very session.
 ///   - The default port only, so a note cannot aim the reader at a service.
 ///
 /// It cannot stop a redirect INTO one of those (the runtime follows up to
@@ -5877,7 +5877,7 @@ pub const Model = struct {
     // `.settings` is reached from the feed and returns to it.
     stage: Stage = .onboarding,
     // The onboarding sign-in field: an existing `nsec` to import a key, or a
-    // `bunker://` URL to pair with an external NIP-46 signer (Signet).
+    // `bunker://` URL to pair with an external NIP-46 signer (Notary).
     login_buffer: canvas.TextBuffer(220) = .{},
     // Settings: whether the "log out" confirmation is showing, and whether the
     // local secret key is revealed for backup.
@@ -6096,7 +6096,7 @@ pub const Model = struct {
         // The built-in signer, which is a separate process on loopback and can
         // refuse, be busy, or not be running at all.
         if (g_signer_kind == .helper and g_helper_sign_notice.load(.acquire))
-            return "Signet could not sign that. Draft restored, try again.";
+            return "Notary could not sign that. Draft restored, try again.";
         if (g_identity_npub_len == 0) return "Preparing your key…";
         // Show the user's own display name once their kind:0 is known, else npub.
         var who: []const u8 = g_identity_npub_buf[0..g_identity_npub_len];
@@ -6133,7 +6133,7 @@ pub const Model = struct {
     /// The line under the welcome screen's create button.
     pub fn create_hint(self: *const Model) []const u8 {
         _ = self;
-        if (keyholderMissing()) return "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it, or bring a key you already have.";
+        if (keyholderMissing()) return "Notary, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it, or bring a key you already have.";
         return "A second to set up. No email, no signup.";
     }
     /// The welcome screen's opening line, which normally sells making a key.
@@ -6177,7 +6177,7 @@ pub const Model = struct {
         return switch (g_signer_kind) {
             .local => "Local key",
             .remote => "Remote signer",
-            .helper => "Signet",
+            .helper => "Notary",
         };
     }
     /// Whether the identity is a local key (so its secret can be backed up here).
@@ -6224,7 +6224,7 @@ pub const Model = struct {
             // and it is gated on exactly this kind.
             .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
-            // Signet held it, and Signet is asked to forget it. The two cases
+            // Notary held it, and Notary is asked to forget it. The two cases
             // are not the same thing and used to share one sentence that was
             // false for both.
             //
@@ -6237,9 +6237,9 @@ pub const Model = struct {
             // has no callers, minted here is what every new identity is. Saying
             // so is the least this can do until there is a real way to save one.
             .helper => if (g_identity_minted_here)
-                "Signet made this key and it exists nowhere else. Signing out deletes it for good: your notes stay on relays, but nothing will ever be able to post, reply or edit your profile as this account again."
+                "Notary made this key and it exists nowhere else. Signing out deletes it for good: your notes stay on relays, but nothing will ever be able to post, reply or edit your profile as this account again."
             else
-                "Your key will be removed from Signet on this device. You can sign in again with the same key.",
+                "Your key will be removed from Notary on this device. You can sign in again with the same key.",
         };
     }
     /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
@@ -6257,17 +6257,17 @@ pub const Model = struct {
         return switch (g_signer_kind) {
             .local => "Signing with a local key",
             .remote => "Signing via a remote signer",
-            .helper => "Signing via Signet",
+            .helper => "Signing via Notary",
         };
     }
-    /// Whether Signet is what holds this account's key, and whether there is a
+    /// Whether Notary is what holds this account's key, and whether there is a
     /// window to show it in. Both halves matter: a remote signer is somebody
-    /// else's process on somebody else's machine and Signet has nothing to say
+    /// else's process on somebody else's machine and Notary has nothing to say
     /// about it, and an install that arrived without the window would offer a
     /// press that opens nothing.
-    pub fn can_open_signet(self: *const Model) bool {
+    pub fn can_open_notary(self: *const Model) bool {
         _ = self;
-        return openSignetAvailable();
+        return openNotaryAvailable();
     }
     /// Where the key actually is, which is the part worth knowing.
     pub fn signer_sub(self: *const Model) []const u8 {
@@ -6275,7 +6275,7 @@ pub const Model = struct {
         return switch (g_signer_kind) {
             .local => "The key is on this Mac, in this app.",
             .remote => "The key never leaves your signer. Plaza asks it to sign.",
-            .helper => "The key is held by Signet on this Mac, not by Plaza.",
+            .helper => "The key is held by Notary on this Mac, not by Plaza.",
         };
     }
     /// Whether the app is allowed to fetch what a note names.
@@ -8773,9 +8773,9 @@ pub const Msg = union(enum) {
     close_join,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
-    /// The sheet's import path: open the Signet window (a separate process),
+    /// The sheet's import path: open the Notary window (a separate process),
     /// so a pasted key never enters Plaza. The remembered intent survives.
-    open_signet_import,
+    open_notary_import,
     /// Leave the join screen back to the feed; reading never needs an identity.
     keep_browsing,
     /// The join sheet's "Use your own signer": go to the focused bunker input.
@@ -8877,7 +8877,7 @@ pub const Msg = union(enum) {
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
     helper_exited: native_sdk.EffectExit,
-    signet_exited: native_sdk.EffectExit,
+    notary_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
     /// A /setup (create) answered: adopt the new helper identity.
@@ -8921,8 +8921,8 @@ pub const Msg = union(enum) {
     copy_note_text: i64,
     /// Put the mention picker away without choosing anybody.
     close_mentions,
-    /// Open the Signet window on what it is holding, from Settings.
-    open_signet_window,
+    /// Open the Notary window on what it is holding, from Settings.
+    open_notary_window,
     /// Toggle a like on a note (by id): publish a kind:7 reaction, or a kind:5
     /// deletion to un-like. A guest press is remembered and routed to the join.
     like: i64,
@@ -8952,7 +8952,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_signet_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "signet_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_signet_window", "copy_note_text", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -9135,7 +9135,7 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
     // What holds the key, said as a fact about this machine rather than as a
     // badge. The dot is green only for a signer that is answering.
     // The dot reports the signer. Painting it green unconditionally would say
-    // "this is working" while a dead Signet daemon quietly refused every note.
+    // "this is working" while a dead Notary daemon quietly refused every note.
     const signer_state = signerStatus();
     const signer_healthy = signerIsHealthy();
     rows[n] = ui.row(.{ .cross = .center, .gap = 0 }, .{
@@ -9148,7 +9148,7 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.column(.{ .gap = 0, .grow = 1 }, .{
             // The line says what signs for you; the sub-line says how that is
             // going. When the signer is unhealthy its own words take the
-            // sub-line, because "Signet unreachable" is the thing worth reading
+            // sub-line, because "Notary unreachable" is the thing worth reading
             // and a fixed reassurance underneath it would be a lie.
             ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = model.signer_line(), .weight = .medium, .scale = menu_scale }}),
             vgap(ui, 2),
@@ -9164,10 +9164,10 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
         // confirmation about removing your key is the dishonest option.
         //
         // What DOES belong in that seat is a way to go and look at the thing this
-        // row is a sentence about. Signet is a separate process holding the key
+        // row is a sentence about. Notary is a separate process holding the key
         // this account is, and until now the only time a reader ever saw it was
         // the few seconds of the ceremony that made the key.
-        if (model.can_open_signet()) settingsLink(ui, "Open Signet", Msg.open_signet_window) else ui.spacer(0),
+        if (model.can_open_notary()) settingsLink(ui, "Open Notary", Msg.open_notary_window) else ui.spacer(0),
     });
     n += 1;
 
@@ -9737,7 +9737,7 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
         }
         // The toast rides over Settings as well as over the feed. It was gated on
         // the feed alone, from when nothing in Settings could raise one; the
-        // "Open Signet" control can, and its whole job on a refused press is to
+        // "Open Notary" control can, and its whole job on a refused press is to
         // say why nothing happened. A message that only appears on a screen the
         // reader is not looking at is the silent press it exists to prevent.
         if (model.toast_until != 0) {
@@ -10441,7 +10441,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
                 if (keyholderMissing())
                     ui.paragraph(
                         .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                        &.{.{ .text = "Signet, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
+                        &.{.{ .text = "Notary, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
                     )
                 else
                     ui.spacer(0),
@@ -10449,17 +10449,17 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
                 joinLabel(ui, "ALREADY ON NOSTR"),
                 vgap(ui, 6),
                 // Bringing a key still works with no keyholder: the paste lands
-                // in this process instead (see `.open_signet_import`). It is a
+                // in this process instead (see `.open_notary_import`). It is a
                 // weaker promise than the one this line normally makes, so the
-                // line changes with it. Selling Signet's isolation and then
+                // line changes with it. Selling Notary's isolation and then
                 // taking the nsec into a Plaza text field would be the copy
                 // lying about where the key went.
                 if (keyholderMissing())
-                    joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_signet_import, false)
+                    joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_notary_import, false)
                 else
-                    joinCard(ui, "download", false, "Bring your key", "Goes into Signet. Plaza itself never sees it.", .open_signet_import, false),
+                    joinCard(ui, "download", false, "Bring your key", "Goes into Notary. Plaza itself never sees it.", .open_notary_import, false),
                 vgap(ui, 8),
-                joinCard(ui, "signet", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+                joinCard(ui, "notary", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
                 vgap(ui, 13),
                 ui.row(.{ .cross = .center, .gap = 0 }, .{
                     ui.el(.list_item, .{
@@ -12504,7 +12504,7 @@ fn countPeople(tags: []const nostr.event.Tag) usize {
 
 // The contact list this app has SIGNED but has not seen come back yet.
 //
-// `writeFollow` takes its base from the store, and for a bunker or a Signet key
+// `writeFollow` takes its base from the store, and for a bunker or a Notary key
 // the store is not written until the signer answers: one to five seconds, longer
 // with an approval prompt in front of a human. Two follow presses inside that
 // window both read the SAME pre-press list, so the second one publishes a list
@@ -12561,7 +12561,7 @@ fn releasePendingFollowBase(stored_at: i64) void {
     clearPendingFollowBase();
 }
 
-/// Puts the app in the state a bunker or a Signet key leaves it in: a contact
+/// Puts the app in the state a bunker or a Notary key leaves it in: a contact
 /// list signed, handed to the signer, and not yet in the store. That gap cannot
 /// be driven from a test, because the async paths need a live `Effects`, so the
 /// state they produce is set up directly and the write is then driven for real.
@@ -15095,12 +15095,12 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     });
     rows[1] = menuSeparator(ui);
     var n: usize = 2;
-    // The chip this menu hangs off says "Signet ready", so the way to Signet
+    // The chip this menu hangs off says "Notary ready", so the way to Notary
     // belongs here as well as in Settings: this is where a reader looks when
     // they are wondering about their signer, because it is the thing that just
     // told them about it.
-    if (openSignetAvailable()) {
-        rows[n] = menuRow(ui, "Open Signet", null, null, .open_signet_window);
+    if (openNotaryAvailable()) {
+        rows[n] = menuRow(ui, "Open Notary", null, null, .open_notary_window);
         n += 1;
     }
     rows[n] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
@@ -15301,7 +15301,7 @@ fn signerZone(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const guest = model.is_guest();
     // Name the signer that is actually in use, and say whether it can sign right
-    // now. Claiming "Signet ready" for a local key or an unreachable bunker would
+    // now. Claiming "Notary ready" for a local key or an unreachable bunker would
     // be a chip that lies about where the reader's key lives.
     const signer = signerStatus();
     return ui.stack(.{}, .{
@@ -15363,29 +15363,29 @@ pub fn signerIsHealthy() bool {
 fn signerStatus() SignerStatus {
     const p = theme.palette;
     return switch (g_signer_kind) {
-        // Signet: a separate process, so its health is a real question.
+        // Notary: a separate process, so its health is a real question.
         //
         // Not installed is its own answer, ahead of the state machine. A session
-        // restored onto an install with no Signet in it signs back in before the
+        // restored onto an install with no Notary in it signs back in before the
         // probe has even run, and "unreachable" would send that reader looking
         // for a daemon that has crashed or a port that is busy. Nothing is
         // coming up; the install is short a file.
         .helper => if (keyholderMissing())
-            .{ .label = "Signet is not installed", .glyph = "signet", .color = p.status_warning }
+            .{ .label = "Notary is not installed", .glyph = "notary", .color = p.status_warning }
         else switch (g_helper_state.load(.monotonic)) {
-            2 => .{ .label = "Signet ready", .glyph = "signet", .color = p.status_success },
-            1 => .{ .label = "Signet has no key", .glyph = "signet", .color = p.status_warning },
-            3 => .{ .label = "Signet unreachable", .glyph = "signet", .color = p.text_faint_alt },
-            else => .{ .label = "Signet starting", .glyph = "signet", .color = p.status_warning },
+            2 => .{ .label = "Notary ready", .glyph = "notary", .color = p.status_success },
+            1 => .{ .label = "Notary has no key", .glyph = "notary", .color = p.status_warning },
+            3 => .{ .label = "Notary unreachable", .glyph = "notary", .color = p.text_faint_alt },
+            else => .{ .label = "Notary starting", .glyph = "notary", .color = p.status_warning },
         },
         // A remote bunker: reachable is the whole question, and the remote path
         // already tracks a failed round trip.
         .remote => if (g_remote_sign_notice.load(.acquire))
-            .{ .label = "Signer unreachable", .glyph = "signet", .color = p.status_warning }
+            .{ .label = "Signer unreachable", .glyph = "notary", .color = p.status_warning }
         else
-            .{ .label = "Signer connected", .glyph = "signet", .color = p.status_success },
+            .{ .label = "Signer connected", .glyph = "notary", .color = p.status_success },
         // A key in this process: always able to sign, and honest about being local.
-        .local => .{ .label = "Local key", .glyph = "signet", .color = p.status_success },
+        .local => .{ .label = "Local key", .glyph = "notary", .color = p.status_success },
     };
 }
 
@@ -17205,7 +17205,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
-        .signet_exited => |e| handleSignetExited(model, e),
+        .notary_exited => |e| handleNotaryExited(model, e),
         .helper_pubkey => |response| {
             handleHelperPubkey(model, response);
             // A queued setup fires the moment the daemon is reachable.
@@ -17248,7 +17248,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 setToast(model, if (!outboxHasRoom())
                     "Still trying to send your last notes. This one is kept here."
                 else
-                    "Signet is busy for a moment. Try again.");
+                    "Notary is busy for a moment. Try again.");
                 return;
             }
             // The slot is emptied the moment its contents go to a signer.
@@ -17431,12 +17431,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // without reading one back first, and at this point there is no key
             // at all: the ceremony can still fail, and the reader can still go
             // and import an account with eight hundred follows instead. It is set
-            // when a mint is CONFIRMED, in handleSignetExited and in
+            // when a mint is CONFIRMED, in handleNotaryExited and in
             // handleHelperSetup's create branch.
             beginCreate(fx);
         },
-        .open_signet_import => {
-            // Key material never enters Plaza: the Signet window takes the
+        .open_notary_import => {
+            // Key material never enters Plaza: the Notary window takes the
             // paste and hands it to the daemon; Plaza signs in when the key
             // appears (handleHelperPubkey). If the window binary is missing,
             // fall back to the in-Plaza field rather than a dead button.
@@ -17450,7 +17450,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // And a sign-out earlier in this run latched adopt-on-appear off.
             //
             // The ceremony happens in the other process and exits 0 for an
-            // import, so `handleSignetExited` classifies it as "not a mint" and
+            // import, so `handleNotaryExited` classifies it as "not a mint" and
             // signs nobody in: the health check is the ONLY thing that carries
             // the result back. A latch left over swallows the whole import. The
             // key lands in the daemon, the poll refuses it once a second, and the
@@ -17465,7 +17465,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // out first. The pubkey latch below it is what still keeps the key
             // that just LEFT from walking back in.
             g_logged_out = false;
-            if (ceremonyCanTakeKey()) spawnSignetWindow(fx, .import_key) else model.stage = .onboarding;
+            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else model.stage = .onboarding;
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -17648,7 +17648,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanMediaFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
-        .open_signet_window => spawnSignetWindow(fx, .status),
+        .open_notary_window => spawnNotaryWindow(fx, .status),
         // Deliberately empty: see `Msg.absorb_press`. The press has already done
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},
@@ -18399,8 +18399,8 @@ pub fn identityMintedForTest() bool {
 
 /// Delivers the ceremony window's exit, which is how Plaza learns what it did.
 /// For tests.
-pub fn handleSignetExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
-    handleSignetExited(model, e);
+pub fn handleNotaryExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
+    handleNotaryExited(model, e);
 }
 
 /// Delivers a daemon /pubkey answer, which is how a key made or imported in the
@@ -20003,7 +20003,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
 
 // ------------------------------------------------------- remote signer (NIP-46)
 //
-// Signing can be routed to an external signer (Signet) over NIP-46 so the user's
+// Signing can be routed to an external signer (Notary) over NIP-46 so the user's
 // secret key never enters Plaza. Plaza is the CLIENT: it holds an ephemeral
 // transport keypair, and the user's identity is the bunker's own pubkey. The
 // wire is kind:24133 events whose content is a NIP-44-encrypted request/response
@@ -20392,7 +20392,7 @@ pub fn main(init: std.process.Init) !void {
     // without the daemon cannot make one, and `keyholderMissing` is how the join
     // screens say so instead of offering a button that swallows the press.
     resolveHelper(init);
-    resolveSignetWindow(init);
+    resolveNotaryWindow(init);
 
     const app_state = try PlazaApp.create(std.heap.page_allocator, .{
         .name = "plaza",
@@ -20522,7 +20522,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 // on the user's onboarding action, not silently: a first run with no key file
 // opens the welcome screen, and "Create your identity" generates and persists
 // it. This is the zero-config local signer; connecting an external signer
-// (Signet, over NIP-46) so the key never touches the client is the next
+// (Notary, over NIP-46) so the key never touches the client is the next
 // onboarding option, and swaps in at `signAndPublish`.
 
 /// Opens (creating if needed) `$HOME/.plaza`, returning the directory handle.
@@ -20994,7 +20994,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
 //
 // Each relay's ingest loop runs on its own thread with its own `std.Io.Threaded`
 // and its own secp256k1 context, the io backend and the signer are not shared
-// across threads, the exact shape the Signet daemon uses per relay. It dials,
+// across threads, the exact shape the Notary daemon uses per relay. It dials,
 // subscribes for recent kind:1, verifies each event, and writes it into the
 // shared store; the UI thread reads it back through `Model.refresh`.
 

@@ -43,8 +43,8 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src
 
-      - name: Signet window (check, test, build, format)
-        working-directory: signet-window
+      - name: Notary window (check, test, build, format)
+        working-directory: notary-window
         run: |
           native check
           native test

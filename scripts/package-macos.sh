@@ -53,7 +53,7 @@ hits="$(strings zig-out/bin/plaza | grep -c "native-sdk-automation" || true)"
 [ "$hits" = "0" ] || die "the built binary carries the automation server ($hits marker(s)). Refusing to package it."
 
 # Plaza is three processes, not one: the app, `plaza-signer` (the isolated
-# keyholder daemon that actually holds the secret), and `signet-window` (the key
+# keyholder daemon that actually holds the secret), and `notary-window` (the key
 # ceremony, in its own window). Both helpers are resolved as SIBLINGS of argv[0],
 # so both have to sit in Contents/MacOS, and `native package` carries exactly one
 # executable.
@@ -66,7 +66,7 @@ hits="$(strings zig-out/bin/plaza | grep -c "native-sdk-automation" || true)"
 # your identity" would have dead-ended in a released build. Whatever build.zig
 # installs belongs beside the app, so ask build.zig instead of remembering.
 say "Building the ceremony window..."
-(cd signet-window && rm -rf zig-out && native build .)
+(cd notary-window && rm -rf zig-out && native build .)
 
 # Packaged UNSIGNED on purpose. A signature covers the bundle's contents, so
 # copying binaries in afterwards invalidates it. Inject first, then sign
@@ -82,8 +82,8 @@ for bin in zig-out/bin/*; do
   say "  + $name"
   cp "$bin" "$out/Contents/MacOS/$name"
 done
-say "  + signet-window"
-cp signet-window/zig-out/bin/signet-window "$out/Contents/MacOS/signet-window"
+say "  + notary-window"
+cp notary-window/zig-out/bin/notary-window "$out/Contents/MacOS/notary-window"
 
 say "Signing inside-out..."
 for bin in "$out/Contents/MacOS/"*; do
@@ -97,7 +97,7 @@ codesign --verify --deep --strict "$out" || die "the bundle failed signature ver
 # Assert what a working bundle needs, by name. The loop above is what keeps this
 # list from going stale, but the app degrades SILENTLY when a sibling is missing,
 # so the release is the wrong place to find out.
-for required in plaza plaza-signer signet-window; do
+for required in plaza plaza-signer notary-window; do
   [ -x "$out/Contents/MacOS/$required" ] || die "$required is missing from the bundle."
 done
 say "Built $out"
