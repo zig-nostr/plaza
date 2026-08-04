@@ -11760,3 +11760,90 @@ test "a quote still loading looks like the card that will replace it" {
         return error.SkeletonNotPriced;
     }
 }
+
+// ---- pressing Follow before the list has arrived says so --------------------
+
+test "a follow that could not be written says why instead of nothing" {
+    // Not the case where the app is still reading your list: that one is handled
+    // properly already, with the button disabled and a sentence under the counts
+    // saying so. This is the one with no gate in front of it.
+    //
+    // The built-in signer signs one thing at a time. Press Follow while a
+    // signature is already out and the write is refused, and every affordance
+    // for it looks perfectly live: the button is enabled, the menu row is not
+    // greyed, and the press did nothing at all. That window is a second or two
+    // for a local key and as long as an approval prompt takes for a Notary one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{119} ** 32);
+    main.setIdentityForTest([_]u8{119} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.forgetOwnListMemoForTest();
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/saywhy.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // A real list of their own, so nothing else can be the reason.
+    var tags: [40]nostr.event.Tag = undefined;
+    var hexes: [40][64]u8 = undefined;
+    for (0..40) |i| {
+        _ = try std.fmt.bufPrint(&hexes[i], "{x:0>2}{s}", .{ @as(u8, @intCast(i)), "cd" ** 31 });
+        const pair = try arena.alloc([]const u8, 2);
+        pair[0] = "p";
+        pair[1] = &hexes[i];
+        tags[i] = pair;
+    }
+    const mine = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, mine, signer);
+    main.ingestContactListForTest(mine);
+    try testing.expect(main.canWriteFollows());
+
+    var stranger: [32]u8 = undefined;
+    @memset(&stranger, 0x5a);
+
+    var model = main.Model{};
+    model.stage = .ready;
+    model.viewing_profile = stranger;
+    model.toast_len = 0;
+    model.toast_until = 0;
+    var fx: main.EffectsForTest = undefined;
+
+    // A signature is already out.
+    main.holdHelperSignForTest();
+    main.update(&model, main.Msg{ .follow_person = 1 }, &fx);
+
+    // The stranger was not added, which is correct and is not the point.
+    try testing.expect(!main.isFollowedByMe(stranger));
+
+    // The point: the reader was told, rather than left pressing a live-looking
+    // button that does nothing.
+    if (model.toast_len == 0) return error.RefusedInSilence;
+    const said = model.toast_buf[0..model.toast_len];
+    if (std.mem.indexOf(u8, said, "signer") == null) {
+        std.debug.print("\nthe app said \"{s}\"\n", .{said});
+        return error.SaidTheWrongThing;
+    }
+
+    // And once the signature comes back, the same press works.
+    main.releaseHelperSignForTest();
+    main.setSignerKindLocalForTest();
+    model.toast_len = 0;
+    main.update(&model, main.Msg{ .follow_person = 1 }, &fx);
+    try testing.expect(main.isFollowedByMe(stranger));
+}

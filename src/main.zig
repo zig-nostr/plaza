@@ -2768,6 +2768,13 @@ pub fn signInFlight() bool {
     return false;
 }
 
+/// Puts the built-in signer in the state it is in while a signature is out, so
+/// a test can drive the press that lands during one.
+pub fn holdHelperSignForTest() void {
+    g_signer_kind = .helper;
+    g_helper_sign.active = true;
+}
+
 pub fn helperSignPendingForTest() bool {
     return g_helper_sign.active;
 }
@@ -12336,11 +12343,33 @@ pub fn haveOwnContactListForTest() bool {
 /// petnames and relay hints on other people's `p` tags, tag types this app does
 /// not model, and the content blob, which on older clients is a relay map and on
 /// none of them is ours to discard.
-fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
+/// What a follow write DID, rather than whether it worked.
+///
+/// It was a bool, and two of the three callers discarded it. A refusal is a
+/// legitimate outcome here and there are four different ones, each with
+/// something worth saying: pressing Follow in the first seconds after opening
+/// the app is refused because the account's own list has not arrived yet, and
+/// what the reader saw was a button that did not move and no reason given.
+const FollowWrite = enum {
+    published,
+    /// Already in the state asked for, or the reader themselves.
+    nothing_to_do,
+    /// A signature is already out. One key signs one thing at a time.
+    signer_busy,
+    /// This account's contact list has not been read back yet, and writing one
+    /// over a list nobody has seen is the thing this app refuses everywhere.
+    no_list_yet,
+    /// The shrink guard: the write would have dropped more names than the press
+    /// asked for.
+    would_shrink,
+    failed,
+};
+
+fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // Not while a signature is already out. Everything below moves state before
     // it signs, and a rejected sign is silent, so pressing Follow during another
     // sign used to leave the follow set carrying a name that was never published.
-    if (!signerReady()) return false;
+    if (!signerReady()) return .signer_busy;
     // No `canWriteFollows()` here on purpose, though it is the same question.
     // It runs its own store query, and this function then ran a SECOND one for
     // the list itself: a transient failure between the two answered "yes they
@@ -12348,10 +12377,10 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     // publishes nine names over eight hundred. The gate below is decided from
     // the one read this function actually uses. `canWriteFollows` stays as what
     // the button asks, where being approximate costs nothing.
-    const me = activePubkey() orelse return false;
+    const me = activePubkey() orelse return .failed;
     // Following yourself is not a thing, and an app that lets you is confusing
     // about whose feed it is.
-    if (std.mem.eql(u8, &me, &pubkey)) return false;
+    if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
@@ -12380,7 +12409,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     // the two turned "they have a list, splice onto it" into "they have none,
     // publish the nine names this app chose" over a real list. A key minted here
     // is the only case where having nothing is a fact rather than a read error.
-    if (!have_base and !g_identity_minted_here) return false;
+    if (!have_base and !g_identity_minted_here) return .no_list_yet;
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     // Freed on every path that does not hand it to the write seam. Two of those
@@ -12406,9 +12435,9 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
                 // there, petname, relay hint and all.
                 if (!following) continue;
             }
-            const copy = gpa.alloc([]const u8, tag.len) catch return false;
-            for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return false;
-            tags.append(gpa, copy) catch return false;
+            const copy = gpa.alloc([]const u8, tag.len) catch return .failed;
+            for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
+            tags.append(gpa, copy) catch return .failed;
         }
     } else {
         // No list of their own, and this app minted the key, so there provably
@@ -12425,21 +12454,21 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
             if (!following and std.mem.eql(u8, &f, &pubkey)) continue;
             var fhex: [64]u8 = undefined;
             hexLower(&fhex, f);
-            const copy = gpa.alloc([]const u8, 2) catch return false;
-            copy[0] = gpa.dupe(u8, "p") catch return false;
-            copy[1] = gpa.dupe(u8, &fhex) catch return false;
-            tags.append(gpa, copy) catch return false;
+            const copy = gpa.alloc([]const u8, 2) catch return .failed;
+            copy[0] = gpa.dupe(u8, "p") catch return .failed;
+            copy[1] = gpa.dupe(u8, &fhex) catch return .failed;
+            tags.append(gpa, copy) catch return .failed;
         }
     }
 
     if (following) {
-        if (found) return false; // already followed: nothing to write
-        const copy = gpa.alloc([]const u8, 2) catch return false;
-        copy[0] = gpa.dupe(u8, "p") catch return false;
-        copy[1] = gpa.dupe(u8, &hex) catch return false;
-        tags.append(gpa, copy) catch return false;
+        if (found) return .nothing_to_do; // already followed: nothing to write
+        const copy = gpa.alloc([]const u8, 2) catch return .failed;
+        copy[0] = gpa.dupe(u8, "p") catch return .failed;
+        copy[1] = gpa.dupe(u8, &hex) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
     } else if (!found) {
-        return false; // not followed: nothing to write
+        return .nothing_to_do; // not followed: nothing to write
     }
 
     // THE SHRINK GUARD. No client in the ecosystem has one, and it is the
@@ -12452,14 +12481,14 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     // has not answered yet is the list this app signed rather than the older one
     // still in the store.
     if (have_base) {
-        if (!shrinkAllowed(countPeople(base_tags), countPeople(tags.items), following)) return false;
+        if (!shrinkAllowed(countPeople(base_tags), countPeople(tags.items), following)) return .would_shrink;
     }
 
-    const owned_tags = tags.toOwnedSlice(gpa) catch return false;
+    const owned_tags = tags.toOwnedSlice(gpa) catch return .failed;
     handed_off = true;
     // The content is carried forward verbatim. On older clients it is a relay
     // map, and emptying it would delete a record this app does not even read.
-    const content = gpa.dupe(u8, base_content) catch return false;
+    const content = gpa.dupe(u8, base_content) catch return .failed;
     // Past the base too, not just past the store: a second press inside one
     // signer round trip would otherwise stamp equal to the first, and NIP-01
     // breaks that tie on the id, which is a coin flip over the reader's follows.
@@ -12476,7 +12505,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) bool {
     // the originals, since it owns them from here and the remote path frees them.
     setPendingFollowBase(owned_tags, content, created);
     signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false);
-    return true;
+    return .published;
 }
 
 /// How many DISTINCT people a tag set names. Distinct on purpose: some clients
@@ -12608,7 +12637,7 @@ fn hexEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 pub fn writeFollowForTest(fx: *Effects, pubkey: [32]u8, following: bool) bool {
-    return writeFollow(fx, pubkey, following);
+    return writeFollow(fx, pubkey, following) == .published;
 }
 
 /// The reader's own kind:3, arriving from a relay. Adopted when it is NEWER than
@@ -17292,7 +17321,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             const who = model.viewing_profile orelse return;
-            _ = writeFollow(fx, who, direction == 1);
+            sayFollowWrite(model, writeFollow(fx, who, direction == 1), direction == 1);
         },
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
@@ -17344,7 +17373,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // The menu hangs off the focal note, so its author is the thread's
             // root: the person whose note is being read.
             if (model.viewing_thread == 0) return;
-            _ = writeFollow(fx, model.thread_root.pubkey, direction == 1);
+            sayFollowWrite(model, writeFollow(fx, model.thread_root.pubkey, direction == 1), direction == 1);
         },
         .open_profile_edit => openProfileEdit(model),
         .close_profile_edit => model.editing_profile = false,
@@ -17733,6 +17762,29 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 }
 
 /// Shows a small confirming toast for a few seconds (the tick retires it).
+/// Says what a follow press did, when it did not do the obvious thing.
+///
+/// Silent on success, because the button moving IS the answer and a toast on
+/// every press would be noise. Not silent on a refusal: `writeFollow` has four
+/// of those, all reachable, and the reader used to get a button that stayed
+/// where it was and no reason at all. The most ordinary one is pressing Follow
+/// in the first seconds after opening the app, before this account's own list
+/// has come back from the relays.
+fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
+    switch (outcome) {
+        .published => if (following) setToast(model, "Following"),
+        // Nothing changed because nothing needed to. Saying so would be noise.
+        .nothing_to_do => {},
+        .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
+        .no_list_yet => setToast(model, "Still fetching your follow list. Try again in a moment."),
+        // The guard fired, which means the list this app was about to publish
+        // was not the list it meant to. Saying "try again" would be wrong: the
+        // right move is to leave it alone until the real list is back.
+        .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .failed => setToast(model, "That did not save, and nothing was published."),
+    }
+}
+
 fn setToast(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.toast_buf.len);
     @memcpy(model.toast_buf[0..n], text[0..n]);
@@ -18753,10 +18805,10 @@ fn drivePendingIntent(model: *Model, fx: *Effects) void {
             // than queued, because a write that lands minutes later, silently, is
             // exactly the shape this app refuses everywhere else.
             if (!canWriteFollows()) {
-                setToast(model, "Could not follow yet. Try again in a moment.");
+                setToast(model, "Still fetching your follow list. Try again in a moment.");
                 return;
             }
-            if (writeFollow(fx, pk, true)) setToast(model, "Following");
+            sayFollowWrite(model, writeFollow(fx, pk, true), true);
         },
     }
 }
