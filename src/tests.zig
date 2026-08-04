@@ -4214,6 +4214,92 @@ test "how new the saved pool is survives a restart" {
     try testing.expectEqualStrings("wss://changed-elsewhere.example.com", main.relayUrlAt(0));
 }
 
+test "building the feed does not read the contact list once per card" {
+    // `followBlockedReason` is called from `noteContextItems`, which every note
+    // card builds for its right-click menu. It asked `haveOwnContactList`, which
+    // ran an LMDB query and then duplicated the whole record: every tag, every
+    // field, each its own page_allocator call, which is its own mmap, and an
+    // munmap apiece to free.
+    //
+    // With three hundred follows that is roughly six hundred syscalls per card
+    // per frame. A stack sample of a scroll put 1437 of 1462 app-side samples
+    // inside `noteContextItems`; the frame rebuild measured 22.7 ms against an
+    // 8.3 ms frame, so the feed ran at about nine frames a second, and it got
+    // WORSE the more people you followed.
+    //
+    // Counting the reads rather than timing the build, because the property is
+    // the shape ("not once per card"), and a stopwatch on a CI runner is a poor
+    // way to say that.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x9c} ** 32);
+    main.setIdentityForTest([_]u8{0x9c} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnListMemoForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/cards.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // A real-sized contact list: three hundred people, which is an ordinary
+    // number and the one the slowdown was reported at.
+    var tag_storage: [300][2][]const u8 = undefined;
+    var tags: [300]nostr.event.Tag = undefined;
+    var hexes: [300][64]u8 = undefined;
+    for (0..300) |i| {
+        var pk: [32]u8 = undefined;
+        @memset(&pk, @intCast(i % 251 + 1));
+        _ = std.fmt.bufPrint(&hexes[i], "{x}", .{pk}) catch unreachable;
+        tag_storage[i] = .{ "p", &hexes[i] };
+        tags[i] = &tag_storage[i];
+    }
+    const list = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, list, signer);
+
+    // A feed longer than the viewport, so the window builds a real number of
+    // cards. Written by SOMEBODY ELSE, which is what a feed is: the follow line
+    // in a card's menu short-circuits to "This is you" on your own notes, so a
+    // feed of your own would never reach the question this test is about. It
+    // did, at first, and the reverted-fix check is what caught it.
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{0x9d} ** 32);
+    const ev = try signedNote(arena, other, other_kp, 1_800_000_000, "a note in a long feed");
+    var model = main.initialModel();
+    model.stage = .ready;
+    for (0..200) |i| {
+        model.notes[i] = main.noteFrom(ev, 1_800_000_000);
+        model.notes[i].id = @intCast(i + 1);
+    }
+    model.notes_len = 200;
+
+    // Warm whatever the first build legitimately reads once, then count.
+    _ = try buildTree(arena, &model);
+    main.resetOwnRecordReadsForTest();
+    const tree = try buildTree(arena, &model);
+    const cards = countNoteRows(tree.root);
+    try testing.expect(cards > 4);
+
+    // THE PROPERTY. Not "few reads": NONE. Building a view is not a question the
+    // store should be asked, and once it is asked once per card the number rises
+    // with the viewport and with the size of the list being copied.
+    const reads = main.ownRecordReadsForTest();
+    if (reads != 0) {
+        std.debug.print("\nfeed build read the whole contact list {d} times for {d} cards\n", .{ reads, cards });
+    }
+    try testing.expectEqual(@as(usize, 0), reads);
+}
+
 test "a follow's relay list is a suggestion, and only where they write" {
     const tags = [_]nostr.event.Tag{
         &.{ "r", "wss://writes.example.com", "write" },

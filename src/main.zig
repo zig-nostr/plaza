@@ -705,7 +705,13 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
     // signed out.
     if (ev.kind == contact_list_kind and result != .invalid) {
         if (activePubkey()) |pk| {
-            if (std.mem.eql(u8, &pk, &ev.pubkey)) releasePendingFollowBase(ev.created_at);
+            if (std.mem.eql(u8, &pk, &ev.pubkey)) {
+                releasePendingFollowBase(ev.created_at);
+                // And the view's cheap answer to "do they have a list", which is
+                // asked once per note card per frame and must never be an LMDB
+                // query again.
+                noteOwnContactListStored(pk);
+            }
         }
     }
     return result;
@@ -800,6 +806,32 @@ pub fn ownListBackups(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
     const key = ownBackupKey(&key_buf, kind, pk);
     if (key.len == 0) return null;
     return store.get(gpa, key) catch null;
+}
+
+/// How many whole-record reads have happened. See `ownRecordJson`.
+var g_own_record_reads: usize = 0;
+
+pub fn ownRecordReadsForTest() usize {
+    return g_own_record_reads;
+}
+
+pub fn resetOwnRecordReadsForTest() void {
+    g_own_record_reads = 0;
+}
+
+/// Whether this account has a stored event of `kind` at all.
+///
+/// Distinct from `ownRecordJson` on purpose: this reads one row and copies
+/// nothing, where that duplicates the record's content and every one of its tags.
+/// For a question that is only ever "is there one", the copy was the whole cost.
+fn ownRecordExists(kind: u16) bool {
+    const store = g_store orelse return false;
+    const pk = activePubkey() orelse return false;
+    const kinds = [_]u16{kind};
+    const authors = [_][32]u8{pk};
+    var result = store.query(std.heap.page_allocator, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return false;
+    defer result.deinit();
+    return result.events.len != 0;
 }
 
 /// When this account's newest stored event of `kind` was signed, or 0.
@@ -11726,6 +11758,7 @@ fn forgetFollows() void {
     // A list signed but not yet seen belongs to the account that signed it. Left
     // behind, it would be the base the NEXT account's first follow builds on.
     clearPendingFollowBase();
+    forgetOwnListMemo();
     // The open subscriptions were built for the previous identity and are now
     // asking the wrong question. Without this a sign-in never gets its own
     // records requested on an already-open socket, and following stays disabled
@@ -11789,12 +11822,60 @@ pub fn followBlockedReason() ?[]const u8 {
     return "Looking for your follow list…";
 }
 
-/// Whether this account's own kind:3 is in the local store.
+/// Whether this account's own kind:3 is in the local store, REMEMBERED.
+///
+/// This is asked from view code. `followBlockedReason` calls it, `noteContextItems`
+/// calls that for the follow line in every post's menu, and the feed builds a card
+/// for every note on screen, every frame. The honest answer used to be
+/// `ownRecordJson`, which runs an LMDB query and then duplicates the whole record:
+/// every tag, every field, each one its own `page_allocator` call, which is its own
+/// `mmap`. Freeing it is an `munmap` apiece.
+///
+/// With three hundred follows that is roughly six hundred syscalls per card per
+/// frame. A stack sample of a scroll put 1437 of 1462 app-side samples inside
+/// `noteContextItems`, almost all of them here, and the frame rebuild measured 22.7
+/// ms against an 8.3 ms frame: the feed scrolled at about nine frames a second, and
+/// it got worse the more people you followed, which is exactly backwards.
+///
+/// The answer changes only when a kind:3 for this account reaches the store, and
+/// `plazaIngest` is the one door for that, so it is recorded there instead of
+/// re-derived sixty times a frame. Keyed by pubkey, so an identity change misses
+/// rather than inherits.
+const OwnListMemo = enum { unknown, absent, present };
+var g_own_contact_list_memo: OwnListMemo = .unknown;
+var g_own_contact_list_memo_for: ?[32]u8 = null;
+
 fn haveOwnContactList() bool {
-    const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, contact_list_kind) orelse return false;
-    freeOwnProfile(gpa, own);
-    return true;
+    const pk = activePubkey() orelse return false;
+    if (g_own_contact_list_memo_for) |who| {
+        if (std.mem.eql(u8, &who, &pk) and g_own_contact_list_memo != .unknown) {
+            return g_own_contact_list_memo == .present;
+        }
+    }
+    // The miss path asks whether a record EXISTS, which reads one row and copies
+    // nothing. It is `ownRecordJson` that was expensive, not the query.
+    const present = ownRecordExists(contact_list_kind);
+    g_own_contact_list_memo_for = pk;
+    g_own_contact_list_memo = if (present) .present else .absent;
+    return present;
+}
+
+/// Records that this account's contact list is now in the store. Called from the
+/// ingest door, which is the only way one gets there.
+fn noteOwnContactListStored(pk: [32]u8) void {
+    g_own_contact_list_memo_for = pk;
+    g_own_contact_list_memo = .present;
+}
+
+/// Forgets what was remembered about this account's own lists. An identity change
+/// misses on the pubkey anyway; this is for the paths that want it gone now.
+fn forgetOwnListMemo() void {
+    g_own_contact_list_memo = .unknown;
+    g_own_contact_list_memo_for = null;
+}
+
+pub fn forgetOwnListMemoForTest() void {
+    forgetOwnListMemo();
 }
 
 /// Whether EVERY relay this reader can read from has answered about this
@@ -17286,6 +17367,11 @@ fn ownProfileJson(gpa: std.mem.Allocator) ?OwnProfile {
 /// lists: the caches model a few fields and drop the rest, so rebuilding from
 /// one would publish a record with everything else deleted.
 fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
+    // Counted so a test can assert the SHAPE of the fix rather than its timing:
+    // the property is that building a feed does not read this account's whole
+    // contact list once per card, and a stopwatch on a CI runner is a poor way
+    // to say that. Comptime, so the shipped binary has no counter.
+    if (builtin.is_test) g_own_record_reads += 1;
     const store = g_store orelse return null;
     const pk = activePubkey() orelse return null;
     const kinds = [_]u16{kind};
