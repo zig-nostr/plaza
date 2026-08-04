@@ -1739,11 +1739,21 @@ const app_permissions = [_][]const u8{ native_sdk.security.permission_command, n
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Plaza canvas", .accessibility_label = "Plaza", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
+/// The narrowest the window may be made, read from the manifest that enforces
+/// it so there is exactly one copy of the number.
+///
+/// It is a create-time property, which is why it can only be declared in
+/// app.zon; it is repeated on the scene because leaving it at the default here
+/// would declare "no floor" for any path that re-applies the window's
+/// properties. `zig build test` sweeps every screen from this width.
+pub const window_min_width: f32 = @import("window_floor").manifest_min_width;
+
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
     .title = "Plaza",
     .width = window_width,
     .height = window_height,
+    .min_width = window_min_width,
     .restore_state = false,
     .views = &shell_views,
 }};
@@ -13769,6 +13779,27 @@ pub fn setProfileNip05ForTest(pubkey: [32]u8, id: []const u8, verified: bool) vo
     p.nip05_state = if (verified) .verified else .failed;
 }
 
+/// Fills a cached profile's text fields to whatever length is asked for, so a
+/// sweep can render the WORST case rather than a realistic one.
+///
+/// Every one of these is a stranger's string arriving over a relay, and the
+/// only thing bounding it is the buffer it is copied into. A row that fits a
+/// name is not the question; a row that fits a name of sixty-four characters
+/// is, because that is what the buffer allows and therefore what will
+/// eventually arrive.
+pub fn fillProfileTextForTest(pubkey: [32]u8, name: []const u8, username: []const u8, website: []const u8) void {
+    const p = upsertProfile(pubkey) orelse return;
+    const n = @min(name.len, p.name_buf.len);
+    @memcpy(p.name_buf[0..n], name[0..n]);
+    p.name_len = @intCast(n);
+    const u = @min(username.len, p.username_buf.len);
+    @memcpy(p.username_buf[0..u], username[0..u]);
+    p.username_len = @intCast(u);
+    const w = @min(website.len, p.website_buf.len);
+    @memcpy(p.website_buf[0..w], website[0..w]);
+    p.website_len = @intCast(w);
+}
+
 pub fn verifiedNip05ForTest(pubkey: [32]u8) []const u8 {
     return verifiedNip05(pubkey);
 }
@@ -13804,7 +13835,7 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
             backControl(ui, back_label, Msg.close_thread),
             ui.spacer(1),
             ui.paragraph(
-                .{ .style = .{ .foreground = p.text_primary } },
+                .{ .width = profile_band_name_width, .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = personName(ui, pubkey), .weight = .medium, .scale = menu_scale }},
             ),
             ui.spacer(1),
@@ -13903,7 +13934,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 vgap(ui, 8),
                 ui.row(.{ .cross = .center, .gap = 7 }, .{
                     ui.paragraph(
-                        .{ .style = .{ .foreground = p.text_primary } },
+                        .{ .width = profile_name_width, .style = .{ .foreground = p.text_primary } },
                         &.{.{ .text = personName(ui, pubkey), .weight = .bold, .scale = profile_name_scale }},
                     ),
                     personCheck(ui, pubkey),
@@ -13927,7 +13958,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
                         if (handle.len > 0)
                             ui.paragraph(
-                                .{ .style = .{ .foreground = p.accent_identity } },
+                                .{ .width = profile_handle_width, .style = .{ .foreground = p.accent_identity } },
                                 &.{.{ .text = handle, .scale = meta_scale }},
                             )
                         else
@@ -15522,6 +15553,47 @@ fn metaText(ui: *AppUi, text: []const u8, color: canvas.Color) AppUi.Node {
     return ui.paragraph(.{ .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
 }
 
+/// The same, in a box it is not allowed to outgrow.
+///
+/// The width goes on the TEXT ELEMENT, not on an ancestor, and that distinction
+/// is the whole fix. A definite width on the containing column does nothing: a
+/// text leaf with no `wrap` measures as one line at its natural width whatever
+/// its parents are, and `overflow = .ellipsis` cannot elide anything, because
+/// an ellipsis needs a box to be too small for. I bounded the column, then the
+/// column's parent, and the offending run measured exactly as wide both times.
+fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) AppUi.Node {
+    return ui.paragraph(.{ .width = width, .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
+}
+
+/// How much of a note's identity row belongs to the name and the handle.
+///
+/// The row is the identity block, a 6px gap, then the time. The time is the
+/// app's own string ("4h via Amethyst" at its longest), so it is the part that
+/// can be budgeted; the name and the handle are a stranger's, so they get what
+/// is left and are held to it. Sixty-four characters of display name and a
+/// hundred and twenty-eight of NIP-05 both fit the buffers that receive them,
+/// which is to say both will arrive eventually.
+const time_column_width: f32 = 124;
+const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
+
+/// The reading width of the profile page's own column, inset 20 each side, and
+/// what is left of it once the verified check has taken its place beside the
+/// name. A display name is a stranger's sixty-four characters wherever it is
+/// drawn; the profile draws it larger than the feed does, so it runs out of
+/// room sooner rather than later.
+const profile_text_width: f32 = feed_column_width - 20 * 2;
+const profile_name_width: f32 = profile_text_width - 14 - 7;
+/// The identity line under a profile's name is a handle, a gap, a short npub
+/// and possibly "follows you". Only the handle is a stranger's, so it is the
+/// one held to a budget; the rest are this app's own strings and are as long as
+/// they are. Half the column, which fits a handle of about forty characters and
+/// elides the rest.
+const profile_handle_width: f32 = profile_text_width / 2;
+/// The band above a profile: Back on the left, the name centred in what is
+/// left. Halved because the name is centred between two controls, so the room
+/// it may take is the room on ONE side of centre.
+const profile_band_name_width: f32 = feed_column_width / 2;
+
 /// Fixed empty space along ONE axis. `ui.spacer(n)` takes a GROW factor, not a
 /// size, so it cannot express an inset; these are the sized counterparts, used
 /// wherever the redesign asks for a step that a uniform `padding` or `gap` cannot
@@ -15581,14 +15653,17 @@ fn avatarDisc(ui: *AppUi, note: *const Note, size: f32) AppUi.Node {
 /// handle 1px lower than the mock, and every text run stays on one rail.
 fn identityBlock(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    // `grow` so the block owns the width left over after the timestamp: the name
-    // is a single line (no `wrap`), so a long display name ellipsizes inside the
-    // block instead of pushing the time off the row. The mock leaves the block
-    // hugging its text with a flexible spacer beside it, which has the same effect
-    // for short names and loses the time for long ones.
-    return ui.column(.{ .height = avatar_size, .grow = 1, .main = .space_between }, .{
+    // DEFINITE, and definite on the LEAF as well as the box.
+    //
+    // This used to say `grow`, reasoning that the block would take the width
+    // left after the timestamp and a long display name would ellipsize inside
+    // it. That is not what `grow` does: it hands out SPARE space and never
+    // takes any back, so a name wider than the row keeps its full width and
+    // takes the handle, the time and the card's right edge with it. Sixty-four
+    // characters of display name reached 354px past the window.
+    return ui.column(.{ .height = avatar_size, .width = identity_text_width, .main = .space_between }, .{
         ui.paragraph(
-            .{ .style = .{ .foreground = p.text_primary } },
+            .{ .width = identity_text_width, .style = .{ .foreground = p.text_primary } },
             &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
         ),
         handleLine(ui, note),
@@ -15605,7 +15680,10 @@ fn handleLine(ui: *AppUi, note: *const Note) AppUi.Node {
     if (profileLoading(note.pubkey)) return ui.el(.skeleton, .{ .width = 72, .height = 9 }, .{});
     const label = note.handleLabel(ui.arena);
     if (label.text.len == 0) return ui.spacer(0);
-    const handle = metaText(ui, label.text, if (label.nip05) p.accent_identity else p.text_faint);
+    // Bounded, and bounded by LESS when a check sits in front of it, so the two
+    // together fit the block rather than the handle alone fitting it.
+    const room = if (note.verified()) identity_text_width - 12 - 5 else identity_text_width;
+    const handle = metaTextIn(ui, label.text, if (label.nip05) p.accent_identity else p.text_faint, room);
     // The check and its 5px gap exist only when there IS a check. A row gap is
     // charged for every flow child, so substituting a zero-width spacer for the
     // glyph would still indent the handle 5px past the name's rail.
@@ -16427,7 +16505,14 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                     hgap(ui, row_pad_side),
                     noteAvatar(ui, note),
                     hgap(ui, avatar_to_text_gap),
-                    ui.column(.{ .gap = 0, .grow = 1 }, .{
+                    // DEFINITE, not `grow`. `grow` hands out SPARE space and
+                    // never takes any back, so a column whose widest child is
+                    // already wider than the row keeps that width and pushes
+                    // everything to its right off the card. This is the same
+                    // width the picture and the link card already use, and it
+                    // is what makes an ellipsis on anything inside possible:
+                    // an ellipsis needs a box to be too small for.
+                    ui.column(.{ .gap = 0, .width = picture_column_width }, .{
                         // The identity header: the name over the handle in a box
                         // the avatar's height, with the time hung top-right.
                         ui.row(.{ .gap = 6, .cross = .start }, .{
