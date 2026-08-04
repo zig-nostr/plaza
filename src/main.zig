@@ -13835,8 +13835,8 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
             backControl(ui, back_label, Msg.close_thread),
             ui.spacer(1),
             ui.paragraph(
-                .{ .width = profile_band_name_width, .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = personName(ui, pubkey), .weight = .medium, .scale = menu_scale }},
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = elide(ui, personName(ui, pubkey), profile_band_name_max), .weight = .medium, .scale = menu_scale }},
             ),
             ui.spacer(1),
             hgap(ui, 48),
@@ -13934,8 +13934,8 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 vgap(ui, 8),
                 ui.row(.{ .cross = .center, .gap = 7 }, .{
                     ui.paragraph(
-                        .{ .width = profile_name_width, .style = .{ .foreground = p.text_primary } },
-                        &.{.{ .text = personName(ui, pubkey), .weight = .bold, .scale = profile_name_scale }},
+                        .{ .style = .{ .foreground = p.text_primary } },
+                        &.{.{ .text = elide(ui, personName(ui, pubkey), profile_name_max), .weight = .bold, .scale = profile_name_scale }},
                     ),
                     personCheck(ui, pubkey),
                 }),
@@ -13958,8 +13958,8 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
                         if (handle.len > 0)
                             ui.paragraph(
-                                .{ .width = profile_handle_width, .style = .{ .foreground = p.accent_identity } },
-                                &.{.{ .text = handle, .scale = meta_scale }},
+                                .{ .style = .{ .foreground = p.accent_identity } },
+                                &.{.{ .text = elide(ui, handle, profile_handle_max), .scale = meta_scale }},
                             )
                         else
                             ui.spacer(0),
@@ -15561,6 +15561,26 @@ fn metaText(ui: *AppUi, text: []const u8, color: canvas.Color) AppUi.Node {
 /// its parents are, and `overflow = .ellipsis` cannot elide anything, because
 /// an ellipsis needs a box to be too small for. I bounded the column, then the
 /// column's parent, and the offending run measured exactly as wide both times.
+/// Cuts `text` to at most `max` bytes and marks the cut with an ellipsis.
+///
+/// Because the engine has no max-width. `width` is a DEFINITE size: it bounds
+/// the text, and it also makes the box exactly that wide whatever is in it. For
+/// a leaf that owns its whole line that is precisely right. For one with a
+/// neighbour it is wrong in a way that looks like a different bug: bounding a
+/// profile's name that way put the verified check on the far side of the page,
+/// and bounding the handle put a hand's width of nothing between it and the
+/// npub. So where something sits beside the text, the string is shortened
+/// instead and the box goes on hugging it.
+///
+/// Cuts on a UTF-8 boundary, so a name ending in an emoji or any non-Latin
+/// script loses the character rather than being left as half of one.
+fn elide(ui: *AppUi, text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return ui.fmt("{s}\u{2026}", .{text[0..end]});
+}
+
 fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) AppUi.Node {
     return ui.paragraph(.{ .width = width, .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
 }
@@ -15576,23 +15596,19 @@ fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) App
 const time_column_width: f32 = 124;
 const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
 
-/// The reading width of the profile page's own column, inset 20 each side, and
-/// what is left of it once the verified check has taken its place beside the
-/// name. A display name is a stranger's sixty-four characters wherever it is
-/// drawn; the profile draws it larger than the feed does, so it runs out of
-/// room sooner rather than later.
-const profile_text_width: f32 = feed_column_width - 20 * 2;
-const profile_name_width: f32 = profile_text_width - 14 - 7;
-/// The identity line under a profile's name is a handle, a gap, a short npub
-/// and possibly "follows you". Only the handle is a stranger's, so it is the
-/// one held to a budget; the rest are this app's own strings and are as long as
-/// they are. Half the column, which fits a handle of about forty characters and
-/// elides the rest.
-const profile_handle_width: f32 = profile_text_width / 2;
-/// The band above a profile: Back on the left, the name centred in what is
-/// left. Halved because the name is centred between two controls, so the room
-/// it may take is the room on ONE side of centre.
-const profile_band_name_width: f32 = feed_column_width / 2;
+/// How long a stranger's string may be where something sits BESIDE it.
+///
+/// Lengths, not widths, and that is the engine's doing rather than a
+/// preference: `width` is definite, so it would fix the box at that size and
+/// send the verified check, the npub and "follows you" off to the right of a
+/// three-letter name. See `elide`.
+///
+/// Chosen against the column each one lives in and then measured: the sweep
+/// renders these at the capacity of the buffers that hold them, so a budget
+/// that is too generous fails rather than shipping.
+const profile_name_max: usize = 28;
+const profile_band_name_max: usize = 32;
+const profile_handle_max: usize = 34;
 
 /// Fixed empty space along ONE axis. `ui.spacer(n)` takes a GROW factor, not a
 /// size, so it cannot express an inset; these are the sized counterparts, used
@@ -17026,11 +17042,22 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
             ui.column(.{ .width = link_card_text_width, .gap = 0 }, .{
                 vgap(ui, 10),
                 ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_dim } },
+                    .{ .width = link_card_text_width, .style = .{ .foreground = p.text_dim } },
                     &.{.{ .text = link.domain(), .monospace = true, .scale = mono_chip_scale }},
                 ),
                 vgap(ui, 2),
+                // The width is on THESE, not only on the column around them.
+                // That is what the first attempt got wrong: it stated the
+                // width one level up and asserted the geometry against the
+                // card, which passed, while a title still ran to the window's
+                // right edge and was cut off there with no ellipsis. A text
+                // leaf with no wrap measures as one line at its natural width
+                // whatever its ancestors say, so `.overflow = .ellipsis` had
+                // nothing to elide against. Safe to state here because nothing
+                // sits beside these in the column: a definite width on a leaf
+                // with a neighbour would push the neighbour away instead.
                 ui.text(.{
+                    .width = link_card_text_width,
                     .wrap = false,
                     .overflow = .ellipsis,
                     .size = .sm,
@@ -17038,6 +17065,7 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
                 }, link.title()),
                 if (link.description().len == 0) ui.spacer(0) else vgap(ui, 2),
                 if (link.description().len == 0) ui.spacer(0) else ui.paragraph(.{
+                    .width = link_card_text_width,
                     .wrap = false,
                     .overflow = .ellipsis,
                     .style = .{ .foreground = p.text_muted },
