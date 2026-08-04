@@ -12039,3 +12039,87 @@ test "a profile's name, check and npub sit next to each other" {
         }
     }
 }
+
+test "a profile states one identifier per line, in order" {
+    // Name, then the address they proved, then the key. They shared a row
+    // before, which read as one strip of identifiers and put the npub, the part
+    // most likely to be copied, in the middle of it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.setIdentityForTest([_]u8{0x33} ** 32);
+    defer main.clearIdentityForTest();
+    var them: [32]u8 = undefined;
+    @memset(&them, 0x11);
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    main.fillProfileTextForTest(them, "Sep", "sep", "https://zignostr.com");
+    main.setProfileNip05ForTest(them, "sep@zignostr.com", true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = them;
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, 900);
+    const nip05 = frameOfTextContaining(p, "sep@zignostr.com") orelse return error.NoHandle;
+    const npub = frameOfTextContaining(p, "npub1") orelse return error.NoNpub;
+
+    // Below, not beside. A row would put them at the same y.
+    if (npub.y <= nip05.y + 2) {
+        std.debug.print("\nthe npub is at y={d:.0} and the handle at y={d:.0}\n", .{ npub.y, nip05.y });
+        return error.NpubNotBelowHandle;
+    }
+    // And on the same rail, so the column reads as a column.
+    if (@abs(npub.x - nip05.x) > 1.5) {
+        std.debug.print("\nthe npub starts at x={d:.0} and the handle at x={d:.0}\n", .{ npub.x, nip05.x });
+        return error.NotOnOneRail;
+    }
+}
+
+test "a link preview's description is cut with an ellipsis, not by the card edge" {
+    // The title elides through the engine and the description does not: the
+    // engine's ellipsis works on a plain text node and not on a paragraph built
+    // from spans, so this one is shortened in Zig. Both are asserted, because
+    // the reason they differ is an engine detail that could change.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    main.clearLinkPreviewsForTest();
+    defer main.clearLinkPreviewsForTest();
+    const url = "https://coldcard-hack-tracker.example/x";
+    main.setLinkPreviewForTest(
+        url,
+        "coldcard-hack-tracker.example",
+        "Coldcard Hack Tracker and a title that carries on well past the room the card has for it",
+        "Coldcard Hack Tracker, live monitoring of Bitcoin held from seed entropy sweeps since July 2026, and then some more words after that",
+    );
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest(url);
+    model.notes_len = 1;
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, 900);
+    const card = frameOfSemantics(p, "Open link") orelse return error.NoLinkCard;
+    const right = card.x + card.width;
+
+    var found = false;
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, "live monitoring") == null) continue;
+        found = true;
+        // It says so, rather than simply stopping.
+        if (std.mem.indexOf(u8, n.widget.text, "\u{2026}") == null) {
+            std.debug.print("\nthe description was not cut: \"{s}\"\n", .{n.widget.text});
+            return error.NoEllipsis;
+        }
+        // And it stops inside the card, which is the part a reader sees.
+        if (n.widget.frame.x + n.widget.frame.width > right + 0.5) {
+            std.debug.print(
+                "\nthe description runs to {d:.0}; the card ends at {d:.0}\n",
+                .{ n.widget.frame.x + n.widget.frame.width, right },
+            );
+            return error.DescriptionOverflowsCard;
+        }
+    }
+    if (!found) return error.NoDescription;
+}

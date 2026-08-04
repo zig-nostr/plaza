@@ -13889,7 +13889,6 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
     // because it is the identifier a person chose and can prove, where the npub
     // is the one the maths chose.
     const handle = verifiedNip05(pubkey);
-    const identity_line = named or follows_me or handle.len > 0;
 
     return ui.column(.{ .gap = 0 }, .{
         // The banner, with the face riding up over its lower edge. There is no
@@ -13953,30 +13952,52 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 // spacer would still push "follows you" 8px past the left rule
                 // that the name, bio, links and counts all share. `handleLine`
                 // documents this exact trap and I walked into it anyway.
-                if (identity_line) vgap(ui, 5) else ui.spacer(0),
-                if (identity_line)
-                    ui.row(.{ .cross = .center, .gap = 0 }, .{
-                        if (handle.len > 0)
-                            ui.paragraph(
-                                .{ .style = .{ .foreground = p.accent_identity } },
-                                &.{.{ .text = elide(ui, handle, profile_handle_max), .scale = meta_scale }},
-                            )
-                        else
-                            ui.spacer(0),
-                        if (handle.len > 0 and named) hgap(ui, 8) else ui.spacer(0),
-                        if (named)
-                            ui.paragraph(
-                                .{ .style = .{ .foreground = p.text_muted } },
-                                &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
-                            )
-                        else
-                            ui.spacer(0),
-                        if ((named or handle.len > 0) and follows_me) hgap(ui, 8) else ui.spacer(0),
+                // One fact per line, in the order they are worth: the name,
+                // the address that was verified, the key itself, then where to
+                // pay them. They used to share a row, which read as one long
+                // strip of identifiers and put the npub, the thing most likely
+                // to be copied, in the middle of it.
+                if (handle.len > 0) vgap(ui, 5) else ui.spacer(0),
+                if (handle.len > 0)
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.accent_identity } },
+                        &.{.{ .text = elide(ui, handle, profile_handle_max), .scale = meta_scale }},
+                    )
+                else
+                    ui.spacer(0),
+                if (named) vgap(ui, 4) else ui.spacer(0),
+                if (named)
+                    ui.row(.{ .cross = .center, .gap = 8 }, .{
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = p.text_muted } },
+                            &.{.{ .text = personNpubShort(ui, pubkey), .monospace = true, .scale = mono_meta_scale }},
+                        ),
+                        // Kept beside the key rather than given a line of its
+                        // own: it is a fact about the two of you, not another
+                        // way to address them.
                         if (follows_me)
                             ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
                         else
                             ui.spacer(0),
                     })
+                else
+                    ui.spacer(0),
+                // A key with no name of its own shows no npub either, because
+                // the name line already IS that string. The badge still has to
+                // appear: hanging it off the npub's branch made it vanish for
+                // exactly the readers whose page has least on it, and a test
+                // written for the old layout caught that.
+                if (follows_me and !named) vgap(ui, 4) else ui.spacer(0),
+                if (follows_me and !named)
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "follows you", .scale = meta_scale }})
+                else
+                    ui.spacer(0),
+                if (lud16.len > 0) vgap(ui, 4) else ui.spacer(0),
+                if (lud16.len > 0)
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted_alt } },
+                        &.{.{ .text = elide(ui, lud16, profile_handle_max), .monospace = true, .scale = mono_hint_scale }},
+                    )
                 else
                     ui.spacer(0),
                 if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
@@ -13987,7 +14008,7 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                     )
                 else
                     ui.spacer(0),
-                if (website.len > 0 or lud16.len > 0) profileLinks(ui, website, lud16) else ui.spacer(0),
+                if (website.len > 0) profileLinks(ui, website) else ui.spacer(0),
                 vgap(ui, 9),
                 profileCounts(ui, pubkey, is_me),
                 if (!is_me and followBlockedReason() != null)
@@ -14033,19 +14054,22 @@ fn profileActions(ui: *AppUi, model: *const Model, pubkey: [32]u8, is_me: bool) 
 }
 
 /// Where they point people, when they point anywhere.
-fn profileLinks(ui: *AppUi, website: []const u8, lud16: []const u8) AppUi.Node {
+/// The website line. The lightning address used to share this row and now sits
+/// with the other ways to address someone, directly under the key.
+///
+/// Shortened rather than bounded: a stranger's `website` is printed whole, up to
+/// the 128 bytes of the buffer that holds it, and the profile page is the one
+/// screen that never picks up the fixed reading column, so nothing above this
+/// leaf would have stopped it at the window's edge.
+fn profileLinks(ui: *AppUi, website: []const u8) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 8),
         ui.row(.{ .cross = .center, .gap = 14 }, .{
-            if (website.len > 0)
-                ui.paragraph(.{ .style = .{ .foreground = p.accent_identity } }, &.{.{ .text = website, .scale = meta_scale }})
-            else
-                ui.spacer(0),
-            if (lud16.len > 0)
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = lud16, .monospace = true, .scale = mono_hint_scale }})
-            else
-                ui.spacer(0),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.accent_identity } },
+                &.{.{ .text = elide(ui, website, profile_handle_max), .scale = meta_scale }},
+            ),
             ui.spacer(1),
         }),
     });
@@ -16533,8 +16557,19 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                         // the avatar's height, with the time hung top-right.
                         ui.row(.{ .gap = 6, .cross = .start }, .{
                             identityBlock(ui, note),
+                            // Right-aligned in a stated column, so it ends at
+                            // the card's edge whatever it says. Left to hug its
+                            // text it began at a fixed x (the identity block
+                            // beside it is a definite width) and stopped
+                            // wherever it ran out, leaving a ragged gap after
+                            // "6m via Damus" that grew as the string got
+                            // shorter.
                             ui.paragraph(
-                                .{ .style = .{ .foreground = theme.palette.text_faint_alt } },
+                                .{
+                                    .width = time_column_width,
+                                    .text_alignment = .end,
+                                    .style = .{ .foreground = theme.palette.text_faint_alt },
+                                },
                                 timeSpans(ui, note, meta_scale),
                             ),
                         }),
@@ -16990,6 +17025,9 @@ fn pictureStripes(ui: *AppUi, height: f32) AppUi.Node {
 /// trusting this arithmetic.
 const link_card_tile_size: f32 = 30;
 const link_card_text_width: f32 = picture_column_width - 12 - link_card_tile_size - 10 - 12;
+/// And how many characters of description fit that width at its scale. A length
+/// rather than a width because the engine will not elide this one: see the call.
+const link_desc_max: usize = 78;
 
 fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
@@ -17064,12 +17102,19 @@ fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
                     .style = .{ .foreground = p.text_link_title },
                 }, link.title()),
                 if (link.description().len == 0) ui.spacer(0) else vgap(ui, 2),
+                // Shortened here rather than left to `.overflow`, unlike the
+                // title directly above it. The engine's ellipsis works on a
+                // plain `ui.text` and not on a paragraph built from SPANS: the
+                // title came back correctly elided while this line, with the
+                // same width and the same overflow setting, ran flat off the
+                // end of the card. The span is kept because it carries the
+                // smaller scale a description wants.
                 if (link.description().len == 0) ui.spacer(0) else ui.paragraph(.{
                     .width = link_card_text_width,
                     .wrap = false,
                     .overflow = .ellipsis,
                     .style = .{ .foreground = p.text_muted },
-                }, &.{.{ .text = link.description(), .scale = mono_row_scale }}),
+                }, &.{.{ .text = elide(ui, link.description(), link_desc_max), .scale = mono_row_scale }}),
                 vgap(ui, 10),
             }),
             hgap(ui, 12),
