@@ -10633,6 +10633,83 @@ test "every verb people expect is under a note" {
 
 // ---- P10: a quoted picture ---------------------------------------------------
 
+test "a link preview stays inside the card, however long the page's description" {
+    // The card is a fixed width and its text column used `grow = 1`. `grow`
+    // hands out SPARE space and never takes any back, so a child whose natural
+    // size already exceeds the row has nothing to grow into and keeps that
+    // natural size. A page title and description with `wrap = false` are as wide
+    // as the sentence, so the row overflowed the card, the card overflowed the
+    // column, and the description ran off the right edge of the WINDOW.
+    //
+    // The ellipsis did not save it, because an ellipsis needs a box to be too
+    // small for, and the leaf was never given one.
+    //
+    // Measuring the painted geometry, not the options: the bug was invisible in
+    // the widget tree, where every node claimed to be an ellipsised single line.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.clearLinkPreviewsForTest();
+    defer main.clearLinkPreviewsForTest();
+    const url = "https://github.com/zig-nostr/notary/pull/35";
+    main.setLinkPreviewForTest(
+        url,
+        "github.com",
+        "Signet is Notary by sepehr-safari, Pull Request #35, zig-nostr/notary",
+        "A native remote signer (NIP-46 bunker) for Nostr. Your key stays on a machine you control; every signing request is approved by you, and nothing else ever holds it.",
+    );
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest(url);
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+
+    // The card, found by ITS OWN semantics rather than by widget kind: the feed
+    // is full of list items and the first one is not this. Getting that wrong is
+    // how the first version of this test passed with the bug still in place.
+    const card = frameOfSemantics(p, "Open link") orelse return error.NoLinkCard;
+    const right = card.x + card.width;
+
+    // The two lines that overflowed, found by their content.
+    const title = frameOfTextContaining(p, "Pull Request #35") orelse return error.NoTitle;
+    const desc = frameOfTextContaining(p, "native remote signer") orelse return error.NoDescription;
+
+    for ([_]struct { name: []const u8, f: native_sdk.geometry.RectF }{
+        .{ .name = "title", .f = title },
+        .{ .name = "description", .f = desc },
+    }) |row| {
+        if (row.f.x + row.f.width > right + 0.5) {
+            std.debug.print(
+                "\nthe {s} runs to {d:.0}; the card ends at {d:.0}\n",
+                .{ row.name, row.f.x + row.f.width, right },
+            );
+        }
+        try testing.expect(row.f.x + row.f.width <= right + 0.5);
+    }
+
+    // Whether the CARD itself can exceed the window is a separate question from
+    // whether its text can exceed the card, and only the second was reported.
+}
+
+/// The frame of the first laid-out node carrying this accessibility label.
+fn frameOfSemantics(p: painted.Painted, label: []const u8) ?native_sdk.geometry.RectF {
+    for (p.layout.nodes) |n| {
+        if (std.mem.eql(u8, n.widget.semantics.label, label)) return n.widget.frame;
+    }
+    return null;
+}
+
+/// The frame of the first laid-out node whose text contains `needle`.
+fn frameOfTextContaining(p: painted.Painted, needle: []const u8) ?native_sdk.geometry.RectF {
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, needle) != null) return n.widget.frame;
+    }
+    return null;
+}
+
 test "a quoted note that is only a picture says so" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
