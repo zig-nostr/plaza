@@ -11870,7 +11870,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -11891,14 +11891,69 @@ test "no view paints past the right edge at the narrowest the window can be" {
     const long_site = "https://" ++ ("a" ** 112) ++ ".example";
     const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
     const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
+    // Exactly the 128 bytes `lud16_buf` holds. A single byte over and the
+    // parser drops the field without a word, which is correct of it and made
+    // the first version of this measure an empty line.
+    const long_lud16 = ("l" ** 59) ++ "@" ++ ("w" ** 60) ++ ".example";
+
+    // The profile page reads its website and lightning address from a
+    // PersonCard, which is parsed out of a kind:0 IN THE STORE, not from the
+    // Profile record the helper above fills. They are different buffers behind
+    // similar names, so filling the one the sweep knew about left the two
+    // widest lines on that page rendered from empty strings and measured as
+    // clean.
+    var arena_state_store = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state_store.deinit();
+    const store_arena = arena_state_store.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/sweep.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Unsigned on purpose: `ingest` only verifies when it is handed a signer,
+    // and what is under test is how wide these strings paint rather than
+    // whether the event is authentic.
+    const subject = main.noteWithLinkForTest("").pubkey;
+    const meta = try std.fmt.allocPrint(
+        store_arena,
+        "{{\"name\":\"{s}\",\"website\":\"{s}\",\"lud16\":\"{s}\",\"about\":\"{s}\"}}",
+        .{ long_name, long_site, long_lud16, "A stranger's biography, long enough that it has to wrap more than once in the column it is given." },
+    );
+    _ = try store.ingest(store_arena, .{
+        .id = [_]u8{0xa1} ** 32,
+        .pubkey = subject,
+        .created_at = 1_800_000_000,
+        .kind = 0,
+        .tags = &.{},
+        .content = meta,
+        .sig = [_]u8{0} ** 64,
+    }, .{});
 
     var worst_over: f32 = 0;
+    // What the plain feed renders, so a state that opens something on top of it
+    // can prove it actually opened. A screen the sweep cannot reach measures
+    // clean, and a clean measurement of nothing is the failure this sweep is
+    // most likely to have: it reads exactly like coverage.
+    var base_nodes: usize = 0;
     inline for (@typeInfo(States).@"enum".fields) |f| {
         const st: States = @enumFromInt(f.value);
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
 
-        var model = main.initialModel();
+        // On the heap, not the stack. `inline for` unrolls the body once per
+        // state, and in a Debug build the copies do not share stack slots, so a
+        // Model carrying three hundred notes of fixed buffers overflowed the
+        // thread's stack once this reached thirteen states. It crashed rather
+        // than failed, which is what #139 saw when it first tried to add the
+        // menus and read as a missing precondition. It was the test's own
+        // frame. ReleaseFast reuses the slots and hides it, so this only ever
+        // showed up in CI.
+        const model = try arena_state.allocator().create(main.Model);
+        model.* = main.initialModel();
         model.stage = .ready;
         model.notes[0] = main.noteWithLinkForTest(if (st == .feed) "" else url);
         // A note body long enough to wrap several times, so the body's own
@@ -11929,9 +11984,63 @@ test "no view paints past the right edge at the narrowest the window can be" {
             .notifications => model.notifications_open = true,
             .composing => model.composing = true,
             .joining => model.joining = true,
+            .menu_scope => model.menu = .scope,
+            .menu_relays => model.menu = .relays,
+            .menu_account => model.menu = .account,
+            .menu_outbox => {
+                // The zone this menu hangs off is absent unless something is
+                // actually queued, and the menu itself is absent unless the
+                // queue has rows, so a flag alone drew nothing at all. The
+                // node-count guard is what found that.
+                main.resetOutboxForTest();
+                _ = main.enqueueOutboxForTest(model.notes[0].pubkey, model.notes[0].pubkey, 1_800_000_000);
+                model.outbox_pending = 1;
+                model.menu = .outbox;
+            },
+            .menu_note => model.note_menu = model.notes[0].id,
         }
 
-        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, floor, floor);
+        const p = try painted.Painted.renderAt(arena_state.allocator(), model, floor, floor);
+        // The baseline is the feed WITH the link note, because that is what
+        // every menu state is drawn on top of. Taking it from the plain feed
+        // instead made this guard pass a menu that rendered nothing: the link
+        // note alone accounts for eighteen nodes, which was enough to look like
+        // an opened menu.
+        if (st == .feed_with_link) base_nodes = p.layout.nodes.len;
+        // The profile's two widest lines come from the store, so prove they
+        // reached the screen. Without this the state passes whether the strings
+        // are painted or empty, and an empty string measures beautifully.
+        if (st == .profile) {
+            var saw_site = false;
+            var saw_lud16 = false;
+            for (p.layout.nodes) |n| {
+                if (std.mem.startsWith(u8, n.widget.text, "https://aaaaaaaaaa")) saw_site = true;
+                if (std.mem.startsWith(u8, n.widget.text, "llllllllll")) saw_lud16 = true;
+            }
+            if (!saw_site or !saw_lud16) {
+                std.debug.print(
+                    "\nthe profile painted no website ({}) and no lightning address ({}): this state is measuring empty strings\n",
+                    .{ saw_site, saw_lud16 },
+                );
+                return error.ProfileLinksNeverPainted;
+            }
+        }
+
+        // A menu is drawn OVER the feed, so opening one can only add. If a
+        // state ever stops reaching its screen this fails here rather than
+        // reporting a clean sweep of a screen it never drew.
+        switch (st) {
+            .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+                if (p.layout.nodes.len <= base_nodes) {
+                    std.debug.print(
+                        "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
+                        .{ f.name, p.layout.nodes.len, base_nodes },
+                    );
+                    return error.SweptStateRenderedNothing;
+                }
+            },
+            else => {},
+        }
 
         // Measuring painted geometry, not options. Every one of these nodes
         // reports a perfectly reasonable width on its own; the defect only
