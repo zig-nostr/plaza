@@ -12007,6 +12007,17 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // note alone accounts for eighteen nodes, which was enough to look like
         // an opened menu.
         if (st == .feed_with_link) base_nodes = p.layout.nodes.len;
+        {
+            const tk = theme.tokens(main.Model)(model);
+            canvas.expectA11yAuditSweepClean(arena_state.allocator(), p.tree.root, .{
+                .tokens = tk,
+                .min_size = native_sdk.geometry.SizeF.init(floor, 520),
+                .default_size = native_sdk.geometry.SizeF.init(main.window_width, main.window_height),
+            }) catch |err| {
+                std.debug.print("\nthe accessibility audit found something on the {s} screen (its own report is above)\n", .{f.name});
+                return err;
+            };
+        }
         // The profile's two widest lines come from the store, so prove they
         // reached the screen. Without this the state passes whether the strings
         // are painted or empty, and an empty string measures beautifully.
@@ -12310,4 +12321,33 @@ test "a bio's nostr: mentions are drawn as names, like a note's" {
 
     const shown = main.personAbout(subject);
     try testing.expectEqualStrings("Engaged to @aliza", shown);
+}
+
+test "the accessibility audit is switched on, not just present" {
+    // The sweep above asserts every screen passes this audit. A guard that
+    // cannot fail says the same thing as a guard that passes, so this hands it
+    // a tree it must reject: two sibling buttons announced under one name, which
+    // a screen reader reads as the same control twice.
+    //
+    // Three separate guards this session passed while measuring nothing. This is
+    // the cheapest possible way to know this one is not the fourth.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var ui = main.AppUi.init(arena);
+    const node = ui.column(.{ .gap = 0 }, .{
+        ui.el(.button, .{ .width = 80, .height = 30, .semantics = .{ .role = .button, .label = "Same" } }, .{}),
+        ui.el(.button, .{ .width = 80, .height = 30, .semantics = .{ .role = .button, .label = "Same" } }, .{}),
+    });
+    const tree = try ui.finalizeWithTokens(node, .{});
+
+    // `auditWidgetA11y` rather than the sweep, because the sweep prints its
+    // findings, and a test that expects to fail would print a page of teaching
+    // voice about a fake tree on every green run.
+    const nodes = try arena.alloc(canvas.WidgetLayoutNode, 64);
+    const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, native_sdk.geometry.RectF.init(0, 0, 400, 300), .{}, nodes);
+    var findings: [8]canvas.a11y.A11yAuditFinding = undefined;
+    const issues = canvas.a11y.auditWidgetA11y(layout, &findings);
+    try testing.expect(issues.total > 0);
+    try testing.expectEqual(canvas.a11y.A11yAuditRuleKind.duplicate_sibling_label, issues.findings[0].rule);
 }
