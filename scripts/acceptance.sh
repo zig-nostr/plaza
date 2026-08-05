@@ -332,6 +332,29 @@ journey_guest() {
     fail "a key exists after a session that never asked for one"
   fi
 
+  # The window opens at the size app.zon asks for, measured rather than assumed.
+  #
+  # This is here because it was WRONG for the entire life of the app and nothing
+  # noticed: the toolkit reported the window's frame where the runtime wanted its
+  # content size, so the canvas was 32 points taller than the view it lived in
+  # and the status bar was laid out below the bottom edge. It was invisible on
+  # every fresh launch and came back the first time anyone dragged the window,
+  # which is why it read as intermittent.
+  #
+  # No unit test can see this: the layout is correct at whatever size it is
+  # handed, and the defect is which size that is. It only exists in a real
+  # window, so it is only catchable here.
+  snap
+  local want_h canvas_h
+  want_h=$(grep -oE '\.height = [0-9]+' "$ROOT/app.zon" | head -1 | grep -oE '[0-9]+')
+  canvas_h=$(grep -oE 'main-canvas#[0-9]+ role=group name="" bounds=\(0,0 [0-9]+x[0-9]+\)' \
+    "$SNAP" | head -1 | grep -oE 'x[0-9]+\)' | grep -oE '[0-9]+')
+  if [ -n "$canvas_h" ] && [ "$canvas_h" = "$want_h" ]; then
+    pass "the canvas is the ${want_h}pt app.zon declares, so nothing is laid out past the window"
+  else
+    fail "app.zon asks for a ${want_h}pt window and the canvas is ${canvas_h:-unknown}pt. Anything on the bottom edge is off screen (see plaza#100)"
+  fi
+
   stop_app
 }
 
