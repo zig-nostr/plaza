@@ -12537,3 +12537,19 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // And nobody at all asks nothing, rather than asking about everybody.
     try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, &buf).len);
 }
+
+test "the window cannot be declared smaller than its own floor" {
+    // Both numbers come from app.zon now, so they cannot drift apart in the
+    // source. They can still be declared inconsistently IN the manifest, and a
+    // startup size below the floor is a window that opens smaller than it is
+    // allowed to be dragged, which is the same class of mistake as the floor
+    // sitting seven pixels under what the layout needs (#138).
+    try testing.expect(main.window_width >= main.window_min_width);
+
+    // And they are real numbers, not a silently defaulted zero. A parse that
+    // quietly returned 0 would satisfy the comparison above and make the
+    // overflow sweep measure an empty window.
+    try testing.expect(main.window_min_width > 0);
+    try testing.expect(main.window_width > 0);
+    try testing.expect(main.window_height > 0);
+}

@@ -30,7 +30,13 @@ pub fn build(b: *std.Build) void {
     // sweep in tests.zig measures against the constraint a person actually hits
     // when they drag the window in, rather than against a number typed twice.
     const floor = b.addOptions();
-    floor.addOption(f32, "manifest_min_width", manifestMinWidth(b));
+    floor.addOption(f32, "manifest_min_width", manifestWindowNumber(b, "min_width"));
+    // The startup size too, for the same reason. These were typed again in Zig
+    // as 760x760 beside a manifest that happened to say 760x760, and the app
+    // needs the declared number at runtime to notice when it has been handed
+    // something else (#100).
+    floor.addOption(f32, "manifest_width", manifestWindowNumber(b, "width"));
+    floor.addOption(f32, "manifest_height", manifestWindowNumber(b, "height"));
     // BOTH modules, so app.zon is the one place the number lives. The scene
     // declares the same floor it does, and the sweep measures against it.
     app.exe.root_module.addOptions("window_floor", floor);
@@ -96,17 +102,22 @@ fn linkNostr(b: *std.Build, mod: *std.Build.Module) void {
 /// failed here the first time. A malformed or missing declaration is a hard
 /// error: silently defaulting would make the sweep that depends on it pass by
 /// measuring against nothing.
-fn manifestMinWidth(b: *std.Build) f32 {
+/// Reads a numeric field off the startup window in `app.zon`.
+///
+/// The manifest is the one place these numbers live. Repeating any of them in
+/// Zig is how the floor drifted seven pixels below what the layout needed and
+/// stayed there: two numbers that must agree, with nothing connecting them.
+fn manifestWindowNumber(b: *std.Build, comptime field: []const u8) f32 {
     const text = b.build_root.handle.readFileAlloc(b.graph.io, "app.zon", b.allocator, .limited(1 << 20)) catch
-        @panic("cannot read app.zon to find the window's minimum width");
-    const key = ".min_width = ";
+        @panic("cannot read app.zon to size the startup window");
+    const key = "." ++ field ++ " = ";
     const at = std.mem.indexOf(u8, text, key) orelse
-        @panic("app.zon declares no .min_width for the startup window");
+        @panic("app.zon declares no ." ++ field ++ " for the startup window");
     var end = at + key.len;
     while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
     const digits = text[at + key.len .. end];
-    if (digits.len == 0) @panic("app.zon's .min_width is not a number");
+    if (digits.len == 0) @panic("app.zon's ." ++ field ++ " is not a number");
     const n = std.fmt.parseInt(u32, digits, 10) catch
-        @panic("app.zon's .min_width is not a number");
+        @panic("app.zon's ." ++ field ++ " is not a number");
     return @floatFromInt(n);
 }
