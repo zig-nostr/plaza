@@ -772,6 +772,9 @@ test "the feed builds only the rows the window asked for" {
 
     // A feed far longer than any viewport.
     var model = main.initialModel();
+    // Filled by hand rather than through the store, so the room is reserved
+    // here; the app grows on its way through the rebuild.
+    main.reserveFeedForTest(&model, 512);
     model.stage = .ready;
     for (0..200) |i| {
         model.notes[i] = main.noteFrom(ev, 1_800_000_000);
@@ -3090,6 +3093,9 @@ test "a deep back-stack still lays out" {
     const arena = arena_state.allocator();
 
     var model = main.initialModel();
+    // Filled by hand rather than through the store, so the room is reserved
+    // here; the app grows on its way through the rebuild.
+    main.reserveFeedForTest(&model, 512);
     model.stage = .ready;
     model.viewing_thread = 1;
     model.thread_root = threadNote(0xAA, 100, 0);
@@ -4514,6 +4520,9 @@ test "building the feed does not read the contact list once per card" {
     const other_kp = try other.keyPairFromSecretKey([_]u8{0x9d} ** 32);
     const ev = try signedNote(arena, other, other_kp, 1_800_000_000, "a note in a long feed");
     var model = main.initialModel();
+    // Filled by hand rather than through the store, so the room is reserved
+    // here; the app grows on its way through the rebuild.
+    main.reserveFeedForTest(&model, 512);
     model.stage = .ready;
     for (0..200) |i| {
         model.notes[i] = main.noteFrom(ev, 1_800_000_000);
@@ -4547,6 +4556,9 @@ test "the rows just off screen are warmed, and the ones on it are left alone" {
     // Nothing about downloading an image needs a registry slot. Only showing it
     // does. This pins the band that gets fetched anyway.
     var model = main.initialModel();
+    // Filled by hand rather than through the store, so the room is reserved
+    // here; the app grows on its way through the rebuild.
+    main.reserveFeedForTest(&model, 512);
     model.stage = .ready;
     model.notes_len = 200;
     for (0..200) |i| model.notes[i].id = @intCast(i + 1);
@@ -12552,4 +12564,74 @@ test "the window cannot be declared smaller than its own floor" {
     try testing.expect(main.window_min_width > 0);
     try testing.expect(main.window_width > 0);
     try testing.expect(main.window_height > 0);
+}
+
+test "the feed has no bottom: it holds more notes than the old cap" {
+    // The feed stopped at three hundred, and nothing about the rendering needed
+    // that: the list is windowed, so what is held costs memory rather than
+    // frames. The number was the size of a fixed array, and a reader who paged
+    // to the end of it found the feed simply ended.
+    //
+    // Six hundred here, which is only meaningful because it is past the number
+    // that used to be the ceiling.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    main.setIdentityForTest([_]u8{0x5b} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/deep.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const wanted = 600;
+    var author: [32]u8 = undefined;
+    {
+        var secret: [32]u8 = [_]u8{0x2c} ** 32;
+        const kp = try signer.keyPairFromSecretKey(secret);
+        author = kp.public_key;
+        secret[0] = 0;
+        var i: usize = 0;
+        while (i < wanted) : (i += 1) {
+            const body = try std.fmt.allocPrint(arena, "note number {d}", .{i});
+            const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+            _ = try store.ingest(arena, ev, .{});
+        }
+    }
+    _ = main.setFollowsForTest(&[_][32]u8{author}, 1_800_000_000);
+
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    model.stage = .ready;
+
+    // Page down the way a reader does, rather than setting the limit in one
+    // jump: this is also what proves the storage GROWS instead of being sized
+    // once at the top.
+    while (model.notes_len < wanted) {
+        const before = model.notes_len;
+        main.loadOlderForTest(model);
+        main.invalidateFeedForTest();
+        main.reconcileForTest(model, &store, 1_800_001_000);
+        if (model.notes_len == before) break;
+    }
+
+    try testing.expectEqual(@as(usize, wanted), model.notes_len);
+    try testing.expect(model.notes_len > 300);
+
+    // Every row is a distinct note, newest first. A growth that re-pointed the
+    // slice wrongly, or a reuse table that collided, would show up here as a
+    // repeat rather than as a crash.
+    var seen = std.AutoHashMap(i64, void).init(testing.allocator);
+    defer seen.deinit();
+    for (model.notes[0..model.notes_len]) |note| {
+        try testing.expect(!seen.contains(note.id));
+        try seen.put(note.id, {});
+    }
 }

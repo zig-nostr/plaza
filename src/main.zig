@@ -1330,11 +1330,21 @@ const starter_pack = blk: {
     break :blk pks;
 };
 
-// How many notes the feed can hold, and how many it asks the store for at
-// first. The list is windowed, so holding more costs memory, not frames; the
-// query grows a page at a time as the reader reaches the end.
-const feed_capacity = 300;
+// How many notes the feed asks the store for at first, and how many more each
+// time the reader reaches the end. There is no ceiling: the list is windowed, so
+// holding more notes costs memory rather than frames, and the buffer that holds
+// them grows on demand.
+//
+// It used to stop at three hundred. Nothing about the rendering needed that; the
+// number was the size of a fixed array, and a reader who scrolled to the bottom
+// of it simply found that the feed ended.
 const feed_page = 60;
+/// What the feed asks a RELAY for, which is not the same question as how many
+/// notes it can hold. A filter's limit is what a relay volunteers on subscribe,
+/// and asking a stranger's relay for an unbounded backlog is how a client gets
+/// rate limited. Older notes come from asking again with `until`, not from one
+/// enormous number here.
+const feed_request_limit = 300;
 // A thread's replies are cached in the model (pressable, their pictures
 // fetched), so this bounds that buffer. `thread_depth_max` bounds the
 // open-as-a-sub-thread back-stack, and its ceiling is the SDK's virtual-window
@@ -5877,7 +5887,13 @@ pub const Note = struct {
 pub const Stage = enum { onboarding, ready, settings };
 
 pub const Model = struct {
-    notes: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity,
+    /// The loaded feed. A SLICE into `g_feed_notes`, which grows as the reader
+    /// pages down and is never handed back. It was a fixed array of three
+    /// hundred, and that array was the only reason the feed had a bottom.
+    ///
+    /// Re-pointed by `rebuildNotes` after a growth, so nothing holds this across
+    /// one.
+    notes: []Note = &.{},
     notes_len: usize = 0,
     live_relays: usize = 0,
     /// How many relays the reader has, sampled on the tick beside the live
@@ -6762,7 +6778,11 @@ pub const Model = struct {
         }
         // Only as much as the reader has paged into, so the rebuild cost stays
         // flat until they actually ask for more.
-        const limit = @min(self.feed_limit, feed_capacity);
+        // No ceiling. The reader asked for this many, so the storage grows to
+        // hold them and the query asks for exactly that.
+        const limit = @min(self.feed_limit, ensureFeedCapacity(self.feed_limit));
+        // After a growth the old slice is freed, so re-point before using it.
+        self.notes = g_feed_notes;
         var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(limit) }) catch return;
         defer result.deinit();
 
@@ -6789,20 +6809,17 @@ pub const Model = struct {
         }
 
         // The old cards, so new positions can take them over by id.
-        const old = &g_notes_scratch;
+        const old = g_feed_scratch;
         const old_len = self.notes_len;
         @memcpy(old[0..old_len], self.notes[0..old_len]);
+        const slots = if (reuse_ok) buildReuseIndex(old[0..old_len]) else &.{};
 
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= limit) break;
             const id = noteIdOf(ev);
             self.notes[n] = blk: {
-                if (reuse_ok) {
-                    for (old[0..old_len]) |*prev| {
-                        if (prev.id == id) break :blk prev.*;
-                    }
-                }
+                if (findReused(slots, old[0..old_len], id)) |prev| break :blk prev;
                 break :blk noteFrom(ev, now_s);
             };
             n += 1;
@@ -6855,7 +6872,112 @@ pub fn noteIdOf(ev: nostr.event.Event) i64 {
 // The previous feed, kept across one rebuild so unchanged notes carry over
 // without being re-parsed. Static rather than stack: three hundred cards of
 // fixed buffers are far too big for a frame's stack.
-var g_notes_scratch: [feed_capacity]Note = [_]Note{.{}} ** feed_capacity;
+/// The feed's note storage, and the scratch copy a rebuild carries the previous
+/// pass in. Both grow together and neither ever shrinks: a reader who has paged
+/// down to four thousand notes will do it again next session, and returning the
+/// memory only to ask for it back is churn for a number nobody sees.
+///
+/// Page-allocated rather than static. Three hundred notes was already 900 KB of
+/// BSS across the two arrays; sizing a static array for "no limit" is not a
+/// thing that can be done.
+var g_feed_notes: []Note = &.{};
+var g_feed_scratch: []Note = &.{};
+
+/// Makes room for `want` notes, returning what is actually available. A failed
+/// growth keeps what it had, so a feed that cannot grow stops growing instead of
+/// losing the notes it is already showing.
+fn ensureFeedCapacity(want: usize) usize {
+    if (g_feed_notes.len >= want) return g_feed_notes.len;
+    // Doubling, so paging down a long feed is a handful of allocations rather
+    // than one per page.
+    var next = @max(g_feed_notes.len, feed_page);
+    while (next < want) next *|= 2;
+    const grown = std.heap.page_allocator.realloc(g_feed_notes, next) catch return g_feed_notes.len;
+    const scratch = std.heap.page_allocator.realloc(g_feed_scratch, next) catch {
+        // The two must stay the same length: a rebuild indexes both.
+        g_feed_notes = grown;
+        return @min(grown.len, g_feed_scratch.len);
+    };
+    for (grown[g_feed_notes.len..]) |*n| n.* = .{};
+    g_feed_notes = grown;
+    g_feed_scratch = scratch;
+    return g_feed_notes.len;
+}
+
+/// An open-addressed id-to-slot table over the previous pass, so a rebuild finds
+/// an already-parsed card in constant time.
+///
+/// This was a linear scan of the previous feed, once per event. That is ninety
+/// thousand comparisons at the old three-hundred cap, which was survivable, and
+/// quadratic without one: sixteen million at four thousand notes, on a rebuild
+/// that runs about once a second. Removing the cap is what made the scan matter.
+var g_reuse_slots: []u32 = &.{};
+const reuse_empty: u32 = std.math.maxInt(u32);
+
+fn reuseHash(id: i64, mask: usize) usize {
+    // Fibonacci mixing: note ids are the first eight bytes of a hash, so the low
+    // bits are already well spread, but the multiply costs nothing and protects
+    // against a masked slice of them clustering.
+    const mixed = @as(u64, @bitCast(id)) *% 0x9E37_79B9_7F4A_7C15;
+    return @as(usize, @intCast(mixed >> 40)) & mask;
+}
+
+/// Fills the table for `old` and returns it, or an empty slice if it cannot be
+/// sized, in which case the caller reparses rather than reusing. Reparsing is
+/// slower, never wrong.
+fn buildReuseIndex(old: []const Note) []u32 {
+    if (old.len == 0) return &.{};
+    // Half load factor, so probes stay short.
+    var want: usize = 128;
+    while (want < old.len * 2) want *|= 2;
+    if (g_reuse_slots.len < want) {
+        g_reuse_slots = std.heap.page_allocator.realloc(g_reuse_slots, want) catch return &.{};
+    }
+    const table = g_reuse_slots[0..want];
+    @memset(table, reuse_empty);
+    const mask = want - 1;
+    for (old, 0..) |note, i| {
+        var at = reuseHash(note.id, mask);
+        while (table[at] != reuse_empty) at = (at + 1) & mask;
+        table[at] = @intCast(i);
+    }
+    return table;
+}
+
+/// The previous card for `id`, when there is one.
+fn findReused(table: []const u32, old: []const Note, id: i64) ?Note {
+    if (table.len == 0) return null;
+    const mask = table.len - 1;
+    var at = reuseHash(id, mask);
+    while (table[at] != reuse_empty) : (at = (at + 1) & mask) {
+        const prev = old[table[at]];
+        if (prev.id == id) return prev;
+    }
+    return null;
+}
+
+/// Points a model at the feed storage, growing it to at least one page. Called
+/// wherever a Model is made, so `notes[0]` is writable without every caller
+/// having to think about it.
+pub fn attachFeedStorage(model: *Model) void {
+    _ = ensureFeedCapacity(feed_page);
+    model.notes = g_feed_notes;
+}
+
+/// Makes room for `n` notes and re-points `model` at the grown buffer. For tests
+/// that fill the feed by hand rather than through the store: the app grows on
+/// its way through `rebuildNotes`, and writing past the end without that is the
+/// out-of-bounds it should be.
+/// One more page, the way the reader's scroll asks for it. For tests, so they
+/// page down through the real path rather than setting the limit by hand.
+pub fn loadOlderForTest(model: *Model) void {
+    model.feed_limit += feed_page;
+}
+
+pub fn reserveFeedForTest(model: *Model, n: usize) void {
+    _ = ensureFeedCapacity(n);
+    model.notes = g_feed_notes;
+}
 // The names generation the current cards were parsed under (see
 // `g_names_generation`).
 var g_notes_names_generation: u64 = 0;
@@ -12046,7 +12168,7 @@ pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []n
     while (start < authors.len) : (start += follow_chunk) {
         if (len + 2 > out.len) break;
         const chunk = authors[start..@min(start + follow_chunk, authors.len)];
-        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_capacity };
+        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_request_limit };
         out[len + 1] = .{ .authors = chunk, .kinds = &profile_filter_kinds, .limit = profile_cap };
         len += 2;
     }
@@ -17991,8 +18113,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .load_older => {
             // One more page from the store, up to what the feed can hold.
-            if (model.feed_limit >= feed_capacity) return;
-            model.feed_limit = @min(model.feed_limit + feed_page, feed_capacity);
+            // No ceiling to stop at. The store answers with what it has, and
+            // `notes_len` lands wherever that is; asking for more than exists
+            // simply returns the same feed and the reader has reached the end
+            // of what this app has been told about.
+            model.feed_limit += feed_page;
             g_last_count = std.math.maxInt(usize);
             model.refresh(nowSeconds());
         },
@@ -18760,7 +18885,9 @@ fn enterFeed(model: *Model) void {
 }
 
 pub fn initialModel() Model {
-    return .{};
+    var model = Model{};
+    attachFeedStorage(&model);
+    return model;
 }
 
 // -------------------------------------------------------------- compose & post
@@ -21467,7 +21594,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 }
             }
             const next_filters = [_]nostr.filter.Filter{
-                .{ .authors = authors[0..next_authors_len], .kinds = &feed_kinds, .limit = feed_capacity },
+                .{ .authors = authors[0..next_authors_len], .kinds = &feed_kinds, .limit = feed_request_limit },
                 .{ .authors = authors[0..next_authors_len], .kinds = &profile_kinds, .limit = profile_cap },
             };
             relay.subscribe("plaza-feed", &next_filters) catch {};
