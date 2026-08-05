@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const main = @import("main.zig");
@@ -2620,22 +2621,27 @@ test "replies from outside the follow graph are held below, not dropped" {
 }
 
 test "somebody you follow is in your graph however far down the list they are" {
-    // The thread split asked `followSet()`, which is capped at `max_follows`
-    // because it is the FEED's author set: the feed pays a relay filter entry and
-    // a store cursor per author, so being a slice is the point of it. Membership
-    // is a different question and has no business being capped.
+    // The thread split asked `followSet()` when it wanted membership. That slice
+    // used to be a small cap, so a reader with three hundred follows was told
+    // that follows 129 and up were strangers, in every thread, forever. And
+    // `writeFollow` APPENDS, so the people they had followed most recently were
+    // the ones most likely to be filed under "replies outside your graph".
     //
-    // A reader with three hundred follows was told that follows 129 and up were
-    // strangers, in every thread, forever. And `writeFollow` APPENDS, so the
-    // people they had followed most recently were the ones most likely to be
-    // filed under "replies outside your graph".
+    // The feed reads the whole list now, so the two are the same set for any
+    // list the table holds. What is still worth pinning is the shape of the old
+    // failure: fill the table completely and the person added LAST is in the
+    // graph, because that is the one an off-by-a-cap loses first.
     main.setIdentityForTest([_]u8{0xe1} ** 32);
     defer main.clearIdentityForTest();
     main.forgetFollowsForTest();
     defer main.forgetFollowsForTest();
 
-    const total = main.max_follows + 40;
-    var list: [main.max_follows + 40][32]u8 = undefined;
+    // Heap, not stack: a full table is sixty-five kilobytes of pubkeys and a
+    // Debug build does not economise on frames.
+    var list_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer list_arena.deinit();
+    const total = main.max_follows;
+    const list = try list_arena.allocator().alloc([32]u8, total);
     for (0..total) |i| {
         @memset(&list[i], 0);
         list[i][0] = @intCast(i / 256);
@@ -2644,13 +2650,14 @@ test "somebody you follow is in your graph however far down the list they are" {
     }
     try testing.expect(main.setFollowsForTest(list[0..total], 1_800_000_000));
 
-    // Inside the feed's slice, which always worked.
+    // The front of the list, which always worked even at the old cap.
     try testing.expect(main.inFollowGraph(list[0]));
-    try testing.expect(main.inFollowGraph(list[main.max_follows - 1]));
+    try testing.expect(main.inFollowGraph(list[127]));
 
-    // THE PROPERTY: past it, which did not. Both the last person they followed
-    // and one in the middle of the tail.
-    try testing.expect(main.inFollowGraph(list[main.max_follows]));
+    // THE PROPERTY: deep into the list, where the old cap cut. The last person
+    // they followed, and one in the middle of the tail.
+    try testing.expect(main.inFollowGraph(list[128]));
+    try testing.expect(main.inFollowGraph(list[total / 2]));
     try testing.expect(main.inFollowGraph(list[total - 1]));
 
     // And a stranger is still a stranger, so this is not just "always true".
@@ -6228,11 +6235,14 @@ test "a contact list arriving from a relay becomes the feed's scope" {
     try testing.expectEqual(@as(usize, 3), main.followSetForTest().len);
 }
 
-test "a follow list longer than the feed reads says so" {
-    // The feed reads at most `max_follows` authors, because the store opens one
-    // cursor per author. The list is still WRITTEN back in full, so nothing is
-    // lost; but telling somebody who follows five hundred that they follow 128
-    // is a lie about their own data.
+test "the scope line states how many accounts the feed reads" {
+    // This used to guard a second number. The feed read a slice of the list, so
+    // the line said "128 of 300 accounts": stating only the first to somebody
+    // who follows three hundred people is a lie about their own data.
+    //
+    // The feed reads the whole list now, so there is one number and it is the
+    // right one. What is left to guard is that it is the LIST's number and not
+    // the window's, and that a reader is never quietly told a smaller one.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6249,12 +6259,18 @@ test "a follow list longer than the feed reads says so" {
     }
     _ = main.setFollowsForTest(&many, 1_800_000_000);
 
-    // The feed reads a bounded slice.
-    try testing.expectEqual(@as(usize, 128), main.followSetForTest().len);
-    // And the line says both numbers rather than the flattering one.
+    // Three hundred follows are all read, and stated as one number.
+    try testing.expectEqual(@as(usize, 300), main.followSetForTest().len);
     var model = main.initialModel();
-    const voices = model.scope_voices(arena);
-    try testing.expect(std.mem.indexOf(u8, voices, "128 of 300 accounts") != null);
+    const three_hundred = model.scope_voices(arena);
+    try testing.expect(std.mem.indexOf(u8, three_hundred, "300 accounts \u{b7} yours") != null);
+    try testing.expect(std.mem.indexOf(u8, three_hundred, " of ") == null);
+
+    // A single follow is not "1 accounts".
+    var one: [1][32]u8 = undefined;
+    @memset(&one[0], 7);
+    _ = main.setFollowsForTest(&one, 1_800_000_001);
+    try testing.expect(std.mem.indexOf(u8, model.scope_voices(arena), "1 account \u{b7} yours") != null);
 
     // A list that fits states one number, without the arithmetic.
     var few: [3][32]u8 = undefined;
@@ -6348,11 +6364,16 @@ test "one relay's silence never authorizes replacing a contact list" {
     try testing.expectEqual(@as(usize, 201), p_count);
 }
 
-test "membership is right for every follow, not only the ones the feed reads" {
-    // The feed reads a bounded slice, because the store opens one cursor per
-    // author. Membership is not bounded: offering to follow somebody who is
-    // already on the list, and then doing nothing when pressed, is worse than
-    // not offering.
+test "membership is right for every follow, and so is what the feed reads" {
+    // These were two different numbers, and the bug that named this test was
+    // asking the feed's bounded slice a membership question: a reader with three
+    // hundred follows was told that follows 129 and up were strangers, and a new
+    // follow is APPENDED, so the people they had followed most recently were the
+    // ones most likely to be misfiled.
+    //
+    // The feed reads the whole list now, so for any list the table holds the two
+    // questions agree. They can still diverge past the table, which is why they
+    // are still asked separately here rather than collapsed into one.
     main.setIdentityForTest([_]u8{104} ** 32);
     defer main.clearIdentityForTest();
     main.forgetFollowsForTest();
@@ -6365,9 +6386,8 @@ test "membership is right for every follow, not only the ones the feed reads" {
     }
     _ = main.setFollowsForTest(&many, 1_800_000_000);
 
-    // The feed reads 128 of them.
-    try testing.expectEqual(@as(usize, 128), main.followSetForTest().len);
-    // But all 400 are followed, including the last.
+    // The feed reads all of them, and all of them are followed.
+    try testing.expectEqual(@as(usize, 400), main.followSetForTest().len);
     try testing.expectEqual(@as(usize, 400), main.followTotal());
     // With a list of the reader's OWN, the two questions agree: everybody on it
     // is both read and followed.
@@ -12350,4 +12370,170 @@ test "the accessibility audit is switched on, not just present" {
     const issues = canvas.a11y.auditWidgetA11y(layout, &findings);
     try testing.expect(issues.total > 0);
     try testing.expectEqual(canvas.a11y.A11yAuditRuleKind.duplicate_sibling_label, issues.findings[0].rule);
+}
+
+test "the feed rebuilds inside a frame with every account a reader can follow" {
+    // The other rebuild benchmark measures a typical list. This one measures the
+    // ceiling, because the feed now reads the whole contact list rather than a
+    // slice of it (#143), and the number that matters about that decision is
+    // what it costs at the top.
+    //
+    // ReleaseFast only, and skipped rather than relaxed in Debug. A Debug build
+    // is roughly six times slower per rebuild and would need a budget six times
+    // looser, which would no longer be a frame and would stop meaning anything.
+    // It also signs one event per note, and eight thousand Debug signatures is
+    // minutes of CI for a number nobody ships.
+    if (builtin.mode != .ReleaseFast) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    main.setIdentityForTest([_]u8{98} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/ceiling.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const follows = main.max_follows;
+    const list = try arena.alloc([32]u8, follows);
+    for (0..follows) |i| {
+        var secret: [32]u8 = undefined;
+        @memset(&secret, @intCast((i % 200) + 1));
+        secret[31] = @intCast(i & 0xff);
+        secret[30] = @intCast((i >> 8) & 0xff);
+        const kp = signer.keyPairFromSecretKey(secret) catch continue;
+        list[i] = kp.public_key;
+        // A profile as well as notes, and the profile is OLDER than the notes,
+        // which is the real shape: a bio is written once and posted over ever
+        // since. That ordering is what made the profile query walk whole
+        // timelines before the store indexed authors and kinds together.
+        const meta = try nostr.event.create(arena, signer, kp, 1_799_000_000, 0, &.{}, "{\"name\":\"n\"}", null);
+        _ = try store.ingest(arena, meta, .{});
+        for (0..4) |n| {
+            const body = try std.fmt.allocPrint(arena, "note {d} from {d}", .{ n, i });
+            const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i * 10 + n)), 1, &.{}, body, null);
+            _ = try store.ingest(arena, ev, .{});
+        }
+    }
+    _ = main.setFollowsForTest(list, 1_800_000_000);
+    try testing.expectEqual(follows, main.followSetForTest().len);
+
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    model.stage = .ready;
+    model.feed_limit = 300;
+    main.reconcileForTest(model, &store, 1_800_002_000);
+    try testing.expect(model.notes_len > 0);
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Best of three. The stopwatch runs on a whole machine and nothing is ever
+    // subtracted from a reading, so the error is one-sided and the minimum is
+    // the closest estimate of the real cost available here.
+    var best: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        const started = std.Io.Timestamp.now(io, .awake);
+        const rounds = 5;
+        for (0..rounds) |_| {
+            main.invalidateFeedForTest();
+            main.reconcileForTest(model, &store, 1_800_002_000);
+        }
+        const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
+        const per = @as(u64, @intCast(@max(elapsed.toNanoseconds(), 0))) / rounds;
+        best = @min(best, per);
+    }
+
+    const budget_ns = 16 * std.time.ns_per_ms;
+    std.debug.print("\n[perf] {d} follows (the ceiling): {d}us per feed rebuild (budget {d}us)\n", .{ follows, best / 1000, budget_ns / 1000 });
+    if (best > budget_ns) {
+        std.debug.print(
+            "\nreading every follow costs {d}us per rebuild against a {d}us frame. The feed rebuilds on a timer, so this is a stutter every second, not a slow benchmark.\n",
+            .{ best / 1000, budget_ns / 1000 },
+        );
+        return error.FeedRebuildTooSlow;
+    }
+}
+
+test "a long follow list is split across filters that relays accept, in one REQ" {
+    // The reason the feed read a slice was the REQ, not the store: a filter
+    // naming a few thousand authors is past what several relays take. strfry
+    // refuses a filter whose field items exceed 65535 bytes, which is 2047 hex
+    // pubkeys, and it is not the only one with a ceiling.
+    //
+    // So the authors are split across filters and sent together. This asserts
+    // the split is lossless, because a subscription that silently drops its tail
+    // is exactly the bug the cap was: those people just stop appearing, and
+    // nothing anywhere says so.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One past four full chunks, so the last chunk holds a single author: the
+    // off-by-one that a loop written for round numbers loses.
+    const total = 2001;
+    const authors = try arena.alloc([32]u8, total);
+    for (authors, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i / 256);
+        a[1] = @intCast(i % 256);
+        a[31] = 0x5a;
+    }
+
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = main.buildFeedFilters(authors, &buf);
+
+    // Two filters per chunk: the notes and the metadata.
+    try testing.expectEqual(@as(usize, 10), filters.len);
+
+    // Every author appears exactly once across the note filters, and no filter
+    // is wider than a relay will take.
+    const seen = try arena.alloc(usize, total);
+    @memset(seen, 0);
+    var counted: usize = 0;
+    for (filters) |f| {
+        const list = f.authors.?;
+        try testing.expect(list.len <= 500);
+        try testing.expect(list.len > 0);
+        // Only count the note filters, or every author is seen twice by design.
+        if (f.kinds.?.len != 1) continue;
+        for (list) |a| {
+            const index = @as(usize, a[0]) * 256 + @as(usize, a[1]);
+            seen[index] += 1;
+            counted += 1;
+        }
+    }
+    try testing.expectEqual(total, counted);
+    for (seen, 0..) |n, i| {
+        if (n != 1) {
+            std.debug.print("\nauthor {d} appears in {d} filters, not 1\n", .{ i, n });
+            return error.AuthorLostOrDuplicated;
+        }
+    }
+
+    // The limit is NOT divided across chunks: each names different people, so
+    // splitting it would starve whoever landed last.
+    for (filters) |f| {
+        if (f.kinds.?.len == 1) try testing.expectEqual(@as(u32, 300), f.limit.?);
+    }
+
+    // A list that fits in one chunk is still one chunk, not a special case.
+    const few = try arena.alloc([32]u8, 9);
+    for (few, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i);
+    }
+    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, &buf).len);
+    // And nobody at all asks nothing, rather than asking about everybody.
+    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, &buf).len);
 }
