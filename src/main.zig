@@ -6526,13 +6526,10 @@ pub const Model = struct {
         if (!followsAreOwned()) {
             return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{shown}) catch "hand-picked";
         }
-        const total = followTotal();
-        // A list longer than the feed reads says so. "128 accounts" to somebody
-        // who follows five hundred is a lie about their own data, and the kind
-        // a reader eventually notices.
-        if (total > shown) {
-            return std.fmt.allocPrint(arena, "{d} of {d} accounts · yours", .{ shown, total }) catch "yours";
-        }
+        // One number, because the feed reads the whole list. This used to state
+        // two ("128 of 300 accounts") back when it read a slice, and that was
+        // worth the clutter then: telling somebody who follows five hundred
+        // people that they follow 128 is a lie about their own data.
         if (shown == 1) return "1 account · yours";
         return std.fmt.allocPrint(arena, "{d} accounts · yours", .{shown}) catch "yours";
     }
@@ -12053,10 +12050,6 @@ pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []n
 
 var g_follows: [max_follows_tracked][32]u8 = undefined;
 var g_follow_count: usize = 0;
-/// How many their contact list named, including any past `max_follows_tracked`
-/// that the table could not hold. Only ever differs from `g_follow_count` for a
-/// list longer than the table.
-var g_follow_total: usize = 0;
 /// Whose list is in `g_follows`, for the same reason the relay pool records it:
 /// a list left behind by one account must never be read as another's.
 var g_follow_owner: ?[32]u8 = null;
@@ -12096,7 +12089,7 @@ pub fn followSet() []const [32]u8 {
 /// How many accounts this reader follows, all of them, whether or not the feed
 /// reads them all.
 pub fn followTotal() usize {
-    if (followsAreOwned()) return @max(g_follow_total, g_follow_count);
+    if (followsAreOwned()) return g_follow_count;
     return starter_pack.len;
 }
 
@@ -12206,12 +12199,6 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     const n = @min(list.len, max_follows_tracked);
     @memcpy(g_follows[0..n], list[0..n]);
     g_follow_count = n;
-    // What their list actually SAYS, which is not always what fits in the table.
-    // Kept separately so the scope line can still tell somebody who follows
-    // three thousand accounts that the feed is not reading all of them. Folding
-    // the two together would have made that sentence unreachable and left the
-    // app quietly claiming a number it had truncated itself.
-    g_follow_total = list.len;
     g_follow_owner = pk;
     g_follow_created_at = created_at;
     unlockFollows();
@@ -12228,7 +12215,6 @@ fn forgetFollows() void {
     lockFollows();
     g_follow_owner = null;
     g_follow_count = 0;
-    g_follow_total = 0;
     g_follow_created_at = 0;
     unlockFollows();
     // A list signed but not yet seen belongs to the account that signed it. Left

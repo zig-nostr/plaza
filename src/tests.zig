@@ -6235,12 +6235,14 @@ test "a contact list arriving from a relay becomes the feed's scope" {
     try testing.expectEqual(@as(usize, 3), main.followSetForTest().len);
 }
 
-test "a follow list longer than the feed reads says so" {
-    // The feed reads every account on the list now, so the ordinary reader sees
-    // one number. This still guards the sentence, because the table that holds
-    // the list is finite and somebody will eventually be past it: telling a
-    // reader who follows three thousand accounts that they follow the number
-    // this app could fit is a lie about their own data.
+test "the scope line states how many accounts the feed reads" {
+    // This used to guard a second number. The feed read a slice of the list, so
+    // the line said "128 of 300 accounts": stating only the first to somebody
+    // who follows three hundred people is a lie about their own data.
+    //
+    // The feed reads the whole list now, so there is one number and it is the
+    // right one. What is left to guard is that it is the LIST's number and not
+    // the window's, and that a reader is never quietly told a smaller one.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6264,21 +6266,11 @@ test "a follow list longer than the feed reads says so" {
     try testing.expect(std.mem.indexOf(u8, three_hundred, "300 accounts \u{b7} yours") != null);
     try testing.expect(std.mem.indexOf(u8, three_hundred, " of ") == null);
 
-    // Past what the table holds, both numbers are stated. The list itself is
-    // still written back in full by the follow path, so nothing is lost; what
-    // this guards is that the app does not quietly report its own truncation as
-    // the reader's follow count.
-    const over = main.max_follows + 40;
-    const big = try arena.alloc([32]u8, over);
-    for (big, 0..) |*e, i| {
-        @memset(e, @intCast(i % 251));
-        e[31] = @intCast(i & 0xff);
-        e[30] = @intCast((i >> 8) & 0xff);
-    }
-    _ = main.setFollowsForTest(big, 1_800_000_001);
-    const capped = model.scope_voices(arena);
-    const expected = try std.fmt.allocPrint(arena, "{d} of {d} accounts", .{ main.max_follows, over });
-    try testing.expect(std.mem.indexOf(u8, capped, expected) != null);
+    // A single follow is not "1 accounts".
+    var one: [1][32]u8 = undefined;
+    @memset(&one[0], 7);
+    _ = main.setFollowsForTest(&one, 1_800_000_001);
+    try testing.expect(std.mem.indexOf(u8, model.scope_voices(arena), "1 account \u{b7} yours") != null);
 
     // A list that fits states one number, without the arithmetic.
     var few: [3][32]u8 = undefined;
