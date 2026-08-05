@@ -14,8 +14,8 @@
         // CLI and the framework speak different protocol versions, and moving
         // one alone does not fail the build: it silently breaks every live test.
         .native_sdk = .{
-            .url = "git+https://github.com/vercel-labs/native.git#e84ee28cbe513e75558957b1a18536546390e635",
-            .hash = "native_sdk-0.1.0-hzDzQvrg7QEzV-zdCEQqMhoyHCzPK3VMfrObH6Bl5jor",
+            .url = "git+https://github.com/sepehr-safari/native.git#55ab7392285e0473dee0e579418dd5b21147b1e6",
+            .hash = "native_sdk-0.1.0-hzDzQjHj7QFUR4i8PUurrKO7eqKXKGGNmRduN3Mq_E9R",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the
