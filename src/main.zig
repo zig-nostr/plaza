@@ -11988,15 +11988,75 @@ const contact_list_kind: u16 = 3;
 /// this person" has to be right for every name on the list, or the Follow button
 /// offers to add somebody who is already there and the press does nothing.
 const max_follows_tracked = 2048;
-/// How many the FEED reads from. A follow list of a few thousand is normal on
-/// Nostr; a filter naming them all is roughly 130 KB of REQ, past the payload
-/// cap several relays close the connection over, and a store query opens one
-/// cursor per author. See `max_follows_tracked` for why membership is a
-/// separate, much larger number.
-pub const max_follows = 128;
+/// How many the FEED reads from: all of them.
+///
+/// This was 128 for two reasons and neither survived measurement.
+///
+/// The store cost was real and is fixed. Asking for one kind by many authors
+/// used to be answered from the author index, so it walked everything those
+/// people had ever written and discarded the wrong kinds after decoding them;
+/// nostr v0.3.8 indexes the pair. A feed rebuild across 2048 follows now
+/// measures inside one frame at 60Hz, and the curve that made 128 look like a
+/// cliff turned out to have been recorded in a Debug build.
+///
+/// The REQ payload is real and is handled: a filter naming a few thousand
+/// authors is past what several relays accept, so the subscription splits them
+/// across filters of `follow_chunk` and sends the lot in ONE REQ, which is what
+/// Damus does and what strfry's own limit is written against. A relay answers
+/// every filter in a REQ, so this is a payload split, not a narrower question.
+pub const max_follows = max_follows_tracked;
+
+/// Authors per filter in the feed subscription.
+///
+/// strfry refuses a filter whose field items exceed 65535 bytes, which is 2047
+/// hex pubkeys, and it is not the only relay with a ceiling. Damus splits at
+/// 500 and has had years of contact with relays nobody here runs. Taking the
+/// number that is already proven against the wild rather than the largest one
+/// that fits the one implementation whose source states a limit.
+const follow_chunk = 500;
+
+/// How many chunks the author set can need, rounded up, with the reader's own
+/// key counted. Sizes the filter buffer, so a follow list that grows past it is
+/// a compile-time question rather than a truncated subscription.
+const max_follows_divided = (max_follows + 1 + follow_chunk - 1) / follow_chunk;
+
+/// How many filters the feed subscription can need: two per chunk.
+pub const max_feed_filters = 2 * (max_follows_divided + 1);
+
+/// The feed's notes.
+const feed_filter_kinds = [_]u16{1};
+/// kind:0 is who they are, 10002 is where they are, and 3 is who the reader
+/// follows: their own contact list, which nothing may be written over until it
+/// has been read.
+const profile_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
+
+/// Splits `authors` across filters small enough for a relay to accept, two per
+/// chunk, and returns the slice of `out` that was filled.
+///
+/// One REQ carries all of them. A relay answers every filter in a REQ, so this
+/// asks exactly the question one enormous filter would have asked, in an
+/// envelope that arrives. The per-chunk limit is NOT divided: each chunk names
+/// different people, and splitting the limit would starve whoever landed in the
+/// last one.
+pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    var len: usize = 0;
+    var start: usize = 0;
+    while (start < authors.len) : (start += follow_chunk) {
+        if (len + 2 > out.len) break;
+        const chunk = authors[start..@min(start + follow_chunk, authors.len)];
+        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_capacity };
+        out[len + 1] = .{ .authors = chunk, .kinds = &profile_filter_kinds, .limit = profile_cap };
+        len += 2;
+    }
+    return out[0..len];
+}
 
 var g_follows: [max_follows_tracked][32]u8 = undefined;
 var g_follow_count: usize = 0;
+/// How many their contact list named, including any past `max_follows_tracked`
+/// that the table could not hold. Only ever differs from `g_follow_count` for a
+/// list longer than the table.
+var g_follow_total: usize = 0;
 /// Whose list is in `g_follows`, for the same reason the relay pool records it:
 /// a list left behind by one account must never be read as another's.
 var g_follow_owner: ?[32]u8 = null;
@@ -12036,7 +12096,7 @@ pub fn followSet() []const [32]u8 {
 /// How many accounts this reader follows, all of them, whether or not the feed
 /// reads them all.
 pub fn followTotal() usize {
-    if (followsAreOwned()) return g_follow_count;
+    if (followsAreOwned()) return @max(g_follow_total, g_follow_count);
     return starter_pack.len;
 }
 
@@ -12146,6 +12206,12 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     const n = @min(list.len, max_follows_tracked);
     @memcpy(g_follows[0..n], list[0..n]);
     g_follow_count = n;
+    // What their list actually SAYS, which is not always what fits in the table.
+    // Kept separately so the scope line can still tell somebody who follows
+    // three thousand accounts that the feed is not reading all of them. Folding
+    // the two together would have made that sentence unreachable and left the
+    // app quietly claiming a number it had truncated itself.
+    g_follow_total = list.len;
     g_follow_owner = pk;
     g_follow_created_at = created_at;
     unlockFollows();
@@ -12162,6 +12228,7 @@ fn forgetFollows() void {
     lockFollows();
     g_follow_owner = null;
     g_follow_count = 0;
+    g_follow_total = 0;
     g_follow_created_at = 0;
     unlockFollows();
     // A list signed but not yet seen belongs to the account that signed it. Left
@@ -21319,25 +21386,31 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         authors[authors_len] = pk;
         authors_len += 1;
     }
-    const feed_kinds = [_]u16{1};
+    const feed_kinds = feed_filter_kinds;
     // kind:0 is who they are, kind:10002 is where they are: the reader's own
     // relay list, and the relays their follows write to, which is what makes a
     // suggestion under the add field a fact rather than a guess.
     // kind:0 is who they are, 10002 is where they are, and 3 is who the reader
     // follows: their own contact list, which nothing may be written over until
     // it has been read.
-    const profile_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
-    const filters = [_]nostr.filter.Filter{
-        // `authors_len`, which INCLUDES the reader. This asked for a snapshot
-        // taken BEFORE the reader's own key was appended, so a note
-        // written anywhere but this install was never fetched from any relay: the
-        // feed reads your own notes from the store and the store never had them.
-        // Signing in with an existing key therefore showed a feed with none of
-        // your own writing in it, and every notification about those notes
-        // pressed into nothing, because the note it pointed at was not held.
-        .{ .authors = authors[0..authors_len], .kinds = &feed_kinds, .limit = feed_capacity },
-        .{ .authors = authors[0..authors_len], .kinds = &profile_kinds, .limit = profile_cap },
-    };
+    const profile_kinds = profile_filter_kinds;
+    // Two filters per chunk of authors, all in ONE REQ.
+    //
+    // `authors_len` INCLUDES the reader. An earlier version took the snapshot
+    // BEFORE appending the reader's own key, so a note written anywhere but this
+    // install was never fetched from any relay: the feed reads your own notes
+    // from the store and the store never had them. Signing in with an existing
+    // key showed a feed with none of your own writing in it, and every
+    // notification about those notes pressed into nothing, because the note it
+    // pointed at was not held.
+    //
+    // The chunking is a payload split and nothing more. A relay answers every
+    // filter in a REQ, so five filters of five hundred authors ask the same
+    // question as one filter of two and a half thousand, in an envelope relays
+    // actually accept. The per-chunk limit stays whole for the same reason:
+    // dividing it would starve whoever landed in the last chunk.
+    var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = buildFeedFilters(authors[0..authors_len], &filter_buf);
     // What other people aimed at this reader. Its own subscription, never folded
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
@@ -21347,7 +21420,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // A relay marked write-only is not asked anything. It keeps its socket, so a
     // note goes out the moment it is written, but no filter of this reader's
     // ever reaches it: that is the whole difference the badge promises.
-    if (reads) try relay.subscribe("plaza-feed", &filters);
+    if (reads) try relay.subscribe("plaza-feed", filters);
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
     // feed REQ asks for a 300-note backlog plus profiles, so timing it measures

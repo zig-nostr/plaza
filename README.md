@@ -60,6 +60,19 @@ The same scroll on the same machine, before the feed stopped asking the database
 who you follow once per card, cost 24423us per rebuild: three whole frames to
 draw one, and worse the more people you followed.
 
+The feed reads every account you follow, not a slice of it. At the ceiling of
+2048, with each of those accounts carrying a profile older than their notes
+(which is the real shape: a bio is written once and posted over ever since), a
+rebuild measures 5989us against the 16667us of a 60Hz frame. The subscription
+splits those authors across filters relays will accept and sends them in one
+REQ, so it asks about all of them rather than the first few hundred.
+
+That ceiling is measured by the test suite rather than by the script below:
+
+```sh
+zig build test -Doptimize=ReleaseFast
+```
+
 Measure it yourself, and fail on a regression:
 
 ```sh
