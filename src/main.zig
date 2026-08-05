@@ -13537,6 +13537,17 @@ const PersonCard = struct {
     stamp: usize = std.math.maxInt(usize),
     about_buf: [512]u8 = [_]u8{0} ** 512,
     about_len: u16 = 0,
+    /// The about text with its NIP-27 mentions rewritten as `@name`, which is
+    /// what the page shows. Kept beside the raw bytes rather than rewritten at
+    /// draw time because the card's height is computed from the length of the
+    /// string, so measuring the raw one and drawing the rewritten one would
+    /// reserve space for a line that is not there.
+    about_shown_buf: [512]u8 = [_]u8{0} ** 512,
+    about_shown_len: u16 = 0,
+    /// The names generation `about_shown_buf` was written under. A mention
+    /// resolves to a short npub until that person's kind:0 arrives, and then it
+    /// has a name, so this is rewritten when the cache learns one.
+    about_shown_gen: u64 = std.math.maxInt(u64),
     website_buf: [128]u8 = [_]u8{0} ** 128,
     website_len: u8 = 0,
     lud16_buf: [128]u8 = [_]u8{0} ** 128,
@@ -13619,6 +13630,20 @@ fn refreshPersonCard(card: *PersonCard) void {
         card.following = null;
         card.follows_me = false;
     }
+
+    // A bio is written the same way a note is, so it carries the same
+    // `nostr:npub...` references, and printing one raw drops sixty-three
+    // characters of base32 into the middle of a sentence about a person. The
+    // feed has drawn these as `@name` since NIP-27 landed; this is the same pass
+    // over the same cache.
+    if (card.about_shown_gen != g_names_generation) {
+        card.about_shown_gen = g_names_generation;
+        card.about_shown_len = @intCast(renderContent(
+            &card.about_shown_buf,
+            card.about_buf[0..card.about_len],
+            "",
+        ));
+    }
 }
 
 fn parsePersonMetadata(card: *PersonCard, json: []const u8) void {
@@ -13684,7 +13709,9 @@ fn readRecord(gpa: std.mem.Allocator, pubkey: [32]u8, kind: u16) ?OwnProfile {
 
 pub fn personAbout(pubkey: [32]u8) []const u8 {
     const c = personCard(pubkey);
-    return c.about_buf[0..c.about_len];
+    // The rewritten one, so what the page measures and what it draws are the
+    // same string.
+    return c.about_shown_buf[0..c.about_shown_len];
 }
 
 pub fn personWebsite(pubkey: [32]u8) []const u8 {
