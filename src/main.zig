@@ -41,10 +41,15 @@ const canvas_label = "main-canvas";
 // with real margin on either side, and extra width past that becomes margin,
 // never a longer line. Wider than tall: a reading column wants breathing room,
 // not a tower.
-pub const window_width: f32 = 760;
+//
+// From app.zon, like the floor, so the manifest is the one place the number
+// lives. These were typed here as well, and two numbers that must agree with
+// nothing connecting them is exactly how the floor came to sit seven pixels
+// below what the layout needed.
+pub const window_width: f32 = @import("window_floor").manifest_width;
 // Square. A feed is a column of rows, and the wide-and-short default spent its
 // extra width on margin while showing four notes at a time.
-pub const window_height: f32 = 760;
+pub const window_height: f32 = @import("window_floor").manifest_height;
 const feed_column_width: f32 = 620;
 // The thread's reading column matches the feed's: both are virtualLists now,
 // which reserve the same scrollbar gutter, so the two screens share one column
