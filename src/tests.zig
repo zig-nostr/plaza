@@ -12232,3 +12232,82 @@ test "a link preview's description is cut with an ellipsis, not by the card edge
     }
     if (!found) return error.NoDescription;
 }
+
+test "a bio's nostr: mentions are drawn as names, like a note's" {
+    // A bio is written the same way a note is, so it carries the same NIP-27
+    // references. The feed has drawn them as `@name` for a long time and the
+    // profile printed the raw token, which is sixty-three characters of base32
+    // in the middle of a sentence about a person.
+    //
+    // Asserted through `personAbout`, which is what both the page and the
+    // height calculation call, rather than through `renderContent` directly:
+    // the rewriting was never in doubt, reaching for it was.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bio.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const subject = [_]u8{0x71} ** 32;
+    const friend = [_]u8{0x72} ** 32;
+    const friend_npub = try nostr.nip19.encodeNpub(arena, friend);
+
+    const bio = try std.fmt.allocPrint(arena, "Engaged to nostr:{s}", .{friend_npub});
+    const meta = try std.fmt.allocPrint(arena, "{{\"name\":\"subject\",\"about\":\"{s}\"}}", .{bio});
+    _ = try store.ingest(arena, .{
+        .id = [_]u8{0xb1} ** 32,
+        .pubkey = subject,
+        .created_at = 1_800_000_000,
+        .kind = 0,
+        .tags = &.{},
+        .content = meta,
+        .sig = [_]u8{0} ** 64,
+    }, .{});
+
+    // Nobody knows the friend yet: a short npub, but never the raw token.
+    {
+        const shown = main.personAbout(subject);
+        try testing.expect(std.mem.indexOf(u8, shown, "nostr:") == null);
+        try testing.expect(std.mem.indexOf(u8, shown, "@npub1") != null);
+        try testing.expect(std.mem.startsWith(u8, shown, "Engaged to @npub1"));
+    }
+
+    // Their kind:0 arrives and the app learns the name the way it really does,
+    // through the profile refresh. This is the part a one-shot rewrite at parse
+    // time gets wrong: the bio itself never changes, so nothing about the
+    // subject's own event ever says to look at it again.
+    _ = try store.ingest(arena, .{
+        .id = [_]u8{0xb2} ** 32,
+        .pubkey = friend,
+        .created_at = 1_800_000_001,
+        .kind = 0,
+        .tags = &.{},
+        .content = "{\"name\":\"aliza\"}",
+        .sig = [_]u8{0} ** 64,
+    }, .{});
+
+    // The reader follows her, which is how her name reaches the cache at all.
+    main.setIdentityForTest([_]u8{0x44} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    _ = main.setFollowsForTest(&[_][32]u8{friend}, 1_800_000_000);
+
+    // Heap, not stack: a Model carries three hundred notes of fixed buffers.
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(model, &store, 1_800_000_100);
+
+    const shown = main.personAbout(subject);
+    try testing.expectEqualStrings("Engaged to @aliza", shown);
+}
