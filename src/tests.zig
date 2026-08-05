@@ -11944,7 +11944,16 @@ test "no view paints past the right edge at the narrowest the window can be" {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
 
-        var model = main.initialModel();
+        // On the heap, not the stack. `inline for` unrolls the body once per
+        // state, and in a Debug build the copies do not share stack slots, so a
+        // Model carrying three hundred notes of fixed buffers overflowed the
+        // thread's stack once this reached thirteen states. It crashed rather
+        // than failed, which is what #139 saw when it first tried to add the
+        // menus and read as a missing precondition. It was the test's own
+        // frame. ReleaseFast reuses the slots and hides it, so this only ever
+        // showed up in CI.
+        const model = try arena_state.allocator().create(main.Model);
+        model.* = main.initialModel();
         model.stage = .ready;
         model.notes[0] = main.noteWithLinkForTest(if (st == .feed) "" else url);
         // A note body long enough to wrap several times, so the body's own
@@ -11991,7 +12000,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
             .menu_note => model.note_menu = model.notes[0].id,
         }
 
-        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, floor, floor);
+        const p = try painted.Painted.renderAt(arena_state.allocator(), model, floor, floor);
         // The baseline is the feed WITH the link note, because that is what
         // every menu state is drawn on top of. Taking it from the plain feed
         // instead made this guard pass a menu that rendered nothing: the link
