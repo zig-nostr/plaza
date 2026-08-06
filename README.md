@@ -18,6 +18,18 @@ client.
 > round-trip to the signer) that is stored at once and published to the pool.
 > Private messages land in a milestone ahead. macOS first.
 
+![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
+
+## What it looks like
+
+| | | |
+| --- | --- | --- |
+| ![The feed is a local query: it renders from disk, so it is there before the network is](docs/shots/panel-feed.jpg) | ![Everyone resolved: names, faces and verification, straight from the local store](docs/shots/panel-profile.jpg) | ![Conversations in full: replies nest where they belong, reconciled in the background](docs/shots/panel-thread.jpg) |
+
+<sub>Real windows, photographed from the running app against real notes from
+public relays. Every pixel inside the window is the app's own, so nothing here
+shows a screen the app cannot draw.</sub>
+
 ## Install
 
 ```sh
