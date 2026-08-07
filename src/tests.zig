@@ -12635,3 +12635,33 @@ test "the feed has no bottom: it holds more notes than the old cap" {
         try seen.put(note.id, {});
     }
 }
+
+test "the composer holds a whole announcement, and says when it will not" {
+    // 512 bytes was the old capacity, and an ordinary announcement is longer
+    // than that. Pasting one came back cut mid-sentence with nothing on screen
+    // admitting it, while the footer read "no length limit". The note this test
+    // uses is the real one: at 512 it lost the end of its own URL, so the post
+    // would have carried a dead link.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    const note =
+        "Plaza is out.\n\nA Nostr client for macOS written in Zig. No Electron, no WebView, no " ++
+        "browser hiding in the binary. The toolkit draws every pixel.\n\nThe feed is a local " ++
+        "query. It renders from disk before the network answers, and a 500 note feed query is " ++
+        "0.28ms against 100k stored events.\n\nYour key can stay out of it entirely: sign through " ++
+        "Notary over NIP-46 and the client never sees it.\n\nEarly, and honest about it. No DMs, " ++
+        "no zaps, no search yet. Those are the next milestones and they are public.\n\n" ++
+        "https://zignostr.com/plaza";
+    try testing.expect(note.len > 512);
+
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(note);
+    try testing.expectEqualStrings(note, model.draft());
+
+    // The tail is the part that used to go missing, and the part whose loss is
+    // hardest to notice: a URL that still looks like a URL.
+    try testing.expect(std.mem.endsWith(u8, model.draft(), "https://zignostr.com/plaza"));
+}
