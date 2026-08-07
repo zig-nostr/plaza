@@ -9182,7 +9182,11 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     //
     // Threads and profiles have always been opaque full-screen levels and have
     // always scrolled properly. This is settings joining them.
-    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+    return ui.column(.{
+        .grow = 1,
+        .style_tokens = .{ .background = .background },
+        .semantics = .{ .label = "Settings" },
+    }, .{
         settingsHeader(ui),
         ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
         ui.scroll(.{ .grow = 1 }, .{
@@ -10684,22 +10688,24 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// window with a permanent composer. Escape or a click outside closes it.
 fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.dialog, .{
+    // A PAGE, for the reason settings is one: a modal is a translucent scrim over
+    // the whole window, so every frame of typing or scrolling inside it repaints
+    // the window entire, and the cost grows with the window. Presenting a frame
+    // cost 183ms with a sheet open on a 1600x1000 window against 18ms for an
+    // opaque level of the same size.
+    //
+    // The column keeps `compose_sheet_width` and centres, so the writing surface
+    // is the same shape it always was; what changed is that there is nothing
+    // translucent above the rest of the window.
+    return ui.column(.{
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = .close_compose,
-        .on_press = .close_compose,
-        .style_tokens = .{ .background = .scrim },
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "New note" },
     }, .{
         ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
             ui.el(.card, .{
                 .width = compose_sheet_width,
                 .padding = 0.01,
-                // Its own card rather than `modalCard`, so it needs the same
-                // absorbing press: a click on the composer's background must not
-                // reach the backdrop and put the sheet away mid-sentence.
-                .on_press = Msg.absorb_press,
                 .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
             }, .{
                 ui.column(.{ .gap = 0 }, .{

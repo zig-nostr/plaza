@@ -10106,18 +10106,6 @@ const modal_cases = [_]ModalCase{
         }.f,
     },
     .{
-        .name = "compose",
-        .label = "New note",
-        .dismiss = .close_compose,
-        .control = "Cancel",
-        .open = struct {
-            fn f(m: *Model) void {
-                m.stage = .ready;
-                m.composing = true;
-            }
-        }.f,
-    },
-    .{
         .name = "edit profile",
         .label = "Edit profile",
         .dismiss = .close_profile_edit,
