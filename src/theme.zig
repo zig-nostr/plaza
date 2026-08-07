@@ -275,6 +275,22 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             // redesign's own rgba(5,5,7,.55).
             t.colors.scrim = canvas.Color.rgba8(5, 5, 7, 140);
 
+            // And no backdrop blur, which is the other half of what raising
+            // that alpha is for. The toolkit's own note on the token says a
+            // theme that firms up the wash should zero this, and Plaza had only
+            // ever done the first half.
+            //
+            // The cost is not the blur itself. Any damage that touches a
+            // backdrop blur forces a FULL-SURFACE repaint, because the blur
+            // reads pixels around its output as they were at that point in draw
+            // order and retained pixels cannot supply them. A modal scrim covers
+            // the whole window, so every frame of scrolling inside a sheet
+            // repainted the entire window, and the cost grew with the window:
+            // present measured 55ms at 760x760 and 183ms at 1600x1000. That is
+            // five frames a second on a large window, for a 4 point softness
+            // sitting under a 55 percent dim where nobody can see it.
+            t.blur.scrim = 0;
+
             // The identity violet, carried by the `info` slot. A TextSpan names
             // a token FIELD rather than a Color, so a violet @mention needs a
             // channel in this table; `info` is the one slot the app never spends

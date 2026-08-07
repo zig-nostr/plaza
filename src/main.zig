@@ -1499,20 +1499,20 @@ const profile_card_chrome: f32 = 190;
 pub const quiet_row_extent: f32 = 56;
 // 11c's Settings geometry: a 440 column, a 38px header band, and the section
 // rhythm (16 between sections, 8 from a label to its card).
-const settings_column_width: f32 = 440;
+pub const settings_column_width: f32 = 440;
 /// The padding a bare `.card` injects when `padding` is left unset, which is
 /// what `modalCard` does: zero IS the unset sentinel, so a card that states no
 /// padding gets the house inset rather than none.
 const modal_card_inset: f32 = 24;
-/// How wide the content of a settings card actually is: the sheet's column,
-/// less the modal card's house inset, the sheet's own 18 either side, and the
-/// section card's 12 either side. Derived rather than measured, so moving any
-/// one of them moves this with it, and held against the real layout by a test.
-const settings_content_width: f32 = settings_column_width - modal_card_inset * 2 - 18 * 2 - 12 * 2;
-/// How far the settings sheet sits in from the window's edges. Wider than the
-/// other sheets' 16: this one is as tall as the window allows, and a thin
-/// margin around a full-height card reads as a screen that failed to fill.
-const settings_sheet_inset: f32 = 28;
+/// How wide the content of a settings card actually is: the column, less the
+/// section card's 12 either side. Derived rather than measured, so moving one
+/// moves the other, and held against the real layout by a test.
+///
+/// It used to subtract a modal card's house inset and the sheet's own 18 either
+/// side as well. Settings is a page now: there is no modal card and no sheet
+/// margin, and leaving those terms in would have quietly narrowed every row by
+/// 84 points against a layout that no longer had them.
+const settings_content_width: f32 = settings_column_width - 12 * 2;
 const settings_header_height: f32 = 38;
 pub const settings_column_width_for_test = settings_column_width;
 pub const settings_content_width_for_test = settings_content_width;
@@ -1607,6 +1607,16 @@ const join_card_title_scale: f32 = 13.5 / 14.5;
 const join_card_sub_scale: f32 = 11.0 / 14.5;
 const name_title_scale: f32 = 14.5 / 14.5;
 const compose_header_height: f32 = 38;
+/// How wide the note field actually is: the column, less the card's 14 either
+/// side, less the avatar and the 12 beside it.
+///
+/// STATED, not inherited, and that is the whole point. A text element measures
+/// at its natural width whatever its ancestors say, so a field that takes its
+/// width from a `grow` parent wraps for LAYOUT at one width and measures for
+/// PAINT at another. Two wrappings of the same paragraph then land on the same
+/// rows, which is what made a pasted note look shredded.
+const compose_editor_width: f32 = compose_sheet_width - 14 * 2 - avatar_size - 12;
+pub const compose_editor_width_for_test = compose_editor_width;
 const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
@@ -9170,34 +9180,35 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     n += 1;
 
-    return ui.el(.dialog, .{
+    // A PAGE, not a modal, and the reason is measured rather than stylistic.
+    //
+    // A modal is a translucent scrim across the whole window. Anything that
+    // changes underneath one has to be repainted along with the scrim over it,
+    // so every frame of scrolling inside a sheet repaints the entire window and
+    // the cost grows with the window. On a 1600x1000 window, presenting a frame
+    // took 117ms with settings open as a sheet and 18ms with a thread open,
+    // which is the same screen area drawn as an opaque level. The feed alone was
+    // 17ms. Eight frames a second against sixty, for a dimmed backdrop.
+    //
+    // Threads and profiles have always been opaque full-screen levels and have
+    // always scrolled properly. This is settings joining them.
+    return ui.column(.{
         .grow = 1,
-        .padding = settings_sheet_inset,
-        .on_dismiss = Msg.close_settings,
-        .on_press = Msg.close_settings,
-        .style_tokens = .{ .background = .scrim },
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Settings" },
     }, .{
-        // No `cross` override, for the reason the notifications sheet spells
-        // out: `modalCard` states a width and no height, so under `.start` the
-        // card takes its intrinsic height and the `grow = 1` scroll inside it
-        // resolves to nothing.
-        ui.row(.{ .grow = 1, .main = .center }, .{
-            modalCard(ui, settings_column_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
-                settingsHeader(ui),
-                ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
-                ui.scroll(.{ .grow = 1 }, .{
-                    ui.column(.{ .gap = settings_section_gap }, .{
-                        vgap(ui, 16),
-                        ui.row(.{ .gap = 0 }, .{
-                            hgap(ui, 18),
-                            ui.column(.{ .gap = settings_section_gap, .grow = 1 }, .{sections[0..n]}),
-                            hgap(ui, 18),
-                        }),
-                        vgap(ui, 18),
-                    }),
+        settingsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.spacer(1),
+                ui.column(.{ .gap = settings_section_gap, .width = settings_column_width }, .{
+                    vgap(ui, 16),
+                    ui.column(.{ .gap = settings_section_gap, .grow = 1 }, .{sections[0..n]}),
+                    vgap(ui, 18),
                 }),
-            })),
+                ui.spacer(1),
+            }),
         }),
     });
 }
@@ -10687,77 +10698,69 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// window with a permanent composer. Escape or a click outside closes it.
 fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.dialog, .{
+    // A PAGE, shaped like settings: a bar across the top, then the content in a
+    // card down the middle of the window.
+    //
+    // It is not a modal for the reason settings is not: a modal is a translucent
+    // scrim over the whole window, so every frame repaints the window entire and
+    // the cost grows with it. On a 1600x1000 window a frame cost 183ms as a
+    // sheet and 8ms as a page, and the worst of it was the app sitting idle with
+    // a caret blinking in it.
+    //
+    // It was a bare rounded card flush against the top of the window for a
+    // while, which is what a sheet looks like when the sheet around it is taken
+    // away and nothing is put in its place.
+    return ui.column(.{
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = .close_compose,
-        .on_press = .close_compose,
-        .style_tokens = .{ .background = .scrim },
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "New note" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.el(.card, .{
-                .width = compose_sheet_width,
-                .padding = 0.01,
-                // Its own card rather than `modalCard`, so it needs the same
-                // absorbing press: a click on the composer's background must not
-                // reach the backdrop and put the sheet away mid-sentence.
-                .on_press = Msg.absorb_press,
-                .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
-            }, .{
-                ui.column(.{ .gap = 0 }, .{
-                    // The header band: a title and nothing else, so the sheet
-                    // says what it is before the eye reaches the field.
-                    ui.row(.{ .height = compose_header_height, .cross = .center, .main = .center, .gap = 0 }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_primary } },
-                            &.{.{ .text = "New note", .weight = .medium, .scale = menu_scale }},
-                        ),
-                    }),
-                    ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        composeHeader(ui, model),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.spacer(1),
+                ui.column(.{ .gap = 0, .width = compose_sheet_width }, .{
+                    vgap(ui, 16),
                     // The writer and their words, side by side: the disc says
                     // whose voice this is, which is the one thing a composer
                     // must not leave ambiguous when a signer can be swapped.
-                    ui.row(.{ .gap = 0, .cross = .start }, .{
-                        hgap(ui, 18),
-                        ui.column(.{ .gap = 0 }, .{
-                            vgap(ui, 16),
+                    ui.el(.card, .{
+                        .padding = 14,
+                        .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 },
+                    }, .{
+                        ui.row(.{ .gap = 0, .cross = .start }, .{
                             meAvatar(ui, avatar_size),
+                            hgap(ui, 12),
+                            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                                ui.el(.textarea, .{
+                                    .text = model.draft(),
+                                    .placeholder = "What's on your mind?",
+                                    .on_input = AppUi.inputMsg(.draft_edit),
+                                    .on_submit = .post,
+                                    .width = compose_editor_width,
+                                    .height = compose_editor_height,
+                                    // The caret starts here. A composer you have
+                                    // to click into before you can type is a
+                                    // composer that opened for no reason.
+                                    // Edge-triggered on mount, so it never
+                                    // re-steals the caret on a later rebuild.
+                                    .autofocus = true,
+                                    .style = .{ .background = p.surface_settings_card, .border = p.surface_settings_card, .stroke_width = 0 },
+                                }, .{}),
+                                // Under the field, because the caret cannot be
+                                // located and a picker that floats elsewhere is
+                                // a guess about where the reader is looking.
+                                mentionPicker(ui, model),
+                            }),
                         }),
-                        hgap(ui, 12),
-                        ui.column(.{ .grow = 1, .gap = 0 }, .{
-                            vgap(ui, 16),
-                            ui.el(.textarea, .{
-                                .text = model.draft(),
-                                .placeholder = "What's on your mind?",
-                                .on_input = AppUi.inputMsg(.draft_edit),
-                                .on_submit = .post,
-                                .height = compose_editor_height,
-                                // The caret starts here. A composer you have to
-                                // click into before you can type is a composer
-                                // that opened for no reason, and it is also what
-                                // made Escape dead on this sheet: the runtime
-                                // resolves Escape from the FOCUSED widget up to
-                                // the surface around it, and with nothing
-                                // focused there was no path to the dialog.
-                                // Edge-triggered on mount, so it never re-steals
-                                // the caret on a later rebuild.
-                                .autofocus = true,
-                                .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
-                            }, .{}),
-                            // Under the field, because the caret cannot be
-                            // located and a picker that floats elsewhere is a
-                            // guess about where the reader is looking.
-                            mentionPicker(ui, model),
-                            vgap(ui, 14),
-                        }),
-                        hgap(ui, 18),
                     }),
-                    ui.separator(.{ .style = .{ .foreground = p.divider_row, .background = p.divider_row } }),
+                    vgap(ui, 10),
                     // What pressing Post will do, in the terms that matter: how
-                    // far the note goes, and that nothing here will truncate it.
+                    // far the note goes, and how much room is left when that
+                    // starts to matter.
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
-                        hgap(ui, 18),
+                        hgap(ui, 2),
                         ui.paragraph(
                             .{ .style = .{ .foreground = p.text_dim } },
                             &.{.{ .text = composeReach(ui, model.draft().len), .monospace = true, .scale = mono_meta_scale }},
@@ -10767,16 +10770,32 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                             .{ .style = .{ .foreground = p.text_muted } },
                             &.{.{ .text = "Cmd + Enter", .monospace = true, .scale = mono_hint_scale }},
                         ),
-                        hgap(ui, 10),
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
-                        hgap(ui, 4),
-                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
-                        hgap(ui, 18),
+                        hgap(ui, 2),
                     }),
-                    vgap(ui, 12),
+                    vgap(ui, 18),
                 }),
+                ui.spacer(1),
             }),
         }),
+    });
+}
+
+/// The composer's top bar: the way out on the left, what this is in the middle,
+/// and the verb on the right. The same band settings wears, so the two full
+/// screens in the app are not two different shapes.
+fn composeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0, .height = settings_header_height, .padding = 0.01 }, .{
+        hgap(ui, 10),
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+        ui.spacer(1),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_sheet_title } },
+            &.{.{ .text = "New note", .weight = .medium, .scale = settings_title_scale }},
+        ),
+        ui.spacer(1),
+        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+        hgap(ui, 10),
     });
 }
 
