@@ -1607,6 +1607,16 @@ const join_card_title_scale: f32 = 13.5 / 14.5;
 const join_card_sub_scale: f32 = 11.0 / 14.5;
 const name_title_scale: f32 = 14.5 / 14.5;
 const compose_header_height: f32 = 38;
+/// How wide the note field actually is: the column, less the card's 14 either
+/// side, less the avatar and the 12 beside it.
+///
+/// STATED, not inherited, and that is the whole point. A text element measures
+/// at its natural width whatever its ancestors say, so a field that takes its
+/// width from a `grow` parent wraps for LAYOUT at one width and measures for
+/// PAINT at another. Two wrappings of the same paragraph then land on the same
+/// rows, which is what made a pasted note look shredded.
+const compose_editor_width: f32 = compose_sheet_width - 14 * 2 - avatar_size - 12;
+pub const compose_editor_width_for_test = compose_editor_width;
 const compose_editor_height: f32 = 150;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
@@ -10688,79 +10698,69 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// window with a permanent composer. Escape or a click outside closes it.
 fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    // A PAGE, for the reason settings is one: a modal is a translucent scrim over
-    // the whole window, so every frame of typing or scrolling inside it repaints
-    // the window entire, and the cost grows with the window. Presenting a frame
-    // cost 183ms with a sheet open on a 1600x1000 window against 18ms for an
-    // opaque level of the same size.
+    // A PAGE, shaped like settings: a bar across the top, then the content in a
+    // card down the middle of the window.
     //
-    // The column keeps `compose_sheet_width` and centres, so the writing surface
-    // is the same shape it always was; what changed is that there is nothing
-    // translucent above the rest of the window.
+    // It is not a modal for the reason settings is not: a modal is a translucent
+    // scrim over the whole window, so every frame repaints the window entire and
+    // the cost grows with it. On a 1600x1000 window a frame cost 183ms as a
+    // sheet and 8ms as a page, and the worst of it was the app sitting idle with
+    // a caret blinking in it.
+    //
+    // It was a bare rounded card flush against the top of the window for a
+    // while, which is what a sheet looks like when the sheet around it is taken
+    // away and nothing is put in its place.
     return ui.column(.{
         .grow = 1,
         .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "New note" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.el(.card, .{
-                .width = compose_sheet_width,
-                .padding = 0.01,
-                .style = .{ .background = p.surface_sheet, .border = p.border_window, .radius = 12, .stroke_width = 1 },
-            }, .{
-                ui.column(.{ .gap = 0 }, .{
-                    // The header band: a title and nothing else, so the sheet
-                    // says what it is before the eye reaches the field.
-                    ui.row(.{ .height = compose_header_height, .cross = .center, .main = .center, .gap = 0 }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_primary } },
-                            &.{.{ .text = "New note", .weight = .medium, .scale = menu_scale }},
-                        ),
-                    }),
-                    ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        composeHeader(ui, model),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.spacer(1),
+                ui.column(.{ .gap = 0, .width = compose_sheet_width }, .{
+                    vgap(ui, 16),
                     // The writer and their words, side by side: the disc says
                     // whose voice this is, which is the one thing a composer
                     // must not leave ambiguous when a signer can be swapped.
-                    ui.row(.{ .gap = 0, .cross = .start }, .{
-                        hgap(ui, 18),
-                        ui.column(.{ .gap = 0 }, .{
-                            vgap(ui, 16),
+                    ui.el(.card, .{
+                        .padding = 14,
+                        .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 },
+                    }, .{
+                        ui.row(.{ .gap = 0, .cross = .start }, .{
                             meAvatar(ui, avatar_size),
+                            hgap(ui, 12),
+                            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                                ui.el(.textarea, .{
+                                    .text = model.draft(),
+                                    .placeholder = "What's on your mind?",
+                                    .on_input = AppUi.inputMsg(.draft_edit),
+                                    .on_submit = .post,
+                                    .width = compose_editor_width,
+                                    .height = compose_editor_height,
+                                    // The caret starts here. A composer you have
+                                    // to click into before you can type is a
+                                    // composer that opened for no reason.
+                                    // Edge-triggered on mount, so it never
+                                    // re-steals the caret on a later rebuild.
+                                    .autofocus = true,
+                                    .style = .{ .background = p.surface_settings_card, .border = p.surface_settings_card, .stroke_width = 0 },
+                                }, .{}),
+                                // Under the field, because the caret cannot be
+                                // located and a picker that floats elsewhere is
+                                // a guess about where the reader is looking.
+                                mentionPicker(ui, model),
+                            }),
                         }),
-                        hgap(ui, 12),
-                        ui.column(.{ .grow = 1, .gap = 0 }, .{
-                            vgap(ui, 16),
-                            ui.el(.textarea, .{
-                                .text = model.draft(),
-                                .placeholder = "What's on your mind?",
-                                .on_input = AppUi.inputMsg(.draft_edit),
-                                .on_submit = .post,
-                                .height = compose_editor_height,
-                                // The caret starts here. A composer you have to
-                                // click into before you can type is a composer
-                                // that opened for no reason, and it is also what
-                                // made Escape dead on this sheet: the runtime
-                                // resolves Escape from the FOCUSED widget up to
-                                // the surface around it, and with nothing
-                                // focused there was no path to the dialog.
-                                // Edge-triggered on mount, so it never re-steals
-                                // the caret on a later rebuild.
-                                .autofocus = true,
-                                .style = .{ .background = p.surface_sheet, .border = p.surface_sheet, .stroke_width = 0 },
-                            }, .{}),
-                            // Under the field, because the caret cannot be
-                            // located and a picker that floats elsewhere is a
-                            // guess about where the reader is looking.
-                            mentionPicker(ui, model),
-                            vgap(ui, 14),
-                        }),
-                        hgap(ui, 18),
                     }),
-                    ui.separator(.{ .style = .{ .foreground = p.divider_row, .background = p.divider_row } }),
+                    vgap(ui, 10),
                     // What pressing Post will do, in the terms that matter: how
-                    // far the note goes, and that nothing here will truncate it.
+                    // far the note goes, and how much room is left when that
+                    // starts to matter.
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
-                        hgap(ui, 18),
+                        hgap(ui, 2),
                         ui.paragraph(
                             .{ .style = .{ .foreground = p.text_dim } },
                             &.{.{ .text = composeReach(ui, model.draft().len), .monospace = true, .scale = mono_meta_scale }},
@@ -10770,16 +10770,32 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                             .{ .style = .{ .foreground = p.text_muted } },
                             &.{.{ .text = "Cmd + Enter", .monospace = true, .scale = mono_hint_scale }},
                         ),
-                        hgap(ui, 10),
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
-                        hgap(ui, 4),
-                        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
-                        hgap(ui, 18),
+                        hgap(ui, 2),
                     }),
-                    vgap(ui, 12),
+                    vgap(ui, 18),
                 }),
+                ui.spacer(1),
             }),
         }),
+    });
+}
+
+/// The composer's top bar: the way out on the left, what this is in the middle,
+/// and the verb on the right. The same band settings wears, so the two full
+/// screens in the app are not two different shapes.
+fn composeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0, .height = settings_header_height, .padding = 0.01 }, .{
+        hgap(ui, 10),
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = .close_compose }, "Cancel"),
+        ui.spacer(1),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_sheet_title } },
+            &.{.{ .text = "New note", .weight = .medium, .scale = settings_title_scale }},
+        ),
+        ui.spacer(1),
+        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+        hgap(ui, 10),
     });
 }
 

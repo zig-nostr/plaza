@@ -12658,3 +12658,40 @@ test "the composer holds a whole announcement, and says when it will not" {
     // hardest to notice: a URL that still looks like a URL.
     try testing.expect(std.mem.endsWith(u8, model.draft(), "https://zignostr.com/plaza"));
 }
+
+test "the note field states its own width" {
+    // A text element measures at its natural width whatever its ancestors say,
+    // so a field that inherits width from a `grow` parent wraps for LAYOUT at
+    // one width and measures for PAINT at another. Two wrappings of the same
+    // paragraph then land on the same rows, which is what shredded a pasted
+    // note on screen.
+    //
+    // The rule this holds is not "the number is 498". It is that the field
+    // carries a definite width of its own, and that the number agrees with the
+    // box it sits in.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    main.setIdentityForTest([_]u8{0x5c} ** 32);
+    defer main.clearIdentityForTest();
+
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(
+        "A paragraph long enough to wrap more than once in the composer, " ++
+            "followed by another one.\n\nAnd a second paragraph, so the field has " ++
+            "several source lines to lay out and not merely several visual ones.",
+    );
+
+    const p = try painted.Painted.renderAt(arena, model, main.window_width, main.window_height);
+    var found = false;
+    for (p.layout.nodes) |n| {
+        if (n.widget.kind != .textarea) continue;
+        found = true;
+        // The frame the engine gave it, against the width the app asked for.
+        try testing.expectApproxEqAbs(main.compose_editor_width_for_test, n.widget.frame.width, 1.0);
+    }
+    try testing.expect(found);
+}
