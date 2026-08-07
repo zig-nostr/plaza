@@ -1,5 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
+### What's new in v0.2.1
+
+- **Plaza has its own icon.** An open square with four quadrants around it, which is what a plaza is. It shipped with a placeholder until now.
+
 ### Install
 
 ```sh
