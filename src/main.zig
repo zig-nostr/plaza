@@ -1366,10 +1366,18 @@ const note_collapse_chars = 300;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
 const engagement_watch_cap = 128;
-// The composer's fixed text capacity. Comfortably longer than a typical note;
-// the display buffer (`Note.content_buf`) truncates for rendering, but the
-// published event carries the full draft.
-const compose_capacity = 512;
+// The composer's fixed text capacity. The display buffer
+// (`Note.content_buf`) truncates for rendering, but the published event carries
+// the full draft.
+//
+// It was 512, which is not "comfortably longer than a typical note": it is
+// shorter than an ordinary announcement. Past it the buffer silently dropped
+// what would not fit, while the footer said "no length limit", so a paste came
+// back cut mid-sentence with nothing on screen admitting it. The editor widget
+// keeps its own copy of the text, so the two then disagreed about the content
+// and re-wrapped it differently on the same frame, which is what made the
+// composer look scrambled and feel slow.
+const compose_capacity = 4096;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
 // Wanted-profile fetching runs on its own cadence, decoupled from the view
@@ -9239,16 +9247,16 @@ fn settingsSection(ui: *AppUi, label: []const u8, caption: []const u8, card: App
 /// wears the same edge.
 fn settingsCard(ui: *AppUi, children: anytype) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.card, .{ .padding = 0.01, .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 } }, .{
-        ui.row(.{ .gap = 0 }, .{
-            hgap(ui, 12),
-            ui.column(.{ .gap = 0, .grow = 1 }, .{
-                vgap(ui, 11),
-                ui.column(.{ .gap = 0, .grow = 1 }, children),
-                vgap(ui, 11),
-            }),
-            hgap(ui, 12),
-        }),
+    // Padding, not scaffolding. This was a row, two columns and four spacers
+    // around the children: seven nodes per card to express an inset that the
+    // card can state in one. Settings is the heaviest screen in the app and
+    // half its nodes were whitespace like this.
+    //
+    // The inset is uniform 12 where it used to be 12 horizontal and 11
+    // vertical, because the builder takes one number. One pixel, against six
+    // nodes a card.
+    return ui.el(.card, .{ .padding = 12, .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 } }, .{
+        ui.column(.{ .gap = 0, .grow = 1 }, children),
     });
 }
 
@@ -10752,7 +10760,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                         hgap(ui, 18),
                         ui.paragraph(
                             .{ .style = .{ .foreground = p.text_dim } },
-                            &.{.{ .text = composeReach(ui), .monospace = true, .scale = mono_meta_scale }},
+                            &.{.{ .text = composeReach(ui, model.draft().len), .monospace = true, .scale = mono_meta_scale }},
                         ),
                         ui.spacer(1),
                         ui.paragraph(
@@ -10939,10 +10947,20 @@ fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// How far a note will go, said before it goes rather than after: the relays
 /// that will take a write, and that Plaza imposes no length of its own.
-fn composeReach(ui: *AppUi) []const u8 {
+fn composeReach(ui: *AppUi, written: usize) []const u8 {
+    // The room left, once there is little enough of it to matter. A composer
+    // that silently stops accepting characters is the bug this replaces, and a
+    // counter that is always on screen is a nag for the ninety-nine notes that
+    // will never approach the limit.
+    const left = compose_capacity -| written;
+    if (left <= compose_capacity / 4) {
+        const live_now = liveRelayCount();
+        if (live_now == 0) return ui.fmt("{d} left · no relay is answering", .{left});
+        return ui.fmt("posts to {d} {s} · {d} left", .{ live_now, if (live_now == 1) "relay" else "relays", left });
+    }
     const live = liveRelayCount();
     if (live == 0) return "no relay is answering · it will wait in the outbox";
-    return ui.fmt("posts to {d} {s} · no length limit", .{ live, if (live == 1) "relay" else "relays" });
+    return ui.fmt("posts to {d} {s}", .{ live, if (live == 1) "relay" else "relays" });
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes
@@ -15413,7 +15431,9 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
         rows[n] = menuRow(ui, "Open Notary", null, null, .open_notary_window);
         n += 1;
     }
-    rows[n] = menuRow(ui, "Settings…", "settings", "Cmd+,", .open_settings);
+    // No glyph. "Open Notary" and "Sign out" carry none, and one icon among
+    // three reads as a mistake rather than as emphasis.
+    rows[n] = menuRow(ui, "Settings…", null, "Cmd+,", .open_settings);
     n += 1;
     rows[n] = menuRow(ui, "Sign out", null, null, .open_settings_logout);
     n += 1;
