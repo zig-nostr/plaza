@@ -7,6 +7,7 @@ const painted = @import("painted.zig");
 const theme = @import("theme.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const AppUi = main.AppUi;
@@ -10117,17 +10118,6 @@ const modal_cases = [_]ModalCase{
         }.f,
     },
     .{
-        .name = "settings",
-        .label = "Settings",
-        .dismiss = .close_settings,
-        .control = "Copy npub",
-        .open = struct {
-            fn f(m: *Model) void {
-                m.stage = .settings;
-            }
-        }.f,
-    },
-    .{
         .name = "edit profile",
         .label = "Edit profile",
         .dismiss = .close_profile_edit,
@@ -10153,6 +10143,20 @@ fn modalDialogIndex(p: painted.Painted, label: []const u8) ?usize {
 
 /// The outermost `.card` inside the dialog at `root`: the modal's own surface,
 /// which is the boundary "outside" is measured against.
+/// The settings COLUMN: the band the sections are laid out in, centred in the
+/// window. Settings is a page rather than a modal now, so there is no dialog to
+/// look inside and no card standing in for the content; the column states its
+/// own width and that is the thing every settings rule is about.
+fn settingsColumn(p: painted.Painted) ?geometry.RectF {
+    for (p.layout.nodes) |node| {
+        const f = node.widget.frame;
+        if (@abs(f.width - main.settings_column_width) > 0.5) continue;
+        if (f.height < 200) continue;
+        return f;
+    }
+    return null;
+}
+
 fn modalCardIndex(p: painted.Painted, root: usize) ?usize {
     for (p.layout.nodes, 0..) |node, i| {
         if (node.widget.kind != .card) continue;
@@ -10460,24 +10464,23 @@ test "the settings sheet paints its own surface the whole way down" {
     openFullSettings(&model);
     const p = try painted.Painted.render(arena, &model);
 
-    const root = modalDialogIndex(p, "Settings") orelse return error.NoSettingsSheet;
-    const card_index = modalCardIndex(p, root) orelse return error.NoSettingsCard;
-    const card = p.layout.nodes[card_index].widget.frame;
-    try testing.expect(card.height > 400);
-
-    // Every height inside the sheet, down its middle: something has to paint.
-    // The bug was not a wrong colour, it was nothing at all past the fold.
-    var y = card.y + 2;
-    while (y < card.y + card.height - 2) : (y += 8) {
-        if (p.fillAt(card.x + card.width / 2, y) == null) {
-            std.debug.print("the settings sheet paints nothing at y={d:.0} (card {d:.0}..{d:.0})\n", .{ y, card.y, card.y + card.height });
+    // Down the middle of the window, top to bottom: something has to paint at
+    // every height. The original bug was not a wrong colour, it was nothing at
+    // all past the fold, and a page can make it exactly as easily as a screen
+    // could: the background belongs on the page root, outside the scroll, or it
+    // is only as tall as the viewport.
+    var y: f32 = 2;
+    while (y < main.window_height - 2) : (y += 8) {
+        if (p.fillAt(main.window_width / 2, y) == null) {
+            std.debug.print("settings paints nothing at y={d:.0}\n", .{y});
             return error.SurfaceStopsShort;
         }
     }
 
-    // And it does not run past the window, which is the other half of the same
-    // fault: a surface that reaches its content by growing off the screen.
-    try testing.expect(card.y + card.height <= main.window_height);
+    // And the sections sit in the column the constant names, centred.
+    const col = settingsColumn(p) orelse return error.NoSettingsColumn;
+    try testing.expect(col.height > 300);
+    try testing.expect(col.x > 8);
 }
 
 test "no relay suggestion is drawn outside the card that holds it" {
@@ -10497,18 +10500,18 @@ test "no relay suggestion is drawn outside the card that holds it" {
     openFullSettings(&model);
     const p = try painted.Painted.render(arena, &model);
 
-    const root = modalDialogIndex(p, "Settings") orelse return error.NoSettingsSheet;
-    const card_index = modalCardIndex(p, root) orelse return error.NoSettingsCard;
-    const sheet = p.layout.nodes[card_index].widget.frame;
+    const col_frame = settingsColumn(p) orelse return error.NoSettingsColumn;
+    // The column, not a card: settings is a page and its sections are several
+    // cards, so the band the chips must stay inside is the column itself.
+    const sheet = col_frame;
 
     var seen: usize = 0;
-    for (p.layout.nodes, 0..) |node, i| {
+    for (p.layout.nodes) |node| {
         // Found by the message they carry, not by the words on them: a label
         // filter here would silently match nothing the day the wording changes,
         // and a rule that matches nothing passes.
         const msg = pressMsgById(p, node.widget.id) orelse continue;
         if (msg != .relay_suggest) continue;
-        if (!isDescendantOf(p, i, card_index)) continue;
         const label = node.widget.semantics.label;
         seen += 1;
         const right = node.widget.frame.x + node.widget.frame.width;
@@ -10551,7 +10554,9 @@ test "a settings card's content is as wide as the constant says" {
         const f = node.widget.frame;
         // The section card holding that row, found by containment on the y axis.
         if (row.y < f.y or row.y > f.y + f.height) continue;
-        if (f.width > widest and f.width < main.settings_column_width_for_test) widest = f.width;
+        // <= the column, not < it: as a page the section cards ARE the column's
+        // width, where under the old modal they sat inside it with a margin.
+        if (f.width > widest and f.width <= main.settings_column_width_for_test + 0.5) widest = f.width;
     }
     try testing.expect(widest > 0);
     // The card, less its own 12 either side, is what the content gets.

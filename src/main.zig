@@ -1499,20 +1499,20 @@ const profile_card_chrome: f32 = 190;
 pub const quiet_row_extent: f32 = 56;
 // 11c's Settings geometry: a 440 column, a 38px header band, and the section
 // rhythm (16 between sections, 8 from a label to its card).
-const settings_column_width: f32 = 440;
+pub const settings_column_width: f32 = 440;
 /// The padding a bare `.card` injects when `padding` is left unset, which is
 /// what `modalCard` does: zero IS the unset sentinel, so a card that states no
 /// padding gets the house inset rather than none.
 const modal_card_inset: f32 = 24;
-/// How wide the content of a settings card actually is: the sheet's column,
-/// less the modal card's house inset, the sheet's own 18 either side, and the
-/// section card's 12 either side. Derived rather than measured, so moving any
-/// one of them moves this with it, and held against the real layout by a test.
-const settings_content_width: f32 = settings_column_width - modal_card_inset * 2 - 18 * 2 - 12 * 2;
-/// How far the settings sheet sits in from the window's edges. Wider than the
-/// other sheets' 16: this one is as tall as the window allows, and a thin
-/// margin around a full-height card reads as a screen that failed to fill.
-const settings_sheet_inset: f32 = 28;
+/// How wide the content of a settings card actually is: the column, less the
+/// section card's 12 either side. Derived rather than measured, so moving one
+/// moves the other, and held against the real layout by a test.
+///
+/// It used to subtract a modal card's house inset and the sheet's own 18 either
+/// side as well. Settings is a page now: there is no modal card and no sheet
+/// margin, and leaving those terms in would have quietly narrowed every row by
+/// 84 points against a layout that no longer had them.
+const settings_content_width: f32 = settings_column_width - 12 * 2;
 const settings_header_height: f32 = 38;
 pub const settings_column_width_for_test = settings_column_width;
 pub const settings_content_width_for_test = settings_content_width;
@@ -9170,34 +9170,31 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     n += 1;
 
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = settings_sheet_inset,
-        .on_dismiss = Msg.close_settings,
-        .on_press = Msg.close_settings,
-        .style_tokens = .{ .background = .scrim },
-        .semantics = .{ .label = "Settings" },
-    }, .{
-        // No `cross` override, for the reason the notifications sheet spells
-        // out: `modalCard` states a width and no height, so under `.start` the
-        // card takes its intrinsic height and the `grow = 1` scroll inside it
-        // resolves to nothing.
-        ui.row(.{ .grow = 1, .main = .center }, .{
-            modalCard(ui, settings_column_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
-                settingsHeader(ui),
-                ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
-                ui.scroll(.{ .grow = 1 }, .{
-                    ui.column(.{ .gap = settings_section_gap }, .{
-                        vgap(ui, 16),
-                        ui.row(.{ .gap = 0 }, .{
-                            hgap(ui, 18),
-                            ui.column(.{ .gap = settings_section_gap, .grow = 1 }, .{sections[0..n]}),
-                            hgap(ui, 18),
-                        }),
-                        vgap(ui, 18),
-                    }),
+    // A PAGE, not a modal, and the reason is measured rather than stylistic.
+    //
+    // A modal is a translucent scrim across the whole window. Anything that
+    // changes underneath one has to be repainted along with the scrim over it,
+    // so every frame of scrolling inside a sheet repaints the entire window and
+    // the cost grows with the window. On a 1600x1000 window, presenting a frame
+    // took 117ms with settings open as a sheet and 18ms with a thread open,
+    // which is the same screen area drawn as an opaque level. The feed alone was
+    // 17ms. Eight frames a second against sixty, for a dimmed backdrop.
+    //
+    // Threads and profiles have always been opaque full-screen levels and have
+    // always scrolled properly. This is settings joining them.
+    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        settingsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.spacer(1),
+                ui.column(.{ .gap = settings_section_gap, .width = settings_column_width }, .{
+                    vgap(ui, 16),
+                    ui.column(.{ .gap = settings_section_gap, .grow = 1 }, .{sections[0..n]}),
+                    vgap(ui, 18),
                 }),
-            })),
+                ui.spacer(1),
+            }),
         }),
     });
 }
