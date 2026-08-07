@@ -14636,7 +14636,20 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     // extent table behind it, neither of which this touches, so the feed is still
     // where the reader left it on the way back.
     const window = ui.virtualWindow(options);
-    const occluded = model.viewing_thread != 0 or model.viewing_profile != null;
+    // A SHEET counts too, and for a long time it did not. Settings, the
+    // composer, the notifications panel and the join ladder all sit over the
+    // feed on a scrim, and the feed underneath was being built in full on every
+    // frame of scrolling one of them.
+    //
+    // Measured on a real 105 MB store: scrolling settings cost 1775us to rebuild
+    // and 6806us to lay out, with 747 nodes mounted. Without the feed beneath
+    // it: 142us, 933us, 240 nodes. Seven times the layout work, for rows behind
+    // a 55% scrim and a blur.
+    //
+    // The trade is visible and worth naming: those bands either side of a sheet
+    // now show the app's background rather than a blurred, dimmed feed.
+    const occluded = model.viewing_thread != 0 or model.viewing_profile != null or
+        model.stage == .settings or model.composing or model.notifications_open or model.joining;
     if (occluded) options.item_count = 0;
     // A level drawn opaquely over the feed hides every one of these rows, and
     // building them anyway spent about a third of the whole 1024-node view
