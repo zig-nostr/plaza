@@ -1385,8 +1385,12 @@ const refresh_interval_ms: u64 = 1_000;
 // separate engine timer is the seam a future data-plane extraction cuts along.
 const profile_timer_key: u64 = 3;
 const profile_interval_ms: u64 = 2_000;
-// The app version shown in Settings. Keep in step with app.zon's `.version`.
-const plaza_version = "0.1.0";
+// The app version shown in Settings, from app.zon, which is where the packaged
+// app gets its own. It used to be a second copy here with a comment asking
+// whoever cut a release to remember: by 0.2.2 Settings was still saying 0.1.0.
+// A number that has to be kept in step by hand is a number that drifts.
+const plaza_version = @import("window_floor").manifest_version;
+pub const plaza_version_for_test = plaza_version;
 // Owner-only permissions for the files holding secrets. POSIX gets 0600;
 // Windows has no mode bits (its permissions are file ATTRIBUTES), so it takes
 // the default there and inherits the profile directory's access control.

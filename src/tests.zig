@@ -184,7 +184,12 @@ test "the settings screen shows the identity, key backup, and logout" {
     try testing.expect(findAnyText(tree.root, "Log out") != null);
     try testing.expect(findAnyText(tree.root, "Cancel") == null);
     // The version line renders.
-    try testing.expect(findAnyText(tree.root, "Plaza 0.1.0") != null);
+    // The version app.zon declares, not a literal. This line used to say
+    // "Plaza 0.1.0" and passed happily while the shipped app was 0.2.2, because
+    // both the screen and the test were reading the same stale copy.
+    const shown = try std.fmt.allocPrint(arena, "Plaza {s}", .{main.plaza_version_for_test});
+    try testing.expect(findAnyText(tree.root, shown) != null);
+    try testing.expect(main.plaza_version_for_test.len > 0);
 }
 
 test "a guest is not offered a profile to edit" {

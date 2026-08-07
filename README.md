@@ -3,16 +3,17 @@
 **A fast, local-first Nostr client, built natively in Zig.**
 
 Plaza is the flagship app of the [zig-nostr](https://github.com/zig-nostr)
-ecosystem, a native Nostr client where you browse and post within two minutes
-and the feed renders from disk. It's built on the
+ecosystem, a native Nostr client where you read without an account and post in
+four clicks, and the feed renders from disk. It's built on the
 [`nostr`](https://github.com/zig-nostr/nostr) protocol library, and can sign
 through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
-> **Status: early.** A first run opens a welcome screen: create an identity,
-> bring an existing key, or connect an external signer (Notary) over NIP-46 so
-> your key never touches the app. Either way you land in a follow-based feed
-> seeded by a curated starter pack, with real names, avatars and pictures,
+> **Status: early.** A first run opens straight into a feed, signed in as
+> nobody: a curated starter pack, already populated, with a strip along the top
+> offering a key when you want one. Create an identity, bring an existing key, or
+> connect an external signer (Notary) over NIP-46 so your key never touches the
+> app. The feed carries real names, avatars and pictures,
 > rendered straight from a local store that a pool of background threads keeps
 > filled, one process, no IPC. Composing signs a note (locally, or by a
 > round-trip to the signer) that is stored at once and published to the pool.

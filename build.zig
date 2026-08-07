@@ -36,6 +36,10 @@ pub fn build(b: *std.Build) void {
     // needs the declared number at runtime to notice when it has been handed
     // something else (#100).
     floor.addOption(f32, "manifest_width", manifestWindowNumber(b, "width"));
+    // And the version, for the same reason and with worse consequences: the one
+    // in Zig said 0.1.0 while the app shipped as 0.2.2, so Settings told people
+    // they were running something two releases old.
+    floor.addOption([]const u8, "manifest_version", manifestVersion(b));
     floor.addOption(f32, "manifest_height", manifestWindowNumber(b, "height"));
     // BOTH modules, so app.zon is the one place the number lives. The scene
     // declares the same floor it does, and the sweep measures against it.
@@ -107,6 +111,18 @@ fn linkNostr(b: *std.Build, mod: *std.Build.Module) void {
 /// The manifest is the one place these numbers live. Repeating any of them in
 /// Zig is how the floor drifted seven pixels below what the layout needed and
 /// stayed there: two numbers that must agree, with nothing connecting them.
+/// The version string from `app.zon`, which is the one the packaged app carries.
+fn manifestVersion(b: *std.Build) []const u8 {
+    const text = b.build_root.handle.readFileAlloc(b.graph.io, "app.zon", b.allocator, .limited(1 << 20)) catch
+        @panic("cannot read app.zon to find the app version");
+    const key = ".version = \"";
+    const at = std.mem.indexOf(u8, text, key) orelse @panic("app.zon declares no .version");
+    const rest = text[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse @panic("app.zon's .version is not a string");
+    if (end == 0) @panic("app.zon's .version is empty");
+    return b.allocator.dupe(u8, rest[0..end]) catch @panic("OOM");
+}
+
 fn manifestWindowNumber(b: *std.Build, comptime field: []const u8) f32 {
     const text = b.build_root.handle.readFileAlloc(b.graph.io, "app.zon", b.allocator, .limited(1 << 20)) catch
         @panic("cannot read app.zon to size the startup window");
