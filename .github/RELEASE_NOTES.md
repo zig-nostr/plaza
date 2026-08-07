@@ -1,10 +1,10 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.2.2
+### What's new in v0.2.3
 
-- **The composer stops cutting notes in half.** It held 512 characters and said "no length limit", so a longer note came back cut mid-sentence with nothing admitting it. It holds 4096 now, and tells you how much room is left once a quarter of it is gone.
-- **Sheets scroll properly.** Settings, the composer, notifications and the join screen were rebuilding the whole feed behind them on every frame of scrolling. Settings went from 6806us to 1179us of layout per frame on a full store.
-- **Plaza has its own icon.** An open square with four quadrants around it, which is what a plaza is. It shipped with a placeholder until v0.2.1.
+- **Settings and the composer are full screens, not sheets.** A sheet is a translucent layer over the whole window, so every frame of scrolling or typing in one repainted the entire window and it got worse the wider the window was. On a 1600x1000 window a frame cost 183ms as a sheet and 8ms as a page. The composer was worst when nobody was touching it: a blinking caret was repainting the window twice a second.
+- **The composer has a proper top bar**, the same band settings wears: Cancel, the title, and Post.
+- Escape no longer closes these two. Both keep Cancel and Close, and the keystroke comes back once there is a global handler for it.
 
 ### Install
 
