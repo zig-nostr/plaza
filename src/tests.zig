@@ -12700,3 +12700,42 @@ test "the note field states its own width" {
     }
     try testing.expect(found);
 }
+
+test "the thread's reply box takes more than one line" {
+    // A reply used to be a 34pt pill, which is a shape that can only hold one
+    // line. People answer notes with paragraphs, so the box has to be a
+    // `textarea`: that is the widget where Enter inserts a newline and the
+    // primary chord submits, while a `text_field` submits on Enter instead.
+    //
+    // What this pins is the pair, not the number. The reply box is the widget
+    // kind that can hold a newline, and it is tall enough to show more than one
+    // line of it. A regression to `text_field` fails on the kind; a regression
+    // to a one-line box fails on the frame.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root.id = 1;
+
+    const p = try painted.Painted.renderAt(arena, model, main.window_width, main.window_height);
+
+    var reply: ?@TypeOf(p.layout.nodes[0].widget) = null;
+    for (p.layout.nodes) |n| {
+        if (!std.mem.startsWith(u8, n.widget.placeholder, "Reply to")) continue;
+        reply = n.widget;
+    }
+    // Found by its own placeholder, so this cannot pass on some other editor
+    // that happens to be on screen.
+    try testing.expect(reply != null);
+    try testing.expectEqual(canvas.WidgetKind.textarea, reply.?.kind);
+    try testing.expectApproxEqAbs(main.reply_editor_height_for_test, reply.?.frame.height, 1.0);
+    // Two lines of room at minimum, or "multiline" is a claim the layout does
+    // not honour whatever the widget kind says.
+    try testing.expect(reply.?.frame.height > 34);
+}

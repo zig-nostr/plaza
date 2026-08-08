@@ -1622,6 +1622,12 @@ const compose_header_height: f32 = 38;
 const compose_editor_width: f32 = compose_sheet_width - 14 * 2 - avatar_size - 12;
 pub const compose_editor_width_for_test = compose_editor_width;
 const compose_editor_height: f32 = 150;
+// Three lines of room in the thread's reply box, plus its 14pt padding. Enough
+// that a paragraph does not scroll before it is finished, small enough that the
+// note being answered stays on screen above it, which is the reason to reply in
+// the thread rather than in the composer.
+const reply_editor_height: f32 = 88;
+pub const reply_editor_height_for_test = reply_editor_height;
 /// How many bands a striped placeholder may draw. A tall picture would otherwise
 /// spend fifty widget nodes on a fill nobody reads, against a 1024-node ceiling
 /// that refuses the whole view when it is crossed.
@@ -13561,16 +13567,25 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
     return ui.column(.{ .width = thread_column_width, .gap = 0 }, .{
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
         vgap(ui, 10),
-        ui.row(.{ .cross = .center, .gap = 0 }, .{
+        // Top-aligned, because the field is taller than one line now: the avatar
+        // belongs beside the first line of what you are writing, not floating in
+        // the middle of a half-empty box.
+        ui.row(.{ .cross = .start, .gap = 0 }, .{
             hgap(ui, thread_inset),
             meAvatar(ui, avatar_size),
             hgap(ui, avatar_to_text_gap),
-            // The field IS the pill. A text_field paints its own surface, so
-            // wrapping one in a rounded panel drew a rectangle inside a capsule:
-            // the shape belongs on the control itself.
-            ui.el(.text_field, .{
+            // A `textarea`, not a `text_field`: Enter inserts a newline here and
+            // the primary chord submits, which is the whole point. A reply is
+            // often the paragraph the note deserved, and a single line asked
+            // people to write it somewhere else and paste it back.
+            //
+            // The pill had to go with it. A capsule only reads as one on a
+            // single line; at three it becomes a lozenge with the text pushed
+            // off its own corners, so the shape follows the content and matches
+            // the cards everywhere else.
+            ui.el(.textarea, .{
                 .grow = 1,
-                .height = 34,
+                .height = reply_editor_height,
                 .padding = 14,
                 .text = model.reply_draft(),
                 // By handle, as the shot addresses them: a reply is to an account,
@@ -13578,7 +13593,7 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                 .placeholder = ui.fmt("Reply to {s}…", .{replyTarget(ui, root)}),
                 .on_input = AppUi.inputMsg(.reply_edit),
                 .on_submit = .reply_submit,
-                .style = .{ .background = p.surface_input, .border = p.border_chip, .radius = 999, .stroke_width = 1 },
+                .style = .{ .background = p.surface_input, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 },
             }, .{}),
             hgap(ui, 10),
             // The verb sits beside the field, quiet until there is something to
