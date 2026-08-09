@@ -2758,7 +2758,7 @@ pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
 /// string: that is exactly what the publish path passes, which is why a pasted
 /// note and a typed one cannot diverge.
 pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
-    return contentTags(gpa, content, &.{});
+    return contentTags(gpa, content, &.{}, &.{});
 }
 
 /// The tag set of the last event handed to a signer, for tests.
@@ -6110,6 +6110,12 @@ pub const Model = struct {
     thread_open_at: i64 = 0,
     // The reply composer's edit state, bound through `reply_draft`.
     reply_buffer: canvas.TextBuffer(compose_capacity) = .{},
+    // People the reader has switched off for the draft they are writing. An
+    // exclusion set rather than an inclusion one, so it cannot go stale: if the
+    // mention is deleted the pubkey stops being derived and the entry is simply
+    // never consulted again.
+    mentions_off: [max_mention_tags][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_mention_tags,
+    mentions_off_len: usize = 0,
     // The name beat: after creating an identity, one optional, skippable ask
     // so the account is not blank. Never for imported keys or signers.
     naming: bool = false,
@@ -6606,6 +6612,10 @@ pub const Model = struct {
     /// The note with this id, if it is still in the feed or the open thread. A
     /// thread's root and replies are not in the feed window but are still
     /// pressable (like, image, open-as-thread), so they resolve here too.
+    pub fn mentionsOff(self: *const Model) []const [32]u8 {
+        return self.mentions_off[0..self.mentions_off_len];
+    }
+
     pub fn noteById(self: *const Model, note_id: i64) ?*const Note {
         for (self.notes[0..self.notes_len]) |*note| {
             if (note.id == note_id) return note;
@@ -9147,6 +9157,7 @@ pub const Msg = union(enum) {
     /// Copy a note's words to the clipboard (by id).
     copy_note_text: i64,
     quote_note: i64,
+    toggle_mention_off: [32]u8,
     /// Put the mention picker away without choosing anybody.
     close_mentions,
     /// Open the Notary window on what it is holding, from Settings.
@@ -10805,6 +10816,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                             }),
                         }),
                     }),
+                    composeNotifyRow(ui, model),
                     vgap(ui, 10),
                     // What pressing Post will do, in the terms that matter: how
                     // far the note goes, and how much room is left when that
@@ -11016,6 +11028,112 @@ fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// How far a note will go, said before it goes rather than after: the relays
 /// that will take a write, and that Plaza imposes no length of its own.
+/// Who this note will notify, as names you can switch off.
+///
+/// Nothing here is new information at publish time: it is the same set the
+/// event carries, shown before it goes out. A reply can tag a dozen people who
+/// were merely present in a thread, and the first anybody knew about it used to
+/// be somebody answering a conversation they had left.
+/// The composer's notify row, derived from the draft as it stands.
+fn composeNotifyRow(ui: *AppUi, model: *const Model) AppUi.Node {
+    var people: [max_mention_tags][32]u8 = undefined;
+    const n = notifiedBy(model.draft(), &people);
+    if (n == 0) return ui.spacer(0);
+    return ui.column(.{ .gap = 0 }, .{ vgap(ui, 10), notifyChips(ui, model, people[0..n]) });
+}
+
+/// The reply's notify row: whoever the text names, plus everybody already in
+/// the thread, which is the set that surprises people.
+fn replyNotifyRow(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node {
+    var people: [max_mention_tags][32]u8 = undefined;
+    var n = notifiedBy(model.reply_draft(), &people);
+    const me = activePubkey();
+    var pool: [1 + thread_reply_cap][32]u8 = undefined;
+    var pool_len: usize = 0;
+    pool[0] = root.pubkey;
+    pool_len = 1;
+    for (model.thread_notes[0..model.thread_notes_len]) |note| {
+        if (pool_len == pool.len) break;
+        pool[pool_len] = note.pubkey;
+        pool_len += 1;
+    }
+    for (pool[0..pool_len]) |pubkey| {
+        if (n == people.len) break;
+        if (me) |mine| {
+            if (std.mem.eql(u8, &mine, &pubkey)) continue;
+        }
+        var dup = false;
+        for (people[0..n]) |seen| {
+            if (std.mem.eql(u8, &seen, &pubkey)) dup = true;
+        }
+        if (dup) continue;
+        people[n] = pubkey;
+        n += 1;
+    }
+    if (n == 0) return ui.spacer(0);
+    return ui.column(.{ .gap = 0 }, .{ vgap(ui, 8), notifyChips(ui, model, people[0..n]) });
+}
+
+fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.Node {
+    const p = theme.palette;
+    if (people.len == 0) return ui.spacer(0);
+
+    // Chunked into rows by hand, because `wrap` is a text property in this
+    // toolkit and not a row one: a single row of a dozen chips would run off
+    // the side of the composer rather than folding under itself.
+    //
+    // Two per row, and the name clipped. Three of them blew 35px past the right
+    // edge of the narrowest window the app allows, which the layout guard
+    // caught: a chip is only as wide as the name inside it, and a display name
+    // has no length any of this controls.
+    const per_row = 2;
+    const row_count = (people.len + per_row - 1) / per_row;
+    const rows = ui.arena.alloc(AppUi.Node, row_count + 1) catch return ui.spacer(0);
+    rows[0] = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_dim } },
+        &.{.{ .text = "Notifies", .scale = stat_scale }},
+    );
+
+    var placed: usize = 0;
+    for (rows[1..]) |*row| {
+        const take = @min(per_row, people.len - placed);
+        const kids = ui.arena.alloc(AppUi.Node, take) catch return ui.spacer(0);
+        for (people[placed..][0..take], kids) |pubkey, *kid| {
+            const off = mentionExcluded(model.mentionsOff(), pubkey);
+            // Switched off stays on screen, dimmed, rather than disappearing:
+            // a chip that vanished when pressed would leave nothing to press
+            // to bring the person back.
+            kid.* = ui.el(.panel, .{
+                .padding = 0.01,
+                .on_press = Msg{ .toggle_mention_off = pubkey },
+                .style = .{
+                    .background = if (off) p.surface_rail_tile else p.surface_input,
+                    .border = p.border_chip,
+                    .radius = 999,
+                    .stroke_width = 1,
+                },
+                .semantics = .{
+                    .role = .button,
+                    .label = if (off) "Not notifying, press to switch back on" else "Notifying, press to switch off",
+                },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 10),
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = if (off) p.text_muted else p.text_secondary } },
+                        &.{.{ .text = clipToChars(personName(ui, pubkey), 14, 42), .scale = stat_scale }},
+                    ),
+                    hgap(ui, 10),
+                    vgap(ui, 24),
+                }),
+            });
+        }
+        placed += take;
+        row.* = ui.row(.{ .cross = .center, .gap = 6 }, kids);
+    }
+    return ui.column(.{ .gap = 6 }, rows);
+}
+
 fn composeReach(ui: *AppUi, written: usize) []const u8 {
     // The room left, once there is little enough of it to matter. A composer
     // that silently stops accepting characters is the bug this replaces, and a
@@ -13665,6 +13783,10 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                 }),
             }),
             hgap(ui, thread_inset),
+        }),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, thread_inset + avatar_size + avatar_to_text_gap),
+            replyNotifyRow(ui, model, root),
         }),
         vgap(ui, 10),
     });
@@ -18082,6 +18204,22 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.viewing_thread = 0;
             model.composing = true;
         },
+        // Switching somebody off, or back on. Keyed on the pubkey rather than a
+        // position, because the list is re-derived from the text every frame
+        // and an index would point at somebody else the moment the draft is
+        // edited above it.
+        .toggle_mention_off => |pubkey| {
+            for (model.mentions_off[0..model.mentions_off_len], 0..) |off, i| {
+                if (!std.mem.eql(u8, &off, &pubkey)) continue;
+                model.mentions_off[i] = model.mentions_off[model.mentions_off_len - 1];
+                model.mentions_off_len -= 1;
+                return;
+            }
+            if (model.mentions_off_len < model.mentions_off.len) {
+                model.mentions_off[model.mentions_off_len] = pubkey;
+                model.mentions_off_len += 1;
+            }
+        },
         .close_mentions => model.mention_dismissed = true,
         .copy_note_text => |id| {
             model.note_menu = 0;
@@ -19067,7 +19205,7 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     const owned = gpa.dupe(u8, canonical) catch return false;
     // Read off `owned`, not off the draft buffer: that is cleared two lines
     // below, and the tags hold slices of whatever they were built from.
-    const tags = contentTags(gpa, owned, &.{});
+    const tags = contentTags(gpa, owned, &.{}, model.mentionsOff());
     // A composer draft: kind:1 carrying whatever its own text implies,
     // restorable to the composer if a remote signer never answers.
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true);
@@ -19243,6 +19381,7 @@ fn publishReply(model: *Model, fx: *Effects) void {
         if (me) |mine| {
             if (std.mem.eql(u8, &mine, &n.pubkey)) continue;
         }
+        if (mentionExcluded(model.mentionsOff(), n.pubkey)) continue;
         var dup = false;
         for (participants[0..participants_len]) |seen| {
             if (std.mem.eql(u8, &seen, &n.pubkey)) dup = true;
@@ -19264,7 +19403,7 @@ fn publishReply(model: *Model, fx: *Effects) void {
     // The threading tags first, then whatever the reply's own text implies. A
     // reply can carry a hashtag, a mention or a picture exactly like a note can,
     // and it used to carry none of them.
-    const tags = contentTags(gpa, content, thread[0..filled]);
+    const tags = contentTags(gpa, content, thread[0..filled], model.mentionsOff());
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false);
     model.reply_buffer.clear();
 }
@@ -19382,7 +19521,77 @@ fn imageMimeForUrl(url: []const u8) []const u8 {
 /// Process-lifetime, like the other builders here: the local write and the
 /// detached publish both read these after this returns. Degrades to fewer tags on
 /// OOM rather than refusing to post.
-fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.event.Tag) []const nostr.event.Tag {
+/// Everyone `content` would notify: each mention it names, and the author of
+/// each event it quotes. Self-filtered and deduped, in the order they appear.
+///
+/// The composer's chips and the publish path both call this. Two functions that
+/// each derived the set would be two functions that could disagree, and the one
+/// promise the chips make is that they name exactly who gets tagged.
+fn notifiedBy(content: []const u8, out: *[max_mention_tags][32]u8) usize {
+    var n: usize = 0;
+    const me = activePubkey();
+    var scratch: [16 * 1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < content.len and n < out.len) {
+        // URLs whole, so a token inside one is never read as a reference.
+        if (std.mem.startsWith(u8, content[i..], "http://") or std.mem.startsWith(u8, content[i..], "https://")) {
+            while (i < content.len and !std.ascii.isWhitespace(content[i])) i += 1;
+            continue;
+        }
+        var found: ?[32]u8 = null;
+        var next = i + 1;
+        var fba = std.heap.FixedBufferAllocator.init(&scratch);
+        const arena = fba.allocator();
+        if (parseMentionAt(arena, content, i)) |m| {
+            found = m.pubkey;
+            next = m.end;
+        } else if (refPrecededByBoundary(content, i)) {
+            var body_start = i;
+            if (std.mem.startsWith(u8, content[i..], "nostr:")) body_start = i + "nostr:".len;
+            const rest = content[body_start..];
+            if (std.mem.startsWith(u8, rest, "nevent1")) {
+                var j: usize = 0;
+                while (j < rest.len and isBech32Char(rest[j])) j += 1;
+                if (nostr.nip19.decodeNevent(arena, rest[0..j])) |ptr| {
+                    // Only an author the pointer itself carries. A note1 has
+                    // none, and this list must not name somebody on a guess.
+                    if (ptr.author) |author| found = author;
+                    next = body_start + j;
+                } else |_| {}
+            }
+        }
+        if (found) |pubkey| {
+            const is_me = if (me) |mine| std.mem.eql(u8, &mine, &pubkey) else false;
+            var dup = false;
+            for (out[0..n]) |seen| {
+                if (std.mem.eql(u8, &seen, &pubkey)) dup = true;
+            }
+            if (!is_me and !dup) {
+                out[n] = pubkey;
+                n += 1;
+            }
+            i = @max(next, i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {
+    return notifiedBy(content, out);
+}
+
+/// Whether `pubkey` is in `excluded`, the set the reader has switched off for
+/// this draft.
+fn mentionExcluded(excluded: []const [32]u8, pubkey: [32]u8) bool {
+    for (excluded) |e| {
+        if (std.mem.eql(u8, &e, &pubkey)) return true;
+    }
+    return false;
+}
+
+fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.event.Tag, excluded: []const [32]u8) []const nostr.event.Tag {
     var topics: [max_topic_tags][]const u8 = undefined;
     var topics_len: usize = 0;
     var mentions: [max_mention_tags][32]u8 = undefined;
@@ -19433,7 +19642,8 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
                 }
                 // Never tag yourself: your own inbox lighting up for your own
                 // note is a bug the reader would report as one.
-                if (!is_me and !dup and mentions_len < mentions.len) {
+                const off = mentionExcluded(excluded, m.pubkey);
+                if (!is_me and !dup and !off and mentions_len < mentions.len) {
                     mentions[mentions_len] = m.pubkey;
                     mentions_len += 1;
                 }
@@ -19534,7 +19744,7 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
         const author = q.author orelse continue;
         if (mentions_len >= mentions.len) break;
         const is_me = if (me) |mine| std.mem.eql(u8, &mine, &author) else false;
-        if (is_me) continue;
+        if (is_me or mentionExcluded(excluded, author)) continue;
         var dup = false;
         for (mentions[0..mentions_len]) |seen| {
             if (std.mem.eql(u8, &seen, &author)) dup = true;

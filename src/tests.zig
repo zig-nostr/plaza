@@ -13004,3 +13004,56 @@ test "a reply reaches everyone already in the thread" {
     try testing.expect(saw_root);
     try testing.expect(!saw_self);
 }
+
+test "switching somebody off keeps them out of the note" {
+    // The chips promise they name exactly who gets tagged. That only holds if
+    // the row the reader sees and the tags the event carries come from one
+    // derivation, and if switching a name off actually reaches the publish path.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    var one = [_]u8{0} ** 32;
+    one[0] = 0x11;
+    var two = [_]u8{0} ** 32;
+    two[0] = 0x22;
+    const npub_one = try nostr.nip19.encodeNpub(gpa, one);
+    const npub_two = try nostr.nip19.encodeNpub(gpa, two);
+    const body = try std.fmt.allocPrint(gpa, "nostr:{s} and nostr:{s}", .{ npub_one, npub_two });
+
+    // Both are derived, and the chips are built from this same call.
+    var people: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), main.notifiedByForTest(body, &people));
+
+    model.draft_buffer.set(body);
+    main.clearLastPublishedTagsForTest();
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expectEqual(@as(usize, 2), countTags(main.lastPublishedTagsForTest(), "p"));
+
+    // Switch the first one off and post again. One tag, and it is the other.
+    model.composing = true;
+    model.draft_buffer.set(body);
+    main.update(&model, main.Msg{ .toggle_mention_off = one }, &fx);
+    main.clearLastPublishedTagsForTest();
+    try testing.expect(main.submitPostForTest(&model, &fx));
+
+    const tags = main.lastPublishedTagsForTest();
+    try testing.expectEqual(@as(usize, 1), countTags(tags, "p"));
+    const p = tagNamed(tags, "p") orelse return error.NoMentionTag;
+    try testing.expect(std.mem.startsWith(u8, p[1], "2200"));
+
+    // Pressing it again puts them back: the chip is a toggle, not a delete.
+    model.composing = true;
+    model.draft_buffer.set(body);
+    main.update(&model, main.Msg{ .toggle_mention_off = one }, &fx);
+    main.clearLastPublishedTagsForTest();
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expectEqual(@as(usize, 2), countTags(main.lastPublishedTagsForTest(), "p"));
+}
