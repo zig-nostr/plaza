@@ -1569,6 +1569,8 @@ const ancestor_identity_gap: f32 = 4;
 /// before they are laid out. The column is the estimator's own 70 characters per
 /// line at the 14.5 body, held to the 13.5 register.
 const ancestor_body_lines: usize = 2;
+/// A notification's preview, for the same reason and by the same rule.
+const notification_body_lines: usize = 2;
 /// A quote is an aside, so it shows four lines of the note it quotes and stops
 /// (11f). Its height is then known where the row around it is priced.
 const quote_body_lines: usize = 4;
@@ -4889,8 +4891,13 @@ fn resolveInboxBodies() void {
     defer unlockInbox();
     for (g_inbox[0..g_inbox_len]) |*item| {
         if (!item.used or item.body_len > 0) continue;
-        if (item.verb == .reply or item.verb == .mention) continue;
-        bakeTargetBody(item, item.target_id);
+        // A reply or a mention IS the event, so its own id holds their words.
+        // Skipping these was wrong: `inboxAdd` copies the content as the event
+        // arrives, but `loadInbox` rebuilds the inbox from the store at launch
+        // and never goes near that path, so every reply restored from a previous
+        // session drew a name, a time, and nothing in between.
+        const from: [32]u8 = if (item.verb == .reply or item.verb == .mention) item.id else item.target_id;
+        bakeTargetBody(item, from);
     }
 }
 
@@ -4905,13 +4912,17 @@ fn resolveInboxBodies() void {
 ///
 /// Cheap to repeat. `wantProfile` returns immediately for anyone already named
 /// and never queues a duplicate.
-fn wantInboxProfiles() void {
-    lockInbox();
-    defer unlockInbox();
-    for (g_inbox[0..g_inbox_len]) |item| {
-        if (!item.used) continue;
-        wantProfile(item.author);
-    }
+fn wantInboxProfiles(shown: []const InboxItem) void {
+    // Only the rows on screen, and this is the third time the same rule has had
+    // to be learned on this page. The wanted table holds 48 and evicts to make
+    // room, so asking on behalf of 143 notifications thrashed it: the names that
+    // actually arrived were whichever ones happened to survive the churn, which
+    // is why opening somebody's profile and coming back was what finally loaded
+    // them. Visiting the profile asked for one person instead of a hundred.
+    const first = @min(g_inbox_visible.first, shown.len);
+    const last = @min(g_inbox_visible.last + 1, shown.len);
+    if (last <= first) return;
+    for (shown[first..last]) |item| wantProfile(item.author);
 }
 
 /// Whether the store already holds this event.
@@ -10359,7 +10370,6 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     var buf: [inbox_cap]InboxItem = undefined;
     resolveInboxBodies();
-    wantInboxProfiles();
     const shown = inboxItems(&buf, !model.notifications_everyone);
 
     // A windowed list, not pages. Paging existed because every row was mounted
@@ -10388,6 +10398,8 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .last = @intCast(window.last_visible_index),
         .len = shown.len,
     };
+    // After the window, because it asks on behalf of the rows the window chose.
+    wantInboxProfiles(shown);
     const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.spacer(0);
     // Centred ONCE, around the list, never per row. A spacer-column-spacer
     // wrapper on each row is four nodes apiece, and fourteen mounted rows of
@@ -10635,9 +10647,13 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         // Theirs for a reply, yours for everything else, and dimmer when it is
         // yours: you wrote it, so the new fact is who did what to it.
         const own = item.verb != .reply and item.verb != .mention;
+        // Two lines and stop, cut in the spans before layout because the SDK
+        // has no multi-line clamp. The same rule an ancestor's body follows, so
+        // a long note cannot turn one notification into half a screen.
+        const spans = clampSpansToLines(ui, &.{.{ .text = body, .scale = nested_meta_scale }}, notification_body_lines);
         kids[kids_len] = ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
-            &.{.{ .text = body, .scale = nested_meta_scale }},
+            spans,
         );
         kids_len += 1;
     }
