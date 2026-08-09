@@ -12944,3 +12944,63 @@ test "a nostr mention inside a URL path is not a mention" {
     const tags = main.contentTagsForTest(gpa, body);
     try testing.expectEqual(@as(usize, 0), countTags(tags, "p"));
 }
+
+test "a reply reaches everyone already in the thread" {
+    // A reply that tags only the person being answered is one the rest of the
+    // conversation never hears about, so they answer into a thread that has
+    // moved on. Amethyst p-tags every author in the thread plus the parent's
+    // own mentions; Jumble the parent author plus the parent's p tags. This is
+    // the authors, which is the part Plaza retains.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    main.setIdentityForTest([_]u8{0x66} ** 32);
+    defer main.clearIdentityForTest();
+    main.clearLastPublishedTagsForTest();
+
+    model.thread_root.id = 1;
+    model.thread_root.event_id = [_]u8{0xa1} ** 32;
+    model.thread_root.pubkey = [_]u8{0xb2} ** 32;
+
+    // Two other people in the thread, one of them twice, plus the root author
+    // again and the replier themselves. Only the two distinct others are new.
+    // The replier's own key is the DERIVED pubkey, not the secret handed to
+    // setIdentityForTest. Planting the secret's bytes here would leave the
+    // self-filter untested while the test still looked like it covered it.
+    const mine = main.activePubkeyForTest() orelse return error.NoIdentity;
+    const others = [_][32]u8{
+        [_]u8{0xc3} ** 32,
+        [_]u8{0xd4} ** 32,
+        [_]u8{0xc3} ** 32,
+        [_]u8{0xb2} ** 32,
+        mine,
+    };
+    for (others, 0..) |pk, i| {
+        model.thread_notes[i] = .{ .created_at = 1_800_000_000 };
+        model.thread_notes[i].id = @intCast(700 + i);
+        model.thread_notes[i].pubkey = pk;
+    }
+    model.thread_notes_len = others.len;
+
+    var fx: main.EffectsForTest = undefined;
+    model.reply_buffer.set("agreed, and one more thing");
+    main.update(&model, main.Msg.reply_submit, &fx);
+
+    const tags = main.lastPublishedTagsForTest();
+    // The root author plus the two distinct others. Not the duplicate, not the
+    // root author twice, and never the replier: your own inbox lighting up for
+    // your own reply is a bug a reader would report as one.
+    try testing.expectEqual(@as(usize, 3), countTags(tags, "p"));
+
+    var mine_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&mine_hex, "{x}", .{&mine}) catch unreachable;
+    var saw_self = false;
+    var saw_root = false;
+    for (tags) |t| {
+        if (t.len < 2 or !std.mem.eql(u8, t[0], "p")) continue;
+        if (std.mem.eql(u8, t[1], &mine_hex)) saw_self = true;
+        if (std.mem.startsWith(u8, t[1], "b2b2")) saw_root = true;
+    }
+    try testing.expect(saw_root);
+    try testing.expect(!saw_self);
+}
