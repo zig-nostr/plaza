@@ -1,9 +1,12 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.2.4
+### What's new in v0.2.5
 
-- **Settings shows the version you are actually running.** It said 0.1.0 on a 0.2.2 build, because the number was a second copy kept in step by hand. It comes from the manifest now.
-- Copy: Plaza reads without an account and posts in four clicks. It never took two minutes, and the first run has not asked for a key before showing you anything for a while.
+- **Notes now carry the tags their text implies.** A `#hashtag` publishes a `t` tag, so the note is findable in a hashtag feed instead of only by your followers. A mention publishes a `p` tag, so the person you named actually hears about it. An image URL publishes an `imeta` tag, so other clients can lay the picture out. A `note1` or `nevent1` reference publishes a `q` tag, so it reads as a quote.
+- **Quote a note** from its menu or its right-click. It appends the reference to whatever is already in your composer rather than replacing it.
+- **Replies carry those tags too.** They always had their threading tags and never had these.
+- A link with a `#fragment` no longer publishes a topic named after the fragment, and a non-ASCII hashtag like `#café` is no longer cut short.
+- A `github.com/.../raw/...` image link is rewritten to `raw.githubusercontent.com` before posting. The first is a redirect that many clients refuse to render inline; the second is the same file.
 
 ### Install
 
