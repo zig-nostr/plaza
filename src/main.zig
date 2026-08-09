@@ -4603,11 +4603,74 @@ pub const InboxItem = struct {
     verb: InboxVerb = .mention,
     /// Millisats, for a zap.
     msat: u64 = 0,
+    /// The words this row shows, copied in when the item is admitted.
+    ///
+    /// Never read from the store while drawing. The feed already paid for that
+    /// lesson: asking the database who you follow once per card cost 24423us to
+    /// rebuild, three whole frames to draw one, and two hundred notification
+    /// rows querying per frame would be the same bug wearing a different hat.
+    ///
+    /// WHICH note this holds depends on the verb, and that is the whole design.
+    /// For a reply or a mention it is THEIR note, because the question is what
+    /// did they say. For a reaction, a repost or a zap it is YOUR note, because
+    /// the question is which of mine did this happen to.
+    body_buf: [180]u8 = [_]u8{0} ** 180,
+    body_len: u8 = 0,
+    /// A reaction's own content: `+`, `-`, an emoji, or a `:shortcode:`. The
+    /// gutter draws this instead of a generic heart, which is the difference
+    /// between "somebody reacted" and seeing what they actually sent.
+    glyph_buf: [16]u8 = [_]u8{0} ** 16,
+    glyph_len: u8 = 0,
 
     pub fn hasTarget(self: InboxItem) bool {
         return !std.mem.allEqual(u8, &self.target_id, 0);
     }
+
+    pub fn body(self: *const InboxItem) []const u8 {
+        return self.body_buf[0..self.body_len];
+    }
+
+    pub fn reactionGlyph(self: *const InboxItem) []const u8 {
+        return self.glyph_buf[0..self.glyph_len];
+    }
 };
+
+/// Copies `src` into `dst`, clipped to whole codepoints, and returns the length.
+fn fillClipped(dst: []u8, src: []const u8) u8 {
+    // Whitespace runs collapse to one space, newlines included. A preview is one
+    // block: kept as-is, a note with a blank line between paragraphs drew as two
+    // separated blocks inside a row, so four notifications filled the screen and
+    // the list read as a stack of documents rather than a list of events.
+    var flat_buf: [512]u8 = undefined;
+    var flat_len: usize = 0;
+    var in_space = false;
+    for (src) |c| {
+        const is_space = c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        if (is_space) {
+            in_space = true;
+            continue;
+        }
+        if (in_space and flat_len > 0 and flat_len < flat_buf.len) {
+            flat_buf[flat_len] = ' ';
+            flat_len += 1;
+        }
+        in_space = false;
+        if (flat_len == flat_buf.len) break;
+        flat_buf[flat_len] = c;
+        flat_len += 1;
+    }
+    const trimmed = flat_buf[0..flat_len];
+    const ellipsis = "\u{2026}";
+    // Room kept for the ellipsis before clipping, not after: appending it to a
+    // full buffer would either overflow or cut a codepoint in half.
+    const room = if (trimmed.len > dst.len) dst.len - ellipsis.len else dst.len;
+    const take = clipToChars(trimmed, room, room);
+    @memcpy(dst[0..take.len], take);
+    if (take.len == trimmed.len) return @intCast(take.len);
+    // Cut. Say so, or a sentence that stops mid-word reads as the whole note.
+    @memcpy(dst[take.len..][0..ellipsis.len], ellipsis);
+    return @intCast(take.len + ellipsis.len);
+}
 
 var g_inbox = [_]InboxItem{.{}} ** inbox_cap;
 var g_inbox_len: usize = 0;
@@ -4729,7 +4792,7 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
         }
     }
 
-    const item = InboxItem{
+    var item = InboxItem{
         .used = true,
         .id = identity,
         .author = author,
@@ -4749,12 +4812,106 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     // for exactly the people it is about, which is the one screen where a name
     // is the entire content of the row.
     wantProfile(author);
+    bakeInboxText(&item, ev, verb, target);
     // Fetch what it is about, if this is the first we have heard of it. The row
     // is pressable, so the note behind it should be on its way before the reader
     // ever gets there.
     if (item.hasTarget() and !haveEvent(item.target_id)) wantQuote(item.target_id);
     g_inbox_dirty = true;
     return true;
+}
+
+/// Fills the row's words once, when the item is admitted.
+///
+/// A reply and a mention carry their own text, so those are free. A reaction, a
+/// repost and a zap are about a note of the reader's own, which means one store
+/// read here. Once per item, never per frame: a row that resolved itself while
+/// drawing would put a database query in the scroll path of a two hundred row
+/// list.
+///
+/// A miss is not an error. The note may not have arrived yet, `wantQuote` just
+/// asked for it, and a row with a name and no body still says who did what.
+fn bakeInboxText(item: *InboxItem, ev: nostr.event.Event, verb: InboxVerb, target: [32]u8) void {
+    switch (verb) {
+        // Their words, already in hand.
+        .reply, .mention => item.body_len = fillClipped(&item.body_buf, ev.content),
+        .like => {
+            // The reaction as sent. NIP-25 allows `+`, `-`, an empty string and
+            // a `:shortcode:`; `+` and empty both mean a like, and the row draws
+            // its usual heart for those rather than printing a plus sign.
+            const content = std.mem.trim(u8, ev.content, " \t\r\n");
+            if (content.len > 0 and !std.mem.eql(u8, content, "+")) {
+                item.glyph_len = fillClipped(&item.glyph_buf, content);
+            }
+            bakeTargetBody(item, target);
+        },
+        .repost, .zap => bakeTargetBody(item, target),
+    }
+}
+
+/// The reader's own note, for the rows that are about one.
+///
+/// Usually a miss, and that is expected. What a notification points at is almost
+/// always an older note of the reader's own, which the follow-scoped feed window
+/// does not hold, so the line after this one asks the relays for it. That is why
+/// the resolve below exists: baking once here and never looking again left every
+/// reaction, repost and zap row with no note under it for good.
+fn bakeTargetBody(item: *InboxItem, target: [32]u8) void {
+    if (std.mem.allEqual(u8, &target, 0)) return;
+    const store = g_store orelse return;
+    var se = (store.getEvent(std.heap.page_allocator, target) catch return) orelse return;
+    defer se.deinit();
+    item.body_len = fillClipped(&item.body_buf, se.event.content);
+}
+
+/// The rows the notifications window last put on screen. Written by the view,
+/// read by the pass that lends avatar ids on the next tick.
+var g_inbox_visible: struct { first: usize = 0, last: usize = 0, len: usize = 0 } = .{};
+
+/// The store generation the inbox last tried to fill its missing bodies at.
+var g_inbox_body_stamp: usize = std.math.maxInt(usize);
+
+/// Fills in the note behind every row that is still missing one.
+///
+/// Guarded on the store's event count, so this is one pass per arrival rather
+/// than a query per row per frame. The feed already paid for the other version:
+/// asking the database once per card cost 24423us to rebuild, three whole frames
+/// to draw one.
+///
+/// A row whose note never arrives keeps an empty body and still says who did
+/// what, which is what it did before any of this.
+fn resolveInboxBodies() void {
+    const store = g_store orelse return;
+    const stamp = store.eventCount() catch return;
+    if (stamp == g_inbox_body_stamp) return;
+    g_inbox_body_stamp = stamp;
+    lockInbox();
+    defer unlockInbox();
+    for (g_inbox[0..g_inbox_len]) |*item| {
+        if (!item.used or item.body_len > 0) continue;
+        if (item.verb == .reply or item.verb == .mention) continue;
+        bakeTargetBody(item, item.target_id);
+    }
+}
+
+/// Asks for the metadata of everyone the inbox names.
+///
+/// `inboxAdd` already does this for an event as it arrives, and that is not
+/// enough: `loadInbox` rebuilds the whole inbox from the store on launch without
+/// going near that path, so every notification from a previous session had
+/// nobody asking for its author's name. Those rows showed a raw npub and an
+/// initial for as long as the app ran, which is exactly the screen where a name
+/// IS the content.
+///
+/// Cheap to repeat. `wantProfile` returns immediately for anyone already named
+/// and never queues a duplicate.
+fn wantInboxProfiles() void {
+    lockInbox();
+    defer unlockInbox();
+    for (g_inbox[0..g_inbox_len]) |item| {
+        if (!item.used) continue;
+        wantProfile(item.author);
+    }
 }
 
 /// Whether the store already holds this event.
@@ -6053,7 +6210,6 @@ pub const Model = struct {
     // and an unbounded one would refuse the whole view.
     /// Which page of the sheet is showing, counted from zero. Pages REPLACE each
     /// other rather than accumulating, so this is an index, not a depth.
-    notifications_page: usize = 0,
     // Whether the compose sheet is open. Compose is on demand from the "New
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
@@ -6124,6 +6280,11 @@ pub const Model = struct {
     // never consulted again.
     mentions_off: [max_mention_tags][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_mention_tags,
     mentions_off_len: usize = 0,
+    /// Whether the level on screen was opened FROM notifications, so closing it
+    /// goes back there rather than to the feed. Pressing a row used to drop the
+    /// page entirely, and Back then landed on a feed the reader had not been
+    /// looking at, with their place in the notifications list gone.
+    notifications_return: bool = false,
     // The name beat: after creating an identity, one optional, skippable ask
     // so the account is not blank. Never for imported keys or signers.
     naming: bool = false,
@@ -7125,7 +7286,25 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         }
     }.f;
     if (activePubkey()) |pk| push(&onscreen, &n, pk);
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.notifications_open) {
+        // The notifications page occludes everything, and its rows are the only
+        // faces on screen. Without this branch its authors were never in the
+        // set that lends registry slots, so every row drew initials no matter
+        // how long the page stayed open: the ids were all out on loan to a feed
+        // nobody could see.
+        // Only the rows ON SCREEN, which is the same rule the thread branch
+        // below spells out and the same mistake it is warning about. Pushing
+        // all of them marked every author wanted, and the claim pass never
+        // evicts anything wanted this pass, so nine ids were locked by rows the
+        // reader could not see and every visible row kept its initials.
+        var buf: [inbox_cap]InboxItem = undefined;
+        const shown = inboxItems(&buf, !model.notifications_everyone);
+        const first = @min(g_inbox_visible.first, shown.len);
+        const last = @min(g_inbox_visible.last + 1, shown.len);
+        if (last > first) {
+            for (shown[first..last]) |item| push(&onscreen, &n, item.author);
+        }
+    } else if (model.viewing_profile != null or model.viewing_thread != 0) {
         // A level occludes the feed, so its authors own the ids while it is up,
         // and only the ones ON SCREEN in it. Walking every note in the level
         // instead meant the first nine authors of a long thread took every id
@@ -9050,8 +9229,6 @@ pub const Msg = union(enum) {
     toggle_notifications,
     close_notifications,
     notifications_tab: u8,
-    notifications_older,
-    notifications_newer,
     notifications_read_all,
     /// The note overflow menu.
     toggle_note_menu: i64,
@@ -10179,44 +10356,98 @@ fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: [
 /// that vanishes. A page is capped and replaced rather than appended, which is
 /// the same answer the thread reached for the same reason.
 fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     var buf: [inbox_cap]InboxItem = undefined;
+    resolveInboxBodies();
+    wantInboxProfiles();
     const shown = inboxItems(&buf, !model.notifications_everyone);
-    const pages = if (shown.len == 0) 1 else (shown.len + inbox_page - 1) / inbox_page;
-    const page = @min(model.notifications_page, pages - 1);
-    const first = page * inbox_page;
-    const last = @min(first + inbox_page, shown.len);
-    const rows = ui.arena.alloc(AppUi.Node, last - first) catch return ui.spacer(0);
-    for (rows, first..) |*row, i| row.* = notificationRow(ui, &shown[i]);
 
-    return ui.el(.dialog, .{
+    // A windowed list, not pages. Paging existed because every row was mounted
+    // at once and the whole view is priced against a 1024-node ceiling that
+    // refuses a frame WHOLE when crossed, so twenty rows was the arithmetic that
+    // fit. A window mounts only what is on screen, which removes the ceiling as
+    // a constraint and the pager with it: two hundred notifications are one
+    // scroll rather than ten presses of a Next button.
+    const options: AppUi.VirtualListOptions = .{
+        .id = "notifications",
+        .item_count = shown.len,
+        .item_extent = 0,
+        .extent_estimate = notificationExtentEstimate,
+        .extent_context = &shown_ctx,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 3,
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = Msg.close_notifications,
-        .on_press = Msg.close_notifications,
-        .style_tokens = .{ .background = .scrim },
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Notifications list" },
+    };
+    shown_ctx = .{ .items = shown };
+    const window = ui.virtualWindow(options);
+    g_inbox_visible = .{
+        .first = @intCast(window.first_visible_index),
+        .last = @intCast(window.last_visible_index),
+        .len = shown.len,
+    };
+    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.spacer(0);
+    // Centred ONCE, around the list, never per row. A spacer-column-spacer
+    // wrapper on each row is four nodes apiece, and fourteen mounted rows of
+    // that is fifty-six nodes spent on horizontal alignment: enough on its own
+    // to push this view through the 1024 ceiling that refuses a frame whole.
+    for (rows, 0..) |*row, offset| {
+        const i = window.start_index + offset;
+        row.* = if (i < shown.len) notificationRow(ui, &shown[i]) else ui.spacer(0);
+    }
+
+    return ui.column(.{
+        .grow = 1,
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Notifications" },
     }, .{
-        // No `cross` override. The default is `.stretch`, and the card needs it:
-        // `modalCard` sets a width and no height, so under `.start` the card took
-        // its INTRINSIC height, the `grow = 1` scroll inside it resolved to zero,
-        // and every row was laid out and PAINTED outside the card, down the bare
-        // window, with the footer drawn on top of the first row and nothing
-        // scrollable. The tree was correct the whole time, which is why a test
-        // that asserts on the tree said so.
-        ui.row(.{ .grow = 1, .main = .center }, .{
-            modalCard(ui, 480, ui.column(.{ .grow = 1, .gap = 0 }, .{
-                notificationsHeader(ui),
-                notificationsTabs(ui, model),
-                if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
-                ui.scroll(.{ .grow = 1 }, .{
-                    ui.column(.{ .gap = 0 }, .{rows}),
-                }),
-                notificationsPager(ui, page, pages),
-                notificationsFooter(ui, shown.len),
-            })),
+        notificationsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        notificationsTabs(ui, model),
+        if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
+        ui.row(.{ .grow = 1, .gap = 0 }, .{
+            ui.spacer(1),
+            // Width only, never grow. In a row, grow claims the remaining
+            // horizontal space and beats the fixed width: 620 resolved to 853
+            // and ran 153px past the edge of the narrowest allowed window.
+            // The row's cross-axis stretch is what gives it its height.
+            ui.column(.{ .width = notifications_column_width }, .{
+                ui.virtualList(options, window, .{rows}),
+            }),
+            ui.spacer(1),
         }),
+        notificationsFooter(ui, shown.len),
     });
 }
+
+/// The rows the notifications window is measuring, so the extent callback can
+/// price one without the view handing it a closure.
+const NotificationCtx = struct { items: []const InboxItem = &.{} };
+var shown_ctx: NotificationCtx = .{};
+
+/// A cheap height for the notification at `index`, from the item alone: the
+/// row's chrome plus however many lines its body wraps to.
+fn notificationExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
+    const ctx: *const NotificationCtx = @ptrCast(@alignCast(context orelse return 64));
+    const i: usize = @intCast(index);
+    if (i >= ctx.items.len) return 64;
+    const item = &ctx.items[i];
+    // 12 padding top and bottom, the name line, the time line, and the body.
+    var extent: f32 = 12 * 2 + body_line_height + body_line_height + 6;
+    if (item.body_len > 0) {
+        const per_line: f32 = 58;
+        const lines = @max(1.0, @ceil(@as(f32, @floatFromInt(item.body_len)) / per_line));
+        extent += lines * body_line_height;
+    }
+    return extent;
+}
+
+/// The reading column for notifications, matching the feed's so a row is the
+/// same width whichever screen it is on.
+const notifications_column_width: f32 = feed_column_width;
+pub const notifications_column_width_for_test = notifications_column_width;
 
 /// How many rows the sheet draws at once.
 ///
@@ -10241,51 +10472,31 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 /// ceiling and outside the tenth of it the suite insists stays free.
 pub const inbox_page = 16;
 
-/// Older and newer, when there is more than one page.
-fn notificationsPager(ui: *AppUi, page: usize, pages: usize) AppUi.Node {
-    const p = theme.palette;
-    if (pages <= 1) return ui.spacer(0);
-    return ui.row(.{ .cross = .center, .padding = 10, .gap = 8, .style = .{ .background = p.surface_modal } }, .{
-        if (page > 0)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_newer,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Newer", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Newer", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-        ui.spacer(1),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = ui.fmt("{d} of {d}", .{ page + 1, pages }), .scale = menu_scale }},
-        ),
-        ui.spacer(1),
-        if (page + 1 < pages)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_older,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Older", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Older", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-    });
-}
-
 fn notificationsHeader(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         ui.row(.{ .cross = .center, .gap = 10, .height = 38, .padding = 0.01 }, .{
-            hgap(ui, 14),
+            hgap(ui, 10),
+            // A page needs a way out. As a sheet this had the scrim to press and
+            // Escape to dismiss; an opaque level has neither, so closing it was
+            // the bell in a rail the page was covering.
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .cross = .center,
+                .on_press = Msg.close_notifications,
+                .style = .{ .radius = 6, .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Back", .focusable = true },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 6),
+                    ui.icon(.{ .width = 14, .height = 14, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+                    hgap(ui, 4),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "Back", .scale = stat_scale }}),
+                    hgap(ui, 8),
+                    vgap(ui, 26),
+                }),
+            }),
+            hgap(ui, 4),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Notifications", .weight = .bold, .scale = settings_title_scale }},
@@ -10365,8 +10576,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     const p = theme.palette;
     const read = item.created_at <= inboxReadThrough();
     const glyph: []const u8 = switch (item.verb) {
-        .reply => "reply",
-        .mention => "reply",
+        .reply, .mention => "reply",
         .like => "like",
         .repost => "repeat",
         .zap => "zap",
@@ -10377,22 +10587,73 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         .like => p.status_like,
         else => p.text_muted_alt,
     };
+    // A reply says only the name. "replied to you" above a row that already
+    // shows their reply is the same fact twice.
     const verb_text: []const u8 = switch (item.verb) {
-        .reply => "replied to you",
-        .mention => "mentioned you",
-        .like => "liked your note",
-        .repost => "reposted you",
-        .zap => "zapped you",
+        .reply => "",
+        .mention => "mentioned you in a note",
+        .like => "reacted to your note",
+        .repost => "reposted your note",
+        .zap => "zapped your note",
     };
-    // Flattened deliberately: the four spacer nodes this used to hold, plus the
-    // inner column and its two vertical gaps, cost seven nodes A ROW for spacing
-    // that `padding` and `gap` already express. Twenty rows of that is a seventh
-    // of the whole view budget spent on whitespace.
+    const body = item.body();
+    const emoji = item.reactionGlyph();
+
+    // Name, verb and amount are SPANS of one paragraph, not three paragraphs.
+    // The row is priced in widget nodes against a per-view ceiling that refuses
+    // the whole screen when crossed, and the first cut of this row spent five
+    // extra nodes apiece on things that are only text: twenty rows of that put
+    // the notifications view at 924 against a ceiling of 1024 with 102 that has
+    // to stay free. Spans cost nothing.
+    var head: [3]canvas.TextSpan = undefined;
+    var head_len: usize = 0;
+    head[head_len] = .{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale };
+    head_len += 1;
+    if (verb_text.len > 0) {
+        head[head_len] = .{ .text = ui.fmt(" {s}", .{verb_text}), .scale = nested_meta_scale };
+        head_len += 1;
+    }
+    if (item.verb == .zap and item.msat > 0) {
+        head[head_len] = .{ .text = ui.fmt("  {d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale };
+        head_len += 1;
+    }
+
+    // Built by hand rather than with an `else ui.spacer(0)` per optional child,
+    // because an empty spacer is still a node and this row has three of them.
+    var kids: [3]AppUi.Node = undefined;
+    var kids_len: usize = 0;
+    kids[kids_len] = ui.el(.list_item, .{
+        .padding = 0.01,
+        .on_press = Msg{ .open_person = item.author },
+        .style = .{ .radius = 4, .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+    }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, head[0..head_len]),
+    });
+    kids_len += 1;
+    if (body.len > 0) {
+        // Theirs for a reply, yours for everything else, and dimmer when it is
+        // yours: you wrote it, so the new fact is who did what to it.
+        const own = item.verb != .reply and item.verb != .mention;
+        kids[kids_len] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
+            &.{.{ .text = body, .scale = nested_meta_scale }},
+        );
+        kids_len += 1;
+    }
+    kids[kids_len] = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_faint_alt } },
+        &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
+    );
+    kids_len += 1;
+
     return ui.column(.{ .gap = 0 }, .{
         ui.el(.data_row, .{
             .padding = 12,
             .gap = 10,
-            .cross = .center,
+            // Top aligned: the row is several lines now, and a gutter glyph
+            // floating beside the middle of a paragraph belongs to nothing.
+            .cross = .start,
             // `open_event`, never `open_thread`. The thread route resolves an id
             // against the LOADED FEED, which is scoped to follows and holds at
             // most a few hundred notes; what a notification points at is almost
@@ -10401,7 +10662,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
             // a silent no-op. This one asks the store by name.
             .on_press = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author },
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = verb_text, .focusable = true },
+            .semantics = .{ .role = .button, .label = if (verb_text.len > 0) verb_text else "replied to you", .focusable = true },
         }, .{
             // The unread dot holds its width either way, so a row does not shift
             // sideways the moment it is read.
@@ -10416,26 +10677,26 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
                     .stroke_width = 0,
                 },
             }, .{}),
-            ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
-            ui.row(.{ .cross = .center, .gap = 5, .grow = 1 }, .{
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_body_soft } },
-                    &.{.{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale }},
-                ),
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = verb_text, .scale = nested_meta_scale }}),
-                if (item.verb == .zap and item.msat > 0)
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.status_warning } },
-                        &.{.{ .text = ui.fmt("{d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale }},
-                    )
-                else
-                    ui.spacer(0),
-                ui.spacer(1),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_faint_alt } },
-                    &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
-                ),
+            // The reaction they actually sent, where a generic heart used to be.
+            // A shortcode with no image would print as `:shakingeyes:`, so only
+            // something short enough to read as a glyph is drawn as one.
+            if (item.verb == .like and emoji.len > 0 and emoji.len <= 8)
+                ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = emoji, .scale = nested_meta_scale }})
+            else
+                ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
+            // The face and the name go to the person, everything else goes to
+            // the note. That is what the feed does and what Jumble does, and
+            // without it the one thing a notification is most likely to make
+            // you want (who IS this) was the one thing you could not press.
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .on_press = Msg{ .open_person = item.author },
+                .style = .{ .radius = 999, .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+            }, .{
+                personAvatar(ui, item.author, nested_avatar_size),
             }),
+            ui.column(.{ .gap = 3, .grow = 1 }, kids[0..kids_len]),
         }),
         ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
     });
@@ -17975,6 +18236,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             } else model.composing = true;
         },
         .open_person => |pk| {
+            model.notifications_return = model.notifications_open;
             model.notifications_open = false;
             enterProfile(model, pk);
         },
@@ -17994,7 +18256,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
-            model.notifications_page = 0;
             // Opening IS reading: the reader is looking at them. The mark moves
             // to the newest item held, never to the wall clock, so a backfill
             // arriving later with older stamps is not born already read.
@@ -18008,19 +18269,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.notifications_everyone = which == 1;
             // The other tab holds a different set, so page four of this one is
             // not page four of that one.
-            model.notifications_page = 0;
-        },
-        .notifications_older => {
-            // Clamped in the MODEL, not only where it is drawn. The view clamps
-            // for its own safety, but leaving the model past the end means the
-            // reader presses Newer and watches nothing move, once for every page
-            // the set shrank by underneath them.
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page + 1, last);
-        },
-        .notifications_newer => {
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page, last) -| 1;
         },
         .notifications_read_all => {
             inboxMarkAllRead();
@@ -18401,6 +18649,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // anything that could close the sheet. Closing on arrival therefore
             // left it up in exactly the cases where the reader has least idea why
             // nothing moved.
+            model.notifications_return = model.notifications_open;
             model.notifications_open = false;
             openEvent(model, id);
         },
@@ -20973,6 +21222,13 @@ fn closeThread(model: *Model) void {
         model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
+        // Back to where the reader actually came from. The list is rebuilt from
+        // the same inbox and the window keeps its offset on the list's own id,
+        // so this lands on the row they pressed rather than at the top.
+        if (model.notifications_return) {
+            model.notifications_return = false;
+            model.notifications_open = true;
+        }
     }
 }
 
