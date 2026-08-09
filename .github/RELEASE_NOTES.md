@@ -1,5 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
+### What's new in v0.2.6
+
+- **A reply now reaches everyone already in the thread**, not only the person being answered. Every distinct author in the conversation is notified, capped so a long thread cannot turn one reply into a mass notification.
+
 ### What's new in v0.2.5
 
 - **Notes now carry the tags their text implies.** A `#hashtag` publishes a `t` tag, so the note is findable in a hashtag feed instead of only by your followers. A mention publishes a `p` tag, so the person you named actually hears about it. An image URL publishes an `imeta` tag, so other clients can lay the picture out. A `note1` or `nevent1` reference publishes a `q` tag, so it reads as a quote.
