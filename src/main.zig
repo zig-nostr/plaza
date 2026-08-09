@@ -1671,6 +1671,10 @@ const ancestor_row_chrome: f32 = avatar_size + ancestor_identity_gap + ancestor_
 /// scaled down and both still take a full body line box (see
 /// `ancestor_line_height`), which puts the text column past the 36px disc.
 const ghost_row_extent: f32 = 2 + body_line_height + 3 + body_line_height + ancestor_bottom_pad;
+/// The one quiet line above a reply whose parent is not in the set, plus the
+/// gap under it. Priced here because the block's extent estimate has to include
+/// it or the windowed list sizes the row short and the reader sees it jump.
+const orphan_note_extent: f32 = body_line_height + 6;
 /// The listening footer, and the focal note's own leading space when it is the
 /// first row (an ancestor's bottom pad provides it otherwise).
 const listening_row_extent: f32 = 8 + 1 + 10 + body_line_height + 10;
@@ -5751,6 +5755,10 @@ pub const Note = struct {
     // nothing; the flag disambiguates a genuine all-zero id.
     reply_parent: [32]u8 = [_]u8{0} ** 32,
     has_reply_parent: bool = false,
+    /// This note names a parent that is not in the fetched set. It sits at the
+    /// top level for want of anywhere better, and says so rather than passing
+    /// itself off as an answer to the thread's opening note.
+    parent_missing: bool = false,
     /// What the note says it was written with, from NIP-89's `client` tag.
     /// Copied in rather than read at render time because it is foreign text on a
     /// borrowed event: the buffer is the sanitiser's output, bounded here so a
@@ -8262,11 +8270,19 @@ pub fn nip10Parent(tags: []const nostr.event.Tag) ?[32]u8 {
 /// nesting depth (1 = a direct reply to the root). Expects `notes` already
 /// sorted oldest-first, which is what makes sibling order chronological.
 ///
-/// A reply whose parent is the root, is missing from the set (past the fetch
-/// cap, deleted, or never seen), or answers nothing sits at the top level in
-/// its chronological place. A parent cycle (malformed events) cannot loop: the
-/// visited set admits each note once, and whatever a cycle strands is appended
-/// at the top level.
+/// A reply whose parent is the root, or which answers nothing, sits at the top
+/// level in its chronological place.
+///
+/// A reply whose parent IS named but is not in the set (past the fetch cap,
+/// never seen, or gone from every relay) also sits there, because there is
+/// nowhere better to put it, but it is marked `parent_missing` so the row can
+/// say so. Drawing it as an ordinary first-level reply asserted that it answered
+/// the opening note, which is a claim about the conversation that nothing
+/// supports: the note says which event it answers and that event is simply not
+/// here.
+///
+/// A parent cycle (malformed events) cannot loop: the visited set admits each
+/// note once, and whatever a cycle strands is appended at the top level.
 pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
     const n = notes.len;
     if (n < 2) {
@@ -8280,14 +8296,20 @@ pub fn arrangeThread(notes: []Note, root_event_id: [32]u8) void {
     var parent: [thread_reply_cap]u16 = undefined;
     for (notes[0..n], 0..) |*note, i| {
         parent[i] = @intCast(n);
+        note.parent_missing = false;
         if (!note.has_reply_parent) continue;
         if (std.mem.eql(u8, &note.reply_parent, &root_event_id)) continue;
+        var found = false;
         for (notes[0..n], 0..) |*cand, j| {
             if (i != j and std.mem.eql(u8, &cand.event_id, &note.reply_parent)) {
                 parent[i] = @intCast(j);
+                found = true;
                 break;
             }
         }
+        // Named a parent, and it is not here. Still top level, but no longer
+        // pretending that is where it belongs.
+        note.parent_missing = !found;
     }
     // The DFS emits a PERMUTATION (conversation order over current indices),
     // so ordering is one O(n) gather through the scratch below, never a sort,
@@ -11680,6 +11702,7 @@ fn threadRowHeight(rows: *const ThreadRows, i: usize) f32 {
 /// a line for whatever the branch continues into.
 fn blockExtent(block: *const ThreadBlock) f32 {
     var extent = noteRowEstimate(block.parent, thread_reply_chrome);
+    if (block.parent.parent_missing) extent += orphan_note_extent;
     for (block.children, block.deeper) |*child, deeper| {
         extent += noteRowEstimateBody(child, nested_reply_chrome) * nested_body_scale;
         if (deeper > 0) extent += branch_more_extent;
@@ -13227,6 +13250,26 @@ fn threadGutter(ui: *AppUi, levels: usize) AppUi.Node {
 /// The rail replaces the round-4 indent gutter: the redesign nests ONE level in
 /// place and sends the rest to their own thread, rather than stepping every reply
 /// further right until the text runs out of room.
+/// One line saying this reply answers something the app does not have.
+///
+/// The same words the ghost row uses at the top of an ancestor chain, for the
+/// same reason: the note is not claimed to be gone, only absent from here. It
+/// may arrive when a relay answers.
+fn orphanNote(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.appIcon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_dim } }, "clock"),
+            hgap(ui, 6),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = "The note this answers is not on your relays yet", .scale = stat_scale }},
+            ),
+        }),
+        vgap(ui, 6),
+    });
+}
+
 fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
     const p = theme.palette;
     const note = block.parent;
@@ -13250,6 +13293,10 @@ fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_a
         else
             ui.spacer(0),
         vgap(ui, 12),
+        if (note.parent_missing)
+            ui.row(.{ .gap = 0 }, .{ hgap(ui, thread_inset + avatar_size + avatar_to_text_gap), orphanNote(ui) })
+        else
+            ui.spacer(0),
         // No `cross` here: the default stretches the children, which is what
         // gives the rail a height to grow into. Pinned to the top, the disc's
         // column would be exactly as tall as the disc and the rail would draw
