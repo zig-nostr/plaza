@@ -13057,3 +13057,54 @@ test "switching somebody off keeps them out of the note" {
     try testing.expect(main.submitPostForTest(&model, &fx));
     try testing.expectEqual(@as(usize, 2), countTags(main.lastPublishedTagsForTest(), "p"));
 }
+
+test "a reply whose parent is missing says so instead of posing as a direct reply" {
+    // Three different things used to render identically: a genuine direct reply
+    // to the root, a reply tagged to the root, and a reply that names a parent
+    // nobody has. The third asserted it answered the opening note, which is a
+    // claim about the conversation that nothing in the event supports.
+    //
+    // Taken from a real thread: two replies named parents that returned nothing
+    // from damus, nos.lol, primal and nostr.band, and both drew as first-level
+    // replies to a note they were not answering.
+    const root_id = [_]u8{0xa0} ** 32;
+
+    var notes: [3]main.Note = .{ .{}, .{}, .{} };
+    // A direct reply: names the root.
+    notes[0].event_id = [_]u8{0xb1} ** 32;
+    notes[0].created_at = 1_800_000_001;
+    notes[0].reply_parent = root_id;
+    notes[0].has_reply_parent = true;
+    // A reply to that one, whose parent IS in the set.
+    notes[1].event_id = [_]u8{0xb2} ** 32;
+    notes[1].created_at = 1_800_000_002;
+    notes[1].reply_parent = notes[0].event_id;
+    notes[1].has_reply_parent = true;
+    // An orphan: names a parent that is nowhere in the set.
+    notes[2].event_id = [_]u8{0xb3} ** 32;
+    notes[2].created_at = 1_800_000_003;
+    notes[2].reply_parent = [_]u8{0xcc} ** 32;
+    notes[2].has_reply_parent = true;
+
+    main.arrangeThread(&notes, root_id);
+
+    var direct: ?*main.Note = null;
+    var nested: ?*main.Note = null;
+    var orphan: ?*main.Note = null;
+    for (&notes) |*note| {
+        if (std.mem.eql(u8, &note.event_id, &[_]u8{0xb1} ** 32)) direct = note;
+        if (std.mem.eql(u8, &note.event_id, &[_]u8{0xb2} ** 32)) nested = note;
+        if (std.mem.eql(u8, &note.event_id, &[_]u8{0xb3} ** 32)) orphan = note;
+    }
+
+    // The orphan still sits at the top level, because there is nowhere better,
+    // but it is no longer indistinguishable from a real first-level reply.
+    try testing.expectEqual(@as(u8, 1), orphan.?.depth);
+    try testing.expect(orphan.?.parent_missing);
+
+    // And neither of the honest ones is marked.
+    try testing.expectEqual(@as(u8, 1), direct.?.depth);
+    try testing.expect(!direct.?.parent_missing);
+    try testing.expectEqual(@as(u8, 2), nested.?.depth);
+    try testing.expect(!nested.?.parent_missing);
+}
