@@ -19225,13 +19225,46 @@ fn publishReply(model: *Model, fx: *Effects) void {
     const author_hex = hexAlloc(gpa, root.pubkey) orelse return;
     const e_tag = gpa.dupe([]const u8, &.{ "e", id_hex, "", "root" }) catch return;
     const p_tag = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return;
-    const thread = gpa.alloc(nostr.event.Tag, 2) catch return;
+
+    // Everybody already in the conversation, not only the person being answered.
+    // A reply that tags one author is a reply the rest of the thread never hears
+    // about, so they answer into a conversation that has moved on without them.
+    // Both reference clients do this: Amethyst p-tags every author in the thread
+    // plus the parent's own mentions, Jumble the parent author plus the parent's
+    // p tags. Plaza does not retain a note's raw tags, so this is the authors,
+    // which is the part that carries the conversation.
+    var participants: [max_thread_participant_tags][32]u8 = undefined;
+    var participants_len: usize = 0;
+    const me = activePubkey();
+    for (model.thread_notes[0..model.thread_notes_len]) |n| {
+        if (participants_len == participants.len) break;
+        // Not the root author, who already has a tag, and never yourself.
+        if (std.mem.eql(u8, &n.pubkey, &root.pubkey)) continue;
+        if (me) |mine| {
+            if (std.mem.eql(u8, &mine, &n.pubkey)) continue;
+        }
+        var dup = false;
+        for (participants[0..participants_len]) |seen| {
+            if (std.mem.eql(u8, &seen, &n.pubkey)) dup = true;
+        }
+        if (dup) continue;
+        participants[participants_len] = n.pubkey;
+        participants_len += 1;
+    }
+
+    const thread = gpa.alloc(nostr.event.Tag, 2 + participants_len) catch return;
     thread[0] = e_tag;
     thread[1] = p_tag;
+    var filled: usize = 2;
+    for (participants[0..participants_len]) |pubkey| {
+        const hex = hexAlloc(gpa, pubkey) orelse break;
+        thread[filled] = gpa.dupe([]const u8, &.{ "p", hex }) catch break;
+        filled += 1;
+    }
     // The threading tags first, then whatever the reply's own text implies. A
     // reply can carry a hashtag, a mention or a picture exactly like a note can,
     // and it used to carry none of them.
-    const tags = contentTags(gpa, content, thread);
+    const tags = contentTags(gpa, content, thread[0..filled]);
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false);
     model.reply_buffer.clear();
 }
@@ -19264,6 +19297,9 @@ const max_topic_tags = 10;
 const max_mention_tags = 8;
 const max_quote_tags = 4;
 const max_imeta_tags = 4;
+// A long thread should not turn one reply into a mass notification, and some
+// relays cap tag counts outright.
+const max_thread_participant_tags = 12;
 const max_topic_bytes = 64;
 
 /// Rewrites `github.com/<owner>/<repo>/raw/<rest>` to
