@@ -1,16 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.2.6
+### What's new in v0.2.7
 
-- **A reply now reaches everyone already in the thread**, not only the person being answered. Every distinct author in the conversation is notified, capped so a long thread cannot turn one reply into a mass notification.
-
-### What's new in v0.2.5
-
-- **Notes now carry the tags their text implies.** A `#hashtag` publishes a `t` tag, so the note is findable in a hashtag feed instead of only by your followers. A mention publishes a `p` tag, so the person you named actually hears about it. An image URL publishes an `imeta` tag, so other clients can lay the picture out. A `note1` or `nevent1` reference publishes a `q` tag, so it reads as a quote.
-- **Quote a note** from its menu or its right-click. It appends the reference to whatever is already in your composer rather than replacing it.
-- **Replies carry those tags too.** They always had their threading tags and never had these.
-- A link with a `#fragment` no longer publishes a topic named after the fragment, and a non-ASCII hashtag like `#café` is no longer cut short.
-- A `github.com/.../raw/...` image link is rewritten to `raw.githubusercontent.com` before posting. The first is a redirect that many clients refuse to render inline; the second is the same file.
+- **See who a note will notify, and switch anyone off.** The composer and the reply box list the people who will be tagged. Press a name to drop them, press it again to put them back. Replies tag everyone already in the thread, so this is how you keep one reply from reaching a dozen inboxes.
+- **A reply that answers a note Plaza does not have now says so**, instead of quietly appearing as a reply to the note at the top of the thread. It reads "The note this answers is not on your relays yet", and it may fill in when a relay answers.
 
 ### Install
 
