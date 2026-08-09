@@ -2681,6 +2681,10 @@ const HelperSign = struct {
 };
 var g_helper_sign: HelperSign = .{};
 
+/// The tag set of the most recent event handed to a signer. Read only by tests,
+/// which have no other view of the event that actually goes out.
+var g_last_published_tags: []const nostr.event.Tag = &.{};
+
 /// How long a helper sign may be out before the note is handed back. The daemon
 /// is on loopback and answers in about a millisecond, so this is not a latency
 /// budget: it is the backstop for a response that never arrives at all.
@@ -2748,6 +2752,22 @@ var g_helper_sign_notice = std.atomic.Value(bool).init(false);
 /// intact is not something a test of `requestHelperSign` alone can see.
 pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
     return submitPost(model, fx);
+}
+
+/// The tags a body of text implies, for tests. Deliberately takes the finished
+/// string: that is exactly what the publish path passes, which is why a pasted
+/// note and a typed one cannot diverge.
+pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
+    return contentTags(gpa, content, &.{});
+}
+
+/// The tag set of the last event handed to a signer, for tests.
+pub fn lastPublishedTagsForTest() []const nostr.event.Tag {
+    return g_last_published_tags;
+}
+
+pub fn clearLastPublishedTagsForTest() void {
+    g_last_published_tags = &.{};
 }
 
 pub fn helperSignRestorableForTest() bool {
@@ -8821,6 +8841,12 @@ fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct {
     const prefix = "nostr:";
     var body_start = i;
     if (std.mem.startsWith(u8, src[i..], prefix)) {
+        // The same boundary guard the bare form below has always had. Without
+        // it a contrived `https://example.com/nostr:npub1…` parses as a
+        // mention, and now that the composer turns mentions into `p` tags that
+        // is a notification sent to a real stranger on the strength of a path
+        // segment in somebody else's link.
+        if (!refPrecededByBoundary(src, i)) return null;
         body_start = i + prefix.len;
     } else {
         // A bare npub/nprofile counts too (plenty of clients write them without
@@ -8871,9 +8897,22 @@ fn isBech32Char(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
-/// Whether `c` continues a hashtag word (letters, digits, or underscore).
+/// Whether `c` continues a hashtag word: letters, digits, underscore, or any
+/// byte of a multi-byte UTF-8 sequence.
+///
+/// The `>= 0x80` arm is what makes `#café` and `#日本` whole words rather than
+/// wreckage. Every continuation and lead byte of a UTF-8 sequence is >= 0x80 and
+/// every ASCII byte is below it, so a run that ends on a byte < 0x80 always ends
+/// on a codepoint boundary: the predicate cannot cut a character in half. The
+/// ASCII-only version returned "caf" for the first of those and nothing at all
+/// for the second, and both of those went out as tags once the composer started
+/// emitting them.
+///
+/// It over-accepts emoji and non-ASCII punctuation as word characters. That is
+/// the same trade every client here makes, and it fails toward a slightly long
+/// tag rather than a truncated one.
 fn isHashtagChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
+    return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
 }
 
 /// Whether an event reference (`nostr:nevent1…`/`note1…`/`naddr1…`, or a bare one
@@ -9107,6 +9146,7 @@ pub const Msg = union(enum) {
     close_image,
     /// Copy a note's words to the clipboard (by id).
     copy_note_text: i64,
+    quote_note: i64,
     /// Put the mention picker away without choosing anybody.
     close_mentions,
     /// Open the Notary window on what it is holding, from Settings.
@@ -9140,7 +9180,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -15145,12 +15185,14 @@ fn lowerScope(scope: []const u8) []const u8 {
 /// lists would be two lists to keep in step and the reader would find different
 /// actions depending on which way they reached for them.
 fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
-    const rows = ui.arena.alloc(AppUi.Node, 6) catch return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, 7) catch return ui.spacer(0);
     var n: usize = 0;
     // No glyphs. Two of these four had one and two did not, which reads as two
     // items with something extra rather than as one list: a menu's items are
     // alike, and a glyph on some of them is a difference that means nothing.
     rows[n] = menuRow(ui, "Copy note address", null, null, Msg{ .copy_nevent = note.id });
+    n += 1;
+    rows[n] = menuRow(ui, "Quote", null, null, Msg{ .quote_note = note.id });
     n += 1;
     rows[n] = menuRow(ui, "Copy text", null, null, Msg{ .copy_note_text = note.id });
     n += 1;
@@ -15176,13 +15218,15 @@ fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
 /// presents these as the platform's own menu where there is one, and as the same
 /// anchored surface everything else uses where there is not.
 fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppUi.ContextMenuItem {
-    const items = ui.arena.alloc(AppUi.ContextMenuItem, 6) catch return &.{};
+    const items = ui.arena.alloc(AppUi.ContextMenuItem, 7) catch return &.{};
     var n: usize = 0;
     if (!in_thread) {
         items[n] = .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } };
         n += 1;
     }
     items[n] = .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } };
+    n += 1;
+    items[n] = .{ .label = "Quote", .msg = Msg{ .quote_note = note.id } };
     n += 1;
     items[n] = .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } };
     n += 1;
@@ -18012,6 +18056,32 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const url = std.fmt.bufPrint(&url_buf, "https://njump.me/{s}", .{addr}) catch return;
             openExternally(fx, url);
         },
+        // Quoting is composing with the note already referenced. The composer
+        // opens holding a `nostr:nevent…`, which `contentTags` turns into the
+        // `q` tag at publish, so the reference in the text and the tag on the
+        // event can never disagree: they are derived from the same bytes.
+        .quote_note => |id| {
+            model.note_menu = 0;
+            if (model.is_guest()) {
+                model.joining = true;
+                model.pending = .post;
+                return;
+            }
+            const note = model.noteById(id) orelse return;
+            var scratch: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            // Appended, not overwritten. Something half-written in the composer
+            // is the reader's, and a quote arriving on top of it would be this
+            // app deciding their draft was worth less than its own convenience.
+            const existing = model.draft_buffer.text();
+            var line: [256]u8 = undefined;
+            const sep: []const u8 = if (existing.len == 0) "" else "\n\n";
+            const text = std.fmt.bufPrint(&line, "{s}{s}nostr:{s}", .{ existing, sep, addr }) catch return;
+            model.draft_buffer.set(text);
+            model.viewing_thread = 0;
+            model.composing = true;
+        },
         .close_mentions => model.mention_dismissed = true,
         .copy_note_text => |id| {
             model.note_menu = 0;
@@ -18989,10 +19059,18 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     // A process-lifetime copy of the content: `event.create` references its
     // content slice rather than copying it, and the store write and either the
     // publisher or the NIP-46 round-trip read it after the draft is cleared.
-    const owned = gpa.dupe(u8, text) catch return false;
-    // A composer draft: kind:1, no tags, restorable to the composer if a remote
-    // signer never answers.
-    signAndPublish(fx, gpa, nowSeconds(), 1, &.{}, owned, true);
+    // Canonicalised BEFORE the copy, so the published content and the imeta tag
+    // built from it name the same URL. NIP-92 pairs a tag with a URL in the
+    // content, and a tag pointing at a string that is not there is one a reader
+    // is entitled to ignore.
+    const canonical = canonicalMediaUrls(gpa, text);
+    const owned = gpa.dupe(u8, canonical) catch return false;
+    // Read off `owned`, not off the draft buffer: that is cleared two lines
+    // below, and the tags hold slices of whatever they were built from.
+    const tags = contentTags(gpa, owned, &.{});
+    // A composer draft: kind:1 carrying whatever its own text implies,
+    // restorable to the composer if a remote signer never answers.
+    signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true);
     model.draft_buffer.clear();
     return true;
 }
@@ -19010,6 +19088,10 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
     // per-caller version of it is a switch that holds for whichever paths someone
     // remembered.
     const tags = withClientTag(gpa, kind, tags_in);
+    // The finished tag set, recorded where a test can read it. A parser that is
+    // correct and never called is the regression worth guarding against here,
+    // and every other seam in this file stops short of the event itself.
+    g_last_published_tags = tags;
     switch (g_signer_kind) {
         .local => {
             const signer = g_identity_signer orelse return;
@@ -19143,9 +19225,13 @@ fn publishReply(model: *Model, fx: *Effects) void {
     const author_hex = hexAlloc(gpa, root.pubkey) orelse return;
     const e_tag = gpa.dupe([]const u8, &.{ "e", id_hex, "", "root" }) catch return;
     const p_tag = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return;
-    const tags = gpa.alloc(nostr.event.Tag, 2) catch return;
-    tags[0] = e_tag;
-    tags[1] = p_tag;
+    const thread = gpa.alloc(nostr.event.Tag, 2) catch return;
+    thread[0] = e_tag;
+    thread[1] = p_tag;
+    // The threading tags first, then whatever the reply's own text implies. A
+    // reply can carry a hashtag, a mention or a picture exactly like a note can,
+    // and it used to carry none of them.
+    const tags = contentTags(gpa, content, thread);
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false);
     model.reply_buffer.clear();
 }
@@ -19168,6 +19254,301 @@ fn hexAlloc(gpa: std.mem.Allocator, bytes: [32]u8) ?[]const u8 {
         out[i * 2 + 1] = digits[b & 0x0f];
     }
     return out;
+}
+
+// How many of each derived tag one note may carry. Caps rather than limits: a
+// pasted C header emits a topic per `#include`, a pasted thread emits a mention
+// per npub, and neither should be allowed to turn one note into a hundred-tag
+// event that relays reject wholesale.
+const max_topic_tags = 10;
+const max_mention_tags = 8;
+const max_quote_tags = 4;
+const max_imeta_tags = 4;
+const max_topic_bytes = 64;
+
+/// Rewrites `github.com/<owner>/<repo>/raw/<rest>` to
+/// `raw.githubusercontent.com/<owner>/<repo>/<rest>`, returning `text` unchanged
+/// when there is nothing to rewrite (and on OOM).
+///
+/// The first form is a 302 whose own response is `content-type: text/html`, so a
+/// client that checks the type before inlining refuses to draw the picture and
+/// the note arrives as a wall of text with a link in it. The second form is the
+/// same bytes with `image/jpeg` on the first response.
+///
+/// Narrow on purpose: one host, one path shape, both ends serving the identical
+/// file. This is the only place Plaza edits what somebody typed, and widening it
+/// into a general URL cleaner would make that a habit instead of a fix.
+fn canonicalMediaUrls(gpa: std.mem.Allocator, text: []const u8) []const u8 {
+    const marker = "https://github.com/";
+    if (std.mem.indexOf(u8, text, marker) == null) return text;
+
+    var out = std.ArrayList(u8).initCapacity(gpa, text.len) catch return text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (!std.mem.startsWith(u8, text[i..], marker)) {
+            out.append(gpa, text[i]) catch return text;
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+        const url = text[i..end];
+        const tail = url[marker.len..];
+        // owner/repo/raw/<rest>, and nothing shorter.
+        var parts = std.mem.splitScalar(u8, tail, '/');
+        const owner = parts.next() orelse "";
+        const repo = parts.next() orelse "";
+        const raw = parts.next() orelse "";
+        const rest = parts.rest();
+        if (owner.len > 0 and repo.len > 0 and std.mem.eql(u8, raw, "raw") and rest.len > 0) {
+            out.print(gpa, "https://raw.githubusercontent.com/{s}/{s}/{s}", .{ owner, repo, rest }) catch return text;
+        } else {
+            out.appendSlice(gpa, url) catch return text;
+        }
+        i = end;
+    }
+    return out.toOwnedSlice(gpa) catch text;
+}
+
+/// The MIME type an image URL's extension implies, or "" when it implies none.
+fn imageMimeForUrl(url: []const u8) []const u8 {
+    const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+    const path = url[0..path_end];
+    const table = [_]struct { ext: []const u8, mime: []const u8 }{
+        .{ .ext = ".jpg", .mime = "image/jpeg" },
+        .{ .ext = ".jpeg", .mime = "image/jpeg" },
+        .{ .ext = ".png", .mime = "image/png" },
+        .{ .ext = ".gif", .mime = "image/gif" },
+        .{ .ext = ".webp", .mime = "image/webp" },
+        .{ .ext = ".avif", .mime = "image/avif" },
+        .{ .ext = ".bmp", .mime = "image/bmp" },
+    };
+    for (table) |row| {
+        if (std.ascii.endsWithIgnoreCase(path, row.ext)) return row.mime;
+    }
+    return "";
+}
+
+/// The tags a note's own text implies: `t` per hashtag, `p` per mention, `q` per
+/// quoted event, and `imeta` per image URL.
+///
+/// Everything here is derived from the text being published, at the moment it is
+/// published, never from a list assembled while typing. Deleting a mention has
+/// to delete its tag, and a side list built when the mention was picked goes
+/// stale the moment the text is edited around it.
+///
+/// Not folded into `signAndPublish` alongside `withClientTag`, though that is the
+/// one door every event passes through. A kind:0's content is a JSON blob whose
+/// display name may contain a `#`, and a kind:3's content is machinery; scanning
+/// those would put garbage on the network. The single-door pattern is right for a
+/// tag that describes the client and wrong for tags derived from prose.
+///
+/// Process-lifetime, like the other builders here: the local write and the
+/// detached publish both read these after this returns. Degrades to fewer tags on
+/// OOM rather than refusing to post.
+fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.event.Tag) []const nostr.event.Tag {
+    var topics: [max_topic_tags][]const u8 = undefined;
+    var topics_len: usize = 0;
+    var mentions: [max_mention_tags][32]u8 = undefined;
+    var mentions_len: usize = 0;
+    var quotes: [max_quote_tags]struct { id: [32]u8, author: ?[32]u8 } = undefined;
+    var quotes_len: usize = 0;
+    var images: [max_imeta_tags][]const u8 = undefined;
+    var images_len: usize = 0;
+
+    const me = activePubkey();
+    var scratch: [16 * 1024]u8 = undefined;
+
+    var i: usize = 0;
+    scan: while (i < content.len) {
+        // A URL is consumed WHOLE, before anything else looks at this byte. That
+        // single ordering is what keeps `https://example.com/page#section` from
+        // publishing a topic called "section", and it is the guard the reference
+        // clients are missing.
+        if (std.mem.startsWith(u8, content[i..], "http://") or std.mem.startsWith(u8, content[i..], "https://")) {
+            var j = i;
+            while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+            const url = content[i..j];
+            if (images_len < images.len and looksLikeImageUrl(url)) {
+                var dup = false;
+                for (images[0..images_len]) |seen| {
+                    if (std.mem.eql(u8, seen, url)) dup = true;
+                }
+                // One tag per distinct URL: NIP-92 pairs a tag with a URL in the
+                // content, and the same picture twice is still one picture.
+                if (!dup) {
+                    images[images_len] = url;
+                    images_len += 1;
+                }
+            }
+            i = j;
+            continue :scan;
+        }
+
+        // A mention, by the same parser the renderer uses, so what is tagged is
+        // exactly what is drawn as a name.
+        {
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            if (parseMentionAt(fba.allocator(), content, i)) |m| {
+                const is_me = if (me) |mine| std.mem.eql(u8, &mine, &m.pubkey) else false;
+                var dup = false;
+                for (mentions[0..mentions_len]) |seen| {
+                    if (std.mem.eql(u8, &seen, &m.pubkey)) dup = true;
+                }
+                // Never tag yourself: your own inbox lighting up for your own
+                // note is a bug the reader would report as one.
+                if (!is_me and !dup and mentions_len < mentions.len) {
+                    mentions[mentions_len] = m.pubkey;
+                    mentions_len += 1;
+                }
+                i = m.end;
+                continue :scan;
+            }
+        }
+
+        // A quoted event.
+        if (quotes_len < quotes.len) {
+            var body_start = i;
+            var is_ref = false;
+            if (std.mem.startsWith(u8, content[i..], "nostr:")) {
+                if (refPrecededByBoundary(content, i)) {
+                    body_start = i + "nostr:".len;
+                    is_ref = true;
+                }
+            } else if (std.mem.startsWith(u8, content[i..], "nevent1") or std.mem.startsWith(u8, content[i..], "note1")) {
+                is_ref = refPrecededByBoundary(content, i);
+            }
+            if (is_ref) {
+                const rest = content[body_start..];
+                if (std.mem.startsWith(u8, rest, "nevent1") or std.mem.startsWith(u8, rest, "note1")) {
+                    var j: usize = 0;
+                    while (j < rest.len and isBech32Char(rest[j])) j += 1;
+                    const token = rest[0..j];
+                    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+                    const arena = fba.allocator();
+                    var id: ?[32]u8 = null;
+                    var author: ?[32]u8 = null;
+                    if (std.mem.startsWith(u8, token, "nevent1")) {
+                        if (nostr.nip19.decodeNevent(arena, token)) |ptr| {
+                            id = ptr.id;
+                            author = ptr.author;
+                        } else |_| {}
+                    } else if (nostr.nip19.decodeNote(arena, token)) |note_id| {
+                        id = note_id;
+                    } else |_| {}
+                    if (id) |event_id| {
+                        var dup = false;
+                        for (quotes[0..quotes_len]) |seen| {
+                            if (std.mem.eql(u8, &seen.id, &event_id)) dup = true;
+                        }
+                        if (!dup) {
+                            // Only the author the pointer itself carries. A
+                            // `note1` carries none, and slot 4 is a notification
+                            // target, so a guess there tells the wrong person
+                            // they were quoted. Absent beats wrong.
+                            quotes[quotes_len] = .{ .id = event_id, .author = author };
+                            quotes_len += 1;
+                        }
+                        i = body_start + j;
+                        continue :scan;
+                    }
+                }
+            }
+        }
+
+        // A hashtag, last, because everything above can begin with a character
+        // this would otherwise swallow.
+        if (content[i] == '#' and i + 1 < content.len and isHashtagChar(content[i + 1]) and
+            (i == 0 or !isHashtagChar(content[i - 1])))
+        {
+            var j = i + 1;
+            while (j < content.len and isHashtagChar(content[j])) j += 1;
+            const raw = content[i + 1 .. j];
+            if (raw.len <= max_topic_bytes and std.unicode.utf8ValidateSlice(raw) and topics_len < topics.len) {
+                // NIP-24 is a MUST on the value being lowercase. ASCII folding
+                // only: a full Unicode fold would need a casing table, and the
+                // tags this misses are ones no relay filter is asking for.
+                const folded = gpa.alloc(u8, raw.len) catch {
+                    i = j;
+                    continue :scan;
+                };
+                _ = std.ascii.lowerString(folded, raw);
+                var dup = false;
+                for (topics[0..topics_len]) |seen| {
+                    if (std.mem.eql(u8, seen, folded)) dup = true;
+                }
+                // Folded first, THEN deduped, so `#Nostr #nostr` is one topic.
+                if (dup) {
+                    gpa.free(folded);
+                } else {
+                    topics[topics_len] = folded;
+                    topics_len += 1;
+                }
+            }
+            i = j;
+            continue :scan;
+        }
+
+        i += 1;
+    }
+
+    // Every quoted author is also a mention: NIP-10 asks for it, and without it
+    // the person you quoted never learns you did.
+    for (quotes[0..quotes_len]) |q| {
+        const author = q.author orelse continue;
+        if (mentions_len >= mentions.len) break;
+        const is_me = if (me) |mine| std.mem.eql(u8, &mine, &author) else false;
+        if (is_me) continue;
+        var dup = false;
+        for (mentions[0..mentions_len]) |seen| {
+            if (std.mem.eql(u8, &seen, &author)) dup = true;
+        }
+        if (dup) continue;
+        mentions[mentions_len] = author;
+        mentions_len += 1;
+    }
+
+    const derived = topics_len + mentions_len + quotes_len + images_len;
+    if (derived == 0) return base;
+
+    var out = std.ArrayList(nostr.event.Tag).initCapacity(gpa, base.len + derived) catch return base;
+    out.appendSliceAssumeCapacity(base);
+
+    for (topics[0..topics_len]) |topic| {
+        const tag = gpa.dupe([]const u8, &.{ "t", topic }) catch break;
+        out.appendAssumeCapacity(tag);
+    }
+    for (mentions[0..mentions_len]) |pubkey| {
+        const hex = hexAlloc(gpa, pubkey) orelse break;
+        const tag = gpa.dupe([]const u8, &.{ "p", hex }) catch break;
+        out.appendAssumeCapacity(tag);
+    }
+    for (quotes[0..quotes_len]) |q| {
+        const id_hex = hexAlloc(gpa, q.id) orelse break;
+        // Positional, so an author can only be read out of slot 4. With no
+        // author the tag stops at the id rather than shipping empty slots.
+        const tag = if (q.author) |author| blk: {
+            const author_hex = hexAlloc(gpa, author) orelse break :blk gpa.dupe([]const u8, &.{ "q", id_hex }) catch break;
+            break :blk gpa.dupe([]const u8, &.{ "q", id_hex, "", author_hex }) catch break;
+        } else gpa.dupe([]const u8, &.{ "q", id_hex }) catch break;
+        out.appendAssumeCapacity(tag);
+    }
+    for (images[0..images_len]) |url| {
+        // NIP-92's fields are one space-joined "key value" string each, and a
+        // value may itself contain spaces, so a reader splits on the FIRST space
+        // only. Plaza's own reader already does; this writes what that reads.
+        const url_field = std.fmt.allocPrint(gpa, "url {s}", .{url}) catch break;
+        const mime = imageMimeForUrl(url);
+        const tag = if (mime.len == 0)
+            gpa.dupe([]const u8, &.{ "imeta", url_field }) catch break
+        else blk: {
+            const mime_field = std.fmt.allocPrint(gpa, "m {s}", .{mime}) catch break;
+            break :blk gpa.dupe([]const u8, &.{ "imeta", url_field, mime_field }) catch break;
+        };
+        out.appendAssumeCapacity(tag);
+    }
+
+    return out.toOwnedSlice(gpa) catch base;
 }
 
 /// The NIP-25 like tags for a note: `["e", id]`, `["p", author]`, `["k", "1"]`.

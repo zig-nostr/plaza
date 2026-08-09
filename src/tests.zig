@@ -12739,3 +12739,208 @@ test "the thread's reply box takes more than one line" {
     // not honour whatever the widget kind says.
     try testing.expect(reply.?.frame.height > 34);
 }
+
+/// Finds the first tag whose name is `name`, or null.
+fn tagNamed(tags: []const nostr.event.Tag, name: []const u8) ?nostr.event.Tag {
+    for (tags) |t| {
+        if (t.len > 0 and std.mem.eql(u8, t[0], name)) return t;
+    }
+    return null;
+}
+
+fn countTags(tags: []const nostr.event.Tag, name: []const u8) usize {
+    var n: usize = 0;
+    for (tags) |t| {
+        if (t.len > 0 and std.mem.eql(u8, t[0], name)) n += 1;
+    }
+    return n;
+}
+
+test "a note carries the tags its own text implies" {
+    // The composer used to publish kind:1 with a literally empty tag array, so a
+    // hashtag was violet text that no relay filter could find, a picked mention
+    // notified nobody, and an image URL arrived with no imeta for a client to
+    // lay out. Everything here is derived from the finished string at publish.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    const tags = main.contentTagsForTest(gpa, "shipping #Nostr today, see https://example.com/a.png");
+    const t = tagNamed(tags, "t") orelse return error.NoTopicTag;
+    // NIP-24 is a MUST on the value being lowercase, so the as-typed "#Nostr"
+    // has to arrive folded or a relay filter for "nostr" never matches it.
+    try testing.expectEqualStrings("nostr", t[1]);
+
+    const im = tagNamed(tags, "imeta") orelse return error.NoImetaTag;
+    try testing.expectEqualStrings("url https://example.com/a.png", im[1]);
+    // One space between key and value, and a reader splits on the FIRST space
+    // only, because a value may contain spaces of its own.
+    try testing.expectEqualStrings("m image/png", im[2]);
+}
+
+test "a hash inside a URL is not a hashtag" {
+    // The scanner consumes a URL run whole before it looks for a '#'. Without
+    // that ordering every link with a fragment publishes a junk topic, which is
+    // a bug both reference clients still have.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    const tags = main.contentTagsForTest(gpa, "see https://example.com/guide#installation for the steps");
+    try testing.expectEqual(@as(usize, 0), countTags(tags, "t"));
+}
+
+test "topics fold and dedupe, and a non-ASCII one stays whole" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    // Case-folded BEFORE the duplicate check, or "#Nostr #nostr" ships twice.
+    const dedup = main.contentTagsForTest(gpa, "#Nostr and #nostr and #NOSTR");
+    try testing.expectEqual(@as(usize, 1), countTags(dedup, "t"));
+
+    // The old predicate was ASCII-only, so this emitted a truncated "caf".
+    const unicode = main.contentTagsForTest(gpa, "#café");
+    const t = tagNamed(unicode, "t") orelse return error.NoTopicTag;
+    try testing.expectEqualStrings("café", t[1]);
+}
+
+test "a mention becomes a p tag, and a bare hash does not become anything" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    var pk = [_]u8{0} ** 32;
+    pk[0] = 0x2a;
+    const npub = try nostr.nip19.encodeNpub(gpa, pk);
+    const body = try std.fmt.allocPrint(gpa, "thanks nostr:{s} for the help", .{npub});
+
+    const tags = main.contentTagsForTest(gpa, body);
+    const p = tagNamed(tags, "p") orelse return error.NoMentionTag;
+    // Lowercase 64-hex, which is what NIP-01 requires of a pubkey in a tag.
+    try testing.expectEqual(@as(usize, 64), p[1].len);
+    try testing.expect(std.mem.startsWith(u8, p[1], "2a00"));
+
+    // A '#' with nothing word-like after it is punctuation, not a topic.
+    const bare = main.contentTagsForTest(gpa, "the # sign, and #!/bin/sh");
+    try testing.expectEqual(@as(usize, 0), countTags(bare, "t"));
+}
+
+test "one long paste yields the same tags as the same text typed" {
+    // The parse runs over the finished content at publish, never over
+    // keystrokes, so there is no separate paste path that could drift from the
+    // typing one. This pins that: everything at once, in one string, the way a
+    // paste arrives.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    var pk = [_]u8{0} ** 32;
+    pk[0] = 0x7f;
+    const npub = try nostr.nip19.encodeNpub(gpa, pk);
+    var eid = [_]u8{0} ** 32;
+    eid[0] = 0xc3;
+    const nevent = try nostr.nip19.encodeNevent(gpa, eid, &.{}, null, 1);
+
+    const pasted = try std.fmt.allocPrint(gpa,
+        \\A long note pasted in one go, the way anything real arrives.
+        \\
+        \\It mentions nostr:{s}, quotes nostr:{s}, links
+        \\https://example.com/docs#section which must NOT become a topic, shows
+        \\https://example.com/shot.jpg and repeats https://example.com/shot.jpg,
+        \\and tags #Zig and #zig and #buildinpublic.
+    , .{ npub, nevent });
+
+    const tags = main.contentTagsForTest(gpa, pasted);
+    // #zig folded and deduped against #Zig, plus #buildinpublic. The URL
+    // fragment contributes nothing.
+    try testing.expectEqual(@as(usize, 2), countTags(tags, "t"));
+    try testing.expectEqual(@as(usize, 1), countTags(tags, "q"));
+    // The same picture twice is still one picture.
+    try testing.expectEqual(@as(usize, 1), countTags(tags, "imeta"));
+    // The mention. The quoted nevent carries no author, so it adds no second p:
+    // slot 4 is a notification target and a guess there tells the wrong person.
+    try testing.expectEqual(@as(usize, 1), countTags(tags, "p"));
+
+    const q = tagNamed(tags, "q") orelse return error.NoQuoteTag;
+    try testing.expectEqual(@as(usize, 64), q[1].len);
+}
+
+test "the composer actually attaches the tags to the event it publishes" {
+    // The parser being right is half of it. This pins the other half: that
+    // `submitPost` calls it at all. A correct `contentTags` that nobody invokes
+    // publishes exactly the empty tag array this whole change exists to fix,
+    // and every other seam here stops short of the event that goes out.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.setIdentityForTest([_]u8{0x33} ** 32);
+    defer main.clearIdentityForTest();
+    main.clearLastPublishedTagsForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    model.draft_buffer.set("first light on #Nostr with https://example.com/x.jpg");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+
+    const tags = main.lastPublishedTagsForTest();
+    const t = tagNamed(tags, "t") orelse return error.TagsNeverReachedTheEvent;
+    try testing.expectEqualStrings("nostr", t[1]);
+    const im = tagNamed(tags, "imeta") orelse return error.NoImetaOnEvent;
+    try testing.expectEqualStrings("url https://example.com/x.jpg", im[1]);
+}
+
+test "a github raw link is canonicalised so the picture actually renders" {
+    // github.com/<owner>/<repo>/raw/<path> is a 302 whose own response is
+    // content-type text/html, so clients that check the type before inlining
+    // refuse to draw it and the note lands as text with a link in it. The
+    // raw.githubusercontent.com form serves the same bytes as image/jpeg.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.setIdentityForTest([_]u8{0x44} ** 32);
+    defer main.clearIdentityForTest();
+    main.clearLastPublishedTagsForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    model.draft_buffer.set("shipping https://github.com/zig-nostr/plaza/raw/main/docs/shots/hero.jpg");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+
+    // The imeta names the rewritten URL, which is only correct if the content
+    // was rewritten too: NIP-92 pairs the tag with a URL in the content.
+    const im = tagNamed(main.lastPublishedTagsForTest(), "imeta") orelse return error.NoImetaTag;
+    try testing.expectEqualStrings(
+        "url https://raw.githubusercontent.com/zig-nostr/plaza/main/docs/shots/hero.jpg",
+        im[1],
+    );
+    try testing.expectEqualStrings("m image/jpeg", im[2]);
+}
+
+test "an ordinary github link is left alone" {
+    // The rewrite is one host and one path shape. A repo link is not a raw
+    // link, and editing what somebody typed is only defensible where the two
+    // forms are the identical file.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    const tags = main.contentTagsForTest(gpa, "the source is at https://github.com/zig-nostr/plaza");
+    // No image extension, so no imeta, and nothing here to rewrite either.
+    try testing.expectEqual(@as(usize, 0), countTags(tags, "imeta"));
+}
+
+test "a nostr mention inside a URL path is not a mention" {
+    // The prefixed form had no boundary check, so a path segment that happens
+    // to read `nostr:npub1…` parsed as a mention. Harmless while nothing was
+    // tagged; a notification to a stranger now that mentions become p tags.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+
+    var pk = [_]u8{0} ** 32;
+    pk[0] = 0x5b;
+    const npub = try nostr.nip19.encodeNpub(gpa, pk);
+    const body = try std.fmt.allocPrint(gpa, "see https://example.com/nostr:{s} for details", .{npub});
+
+    const tags = main.contentTagsForTest(gpa, body);
+    try testing.expectEqual(@as(usize, 0), countTags(tags, "p"));
+}
