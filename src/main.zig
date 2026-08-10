@@ -1377,6 +1377,16 @@ const note_collapse_chars = 300;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
 const engagement_watch_cap = 128;
+// The cap on that filter's answer. Without one the relay picks, and 128 note
+// ids across four kinds is a very large thing to leave a busy relay to pick.
+const engagement_request_limit = 500;
+// What an engagement query asks for: replies, reposts, likes, zap receipts.
+const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
+// How often the feed's engagement subscription may be widened as more notes
+// load. A REQ under an existing id replaces it, so widening is one message, but
+// a busy feed adds ids continuously and re-asking on each one would be its own
+// flood.
+const engagement_widen_ms: i64 = 5_000;
 // The composer's fixed text capacity. The display buffer
 // (`Note.content_buf`) truncates for rendering, but the published event carries
 // the full draft.
@@ -2005,10 +2015,33 @@ pub fn relaysPaused() bool {
 /// small ring so the bar can show a median rather than the last spike. Zero means
 /// no sample yet.
 const rtt_samples = 8;
-/// The latency probe: a one-event query whose round trip is the number the status
-/// bar shows, and how often each relay is asked for it.
+/// The latency probe: a query whose round trip is the number the status bar
+/// shows, and how often each relay is asked for it.
 const probe_sub = "plaza-ping";
 const probe_interval_ms: i64 = 20_000;
+
+/// What the probe asks for: one event id that cannot exist.
+///
+/// The relay does an index lookup, finds nothing, and answers EOSE. That round
+/// trip is the number the bar wants, and it costs one lookup and zero events.
+///
+/// It used to ask `{"kinds":[1],"limit":1}`: no authors, no since, no until, and
+/// nothing ever closed it. A REQ stays live past EOSE, so every relay then
+/// pushed Plaza every kind:1 it received, from anyone, for the life of the
+/// connection. Each one was parsed, allocated and put through a full Schnorr
+/// verify before being dropped for not being a note this reader is watching. It
+/// also held a subscription slot on every relay permanently, and an unauthored
+/// global request for all text notes is not a thing an ordinary client sends.
+///
+/// An all-zero id is a value no event can have: the id IS the hash, so having
+/// one would mean holding a SHA-256 preimage of thirty-two zero bytes.
+const probe_ids = [_][32]u8{[_]u8{0} ** 32};
+
+/// The probe's REQ. One filter, naming only that id, capped at one event so even
+/// a relay that answered it somehow could not turn the probe into a stream.
+pub fn probeFilters() [1]nostr.filter.Filter {
+    return .{.{ .ids = &probe_ids, .limit = 1 }};
+}
 var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** max_relays;
 var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** max_relays;
 
@@ -21624,9 +21657,8 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                     engagement_open = true;
                     var evals: [engagement_watch_cap][]const u8 = undefined;
                     for (0..id_count) |i| evals[i] = &ids[i];
-                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
                     const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..id_count] }};
-                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+                    const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
                     relay.subscribe("plaza-person-engagement", &eng_filters) catch break;
                 },
                 .closed => break,
@@ -21639,6 +21671,17 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
 /// How many frames one relay gets to answer a profile's backfill before this
 /// thread moves on. See the comment in `fetchProfileWorker`.
 const profile_fetch_messages = 400;
+
+/// One engagement query over prepared `#e` values.
+///
+/// Three screens ask this same question, and each used to write it out again.
+/// They drifted: the thread and the profile capped the answer, and the feed's,
+/// which is the one re-issued on every reconnect, carried no cap at all, so a
+/// busy relay decided how much of four kinds across 128 note ids to send back.
+/// One function now, so there is nothing left to drift.
+pub fn engagementFilter(tags: []const nostr.filter.TagFilter) nostr.filter.Filter {
+    return .{ .kinds = &engagement_kinds, .tags = tags, .limit = engagement_request_limit };
+}
 
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so
@@ -21723,9 +21766,8 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
             evals[eval_len] = &id_hex[i];
             eval_len += 1;
         }
-        const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
         const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..eval_len] }};
-        const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+        const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
         relay.subscribe("plaza-thread-eng", &eng_filters) catch continue;
         while (true) {
             var msg = (relay.receive() catch break) orelse break;
@@ -22792,6 +22834,20 @@ pub fn reconnectJitterMs(wait: u64, index: usize, attempts: u6) u64 {
     return slice * step;
 }
 
+/// Opens, or replaces, the engagement subscription over the first `count`
+/// watched notes.
+///
+/// A REQ under an existing id IS a replacement, so widening the watched set
+/// costs one message and no CLOSE.
+fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_cap][64]u8, count: usize) void {
+    if (count == 0) return;
+    var evals: [engagement_watch_cap][]const u8 = undefined;
+    for (0..count) |i| evals[i] = &hex[i];
+    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..count] }};
+    const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
+    relay.subscribe("plaza-engagement", &eng_filters) catch {};
+}
+
 /// One relay's ingest loop: dial, serve, and reconnect after a widening delay,
 /// forever.
 fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
@@ -22884,7 +22940,6 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         authors[authors_len] = pk;
         authors_len += 1;
     }
-    const feed_kinds = feed_filter_kinds;
     // Two filters per chunk of authors, all in ONE REQ.
     //
     // `authors_len` INCLUDES the reader. An earlier version took the snapshot
@@ -22915,20 +22970,25 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
     // feed REQ asks for a 300-note backlog plus profiles, so timing it measures
-    // how much this relay had to send, not how fast it answers. The probe is a
-    // one-event query whose REQ-to-EOSE is the round trip the reader cares about,
-    // re-sent periodically so the number stays live. The AWAKE clock, so a system
-    // clock step cannot swing a reading.
+    // how much this relay had to send, not how fast it answers. The probe asks
+    // for an id that cannot exist, so the answer is an empty EOSE and the number
+    // is the round trip and nothing else. Re-sent periodically so it stays live,
+    // and CLOSED as soon as it answers. The AWAKE clock, so a system clock step
+    // cannot swing a reading.
     var probe_at: i64 = 0;
     var probed_at: i64 = 0;
 
     // The loaded notes' ids (and their hex), collected from the feed as it
     // arrives. On the feed's EOSE a second subscription opens for their
-    // engagement, so counts fold in alongside the feed on the same connection.
+    // engagement, so counts fold in alongside the feed on the same connection,
+    // and it is widened as more notes load.
     var feed_ids: [engagement_watch_cap]i64 = undefined;
     var feed_id_hex: [engagement_watch_cap][64]u8 = undefined;
     var feed_ids_len: usize = 0;
-    var engagement_open = false;
+    // How many of those ids the engagement subscription currently names, and
+    // when it was last (re)issued.
+    var engagement_watching: usize = 0;
+    var engagement_at: i64 = 0;
 
     while (true) {
         // A pause takes effect at the next message this relay sends: the thread
@@ -23003,16 +23063,28 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // rides the next message rather than a timer; a relay too quiet to carry
         // one is also a relay whose latency nobody is waiting on.
         //
-        // A write-only relay is probed too: one newest note, which says nothing
-        // about who this reader follows or reads, and its answer is the latency
-        // shown beside a relay they do use.
+        // A write-only relay is probed too: a question about one id that does
+        // not exist, which says nothing about who this reader follows or reads,
+        // and its answer is the latency shown beside a relay they do use.
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         if (probe_at == 0 and (probed_at == 0 or now_ms - probed_at > probe_interval_ms)) {
-            const probe_filters = [_]nostr.filter.Filter{.{ .kinds = &feed_kinds, .limit = 1 }};
+            const probe_filters = probeFilters();
             if (relay.subscribe(probe_sub, &probe_filters)) |_| {
                 probe_at = now_ms;
                 probed_at = now_ms;
             } else |_| {}
+        }
+        // Widen the engagement subscription as more of the feed loads. It used
+        // to be opened once per connection over whatever had arrived by the
+        // feed's EOSE and never touched again, so every note past that point
+        // read zero likes, zero replies and zero zaps for the whole session, and
+        // so did every note that arrived live.
+        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
+            now_ms - engagement_at > engagement_widen_ms)
+        {
+            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+            engagement_watching = feed_ids_len;
+            engagement_at = now_ms;
         }
         switch (msg.value) {
             .event => |e| {
@@ -23066,6 +23138,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - probe_at;
                     if (elapsed >= 0) recordRelayRtt(index, @intCast(@min(elapsed, std.math.maxInt(u16))));
                     probe_at = 0;
+                    // Answered, so close it. A REQ stays live past EOSE, and the
+                    // question has been answered: leaving it open is how the
+                    // probe became a standing subscription on every relay.
+                    relay.unsubscribe(probe_sub) catch {};
                 }
                 if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
                     // Only when THIS subscription actually asked about the
@@ -23083,14 +23159,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     }
                 }
                 // Stored feed drained: now watch those notes' engagement.
-                if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
-                    engagement_open = true;
-                    var evals: [engagement_watch_cap][]const u8 = undefined;
-                    for (0..feed_ids_len) |i| evals[i] = &feed_id_hex[i];
-                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
-                    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..feed_ids_len] }};
-                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags }};
-                    relay.subscribe("plaza-engagement", &eng_filters) catch {};
+                if (engagement_watching == 0 and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                    engagement_watching = feed_ids_len;
+                    engagement_at = now_ms;
                 }
             },
             .closed => |c| {

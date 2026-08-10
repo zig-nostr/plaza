@@ -12504,6 +12504,57 @@ test "a relay that keeps dropping is asked less and less often" {
     try testing.expectEqual(@as(u6, 63), main.nextReconnectAttempts(63, 0));
 }
 
+test "the latency probe cannot deliver a single event" {
+    // The probe exists to time a round trip, and that is ALL it should cost. It
+    // used to ask for kind:1 with no author, no since and no until, which is a
+    // subscription to every text note the relay receives, from anyone, held open
+    // for the life of the connection: every one of those events was parsed,
+    // allocated and secp256k1-verified before being thrown away.
+    //
+    // Asserting the property rather than the wording: whatever the probe asks
+    // for, an ordinary note must not match it.
+    const filters = main.probeFilters();
+    try testing.expectEqual(@as(usize, 1), filters.len);
+    const f = filters[0];
+
+    const ev = nostr.event.Event{
+        .id = [_]u8{0x9c} ** 32,
+        .pubkey = [_]u8{0x11} ** 32,
+        .created_at = 1_700_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "an ordinary note",
+        .sig = [_]u8{0} ** 64,
+    };
+    try testing.expect(!f.matches(ev));
+
+    // And it is narrow by construction, not by luck: it names exact ids, so
+    // there is no kind, author or time window for anything to arrive through.
+    try testing.expect(f.ids != null);
+    try testing.expect(f.kinds == null);
+    try testing.expect(f.authors == null);
+    try testing.expect(f.tags == null);
+    // Belt and braces: even a relay that matched it somehow sends one event.
+    try testing.expectEqual(@as(u32, 1), f.limit.?);
+}
+
+test "every engagement query asks the same bounded question" {
+    // Three screens ask for replies, reposts, likes and zaps over a list of note
+    // ids. They were three copies and they drifted: the feed's, which is the one
+    // re-issued on every reconnect, ended up with no cap at all, so the relay
+    // chose how much of four kinds across 128 note ids to send back.
+    const values = [_][]const u8{ "a" ** 64, "b" ** 64 };
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &values }};
+    const f = main.engagementFilter(&tags);
+
+    try testing.expect(f.limit != null);
+    try testing.expectEqual(@as(u32, 500), f.limit.?);
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 6, 7, 9735 }, f.kinds.?);
+    try testing.expectEqual(@as(usize, 1), f.tags.?.len);
+    try testing.expectEqual(@as(u8, 'e'), f.tags.?[0].letter);
+    try testing.expectEqual(@as(usize, 2), f.tags.?[0].values.len);
+}
+
 test "eight relays that drop together do not come back together" {
     // The whole pool goes down on one network blip, so without a spread all
     // eight threads redial in the same millisecond, and keep doing it, forever.
