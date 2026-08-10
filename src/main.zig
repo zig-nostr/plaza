@@ -1422,7 +1422,20 @@ const open_url_key: u64 = 102;
 // (a full thread: the active user + the root + up to `thread_reply_cap` replies)
 // with headroom for recently-seen authors, so the mark pass never has to evict
 // an author it just marked. Names are cheap; only avatars are slot-bound.
-const profile_cap = thread_reply_cap + 60;
+// The old value was `thread_reply_cap + 60` = 160, reasoned about a full thread
+// and nothing else, while an inbox holds 200 items.
+//
+// The research said to raise this to 4096, citing Jumble's 5000. That is wrong
+// FOR THIS CODEBASE and the measurement says so: several paths walk the whole
+// array once per feed rebuild, so the cost is linear in this number. At the
+// 2048-follow ceiling the rebuild measured 6018us at 160, 9499us at 256,
+// 12213us at 512 and 16259us at 2048, against a 16000us frame. Jumble can hold
+// 5000 because its cache is a hash map, not an array anything scans.
+//
+// 256 buys real headroom over a screenful of notifications for 3.5ms, and stops
+// there. The right way to earn more is to stop upserting every follow into an
+// LRU sized for on-screen authors, which is its own piece of work.
+const profile_cap = 256;
 
 comptime {
     // The avatar pass marks the whole on-screen author set (active user + a
@@ -2763,6 +2776,22 @@ pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
 /// The tags a body of text implies, for tests. Deliberately takes the finished
 /// string: that is exactly what the publish path passes, which is why a pasted
 /// note and a typed one cannot diverge.
+pub fn resetWantedProfilesForTest() void {
+    g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+}
+
+pub fn wantProfileForTest(pubkey: [32]u8) void {
+    wantProfile(pubkey);
+}
+
+pub fn wantedProfileCountForTest() usize {
+    var n: usize = 0;
+    for (&g_wanted) |*w| {
+        if (w.used) n += 1;
+    }
+    return n;
+}
+
 pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
     return contentTags(gpa, content, &.{}, &.{});
 }
@@ -3382,18 +3411,43 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 // to the follow set's metadata, so a mention of anyone else would render as a
 // bare npub forever; these are fetched separately, once each, and then resolve
 // like any other name.
-const wanted_profiles_cap = 48;
+// Sized to the real ceiling rather than to a guess: a full inbox, a full
+// thread, and headroom. The old table held 48 and, once full, SILENTLY DROPPED
+// every further request: the loop looked for a slot already asked the maximum
+// number of times, found none, and fell off the end having queued nothing. With
+// 144 notifications that is what it did all day, which is why a name only ever
+// arrived after visiting that person's profile, because visiting asks for one.
+//
+// No shipping client has an author cap here. NDK merges `authors` with no limit
+// at all; Amethyst rebuilds one REQ from every name currently on screen.
+const wanted_profiles_cap = inbox_cap + thread_reply_cap + 64;
 const WantedProfile = struct {
     used: bool = false,
-    requested: bool = false,
-    /// How many times this one has been asked for. Some pubkeys simply have no
-    /// metadata published anywhere, so the asking is bounded.
+    /// When this pubkey was last actually asked for, and how many times running
+    /// it has come back with nothing. Together they gate a retry: wait
+    /// `2^attempts` seconds, clamped, before asking again.
+    ///
+    /// There is no strike limit. The old code wrote a pubkey off permanently
+    /// after three rounds and incremented the counter BEFORE checking whether
+    /// the network was even allowed, so an app launched offline burned all three
+    /// inside forty seconds and showed a raw npub for the rest of the process.
+    /// welshman's loader is the shape copied here: a timestamp, exponential
+    /// backoff, and nothing ever marked dead.
+    last_tried: i64 = 0,
     attempts: u8 = 0,
     pubkey: [32]u8 = [_]u8{0} ** 32,
 };
-/// How many rounds to ask for a mentioned profile before letting it be.
-const max_profile_attempts = 3;
+/// The longest a repeatedly silent pubkey waits between asks.
+const profile_retry_cap_s: i64 = 300;
 var g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+
+/// Whether `w` is due another ask.
+fn profileRetryDue(w: *const WantedProfile, now: i64) bool {
+    if (w.attempts == 0) return true;
+    const shift: u6 = @intCast(@min(w.attempts, 8));
+    const wait = @min(@as(i64, 1) << shift, profile_retry_cap_s);
+    return now - w.last_tried >= wait;
+}
 
 /// Notes that `pubkey` was mentioned but has no known name yet.
 fn wantProfile(pubkey: [32]u8) void {
@@ -3409,16 +3463,15 @@ fn wantProfile(pubkey: [32]u8) void {
             return;
         }
     }
-    // The set is full. Reclaim a slot from someone we have already asked for the
-    // maximum times (no metadata anywhere), so a fresh thread's authors are never
-    // starved by a backlog of dead entries. Without this the table fills up once
-    // and every later reply author renders as a bare npub forever.
+    // Genuinely full, which the size above is chosen to make impossible in
+    // normal use. Take the slot that has gone longest without an answer rather
+    // than dropping the request, because dropping it is what the old 48-slot
+    // table did and it is the whole reason names never loaded.
+    var oldest: ?*WantedProfile = null;
     for (&g_wanted) |*w| {
-        if (w.attempts >= max_profile_attempts) {
-            w.* = .{ .used = true, .pubkey = pubkey };
-            return;
-        }
+        if (oldest == null or w.last_tried < oldest.?.last_tried) oldest = w;
     }
+    if (oldest) |w| w.* = .{ .used = true, .pubkey = pubkey };
 }
 
 /// Whether `pubkey`'s profile is still being fetched: no profile in hand yet, and
@@ -3428,49 +3481,95 @@ fn wantProfile(pubkey: [32]u8) void {
 fn profileLoading(pubkey: [32]u8) bool {
     if (lookupProfile(pubkey) != null) return false;
     for (&g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.attempts < max_profile_attempts;
+        // Still being asked for, because nothing is ever written off now.
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
     }
     return false;
 }
 
-/// Profile-timer rounds between re-asking for metadata that has not arrived
-/// (about 20s at the profile interval).
-const profile_rearm_rounds: u64 = 10;
 var g_profile_round: u64 = 0;
-
-/// Lets the still-unnamed be asked for again on the next pass.
-fn rearmWantedProfiles() void {
-    for (&g_wanted) |*w| {
-        if (w.used and w.attempts < max_profile_attempts) w.requested = false;
-    }
-}
+/// Quote re-ask rounds. Quotes still use a round counter; profiles moved to a
+/// per-pubkey backoff, and the two shared this number only by accident.
+const quote_rearm_rounds: u64 = 10;
 
 /// Asks the relays for the metadata of everyone mentioned but still unnamed, in
 /// one batch on a throwaway connection.
 fn requestWantedProfiles() void {
+    const now = nowSeconds();
     var batch: [wanted_profiles_cap][32]u8 = undefined;
     var n: usize = 0;
     for (&g_wanted) |*w| {
         if (!w.used) continue;
-        // Resolved: free the slot so later mentions can use it. Without this the
-        // table fills with names we already have and new mentions are dropped.
+        // Resolved: free the slot so later mentions can use it.
         if (lookupProfile(w.pubkey)) |p| {
             if (p.name_len > 0) {
                 w.* = .{};
                 continue;
             }
         }
-        if (w.attempts >= max_profile_attempts) continue;
-        if (w.requested) continue;
+        if (!profileRetryDue(w, now)) continue;
         batch[n] = w.pubkey;
         n += 1;
-        w.requested = true;
-        w.attempts += 1;
         if (n == batch.len) break;
     }
     if (n == 0) return;
+
+    // THE DISK FIRST, always. A notification's author is very often somebody
+    // whose kind:0 is already in the store from the feed, a thread, or a
+    // previous session, and this path never once looked. Every reference client
+    // reads its cache before it opens a socket: NDK's `fetchProfile` returns
+    // from the cache adapter before creating a subscription, and Jumble reads
+    // IndexedDB and only refreshes past a three day staleness.
+    //
+    // Exact and cheap here, because the store has a composite author+kind index
+    // and keeps at most one kind:0 per pubkey.
+    var still_missing: [wanted_profiles_cap][32]u8 = undefined;
+    var missing: usize = 0;
+    if (g_store) |store| {
+        const kinds = [_]u16{0};
+        if (store.query(std.heap.page_allocator, .{ .authors = batch[0..n], .kinds = &kinds, .limit = @intCast(n) })) |res| {
+            var result = res;
+            defer result.deinit();
+            for (result.events) |ev| {
+                const prof = upsertProfile(ev.pubkey) orelse continue;
+                if (std.mem.eql(u8, &prof.meta_id, &ev.id)) continue;
+                parseMetadataInto(prof, ev.content);
+                prof.meta_id = ev.id;
+                g_names_generation +%= 1;
+            }
+        } else |_| {}
+        for (batch[0..n]) |pk| {
+            const known = if (lookupProfile(pk)) |prof| prof.name_len > 0 else false;
+            if (known) {
+                // Answered from disk. Retire the want rather than asking a relay
+                // for something already held.
+                for (&g_wanted) |*w| {
+                    if (w.used and std.mem.eql(u8, &w.pubkey, &pk)) w.* = .{};
+                }
+                continue;
+            }
+            still_missing[missing] = pk;
+            missing += 1;
+        }
+    } else {
+        @memcpy(still_missing[0..n], batch[0..n]);
+        missing = n;
+    }
+    if (missing == 0) return;
+
+    // Only now, and only for what disk could not answer. The attempt is counted
+    // HERE, after the network is known to be allowed, never before: counting it
+    // first is what wrote names off during the seconds before the first relay
+    // had finished its handshake.
     if (!networkAllowed()) return;
-    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
+    for (still_missing[0..missing]) |pk| {
+        for (&g_wanted) |*w| {
+            if (!w.used or !std.mem.eql(u8, &w.pubkey, &pk)) continue;
+            w.last_tried = now;
+            w.attempts +|= 1;
+        }
+    }
+    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, still_missing, missing }) catch return;
     thread.detach();
 }
 
@@ -4361,6 +4460,7 @@ var g_names_generation: u64 = 0;
 /// Clears the profile cache. For tests, which share the process globals.
 pub fn resetProfilesForTest() void {
     g_profiles = [_]Profile{.{}} ** profile_cap;
+    @memset(&g_profile_index, 0);
     g_names_generation = 0;
     g_notes_names_generation = 0;
     g_avatar_clock = 0;
@@ -4712,10 +4812,15 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     var names_me = false;
     var hex: [64]u8 = undefined;
     hexLower(&hex, me);
+    var last_p_is_me = false;
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
         p_tags += 1;
-        if (std.ascii.eqlIgnoreCase(tag[1], &hex)) names_me = true;
+        const mine = std.ascii.eqlIgnoreCase(tag[1], &hex);
+        if (mine) names_me = true;
+        // Tracked separately: for a reaction or a repost the LAST p tag is the
+        // one that means "this is about you".
+        last_p_is_me = mine;
     }
     if (!names_me) return null;
     // A note addressed to a crowd is a broadcast. Being one of twenty names on
@@ -4724,11 +4829,46 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
 
     return switch (ev.kind) {
         1 => if (inboxTargetsMyNote(ev, me)) .reply else .mention,
-        6, 16 => .repost,
-        7 => if (isLikeReaction(ev.content)) .like else null,
+        // A repost or a reaction copies the p tags of what it is about, and
+        // NIP-10 has a reply carry every p tag of its parent plus the parent's
+        // author. So the reader's key propagates down every thread they ever
+        // touched, and ANY-tag matching then filed somebody reacting to a
+        // stranger's reply, three levels below a note of the reader's, as a
+        // notification about the reader.
+        //
+        // NIP-25: "If a client decides to include other `p` tags, which not
+        // recommended, the target event `pubkey` should be last the `p` tags."
+        // So the last one is the target's author. Jumble enforces exactly this.
+        // Where the reacted event is on disk, its author is checked directly,
+        // which is better evidence than tag order.
+        6, 16 => if (reactionTargetsMe(ev, me, last_p_is_me)) .repost else null,
+        7 => if (isLikeReaction(ev.content) and reactionTargetsMe(ev, me, last_p_is_me)) .like else null,
         9735 => .zap,
         else => null,
     };
+}
+
+/// Whether a reaction or repost is about a note of the reader's.
+///
+/// The store is the authority when it holds the target: an author is a fact,
+/// where tag order is a convention the sender may not have followed. Falls back
+/// to NIP-25's rule that the target's author is the last `p` tag.
+fn reactionTargetsMe(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) bool {
+    if (engagementTarget(ev)) |t| {
+        if (t.len == 64) {
+            var id: [32]u8 = undefined;
+            if (std.fmt.hexToBytes(&id, t)) |_| {
+                if (g_store) |store| {
+                    if (store.getEvent(std.heap.page_allocator, id) catch null) |found| {
+                        var se = found;
+                        defer se.deinit();
+                        return std.mem.eql(u8, &se.event.pubkey, &me);
+                    }
+                }
+            } else |_| {}
+        }
+    }
+    return last_p_is_me;
 }
 
 /// Whether this note replies to something the reader wrote, as opposed to merely
@@ -5285,22 +5425,13 @@ fn saveInbox() void {
         unlockInbox();
         return;
     };
-    for (g_inbox[0..g_inbox_len]) |item| {
-        var hex: [64]u8 = undefined;
-        hexLower(&hex, item.id);
-        var ahex: [64]u8 = undefined;
-        hexLower(&ahex, item.author);
-        var thex: [64]u8 = undefined;
-        hexLower(&thex, item.target_id);
-        out.print(gpa, "{s} {s} {d} {s} {s} {d}\n", .{
-            hex[0..],
-            ahex[0..],
-            item.created_at,
-            thex[0..],
-            @tagName(item.verb),
-            item.msat,
-        }) catch break;
-    }
+    // Only the read marker. The items themselves are NOT serialised here any
+    // more: the events are already in the store, indexed by their `p` tag, and
+    // writing a second parallel copy of them was both duplication and a bug.
+    // The blob carried the id, author, stamp, target, verb and msat, and nothing
+    // else, so a restored row had no words and no reaction glyph, which is
+    // exactly the "some rows have no content" report. Rebuilding from the store
+    // replays the real events through the real gate and cannot drift from it.
     g_inbox_dirty = false;
     unlockInbox();
     // Outside the lock: an LMDB write must never be held under a spinlock that
@@ -5312,62 +5443,49 @@ fn saveInbox() void {
 fn loadInbox() void {
     const store = g_store orelse return;
     const me = activePubkey() orelse return;
-    var key_buf: [96]u8 = undefined;
-    const key = inboxKey(&key_buf, me);
-    if (key.len == 0) return;
     const gpa = std.heap.page_allocator;
-    const raw = (store.get(gpa, key) catch null) orelse return;
-    defer gpa.free(raw);
 
     lockInbox();
-    defer unlockInbox();
     resetInboxLocked(me);
-    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        var parts = std.mem.tokenizeScalar(u8, line, ' ');
-        const first = parts.next() orelse continue;
-        if (std.mem.eql(u8, first, "read")) {
-            const v = parts.next() orelse continue;
-            g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
-            continue;
+    unlockInbox();
+
+    // AFTER the reset, which clears it. Reading the marker first and resetting
+    // second put the whole inbox back at unread on every launch.
+    var key_buf: [96]u8 = undefined;
+    const key = inboxKey(&key_buf, me);
+    if (key.len > 0) {
+        if (store.get(gpa, key) catch null) |raw| {
+            defer gpa.free(raw);
+            var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+            while (lines.next()) |line| {
+                var parts = std.mem.tokenizeScalar(u8, line, ' ');
+                const first = parts.next() orelse continue;
+                if (!std.mem.eql(u8, first, "read")) continue;
+                const v = parts.next() orelse continue;
+                g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
+            }
         }
-        if (g_inbox_len >= g_inbox.len) break;
-        if (first.len != 64) continue;
-        var item = InboxItem{ .used = true };
-        _ = std.fmt.hexToBytes(&item.id, first) catch continue;
-        const ahex = parts.next() orelse continue;
-        if (ahex.len != 64) continue;
-        _ = std.fmt.hexToBytes(&item.author, ahex) catch continue;
-        item.created_at = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
-        // A field that is not a whole id leaves the item with no target rather
-        // than discarding the item: a notification the reader cannot follow
-        // through to is still a notification they should be told about.
-        const thex = parts.next() orelse continue;
-        if (thex.len == 64) {
-            var scratch: [32]u8 = undefined;
-            if (std.fmt.hexToBytes(&scratch, thex)) |_| {
-                item.target_id = scratch;
-            } else |_| {}
-        }
-        const verb = parts.next() orelse continue;
-        item.verb = if (std.mem.eql(u8, verb, "reply"))
-            .reply
-        else if (std.mem.eql(u8, verb, "mention"))
-            .mention
-        else if (std.mem.eql(u8, verb, "like"))
-            .like
-        else if (std.mem.eql(u8, verb, "repost"))
-            .repost
-        else if (std.mem.eql(u8, verb, "zap"))
-            .zap
-        else
-            continue;
-        item.msat = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
-        g_inbox[g_inbox_len] = item;
-        g_inbox_len += 1;
     }
-    sortInboxLocked();
-    g_inbox_dirty = false;
+
+    // The same filter the relay is asked, answered from disk. Jumble does
+    // exactly this: it paints the notification list from IndexedDB using the
+    // identical filter it is about to send, before opening a socket.
+    //
+    // Replayed through `inboxAdd`, so restored rows pass the same gate, the same
+    // dedup and the same text baking as live ones. The hand-rolled blob this
+    // replaces could not: it held six scalar fields and no content, so every row
+    // restored from a previous session came back with a name, a time, and
+    // nothing in between.
+    const hex = inboxMeHex(me);
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &.{&hex} }};
+    var result = store.query(gpa, .{
+        .kinds = &inbox_kinds,
+        .tags = &tags,
+        .limit = inbox_backfill_cap,
+    }) catch return;
+    defer result.deinit();
+    const now = nowSeconds();
+    for (result.events) |ev| _ = inboxAdd(ev, now);
 }
 
 pub fn saveInboxForTest() void {
@@ -5686,9 +5804,57 @@ pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void
 }
 
 /// Finds the cached profile for `pubkey`, or null.
+/// An open-addressed index over `g_profiles`, so a lookup is a probe rather
+/// than a walk.
+///
+/// The cache was 160 slots and a linear scan was fine. Sizing it to the real
+/// author set (200 notifications plus up to 2048 follows) made that scan 12x
+/// longer, and it runs per note per feed rebuild: the 2048-follow rebuild went
+/// from inside the frame budget to 17155us against 16000us, a visible stutter
+/// every second. The cap and this index are one change, not two.
+///
+/// Slot values are index+1 so that zero means empty. Rebuilt wholesale on
+/// eviction, which is rare and bounded.
+const profile_index_slots = 4096;
+var g_profile_index = [_]u16{0} ** profile_index_slots;
+var g_profile_index_stale: usize = 0;
+
+fn profileSlotFor(pubkey: [32]u8) usize {
+    // The pubkey is already a hash, so its low bits are as good as any.
+    const h = std.mem.readInt(u64, pubkey[0..8], .little);
+    return @intCast(h % profile_index_slots);
+}
+
+fn profileIndexInsert(idx: usize) void {
+    var slot = profileSlotFor(g_profiles[idx].pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        if (g_profile_index[slot] == 0) {
+            g_profile_index[slot] = @intCast(idx + 1);
+            return;
+        }
+        slot = (slot + 1) % profile_index_slots;
+    }
+}
+
+fn profileIndexRebuild() void {
+    @memset(&g_profile_index, 0);
+    g_profile_index_stale = 0;
+    for (&g_profiles, 0..) |*p, i| {
+        if (p.used) profileIndexInsert(i);
+    }
+}
+
 fn lookupProfile(pubkey: [32]u8) ?*Profile {
-    for (&g_profiles) |*p| {
+    var slot = profileSlotFor(pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        const entry = g_profile_index[slot];
+        // An empty slot ends the probe: nothing past it can belong to this key.
+        if (entry == 0) return null;
+        const p = &g_profiles[entry - 1];
         if (p.used and std.mem.eql(u8, &p.pubkey, &pubkey)) return p;
+        slot = (slot + 1) % profile_index_slots;
     }
     return null;
 }
@@ -5699,9 +5865,10 @@ fn lookupProfile(pubkey: [32]u8) ?*Profile {
 /// one only while on screen.
 pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     if (lookupProfile(pubkey)) |p| return p;
-    for (&g_profiles) |*p| {
+    for (&g_profiles, 0..) |*p, i| {
         if (!p.used) {
             p.* = .{ .used = true, .pubkey = pubkey };
+            profileIndexInsert(i);
             return p;
         }
     }
@@ -5720,7 +5887,22 @@ pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     }
     const v = victim orelse return null;
     v.* = .{ .used = true, .pubkey = pubkey };
+    // The evicted key's entry is left pointing at a slot that no longer holds
+    // it. That is SAFE, because a lookup compares the pubkey and keeps probing
+    // on a mismatch, and it is what keeps eviction O(1). Rebuilding the whole
+    // table here instead cost 10ms per feed rebuild at 2048 follows, where the
+    // cache is permanently full and every new author evicts.
+    profileIndexInsert(idxOf(v));
+    g_profile_index_stale += 1;
+    // Stale entries lengthen probe chains, so the table is rebuilt occasionally
+    // rather than never. Amortised to nothing across 512 evictions.
+    if (g_profile_index_stale >= 512) profileIndexRebuild();
     return v;
+}
+
+/// The slot number of a profile pointer, for the index.
+fn idxOf(p: *const Profile) usize {
+    return (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
 }
 
 /// Parses a kind:0 metadata JSON content into `profile`'s name and picture.
@@ -12686,7 +12868,18 @@ pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []n
         if (len + 2 > out.len) break;
         const chunk = authors[start..@min(start + follow_chunk, authors.len)];
         out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_request_limit };
-        out[len + 1] = .{ .authors = chunk, .kinds = &profile_filter_kinds, .limit = profile_cap };
+        // One record per author per kind, which is what the filter can actually
+        // return: these are all replaceable, so a relay holds at most one of
+        // each. The old limit was `profile_cap`, a UI cache size, which for a
+        // 500-author chunk across three kinds asked for 1500 records and
+        // permitted 160. A relay obeying the limit answered a third of a chunk
+        // and the rest of those authors stayed nameless until something else
+        // happened to ask for them.
+        out[len + 1] = .{
+            .authors = chunk,
+            .kinds = &profile_filter_kinds,
+            .limit = @intCast(chunk.len * profile_filter_kinds.len),
+        };
         len += 2;
     }
     return out[0..len];
@@ -12705,6 +12898,23 @@ var g_follow_created_at: i64 = 0;
 /// notes, and a sign-in asks for the new account's own records, without waiting
 /// for a socket to drop.
 var g_follow_gen = std.atomic.Value(u32).init(0);
+
+/// Bumped only when WHO IS SIGNED IN changes, never when the follow list moves.
+///
+/// The inbox REQ hung off the follow generation, so following one person
+/// re-issued `plaza-inbox` on every read relay with a 200-event backfill. At
+/// eight relays that is up to 1600 events re-delivered and re-verified for a
+/// change the inbox does not depend on: its filter names one pubkey, the
+/// reader's own. Amethyst keeps these on separate watchers for the same reason.
+var g_identity_gen = std.atomic.Value(u32).init(0);
+
+pub fn identityGeneration() u32 {
+    return g_identity_gen.load(.acquire);
+}
+
+pub fn bumpIdentityGeneration() void {
+    _ = g_identity_gen.fetchAdd(1, .monotonic);
+}
 /// Guards the table. The UI thread writes it; ingest threads read it to build
 /// their filters.
 var g_follow_lock = std.atomic.Value(bool).init(false);
@@ -12870,6 +13080,9 @@ fn forgetFollows() void {
     // records requested on an already-open socket, and following stays disabled
     // for the whole session.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // And this is the one thing the inbox DOES depend on: whose notifications
+    // these are. It is the only place that bumps it, which is the point.
+    bumpIdentityGeneration();
 }
 
 /// Seeds the follow set from the local store, at boot and at sign-in.
@@ -18181,14 +18394,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .profiles => |t| {
             if (t.outcome == .fired) {
-                // Re-arm the still-unnamed every so often: a relay that had
-                // nothing a moment ago may have it now.
+                // Quotes still re-arm on a round counter. Profiles no longer
+                // need to: each pubkey carries its own last-tried stamp and
+                // backs off on its own, so asking every tick costs nothing for
+                // the ones that are waiting and retries the rest when due.
                 g_profile_round +%= 1;
                 g_quote_round +%= 1;
-                if (g_profile_round % profile_rearm_rounds == 0) {
-                    rearmWantedProfiles();
-                    rearmWantedQuotes();
-                }
+                if (g_quote_round % quote_rearm_rounds == 0) rearmWantedQuotes();
                 requestWantedProfiles();
                 requestWantedQuotes();
             }
@@ -22531,6 +22743,9 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // The generation this subscription was built for. When it moves, this
     // connection is asking the wrong question and re-asks below.
     var subscribed_gen = followGeneration();
+    // Set to the generation already served by `subscribeInbox` at dial below,
+    // so the loop does not immediately re-issue what was just sent.
+    var inbox_gen = identityGeneration();
     // Whether this subscription asked about the reader themselves. A connection
     // dialed while signed out did not, and its EOSE is not an answer about them.
     var asked_about_me = activePubkey() != null;
@@ -22640,6 +22855,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // connection, no matter who replied. Re-issuing here is also what
             // heals a REQ that failed to send, and what stops a socket carrying
             // the previous account's filter after a switch.
+        }
+        // The inbox rides its own generation: its filter names ONE pubkey, the
+        // reader's, so a contact-list change has nothing to do with it.
+        if (reads and identityGeneration() != inbox_gen) {
+            inbox_gen = identityGeneration();
             subscribeInbox(relay);
         }
         var msg = (try relay.receive()) orelse break;

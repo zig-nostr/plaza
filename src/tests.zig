@@ -7182,6 +7182,13 @@ test "the inbox survives a restart, targets and all" {
         &.{ "e", target_hex },
     }, 1_800_000_000);
     reply.id[0] = 0x6B;
+    // Into the STORE as well as the inbox, which is what really happens: the
+    // pool ingests the event and then files it. The inbox is rebuilt from the
+    // store's `p` tag index at launch now rather than from a parallel blob, so
+    // an event that was never stored is one that never happened. That is the
+    // point of the change: the blob could not carry the note's words or a
+    // reaction's glyph, so every restored row came back blank.
+    _ = try store.ingest(arena_state.allocator(), reply, .{});
     try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
     main.inboxMarkAllRead();
     const read_through = main.inboxReadThrough();
@@ -13016,4 +13023,65 @@ test "a reply whose parent is missing says so instead of posing as a direct repl
     try testing.expect(!direct.?.parent_missing);
     try testing.expectEqual(@as(u8, 2), nested.?.depth);
     try testing.expect(!nested.?.parent_missing);
+}
+
+test "a wanted profile is never silently dropped, however many are wanted" {
+    // The old table held 48 and, once full, looked for a slot already asked the
+    // maximum number of times. Finding none it fell off the end of the function
+    // having queued nothing at all. With 144 notifications that is what it did
+    // every time, which is why a name only ever appeared after visiting that
+    // person's profile: visiting asks for one pubkey, so it survived the churn.
+    //
+    // No shipping client caps authors here. NDK merges them with no limit at
+    // all; Amethyst rebuilds one REQ from every name currently on screen.
+    main.resetWantedProfilesForTest();
+
+    const many = 300;
+    var i: usize = 0;
+    while (i < many) : (i += 1) {
+        var pk = [_]u8{0} ** 32;
+        pk[0] = @intCast(i % 251);
+        pk[1] = @intCast(i / 251);
+        pk[2] = @intCast(i % 7 + 1);
+        main.wantProfileForTest(pk);
+    }
+
+    // Every distinct key asked for is still being asked for. The exact count is
+    // not the point: that none of them vanished is.
+    try testing.expect(main.wantedProfileCountForTest() >= 200);
+}
+
+test "a reaction three levels down someone else's thread is not my notification" {
+    // NIP-10 has a reply carry every p tag of its parent plus the parent's
+    // author, and a NIP-25 reaction copies the p tags of what it reacts to. So
+    // a reader's pubkey propagates down every thread they ever touched, and
+    // matching ANY p tag filed a stranger reacting to a stranger's reply as a
+    // notification about the reader.
+    //
+    // NIP-25: the target event's pubkey should be LAST among the p tags.
+    main.setIdentityForTest([_]u8{0xA7} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, k| _ = std.fmt.bufPrint(me_hex[k * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const someone = "dd" ** 32;
+
+    // My key is present, but the LAST p tag is somebody else: this reaction is
+    // about their note, and my key is only riding along from the thread.
+    var not_mine = inboxEvent(7, 0x31, &.{
+        &.{ "p", &me_hex },
+        &.{ "p", someone },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_100);
+    not_mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(not_mine, me) == null);
+
+    // My key last: this one really is about my note.
+    var mine = inboxEvent(7, 0x32, &.{
+        &.{ "p", someone },
+        &.{ "p", &me_hex },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_200);
+    mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(mine, me) != null);
 }
