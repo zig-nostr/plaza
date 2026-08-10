@@ -4914,7 +4914,7 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     if (p_tags > inbox_hellthread_max) return null;
 
     return switch (ev.kind) {
-        1 => if (inboxTargetsMyNote(ev, me)) .reply else .mention,
+        1 => noteVerbFor(ev, me, last_p_is_me),
         // A repost or a reaction copies the p tags of what it is about, and
         // NIP-10 has a reply carry every p tag of its parent plus the parent's
         // author. So the reader's key propagates down every thread they ever
@@ -4928,10 +4928,56 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
         // Where the reacted event is on disk, its author is checked directly,
         // which is better evidence than tag order.
         6, 16 => if (reactionTargetsMe(ev, me, last_p_is_me)) .repost else null,
-        7 => if (isLikeReaction(ev.content) and reactionTargetsMe(ev, me, last_p_is_me)) .like else null,
+        // Every reaction except the one that is not good news. The content
+        // picks the GLYPH; it does not decide admission. Requiring "+" or empty
+        // meant a heart, a fire or any custom shortcode produced no row, no
+        // badge and no glyph, so a reader was told nobody had reacted when
+        // people had, and the emoji the row is built to show could never reach
+        // it. NIP-25 has exactly one negative, and a downvote is still not
+        // something to celebrate in a bell.
+        7 => if (!isDownvoteReaction(ev.content) and reactionTargetsMe(ev, me, last_p_is_me)) .like else null,
         9735 => .zap,
         else => null,
     };
+}
+
+/// NIP-25's one negative reaction: content of exactly "-".
+///
+/// Everything else, "+" and empty and every emoji and shortcode, is somebody
+/// reacting well enough to be told about.
+fn isDownvoteReaction(content: []const u8) bool {
+    return std.mem.eql(u8, content, "-");
+}
+
+/// What a kind:1 naming the reader actually is, or null when it is not about
+/// them at all.
+///
+/// The distinction that matters is whether the note is a REPLY. NIP-10 has a
+/// reply carry every `p` tag of its parent plus the parent's author, so once
+/// the reader posts a single word into a thread, their key travels down every
+/// branch of it forever. Reading any `p` tag as a mention therefore filed every
+/// later exchange between two other people, in any conversation the reader once
+/// touched, as "X mentioned you in a note". In a busy thread that becomes the
+/// commonest row in the inbox: it pushes real notifications out through the
+/// item cap and inflates the unread badge on the rail.
+///
+/// A note that is NOT a reply inherited nothing, so a `p` tag on it is a
+/// decision somebody made, and it still counts.
+fn noteVerbFor(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) ?InboxVerb {
+    // Answering a note this app holds and can see is the reader's.
+    if (inboxTargetsMyNote(ev, me)) return .reply;
+    // Named in the text. A mention is something the writer typed, so a quote of
+    // the reader's note counts here too.
+    if (contentNames(ev.content, me)) return .mention;
+    if (nip10Parent(ev.tags) != null) {
+        // A reply whose parent this app does not hold, which is the normal case
+        // for a reader who has been away. NIP-25's ordering rule is the same
+        // fallback the reaction path leans on: the last `p` tag is the one the
+        // event is about. It is what keeps a genuine reply from being dropped
+        // along with the thread noise.
+        return if (last_p_is_me) .reply else null;
+    }
+    return .mention;
 }
 
 /// Whether a reaction or repost is about a note of the reader's.
@@ -20343,6 +20389,53 @@ fn notifiedBy(content: []const u8, out: *[max_mention_tags][32]u8) usize {
         i += 1;
     }
     return n;
+}
+
+/// Whether `content` names `who`: as a NIP-27 mention, or as the author of an
+/// event it quotes.
+///
+/// The reading half of what `notifiedBy` does for writing. Same scan, same
+/// tokens, one difference: this one is asked about a specific person and so
+/// cannot filter the reader out, which is the only thing it is ever asked
+/// about.
+pub fn contentNames(content: []const u8, who: [32]u8) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < content.len) {
+        // URLs whole, so a token inside one is never read as a reference.
+        if (std.mem.startsWith(u8, content[i..], "http://") or std.mem.startsWith(u8, content[i..], "https://")) {
+            while (i < content.len and !std.ascii.isWhitespace(content[i])) i += 1;
+            continue;
+        }
+        var fba = std.heap.FixedBufferAllocator.init(&scratch);
+        const arena = fba.allocator();
+        if (parseMentionAt(arena, content, i)) |m| {
+            if (std.mem.eql(u8, &m.pubkey, &who)) return true;
+            i = @max(m.end, i + 1);
+            continue;
+        }
+        if (refPrecededByBoundary(content, i)) {
+            var body_start = i;
+            if (std.mem.startsWith(u8, content[i..], "nostr:")) body_start = i + "nostr:".len;
+            const rest = content[body_start..];
+            if (std.mem.startsWith(u8, rest, "nevent1")) {
+                var j: usize = 0;
+                while (j < rest.len and isBech32Char(rest[j])) j += 1;
+                if (nostr.nip19.decodeNevent(arena, rest[0..j])) |ptr| {
+                    // Quoting somebody's note is telling them about it, so the
+                    // author the pointer carries counts. A `note1` carries none,
+                    // and nobody is named on a guess.
+                    if (ptr.author) |author| {
+                        if (std.mem.eql(u8, &author, &who)) return true;
+                    }
+                    i = @max(body_start + j, i + 1);
+                    continue;
+                } else |_| {}
+            }
+        }
+        i += 1;
+    }
+    return false;
 }
 
 pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {

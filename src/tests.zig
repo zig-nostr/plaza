@@ -7002,9 +7002,44 @@ test "a p tag alone is not a notification" {
     const other = [_]nostr.event.Tag{&.{ "p", "aa" ** 32 }};
     try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &other, 100), me) == null);
 
-    // Naming me IS a mention.
+    // Naming me in a note somebody wrote from scratch IS a mention: nothing
+    // put that tag there but the person writing.
     const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
     try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(inboxEvent(1, 0xC1, &mine, 100), me).?);
+
+    // But the same tag on a REPLY says nothing, and this is what the title of
+    // this test was always about. NIP-10 has a reply carry every `p` tag of its
+    // parent plus the parent's author, so one word posted into a thread puts
+    // the reader's key on every message in it, forever. Two strangers talking
+    // three levels below a note of mine were arriving as "mentioned you", and
+    // in a busy thread that becomes the commonest row in the inbox.
+    const between_others = [_]nostr.event.Tag{
+        &.{ "e", "cc" ** 32, "", "root" },
+        &.{ "p", &me_hex },
+        &.{ "p", "dd" ** 32 },
+    };
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &between_others, 100), me) == null);
+
+    // A reply whose last `p` tag is me is a reply TO me, even when this app has
+    // never seen the note being answered. Dropping those would trade one wrong
+    // answer for another.
+    const to_me = [_]nostr.event.Tag{
+        &.{ "e", "cc" ** 32, "", "root" },
+        &.{ "p", "dd" ** 32 },
+        &.{ "p", &me_hex },
+    };
+    try testing.expectEqual(main.InboxVerb.reply, main.inboxVerbForTest(inboxEvent(1, 0xC1, &to_me, 100), me).?);
+
+    // And being named in the TEXT of a reply is a mention wherever the tags
+    // fall, because somebody typed it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const npub = try nostr.nip19.encodeNpub(arena_state.allocator(), me);
+    var content_buf: [200]u8 = undefined;
+    const said = try std.fmt.bufPrint(&content_buf, "as nostr:{s} was saying", .{npub});
+    var mentions_me = inboxEvent(1, 0xC1, &between_others, 100);
+    mentions_me.content = said;
+    try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(mentions_me, me).?);
 
     // A note naming twenty people is a broadcast, and being one of the twenty
     // is not a message. This is the cheapest filter that works.
@@ -7035,6 +7070,16 @@ test "a reaction that is not a like is not a notification" {
     // A downvote is not something to celebrate in a bell.
     like.content = "-";
     try testing.expect(main.inboxVerbForTest(like, me) == null);
+
+    // Everything else IS. Amethyst, Damus and Primal all send an emoji rather
+    // than "+" by default, and requiring "+" meant every one of those reactions
+    // produced no row, no badge and no glyph: the reader was told nobody had
+    // reacted while people had, and the emoji the row is built to draw could
+    // never get there.
+    for ([_][]const u8{ "❤️", "🔥", ":shakingeyes:", "+" }) |content| {
+        like.content = content;
+        try testing.expectEqual(main.InboxVerb.like, main.inboxVerbForTest(like, me).?);
+    }
 
     // Reposts and zaps are their own verbs.
     try testing.expectEqual(main.InboxVerb.repost, main.inboxVerbForTest(inboxEvent(6, 0xC2, &mine, 100), me).?);
