@@ -11648,6 +11648,50 @@ test "a picture that will not load says so instead of waiting forever" {
     }
 }
 
+test "opening a reply asks about the conversation, not just that reply" {
+    // NIP-10 is what makes this necessary. A reply carries an `e` tag for the
+    // ROOT and one for its immediate parent, so a grandchild of the note in the
+    // reader's hand names its parent and the root, and never the note in
+    // between. Asking only about the note pressed therefore returned its direct
+    // children and nothing else: no siblings, no parent, no root post, and
+    // nothing under those children.
+    const focal = [_]u8{0xf0} ** 32;
+    const root = [_]u8{0x0a} ** 32;
+    var root_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&root_hex, "{x}", .{root}) catch unreachable;
+
+    var out: [2][32]u8 = undefined;
+
+    // A reply in the middle of a thread: both ids, the pressed note first.
+    const marked = [_]nostr.event.Tag{
+        &.{ "e", &root_hex, "", "root" },
+        &.{ "e", "b" ** 64, "", "reply" },
+    };
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &marked, &out));
+    try testing.expectEqualSlices(u8, &focal, &out[0]);
+    try testing.expectEqualSlices(u8, &root, &out[1]);
+
+    // A root post has nothing above it, so there is nothing to add.
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &.{}, &out));
+    try testing.expectEqualSlices(u8, &focal, &out[0]);
+
+    // A note that names ITSELF as its root is one id, not the same id twice.
+    var focal_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&focal_hex, "{x}", .{focal}) catch unreachable;
+    const self_rooted = [_]nostr.event.Tag{&.{ "e", &focal_hex, "", "root" }};
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &self_rooted, &out));
+
+    // A quote is not an ancestor: a mention-marked tag must not be taken as the
+    // root, or pressing a note that quotes another opens the wrong thread.
+    const quoting = [_]nostr.event.Tag{&.{ "e", &root_hex, "", "mention" }};
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &quoting, &out));
+
+    // An old-style positional reply, with no marker at all, still resolves.
+    const positional = [_]nostr.event.Tag{&.{ "e", &root_hex }};
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &positional, &out));
+    try testing.expectEqualSlices(u8, &root, &out[1]);
+}
+
 test "a host having a moment is not the same as a host saying no" {
     // A 404 is an answer and the box says so. A timeout, a rate limit or a 5xx
     // is the network having a moment, and marking a good picture permanently

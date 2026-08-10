@@ -8919,6 +8919,23 @@ pub fn nip10Root(tags: []const nostr.event.Tag) ?[32]u8 {
     return first_plain;
 }
 
+/// The event ids a thread subscription should name: the note the reader
+/// pressed, and the root of the conversation it belongs to when that is a
+/// different note. Fills `out` and returns how many are in it.
+///
+/// Both, not just the root, and not just the note. The root is what the rest of
+/// the conversation actually tags, and the pressed note is what keeps this
+/// working when a root tag is missing, wrong, or points at something else: its
+/// own direct children still match.
+pub fn threadQueryIds(focal: [32]u8, tags: []const nostr.event.Tag, out: *[2][32]u8) usize {
+    out[0] = focal;
+    const root = nip10Root(tags) orelse return 1;
+    // A note that names itself as its own root is one id, not two.
+    if (std.mem.eql(u8, &root, &focal)) return 1;
+    out[1] = root;
+    return 2;
+}
+
 /// Whether the tags carry a NON-mention `e` reference to `id`: a root, reply,
 /// or positional ancestor pointer. A mention-marked tag is a quote, not an
 /// ancestor tie.
@@ -21800,8 +21817,39 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
-    var root_hex: [64]u8 = undefined;
-    hexLower(&root_hex, root_id);
+    // The note the reader pressed, and the ROOT of the conversation it sits in.
+    //
+    // Usually the same note, and when they are not, asking only about the note
+    // pressed asks a question almost nothing answers. NIP-10 says a reply
+    // carries an `e` tag for the ROOT and one for its immediate parent, so a
+    // grandchild of the note in the reader's hand names its own parent and the
+    // root, and never the note in between. Opening a reply from the feed
+    // therefore fetched that note's direct children and nothing else: no
+    // siblings, no parent, no root post, and nothing under those children. The
+    // ancestors then trickled in one hop at a time through the quote fetcher,
+    // which is why an old conversation took several seconds to assemble.
+    //
+    // Both ids go into ONE filter. Keeping the pressed note in it is what makes
+    // this safe when a root tag is missing, wrong, or points somewhere else:
+    // that note's own children still match.
+    var thread_ids: [2][32]u8 = undefined;
+    var thread_count: usize = 1;
+    thread_ids[0] = root_id;
+    if (g_store) |store| {
+        if (store.getEvent(gpa, root_id) catch null) |se| {
+            var owned = se;
+            defer owned.deinit();
+            thread_count = threadQueryIds(root_id, owned.event.tags, &thread_ids);
+        }
+    }
+    var thread_hex: [2][64]u8 = undefined;
+    var thread_evals: [2][]const u8 = undefined;
+    var thread_watch: [2]i64 = undefined;
+    for (0..thread_count) |i| {
+        hexLower(&thread_hex[i], thread_ids[i]);
+        thread_evals[i] = &thread_hex[i];
+        thread_watch[i] = @intCast(std.mem.readInt(u64, thread_ids[i][0..8], .big) & std.math.maxInt(i64));
+    }
 
     for (0..relaySlots()) |ri| {
         var url_buf: [96]u8 = undefined;
@@ -21815,15 +21863,16 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // Phase 1: the replies themselves (kind:1 e-tagging the root). Collect
         // their ids as they arrive so phase 2 can watch their engagement too.
         var id_hex: [thread_reply_cap][64]u8 = undefined;
-        var watch_ids: [thread_reply_cap + 1]i64 = undefined;
+        var watch_ids: [thread_reply_cap + 2]i64 = undefined;
         var id_count: usize = 0;
-        // The root is watched from the start, so its own counts refresh.
-        watch_ids[0] = @intCast(std.mem.readInt(u64, root_id[0..8], .big) & std.math.maxInt(i64));
-        var watch_len: usize = 1;
+        // The note pressed, and the conversation's root when that is a
+        // different note, are both watched from the start so their own counts
+        // refresh alongside the replies'.
+        var watch_len: usize = 0;
+        while (watch_len < thread_count) : (watch_len += 1) watch_ids[watch_len] = thread_watch[watch_len];
 
         const reply_kinds = [_]u16{1};
-        const root_evals = [_][]const u8{&root_hex};
-        const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &root_evals }};
+        const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = thread_evals[0..thread_count] }};
         const reply_filters = [_]nostr.filter.Filter{.{ .kinds = &reply_kinds, .tags = &reply_tags, .limit = thread_reply_cap }};
         relay.subscribe("plaza-thread", &reply_filters) catch continue;
         while (true) {
@@ -21849,9 +21898,9 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // Phase 2: engagement on the root and every reply (replies, reposts,
         // likes, zaps), folded into the shared table so the thread shows real
         // metrics on each row, the same counts the feed shows.
-        var evals: [thread_reply_cap + 1][]const u8 = undefined;
-        evals[0] = &root_hex;
-        var eval_len: usize = 1;
+        var evals: [thread_reply_cap + 2][]const u8 = undefined;
+        var eval_len: usize = 0;
+        while (eval_len < thread_count) : (eval_len += 1) evals[eval_len] = thread_evals[eval_len];
         for (0..id_count) |i| {
             evals[eval_len] = &id_hex[i];
             eval_len += 1;
