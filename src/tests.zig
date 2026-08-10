@@ -11654,11 +11654,66 @@ test "a host having a moment is not the same as a host saying no" {
     // broken over one of those is the quote fetch's old mistake in a place the
     // reader can see.
     for ([_]u16{ 404, 410, 403, 400 }) |final| {
-        try testing.expect(main.mediaFailureIsFinalForTest(final));
+        try testing.expectEqual(main.ImageFailure.give_up, main.classifyImageFailure(.ok, final));
     }
-    for ([_]u16{ 0, 408, 429, 500, 502, 503 }) |transient| {
-        try testing.expect(!main.mediaFailureIsFinalForTest(transient));
+    for ([_]u16{ 408, 429, 500, 502, 503 }) |transient| {
+        try testing.expectEqual(main.ImageFailure.retry, main.classifyImageFailure(.ok, transient));
     }
+    // No answer at all is the network, whatever status field came with it.
+    for ([_]native_sdk.EffectFetchOutcome{ .connect_failed, .tls_failed, .protocol_failed, .timed_out }) |outcome| {
+        try testing.expectEqual(main.ImageFailure.retry, main.classifyImageFailure(outcome, 0));
+    }
+}
+
+test "a picture too big to decode is not downloaded again forever" {
+    // This is the one the status code cannot answer. An oversized or truncated
+    // body comes back 200: the host did nothing wrong and will send exactly the
+    // same bytes next time. Reading only the status put the slot back to idle,
+    // and the scan that refills idle slots runs on the one-second tick AND on
+    // every scroll event, so one picture too large for the decoder was
+    // re-downloaded for as long as the reader looked at it.
+    try testing.expectEqual(main.ImageFailure.give_up, main.classifyImageFailure(.ok, 200));
+
+    // Driven through the real handler, because the classification is only half
+    // of it: the slot has to end up somewhere the refill scan will not pick up.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_001;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    // A 200 carrying more than the decoder will take.
+    const too_big = try arena.alloc(u8, 250_000);
+    @memset(too_big, 0);
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 200, too_big);
+    if (!main.mediaFailed(note_id)) {
+        std.debug.print("an oversized picture went back to idle, so it will be fetched again\n", .{});
+        return error.WouldRefetchForever;
+    }
+}
+
+test "a picture the network lost is retried, but not without end" {
+    // The mirror of the case above, and the one the avatar path used to get
+    // wrong in the other direction: a 503 is the host having a moment, so the
+    // picture is worth asking for again. Bounded, so that no future mistake in
+    // the classification can turn "worth asking again" into a download loop.
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_002;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 503, "");
+    try testing.expect(main.mediaIdleForTest(note_id));
+    try testing.expectEqual(@as(u8, 1), main.mediaAttemptsForTest(note_id).?);
+
+    main.deliverMediaResponseForTest(&fx, note_id, .connect_failed, 0, "");
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 429, "");
+    try testing.expect(main.mediaIdleForTest(note_id));
+
+    // The fourth is where it stops.
+    main.deliverMediaResponseForTest(&fx, note_id, .timed_out, 0, "");
+    try testing.expect(main.mediaFailed(note_id));
 }
 
 test "a quote still loading looks like the card that will replace it" {

@@ -4471,6 +4471,10 @@ const Profile = struct {
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Fetches of this face that came back unusable for a reason worth retrying.
+    /// Cleared on a successful load, on a changed picture URL, and by the
+    /// Settings retry.
+    avatar_attempts: u8 = 0,
     /// Whether this face's BYTES have been pulled into the disk cache ahead of
     /// being needed. Separate from `avatar_state` because that one is about a
     /// registry id and there are only nine of those: warming is what a row just
@@ -6018,6 +6022,9 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
                 @memcpy(profile.picture_buf[0..trimmed.len], trimmed);
                 profile.picture_len = @intCast(trimmed.len);
                 if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
+                // A different picture is a different resource, so whatever the
+                // last one failed at says nothing about this one.
+                profile.avatar_attempts = 0;
             }
         }
     }
@@ -7864,9 +7871,18 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         p.avatar_state = .idle;
         return;
     }
-    // Anything but a clean, whole, OK image body falls back to initials.
+    // Anything but a clean, whole, OK image body. Which of those is worth asking
+    // again is the same question the feed's pictures ask, so it is the same
+    // answer: a face used to be given up on for the rest of the session over one
+    // 503, one rate limit, or one dropped connection.
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
-        p.avatar_state = .failed;
+        p.avatar_state = switch (classifyImageFailure(response.outcome, response.status)) {
+            .give_up => .failed,
+            .retry => blk: {
+                p.avatar_attempts +|= 1;
+                break :blk if (p.avatar_attempts >= max_image_attempts) .failed else .idle;
+            },
+        };
         return;
     }
     // Decode into this profile's fixed image id, downscaling if the platform
@@ -7874,8 +7890,10 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     // back to initials now.
     if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) |_| {
         p.avatar_state = .loaded;
+        p.avatar_attempts = 0;
         storeCachedImage(p.url(), response.body);
     } else {
+        // Undecodable bytes are a fact about the picture, not about the network.
         p.avatar_state = .failed;
     }
 }
@@ -8161,6 +8179,10 @@ const MediaSlot = struct {
     note_id: i64 = 0,
     image_id: u64 = 0,
     state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Fetches for this slot's URL that came back unusable for a reason worth
+    /// retrying. Reset when the slot is handed to a different note, because
+    /// `claimMediaSlot` rebuilds the whole struct.
+    attempts: u8 = 0,
     /// Tick counter at the last time this note was still wanted, for eviction.
     last_used: u64 = 0,
     /// The registered pixel size, so the card can lay the picture out at its
@@ -8301,8 +8323,32 @@ pub fn markMediaFailedForTest(slot: *MediaSlot) void {
     slot.state = .failed;
 }
 
-pub fn mediaFailureIsFinalForTest(status: u16) bool {
-    return mediaFailureIsFinal(status);
+pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.attempts;
+}
+
+pub fn mediaIdleForTest(note_id: i64) bool {
+    const m = mediaSlotFor(note_id) orelse return false;
+    return m.state == .idle;
+}
+
+/// Delivers one picture-fetch response for `note_id` the way the runtime would,
+/// so a test can drive the failure paths rather than the classifier alone.
+pub fn deliverMediaResponseForTest(
+    fx: *Effects,
+    note_id: i64,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    handleMediaFetched(fx, .{
+        .key = media_fetch_key_base + (m.image_id - media_image_id_base),
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
 }
 
 pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
@@ -8530,16 +8576,46 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
     fired.* += 1;
 }
 
-/// Whether a failed picture fetch is worth another try later.
+/// What a fetch that produced no usable image says about trying again.
+pub const ImageFailure = enum { retry, give_up };
+
+/// Classifies a picture or avatar fetch that did not produce an image.
 ///
-/// A 4xx other than "slow down" is the host answering: the picture is not there,
-/// or not for us, and asking again just makes the same round trip. Everything
-/// else (no status at all, a rate limit, a 5xx) is the network or the host
-/// having a moment, and those recover.
-fn mediaFailureIsFinal(status: u16) bool {
-    if (status == 408 or status == 429) return false;
-    return status >= 400 and status < 500;
+/// The question is not what the status code was, it is WHAT FAILED. A body that
+/// arrived whole, with a 200, and is simply too large for the decoder, or was
+/// truncated, or is empty, is a fact about that picture: it will be exactly as
+/// large the next time, and every time after that. A timeout, a 5xx or a rate
+/// limit is the network or the host having a moment, and those recover.
+///
+/// Reading only the status conflated the two, in opposite directions on the two
+/// paths. The feed asked whether the STATUS was final, and an oversized picture
+/// comes back 200, so the slot went back to idle and the same picture was
+/// downloaded again on the next tick and again on every scroll event, for as
+/// long as the note stayed on screen. The avatar path asked nothing at all, so a
+/// single 503 or one dropped connection blanked that face for the rest of the
+/// session, on every screen.
+pub fn classifyImageFailure(outcome: native_sdk.EffectFetchOutcome, status: u16) ImageFailure {
+    // Never reached a host, or the request was cut short on the way.
+    if (outcome != .ok) return .retry;
+    // The host answered, and the answer was not an image and will not become
+    // one: too large to decode, cut off, or empty.
+    if (status == 200) return .give_up;
+    // The two 4xx that are about timing rather than about the resource.
+    if (status == 408 or status == 429) return .retry;
+    // Any other 4xx is the host saying no, and it will say no again.
+    if (status >= 400 and status < 500) return .give_up;
+    // 5xx, and anything unexpected: the host is having a moment.
+    return .retry;
 }
+
+/// How many times a picture or avatar may come back unusable for a reason worth
+/// retrying before Plaza stops asking.
+///
+/// A backstop, not the mechanism. `classifyImageFailure` is what should decide,
+/// and this is here so that no future mistake in it can produce an unbounded
+/// download loop again: getting that wrong cost 240 KiB a second, per picture,
+/// for as long as the reader looked at it.
+const max_image_attempts = 4;
 
 /// Handles a feed-image fetch response, mirroring the avatar path.
 fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
@@ -8554,14 +8630,22 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         return;
     }
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
-        // A host that said NO is different from a host that did not answer. A
-        // 404 or a 410 is an answer, and the box says so; a timeout, a 5xx or a
-        // rate limit is the network having a moment, and marking the picture
-        // permanently broken over one of those is the same mistake the quote
-        // fetch used to make, in a place the reader can see.
-        slot.state = if (mediaFailureIsFinal(response.status)) .failed else .idle;
+        // A host that said NO is different from a host that did not answer, and
+        // a picture that is simply too big is different again: it will be the
+        // same size next time, so asking again is a download with a known
+        // answer. Only something that can change goes back to idle.
+        slot.state = switch (classifyImageFailure(response.outcome, response.status)) {
+            .give_up => .failed,
+            .retry => blk: {
+                slot.attempts +|= 1;
+                break :blk if (slot.attempts >= max_image_attempts) .failed else .idle;
+            },
+        };
         return;
     }
+    // Whatever it took to get here, this URL answers, so the count of tries
+    // worth making starts again.
+    slot.attempts = 0;
     // An animated GIF keeps all its frames; anything else (including a GIF with
     // only one frame) takes the still path.
     if (loadAnimatedGif(fx, slot, response.body)) {
@@ -8609,10 +8693,16 @@ fn openExternally(fx: *Effects, url: []const u8) void {
 /// Lets everything that failed to load try again, after the media proxy changed.
 fn retryFailedImages() void {
     for (&g_profiles) |*p| {
-        if (p.used and p.avatar_state == .failed) p.avatar_state = .idle;
+        if (p.used and p.avatar_state == .failed) {
+            p.avatar_state = .idle;
+            p.avatar_attempts = 0;
+        }
     }
     for (&g_media) |*m| {
-        if (m.used and m.state == .failed) m.state = .idle;
+        if (m.used and m.state == .failed) {
+            m.state = .idle;
+            m.attempts = 0;
+        }
     }
 }
 
