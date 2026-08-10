@@ -2139,8 +2139,6 @@ var g_remote_secret_buf: [128]u8 = undefined;
 var g_remote_secret_len: usize = 0;
 // 0 idle, 1 connecting, 2 connected, 3 failed. Drives the onboarding status line.
 var g_remote_status = std.atomic.Value(u8).init(0);
-// Monotonic source of unique NIP-46 request ids.
-var g_req_counter = std.atomic.Value(u64).init(0);
 
 // ------------------------------------------------- the isolated signer helper
 //
@@ -2377,6 +2375,27 @@ pub fn ceremonyCanTakeKeyForTest() bool {
 }
 
 /// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
+/// Pretends this session connected to `pubkey`'s bunker.
+pub fn setRemotePubkeyForTest(pubkey: [32]u8) void {
+    g_remote_pubkey = pubkey;
+}
+
+/// Hands one NIP-46 response event to the listener's handler, as a relay would.
+/// The generation is the live one, so only the checks under test can reject it.
+pub fn deliverNip46ResponseForTest(
+    signer: nostr.keys.Signer,
+    client_kp: nostr.keys.KeyPair,
+    ev: nostr.event.Event,
+) void {
+    handleNip46Response(
+        std.heap.page_allocator,
+        signer,
+        client_kp,
+        ev,
+        g_remote_generation.load(.acquire),
+    );
+}
+
 pub fn setSignerKindForTest(kind: []const u8) void {
     g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
         .helper
@@ -21999,12 +22018,30 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
     return true;
 }
 
+/// A request id nobody watching the relay can guess.
+///
+/// These were `req-0`, `req-1`, and so on, from a counter that starts at zero
+/// on every launch. Our client pubkey is not a secret: it is the `p` tag on
+/// every request we publish. Anyone reading the bunker's relay could therefore
+/// address an answer to us and guess which request was in flight. They still
+/// cannot read the request, and after the sender check above they cannot be
+/// heard at all, but a request id should not be a countdown either.
+///
+/// Sixteen hex characters from the system CSPRNG, the same source the ephemeral
+/// client key comes from.
+fn newRequestId(out: *[24]u8) ?[]const u8 {
+    const io = g_io orelse return null;
+    var raw: [8]u8 = undefined;
+    io.randomSecure(&raw) catch return null;
+    return std.fmt.bufPrint(out, "{x}", .{raw}) catch null;
+}
+
 /// Sends the NIP-46 `connect` request (remote pubkey + optional secret).
 fn sendConnect(gpa: std.mem.Allocator) void {
     var hexbuf: [64]u8 = undefined;
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
-    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    const req_id = newRequestId(&idbuf) orelse return;
     if (!registerPending(req_id, .connect, null, false)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
@@ -22039,7 +22076,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     defer gpa.free(unsigned_json);
 
     var idbuf: [24]u8 = undefined;
-    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch {
+    const req_id = newRequestId(&idbuf) orelse {
         gpa.free(content_owned);
         return;
     };
@@ -22120,7 +22157,21 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
     const pvals = [_][]const u8{&client_hex};
     const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &pvals }};
     const kinds = [_]u16{nostr.nip46.kind};
-    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .tags = &tag_filters }};
+    // FROM THE SIGNER, addressed to us. The `p` tag alone is not a restriction:
+    // our client pubkey is on every request we publish, so anyone reading the
+    // relay can address an event to it. Naming the author is what makes this
+    // subscription about a conversation with one party.
+    //
+    // `limit = 0` asks for nothing stored. Kind 24133 is ephemeral and a relay
+    // should not be keeping it, but one that does would otherwise replay a
+    // previous session's answers into this one.
+    const authors = [_][32]u8{g_remote_pubkey};
+    const filters = [_]nostr.filter.Filter{.{
+        .authors = &authors,
+        .kinds = &kinds,
+        .tags = &tag_filters,
+        .limit = 0,
+    }};
     try relay.subscribe("plaza-nip46", &filters);
 
     while (generation == g_remote_generation.load(.acquire)) {
@@ -22141,6 +22192,16 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
 /// twice and a stale session's response never lands.
 fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event, generation: u64) void {
     if (generation != g_remote_generation.load(.acquire)) return;
+    // Only the signer this session connected to.
+    //
+    // A relay filter is a request, not a guarantee, and this one has to hold on
+    // its own because of how NIP-44 works: the conversation key is derived from
+    // the SENDER's key, so an event from anybody decrypts successfully as long
+    // as they encrypted it to our client key. That key is public. Without this
+    // line, a stranger who guesses the id of a request in flight can answer it,
+    // and the answer is either an event we then publish from the reader's
+    // machine to the reader's relays, or a failure that discards their note.
+    if (!std.mem.eql(u8, &ev.pubkey, &g_remote_pubkey)) return;
     const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
     defer gpa.free(plaintext);
     var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
@@ -22168,6 +22229,11 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
+            // Signed as the account we asked it to sign as. The verify further
+            // down the write path checks that an event's signature matches its
+            // OWN pubkey, which a stranger's event also satisfies, so this is
+            // the check that says the note is this reader's.
+            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return;
             // A process-lifetime copy of the content: `parsed` is freed on
             // return, but the detached publisher reads it afterwards. Our
             // composer produces tagless kind:1 notes, so an empty tag set still

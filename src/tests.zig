@@ -1405,6 +1405,78 @@ test "a NIP-46 response is matched to its request by id, and unknown ids are dro
     try testing.expect(main.takePendingContentForTest("req-1") == null);
 }
 
+test "only the signer we connected to can answer a signing request" {
+    // NIP-44 derives its conversation key from the SENDER, so a response from
+    // anybody at all decrypts, as long as they encrypted it to our client key.
+    // That key is public: it is the `p` tag on every request we publish. So the
+    // relay filter cannot be the only thing standing between the reader and a
+    // stranger's answer, and the handler has to check the sender itself.
+    //
+    // Left unchecked, an answer carrying a forged event is stored and published
+    // to the reader's own relays from the reader's own machine, and an answer
+    // carrying an error throws away the note they just wrote.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    const gpa = std.heap.page_allocator;
+
+    // Real keys, and a real sealed response, because a test that hands the
+    // handler undecryptable rubbish passes whether the check is there or not:
+    // the decrypt fails and the slot survives for the wrong reason. The
+    // stranger here does exactly what a stranger could do, correctly.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const client_kp = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const bunker_kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const stranger_kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    main.setRemotePubkeyForTest(bunker_kp.public_key);
+
+    try testing.expect(main.registerPendingForTest("f00dcafe", .connect, null));
+
+    // The stranger encrypts a perfectly valid ack to our client key, under the
+    // id of the request in flight. Nothing about the ciphertext is wrong: the
+    // conversation key comes from THEIR key, so it decrypts on our side.
+    var sealed = try nostr.nip46.seal(
+        gpa,
+        io,
+        signer,
+        stranger_kp,
+        client_kp.public_key,
+        "{\"id\":\"f00dcafe\",\"result\":\"ack\",\"error\":\"\"}",
+        1_700_000_000,
+    );
+    defer sealed.deinit();
+    main.deliverNip46ResponseForTest(signer, client_kp, sealed.event);
+
+    // The request is still waiting, which is the point: the stranger neither
+    // answered it nor consumed it.
+    if (main.takePendingContentForTest("f00dcafe") == null) {
+        std.debug.print("a stranger's response resolved the reader's pending request\n", .{});
+        return error.StrangerAnsweredForTheBunker;
+    }
+
+    // And the bunker's own answer, byte for byte the same message, still works.
+    try testing.expect(main.registerPendingForTest("f00dcafe", .connect, null));
+    var real = try nostr.nip46.seal(
+        gpa,
+        io,
+        signer,
+        bunker_kp,
+        client_kp.public_key,
+        "{\"id\":\"f00dcafe\",\"result\":\"ack\",\"error\":\"\"}",
+        1_700_000_000,
+    );
+    defer real.deinit();
+    main.deliverNip46ResponseForTest(signer, client_kp, real.event);
+    if (main.takePendingContentForTest("f00dcafe") != null) {
+        std.debug.print("the bunker's own answer was rejected along with the stranger's\n", .{});
+        return error.LockedOutTheRealSigner;
+    }
+}
+
 test "a heart filled by one account is not the next account's to un-like" {
     // The like table was keyed by note id alone, which is identical under every
     // account, and nothing ever cleared it. So a note liked as A showed a filled
