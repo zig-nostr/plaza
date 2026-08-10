@@ -13085,3 +13085,28 @@ test "a reaction three levels down someone else's thread is not my notification"
     mine.content = "+";
     try testing.expect(main.inboxVerbForTest(mine, me) != null);
 }
+
+test "a tag copy that could not complete reads as no base, not as an empty one" {
+    // The splice base for every replaceable write comes through `dupeTags`, and
+    // the writes decide how much to keep by counting what is in it. An empty
+    // slice is a true answer for a record with no tags and a destructive one for
+    // a copy that ran short: the follow list's shrink guard compares against
+    // this same slice, so zero to one reads as growth and passes.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "aa" ** 32 },
+        &.{ "p", "bb" ** 32 },
+    };
+
+    // Enough memory: the copy is whole and every field survives.
+    const ok = main.dupeTagsForTest(a.allocator(), &tags) orelse return error.CopyRefusedWithMemoryAvailable;
+    try testing.expectEqual(@as(usize, 2), ok.len);
+    try testing.expectEqualStrings("p", ok[0][0]);
+
+    // Not enough: null, so the caller takes its store-miss path. Anything that
+    // returned a short or empty slice here would be reported as a real base.
+    var failing = testing.FailingAllocator.init(a.allocator(), .{ .fail_index = 1 });
+    try testing.expect(main.dupeTagsForTest(failing.allocator(), &tags) == null);
+}

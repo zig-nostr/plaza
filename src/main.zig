@@ -549,15 +549,26 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // one the app was born with. An edit grants this to itself, which is why it
     // is not the whole gate.
     if (!relayListIsOwned()) return false;
-    if (!canWriteRelayList()) return false;
     // A refusal here keeps the edit pending, so the tick brings it back the
     // moment the signer is free. This is the half of the same-tick collision the
     // relay list was on the losing end of.
     if (!signerReady()) return false;
     const gpa = std.heap.page_allocator;
 
+    // Read ONCE, and gate on the read that is actually spliced from.
+    //
+    // This used to ask `canWriteRelayList()` first, which does its own store
+    // read, and then read again for the base. Two reads can disagree: if the
+    // second returns nothing, the gate has already said yes, the splice loop is
+    // skipped, and the event is built from the pool alone. A thirteen-relay list
+    // is then replaced by the eight relays this process happens to hold, which
+    // is the exact deletion the splice below exists to prevent. `writeFollow`
+    // documents this hazard and decides its gate from the one read it uses.
     var previous: ?OwnProfile = null;
     if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
+    // Somebody else's list may not be overwritten sight unseen. Minting the
+    // identity here is the one case where there is legitimately nothing to read.
+    if (previous == null and !g_identity_minted_here) return false;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
@@ -2801,6 +2812,10 @@ pub fn wantedProfileCountForTest() usize {
     return n;
 }
 
+pub fn dupeTagsForTest(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
+    return dupeTags(gpa, tags);
+}
+
 pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
     return contentTags(gpa, content, &.{}, &.{});
 }
@@ -3081,7 +3096,13 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
     // empty would leave the published id not matching its content, so relays
     // would reject it. Deep-copied because `parsed` is freed on return.
-    out.tags = dupeTags(gpa, parsed.value.tags);
+    // Whole, or the note is handed back rather than published. Without the
+    // signed tags the id no longer matches the event, so a relay rejects it and
+    // the reader is told nothing; failing here keeps the note recoverable.
+    out.tags = dupeTags(gpa, parsed.value.tags) orelse {
+        failHelperSign();
+        return;
+    };
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -13532,10 +13553,10 @@ fn clearPendingFollowBase() void {
 fn setPendingFollowBase(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
     const gpa = std.heap.page_allocator;
     clearPendingFollowBase();
-    const tag_copy = dupeTags(gpa, tags);
-    // `dupeTags` degrades to an empty set rather than failing, and an empty base
-    // is worse than no base: it would publish a list with nobody in it.
-    if (tag_copy.len == 0 and tags.len != 0) return;
+    // No base beats a partial one: a partial one publishes a list with nobody
+    // in it. `dupeTags` reports the difference now rather than returning an
+    // empty set that reads as "this list was empty".
+    const tag_copy = dupeTags(gpa, tags) orelse return;
     g_pending_follow_tags = tag_copy;
     g_pending_follow_content = gpa.dupe(u8, content) catch {
         clearPendingFollowBase();
@@ -14673,7 +14694,8 @@ fn readRecord(gpa: std.mem.Allocator, pubkey: [32]u8, kind: u16) ?OwnProfile {
     defer result.deinit();
     if (result.events.len == 0) return null;
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -19195,7 +19217,8 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     // Copied out before `result.deinit()`: the query owns its events through an
     // arena, and the write seam holds what it is given past this frame.
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -19389,7 +19412,7 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // The TAGS come forward too. NIP-39 identity proofs (a GitHub account, a
     // Mastodon handle) live in kind:0's tags, and republishing with none would
     // delete them as silently as dropping a JSON key.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, created, 0, tags, merged, false);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
@@ -19607,7 +19630,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     // proofs to lose, so this is not a bug being fixed: it is the one line that
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
@@ -20477,13 +20500,24 @@ fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
 /// Deep-copies `tags` into process-lifetime memory so the detached publisher can
 /// read them after the parse arena is freed. Returns an empty set on OOM (posts
 /// are tagless, so nothing is lost there; a reaction that OOMs simply drops).
-fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) []const nostr.event.Tag {
+/// Copies a record's tags, or reports that it could not.
+///
+/// Null, never an empty slice. This is the splice base for every replaceable
+/// write (kind 0, 3 and 10002), and those writes decide how much to keep by
+/// counting what is in here. An empty slice says "this record had no tags",
+/// which is a true statement about a record with no tags and a catastrophic one
+/// about a copy that ran out of memory: the follow list's own shrink guard
+/// compares against this same slice, so 0 to 1 reads as growth and passes.
+///
+/// A base that could not be copied whole must read as "not read". Every caller
+/// already handles that safely, because it is the same path as a store miss.
+fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
     if (tags.len == 0) return &.{};
-    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return &.{};
+    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return null;
     for (tags, 0..) |tag, i| {
-        const fields = gpa.alloc([]const u8, tag.len) catch return &.{};
+        const fields = gpa.alloc([]const u8, tag.len) catch return null;
         for (tag, 0..) |field, j| {
-            fields[j] = gpa.dupe(u8, field) catch return &.{};
+            fields[j] = gpa.dupe(u8, field) catch return null;
         }
         out[i] = fields;
     }
@@ -21964,7 +21998,9 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             // Preserve the signed tags (a reaction carries e/p/k); forcing them
             // empty would make the id not match, and the verify below would drop
             // it. Deep-copied because `parsed` is freed on return.
-            out.tags = dupeTags(gpa, parsed.value.tags);
+            // Whole, or not published: the id is computed over these tags, so
+            // a partial copy is an event the verify below would drop anyway.
+            out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
             ingestAndPublish(gpa, out, signer);
         },
     }
