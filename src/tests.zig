@@ -5062,14 +5062,43 @@ test "the name beat forwards the tags it read, the same as the sheet's save" {
 }
 
 test "a profile that will not parse does not become a blank profile" {
-    // Garbage in the store must not turn into an empty object with three fields
-    // written over it. It falls back to an object the edit is applied to, and
-    // the caller's stage machine is what decides whether to publish at all.
+    // This asserted the opposite of its own title: that garbage merged into an
+    // empty object with the sheet's fields written over it, on the reasoning
+    // that the caller would decide whether to publish. The caller does not. It
+    // publishes whatever the merge hands back, so an unreadable record came out
+    // the other side as a kind:0 holding nothing but a display name, and the
+    // reader's lightning address, NIP-05, banner and website were gone from
+    // every relay and every other client.
     var model = main.initialModel();
     model.profile_name_buffer.set("Alice");
-    const merged = main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model).?;
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model) == null);
+
+    // Not only outright garbage. Zig's JSON parser rejects an unpaired
+    // surrogate half, which parsers elsewhere in the ecosystem accept, so a
+    // profile carrying one is a real profile that this app cannot read. It is
+    // exactly the reader most likely to have a full profile to lose.
+    const lone_surrogate = "{\"name\":\"a\\ud83db\",\"lud16\":\"alice@example.com\"}";
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, lone_surrogate, &model) == null);
+
+    // A root that is valid JSON but not an object is the same story.
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, "[1,2,3]", &model) == null);
+
+    // Only a caller that says there is nothing there starts from nothing. That
+    // is the literal `{}` handed over when no record was found.
+    const fresh = main.mergeProfileJsonForTest(testing.allocator, "{}", &model) orelse
+        return error.RefusedToWriteAFirstProfile;
+    defer testing.allocator.free(fresh);
+    try testing.expect(std.mem.indexOf(u8, fresh, "\"display_name\":\"Alice\"") != null);
+
+    // And the ordinary path still merges: a field the sheet does not show must
+    // come through the edit untouched, which is what the merge is for.
+    const held = "{\"name\":\"alice\",\"lud16\":\"alice@example.com\",\"nip05\":\"alice@example.com\"}";
+    const merged = main.mergeProfileJsonForTest(testing.allocator, held, &model) orelse
+        return error.LostAReadableProfile;
     defer testing.allocator.free(merged);
     try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@example.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
 }
 
 test "the sheet refuses to save until it has read the profile it would replace" {

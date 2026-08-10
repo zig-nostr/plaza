@@ -19583,17 +19583,43 @@ fn saveProfile(model: *Model, fx: *Effects) void {
 /// Parses `existing`, replaces the three keys this app models, and serialises the
 /// whole object back. Key order survives the round trip, so a profile this app
 /// did not change comes back byte-similar rather than reshuffled.
+/// The object a kind:0 edit merges into, or null when a record that IS there
+/// could not be read.
+///
+/// Falling back to an empty object on a parse failure is the merge failing
+/// open, and this object is the base every field is written into. A profile
+/// that did not parse would be republished as nothing but the fields the screen
+/// happened to hold, so the reader's lightning address, NIP-05, banner and
+/// website would be gone from every relay and from every other client. That is
+/// the same shape as writing a contact list over one that was never read, and
+/// the answer is the same: a record that cannot be read whole reads as "not
+/// read", which every caller already handles.
+///
+/// Not a hypothetical failure, either. Zig's JSON parser is stricter than the
+/// ones the rest of the ecosystem uses: it rejects an unpaired surrogate half
+/// in a `\u` escape, and it validates raw UTF-8. Profiles that came through
+/// bridges, or were written by clients that never checked, carry both, and
+/// those readers would be the ones who lost the most.
+///
+/// Only a caller saying there is nothing there may start from nothing, which is
+/// the literal `{}` passed when no record was found.
+fn profileMergeBase(a: std.mem.Allocator, existing: []const u8) ?std.json.ObjectMap {
+    const nothing_to_lose = existing.len == 0 or
+        std.mem.eql(u8, std.mem.trim(u8, existing, " \t\r\n"), "{}");
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch return if (nothing_to_lose) std.json.ObjectMap.empty else null;
+    if (root != .object) return if (nothing_to_lose) std.json.ObjectMap.empty else null;
+    return root.object;
+}
+
 fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_always,
-    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
-    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
-    var obj = root.object;
+    var obj = profileMergeBase(a, existing) orelse return null;
 
     // An emptied field REMOVES its key rather than writing "": a profile with
     // `"about": ""` reads to other clients as a bio the reader deliberately
@@ -19804,12 +19830,7 @@ fn mergeNameJson(gpa: std.mem.Allocator, existing: []const u8, name: []const u8)
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_always,
-    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
-    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
-    var obj = root.object;
+    var obj = profileMergeBase(a, existing) orelse return null;
     setOrRemove(&obj, a, "name", name) catch return null;
     setOrRemove(&obj, a, "display_name", name) catch return null;
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
