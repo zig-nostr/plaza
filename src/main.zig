@@ -1422,8 +1422,17 @@ const open_url_key: u64 = 102;
 // (a full thread: the active user + the root + up to `thread_reply_cap` replies)
 // with headroom for recently-seen authors, so the mark pass never has to evict
 // an author it just marked. Names are cheap; only avatars are slot-bound.
-// The old value was `thread_reply_cap + 60` = 160, reasoned about a full thread
-// and nothing else, while an inbox holds 200 items.
+// 4096, and it costs nothing. Measured at the 2048-follow ceiling with the
+// follow-list walk removed: 3714us at 256, 3743us at 1024, 3627us at 4096,
+// which is one number three times inside noise.
+//
+// It used to cost a great deal (6018us at 160 rising to 26258us at 4096) and
+// the reason was not the cache. `refreshProfiles` derived its LMDB query limit
+// from this constant, so growing the cache grew a database read that ran on
+// every feed rebuild. Two unrelated quantities sharing one name.
+//
+// The index is twice the capacity, because an open-addressed table at full load
+// degrades to a linear scan.
 //
 // The research said to raise this to 4096, citing Jumble's 5000. That is wrong
 // FOR THIS CODEBASE and the measurement says so: several paths walk the whole
@@ -1435,7 +1444,7 @@ const open_url_key: u64 = 102;
 // 256 buys real headroom over a screenful of notifications for 3.5ms, and stops
 // there. The right way to earn more is to stop upserting every follow into an
 // LRU sized for on-screen authors, which is its own piece of work.
-const profile_cap = 256;
+const profile_cap = 4096;
 
 comptime {
     // The avatar pass marks the whole on-screen author set (active user + a
@@ -5815,7 +5824,7 @@ pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void
 ///
 /// Slot values are index+1 so that zero means empty. Rebuilt wholesale on
 /// eviction, which is rare and bounded.
-const profile_index_slots = 4096;
+const profile_index_slots = 8192;
 var g_profile_index = [_]u16{0} ** profile_index_slots;
 var g_profile_index_stale: usize = 0;
 
@@ -7411,13 +7420,24 @@ fn refreshProfiles(store: *nostr.store.Store) void {
     // comptime pack with no checks, so the first runtime follow list longer than
     // nine would have written past it: silent stack corruption in a release
     // build, from a feature that has nothing to do with profiles.
-    var authors: [max_follows + 1 + wanted_profiles_cap][32]u8 = undefined;
+    // NOT the follow list. This used to walk every follow, up to 2048 of them,
+    // on the feed reconcile path, and ask LMDB for all of their metadata on
+    // every rebuild. That is the single reason a bigger profile cache made
+    // scrolling slower rather than faster: the query limit was derived from the
+    // cache size, so growing the cache grew the query.
+    //
+    // No reference client does this. Notedeck collects pubkeys from notes that
+    // were actually ingested and only on a database MISS, then asks in a
+    // debounced batch, with no follow-list pass anywhere. Amethyst has no path
+    // at all that requests kind:0 for a whole contact list: each name on screen
+    // registers itself. Jumble does walk the follow list, but off the render
+    // path entirely, twenty at a time with a one second sleep between batches.
+    //
+    // What replaces it is already here: a displayed author with no name calls
+    // `wantProfile`, so the wanted set IS the on-screen set, which is exactly
+    // the input Notedeck uses.
+    var authors: [wanted_profiles_cap + 1][32]u8 = undefined;
     var authors_len: usize = 0;
-    for (followSet()) |pk| {
-        if (authors_len >= authors.len) break;
-        authors[authors_len] = pk;
-        authors_len += 1;
-    }
     if (activePubkey()) |pk| {
         if (authors_len < authors.len) {
             authors[authors_len] = pk;
@@ -7431,7 +7451,10 @@ fn refreshProfiles(store: *nostr.store.Store) void {
         authors[authors_len] = w.pubkey;
         authors_len += 1;
     }
-    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap + wanted_profiles_cap }) catch return;
+    if (authors_len == 0) return;
+    // The limit is how many records the query can match, which is one kind:0
+    // per author. It is not a cache size, and tying it to one was the bug.
+    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(authors_len) }) catch return;
     defer result.deinit();
     for (result.events) |ev| {
         const p = upsertProfile(ev.pubkey) orelse continue;
