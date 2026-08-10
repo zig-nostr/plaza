@@ -22744,7 +22744,55 @@ fn performLogout(model: *Model, fx: *Effects) void {
 // subscribes for recent kind:1, verifies each event, and writes it into the
 // shared store; the UI thread reads it back through `Model.refresh`.
 
-/// One relay's ingest loop: dial, serve, and reconnect after a short delay,
+/// The first wait before redialling a relay whose connection ended, and the
+/// ceiling that wait grows to.
+///
+/// This used to be a flat three seconds, forever, with no counter. A relay that
+/// is down, that has stopped taking this reader, or that accepts the handshake
+/// and then drops the socket was dialled twelve hundred times an hour for as
+/// long as the app stayed open, from eight threads with no jitter between them,
+/// and every one of those dials re-asked for the whole backlog.
+const reconnect_base_ms: u64 = 3_000;
+const reconnect_max_ms: u64 = 300_000;
+
+/// How long a connection has to last before it counts as having worked.
+///
+/// The reason for the rule is not obvious: a successful handshake is NOT
+/// evidence that a relay is healthy. A relay that accepts the socket and
+/// immediately closes it would reset the ladder on every open, and the widening
+/// delay would never widen. Only a connection that stayed up clears the count.
+const stable_connection_ms: i64 = 60_000;
+
+/// The wait before redialling, after `attempts` connections in a row that did
+/// not last. Doubling, capped.
+pub fn reconnectDelayMs(attempts: u6) u64 {
+    const shift: u6 = @min(attempts, 7);
+    return @min(reconnect_base_ms << shift, reconnect_max_ms);
+}
+
+/// The attempt count after a connection that stayed up for `lasted_ms`.
+///
+/// Separate from the loop so the rule can be asserted rather than described: a
+/// connection only clears the ladder by LASTING, never by opening.
+pub fn nextReconnectAttempts(attempts: u6, lasted_ms: i64) u6 {
+    return if (lasted_ms >= stable_connection_ms) 0 else attempts +| 1;
+}
+
+/// Extra delay for slot `index`, so the pool does not redial in lockstep.
+///
+/// Spread rather than randomness, because the thing being avoided is specific:
+/// eight threads that dropped together on one network blip coming back together,
+/// and then staying in step for the rest of the session. Walking the offset by
+/// the attempt as well as the slot separates two relays that happened to start
+/// aligned. Never more than a quarter of the wait, and it is a function, so what
+/// it promises can be asserted.
+pub fn reconnectJitterMs(wait: u64, index: usize, attempts: u6) u64 {
+    const slice = wait / 64;
+    const step = (index *% 5 +% @as(usize, attempts) *% 3) % 16;
+    return slice * step;
+}
+
+/// One relay's ingest loop: dial, serve, and reconnect after a widening delay,
 /// forever.
 fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -22754,11 +22802,21 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
+    // Connections in a row that did not last `stable_connection_ms`.
+    var attempts: u6 = 0;
+    // The address last dialled, so re-pointing a slot starts a clean ladder
+    // instead of inheriting the previous relay's failures. Fixing a typo in a
+    // relay URL should take effect now, not in five minutes.
+    var tried_buf: [96]u8 = undefined;
+    var tried_len: usize = 0;
+
     while (true) {
         // An empty slot is not an error: it is a seat kept for a relay the
         // reader may add. It costs a sleeping thread and nothing else.
         if (relayAt(index) == null) {
             setRelayStatus(index, .offline);
+            attempts = 0;
+            tried_len = 0;
             io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
             continue;
         }
@@ -22766,16 +22824,30 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
         // pausing costs them nothing but the live tail.
         if (relaysPaused()) {
             setRelayStatus(index, .offline);
+            attempts = 0;
             io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
             continue;
         }
+        var url_buf: [96]u8 = undefined;
+        if (relaySnapshot(index, &url_buf)) |now| {
+            if (!relayUrlEql(now.url, tried_buf[0..tried_len])) {
+                attempts = 0;
+                tried_len = now.url.len;
+                @memcpy(tried_buf[0..tried_len], now.url);
+            }
+        }
         setRelayStatus(index, .connecting);
+        const opened_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         ingestOnce(gpa, io, signer, index) catch |err| {
             std.debug.print("plaza: [{s}] {s}\n", .{ relayUrlAt(index), @errorName(err) });
         };
         setRelayStatus(index, .offline);
         clearRelayRtt(index);
-        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+        const lasted = std.Io.Timestamp.now(io, .awake).toMilliseconds() - opened_at;
+        attempts = nextReconnectAttempts(attempts, lasted);
+        const wait = reconnectDelayMs(attempts);
+        const spread = reconnectJitterMs(wait, index, attempts);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait + spread)), .awake) catch {};
     }
 }
 
@@ -22813,13 +22885,6 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         authors_len += 1;
     }
     const feed_kinds = feed_filter_kinds;
-    // kind:0 is who they are, kind:10002 is where they are: the reader's own
-    // relay list, and the relays their follows write to, which is what makes a
-    // suggestion under the add field a fact rather than a guess.
-    // kind:0 is who they are, 10002 is where they are, and 3 is who the reader
-    // follows: their own contact list, which nothing may be written over until
-    // it has been read.
-    const profile_kinds = profile_filter_kinds;
     // Two filters per chunk of authors, all in ONE REQ.
     //
     // `authors_len` INCLUDES the reader. An earlier version took the snapshot
@@ -22901,11 +22966,21 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     asked_about_me = true;
                 }
             }
-            const next_filters = [_]nostr.filter.Filter{
-                .{ .authors = authors[0..next_authors_len], .kinds = &feed_kinds, .limit = feed_request_limit },
-                .{ .authors = authors[0..next_authors_len], .kinds = &profile_kinds, .limit = profile_cap },
-            };
-            relay.subscribe("plaza-feed", &next_filters) catch {};
+            // Built by the SAME function the dial-time subscription uses.
+            //
+            // This path used to hand-roll its own pair of filters, and both of
+            // the things `buildFeedFilters` exists to prevent came back with it:
+            // every author named in ONE filter, which is past the size several
+            // relays accept once a real follow list is loaded, and a metadata
+            // limit taken from `profile_cap`, which is the size of a screen
+            // cache and has nothing to do with how many records to ask for.
+            //
+            // It mattered more here than anywhere, because this is the path
+            // every reader takes: Plaza dials before anyone has signed in, so
+            // the subscription that carries the actual account is always the
+            // re-issued one, never the one built at dial.
+            const next_filters = buildFeedFilters(authors[0..next_authors_len], &filter_buf);
+            relay.subscribe("plaza-feed", next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
             // Asking only at dial was the whole feature's undoing, because Plaza
@@ -23017,6 +23092,29 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags }};
                     relay.subscribe("plaza-engagement", &eng_filters) catch {};
                 }
+            },
+            .closed => |c| {
+                // A relay saying no. NIP-01's CLOSED carries a reason, and
+                // dropping it on the floor is what made a refused subscription
+                // indistinguishable from a quiet one: a green chip, "Live", and
+                // nothing arriving, for the rest of the connection, with no
+                // retry and nothing written down.
+                std.debug.print("plaza: [{s}] closed {s}: {s}\n", .{ url, c.subscription_id, c.message });
+                if (std.mem.eql(u8, c.subscription_id, probe_sub)) {
+                    // Only the latency reading is lost. Clear the pending sample
+                    // so the next message asks again rather than waiting forever
+                    // for an EOSE that is not coming.
+                    probe_at = 0;
+                } else if (std.mem.eql(u8, c.subscription_id, "plaza-feed")) {
+                    // The feed is what this connection is FOR, so end it and let
+                    // the reconnect ladder decide when to ask again. A relay that
+                    // refuses this filter now will usually refuse it in three
+                    // seconds too, which is exactly why that delay widens.
+                    return error.FeedSubscriptionClosed;
+                }
+                // The inbox and the engagement subscription are refused on their
+                // own terms. Either one is worth reporting and neither is worth
+                // tearing down a working feed for.
             },
             else => {},
         }
