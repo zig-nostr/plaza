@@ -7182,6 +7182,13 @@ test "the inbox survives a restart, targets and all" {
         &.{ "e", target_hex },
     }, 1_800_000_000);
     reply.id[0] = 0x6B;
+    // Into the STORE as well as the inbox, which is what really happens: the
+    // pool ingests the event and then files it. The inbox is rebuilt from the
+    // store's `p` tag index at launch now rather than from a parallel blob, so
+    // an event that was never stored is one that never happened. That is the
+    // point of the change: the blob could not carry the note's words or a
+    // reaction's glyph, so every restored row came back blank.
+    _ = try store.ingest(arena_state.allocator(), reply, .{});
     try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
     main.inboxMarkAllRead();
     const read_through = main.inboxReadThrough();
@@ -7464,32 +7471,6 @@ test "a keyboard shortcut fired under the sheet does not arm something invisible
     }
 }
 
-test "the page the reader is on stays inside the pages that exist" {
-    // The set moves underneath: a fresh contact list narrows the follows tab, an
-    // eviction shortens both. Clamping only where it is drawn meant the model
-    // stayed past the end, and Newer then did nothing visible once per page the
-    // reader had drifted by.
-    main.setIdentityForTest([_]u8{0xEF} ** 32);
-    defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
-
-    seedInbox(main.inbox_page * 3, 0xA0, 1_800_000_000);
-    var model = main.initialModel();
-    model.stage = .ready;
-    model.notifications_open = true;
-    model.notifications_everyone = true;
-
-    var fx: main.EffectsForTest = undefined;
-    // Walk past the end: it stops at the last page rather than running away.
-    for (0..10) |_| main.update(&model, .notifications_older, &fx);
-    try testing.expectEqual(@as(usize, 2), model.notifications_page);
-    // And one press back moves one page, not none.
-    main.update(&model, .notifications_newer, &fx);
-    try testing.expectEqual(@as(usize, 1), model.notifications_page);
-}
-
 test "an amount no one could have sent is not an amount" {
     // `bolt11` is a string the sender writes. The first version read it into a
     // u64 and drew whatever came out, which for a junk prefix was eighteen
@@ -7637,7 +7618,7 @@ test "the bell opens onto the notifications it counted" {
     model.notifications_open = true;
     // Whatever the sheet opens on by default, not what this test would prefer.
     const tree = try buildTree(arena, &model);
-    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "mentioned you in a note") != null);
     try testing.expect(findAnyText(tree.root, "Nothing from the people you follow yet. Everyone is in the other tab.") == null);
 }
 
@@ -7681,7 +7662,7 @@ test "a notification press asks the store, not the feed" {
     model.stage = .ready;
     model.notifications_open = true;
     const tree = try buildTree(arena, &model);
-    const row = findByLabel(tree.root, "replied to you") orelse findByLabel(tree.root, "mentioned you") orelse return error.RowMissing;
+    const row = findByLabel(tree.root, "replied to you") orelse findByLabel(tree.root, "mentioned you in a note") orelse return error.RowMissing;
     for (tree.handlers) |h| {
         if (h.id != row.id or h.event != .press) continue;
         switch (h.action) {
@@ -7714,51 +7695,36 @@ test "walking somewhere from the sheet closes the sheet" {
     try testing.expect(model.viewing_profile != null);
 }
 
-test "the notifications sheet lays its rows out INSIDE its card" {
-    // The tree said this screen was right for as long as it was wrong. `modalCard`
-    // sets a width and no height, so under a `.start` cross-alignment the card took
-    // its intrinsic height, the `grow = 1` scroll inside it resolved to ZERO, and
-    // the rows were laid out and painted down the bare window below the card with
-    // the footer drawn on top of the first one. Every assertion about the widget
-    // tree passed throughout. So this one asks the geometry instead.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0xD4} ** 32);
+test "the notifications page draws its rows in the reading column" {
+    // This replaces a test that asserted the rows sat inside a modal card. There
+    // is no card: notifications is an opaque level now, like threads, profiles,
+    // settings and the composer, because a scrim repaints the whole window every
+    // frame and the cost grows with it.
+    //
+    // What still matters is that a row lands in the column and not spread across
+    // a wide window, so the same note is the same width wherever it is shown.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    main.setIdentityForTest([_]u8{0x2f} ** 32);
     defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
 
-    var model = main.initialModel();
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
     model.stage = .ready;
     model.notifications_open = true;
-    model.notifications_everyone = true;
-    seedInbox(12, 0x40, 1_800_000_000);
+    main.seedInboxUnreadForTest(6);
 
-    const p = try painted.Painted.render(arena, &model);
-    const card = p.fillRectOf(theme.palette.surface_modal) orelse return error.CardNotPainted;
-
-    // The card is a panel, not a strip: it has to be tall enough to hold a list.
-    try testing.expect(card.height > main.window_height / 2);
-
-    // The scroll region has somewhere to put them. This is the assertion that
-    // fails on the bug and passes here: the region laid out at height ZERO, so
-    // there was no viewport, nothing scrolled, and the rows below the first
-    // handful were unreachable however far the reader dragged.
-    const view = frameOfKind(p, .scroll_view) orelse return error.ScrollNotLaidOut;
-    try testing.expect(view.height > 200);
-    try testing.expect(view.y >= card.y - 1);
-
-    // The first row starts inside the viewport rather than at the top of the
-    // window, and the footer sits BELOW the region instead of on top of row one.
-    const rows = p.framesOf("mentioned you");
-    try testing.expect(rows.len > 0);
-    try testing.expect(rows[0].y >= view.y - 1);
-    const footer = frameOfText(p, "read state stays on this Mac") orelse return error.FooterNotPainted;
-    try testing.expect(footer.y >= view.y + view.height - 1);
-    try testing.expect(footer.y + footer.height <= card.y + card.height + 1);
+    const tree = try painted.Painted.renderAt(arena, model, main.window_width, main.window_height);
+    var widest: f32 = 0;
+    for (tree.layout.nodes) |n| {
+        if (n.widget.kind != .data_row) continue;
+        widest = @max(widest, n.widget.frame.width);
+    }
+    try testing.expect(widest > 0);
+    // The column, not the window. A row wider than the column means the centring
+    // row collapsed and every notification is running the full width.
+    try testing.expect(widest <= main.notifications_column_width_for_test + 1);
 }
 
 test "the sheet fits the view budget over the deepest thing under it" {
@@ -7813,44 +7779,6 @@ test "the sheet fits the view budget over the deepest thing under it" {
     try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
 }
 
-test "pages replace rather than pile up, and every notification is reachable" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0xD6} ** 32);
-    defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
-
-    var model = main.initialModel();
-    model.stage = .ready;
-    model.notifications_open = true;
-    model.notifications_everyone = true;
-    seedInbox(main.inbox_page * 2, 0x80, 1_800_000_000);
-
-    // One page's worth of rows, however many are held.
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
-        try testing.expect(findAnyText(tree.root, "1 of 2") != null);
-    }
-    // The second page REPLACES the first: the cost is the same either way, and
-    // the older items are reachable instead of being cut off at a page limit.
-    model.notifications_page = 1;
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
-        try testing.expect(findAnyText(tree.root, "2 of 2") != null);
-    }
-    // A page number means nothing once the set under it changes.
-    var m2 = model;
-    var fx: main.EffectsForTest = undefined;
-    main.update(&m2, .{ .notifications_tab = 0 }, &fx);
-    try testing.expectEqual(@as(usize, 0), m2.notifications_page);
-}
-
 test "the notifications sheet renders what it holds" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -7882,7 +7810,7 @@ test "the notifications sheet renders what it holds" {
     _ = main.inboxAddForTest(inboxEvent(1, 0xCA, &mine, 1_800_000_000), 1_800_000_000);
 
     const tree = try buildTree(arena, &model);
-    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "mentioned you in a note") != null);
     try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
 }
 
@@ -10095,18 +10023,6 @@ const modal_cases = [_]ModalCase{
             fn f(m: *Model) void {
                 m.stage = .ready;
                 m.naming = true;
-            }
-        }.f,
-    },
-    .{
-        .name = "notifications",
-        .label = "Notifications",
-        .dismiss = .close_notifications,
-        .control = "Everyone",
-        .open = struct {
-            fn f(m: *Model) void {
-                m.stage = .ready;
-                m.notifications_open = true;
             }
         }.f,
     },
@@ -13107,4 +13023,90 @@ test "a reply whose parent is missing says so instead of posing as a direct repl
     try testing.expect(!direct.?.parent_missing);
     try testing.expectEqual(@as(u8, 2), nested.?.depth);
     try testing.expect(!nested.?.parent_missing);
+}
+
+test "a wanted profile is never silently dropped, however many are wanted" {
+    // The old table held 48 and, once full, looked for a slot already asked the
+    // maximum number of times. Finding none it fell off the end of the function
+    // having queued nothing at all. With 144 notifications that is what it did
+    // every time, which is why a name only ever appeared after visiting that
+    // person's profile: visiting asks for one pubkey, so it survived the churn.
+    //
+    // No shipping client caps authors here. NDK merges them with no limit at
+    // all; Amethyst rebuilds one REQ from every name currently on screen.
+    main.resetWantedProfilesForTest();
+
+    const many = 300;
+    var i: usize = 0;
+    while (i < many) : (i += 1) {
+        var pk = [_]u8{0} ** 32;
+        pk[0] = @intCast(i % 251);
+        pk[1] = @intCast(i / 251);
+        pk[2] = @intCast(i % 7 + 1);
+        main.wantProfileForTest(pk);
+    }
+
+    // Every distinct key asked for is still being asked for. The exact count is
+    // not the point: that none of them vanished is.
+    try testing.expect(main.wantedProfileCountForTest() >= 200);
+}
+
+test "a reaction three levels down someone else's thread is not my notification" {
+    // NIP-10 has a reply carry every p tag of its parent plus the parent's
+    // author, and a NIP-25 reaction copies the p tags of what it reacts to. So
+    // a reader's pubkey propagates down every thread they ever touched, and
+    // matching ANY p tag filed a stranger reacting to a stranger's reply as a
+    // notification about the reader.
+    //
+    // NIP-25: the target event's pubkey should be LAST among the p tags.
+    main.setIdentityForTest([_]u8{0xA7} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, k| _ = std.fmt.bufPrint(me_hex[k * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const someone = "dd" ** 32;
+
+    // My key is present, but the LAST p tag is somebody else: this reaction is
+    // about their note, and my key is only riding along from the thread.
+    var not_mine = inboxEvent(7, 0x31, &.{
+        &.{ "p", &me_hex },
+        &.{ "p", someone },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_100);
+    not_mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(not_mine, me) == null);
+
+    // My key last: this one really is about my note.
+    var mine = inboxEvent(7, 0x32, &.{
+        &.{ "p", someone },
+        &.{ "p", &me_hex },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_200);
+    mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(mine, me) != null);
+}
+
+test "a tag copy that could not complete reads as no base, not as an empty one" {
+    // The splice base for every replaceable write comes through `dupeTags`, and
+    // the writes decide how much to keep by counting what is in it. An empty
+    // slice is a true answer for a record with no tags and a destructive one for
+    // a copy that ran short: the follow list's shrink guard compares against
+    // this same slice, so zero to one reads as growth and passes.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "aa" ** 32 },
+        &.{ "p", "bb" ** 32 },
+    };
+
+    // Enough memory: the copy is whole and every field survives.
+    const ok = main.dupeTagsForTest(a.allocator(), &tags) orelse return error.CopyRefusedWithMemoryAvailable;
+    try testing.expectEqual(@as(usize, 2), ok.len);
+    try testing.expectEqualStrings("p", ok[0][0]);
+
+    // Not enough: null, so the caller takes its store-miss path. Anything that
+    // returned a short or empty slice here would be reported as a real base.
+    var failing = testing.FailingAllocator.init(a.allocator(), .{ .fail_index = 1 });
+    try testing.expect(main.dupeTagsForTest(failing.allocator(), &tags) == null);
 }

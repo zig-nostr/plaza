@@ -549,15 +549,26 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // one the app was born with. An edit grants this to itself, which is why it
     // is not the whole gate.
     if (!relayListIsOwned()) return false;
-    if (!canWriteRelayList()) return false;
     // A refusal here keeps the edit pending, so the tick brings it back the
     // moment the signer is free. This is the half of the same-tick collision the
     // relay list was on the losing end of.
     if (!signerReady()) return false;
     const gpa = std.heap.page_allocator;
 
+    // Read ONCE, and gate on the read that is actually spliced from.
+    //
+    // This used to ask `canWriteRelayList()` first, which does its own store
+    // read, and then read again for the base. Two reads can disagree: if the
+    // second returns nothing, the gate has already said yes, the splice loop is
+    // skipped, and the event is built from the pool alone. A thirteen-relay list
+    // is then replaced by the eight relays this process happens to hold, which
+    // is the exact deletion the splice below exists to prevent. `writeFollow`
+    // documents this hazard and decides its gate from the one read it uses.
     var previous: ?OwnProfile = null;
     if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
+    // Somebody else's list may not be overwritten sight unseen. Minting the
+    // identity here is the one case where there is legitimately nothing to read.
+    if (previous == null and !g_identity_minted_here) return false;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
@@ -1422,7 +1433,29 @@ const open_url_key: u64 = 102;
 // (a full thread: the active user + the root + up to `thread_reply_cap` replies)
 // with headroom for recently-seen authors, so the mark pass never has to evict
 // an author it just marked. Names are cheap; only avatars are slot-bound.
-const profile_cap = thread_reply_cap + 60;
+// 4096, and it costs nothing. Measured at the 2048-follow ceiling with the
+// follow-list walk removed: 3714us at 256, 3743us at 1024, 3627us at 4096,
+// which is one number three times inside noise.
+//
+// It used to cost a great deal (6018us at 160 rising to 26258us at 4096) and
+// the reason was not the cache. `refreshProfiles` derived its LMDB query limit
+// from this constant, so growing the cache grew a database read that ran on
+// every feed rebuild. Two unrelated quantities sharing one name.
+//
+// The index is twice the capacity, because an open-addressed table at full load
+// degrades to a linear scan.
+//
+// The research said to raise this to 4096, citing Jumble's 5000. That is wrong
+// FOR THIS CODEBASE and the measurement says so: several paths walk the whole
+// array once per feed rebuild, so the cost is linear in this number. At the
+// 2048-follow ceiling the rebuild measured 6018us at 160, 9499us at 256,
+// 12213us at 512 and 16259us at 2048, against a 16000us frame. Jumble can hold
+// 5000 because its cache is a hash map, not an array anything scans.
+//
+// 256 buys real headroom over a screenful of notifications for 3.5ms, and stops
+// there. The right way to earn more is to stop upserting every follow into an
+// LRU sized for on-screen authors, which is its own piece of work.
+const profile_cap = 4096;
 
 comptime {
     // The avatar pass marks the whole on-screen author set (active user + a
@@ -1569,6 +1602,8 @@ const ancestor_identity_gap: f32 = 4;
 /// before they are laid out. The column is the estimator's own 70 characters per
 /// line at the 14.5 body, held to the 13.5 register.
 const ancestor_body_lines: usize = 2;
+/// A notification's preview, for the same reason and by the same rule.
+const notification_body_lines: usize = 2;
 /// A quote is an aside, so it shows four lines of the note it quotes and stops
 /// (11f). Its height is then known where the row around it is priced.
 const quote_body_lines: usize = 4;
@@ -2761,6 +2796,26 @@ pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
 /// The tags a body of text implies, for tests. Deliberately takes the finished
 /// string: that is exactly what the publish path passes, which is why a pasted
 /// note and a typed one cannot diverge.
+pub fn resetWantedProfilesForTest() void {
+    g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+}
+
+pub fn wantProfileForTest(pubkey: [32]u8) void {
+    wantProfile(pubkey);
+}
+
+pub fn wantedProfileCountForTest() usize {
+    var n: usize = 0;
+    for (&g_wanted) |*w| {
+        if (w.used) n += 1;
+    }
+    return n;
+}
+
+pub fn dupeTagsForTest(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
+    return dupeTags(gpa, tags);
+}
+
 pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
     return contentTags(gpa, content, &.{}, &.{});
 }
@@ -3041,7 +3096,13 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
     // empty would leave the published id not matching its content, so relays
     // would reject it. Deep-copied because `parsed` is freed on return.
-    out.tags = dupeTags(gpa, parsed.value.tags);
+    // Whole, or the note is handed back rather than published. Without the
+    // signed tags the id no longer matches the event, so a relay rejects it and
+    // the reader is told nothing; failing here keeps the note recoverable.
+    out.tags = dupeTags(gpa, parsed.value.tags) orelse {
+        failHelperSign();
+        return;
+    };
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -3380,18 +3441,43 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 // to the follow set's metadata, so a mention of anyone else would render as a
 // bare npub forever; these are fetched separately, once each, and then resolve
 // like any other name.
-const wanted_profiles_cap = 48;
+// Sized to the real ceiling rather than to a guess: a full inbox, a full
+// thread, and headroom. The old table held 48 and, once full, SILENTLY DROPPED
+// every further request: the loop looked for a slot already asked the maximum
+// number of times, found none, and fell off the end having queued nothing. With
+// 144 notifications that is what it did all day, which is why a name only ever
+// arrived after visiting that person's profile, because visiting asks for one.
+//
+// No shipping client has an author cap here. NDK merges `authors` with no limit
+// at all; Amethyst rebuilds one REQ from every name currently on screen.
+const wanted_profiles_cap = inbox_cap + thread_reply_cap + 64;
 const WantedProfile = struct {
     used: bool = false,
-    requested: bool = false,
-    /// How many times this one has been asked for. Some pubkeys simply have no
-    /// metadata published anywhere, so the asking is bounded.
+    /// When this pubkey was last actually asked for, and how many times running
+    /// it has come back with nothing. Together they gate a retry: wait
+    /// `2^attempts` seconds, clamped, before asking again.
+    ///
+    /// There is no strike limit. The old code wrote a pubkey off permanently
+    /// after three rounds and incremented the counter BEFORE checking whether
+    /// the network was even allowed, so an app launched offline burned all three
+    /// inside forty seconds and showed a raw npub for the rest of the process.
+    /// welshman's loader is the shape copied here: a timestamp, exponential
+    /// backoff, and nothing ever marked dead.
+    last_tried: i64 = 0,
     attempts: u8 = 0,
     pubkey: [32]u8 = [_]u8{0} ** 32,
 };
-/// How many rounds to ask for a mentioned profile before letting it be.
-const max_profile_attempts = 3;
+/// The longest a repeatedly silent pubkey waits between asks.
+const profile_retry_cap_s: i64 = 300;
 var g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+
+/// Whether `w` is due another ask.
+fn profileRetryDue(w: *const WantedProfile, now: i64) bool {
+    if (w.attempts == 0) return true;
+    const shift: u6 = @intCast(@min(w.attempts, 8));
+    const wait = @min(@as(i64, 1) << shift, profile_retry_cap_s);
+    return now - w.last_tried >= wait;
+}
 
 /// Notes that `pubkey` was mentioned but has no known name yet.
 fn wantProfile(pubkey: [32]u8) void {
@@ -3407,16 +3493,15 @@ fn wantProfile(pubkey: [32]u8) void {
             return;
         }
     }
-    // The set is full. Reclaim a slot from someone we have already asked for the
-    // maximum times (no metadata anywhere), so a fresh thread's authors are never
-    // starved by a backlog of dead entries. Without this the table fills up once
-    // and every later reply author renders as a bare npub forever.
+    // Genuinely full, which the size above is chosen to make impossible in
+    // normal use. Take the slot that has gone longest without an answer rather
+    // than dropping the request, because dropping it is what the old 48-slot
+    // table did and it is the whole reason names never loaded.
+    var oldest: ?*WantedProfile = null;
     for (&g_wanted) |*w| {
-        if (w.attempts >= max_profile_attempts) {
-            w.* = .{ .used = true, .pubkey = pubkey };
-            return;
-        }
+        if (oldest == null or w.last_tried < oldest.?.last_tried) oldest = w;
     }
+    if (oldest) |w| w.* = .{ .used = true, .pubkey = pubkey };
 }
 
 /// Whether `pubkey`'s profile is still being fetched: no profile in hand yet, and
@@ -3426,49 +3511,95 @@ fn wantProfile(pubkey: [32]u8) void {
 fn profileLoading(pubkey: [32]u8) bool {
     if (lookupProfile(pubkey) != null) return false;
     for (&g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.attempts < max_profile_attempts;
+        // Still being asked for, because nothing is ever written off now.
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
     }
     return false;
 }
 
-/// Profile-timer rounds between re-asking for metadata that has not arrived
-/// (about 20s at the profile interval).
-const profile_rearm_rounds: u64 = 10;
 var g_profile_round: u64 = 0;
-
-/// Lets the still-unnamed be asked for again on the next pass.
-fn rearmWantedProfiles() void {
-    for (&g_wanted) |*w| {
-        if (w.used and w.attempts < max_profile_attempts) w.requested = false;
-    }
-}
+/// Quote re-ask rounds. Quotes still use a round counter; profiles moved to a
+/// per-pubkey backoff, and the two shared this number only by accident.
+const quote_rearm_rounds: u64 = 10;
 
 /// Asks the relays for the metadata of everyone mentioned but still unnamed, in
 /// one batch on a throwaway connection.
 fn requestWantedProfiles() void {
+    const now = nowSeconds();
     var batch: [wanted_profiles_cap][32]u8 = undefined;
     var n: usize = 0;
     for (&g_wanted) |*w| {
         if (!w.used) continue;
-        // Resolved: free the slot so later mentions can use it. Without this the
-        // table fills with names we already have and new mentions are dropped.
+        // Resolved: free the slot so later mentions can use it.
         if (lookupProfile(w.pubkey)) |p| {
             if (p.name_len > 0) {
                 w.* = .{};
                 continue;
             }
         }
-        if (w.attempts >= max_profile_attempts) continue;
-        if (w.requested) continue;
+        if (!profileRetryDue(w, now)) continue;
         batch[n] = w.pubkey;
         n += 1;
-        w.requested = true;
-        w.attempts += 1;
         if (n == batch.len) break;
     }
     if (n == 0) return;
+
+    // THE DISK FIRST, always. A notification's author is very often somebody
+    // whose kind:0 is already in the store from the feed, a thread, or a
+    // previous session, and this path never once looked. Every reference client
+    // reads its cache before it opens a socket: NDK's `fetchProfile` returns
+    // from the cache adapter before creating a subscription, and Jumble reads
+    // IndexedDB and only refreshes past a three day staleness.
+    //
+    // Exact and cheap here, because the store has a composite author+kind index
+    // and keeps at most one kind:0 per pubkey.
+    var still_missing: [wanted_profiles_cap][32]u8 = undefined;
+    var missing: usize = 0;
+    if (g_store) |store| {
+        const kinds = [_]u16{0};
+        if (store.query(std.heap.page_allocator, .{ .authors = batch[0..n], .kinds = &kinds, .limit = @intCast(n) })) |res| {
+            var result = res;
+            defer result.deinit();
+            for (result.events) |ev| {
+                const prof = upsertProfile(ev.pubkey) orelse continue;
+                if (std.mem.eql(u8, &prof.meta_id, &ev.id)) continue;
+                parseMetadataInto(prof, ev.content);
+                prof.meta_id = ev.id;
+                g_names_generation +%= 1;
+            }
+        } else |_| {}
+        for (batch[0..n]) |pk| {
+            const known = if (lookupProfile(pk)) |prof| prof.name_len > 0 else false;
+            if (known) {
+                // Answered from disk. Retire the want rather than asking a relay
+                // for something already held.
+                for (&g_wanted) |*w| {
+                    if (w.used and std.mem.eql(u8, &w.pubkey, &pk)) w.* = .{};
+                }
+                continue;
+            }
+            still_missing[missing] = pk;
+            missing += 1;
+        }
+    } else {
+        @memcpy(still_missing[0..n], batch[0..n]);
+        missing = n;
+    }
+    if (missing == 0) return;
+
+    // Only now, and only for what disk could not answer. The attempt is counted
+    // HERE, after the network is known to be allowed, never before: counting it
+    // first is what wrote names off during the seconds before the first relay
+    // had finished its handshake.
     if (!networkAllowed()) return;
-    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
+    for (still_missing[0..missing]) |pk| {
+        for (&g_wanted) |*w| {
+            if (!w.used or !std.mem.eql(u8, &w.pubkey, &pk)) continue;
+            w.last_tried = now;
+            w.attempts +|= 1;
+        }
+    }
+    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, still_missing, missing }) catch return;
     thread.detach();
 }
 
@@ -4359,6 +4490,7 @@ var g_names_generation: u64 = 0;
 /// Clears the profile cache. For tests, which share the process globals.
 pub fn resetProfilesForTest() void {
     g_profiles = [_]Profile{.{}} ** profile_cap;
+    @memset(&g_profile_index, 0);
     g_names_generation = 0;
     g_notes_names_generation = 0;
     g_avatar_clock = 0;
@@ -4603,11 +4735,74 @@ pub const InboxItem = struct {
     verb: InboxVerb = .mention,
     /// Millisats, for a zap.
     msat: u64 = 0,
+    /// The words this row shows, copied in when the item is admitted.
+    ///
+    /// Never read from the store while drawing. The feed already paid for that
+    /// lesson: asking the database who you follow once per card cost 24423us to
+    /// rebuild, three whole frames to draw one, and two hundred notification
+    /// rows querying per frame would be the same bug wearing a different hat.
+    ///
+    /// WHICH note this holds depends on the verb, and that is the whole design.
+    /// For a reply or a mention it is THEIR note, because the question is what
+    /// did they say. For a reaction, a repost or a zap it is YOUR note, because
+    /// the question is which of mine did this happen to.
+    body_buf: [180]u8 = [_]u8{0} ** 180,
+    body_len: u8 = 0,
+    /// A reaction's own content: `+`, `-`, an emoji, or a `:shortcode:`. The
+    /// gutter draws this instead of a generic heart, which is the difference
+    /// between "somebody reacted" and seeing what they actually sent.
+    glyph_buf: [16]u8 = [_]u8{0} ** 16,
+    glyph_len: u8 = 0,
 
     pub fn hasTarget(self: InboxItem) bool {
         return !std.mem.allEqual(u8, &self.target_id, 0);
     }
+
+    pub fn body(self: *const InboxItem) []const u8 {
+        return self.body_buf[0..self.body_len];
+    }
+
+    pub fn reactionGlyph(self: *const InboxItem) []const u8 {
+        return self.glyph_buf[0..self.glyph_len];
+    }
 };
+
+/// Copies `src` into `dst`, clipped to whole codepoints, and returns the length.
+fn fillClipped(dst: []u8, src: []const u8) u8 {
+    // Whitespace runs collapse to one space, newlines included. A preview is one
+    // block: kept as-is, a note with a blank line between paragraphs drew as two
+    // separated blocks inside a row, so four notifications filled the screen and
+    // the list read as a stack of documents rather than a list of events.
+    var flat_buf: [512]u8 = undefined;
+    var flat_len: usize = 0;
+    var in_space = false;
+    for (src) |c| {
+        const is_space = c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        if (is_space) {
+            in_space = true;
+            continue;
+        }
+        if (in_space and flat_len > 0 and flat_len < flat_buf.len) {
+            flat_buf[flat_len] = ' ';
+            flat_len += 1;
+        }
+        in_space = false;
+        if (flat_len == flat_buf.len) break;
+        flat_buf[flat_len] = c;
+        flat_len += 1;
+    }
+    const trimmed = flat_buf[0..flat_len];
+    const ellipsis = "\u{2026}";
+    // Room kept for the ellipsis before clipping, not after: appending it to a
+    // full buffer would either overflow or cut a codepoint in half.
+    const room = if (trimmed.len > dst.len) dst.len - ellipsis.len else dst.len;
+    const take = clipToChars(trimmed, room, room);
+    @memcpy(dst[0..take.len], take);
+    if (take.len == trimmed.len) return @intCast(take.len);
+    // Cut. Say so, or a sentence that stops mid-word reads as the whole note.
+    @memcpy(dst[take.len..][0..ellipsis.len], ellipsis);
+    return @intCast(take.len + ellipsis.len);
+}
 
 var g_inbox = [_]InboxItem{.{}} ** inbox_cap;
 var g_inbox_len: usize = 0;
@@ -4647,10 +4842,15 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     var names_me = false;
     var hex: [64]u8 = undefined;
     hexLower(&hex, me);
+    var last_p_is_me = false;
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
         p_tags += 1;
-        if (std.ascii.eqlIgnoreCase(tag[1], &hex)) names_me = true;
+        const mine = std.ascii.eqlIgnoreCase(tag[1], &hex);
+        if (mine) names_me = true;
+        // Tracked separately: for a reaction or a repost the LAST p tag is the
+        // one that means "this is about you".
+        last_p_is_me = mine;
     }
     if (!names_me) return null;
     // A note addressed to a crowd is a broadcast. Being one of twenty names on
@@ -4659,11 +4859,46 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
 
     return switch (ev.kind) {
         1 => if (inboxTargetsMyNote(ev, me)) .reply else .mention,
-        6, 16 => .repost,
-        7 => if (isLikeReaction(ev.content)) .like else null,
+        // A repost or a reaction copies the p tags of what it is about, and
+        // NIP-10 has a reply carry every p tag of its parent plus the parent's
+        // author. So the reader's key propagates down every thread they ever
+        // touched, and ANY-tag matching then filed somebody reacting to a
+        // stranger's reply, three levels below a note of the reader's, as a
+        // notification about the reader.
+        //
+        // NIP-25: "If a client decides to include other `p` tags, which not
+        // recommended, the target event `pubkey` should be last the `p` tags."
+        // So the last one is the target's author. Jumble enforces exactly this.
+        // Where the reacted event is on disk, its author is checked directly,
+        // which is better evidence than tag order.
+        6, 16 => if (reactionTargetsMe(ev, me, last_p_is_me)) .repost else null,
+        7 => if (isLikeReaction(ev.content) and reactionTargetsMe(ev, me, last_p_is_me)) .like else null,
         9735 => .zap,
         else => null,
     };
+}
+
+/// Whether a reaction or repost is about a note of the reader's.
+///
+/// The store is the authority when it holds the target: an author is a fact,
+/// where tag order is a convention the sender may not have followed. Falls back
+/// to NIP-25's rule that the target's author is the last `p` tag.
+fn reactionTargetsMe(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) bool {
+    if (engagementTarget(ev)) |t| {
+        if (t.len == 64) {
+            var id: [32]u8 = undefined;
+            if (std.fmt.hexToBytes(&id, t)) |_| {
+                if (g_store) |store| {
+                    if (store.getEvent(std.heap.page_allocator, id) catch null) |found| {
+                        var se = found;
+                        defer se.deinit();
+                        return std.mem.eql(u8, &se.event.pubkey, &me);
+                    }
+                }
+            } else |_| {}
+        }
+    }
+    return last_p_is_me;
 }
 
 /// Whether this note replies to something the reader wrote, as opposed to merely
@@ -4729,7 +4964,7 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
         }
     }
 
-    const item = InboxItem{
+    var item = InboxItem{
         .used = true,
         .id = identity,
         .author = author,
@@ -4749,12 +4984,115 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     // for exactly the people it is about, which is the one screen where a name
     // is the entire content of the row.
     wantProfile(author);
+    bakeInboxText(&item, ev, verb, target);
     // Fetch what it is about, if this is the first we have heard of it. The row
     // is pressable, so the note behind it should be on its way before the reader
     // ever gets there.
     if (item.hasTarget() and !haveEvent(item.target_id)) wantQuote(item.target_id);
     g_inbox_dirty = true;
     return true;
+}
+
+/// Fills the row's words once, when the item is admitted.
+///
+/// A reply and a mention carry their own text, so those are free. A reaction, a
+/// repost and a zap are about a note of the reader's own, which means one store
+/// read here. Once per item, never per frame: a row that resolved itself while
+/// drawing would put a database query in the scroll path of a two hundred row
+/// list.
+///
+/// A miss is not an error. The note may not have arrived yet, `wantQuote` just
+/// asked for it, and a row with a name and no body still says who did what.
+fn bakeInboxText(item: *InboxItem, ev: nostr.event.Event, verb: InboxVerb, target: [32]u8) void {
+    switch (verb) {
+        // Their words, already in hand.
+        .reply, .mention => item.body_len = fillClipped(&item.body_buf, ev.content),
+        .like => {
+            // The reaction as sent. NIP-25 allows `+`, `-`, an empty string and
+            // a `:shortcode:`; `+` and empty both mean a like, and the row draws
+            // its usual heart for those rather than printing a plus sign.
+            const content = std.mem.trim(u8, ev.content, " \t\r\n");
+            if (content.len > 0 and !std.mem.eql(u8, content, "+")) {
+                item.glyph_len = fillClipped(&item.glyph_buf, content);
+            }
+            bakeTargetBody(item, target);
+        },
+        .repost, .zap => bakeTargetBody(item, target),
+    }
+}
+
+/// The reader's own note, for the rows that are about one.
+///
+/// Usually a miss, and that is expected. What a notification points at is almost
+/// always an older note of the reader's own, which the follow-scoped feed window
+/// does not hold, so the line after this one asks the relays for it. That is why
+/// the resolve below exists: baking once here and never looking again left every
+/// reaction, repost and zap row with no note under it for good.
+fn bakeTargetBody(item: *InboxItem, target: [32]u8) void {
+    if (std.mem.allEqual(u8, &target, 0)) return;
+    const store = g_store orelse return;
+    var se = (store.getEvent(std.heap.page_allocator, target) catch return) orelse return;
+    defer se.deinit();
+    item.body_len = fillClipped(&item.body_buf, se.event.content);
+}
+
+/// The rows the notifications window last put on screen. Written by the view,
+/// read by the pass that lends avatar ids on the next tick.
+var g_inbox_visible: struct { first: usize = 0, last: usize = 0, len: usize = 0 } = .{};
+
+/// The store generation the inbox last tried to fill its missing bodies at.
+var g_inbox_body_stamp: usize = std.math.maxInt(usize);
+
+/// Fills in the note behind every row that is still missing one.
+///
+/// Guarded on the store's event count, so this is one pass per arrival rather
+/// than a query per row per frame. The feed already paid for the other version:
+/// asking the database once per card cost 24423us to rebuild, three whole frames
+/// to draw one.
+///
+/// A row whose note never arrives keeps an empty body and still says who did
+/// what, which is what it did before any of this.
+fn resolveInboxBodies() void {
+    const store = g_store orelse return;
+    const stamp = store.eventCount() catch return;
+    if (stamp == g_inbox_body_stamp) return;
+    g_inbox_body_stamp = stamp;
+    lockInbox();
+    defer unlockInbox();
+    for (g_inbox[0..g_inbox_len]) |*item| {
+        if (!item.used or item.body_len > 0) continue;
+        // A reply or a mention IS the event, so its own id holds their words.
+        // Skipping these was wrong: `inboxAdd` copies the content as the event
+        // arrives, but `loadInbox` rebuilds the inbox from the store at launch
+        // and never goes near that path, so every reply restored from a previous
+        // session drew a name, a time, and nothing in between.
+        const from: [32]u8 = if (item.verb == .reply or item.verb == .mention) item.id else item.target_id;
+        bakeTargetBody(item, from);
+    }
+}
+
+/// Asks for the metadata of everyone the inbox names.
+///
+/// `inboxAdd` already does this for an event as it arrives, and that is not
+/// enough: `loadInbox` rebuilds the whole inbox from the store on launch without
+/// going near that path, so every notification from a previous session had
+/// nobody asking for its author's name. Those rows showed a raw npub and an
+/// initial for as long as the app ran, which is exactly the screen where a name
+/// IS the content.
+///
+/// Cheap to repeat. `wantProfile` returns immediately for anyone already named
+/// and never queues a duplicate.
+fn wantInboxProfiles(shown: []const InboxItem) void {
+    // Only the rows on screen, and this is the third time the same rule has had
+    // to be learned on this page. The wanted table holds 48 and evicts to make
+    // room, so asking on behalf of 143 notifications thrashed it: the names that
+    // actually arrived were whichever ones happened to survive the churn, which
+    // is why opening somebody's profile and coming back was what finally loaded
+    // them. Visiting the profile asked for one person instead of a hundred.
+    const first = @min(g_inbox_visible.first, shown.len);
+    const last = @min(g_inbox_visible.last + 1, shown.len);
+    if (last <= first) return;
+    for (shown[first..last]) |item| wantProfile(item.author);
 }
 
 /// Whether the store already holds this event.
@@ -5117,22 +5455,13 @@ fn saveInbox() void {
         unlockInbox();
         return;
     };
-    for (g_inbox[0..g_inbox_len]) |item| {
-        var hex: [64]u8 = undefined;
-        hexLower(&hex, item.id);
-        var ahex: [64]u8 = undefined;
-        hexLower(&ahex, item.author);
-        var thex: [64]u8 = undefined;
-        hexLower(&thex, item.target_id);
-        out.print(gpa, "{s} {s} {d} {s} {s} {d}\n", .{
-            hex[0..],
-            ahex[0..],
-            item.created_at,
-            thex[0..],
-            @tagName(item.verb),
-            item.msat,
-        }) catch break;
-    }
+    // Only the read marker. The items themselves are NOT serialised here any
+    // more: the events are already in the store, indexed by their `p` tag, and
+    // writing a second parallel copy of them was both duplication and a bug.
+    // The blob carried the id, author, stamp, target, verb and msat, and nothing
+    // else, so a restored row had no words and no reaction glyph, which is
+    // exactly the "some rows have no content" report. Rebuilding from the store
+    // replays the real events through the real gate and cannot drift from it.
     g_inbox_dirty = false;
     unlockInbox();
     // Outside the lock: an LMDB write must never be held under a spinlock that
@@ -5144,62 +5473,49 @@ fn saveInbox() void {
 fn loadInbox() void {
     const store = g_store orelse return;
     const me = activePubkey() orelse return;
-    var key_buf: [96]u8 = undefined;
-    const key = inboxKey(&key_buf, me);
-    if (key.len == 0) return;
     const gpa = std.heap.page_allocator;
-    const raw = (store.get(gpa, key) catch null) orelse return;
-    defer gpa.free(raw);
 
     lockInbox();
-    defer unlockInbox();
     resetInboxLocked(me);
-    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        var parts = std.mem.tokenizeScalar(u8, line, ' ');
-        const first = parts.next() orelse continue;
-        if (std.mem.eql(u8, first, "read")) {
-            const v = parts.next() orelse continue;
-            g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
-            continue;
+    unlockInbox();
+
+    // AFTER the reset, which clears it. Reading the marker first and resetting
+    // second put the whole inbox back at unread on every launch.
+    var key_buf: [96]u8 = undefined;
+    const key = inboxKey(&key_buf, me);
+    if (key.len > 0) {
+        if (store.get(gpa, key) catch null) |raw| {
+            defer gpa.free(raw);
+            var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+            while (lines.next()) |line| {
+                var parts = std.mem.tokenizeScalar(u8, line, ' ');
+                const first = parts.next() orelse continue;
+                if (!std.mem.eql(u8, first, "read")) continue;
+                const v = parts.next() orelse continue;
+                g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
+            }
         }
-        if (g_inbox_len >= g_inbox.len) break;
-        if (first.len != 64) continue;
-        var item = InboxItem{ .used = true };
-        _ = std.fmt.hexToBytes(&item.id, first) catch continue;
-        const ahex = parts.next() orelse continue;
-        if (ahex.len != 64) continue;
-        _ = std.fmt.hexToBytes(&item.author, ahex) catch continue;
-        item.created_at = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
-        // A field that is not a whole id leaves the item with no target rather
-        // than discarding the item: a notification the reader cannot follow
-        // through to is still a notification they should be told about.
-        const thex = parts.next() orelse continue;
-        if (thex.len == 64) {
-            var scratch: [32]u8 = undefined;
-            if (std.fmt.hexToBytes(&scratch, thex)) |_| {
-                item.target_id = scratch;
-            } else |_| {}
-        }
-        const verb = parts.next() orelse continue;
-        item.verb = if (std.mem.eql(u8, verb, "reply"))
-            .reply
-        else if (std.mem.eql(u8, verb, "mention"))
-            .mention
-        else if (std.mem.eql(u8, verb, "like"))
-            .like
-        else if (std.mem.eql(u8, verb, "repost"))
-            .repost
-        else if (std.mem.eql(u8, verb, "zap"))
-            .zap
-        else
-            continue;
-        item.msat = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
-        g_inbox[g_inbox_len] = item;
-        g_inbox_len += 1;
     }
-    sortInboxLocked();
-    g_inbox_dirty = false;
+
+    // The same filter the relay is asked, answered from disk. Jumble does
+    // exactly this: it paints the notification list from IndexedDB using the
+    // identical filter it is about to send, before opening a socket.
+    //
+    // Replayed through `inboxAdd`, so restored rows pass the same gate, the same
+    // dedup and the same text baking as live ones. The hand-rolled blob this
+    // replaces could not: it held six scalar fields and no content, so every row
+    // restored from a previous session came back with a name, a time, and
+    // nothing in between.
+    const hex = inboxMeHex(me);
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &.{&hex} }};
+    var result = store.query(gpa, .{
+        .kinds = &inbox_kinds,
+        .tags = &tags,
+        .limit = inbox_backfill_cap,
+    }) catch return;
+    defer result.deinit();
+    const now = nowSeconds();
+    for (result.events) |ev| _ = inboxAdd(ev, now);
 }
 
 pub fn saveInboxForTest() void {
@@ -5518,9 +5834,57 @@ pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void
 }
 
 /// Finds the cached profile for `pubkey`, or null.
+/// An open-addressed index over `g_profiles`, so a lookup is a probe rather
+/// than a walk.
+///
+/// The cache was 160 slots and a linear scan was fine. Sizing it to the real
+/// author set (200 notifications plus up to 2048 follows) made that scan 12x
+/// longer, and it runs per note per feed rebuild: the 2048-follow rebuild went
+/// from inside the frame budget to 17155us against 16000us, a visible stutter
+/// every second. The cap and this index are one change, not two.
+///
+/// Slot values are index+1 so that zero means empty. Rebuilt wholesale on
+/// eviction, which is rare and bounded.
+const profile_index_slots = 8192;
+var g_profile_index = [_]u16{0} ** profile_index_slots;
+var g_profile_index_stale: usize = 0;
+
+fn profileSlotFor(pubkey: [32]u8) usize {
+    // The pubkey is already a hash, so its low bits are as good as any.
+    const h = std.mem.readInt(u64, pubkey[0..8], .little);
+    return @intCast(h % profile_index_slots);
+}
+
+fn profileIndexInsert(idx: usize) void {
+    var slot = profileSlotFor(g_profiles[idx].pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        if (g_profile_index[slot] == 0) {
+            g_profile_index[slot] = @intCast(idx + 1);
+            return;
+        }
+        slot = (slot + 1) % profile_index_slots;
+    }
+}
+
+fn profileIndexRebuild() void {
+    @memset(&g_profile_index, 0);
+    g_profile_index_stale = 0;
+    for (&g_profiles, 0..) |*p, i| {
+        if (p.used) profileIndexInsert(i);
+    }
+}
+
 fn lookupProfile(pubkey: [32]u8) ?*Profile {
-    for (&g_profiles) |*p| {
+    var slot = profileSlotFor(pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        const entry = g_profile_index[slot];
+        // An empty slot ends the probe: nothing past it can belong to this key.
+        if (entry == 0) return null;
+        const p = &g_profiles[entry - 1];
         if (p.used and std.mem.eql(u8, &p.pubkey, &pubkey)) return p;
+        slot = (slot + 1) % profile_index_slots;
     }
     return null;
 }
@@ -5531,9 +5895,10 @@ fn lookupProfile(pubkey: [32]u8) ?*Profile {
 /// one only while on screen.
 pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     if (lookupProfile(pubkey)) |p| return p;
-    for (&g_profiles) |*p| {
+    for (&g_profiles, 0..) |*p, i| {
         if (!p.used) {
             p.* = .{ .used = true, .pubkey = pubkey };
+            profileIndexInsert(i);
             return p;
         }
     }
@@ -5552,7 +5917,22 @@ pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     }
     const v = victim orelse return null;
     v.* = .{ .used = true, .pubkey = pubkey };
+    // The evicted key's entry is left pointing at a slot that no longer holds
+    // it. That is SAFE, because a lookup compares the pubkey and keeps probing
+    // on a mismatch, and it is what keeps eviction O(1). Rebuilding the whole
+    // table here instead cost 10ms per feed rebuild at 2048 follows, where the
+    // cache is permanently full and every new author evicts.
+    profileIndexInsert(idxOf(v));
+    g_profile_index_stale += 1;
+    // Stale entries lengthen probe chains, so the table is rebuilt occasionally
+    // rather than never. Amortised to nothing across 512 evictions.
+    if (g_profile_index_stale >= 512) profileIndexRebuild();
     return v;
+}
+
+/// The slot number of a profile pointer, for the index.
+fn idxOf(p: *const Profile) usize {
+    return (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
 }
 
 /// Parses a kind:0 metadata JSON content into `profile`'s name and picture.
@@ -6053,7 +6433,6 @@ pub const Model = struct {
     // and an unbounded one would refuse the whole view.
     /// Which page of the sheet is showing, counted from zero. Pages REPLACE each
     /// other rather than accumulating, so this is an index, not a depth.
-    notifications_page: usize = 0,
     // Whether the compose sheet is open. Compose is on demand from the "New
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
@@ -6124,6 +6503,11 @@ pub const Model = struct {
     // never consulted again.
     mentions_off: [max_mention_tags][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_mention_tags,
     mentions_off_len: usize = 0,
+    /// Whether the level on screen was opened FROM notifications, so closing it
+    /// goes back there rather than to the feed. Pressing a row used to drop the
+    /// page entirely, and Back then landed on a feed the reader had not been
+    /// looking at, with their place in the notifications list gone.
+    notifications_return: bool = false,
     // The name beat: after creating an identity, one optional, skippable ask
     // so the account is not blank. Never for imported keys or signers.
     naming: bool = false,
@@ -7057,13 +7441,24 @@ fn refreshProfiles(store: *nostr.store.Store) void {
     // comptime pack with no checks, so the first runtime follow list longer than
     // nine would have written past it: silent stack corruption in a release
     // build, from a feature that has nothing to do with profiles.
-    var authors: [max_follows + 1 + wanted_profiles_cap][32]u8 = undefined;
+    // NOT the follow list. This used to walk every follow, up to 2048 of them,
+    // on the feed reconcile path, and ask LMDB for all of their metadata on
+    // every rebuild. That is the single reason a bigger profile cache made
+    // scrolling slower rather than faster: the query limit was derived from the
+    // cache size, so growing the cache grew the query.
+    //
+    // No reference client does this. Notedeck collects pubkeys from notes that
+    // were actually ingested and only on a database MISS, then asks in a
+    // debounced batch, with no follow-list pass anywhere. Amethyst has no path
+    // at all that requests kind:0 for a whole contact list: each name on screen
+    // registers itself. Jumble does walk the follow list, but off the render
+    // path entirely, twenty at a time with a one second sleep between batches.
+    //
+    // What replaces it is already here: a displayed author with no name calls
+    // `wantProfile`, so the wanted set IS the on-screen set, which is exactly
+    // the input Notedeck uses.
+    var authors: [wanted_profiles_cap + 1][32]u8 = undefined;
     var authors_len: usize = 0;
-    for (followSet()) |pk| {
-        if (authors_len >= authors.len) break;
-        authors[authors_len] = pk;
-        authors_len += 1;
-    }
     if (activePubkey()) |pk| {
         if (authors_len < authors.len) {
             authors[authors_len] = pk;
@@ -7077,7 +7472,10 @@ fn refreshProfiles(store: *nostr.store.Store) void {
         authors[authors_len] = w.pubkey;
         authors_len += 1;
     }
-    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap + wanted_profiles_cap }) catch return;
+    if (authors_len == 0) return;
+    // The limit is how many records the query can match, which is one kind:0
+    // per author. It is not a cache size, and tying it to one was the bug.
+    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(authors_len) }) catch return;
     defer result.deinit();
     for (result.events) |ev| {
         const p = upsertProfile(ev.pubkey) orelse continue;
@@ -7125,7 +7523,25 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         }
     }.f;
     if (activePubkey()) |pk| push(&onscreen, &n, pk);
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.notifications_open) {
+        // The notifications page occludes everything, and its rows are the only
+        // faces on screen. Without this branch its authors were never in the
+        // set that lends registry slots, so every row drew initials no matter
+        // how long the page stayed open: the ids were all out on loan to a feed
+        // nobody could see.
+        // Only the rows ON SCREEN, which is the same rule the thread branch
+        // below spells out and the same mistake it is warning about. Pushing
+        // all of them marked every author wanted, and the claim pass never
+        // evicts anything wanted this pass, so nine ids were locked by rows the
+        // reader could not see and every visible row kept its initials.
+        var buf: [inbox_cap]InboxItem = undefined;
+        const shown = inboxItems(&buf, !model.notifications_everyone);
+        const first = @min(g_inbox_visible.first, shown.len);
+        const last = @min(g_inbox_visible.last + 1, shown.len);
+        if (last > first) {
+            for (shown[first..last]) |item| push(&onscreen, &n, item.author);
+        }
+    } else if (model.viewing_profile != null or model.viewing_thread != 0) {
         // A level occludes the feed, so its authors own the ids while it is up,
         // and only the ones ON SCREEN in it. Walking every note in the level
         // instead meant the first nine authors of a long thread took every id
@@ -9050,8 +9466,6 @@ pub const Msg = union(enum) {
     toggle_notifications,
     close_notifications,
     notifications_tab: u8,
-    notifications_older,
-    notifications_newer,
     notifications_read_all,
     /// The note overflow menu.
     toggle_note_menu: i64,
@@ -10179,44 +10593,99 @@ fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: [
 /// that vanishes. A page is capped and replaced rather than appended, which is
 /// the same answer the thread reached for the same reason.
 fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     var buf: [inbox_cap]InboxItem = undefined;
+    resolveInboxBodies();
     const shown = inboxItems(&buf, !model.notifications_everyone);
-    const pages = if (shown.len == 0) 1 else (shown.len + inbox_page - 1) / inbox_page;
-    const page = @min(model.notifications_page, pages - 1);
-    const first = page * inbox_page;
-    const last = @min(first + inbox_page, shown.len);
-    const rows = ui.arena.alloc(AppUi.Node, last - first) catch return ui.spacer(0);
-    for (rows, first..) |*row, i| row.* = notificationRow(ui, &shown[i]);
 
-    return ui.el(.dialog, .{
+    // A windowed list, not pages. Paging existed because every row was mounted
+    // at once and the whole view is priced against a 1024-node ceiling that
+    // refuses a frame WHOLE when crossed, so twenty rows was the arithmetic that
+    // fit. A window mounts only what is on screen, which removes the ceiling as
+    // a constraint and the pager with it: two hundred notifications are one
+    // scroll rather than ten presses of a Next button.
+    const options: AppUi.VirtualListOptions = .{
+        .id = "notifications",
+        .item_count = shown.len,
+        .item_extent = 0,
+        .extent_estimate = notificationExtentEstimate,
+        .extent_context = &shown_ctx,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 3,
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = Msg.close_notifications,
-        .on_press = Msg.close_notifications,
-        .style_tokens = .{ .background = .scrim },
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Notifications list" },
+    };
+    shown_ctx = .{ .items = shown };
+    const window = ui.virtualWindow(options);
+    g_inbox_visible = .{
+        .first = @intCast(window.first_visible_index),
+        .last = @intCast(window.last_visible_index),
+        .len = shown.len,
+    };
+    // After the window, because it asks on behalf of the rows the window chose.
+    wantInboxProfiles(shown);
+    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.spacer(0);
+    // Centred ONCE, around the list, never per row. A spacer-column-spacer
+    // wrapper on each row is four nodes apiece, and fourteen mounted rows of
+    // that is fifty-six nodes spent on horizontal alignment: enough on its own
+    // to push this view through the 1024 ceiling that refuses a frame whole.
+    for (rows, 0..) |*row, offset| {
+        const i = window.start_index + offset;
+        row.* = if (i < shown.len) notificationRow(ui, &shown[i]) else ui.spacer(0);
+    }
+
+    return ui.column(.{
+        .grow = 1,
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Notifications" },
     }, .{
-        // No `cross` override. The default is `.stretch`, and the card needs it:
-        // `modalCard` sets a width and no height, so under `.start` the card took
-        // its INTRINSIC height, the `grow = 1` scroll inside it resolved to zero,
-        // and every row was laid out and PAINTED outside the card, down the bare
-        // window, with the footer drawn on top of the first row and nothing
-        // scrollable. The tree was correct the whole time, which is why a test
-        // that asserts on the tree said so.
-        ui.row(.{ .grow = 1, .main = .center }, .{
-            modalCard(ui, 480, ui.column(.{ .grow = 1, .gap = 0 }, .{
-                notificationsHeader(ui),
-                notificationsTabs(ui, model),
-                if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
-                ui.scroll(.{ .grow = 1 }, .{
-                    ui.column(.{ .gap = 0 }, .{rows}),
-                }),
-                notificationsPager(ui, page, pages),
-                notificationsFooter(ui, shown.len),
-            })),
+        notificationsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        notificationsTabs(ui, model),
+        if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
+        ui.row(.{ .grow = 1, .gap = 0 }, .{
+            ui.spacer(1),
+            // Width only, never grow. In a row, grow claims the remaining
+            // horizontal space and beats the fixed width: 620 resolved to 853
+            // and ran 153px past the edge of the narrowest allowed window.
+            // The row's cross-axis stretch is what gives it its height.
+            ui.column(.{ .width = notifications_column_width }, .{
+                ui.virtualList(options, window, .{rows}),
+            }),
+            ui.spacer(1),
         }),
+        notificationsFooter(ui, shown.len),
     });
 }
+
+/// The rows the notifications window is measuring, so the extent callback can
+/// price one without the view handing it a closure.
+const NotificationCtx = struct { items: []const InboxItem = &.{} };
+var shown_ctx: NotificationCtx = .{};
+
+/// A cheap height for the notification at `index`, from the item alone: the
+/// row's chrome plus however many lines its body wraps to.
+fn notificationExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
+    const ctx: *const NotificationCtx = @ptrCast(@alignCast(context orelse return 64));
+    const i: usize = @intCast(index);
+    if (i >= ctx.items.len) return 64;
+    const item = &ctx.items[i];
+    // 12 padding top and bottom, the name line, the time line, and the body.
+    var extent: f32 = 12 * 2 + body_line_height + body_line_height + 6;
+    if (item.body_len > 0) {
+        const per_line: f32 = 58;
+        const lines = @max(1.0, @ceil(@as(f32, @floatFromInt(item.body_len)) / per_line));
+        extent += lines * body_line_height;
+    }
+    return extent;
+}
+
+/// The reading column for notifications, matching the feed's so a row is the
+/// same width whichever screen it is on.
+const notifications_column_width: f32 = feed_column_width;
+pub const notifications_column_width_for_test = notifications_column_width;
 
 /// How many rows the sheet draws at once.
 ///
@@ -10241,51 +10710,31 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 /// ceiling and outside the tenth of it the suite insists stays free.
 pub const inbox_page = 16;
 
-/// Older and newer, when there is more than one page.
-fn notificationsPager(ui: *AppUi, page: usize, pages: usize) AppUi.Node {
-    const p = theme.palette;
-    if (pages <= 1) return ui.spacer(0);
-    return ui.row(.{ .cross = .center, .padding = 10, .gap = 8, .style = .{ .background = p.surface_modal } }, .{
-        if (page > 0)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_newer,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Newer", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Newer", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-        ui.spacer(1),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = ui.fmt("{d} of {d}", .{ page + 1, pages }), .scale = menu_scale }},
-        ),
-        ui.spacer(1),
-        if (page + 1 < pages)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_older,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Older", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Older", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-    });
-}
-
 fn notificationsHeader(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         ui.row(.{ .cross = .center, .gap = 10, .height = 38, .padding = 0.01 }, .{
-            hgap(ui, 14),
+            hgap(ui, 10),
+            // A page needs a way out. As a sheet this had the scrim to press and
+            // Escape to dismiss; an opaque level has neither, so closing it was
+            // the bell in a rail the page was covering.
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .cross = .center,
+                .on_press = Msg.close_notifications,
+                .style = .{ .radius = 6, .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Back", .focusable = true },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 6),
+                    ui.icon(.{ .width = 14, .height = 14, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+                    hgap(ui, 4),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "Back", .scale = stat_scale }}),
+                    hgap(ui, 8),
+                    vgap(ui, 26),
+                }),
+            }),
+            hgap(ui, 4),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Notifications", .weight = .bold, .scale = settings_title_scale }},
@@ -10365,8 +10814,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     const p = theme.palette;
     const read = item.created_at <= inboxReadThrough();
     const glyph: []const u8 = switch (item.verb) {
-        .reply => "reply",
-        .mention => "reply",
+        .reply, .mention => "reply",
         .like => "like",
         .repost => "repeat",
         .zap => "zap",
@@ -10377,22 +10825,81 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         .like => p.status_like,
         else => p.text_muted_alt,
     };
+    // A reply says only the name. "replied to you" above a row that already
+    // shows their reply is the same fact twice.
     const verb_text: []const u8 = switch (item.verb) {
-        .reply => "replied to you",
-        .mention => "mentioned you",
-        .like => "liked your note",
-        .repost => "reposted you",
-        .zap => "zapped you",
+        .reply => "",
+        .mention => "mentioned you in a note",
+        .like => "reacted to your note",
+        .repost => "reposted your note",
+        .zap => "zapped your note",
     };
-    // Flattened deliberately: the four spacer nodes this used to hold, plus the
-    // inner column and its two vertical gaps, cost seven nodes A ROW for spacing
-    // that `padding` and `gap` already express. Twenty rows of that is a seventh
-    // of the whole view budget spent on whitespace.
+    const body = item.body();
+    const emoji = item.reactionGlyph();
+
+    // Name, verb and amount are SPANS of one paragraph, not three paragraphs.
+    // The row is priced in widget nodes against a per-view ceiling that refuses
+    // the whole screen when crossed, and the first cut of this row spent five
+    // extra nodes apiece on things that are only text: twenty rows of that put
+    // the notifications view at 924 against a ceiling of 1024 with 102 that has
+    // to stay free. Spans cost nothing.
+    var head: [3]canvas.TextSpan = undefined;
+    var head_len: usize = 0;
+    head[head_len] = .{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale };
+    head_len += 1;
+    if (verb_text.len > 0) {
+        head[head_len] = .{ .text = ui.fmt(" {s}", .{verb_text}), .scale = nested_meta_scale };
+        head_len += 1;
+    }
+    if (item.verb == .zap and item.msat > 0) {
+        head[head_len] = .{ .text = ui.fmt("  {d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale };
+        head_len += 1;
+    }
+
+    // Built by hand rather than with an `else ui.spacer(0)` per optional child,
+    // because an empty spacer is still a node and this row has three of them.
+    var kids: [3]AppUi.Node = undefined;
+    var kids_len: usize = 0;
+    kids[kids_len] = ui.el(.list_item, .{
+        .padding = 0.01,
+        .on_press = Msg{ .open_person = item.author },
+        .style = .{ .radius = 4, .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+    }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, head[0..head_len]),
+    });
+    kids_len += 1;
+    if (body.len > 0) {
+        // Theirs for a reply, yours for everything else, and dimmer when it is
+        // yours: you wrote it, so the new fact is who did what to it.
+        const own = item.verb != .reply and item.verb != .mention;
+        // Two lines and stop, cut in the spans before layout because the SDK
+        // has no multi-line clamp. The same rule an ancestor's body follows, so
+        // a long note cannot turn one notification into half a screen.
+        // Through the same renderer the feed uses, so a `nostr:npub…` reads as a
+        // name and a `nostr:nevent…` does not dump sixty characters of bech32
+        // into the preview. It was raw before, which is the one thing a preview
+        // must not be.
+        const spans = clampSpansToLines(ui, contentSpans(ui, body), notification_body_lines);
+        kids[kids_len] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
+            spans,
+        );
+        kids_len += 1;
+    }
+    kids[kids_len] = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_faint_alt } },
+        &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
+    );
+    kids_len += 1;
+
     return ui.column(.{ .gap = 0 }, .{
         ui.el(.data_row, .{
             .padding = 12,
             .gap = 10,
-            .cross = .center,
+            // Top aligned: the row is several lines now, and a gutter glyph
+            // floating beside the middle of a paragraph belongs to nothing.
+            .cross = .start,
             // `open_event`, never `open_thread`. The thread route resolves an id
             // against the LOADED FEED, which is scoped to follows and holds at
             // most a few hundred notes; what a notification points at is almost
@@ -10401,7 +10908,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
             // a silent no-op. This one asks the store by name.
             .on_press = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author },
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = verb_text, .focusable = true },
+            .semantics = .{ .role = .button, .label = if (verb_text.len > 0) verb_text else "replied to you", .focusable = true },
         }, .{
             // The unread dot holds its width either way, so a row does not shift
             // sideways the moment it is read.
@@ -10416,26 +10923,34 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
                     .stroke_width = 0,
                 },
             }, .{}),
-            ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
-            ui.row(.{ .cross = .center, .gap = 5, .grow = 1 }, .{
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_body_soft } },
-                    &.{.{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale }},
-                ),
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = verb_text, .scale = nested_meta_scale }}),
-                if (item.verb == .zap and item.msat > 0)
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.status_warning } },
-                        &.{.{ .text = ui.fmt("{d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale }},
-                    )
+            // Glyph and face together, centred against EACH OTHER, and that pair
+            // top-aligned against the text. The row's own `.cross = .start` is
+            // right for the avatar, which should hang beside the name and the
+            // first line of the body, and wrong for a 14pt glyph, which then
+            // floated at the very top with nothing beside it.
+            ui.row(.{ .cross = .center, .gap = 10 }, .{
+                // The reaction they actually sent, where a generic heart used to
+                // be. A shortcode with no image would print as `:shakingeyes:`,
+                // so only something short enough to read as a glyph is drawn.
+                if (item.verb == .like and emoji.len > 0 and emoji.len <= 8)
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = emoji, .scale = nested_meta_scale }})
                 else
-                    ui.spacer(0),
-                ui.spacer(1),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_faint_alt } },
-                    &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
-                ),
+                    ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
+                // The face and the name go to the person, everything else goes
+                // to the note. That is what the feed does and what Jumble does,
+                // and without it the one thing a notification is most likely to
+                // make you want (who IS this) was the one thing you could not
+                // press.
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .on_press = Msg{ .open_person = item.author },
+                    .style = .{ .radius = 999, .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+                }, .{
+                    personAvatar(ui, item.author, nested_avatar_size),
+                }),
             }),
+            ui.column(.{ .gap = 3, .grow = 1 }, kids[0..kids_len]),
         }),
         ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
     });
@@ -12397,7 +12912,18 @@ pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []n
         if (len + 2 > out.len) break;
         const chunk = authors[start..@min(start + follow_chunk, authors.len)];
         out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_request_limit };
-        out[len + 1] = .{ .authors = chunk, .kinds = &profile_filter_kinds, .limit = profile_cap };
+        // One record per author per kind, which is what the filter can actually
+        // return: these are all replaceable, so a relay holds at most one of
+        // each. The old limit was `profile_cap`, a UI cache size, which for a
+        // 500-author chunk across three kinds asked for 1500 records and
+        // permitted 160. A relay obeying the limit answered a third of a chunk
+        // and the rest of those authors stayed nameless until something else
+        // happened to ask for them.
+        out[len + 1] = .{
+            .authors = chunk,
+            .kinds = &profile_filter_kinds,
+            .limit = @intCast(chunk.len * profile_filter_kinds.len),
+        };
         len += 2;
     }
     return out[0..len];
@@ -12416,6 +12942,23 @@ var g_follow_created_at: i64 = 0;
 /// notes, and a sign-in asks for the new account's own records, without waiting
 /// for a socket to drop.
 var g_follow_gen = std.atomic.Value(u32).init(0);
+
+/// Bumped only when WHO IS SIGNED IN changes, never when the follow list moves.
+///
+/// The inbox REQ hung off the follow generation, so following one person
+/// re-issued `plaza-inbox` on every read relay with a 200-event backfill. At
+/// eight relays that is up to 1600 events re-delivered and re-verified for a
+/// change the inbox does not depend on: its filter names one pubkey, the
+/// reader's own. Amethyst keeps these on separate watchers for the same reason.
+var g_identity_gen = std.atomic.Value(u32).init(0);
+
+pub fn identityGeneration() u32 {
+    return g_identity_gen.load(.acquire);
+}
+
+pub fn bumpIdentityGeneration() void {
+    _ = g_identity_gen.fetchAdd(1, .monotonic);
+}
 /// Guards the table. The UI thread writes it; ingest threads read it to build
 /// their filters.
 var g_follow_lock = std.atomic.Value(bool).init(false);
@@ -12581,6 +13124,9 @@ fn forgetFollows() void {
     // records requested on an already-open socket, and following stays disabled
     // for the whole session.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // And this is the one thing the inbox DOES depend on: whose notifications
+    // these are. It is the only place that bumps it, which is the point.
+    bumpIdentityGeneration();
 }
 
 /// Seeds the follow set from the local store, at boot and at sign-in.
@@ -13007,10 +13553,10 @@ fn clearPendingFollowBase() void {
 fn setPendingFollowBase(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
     const gpa = std.heap.page_allocator;
     clearPendingFollowBase();
-    const tag_copy = dupeTags(gpa, tags);
-    // `dupeTags` degrades to an empty set rather than failing, and an empty base
-    // is worse than no base: it would publish a list with nobody in it.
-    if (tag_copy.len == 0 and tags.len != 0) return;
+    // No base beats a partial one: a partial one publishes a list with nobody
+    // in it. `dupeTags` reports the difference now rather than returning an
+    // empty set that reads as "this list was empty".
+    const tag_copy = dupeTags(gpa, tags) orelse return;
     g_pending_follow_tags = tag_copy;
     g_pending_follow_content = gpa.dupe(u8, content) catch {
         clearPendingFollowBase();
@@ -14148,7 +14694,8 @@ fn readRecord(gpa: std.mem.Allocator, pubkey: [32]u8, kind: u16) ?OwnProfile {
     defer result.deinit();
     if (result.events.len == 0) return null;
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -14627,7 +15174,12 @@ fn profileTabFocused(ui: *AppUi, label: []const u8, active: bool, msg: Msg, focu
         hgap(ui, 11),
         ui.paragraph(
             .{ .style = .{ .foreground = if (active) p.text_primary else p.text_muted_alt } },
-            &.{.{ .text = label, .weight = if (active) .medium else .regular, .scale = menu_scale }},
+            // One weight for both. The active tab already has its own fill,
+            // border and text colour, and changing the weight as well moved the
+            // glyph metrics, so the two labels sat on different baselines inside
+            // boxes that were centred correctly. The tabs looked misaligned and
+            // the row was never the problem.
+            &.{.{ .text = label, .scale = menu_scale }},
         ),
         hgap(ui, 11),
     });
@@ -17887,14 +18439,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .profiles => |t| {
             if (t.outcome == .fired) {
-                // Re-arm the still-unnamed every so often: a relay that had
-                // nothing a moment ago may have it now.
+                // Quotes still re-arm on a round counter. Profiles no longer
+                // need to: each pubkey carries its own last-tried stamp and
+                // backs off on its own, so asking every tick costs nothing for
+                // the ones that are waiting and retries the rest when due.
                 g_profile_round +%= 1;
                 g_quote_round +%= 1;
-                if (g_profile_round % profile_rearm_rounds == 0) {
-                    rearmWantedProfiles();
-                    rearmWantedQuotes();
-                }
+                if (g_quote_round % quote_rearm_rounds == 0) rearmWantedQuotes();
                 requestWantedProfiles();
                 requestWantedQuotes();
             }
@@ -17975,6 +18526,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             } else model.composing = true;
         },
         .open_person => |pk| {
+            model.notifications_return = model.notifications_open;
             model.notifications_open = false;
             enterProfile(model, pk);
         },
@@ -17994,7 +18546,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
-            model.notifications_page = 0;
             // Opening IS reading: the reader is looking at them. The mark moves
             // to the newest item held, never to the wall clock, so a backfill
             // arriving later with older stamps is not born already read.
@@ -18008,19 +18559,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.notifications_everyone = which == 1;
             // The other tab holds a different set, so page four of this one is
             // not page four of that one.
-            model.notifications_page = 0;
-        },
-        .notifications_older => {
-            // Clamped in the MODEL, not only where it is drawn. The view clamps
-            // for its own safety, but leaving the model past the end means the
-            // reader presses Newer and watches nothing move, once for every page
-            // the set shrank by underneath them.
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page + 1, last);
-        },
-        .notifications_newer => {
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page, last) -| 1;
         },
         .notifications_read_all => {
             inboxMarkAllRead();
@@ -18401,6 +18939,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // anything that could close the sheet. Closing on arrival therefore
             // left it up in exactly the cases where the reader has least idea why
             // nothing moved.
+            model.notifications_return = model.notifications_open;
             model.notifications_open = false;
             openEvent(model, id);
         },
@@ -18678,7 +19217,8 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     // Copied out before `result.deinit()`: the query owns its events through an
     // arena, and the write seam holds what it is given past this frame.
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -18872,7 +19412,7 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // The TAGS come forward too. NIP-39 identity proofs (a GitHub account, a
     // Mastodon handle) live in kind:0's tags, and republishing with none would
     // delete them as silently as dropping a JSON key.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, created, 0, tags, merged, false);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
@@ -19090,7 +19630,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     // proofs to lose, so this is not a bug being fixed: it is the one line that
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
@@ -19960,13 +20500,24 @@ fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
 /// Deep-copies `tags` into process-lifetime memory so the detached publisher can
 /// read them after the parse arena is freed. Returns an empty set on OOM (posts
 /// are tagless, so nothing is lost there; a reaction that OOMs simply drops).
-fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) []const nostr.event.Tag {
+/// Copies a record's tags, or reports that it could not.
+///
+/// Null, never an empty slice. This is the splice base for every replaceable
+/// write (kind 0, 3 and 10002), and those writes decide how much to keep by
+/// counting what is in here. An empty slice says "this record had no tags",
+/// which is a true statement about a record with no tags and a catastrophic one
+/// about a copy that ran out of memory: the follow list's own shrink guard
+/// compares against this same slice, so 0 to 1 reads as growth and passes.
+///
+/// A base that could not be copied whole must read as "not read". Every caller
+/// already handles that safely, because it is the same path as a store miss.
+fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
     if (tags.len == 0) return &.{};
-    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return &.{};
+    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return null;
     for (tags, 0..) |tag, i| {
-        const fields = gpa.alloc([]const u8, tag.len) catch return &.{};
+        const fields = gpa.alloc([]const u8, tag.len) catch return null;
         for (tag, 0..) |field, j| {
-            fields[j] = gpa.dupe(u8, field) catch return &.{};
+            fields[j] = gpa.dupe(u8, field) catch return null;
         }
         out[i] = fields;
     }
@@ -20973,6 +21524,13 @@ fn closeThread(model: *Model) void {
         model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
+        // Back to where the reader actually came from. The list is rebuilt from
+        // the same inbox and the window keeps its offset on the list's own id,
+        // so this lands on the row they pressed rather than at the top.
+        if (model.notifications_return) {
+            model.notifications_return = false;
+            model.notifications_open = true;
+        }
     }
 }
 
@@ -21440,7 +21998,9 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             // Preserve the signed tags (a reaction carries e/p/k); forcing them
             // empty would make the id not match, and the verify below would drop
             // it. Deep-copied because `parsed` is freed on return.
-            out.tags = dupeTags(gpa, parsed.value.tags);
+            // Whole, or not published: the id is computed over these tags, so
+            // a partial copy is an event the verify below would drop anyway.
+            out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
             ingestAndPublish(gpa, out, signer);
         },
     }
@@ -22242,6 +22802,9 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // The generation this subscription was built for. When it moves, this
     // connection is asking the wrong question and re-asks below.
     var subscribed_gen = followGeneration();
+    // Set to the generation already served by `subscribeInbox` at dial below,
+    // so the loop does not immediately re-issue what was just sent.
+    var inbox_gen = identityGeneration();
     // Whether this subscription asked about the reader themselves. A connection
     // dialed while signed out did not, and its EOSE is not an answer about them.
     var asked_about_me = activePubkey() != null;
@@ -22351,6 +22914,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // connection, no matter who replied. Re-issuing here is also what
             // heals a REQ that failed to send, and what stops a socket carrying
             // the previous account's filter after a switch.
+        }
+        // The inbox rides its own generation: its filter names ONE pubkey, the
+        // reader's, so a contact-list change has nothing to do with it.
+        if (reads and identityGeneration() != inbox_gen) {
+            inbox_gen = identityGeneration();
             subscribeInbox(relay);
         }
         var msg = (try relay.receive()) orelse break;
