@@ -12453,6 +12453,19 @@ test "a long follow list is split across filters that relays accept, in one REQ"
         if (f.kinds.?.len == 1) try testing.expectEqual(@as(u32, 300), f.limit.?);
     }
 
+    // The metadata limit is derived from the chunk, never from a screen cache.
+    //
+    // These are replaceable records, so a relay holds at most one of each per
+    // author: the right number to ask for is the number of authors times the
+    // number of kinds, and anything else is a coincidence. Asserting it because
+    // the number that used to be here was `profile_cap`, the size of the
+    // in-memory profile table, which permitted a fraction of a chunk and left
+    // the rest of those people nameless.
+    for (filters) |f| {
+        if (f.kinds.?.len == 1) continue;
+        try testing.expectEqual(@as(u32, @intCast(f.authors.?.len * 3)), f.limit.?);
+    }
+
     // A list that fits in one chunk is still one chunk, not a special case.
     const few = try arena.alloc([32]u8, 9);
     for (few, 0..) |*a, i| {
@@ -12462,6 +12475,56 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, &buf).len);
     // And nobody at all asks nothing, rather than asking about everybody.
     try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, &buf).len);
+}
+
+test "a relay that keeps dropping is asked less and less often" {
+    // The wait doubles from three seconds and stops at five minutes, so a relay
+    // that is down, that has stopped taking this reader, or that accepts the
+    // handshake and hangs up is not dialled twelve hundred times an hour for as
+    // long as the app is open.
+    try testing.expectEqual(@as(u64, 3_000), main.reconnectDelayMs(0));
+    try testing.expectEqual(@as(u64, 6_000), main.reconnectDelayMs(1));
+    try testing.expectEqual(@as(u64, 12_000), main.reconnectDelayMs(2));
+    try testing.expectEqual(@as(u64, 96_000), main.reconnectDelayMs(5));
+    try testing.expectEqual(@as(u64, 300_000), main.reconnectDelayMs(7));
+    // And it stops there rather than growing into hours, or wrapping.
+    try testing.expectEqual(@as(u64, 300_000), main.reconnectDelayMs(63));
+
+    // The ladder is cleared by a connection that LASTED, never by one that
+    // merely opened. A relay that accepts the socket and drops it immediately
+    // is the case this exists for: without the rule its ladder resets on every
+    // open and it is redialled at three seconds forever.
+    try testing.expectEqual(@as(u6, 1), main.nextReconnectAttempts(0, 1_200));
+    try testing.expectEqual(@as(u6, 2), main.nextReconnectAttempts(1, 59_999));
+    try testing.expectEqual(@as(u6, 0), main.nextReconnectAttempts(5, 60_000));
+    try testing.expectEqual(@as(u6, 0), main.nextReconnectAttempts(63, 3_600_000));
+    // A clock that reads backwards must not clear it either.
+    try testing.expectEqual(@as(u6, 4), main.nextReconnectAttempts(3, -1));
+    // And the count saturates instead of wrapping back to a short wait.
+    try testing.expectEqual(@as(u6, 63), main.nextReconnectAttempts(63, 0));
+}
+
+test "eight relays that drop together do not come back together" {
+    // The whole pool goes down on one network blip, so without a spread all
+    // eight threads redial in the same millisecond, and keep doing it, forever.
+    // Assert the consequence: eight distinct wake-up times, none of them more
+    // than a quarter past the wait.
+    const wait = main.reconnectDelayMs(0);
+    var seen: [8]u64 = undefined;
+    for (0..8) |i| {
+        const jitter = main.reconnectJitterMs(wait, i, 0);
+        try testing.expect(jitter <= wait / 4);
+        seen[i] = wait + jitter;
+    }
+    for (seen, 0..) |a, i| {
+        for (seen[i + 1 ..]) |b| {
+            if (a == b) return error.RelaysStillInLockstep;
+        }
+    }
+
+    // Two relays that DID start aligned are separated by the attempt count, so
+    // a slot that fails while its neighbour recovers drifts apart from it.
+    try testing.expect(main.reconnectJitterMs(wait, 3, 0) != main.reconnectJitterMs(wait, 3, 1));
 }
 
 test "the window cannot be declared smaller than its own floor" {
