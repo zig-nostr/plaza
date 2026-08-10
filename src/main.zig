@@ -10650,7 +10650,11 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         // Two lines and stop, cut in the spans before layout because the SDK
         // has no multi-line clamp. The same rule an ancestor's body follows, so
         // a long note cannot turn one notification into half a screen.
-        const spans = clampSpansToLines(ui, &.{.{ .text = body, .scale = nested_meta_scale }}, notification_body_lines);
+        // Through the same renderer the feed uses, so a `nostr:npub…` reads as a
+        // name and a `nostr:nevent…` does not dump sixty characters of bech32
+        // into the preview. It was raw before, which is the one thing a preview
+        // must not be.
+        const spans = clampSpansToLines(ui, contentSpans(ui, body), notification_body_lines);
         kids[kids_len] = ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
             spans,
@@ -10693,24 +10697,32 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
                     .stroke_width = 0,
                 },
             }, .{}),
-            // The reaction they actually sent, where a generic heart used to be.
-            // A shortcode with no image would print as `:shakingeyes:`, so only
-            // something short enough to read as a glyph is drawn as one.
-            if (item.verb == .like and emoji.len > 0 and emoji.len <= 8)
-                ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = emoji, .scale = nested_meta_scale }})
-            else
-                ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
-            // The face and the name go to the person, everything else goes to
-            // the note. That is what the feed does and what Jumble does, and
-            // without it the one thing a notification is most likely to make
-            // you want (who IS this) was the one thing you could not press.
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .on_press = Msg{ .open_person = item.author },
-                .style = .{ .radius = 999, .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
-            }, .{
-                personAvatar(ui, item.author, nested_avatar_size),
+            // Glyph and face together, centred against EACH OTHER, and that pair
+            // top-aligned against the text. The row's own `.cross = .start` is
+            // right for the avatar, which should hang beside the name and the
+            // first line of the body, and wrong for a 14pt glyph, which then
+            // floated at the very top with nothing beside it.
+            ui.row(.{ .cross = .center, .gap = 10 }, .{
+                // The reaction they actually sent, where a generic heart used to
+                // be. A shortcode with no image would print as `:shakingeyes:`,
+                // so only something short enough to read as a glyph is drawn.
+                if (item.verb == .like and emoji.len > 0 and emoji.len <= 8)
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = emoji, .scale = nested_meta_scale }})
+                else
+                    ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
+                // The face and the name go to the person, everything else goes
+                // to the note. That is what the feed does and what Jumble does,
+                // and without it the one thing a notification is most likely to
+                // make you want (who IS this) was the one thing you could not
+                // press.
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .on_press = Msg{ .open_person = item.author },
+                    .style = .{ .radius = 999, .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+                }, .{
+                    personAvatar(ui, item.author, nested_avatar_size),
+                }),
             }),
             ui.column(.{ .gap = 3, .grow = 1 }, kids[0..kids_len]),
         }),
@@ -14904,7 +14916,12 @@ fn profileTabFocused(ui: *AppUi, label: []const u8, active: bool, msg: Msg, focu
         hgap(ui, 11),
         ui.paragraph(
             .{ .style = .{ .foreground = if (active) p.text_primary else p.text_muted_alt } },
-            &.{.{ .text = label, .weight = if (active) .medium else .regular, .scale = menu_scale }},
+            // One weight for both. The active tab already has its own fill,
+            // border and text colour, and changing the weight as well moved the
+            // glyph metrics, so the two labels sat on different baselines inside
+            // boxes that were centred correctly. The tabs looked misaligned and
+            // the row was never the problem.
+            &.{.{ .text = label, .scale = menu_scale }},
         ),
         hgap(ui, 11),
     });
