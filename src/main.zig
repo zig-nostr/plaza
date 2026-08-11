@@ -5857,11 +5857,80 @@ pub fn bolt11Msat(invoice: []const u8) u64 {
 }
 
 /// The sats a kind:9735 zap receipt is worth, from its bolt11 tag.
+/// The most a single receipt may add to a note's total.
+///
+/// Not a judgement about generosity: it is a bound on how wrong one forged
+/// receipt can make the number. A hundred thousand sats is already an unusual
+/// zap, and a card claiming millions is the whole payoff for forging one.
+const zap_msat_ceiling: u64 = 100_000_000; // 100k sats
+pub const zap_msat_ceiling_for_test = zap_msat_ceiling;
+
+/// What a zap receipt is worth to a note's total, after checking it is real.
+///
+/// The counting path used to read the receipt's own `bolt11` tag and add it,
+/// with nothing checked. A kind:9735 is an ordinary public event that anybody
+/// can publish, so a note could be given any total at all by writing a receipt
+/// with a large invoice string in it and no payment behind it. `zapClaim`
+/// already did this properly for the inbox and this path never called it.
+///
+/// What is checked here, without a network round trip:
+///
+///   - the `description` holds a real kind:9734 zap request whose signature
+///     verifies, so the receipt carries something the payer actually signed;
+///   - that request asks about THIS event, so a genuine receipt for a different
+///     note cannot be replayed onto this one;
+///   - the amount is the smaller of what the request asked for and what the
+///     invoice says, so neither number alone can inflate the total;
+///   - the result is clamped.
+///
+/// Not checked: that the receipt is signed by the recipient's LNURL server
+/// (`nostrPubkey`), which the reference clients do verify. That needs the
+/// recipient's LNURL, which is a fetch this path cannot make. Its absence means
+/// a receipt can still be minted by someone willing to sign a zap request for
+/// the reader's note, which is a far higher bar than editing a string.
 fn zapMsat(ev: nostr.event.Event) u64 {
+    const target = engagementTarget(ev) orelse return 0;
+
+    var invoice_msat: u64 = 0;
+    var description: ?[]const u8 = null;
     for (ev.tags) |tag| {
-        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "bolt11")) return bolt11Msat(tag[1]);
+        if (tag.len < 2) continue;
+        if (std.mem.eql(u8, tag[0], "bolt11")) invoice_msat = bolt11Msat(tag[1]);
+        if (std.mem.eql(u8, tag[0], "description")) description = tag[1];
     }
-    return 0;
+    const desc = description orelse return 0;
+
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.event.fromJson(gpa, desc) catch return 0;
+    defer parsed.deinit();
+    const req = parsed.value;
+    if (req.kind != 9734) return 0;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    if (!(nostr.event.verify(gpa, signer, req) catch false)) return 0;
+
+    // The request has to be about the note being credited. Without this a real
+    // receipt for a popular note could be re-published against any other note.
+    var about_this_note = false;
+    var requested_msat: u64 = 0;
+    for (req.tags) |t| {
+        if (t.len < 2) continue;
+        if (t[0].len == 1 and t[0][0] == 'e' and std.ascii.eqlIgnoreCase(t[1], target))
+            about_this_note = true;
+        if (std.mem.eql(u8, t[0], "amount"))
+            requested_msat = std.fmt.parseInt(u64, t[1], 10) catch 0;
+    }
+    if (!about_this_note) return 0;
+
+    // Both numbers, when both are present: the smaller one. An invoice for a
+    // fortune attached to a request for a sat is not worth a fortune, and the
+    // reverse is equally untrue.
+    const msat = if (requested_msat > 0 and invoice_msat > 0)
+        @min(requested_msat, invoice_msat)
+    else if (invoice_msat > 0) invoice_msat else requested_msat;
+
+    return @min(msat, zap_msat_ceiling);
 }
 
 /// The single note an engagement event is about: its `reply`-marked e tag if it
@@ -5924,6 +5993,16 @@ fn noteIdFromHex(hex: []const u8) ?i64 {
 }
 
 /// Clears the engagement table and dedup set. For tests.
+/// Sets a note's zap total directly, for tests about what the RENDER does with
+/// a large number. Ingestion cannot produce one in a single step any more, and
+/// the two properties are worth testing apart: what is admitted, and what is
+/// survivable once admitted.
+pub fn setZapMsatForTest(id: i64, msat: u64) void {
+    engagementLock();
+    defer engagementUnlock();
+    if (ensureEngagement(id)) |row| row.counts.zap_msat = msat;
+}
+
 pub fn resetEngagementForTest() void {
     g_engagement = [_]Engagement{.{}} ** engagement_cap;
     g_seen = [_]u64{0} ** seen_engagement_cap;

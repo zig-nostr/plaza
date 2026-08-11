@@ -620,21 +620,107 @@ test "engagement counts one event against its single target, not every e-tag" {
     try testing.expectEqual(@as(u32, 1), main.engagementFor(parent_i64).likes);
 }
 
-test "engagement sums zap sats from the bolt11 amount" {
-    main.resetEngagementForTest();
-    defer main.resetEngagementForTest();
+/// A zap receipt whose `description` carries a real, signed kind:9734 asking
+/// about `target_hex`. Anything less is not a zap the counting path will take.
+fn zapReceipt(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    target_hex: []const u8,
+    invoice: []const u8,
+    amount_msat: ?[]const u8,
+) !nostr.event.Event {
+    // Every slice here is arena-allocated on purpose: `create` borrows the tag
+    // slice rather than copying it, so a local array would dangle the moment
+    // this function returned.
+    const req_e = try arena.dupe([]const u8, &.{ "e", target_hex });
+    var req_tags = try arena.alloc(nostr.event.Tag, if (amount_msat != null) @as(usize, 2) else 1);
+    req_tags[0] = req_e;
+    if (amount_msat) |a| req_tags[1] = try arena.dupe([]const u8, &.{ "amount", a });
+    const req = try nostr.event.create(arena, signer, kp, 1_800_000_000, 9734, req_tags, "", null);
+    const req_json = try nostr.event.toJson(arena, req);
+
+    var tags = try arena.alloc(nostr.event.Tag, 3);
+    tags[0] = try arena.dupe([]const u8, &.{ "e", target_hex });
+    tags[1] = try arena.dupe([]const u8, &.{ "bolt11", invoice });
+    tags[2] = try arena.dupe([]const u8, &.{ "description", req_json });
+    return nostr.event.create(arena, signer, kp, 1_800_000_001, 9735, tags, "", null);
+}
+
+test "a zap counts only when a signed request backs it, for this note" {
+    // The counting path used to add the receipt's own bolt11 string with
+    // nothing checked, and a kind:9735 is an ordinary public event. So any note
+    // could be given any total by publishing a receipt with a big invoice in it
+    // and no payment behind it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x42} ** 32);
 
     var target_id = [_]u8{0} ** 32;
     target_id[0] = 0x5A;
     const target_i64: i64 = @intCast(std.mem.readInt(u64, target_id[0..8], .big) & std.math.maxInt(i64));
     const target_hex = std.fmt.bytesToHex(target_id, .lower);
-    const e_tag = [_][]const u8{ "e", &target_hex };
-    const bolt11 = [_][]const u8{ "bolt11", "lnbc210n1pjxxxxx" }; // 21000 msat = 21 sats
-    const tags = [_]nostr.event.Tag{ &e_tag, &bolt11 };
     const feed = [_]i64{target_i64};
 
-    main.countEngagementForTest(engagementEvent(11, 9735, "", &tags), &feed);
-    try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    // A real one: signed request, about this note, 21 sats.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc210n1pjxxxxx", "21000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // A bare invoice with no request behind it: the forgery, now worth nothing.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const e_tag = [_][]const u8{ "e", &target_hex };
+        const bolt11 = [_][]const u8{ "bolt11", "lnbc10m1pxxx" }; // a million sats
+        const tags = [_]nostr.event.Tag{ &e_tag, &bolt11 };
+        main.countEngagementForTest(engagementEvent(11, 9735, "", &tags), &feed);
+        try testing.expectEqual(@as(u64, 0), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // A genuine receipt for a DIFFERENT note, replayed onto this one.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        var other = [_]u8{0} ** 32;
+        other[0] = 0x77;
+        const other_hex = std.fmt.bytesToHex(other, .lower);
+        // Request names the other note; the receipt's own e tag names this one.
+        const receipt = try zapReceipt(arena, signer, kp, &other_hex, "lnbc210n1pjxxxxx", "21000");
+        var tags = try arena.alloc(nostr.event.Tag, receipt.tags.len);
+        for (receipt.tags, 0..) |t, i| tags[i] = t;
+        tags[0] = try arena.dupe([]const u8, &.{ "e", &target_hex });
+        var moved = receipt;
+        moved.tags = tags;
+        main.countEngagementForTest(moved, &feed);
+        try testing.expectEqual(@as(u64, 0), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // Request and invoice disagreeing: the smaller wins, so neither number
+    // alone can inflate the total.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc10m1pxxx", "21000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // And a real request for an absurd amount is still clamped.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc51pxxx", "500000000000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(main.zap_msat_ceiling_for_test, main.engagementFor(target_i64).zap_msat);
+    }
 }
 
 test "bolt11 amounts parse across multipliers" {
@@ -8282,11 +8368,13 @@ test "the client-tag switch is wired, and flipping it sticks" {
 }
 
 test "a zap total no invoice could hold does not take the screen down with it" {
-    // `bolt11` is a string on somebody else's event. Nothing validates it, and
-    // nothing can: a zap receipt is a text field anyone may publish. The action
-    // bar narrowed that saturating u64 total into a u32 to draw it, which is an
-    // abort in a safety build and a silently wrong number in the shipped one, and
-    // the input costs an attacker one signature.
+    // A zap total is a saturating u64, and the action bar narrowed it into a u32
+    // to draw it: an abort in a safety build, a silently wrong number in the
+    // shipped one. Receipts are validated and clamped on the way in now, so a
+    // single one can no longer produce a total like this; totals accumulate,
+    // though, and the arithmetic saturates, so the render still has to survive
+    // whatever it is handed. That is what this checks, so it sets the total
+    // directly rather than pretending a forged receipt could still do it.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -8306,17 +8394,7 @@ test "a zap total no invoice could hold does not take the screen down with it" {
     var e_hex: [64]u8 = undefined;
     for (model.thread_root.event_id, 0..) |b, i| _ = std.fmt.bufPrint(e_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
 
-    // One receipt claiming more millisats than there are millisats.
-    const receipt = nostr.event.Event{
-        .id = [_]u8{0x9F} ** 32,
-        .pubkey = [_]u8{0x77} ** 32,
-        .created_at = 1_800_000_000,
-        .kind = 9735,
-        .tags = &.{ &.{ "e", &e_hex }, &.{ "bolt11", "lnbc1000000000m1xxxx" } },
-        .content = "",
-        .sig = [_]u8{0} ** 64,
-    };
-    main.countEngagementForTest(receipt, &.{model.thread_root.id});
+    main.setZapMsatForTest(model.thread_root.id, std.math.maxInt(u64));
     // Well past what a u32 of sats can hold.
     try testing.expect(main.engagementFor(model.thread_root.id).zap_msat / 1000 > std.math.maxInt(u32));
 
