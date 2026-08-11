@@ -13606,3 +13606,45 @@ test "a relay coming back puts a note at the front of the queue, but a flapping 
     }
     try testing.expectEqual(before, main.outboxRoundsForTest(id).?);
 }
+
+test "a feed author with no name is asked about, before the row is on screen" {
+    // The wanted set had exactly two sources: the inbox, and quoted notes. The
+    // feed registered nobody. That was survivable only while `refreshProfiles`
+    // walked the whole follow list, and when that walk left the render path the
+    // feed lost its only source of names. Real accounts, with profiles sitting
+    // on the relays, drew as a raw npub and a two-character avatar for the
+    // whole session.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // A feed longer than one screen, so the band matters.
+    const rows = 40;
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        var note = threadNote(@intCast(i + 1), @intCast(1000 - @as(i64, @intCast(i))), 0);
+        note.id = @intCast(i + 1);
+        note.pubkey = [_]u8{@intCast(i + 1)} ** 32;
+        model.notes[i] = note;
+    }
+    model.notes_len = rows;
+    main.setVisibleRangeForTest(0, 4);
+
+    main.wantProfilesAheadForTest(&model);
+
+    // On screen: asked about, obviously.
+    try testing.expect(main.isProfileWantedForTest([_]u8{1} ** 32));
+    try testing.expect(main.isProfileWantedForTest([_]u8{5} ** 32));
+
+    // And ahead of the fold, which is the point: a name that only starts
+    // loading when the row appears is a name the reader watches arrive. It is
+    // also what lets a face be warmed early, since the picture URL lives in the
+    // kind:0 and there is nothing to warm until it lands.
+    try testing.expect(main.isProfileWantedForTest([_]u8{12} ** 32));
+
+    // Not the whole feed, though: the band is bounded, or a long scrollback
+    // would ask about everybody at once.
+    try testing.expect(!main.isProfileWantedForTest([_]u8{40} ** 32));
+}
