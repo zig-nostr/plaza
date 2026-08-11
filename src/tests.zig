@@ -14907,3 +14907,77 @@ test "a write-only relay is not asked a question" {
     try testing.expectEqual(@as(usize, 0), slots[0]);
     try testing.expectEqual(@as(usize, 2), slots[1]);
 }
+
+test "a name is only bounded when it might need bounding" {
+    // The `width` on an identity leaf is what lets the SDK ellipsize, and
+    // fitting bounded single-line text is what the layout stage pays for. Two
+    // sit in every feed row. So it goes on only when the string could overflow.
+    //
+    // The test is an UPPER BOUND on the width, never an estimate: a false "does
+    // not fit" costs one row the old behaviour, a false "fits" puts a
+    // stranger's display name through the side of the window, which is the bug
+    // this whole mechanism exists for.
+    const room = main.identityTextWidthForTest;
+    try testing.expect(main.textProvablyFitsForTest("jack", room));
+    try testing.expect(main.textProvablyFitsForTest("fiatjaf", room));
+    try testing.expect(main.textProvablyFitsForTest("", room));
+
+    // A display name is 64 bytes at most and a NIP-05 is 128. Neither of those
+    // provably fits, so both keep the bound.
+    try testing.expect(!main.textProvablyFitsForTest("W" ** 64, room));
+    try testing.expect(!main.textProvablyFitsForTest("W" ** 128, room));
+}
+
+test "the fit test is an upper bound, not a guess" {
+    // One byte is at most one glyph, and a glyph at these sizes is at most
+    // about its em. The constant has to stay at or above that or the bound
+    // stops being one: at 8px per byte a 50-character name would be waved
+    // through as fitting 410px, and 50 characters do not fit 410px.
+    try testing.expect(main.identityMaxPxPerByteForTest >= 14);
+
+    // Exactly at the limit fits; one byte past it does not. Stated so the
+    // comparison cannot quietly become strict or drift by one.
+    const room = main.identityMaxPxPerByteForTest * 4;
+    try testing.expect(main.textProvablyFitsForTest("abcd", room));
+    try testing.expect(!main.textProvablyFitsForTest("abcde", room));
+}
+
+test "counting bytes is pessimistic about multi-byte text, and that is the safe direction" {
+    // The rule counts BYTES and charges each one a full glyph's width, so
+    // multi-byte text is treated as far wider than it renders: eight emoji are
+    // thirty-two bytes and get charged 512px for about 144px of glyphs.
+    //
+    // That is the wrong answer in the harmless direction. Those names keep the
+    // bound they do not need, which costs one row the old layout cost; the
+    // direction that matters is never waving through something that overflows.
+    // Written down because the obvious "fix" is to count codepoints instead,
+    // and a codepoint can be a full-width glyph, so that would make the bound
+    // wrong rather than merely conservative.
+    const room = main.identityTextWidthForTest;
+    try testing.expect(!main.textProvablyFitsForTest("\u{1F600}" ** 8, room));
+    // Short ones still take the cheap path, which is the common case.
+    try testing.expect(main.textProvablyFitsForTest("\u{1F600}" ** 5, room));
+}
+
+test "a feed of ordinary names takes the cheap path, a feed of hostile ones does not" {
+    // The whole optimisation rests on this being the common case. If real
+    // display names were long enough to need bounding, the branch would cost a
+    // comparison and buy nothing, and it should not exist.
+    const room = main.identityTextWidthForTest;
+    main.resetIdentityLeafCountsForTest();
+
+    const ordinary = [_][]const u8{ "jack", "fiatjaf", "Lyn Alden", "hodlonaut", "NVK", "Gigi", "preston", "odell" };
+    for (ordinary) |n| _ = main.textProvablyFitsForTest(n, room);
+    const after_ordinary = main.identityLeafCountsForTest();
+    try testing.expectEqual(ordinary.len, after_ordinary.free);
+    try testing.expectEqual(@as(usize, 0), after_ordinary.bounded);
+
+    // And the strings this exists to contain still get the width: a display
+    // name filled to its 64-byte buffer, and a NIP-05 filled to its 128.
+    main.resetIdentityLeafCountsForTest();
+    _ = main.textProvablyFitsForTest("W" ** 64, room);
+    _ = main.textProvablyFitsForTest("W" ** 128, room);
+    const after_hostile = main.identityLeafCountsForTest();
+    try testing.expectEqual(@as(usize, 0), after_hostile.free);
+    try testing.expectEqual(@as(usize, 2), after_hostile.bounded);
+}

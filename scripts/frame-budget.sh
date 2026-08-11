@@ -55,12 +55,32 @@ set -euo pipefail
 # string provably fits, and a display name long enough to be worth bounding is
 # most display names.
 #
-# So the budget records what the app costs and the cost is logged as a debt
-# against the SDK's text fitting, not hidden inside a number that reads as
-# healthy. The gate is still worth having at 3400: it caught this, and nothing
-# else did, for fifty-three commits.
+# 3400 was then measured against, and it is too tight: 3376us was observed on a
+# healthy build the same afternoon. Which led to the thing actually worth
+# knowing about this gate.
+#
+# THE LAYOUT READING VARIES 2.4x RUN TO RUN ON UNCHANGED CODE. Twenty-two
+# readings taken in one afternoon span 1424us to 3376us, and dividing by the
+# mounted node count does not stabilise them either (3.45 to 7.54us per node,
+# 2.2x). The cause is that the feed is whatever the relays happened to send:
+# how many rows carry an image, a quote card or a link preview changes what
+# there is to lay out, and that changes between runs of the same binary.
+#
+# So this number is a coarse alarm and cannot be anything else while the
+# content is network-supplied. It still earns its place: the regression it
+# exists to catch measures 24423us, which is seven times the noise. But it
+# cannot resolve a few hundred microseconds, and treating it as though it can
+# is what produced two wrong conclusions in one afternoon: first that the app
+# had not regressed (it had, by a third), then that a 300us saving could be
+# confirmed from it (it cannot).
+#
+# Set from the observed maximum plus room, not from the mean. A gate the
+# healthy app trips teaches people to rerun it until it passes.
+#
+# Making this tight needs a feed that does not come from the network. That is a
+# harness change, not a number change, and it is the real fix.
 REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-700}
-LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-3400}
+LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-4500}
 PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-200}
 # The plan stage grows with the number of registered images the app draws
 # (upstream reprocesses them every frame); this bound catches the app suddenly
