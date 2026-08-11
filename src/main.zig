@@ -2895,6 +2895,17 @@ pub fn wantProfileForTest(pubkey: [32]u8) void {
     wantProfile(pubkey);
 }
 
+pub fn wantProfilesAheadForTest(model: *const Model) void {
+    wantProfilesAhead(model);
+}
+
+pub fn isProfileWantedForTest(pubkey: [32]u8) bool {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
+    }
+    return false;
+}
+
 pub fn wantedProfileCountForTest() usize {
     var n: usize = 0;
     for (&g_wanted) |*w| {
@@ -4633,6 +4644,7 @@ pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
 
 /// Runs one avatar-id assignment pass, for tests.
 pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
+    wantProfilesAhead(model);
     assignAvatarSlots(fx, model);
 }
 
@@ -7727,6 +7739,46 @@ fn markAvatarWanted(pubkey: [32]u8) void {
 /// thread of strangers showed initials for everyone. Runs each tick before
 /// `scanAvatarFetches`, which then fetches the faces for whoever just gained an
 /// id. `fx` is needed to free a reclaimed id's registered image.
+/// Asks for the kind:0 of everybody the reader is about to read.
+///
+/// The wanted set is the app's queue of "whose name do we still need", and it
+/// was populated by exactly two callers: the inbox, and quoted notes. The FEED
+/// never registered anybody. That was fine only for as long as `refreshProfiles`
+/// walked the whole follow list, and when that walk was removed from the render
+/// path the feed lost its only source of names: the comment left behind claimed
+/// "a displayed author with no name calls `wantProfile`", which was true of the
+/// notifications page it was written for and of nothing else.
+///
+/// What that looked like: real accounts, with profiles sitting on the relays,
+/// drawn as a raw npub and a two-character avatar for the whole session. The
+/// dial-time subscription asks for kind:0 alongside the notes, so most authors
+/// resolve and the gap looks like an occasional glitch rather than a missing
+/// mechanism. Anybody that one bounded backfill did not cover was never asked
+/// about again.
+///
+/// Over the PREFETCH band, not just the visible rows, so a name is being fetched
+/// while the row is still below the fold. This is the same window the image
+/// warmer uses, and it has to be: `warmAvatar` needs `picture_len`, which comes
+/// from the kind:0, so a face cannot be warmed ahead for somebody nobody asked
+/// about. One missing registration was starving both.
+///
+/// Cheap to call every tick: `wantProfile` returns at once for anybody already
+/// named, which after the first pass is nearly everybody.
+fn wantProfilesAhead(model: *const Model) void {
+    if (activePubkey()) |pk| wantProfile(pk);
+    // The notifications page registers its own authors as rows are admitted,
+    // which catches likers and zappers who are in no other set.
+    if (model.notifications_open) return;
+    if (model.viewing_profile != null or model.viewing_thread != 0) {
+        const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
+        for (set.authors[0..set.author_count]) |pk| wantProfile(pk);
+        return;
+    }
+    const w = model.prefetchRange();
+    var i = w.first;
+    while (i <= w.last and i < model.notes_len) : (i += 1) wantProfile(model.notes[i].pubkey);
+}
+
 fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
     g_avatar_clock += 1;
 
@@ -18613,6 +18665,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // are registered here, so a returning user gets faces WITH the notes rather
     // than a tick later. Only what is on disk resolves now; the rest is fetched
     // from the first tick onward.
+    wantProfilesAhead(model);
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
@@ -18730,6 +18783,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
+                wantProfilesAhead(model);
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanBannerFetch(fx, model);
@@ -19291,6 +19345,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Load what just came into view without waiting for the next tick:
             // hand avatar ids to the newly-visible authors, then their faces and
             // pictures.
+            wantProfilesAhead(model);
             assignAvatarSlots(fx, model);
             scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
