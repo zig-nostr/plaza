@@ -4231,7 +4231,7 @@ test "the queue stops asking, and lets go of what landed" {
     const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const stuck = [_]u8{0xc9} ** 32;
     try testing.expect(main.enqueueOutboxForTest(stuck, me, 1000));
-    for (0..main.max_outbox_rounds_for_test) |_| main.countOutboxRoundForTest(stuck);
+    for (0..main.rounds_before_stuck_for_test) |_| main.countOutboxRoundForTest(stuck);
     // It stops ASKING, and it stays: erasing a note the reader wrote, because
     // no relay would take it, is the one thing this queue exists to prevent.
     main.sweepOutboxForTest(1000);
@@ -4986,7 +4986,7 @@ test "an edit gives a note that gave up its rounds back" {
     const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const id = [_]u8{3} ** 32;
     try testing.expect(main.enqueueOutboxForTest(id, me, 100));
-    for (0..main.max_outbox_rounds_for_test) |_| main.markOutboxRoundForTest(id);
+    for (0..main.rounds_before_stuck_for_test) |_| main.markOutboxRoundForTest(id);
     try testing.expectEqual(@as(usize, 1), main.outboxCounts().stuck);
 
     main.forgetOutboxAcksForTest();
@@ -13546,4 +13546,63 @@ test "a tag copy that could not complete reads as no base, not as an empty one" 
     // returned a short or empty slice here would be reported as a real base.
     var failing = testing.FailingAllocator.init(a.allocator(), .{ .fail_index = 1 });
     try testing.expect(main.dupeTagsForTest(failing.allocator(), &tags) == null);
+}
+
+test "a note nobody took is still offered, long after the app calls it stuck" {
+    // The queue used to give up after six rounds, about eleven minutes on the
+    // old ladder. Close a lid for twelve, or spend that long on a captive
+    // portal where TCP connects and TLS does not, and every queued note was
+    // abandoned for the life of the install: never offered again, the count
+    // surviving restarts, and sixteen of them filling the queue so the account
+    // could not post from that install at all.
+    main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
+
+    const id = [_]u8{0x31} ** 32;
+    main.setIdentityForTest([_]u8{0x99} ** 32);
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expect(main.enqueueOutboxForTest(id, me, 0));
+
+    // Well past the point the app starts calling it stuck.
+    for (0..main.rounds_before_stuck_for_test + 4) |_| main.countOutboxRoundForTest(id);
+
+    // The word on the row, which is all it is now.
+    try testing.expectEqual(main.OutboxState.stuck, main.outboxStateForTest(id).?);
+
+    // And it is still collected, given enough time on the widening delay.
+    var due: [16][32]u8 = undefined;
+    const n = main.collectOutboxDueForTest(&due, 100_000);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualSlices(u8, &id, &due[0]);
+}
+
+test "a relay coming back puts a note at the front of the queue, but a flapping one cannot" {
+    // The backoff was only ever reset by editing the relay list, so a note that
+    // had widened out to an hourly retry stayed there even when the network
+    // came back a second later.
+    main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
+
+    const id = [_]u8{0x32} ** 32;
+    main.setIdentityForTest([_]u8{0x99} ** 32);
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expect(main.enqueueOutboxForTest(id, me, 0));
+    for (0..4) |_| main.countOutboxRoundForTest(id);
+    try testing.expect(main.outboxRoundsForTest(id).? > 0);
+
+    // Offline, then back: the ladder resets.
+    main.setRelayStatusForTest(0, false);
+    main.setRelayStatusForTest(0, true);
+    try testing.expectEqual(@as(u8, 0), main.outboxRoundsForTest(id).?);
+
+    // A relay that accepts the handshake and drops it reconnects every three
+    // seconds. If each of those reset the ladder, the widening delay would
+    // never widen and a dead relay would be dialled without pause.
+    for (0..6) |_| main.countOutboxRoundForTest(id);
+    const before = main.outboxRoundsForTest(id).?;
+    for (0..5) |_| {
+        main.setRelayStatusForTest(0, false);
+        main.setRelayStatusForTest(0, true);
+    }
+    try testing.expectEqual(before, main.outboxRoundsForTest(id).?);
 }

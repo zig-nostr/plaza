@@ -1995,7 +1995,46 @@ pub fn sortThreadNotes(notes: []Note) void {
 
 /// Sets relay `index`'s live connection state.
 fn setRelayStatus(index: usize, state: Conn) void {
+    const was: Conn = @enumFromInt(g_relay_status[index].load(.monotonic));
     g_relay_status[index].store(@intFromEnum(state), .monotonic);
+    // A relay coming back is the event a queued note has been waiting for. The
+    // backoff was only ever reset by editing the relay list, so a note that had
+    // widened out to an hourly retry stayed on that schedule even when the
+    // network returned a second later.
+    if (state == .connected and was != .connected) wakeOutboxBackoff();
+}
+
+/// How often a returning relay may pull the queue's backoff back to zero.
+///
+/// A relay that accepts the handshake and drops the socket reconnects every
+/// three seconds, and without this each of those would reset every note to an
+/// immediate retry: the widening delay would never widen and a dead relay would
+/// be dialled continuously. Amethyst has the same guard for the same reason.
+const outbox_wake_min_s: i64 = 60;
+var g_outbox_woke_at: std.atomic.Value(i64) = .init(0);
+/// Whether a wake has happened at all. A separate flag rather than a zero
+/// sentinel, because zero is a real timestamp: `nowSeconds` returns it whenever
+/// there is no io, and a rate limit that stops working at a particular clock
+/// value is not a rate limit.
+var g_outbox_woke_ever = std.atomic.Value(bool).init(false);
+
+/// Puts every unacked note back at the front of the retry ladder.
+fn wakeOutboxBackoff() void {
+    const now = nowSeconds();
+    if (g_outbox_woke_ever.load(.monotonic) and
+        now -| g_outbox_woke_at.load(.monotonic) < outbox_wake_min_s) return;
+    g_outbox_woke_ever.store(true, .monotonic);
+    g_outbox_woke_at.store(now, .monotonic);
+
+    outboxLock();
+    defer outboxUnlock();
+    var changed = false;
+    for (&g_outbox) |*e| {
+        if (!e.used or e.acked != 0 or e.rounds == 0) continue;
+        e.rounds = 0;
+        changed = true;
+    }
+    if (changed) _ = g_outbox_rev.fetchAdd(1, .monotonic);
 }
 
 /// Whether the reader has paused the pool. Read by every relay thread between
@@ -20988,7 +21027,10 @@ pub const OutboxEntry = struct {
     pub fn state(self: OutboxEntry) OutboxState {
         if (self.acked != 0) return .sent;
         if (self.sending) return .sending;
-        if (self.rounds >= max_outbox_rounds) return .stuck;
+        // A LABEL, not a verdict. The queue keeps offering this note; the word
+        // only tells the reader it has been a while. It used to mean the app
+        // had given up, which is the one thing a queue must not do silently.
+        if (self.rounds >= rounds_before_stuck) return .stuck;
         return .queued;
     }
 };
@@ -21003,7 +21045,11 @@ fn outboxRetryDelay(rounds: u8) i64 {
         1 => 5,
         2 => 20,
         3 => 60,
-        else => 300,
+        4 => 300,
+        5 => 900,
+        // Once an hour, forever. A relay that has been unreachable for an hour
+        // may well come back tomorrow, and asking it hourly costs one dial.
+        else => 3600,
     };
 }
 
@@ -21014,9 +21060,19 @@ var g_outbox_overflow = std.atomic.Value(bool).init(false);
 /// Room for a burst of posting without becoming a store of its own. A reader who
 /// writes more than this while offline is past what a status bar can explain.
 const outbox_cap = 16;
-/// How many times a note is offered to the relays before the queue stops asking.
-/// Every round is a full walk of the pool, so this is not a byte-level retry.
-const max_outbox_rounds = 6;
+/// After how many failed rounds the popover starts calling a note stuck.
+///
+/// This used to be the point at which the queue GAVE UP. Six rounds on the old
+/// ladder is about eleven and a half minutes, so closing a laptop lid for
+/// twelve, or spending that long on a captive portal where TCP connects and TLS
+/// does not, permanently abandoned every queued note. It was never offered
+/// again for the life of the install, the count survived a restart, and sixteen
+/// of them filled the queue so the account could never post from that install
+/// again. The only escape was editing the relay list, which nobody would guess.
+///
+/// Now it only changes the word on the row. The note keeps being offered, on a
+/// widening delay, for as long as the app is running.
+const rounds_before_stuck = 6;
 
 var g_outbox = [_]OutboxEntry{.{}} ** outbox_cap;
 /// Bumped whenever the queue changes, so the UI thread can tell that the
@@ -21215,7 +21271,24 @@ pub fn resetOutboxForTest() void {
     outboxLock();
     defer outboxUnlock();
     for (&g_outbox) |*e| e.* = .{};
+    g_outbox_woke_at.store(0, .monotonic);
+    g_outbox_woke_ever.store(false, .monotonic);
 }
+
+pub fn outboxStateForTest(id: [32]u8) ?OutboxState {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.state();
+}
+
+pub fn outboxRoundsForTest(id: [32]u8) ?u8 {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.rounds;
+}
+
 
 pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
     return enqueueOutbox(id, author, now_s);
@@ -21238,7 +21311,7 @@ pub fn outboxRetryDelayForTest(rounds: u8) i64 {
     return outboxRetryDelay(rounds);
 }
 
-pub const max_outbox_rounds_for_test = max_outbox_rounds;
+pub const rounds_before_stuck_for_test = rounds_before_stuck;
 pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
 
 /// A fingerprint of the pool, in slot order. The outbox records which relay took
@@ -21458,7 +21531,7 @@ fn collectOutboxDue(ids: *[outbox_cap][32]u8, now_s: i64) usize {
     outboxLock();
     defer outboxUnlock();
     for (&g_outbox) |*e| {
-        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
+        if (!e.used or e.sending or e.acked != 0) continue;
         // Somebody else's note. This is the line that stops the previous
         // account's unsent writing going out over the next account's relays,
         // and signed out it stops everything, because a queued note is a promise
