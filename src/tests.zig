@@ -14907,3 +14907,56 @@ test "a write-only relay is not asked a question" {
     try testing.expectEqual(@as(usize, 0), slots[0]);
     try testing.expectEqual(@as(usize, 2), slots[1]);
 }
+
+test "a relay the reader is not on is asked without a since" {
+    // `feedSince` is "the newest note I hold, minus an hour". On the pool's own
+    // relays that is right: they have been answering this question all along,
+    // so anything older is already in the store.
+    //
+    // A routed relay has answered nothing. It was dialled because it holds
+    // notes from people whose posts the reader has never had, and every one of
+    // those is older than the newest note the reader holds from anybody else.
+    // A `since` there asks a relay full of missing history for the last hour of
+    // it, which is how this shipped in v0.3.0 and delivered almost nothing.
+    var authors: [3][32]u8 = undefined;
+    for (&authors, 0..) |*a, i| {
+        a.* = [_]u8{0} ** 32;
+        a[0] = @intCast(i + 1);
+    }
+
+    // The feed HAS to be holding a note, or `feedSince` returns null for want
+    // of one and this test passes whether or not the code asks for a bound.
+    // Removing the fix failed nothing until this line existed.
+    main.setFeedNewestForTest(1_800_000_000);
+    defer main.setFeedNewestForTest(0);
+    try testing.expect(main.feedSinceForTest() != null);
+
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = main.buildRoutedFiltersForTest(&authors, &buf);
+
+    try testing.expect(filters.len > 0);
+    for (filters) |f| {
+        try testing.expectEqual(@as(?i64, null), f.since);
+    }
+}
+
+test "the pool's own relays still get a since" {
+    // The other half, so the two cannot be conflated later: the pool HAS been
+    // answering, so bounding it is what stops every reconnect re-downloading
+    // the backlog. Only the note filter carries it; the metadata filter is
+    // deliberately unbounded, because a profile edited while the app was closed
+    // is older than the newest note held.
+    var authors: [2][32]u8 = undefined;
+    for (&authors, 0..) |*a, i| {
+        a.* = [_]u8{0} ** 32;
+        a[0] = @intCast(i + 1);
+    }
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = main.buildFeedFilters(&authors, null, 1_800_000_000, &buf);
+
+    var with_since: usize = 0;
+    for (filters) |f| {
+        if (f.since != null) with_since += 1;
+    }
+    try testing.expect(with_since > 0);
+}

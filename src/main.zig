@@ -4649,6 +4649,43 @@ fn requestWantedProfiles() void {
     askProfiles(still_missing, missing);
 }
 
+/// The filters for a relay the reader is not on, asked about the people who
+/// write there.
+///
+/// NO `since`, which is the whole point of this function existing separately.
+///
+/// `feedSince` is "the newest note I hold, minus an hour", and on the pool's own
+/// relays that is right: they have been answering this same question all along,
+/// so anything older is already in the store. A routed relay has answered
+/// nothing. It was dialled precisely because it holds notes from people whose
+/// posts the reader has never had, and every one of those is older than the
+/// newest note the reader holds from anybody else. Stamping `since` on that
+/// subscription asks a relay full of missing history for the last hour of it.
+///
+/// Amethyst hit the same thing from the other side and wrote it down: a `since`
+/// floor "silently emptied the tab" on a cold start.
+///
+/// No `self` either: the reader's own notes come from the reader's own relays,
+/// and asking a stranger's relay about them is asking the wrong place.
+fn buildRoutedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    return buildFeedFilters(authors, null, null, out);
+}
+
+pub fn buildRoutedFiltersForTest(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    return buildRoutedFilters(authors, out);
+}
+
+/// Stamps the newest note the feed has seen, so a test can put `feedSince` in
+/// the state that matters. Without this it returns null for want of any note at
+/// all, and a test asserting "no since" passes whether or not the code asks for
+/// one.
+pub fn setFeedNewestForTest(created_at: i64) void {
+    g_feed_newest.store(created_at, .monotonic);
+}
+pub fn feedSinceForTest() ?i64 {
+    return feedSince();
+}
+
 /// Asks the pool for these authors' metadata, on the sockets it already holds.
 ///
 /// Was a thread that dialled every relay in turn and read each to EOSE: eight
@@ -24991,9 +25028,7 @@ fn discoveredOnce(
     defer offerLiveRelay(discovered_watch_base + index, null);
 
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    // No `self`: the reader's own notes come from the reader's own relays, and
-    // asking a stranger's relay about them would be asking the wrong place.
-    const filters = buildFeedFilters(authors, null, feedSince(), &filter_buf);
+    const filters = buildRoutedFilters(authors, &filter_buf);
     try relay.subscribe("plaza-outbox", filters);
 
     while (true) {
