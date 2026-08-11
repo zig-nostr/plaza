@@ -13720,3 +13720,46 @@ test "a reply is routed to the read relays of the people it names" {
         try testing.expect(main.poolHasRelayForTest(first.url));
     }
 }
+
+test "reaching the bottom asks the relays for what came before" {
+    // Reaching the end of the loaded feed used to raise the store's query limit
+    // and nothing else. The store answers with what it has, so once the initial
+    // backfill ran out the list stopped growing: no older history, no
+    // end-of-feed state, no way to reach anything from before the app was
+    // opened. Grepping this file for `.until` returned nothing at all, which is
+    // the whole bug: no filter Plaza ever sent carried one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const total = 1200;
+    const authors = try arena.alloc([32]u8, total);
+    for (authors, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i / 256);
+        a[1] = @intCast(i % 256);
+    }
+
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const until: i64 = 1_700_000_000;
+    const filters = main.buildOlderFilters(authors, until, &buf);
+
+    // Chunked like the live subscription, because the same relays refuse the
+    // same oversized filter.
+    try testing.expectEqual(@as(usize, 3), filters.len);
+    var counted: usize = 0;
+    for (filters) |f| {
+        try testing.expect(f.authors.?.len <= 500);
+        counted += f.authors.?.len;
+        // The point of the whole change.
+        try testing.expectEqual(until, f.until.?);
+        // Notes only: profiles and relay lists are replaceable, so there is no
+        // older copy to page back to and asking for one wastes the budget.
+        try testing.expectEqual(@as(usize, 1), f.kinds.?.len);
+        try testing.expectEqual(@as(u16, 1), f.kinds.?[0]);
+    }
+    try testing.expectEqual(total, counted);
+
+    // An empty follow set asks nothing rather than asking about everybody.
+    try testing.expectEqual(@as(usize, 0), main.buildOlderFilters(&.{}, until, &buf).len);
+}

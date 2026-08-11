@@ -19398,9 +19398,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // `notes_len` lands wherever that is; asking for more than exists
             // simply returns the same feed and the reader has reached the end
             // of what this app has been told about.
+            const held = model.notes_len;
             model.feed_limit += feed_page;
             g_last_count = std.math.maxInt(usize);
             model.refresh(nowSeconds());
+            // The store had no more to give, so ask the relays for what came
+            // before the oldest note in hand. Store first, network second.
+            if (model.notes_len == held and model.notes_len > 0 and !feedEndReached()) {
+                fetchOlderNotes(model.notes[model.notes_len - 1].created_at - 1);
+            }
         },
         .close_settings => {
             model.logout_pending = false;
@@ -22035,6 +22041,130 @@ fn pushCurrentScreen(model: *Model) void {
         model.thread_stack[model.thread_stack_len] = .{ .note = model.thread_root };
         model.thread_stack_len += 1;
     }
+}
+
+/// The filters that ask for notes older than `until`.
+///
+/// Chunked exactly like the live subscription, and for the same reason: a relay
+/// refuses a filter whose field items exceed its size cap. Separate from
+/// `buildFeedFilters` because this asks for notes and nothing else: profiles
+/// and relay lists are replaceable, so there is no older copy to page back to.
+pub fn buildOlderFilters(
+    authors: []const [32]u8,
+    until: i64,
+    out: []nostr.filter.Filter,
+) []nostr.filter.Filter {
+    var len: usize = 0;
+    var start: usize = 0;
+    while (start < authors.len and len < out.len) : (start += follow_chunk) {
+        const chunk = authors[start..@min(start + follow_chunk, authors.len)];
+        out[len] = .{
+            .authors = chunk,
+            .kinds = &feed_filter_kinds,
+            .until = until,
+            .limit = feed_page,
+        };
+        len += 1;
+    }
+    return out[0..len];
+}
+
+/// Whether an older-notes fetch is already in flight, so a reader who keeps
+/// scrolling does not stack one request per frame.
+var g_older_busy = std.atomic.Value(bool).init(false);
+/// Set when a network round for older notes came back with nothing new, which
+/// is the only honest way to know the feed has an end.
+var g_feed_end_reached = std.atomic.Value(bool).init(false);
+
+pub fn feedEndReached() bool {
+    return g_feed_end_reached.load(.monotonic);
+}
+
+pub fn resetFeedEndForTest() void {
+    g_feed_end_reached.store(false, .monotonic);
+    g_older_busy.store(false, .monotonic);
+}
+
+/// Asks the relays for notes older than `until`.
+///
+/// Reaching the end of the loaded feed used to raise the store's query limit
+/// and nothing else. The store answers with what it has, so once the initial
+/// backfill was exhausted the list simply stopped growing: no older history, no
+/// end-of-feed state, and no way to reach anything from before the app was
+/// opened. A reader coming back after a week saw the last few hundred notes and
+/// could not scroll past them. Grepping this file for `.until` returned nothing
+/// at all, which is the whole bug: no filter Plaza ever sent carried one.
+///
+/// Store first, network second, which is Jumble's ordering: `_loadMoreTimeline`
+/// serves from its cached list and only then asks with `{ ...filter, until }`.
+fn fetchOlderNotes(until: i64) void {
+    if (g_store == null) return;
+    // One at a time. Sitting at the bottom of the list fires this on every
+    // frame, and each round is a dial per relay.
+    if (g_older_busy.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, fetchOlderWorker, .{until}) catch {
+        g_older_busy.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchOlderWorker(until: i64) void {
+    const gpa = std.heap.page_allocator;
+    defer g_older_busy.store(false, .release);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var authors: [max_follows + 1][32]u8 = undefined;
+    var authors_len: usize = 0;
+    if (activePubkey()) |pk| {
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    for (followSet()) |pk| {
+        if (authors_len == authors.len) break;
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    if (authors_len == 0) return;
+
+    var filters: [max_feed_filters]nostr.filter.Filter = undefined;
+    const built = buildOlderFilters(authors[0..authors_len], until, &filters);
+    const flen = built.len;
+
+    var added: usize = 0;
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        defer relay.deinit();
+        relay.subscribe("plaza-older", filters[0..flen]) catch continue;
+        var seen: usize = 0;
+        // Bounded: `receive` has no deadline, and a relay that takes the
+        // subscription and then goes quiet would hold this thread forever.
+        while (seen < profile_fetch_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .added) added += 1;
+                },
+                .eose => break,
+                .closed => break,
+                else => {},
+            }
+        }
+        relay.unsubscribe("plaza-older") catch {};
+    }
+
+    // Nothing anywhere had anything older. That is an end, and saying so is
+    // better than a spinner that never resolves.
+    if (added == 0) g_feed_end_reached.store(true, .monotonic);
 }
 
 /// Opens a person as a level of their own.
