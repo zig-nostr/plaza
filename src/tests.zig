@@ -14847,3 +14847,63 @@ test "an unchanged route table does not tell the connections to re-ask" {
     try testing.expect(main.discoveredGenerationForTest() != settled);
     try testing.expectEqual(@as(usize, 2), main.discoveredCount());
 }
+
+// -- Asking on a socket that is already open ---------------------------------
+//
+// A one-shot used to dial its own connection to every relay in turn: eight TLS
+// handshakes and a parked thread to learn one display name. The pool already
+// holds those sockets, and no shipping client dials for a one-shot.
+//
+// The property that makes sharing safe is that there is nothing to route back.
+// Every event goes to the store on the thread that owns the socket, whoever
+// asked, and the render thread reads the store. A subscription id names a
+// question, never a caller waiting on an answer.
+
+test "a one-shot subscription id is recognisable as one" {
+    // The relay threads dispatch on this. Anything that is not the feed, the
+    // inbox or a one-shot falls into the engagement arm and is counted as
+    // somebody reacting to a note, so a question that does not announce itself
+    // does not merely go unanswered: it inflates a tally.
+    try testing.expect(main.isOneShotSubForTest(main.oneShotSubPrefixForTest ++ "profiles"));
+    try testing.expect(main.isOneShotSubForTest(main.oneShotSubPrefixForTest ++ "quotes"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-feed"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-inbox"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-engagement"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-thread"));
+}
+
+test "asking the pool with nothing connected asks nobody, and does not dial" {
+    // The whole point is that it uses sockets that already exist. With no live
+    // connection there is nothing to write to, and the honest result is zero
+    // relays asked rather than a connection opened to make the number look
+    // better. A test binary must never reach the network.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example.com", true, true);
+
+    const kinds = [_]u16{0};
+    const authors = [_][32]u8{[_]u8{7} ** 32};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .limit = 1 }};
+    try testing.expectEqual(@as(usize, 0), main.askPoolForTest(main.oneShotSubPrefixForTest ++ "profiles", &filters));
+}
+
+test "a write-only relay is not asked a question" {
+    // Asking a relay that takes writes and answers no filters is asking it the
+    // wrong thing. It keeps its socket, for publishing.
+    //
+    // Asserted on WHICH SLOTS are chosen, not on how many were asked. With no
+    // live socket in a test every slot is skipped anyway, so a count passes
+    // whether or not the read marker is honoured: removing the check failed
+    // nothing when this test was first written.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://reads.example.com", true, false);
+    _ = main.addRelayForTest("wss://writeonly.example.com", false, true);
+    _ = main.addRelayForTest("wss://both.example.com", true, true);
+
+    var slots: [8]usize = undefined;
+    const n = main.askableSlotsForTest(&slots);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 0), slots[0]);
+    try testing.expectEqual(@as(usize, 2), slots[1]);
+}
