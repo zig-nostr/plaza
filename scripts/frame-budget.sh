@@ -31,8 +31,36 @@ set -euo pipefail
 # worst honest reading. That is still a tight gate: the regression these exist to
 # catch, the feed asking the database who you follow once per card, measures
 # 24423us against a rebuild budget of 700.
+#
+# LAYOUT, raised 2400 -> 3400, and this one is not drift. It is a real cost that
+# arrived in one commit, and the number is being moved with the cause written
+# down rather than quietly.
+#
+# Bisected on one machine, one account, one afternoon, best-of-three per run:
+#
+#   #137, where 2400 was set   1424us  1574us  1646us
+#   #138, the next commit      2784us
+#   today                      2315us  2389us  2404us
+#
+# #138 is "Nothing paints past the edge of the window": a display name and a
+# NIP-05 handle are strangers' strings, and before it a long one ran hundreds of
+# pixels past the window. The fix is a definite `width` on the text leaf itself,
+# because that is the only place the SDK will ellipsize from. Two of those sit in
+# every feed row, so a screenful pays it eight to sixteen times per frame, and
+# fitting bounded single-line text is what costs the extra millisecond.
+#
+# It is not being reverted and it should not be. The bug it fixed was reported by
+# a reader, took a long time to find, and comes back the moment the width comes
+# off. Nor can it be made conditional here: a bound is only skippable when the
+# string provably fits, and a display name long enough to be worth bounding is
+# most display names.
+#
+# So the budget records what the app costs and the cost is logged as a debt
+# against the SDK's text fitting, not hidden inside a number that reads as
+# healthy. The gate is still worth having at 3400: it caught this, and nothing
+# else did, for fifty-three commits.
 REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-700}
-LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-2400}
+LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-3400}
 PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-200}
 # The plan stage grows with the number of registered images the app draws
 # (upstream reprocesses them every frame); this bound catches the app suddenly
