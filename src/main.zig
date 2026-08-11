@@ -21800,6 +21800,116 @@ fn publishOwnedWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
 /// keeps the ingest loops untouched; the note is already in the local store, so
 /// the feed shows it regardless of publish latency. Runs on a detached thread
 /// with its own io backend, never the UI thread's.
+/// At most this many of one recipient's read relays are added for a publish.
+///
+/// Jumble takes five, welshman's default scenario limit is three. Three is the
+/// smaller of the two and still means a person has to have lost three relays at
+/// once to miss a reply.
+const inbox_relays_per_recipient = 3;
+/// A ceiling on the whole extra set, so a note naming a dozen people does not
+/// turn one Post into thirty dials.
+const max_extra_inbox_relays = 8;
+
+/// Publishes `ev` to the relays the people it names actually READ from.
+///
+/// Plaza sent every note to the reader's own write relays and nowhere else. If
+/// the person being replied to does not read those relays, their client never
+/// sees the reply and never tells them: a thread started from Plaza reads
+/// one-sided to everybody else in it. Plaza's own inbox subscription is the
+/// mirror of this and is correct, so the app was receiving what others routed
+/// to it and not reciprocating.
+///
+/// Best effort, and deliberately not recorded in the outbox. An acknowledgement
+/// there is a bit in a per-slot bitmap and these relays hold no slot; more to
+/// the point, "did my note go out" is a question about the reader's own relays,
+/// and a stranger's inbox relay refusing an unknown pubkey is normal rather
+/// than a delivery failure worth alarming them about.
+fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event.Event) void {
+    const store = g_store orelse return;
+
+    // Who the note names. The author is skipped: a reply to yourself does not
+    // need routing, and the pool already carries it.
+    var recipients: [max_extra_inbox_relays * 2][32]u8 = undefined;
+    var n: usize = 0;
+    for (ev.tags) |tag| {
+        if (n == recipients.len) break;
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p") or tag[1].len != 64) continue;
+        var pk: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk, tag[1]) catch continue;
+        if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+        var dupe = false;
+        for (recipients[0..n]) |seen| {
+            if (std.mem.eql(u8, &seen, &pk)) dupe = true;
+        }
+        if (dupe) continue;
+        recipients[n] = pk;
+        n += 1;
+    }
+    if (n == 0) return;
+
+    const kinds = [_]u16{relay_list_kind};
+    var result = store.query(gpa, .{ .authors = recipients[0..n], .kinds = &kinds, .limit = @intCast(n) }) catch return;
+    defer result.deinit();
+
+    var urls: [max_extra_inbox_relays][96]u8 = undefined;
+    var url_len: [max_extra_inbox_relays]usize = undefined;
+    var urls_n: usize = 0;
+
+    for (result.events) |list_ev| {
+        var parsed = nostr.nip65.parseRelayList(gpa, list_ev) catch continue;
+        defer parsed.deinit();
+        var taken: usize = 0;
+        for (parsed.list.entries) |entry| {
+            if (taken == inbox_relays_per_recipient or urls_n == urls.len) break;
+            // Where they READ. A relay they only write to will never show them
+            // anything, so a reply left there is a reply nobody receives.
+            if (!entry.read) continue;
+            const trimmed = std.mem.trim(u8, entry.url, " \t\r\n");
+            if (trimmed.len == 0 or trimmed.len > 96) continue;
+            // Already covered by the pool walk, so dialling it again would only
+            // publish the same note twice to the same host.
+            if (poolHasRelay(trimmed)) continue;
+            var already = false;
+            for (0..urls_n) |i| {
+                if (std.mem.eql(u8, urls[i][0..url_len[i]], trimmed)) already = true;
+            }
+            if (already) continue;
+            @memcpy(urls[urls_n][0..trimmed.len], trimmed);
+            url_len[urls_n] = trimmed.len;
+            urls_n += 1;
+            taken += 1;
+        }
+    }
+
+    for (0..urls_n) |i| {
+        const url = urls[i][0..url_len[i]];
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        relay.publish(ev) catch continue;
+        // One read, to give the frame somewhere to flush to. The verdict is not
+        // recorded, so there is nothing to wait around for.
+        var msg = (relay.receive() catch continue) orelse continue;
+        msg.deinit();
+    }
+}
+
+/// Whether `url` is already one of the reader's own relays.
+pub fn poolHasRelayForTest(url: []const u8) bool {
+    return poolHasRelay(url);
+}
+
+fn poolHasRelay(url: []const u8) bool {
+    for (0..relaySlots()) |i| {
+        var buf: [96]u8 = undefined;
+        const entry = relaySnapshot(i, &buf) orelse continue;
+        // The pool's own comparison, which knows that a trailing slash and a
+        // difference of case are the same relay. Two spellings here would mean
+        // publishing the same note to the same host twice.
+        if (relayUrlEql(entry.url, url)) return true;
+    }
+    return false;
+}
+
 fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -21843,6 +21953,10 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
             }
         }
     }
+
+    // And where the people it names actually read, which the reader's own
+    // relays say nothing about.
+    publishToRecipientInboxes(gpa, io, ev);
 }
 
 /// How many frames to read from one relay while waiting for its verdict. A relay

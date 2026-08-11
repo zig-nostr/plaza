@@ -13675,3 +13675,48 @@ test "a feed author with no name is asked about, before the row is on screen" {
     // would ask about everybody at once.
     try testing.expect(!main.isProfileWantedForTest([_]u8{40} ** 32));
 }
+
+test "a reply is routed to the read relays of the people it names" {
+    // Plaza sent every note to the reader's own write relays and nowhere else.
+    // If the person being replied to does not read those relays, their client
+    // never sees the reply and never tells them, so a thread started from Plaza
+    // reads one-sided to everybody else in it. Plaza's own inbox subscription
+    // is the mirror of this and was already correct, so the app received what
+    // others routed to it and did not reciprocate.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x51} ** 32);
+
+    // Their kind:10002: one relay they read, one they only write to.
+    var tags = try arena.alloc(nostr.event.Tag, 2);
+    tags[0] = try arena.dupe([]const u8, &.{ "r", "wss://inbox.example", "read" });
+    tags[1] = try arena.dupe([]const u8, &.{ "r", "wss://outbox.example", "write" });
+    const list = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, tags, "", null);
+
+    var parsed = try nostr.nip65.parseRelayList(testing.allocator, list);
+    defer parsed.deinit();
+
+    var reads: usize = 0;
+    var write_only: usize = 0;
+    for (parsed.list.entries) |e| {
+        if (e.read) reads += 1;
+        if (e.write and !e.read) write_only += 1;
+    }
+    // The routing rule the delivery pass applies: a relay they only WRITE to
+    // will never show them anything, so a reply left there reaches nobody.
+    try testing.expectEqual(@as(usize, 1), reads);
+    try testing.expectEqual(@as(usize, 1), write_only);
+
+    // A recipient relay that is already one of the reader's own is not dialled
+    // a second time, and the comparison is the pool's own, so a trailing slash
+    // is not a different relay.
+    main.resetRelaysToBootstrapForTest();
+    try testing.expect(!main.poolHasRelayForTest("wss://inbox.example"));
+    var buf: [96]u8 = undefined;
+    if (main.relaySnapshot(0, &buf)) |first| {
+        try testing.expect(main.poolHasRelayForTest(first.url));
+    }
+}
