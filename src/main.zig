@@ -141,6 +141,210 @@ fn unlockRelayTable() void {
     g_suggested_lock.store(false, .release);
 }
 
+// -- Where the people you follow actually write ------------------------------
+//
+// The suggestions used to be first come, first kept: the first six write relays
+// seen in anyone's kind:10002 filled the table and everything after was
+// dropped. Which six that is depends on whose relay list happened to arrive
+// first, so a relay one person uses could sit above one two hundred people use,
+// and the reader was being asked to add relays in arrival order.
+//
+// What the answer should be is the inversion every outbox implementation
+// starts with: turn "person -> relays they write to" into "relay -> people who
+// write there", and rank by how many. Jumble does exactly this, and takes each
+// author's top few write relays rather than all of them, on the reasoning
+// written into their source: most people do not understand relays and a list
+// of nine cannot be trusted to mean anything.
+//
+// Computed from the STORE rather than accumulated on ingest. The store already
+// holds one kind:10002 per author, which is the whole input, and counting on
+// arrival would need per-relay author sets to avoid counting one person twice
+// when their list is re-sent. Reading it back is both simpler and correct by
+// construction.
+
+/// How many of one author's write relays count toward the ranking.
+///
+/// Jumble's number. An author advertising a dozen relays is not telling you
+/// about a dozen places their notes reliably are; taking the first few keeps
+/// one enthusiastic list from outvoting everyone else's.
+const outbox_relays_per_author = 4;
+/// How many relays the ranking considers before it stops. Bounded so a follow
+/// list of two thousand cannot make this allocate without limit.
+const relay_rank_candidates = 128;
+
+/// A relay some of the reader's follows write to, and how many of them.
+const RelayRank = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    len: u8 = 0,
+    writers: u16 = 0,
+
+    fn urlSlice(self: *const RelayRank) []const u8 {
+        return self.url[0..self.len];
+    }
+};
+
+/// True when `a` should be offered before `b`: more of the reader's follows
+/// write there, ties broken by URL so the list does not shuffle between runs
+/// for no reason a reader could see.
+fn rankBefore(a: RelayRank, b: RelayRank) bool {
+    if (a.writers != b.writers) return a.writers > b.writers;
+    return std.mem.order(u8, a.urlSlice(), b.urlSlice()) == .lt;
+}
+
+/// Folds one author's write relays into `table`, counting each relay once for
+/// that author however many times they list it. Returns the new length.
+fn foldWriteRelays(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    var len = len_in;
+    // What this author has already voted for. A relay list naming the same
+    // relay twice is one person's opinion twice, and it would quietly promote
+    // whatever a duplicate-happy list mentions most.
+    var voted: [outbox_relays_per_author][]const u8 = undefined;
+    var taken: usize = 0;
+    for (urls) |raw| {
+        if (taken >= outbox_relays_per_author) break;
+        const url = std.mem.trim(u8, raw, " \t\r\n");
+        if (url.len == 0 or url.len > 96) continue;
+        if (!isRelayUrl(url)) continue;
+        var dup = false;
+        for (voted[0..taken]) |v| {
+            if (relayUrlEql(v, url)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        voted[taken] = url;
+        taken += 1;
+
+        var seated = false;
+        for (table[0..len]) |*e| {
+            if (!relayUrlEql(e.urlSlice(), url)) continue;
+            e.writers +|= 1;
+            seated = true;
+            break;
+        }
+        if (seated) continue;
+        if (len >= table.len) continue;
+        table[len] = .{ .len = @intCast(url.len), .writers = 1 };
+        @memcpy(table[len].url[0..url.len], url);
+        len += 1;
+    }
+    return len;
+}
+
+/// Rebuilds the suggestions from every relay list the store holds for the
+/// people this reader follows, ordered by how many of them write there.
+///
+/// One pass over one query. The relays already in the pool are dropped, because
+/// a relay the reader is on is not a suggestion, and the top few of what is left
+/// are what gets offered.
+fn rankRelaySuggestions(store: *nostr.store.Store) void {
+    var authors: [max_follows][32]u8 = undefined;
+    var authors_len: usize = 0;
+    for (followSet()) |pk| {
+        if (authors_len >= authors.len) break;
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    if (authors_len == 0) return;
+
+    const kinds = [_]u16{relay_list_kind};
+    var result = store.query(std.heap.page_allocator, .{
+        .authors = authors[0..authors_len],
+        .kinds = &kinds,
+        .limit = @intCast(authors_len),
+    }) catch return;
+    defer result.deinit();
+
+    var table: [relay_rank_candidates]RelayRank = undefined;
+    var len: usize = 0;
+    var urls: [32][]const u8 = undefined;
+    for (result.events) |ev| {
+        // The reader's own list says where THEY write. It is not a suggestion
+        // about anyone else, and counting it would have the reader voting for
+        // their own relays in a ranking meant to tell them about others'.
+        if (activePubkey()) |pk| {
+            if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+        }
+        var n: usize = 0;
+        for (ev.tags) |tag| {
+            if (n >= urls.len) break;
+            if (tag.len < 2) continue;
+            if (!std.mem.eql(u8, tag[0], "r")) continue;
+            // Only where they WRITE. A relay somebody merely reads from will
+            // never hold their notes, so routing a read there buys nothing.
+            if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
+            urls[n] = tag[1];
+            n += 1;
+        }
+        len = foldWriteRelays(&table, len, urls[0..n]);
+    }
+    if (len == 0) return;
+
+    std.mem.sort(RelayRank, table[0..len], {}, struct {
+        fn lt(_: void, a: RelayRank, b: RelayRank) bool {
+            return rankBefore(a, b);
+        }
+    }.lt);
+
+    // The pool, copied out BEFORE the table lock is taken. `relaySnapshot` takes
+    // that same lock and it is a plain spinlock with no owner tracking, so
+    // reaching for it from inside is not a slow path, it is a hang: the thread
+    // waits for a lock only it could release. Found by running the tests.
+    var pool: [max_relays][96]u8 = undefined;
+    var pool_len: [max_relays]u8 = @splat(0);
+    var pool_n: usize = 0;
+    for (0..relaySlots()) |i| {
+        var pool_buf: [96]u8 = undefined;
+        const pe = relaySnapshot(i, &pool_buf) orelse continue;
+        if (pool_n >= pool.len) break;
+        @memcpy(pool[pool_n][0..pe.url.len], pe.url);
+        pool_len[pool_n] = @intCast(pe.url.len);
+        pool_n += 1;
+    }
+
+    lockRelayTable();
+    defer unlockRelayTable();
+    var kept: u8 = 0;
+    for (table[0..len]) |e| {
+        if (kept >= max_relay_suggestions) break;
+        // A relay the reader is already on is not news.
+        var in_pool = false;
+        for (0..pool_n) |i| {
+            if (relayUrlEql(pool[i][0..pool_len[i]], e.urlSlice())) {
+                in_pool = true;
+                break;
+            }
+        }
+        if (in_pool) continue;
+        @memcpy(g_suggested[kept][0..e.len], e.urlSlice());
+        g_suggested_len[kept] = e.len;
+        kept += 1;
+    }
+    // Published last, so a reader cannot see a half-rewritten table: the count
+    // is what bounds every read of it.
+    g_suggested_count.store(kept, .release);
+}
+
+/// Set when a relay list that is not the reader's own reaches the store, so the
+/// ranking is redone once rather than on every tick.
+var g_relay_ranks_dirty = std.atomic.Value(bool).init(true);
+
+pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
+    rankRelaySuggestions(store);
+}
+pub fn foldWriteRelaysForTest(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    return foldWriteRelays(table, len_in, urls);
+}
+pub const RelayRankForTest = RelayRank;
+pub fn relayRankWritersForTest(e: RelayRank) u16 {
+    return e.writers;
+}
+pub fn relayRankUrlForTest(e: *const RelayRank) []const u8 {
+    return e.urlSlice();
+}
+pub const outboxRelaysPerAuthorForTest = outbox_relays_per_author;
+
 /// Records a relay a follow writes to, unless it is already in the pool or
 /// already suggested. First come, first kept: the table is small on purpose,
 /// because a wall of suggestions is not a suggestion.
@@ -395,14 +599,14 @@ fn ingestRelayList(ev: nostr.event.Event) void {
             return;
         }
     }
-    for (ev.tags) |tag| {
-        if (tag.len < 2) continue;
-        if (!std.mem.eql(u8, tag[0], "r")) continue;
-        // Only where they WRITE: a relay a follow merely reads from will never
-        // hold their notes, so adding it would buy nothing.
-        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
-        noteRelaySuggestion(std.mem.trim(u8, tag[1], " \t\r\n"));
-    }
+    // Somebody else's list. The suggestions are ranked from every list the
+    // store holds rather than from this one in isolation, so all this has to do
+    // is say that the answer has moved.
+    //
+    // It used to walk the tags here and keep the first six write relays ever
+    // seen. That made the offer depend on whose list arrived first: one
+    // person's relay could sit above one two hundred people use.
+    g_relay_ranks_dirty.store(true, .release);
 }
 
 /// An edit is waiting to be published, and when it was made. Walking a badge
@@ -7933,6 +8137,10 @@ pub const Model = struct {
             // A grown store may hold quoted events the feed references now.
             refreshQuotes(store);
         }
+        // Off the store-changed guard, on its own flag: a relay list is rare
+        // and the ranking reads every one of them, so it runs when one lands
+        // and not once a second because a reaction did.
+        if (g_relay_ranks_dirty.swap(false, .acq_rel)) rankRelaySuggestions(store);
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
     }
 
@@ -14234,9 +14442,11 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     g_follow_created_at = created_at;
     unlockFollows();
     // Everything scoped to the follow set is now stale: the feed's query, the
-    // relay filters, the names being fetched.
+    // relay filters, the names being fetched, and which relays are worth
+    // suggesting (the ranking is a count of THESE people).
     _ = g_follow_gen.fetchAdd(1, .monotonic);
     invalidateFeed();
+    g_relay_ranks_dirty.store(true, .release);
     return true;
 }
 

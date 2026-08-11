@@ -4771,6 +4771,34 @@ test "a warmed picture is asked for at the address the row will look up" {
 }
 
 test "a follow's relay list is a suggestion, and only where they write" {
+    // Same three rules as ever, now reached through the store: only where they
+    // write, never a relay the reader is already on, and one list is one
+    // opinion however many times it arrives.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/suggest.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
     const tags = [_]nostr.event.Tag{
         &.{ "r", "wss://writes.example.com", "write" },
         &.{ "r", "wss://both.example.com" },
@@ -4779,25 +4807,107 @@ test "a follow's relay list is a suggestion, and only where they write" {
         // Already in the pool: not worth offering.
         &.{ "r", "wss://relay.damus.io" },
     };
-    const ev = nostr.event.Event{
-        .id = [_]u8{0} ** 32,
-        .pubkey = [_]u8{9} ** 32,
-        .created_at = 0,
-        .kind = 10002,
-        .tags = &tags,
-        .content = "",
-        .sig = [_]u8{0} ** 64,
-    };
-    main.resetRelaysForTest();
-    main.ingestRelayListForTest(ev);
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    main.rankRelaySuggestionsForTest(&store);
+
     try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
     var buf: [96]u8 = undefined;
-    try testing.expectEqualStrings("wss://writes.example.com", main.relaySuggestionCopy(0, &buf).?);
-    try testing.expectEqualStrings("wss://both.example.com", main.relaySuggestionCopy(1, &buf).?);
+    // Equal counts, so the tie-break orders them, and the order is stable
+    // rather than whatever the tags happened to say.
+    try testing.expectEqualStrings("wss://both.example.com", main.relaySuggestionCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://writes.example.com", main.relaySuggestionCopy(1, &buf).?);
 
-    // The same list again adds nothing: a suggestion is a fact, not a tally.
-    main.ingestRelayListForTest(ev);
+    // Ranking again over the same store changes nothing: it is a count of
+    // people, and there is still one person.
+    main.rankRelaySuggestionsForTest(&store);
     try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+}
+
+test "the relay more of your follows write to is offered first" {
+    // The bug this replaces: the first six write relays ever seen filled the
+    // table and everything after was dropped, so which six you were offered
+    // depended on whose relay list happened to arrive first. A relay one person
+    // uses could sit above one everybody uses.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/rank.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One person on the lonely relay, and they list it FIRST so arrival order
+    // would have put it at the top. Five on the popular one.
+    var list: [6][32]u8 = undefined;
+    for (0..6) |i| {
+        var secret = [_]u8{3} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        list[i] = kp.public_key;
+        const tags = if (i == 0)
+            [_]nostr.event.Tag{&.{ "r", "wss://lonely.example.com" }}
+        else
+            [_]nostr.event.Tag{&.{ "r", "wss://popular.example.com" }};
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), 10002, &tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+    try testing.expectEqualStrings("wss://popular.example.com", main.relaySuggestionCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://lonely.example.com", main.relaySuggestionCopy(1, &buf).?);
+}
+
+test "one person cannot outvote everyone by listing a relay twice" {
+    var table: [8]main.RelayRankForTest = undefined;
+    const urls = [_][]const u8{
+        "wss://a.example.com",
+        "wss://a.example.com/",
+        "WSS://A.example.com",
+    };
+    const len = main.foldWriteRelaysForTest(&table, 0, &urls);
+    try testing.expectEqual(@as(usize, 1), len);
+    try testing.expectEqual(@as(u16, 1), main.relayRankWritersForTest(table[0]));
+}
+
+test "one enthusiastic relay list does not outvote everyone else's" {
+    // Jumble's rule, and their reasoning: most people do not understand relays,
+    // so an author advertising a dozen is not telling you about a dozen places
+    // their notes reliably are. Only the first few of any one list count.
+    var table: [64]main.RelayRankForTest = undefined;
+    var urls: [16][]const u8 = undefined;
+    const names = [_][]const u8{
+        "wss://r0.example.com", "wss://r1.example.com", "wss://r2.example.com",
+        "wss://r3.example.com", "wss://r4.example.com", "wss://r5.example.com",
+        "wss://r6.example.com", "wss://r7.example.com", "wss://r8.example.com",
+        "wss://r9.example.com", "wss://ra.example.com", "wss://rb.example.com",
+    };
+    for (names, 0..) |n, i| urls[i] = n;
+    const len = main.foldWriteRelaysForTest(&table, 0, urls[0..names.len]);
+    try testing.expectEqual(main.outboxRelaysPerAuthorForTest, len);
+}
+
+test "a relay list that is nothing but junk contributes nothing" {
+    var table: [8]main.RelayRankForTest = undefined;
+    const urls = [_][]const u8{ "", "   ", "http://not-a-relay.example.com", "nostr:npub1x" };
+    try testing.expectEqual(@as(usize, 0), main.foldWriteRelaysForTest(&table, 0, &urls));
 }
 
 test "one relay under two spellings is one relay" {
