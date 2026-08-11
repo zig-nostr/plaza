@@ -14279,3 +14279,108 @@ test "a note that fills a gap below the window arrives when the reader pages dow
     try testing.expectEqual(@as(usize, 3), f.model.notes_len);
     try testing.expectEqual(main.noteIdOf(old_one), f.model.notes[2].id);
 }
+
+// -- A connection that stopped answering ------------------------------------
+//
+// A relay's ingest thread blocks in `receive` until the relay speaks. A peer
+// that goes away without closing leaves that thread waiting forever behind a
+// green dot: no error, no timeout, no reconnect, and nothing able to tell it
+// apart from a quiet night. The keeper is a separate thread precisely because
+// the waiting one cannot notice anything.
+//
+// Its decision is a pure function of two numbers, so it is asserted here
+// without a socket, a thread or a clock.
+
+test "a connection that has never spoken is not a stalled one" {
+    // The window between the handshake and the relay's first word. Treating a
+    // missing measurement as an infinite one would cut off every relay that
+    // took a moment to answer, which is every relay on a slow network.
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, null));
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, 999_999));
+}
+
+test "a talking relay is left alone" {
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(0, null));
+    try testing.expectEqual(
+        main.KeeperActionForTest.leave_it,
+        main.keeperActionForTest(main.relayPingAfterMsForTest - 1, null),
+    );
+}
+
+test "a relay that has gone quiet is asked whether it is still there" {
+    try testing.expectEqual(
+        main.KeeperActionForTest.ping,
+        main.keeperActionForTest(main.relayPingAfterMsForTest, null),
+    );
+}
+
+test "a quiet relay is asked once per interval, not once per look" {
+    // The keeper looks every few seconds and the interval is half a minute. A
+    // socket that has stopped answering would otherwise collect a dozen pings
+    // on its way to being declared dead.
+    const idle = main.relayPingAfterMsForTest + 5_000;
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(idle, 5_000));
+    try testing.expectEqual(
+        main.KeeperActionForTest.ping,
+        main.keeperActionForTest(idle, main.relayPingAfterMsForTest),
+    );
+}
+
+test "a relay that answers none of three pings is given up on" {
+    try testing.expectEqual(
+        main.KeeperActionForTest.give_up,
+        main.keeperActionForTest(main.relayDeadAfterMsForTest, 0),
+    );
+    // And the deadline wins over the ping interval: a socket this far gone is
+    // not asked again, it is closed.
+    try testing.expectEqual(
+        main.KeeperActionForTest.give_up,
+        main.keeperActionForTest(main.relayDeadAfterMsForTest + 60_000, main.relayDeadAfterMsForTest),
+    );
+}
+
+test "the deadline is a multiple of the interval, so silence is answered before it is fatal" {
+    // Not decoration: if the deadline were under the interval, the keeper would
+    // declare a relay dead without ever having asked it anything, and every
+    // quiet connection in the pool would be recycled on a timer.
+    try testing.expect(main.relayDeadAfterMsForTest >= main.relayPingAfterMsForTest * 2);
+}
+
+test "a quiet relay still counts as a relay" {
+    // The pool summary drives an "offline, reconnecting" banner over the whole
+    // app. A relay with an open socket, live subscriptions and a publish path
+    // that works is not offline, and saying so on a slow night would be the
+    // same kind of lie as the green dot, pointing the other way.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example", true, true);
+    main.setRelayStatusForTest(0, true);
+    try testing.expectEqual(@as(usize, 1), main.liveRelayCountForTest());
+
+    main.setRelayQuietForTest(0);
+    try testing.expect(main.relayStatusQuietForTest(0));
+    try testing.expectEqual(@as(usize, 1), main.liveRelayCountForTest());
+    // And it is still a relay a note can go out on.
+    try testing.expect(main.relayStatusConnectedForTest(0));
+}
+
+test "coming back from quiet is not a network recovery" {
+    // The outbox widens its retry delay when nothing can be reached and pulls it
+    // back when a relay returns. A relay answering the keepalive it was just
+    // sent is news about one socket, not about the network, and letting it reset
+    // the ladder would mean a quiet pool resetting it every minute forever.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example", true, true);
+    main.forgetOutboxAcksForTest();
+
+    main.setRelayStatusForTest(0, false);
+    main.setRelayStatusForTest(0, true);
+    const after_real_recovery = main.outboxWokeForTest();
+    try testing.expect(after_real_recovery);
+
+    main.resetOutboxWokeForTest();
+    main.setRelayQuietForTest(0);
+    main.setRelayStatusForTest(0, true);
+    try testing.expect(!main.outboxWokeForTest());
+}

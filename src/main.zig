@@ -1234,8 +1234,31 @@ pub fn setRelayStatusForTest(i: usize, connected: bool) void {
 }
 
 pub fn relayStatusConnectedForTest(i: usize) bool {
-    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .connected;
+    return connHolds(@enumFromInt(g_relay_status[i].load(.monotonic)));
 }
+
+/// What the keeper would do for a connection this idle, last pinged this long
+/// ago. Null for either means "no measurement".
+pub fn keeperActionForTest(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
+    return keeperAction(idle_ms, since_ping_ms);
+}
+pub const KeeperActionForTest = KeeperAction;
+
+pub fn setRelayQuietForTest(i: usize) void {
+    setRelayStatus(i, .quiet);
+}
+pub fn outboxWokeForTest() bool {
+    return g_outbox_woke_ever.load(.monotonic);
+}
+pub fn resetOutboxWokeForTest() void {
+    g_outbox_woke_ever.store(false, .monotonic);
+    g_outbox_woke_at.store(0, .monotonic);
+}
+pub fn relayStatusQuietForTest(i: usize) bool {
+    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .quiet;
+}
+pub const relayPingAfterMsForTest = relay_ping_after_ms;
+pub const relayDeadAfterMsForTest = relay_dead_after_ms;
 
 pub fn isReaderNoteForTest(kind: u16) bool {
     return isReaderNote(kind);
@@ -1874,12 +1897,30 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // write lock one at a time) and hands readers an MVCC snapshot, and every
 // `nostr.store` call is a self-contained transaction on its calling thread.
 
-const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2 };
+/// A relay slot's connection state.
+///
+/// `quiet` is the state this app used to be unable to express, and the reason a
+/// green dot could be a lie: the socket is open, nothing has come down it for a
+/// while, and a ping is out with no answer yet. It is not offline, because
+/// nothing has failed; it is not plainly connected either, because the last
+/// evidence of that is a minute old. Every shipping client the pool was
+/// compared against has exactly two states here and shows the same green dot
+/// over a half-open socket, so this is not a bug being fixed so much as a lie
+/// being stopped.
+const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2, quiet = 3 };
 
 var g_store: ?*nostr.store.Store = null;
 // One connection state per relay in the pool, flipped by that relay's ingest
 // thread and read by the UI thread to summarise the pool.
 var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** max_relays;
+
+/// Whether a slot holds a socket, whatever the socket is doing. A relay that has
+/// gone quiet has not dropped: nothing has failed, and counting it as offline
+/// would put the whole app behind an "offline, reconnecting" banner because the
+/// night was slow.
+fn connHolds(state: Conn) bool {
+    return state == .connected or state == .quiet;
+}
 
 /// Arrival order inside a thread level: the build a reply first appeared in, so a
 /// late arrival lands after what has already been read instead of jumping into the
@@ -2014,7 +2055,126 @@ fn setRelayStatus(index: usize, state: Conn) void {
     // backoff was only ever reset by editing the relay list, so a note that had
     // widened out to an hourly retry stayed on that schedule even when the
     // network returned a second later.
-    if (state == .connected and was != .connected) wakeOutboxBackoff();
+    //
+    // Coming back from QUIET does not count. A relay answering the keepalive it
+    // was sent is not news about the network, it is news about that one socket,
+    // and treating it as a recovery would let a quiet pool reset the queue's
+    // ladder every minute forever.
+    if (state == .connected and was != .connected and was != .quiet) wakeOutboxBackoff();
+}
+
+// -- Knowing a socket is still there -----------------------------------------
+//
+// A relay's ingest thread blocks in `receive` until the relay says something.
+// If the peer goes away without closing, that thread waits forever and the chip
+// stays green: no error, no timeout, no reconnect. Nothing in this app could
+// tell that apart from a quiet night.
+//
+// Nothing can tell it apart from inside that thread either, which is the whole
+// difficulty. A thread waiting on a dead peer cannot notice anything. So a
+// separate one watches the pool: it sends the ping, and it is the one that can
+// still act when no answer comes.
+//
+// The numbers are Amethyst's, who surveyed 122 relays and found idle timeouts
+// clustered at roughly 60, 120, 240, 300 and 600 seconds, and who report that a
+// ping only reliably holds a connection open when its interval is at most about
+// half the timeout. Thirty seconds sits under half of the shortest tier. Ninety
+// is three missed answers, which is the point at which a socket that has not
+// said a word to three pings is not coming back.
+const relay_ping_after_ms: i64 = 30_000;
+const relay_dead_after_ms: i64 = 90_000;
+/// How often the keeper looks. Short enough that ninety seconds means ninety,
+/// long enough to cost nothing.
+const relay_keeper_tick_ms: u64 = 5_000;
+
+/// The live connection for each slot, for the keeper and nothing else.
+///
+/// Published by the thread that dialled it and cleared by that same thread
+/// before the connection is freed, both under the slot's lock, and the keeper
+/// holds that lock for as long as it touches the pointer. Without it the keeper
+/// can be inside `ping` on a `Relay` whose owner has already returned and run
+/// its `deinit`.
+var g_relay_live: [max_relays]?*nostr.relay.Relay = @splat(null);
+var g_relay_live_lock: [max_relays]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+/// When each slot was last pinged, so a socket that stops answering is pinged
+/// once per interval rather than once per keeper tick.
+var g_relay_pinged_ms: [max_relays]i64 = @splat(0);
+
+fn lockLiveRelay(index: usize) void {
+    while (g_relay_live_lock[index].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockLiveRelay(index: usize) void {
+    g_relay_live_lock[index].store(false, .release);
+}
+
+/// Offers this slot's connection to the keeper, or withdraws it. The owning
+/// thread calls this with the connection on the way in and with null on the way
+/// out, BEFORE the connection is freed.
+fn publishLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
+    lockLiveRelay(index);
+    defer unlockLiveRelay(index);
+    g_relay_live[index] = relay;
+    g_relay_pinged_ms[index] = 0;
+}
+
+/// What the keeper decides for one slot, given how long that connection has
+/// been silent and when it was last pinged. Pulled out so it can be asserted
+/// without a socket, a thread or a clock.
+const KeeperAction = enum { leave_it, ping, give_up };
+
+fn keeperAction(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
+    // Nothing has ever arrived on this connection. That is the window between
+    // the handshake and the relay's first word, not a stall, and treating a
+    // missing measurement as an infinite one would cut off every relay that
+    // took a moment to answer.
+    const idle = idle_ms orelse return .leave_it;
+    if (idle >= relay_dead_after_ms) return .give_up;
+    if (idle < relay_ping_after_ms) return .leave_it;
+    // Silent past the interval. Ping, but only once per interval: at a five
+    // second tick a socket that has stopped answering would otherwise be pinged
+    // twelve more times on its way to being declared dead.
+    const since = since_ping_ms orelse return .ping;
+    return if (since >= relay_ping_after_ms) .ping else .leave_it;
+}
+
+/// Watches every slot's connection for silence: pings one that has gone quiet,
+/// and cuts off one that will not answer.
+fn relayKeeper(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    while (true) {
+        io.sleep(std.Io.Duration.fromMilliseconds(relay_keeper_tick_ms), .awake) catch {};
+        const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        for (0..max_relays) |i| {
+            lockLiveRelay(i);
+            defer unlockLiveRelay(i);
+            const relay = g_relay_live[i] orelse continue;
+            const idle = relay.idleMs(io);
+            const since_ping: ?i64 = if (g_relay_pinged_ms[i] == 0) null else now - g_relay_pinged_ms[i];
+            switch (keeperAction(idle, since_ping)) {
+                .leave_it => {},
+                .ping => {
+                    // A failed write is not a verdict on its own; the silence
+                    // deadline is. Letting a write error tear the socket down
+                    // here would race the owning thread's own error handling.
+                    relay.ping(io) catch {};
+                    g_relay_pinged_ms[i] = now;
+                    setRelayStatus(i, .quiet);
+                },
+                .give_up => {
+                    // Half-close, so the owner's blocked `receive` returns and
+                    // it reconnects through its own path. NOT deinit: the owner
+                    // still holds this and has to unwind.
+                    relay.shutdown(io);
+                    g_relay_live[i] = null;
+                    g_relay_pinged_ms[i] = 0;
+                    setRelayStatus(i, .offline);
+                },
+            }
+        }
+    }
 }
 
 /// How often a returning relay may pull the queue's backoff back to zero.
@@ -7568,7 +7728,10 @@ pub const Model = struct {
         for (0..relaySlots()) |i| {
             if (relayAt(i) == null) continue;
             switch (@as(Conn, @enumFromInt(g_relay_status[i].load(.acquire)))) {
-                .connected => live += 1,
+                // A quiet relay still holds its socket and nothing has failed,
+                // so it counts as live here. Saying otherwise would put the app
+                // behind an "offline, reconnecting" banner on a slow night.
+                .connected, .quiet => live += 1,
                 .offline => offline += 1,
                 .connecting => {},
             }
@@ -10927,6 +11090,10 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
     const p = theme.palette;
     const dot: canvas.Color = switch (state) {
         .connected => p.status_success,
+        // Amber, not green. The socket is open and nothing has failed, but the
+        // last word from this relay is a minute old and a keepalive is out with
+        // no answer. Green here is the lie this state exists to stop telling.
+        .quiet => p.status_warning_text,
         .connecting => p.status_warning_text,
         .offline => p.status_offline,
     };
@@ -10941,6 +11108,8 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
             // rather than as the app already doing something about it.
             if (state == .connecting)
                 ui.paragraph(.{ .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = "reconnecting", .monospace = true, .scale = mono_chip_scale }})
+            else if (state == .quiet)
+                ui.paragraph(.{ .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = "quiet", .monospace = true, .scale = mono_chip_scale }})
             else if (relayRttMs(index)) |ms|
                 ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = ui.fmt("{d} ms", .{ms}), .monospace = true, .scale = mono_chip_scale }})
             else
@@ -16927,13 +17096,16 @@ fn relayRow(ui: *AppUi, url: []const u8, index: usize, badge: []const u8, model:
     // A relay leaves at its next message, so during a pause some rows are still
     // genuinely connected. Each row reports ITSELF: claiming the whole list is
     // paused while notes are still arriving on it is the dishonesty this is for.
-    const connected = state == .connected;
+    // Holding a socket, whichever way. The row still reads as a working relay
+    // (its round trip is real, its badge means something), and only the dot and
+    // the word say that the last evidence of life is a minute old.
+    const connected = connHolds(state);
     const paused = model.relays_paused and !connected;
     const dot = if (paused)
         p.text_faint_alt
-    else if (connected)
+    else if (state == .connected)
         p.status_success
-    else if (state == .connecting)
+    else if (state == .connecting or state == .quiet)
         p.status_warning
     else
         p.status_offline;
@@ -16958,6 +17130,8 @@ fn relayRow(ui: *AppUi, url: []const u8, index: usize, badge: []const u8, model:
             &.{.{
                 .text = if (paused)
                     "paused"
+                else if (state == .quiet)
+                    "quiet"
                 else if (connected)
                     (if (relayRttMs(index)) |ms| ui.fmt("{d}ms", .{ms}) else "…")
                 else if (state == .connecting)
@@ -18366,7 +18540,9 @@ fn liveRelayCount() usize {
         // A dormant seat is not a live relay whatever its last status said.
         if (relayAt(i) == null) continue;
         const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
-        if (state == .connected) n += 1;
+        // Quiet counts. It holds a socket, its subscriptions are still open on
+        // the relay, and a note published now goes out on it.
+        if (connHolds(state)) n += 1;
     }
     return n;
 }
@@ -23483,6 +23659,20 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
         };
         thread.detach();
     }
+
+    // One more, watching all of them. It has to be a separate thread and not
+    // work folded into the eight: each of those is blocked inside `receive`
+    // exactly when there is something to notice, and a thread waiting on a dead
+    // peer is the last thing that can tell it has stopped answering.
+    if (std.Thread.spawn(.{}, relayKeeper, .{gpa})) |keeper| {
+        keeper.detach();
+    } else |err| {
+        // Not fatal. Without it the pool behaves the way it did before: a
+        // half-open socket sits there. Said out loud rather than swallowed,
+        // because "the feed silently stopped updating" is the symptom and it
+        // looks nothing like its cause.
+        std.debug.print("plaza: relay keepalive did not start ({s}); a dropped connection will not be noticed\n", .{@errorName(err)});
+    }
 }
 
 /// How much address space the store may grow into.
@@ -24137,7 +24327,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     const url = entry.url;
     const reads = entry.read;
     var relay = try nostr.relay.dial(gpa, io, url);
+    // Withdrawn BEFORE the connection is freed, and the defers unwind in
+    // reverse, so this one is declared second and runs first. The other order
+    // hands the keeper a pointer to a `Relay` that is already gone.
     defer relay.deinit();
+    publishLiveRelay(index, relay);
+    defer publishLiveRelay(index, null);
     setRelayStatus(index, .connected);
 
     // Follow-scoped: the starter pack's recent notes for the feed, plus their
