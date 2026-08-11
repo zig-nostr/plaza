@@ -193,29 +193,60 @@ fn rankBefore(a: RelayRank, b: RelayRank) bool {
 
 /// Folds one author's write relays into `table`, counting each relay once for
 /// that author however many times they list it. Returns the new length.
-fn foldWriteRelays(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
-    var len = len_in;
-    // What this author has already voted for. A relay list naming the same
-    // relay twice is one person's opinion twice, and it would quietly promote
-    // whatever a duplicate-happy list mentions most.
-    var voted: [outbox_relays_per_author][]const u8 = undefined;
-    var taken: usize = 0;
+/// The write relays of one relay list that count toward routing: the first few
+/// DISTINCT ones, trimmed and sanity-checked. Returns how many landed in `out`.
+///
+/// One function, because the ranking and the routing have to agree exactly.
+/// They did not: the ranking skipped a repeat before counting it against the
+/// cap and the routing counted raw tags, so an author listing `[A, A, B, C, D]`
+/// had D counted in the ranking and dropped in the routing, and D then got a
+/// connection with nobody on it. Found by removing the empty-relay guard and
+/// noticing that no test cared.
+fn selectWriteRelays(urls: []const []const u8, out: *[outbox_relays_per_author][]const u8) usize {
+    var n: usize = 0;
     for (urls) |raw| {
-        if (taken >= outbox_relays_per_author) break;
+        if (n >= out.len) break;
         const url = std.mem.trim(u8, raw, " \t\r\n");
         if (url.len == 0 or url.len > 96) continue;
         if (!isRelayUrl(url)) continue;
+        // A relay list naming the same relay twice is one person's opinion
+        // twice, and it would quietly promote whatever a duplicate-happy list
+        // mentions most.
         var dup = false;
-        for (voted[0..taken]) |v| {
+        for (out[0..n]) |v| {
             if (relayUrlEql(v, url)) {
                 dup = true;
                 break;
             }
         }
         if (dup) continue;
-        voted[taken] = url;
-        taken += 1;
+        out[n] = url;
+        n += 1;
+    }
+    return n;
+}
 
+/// The `r` tags of a relay list, as raw values. Only where they WRITE: a relay
+/// somebody merely reads from will never hold their notes, so it is not a route
+/// to them.
+fn writeTagUrls(ev: nostr.event.Event, out: [][]const u8) usize {
+    var n: usize = 0;
+    for (ev.tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "r")) continue;
+        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
+        out[n] = tag[1];
+        n += 1;
+    }
+    return n;
+}
+
+fn foldWriteRelays(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    var len = len_in;
+    var selected: [outbox_relays_per_author][]const u8 = undefined;
+    const chosen = selectWriteRelays(urls, &selected);
+    for (selected[0..chosen]) |url| {
         var seated = false;
         for (table[0..len]) |*e| {
             if (!relayUrlEql(e.urlSlice(), url)) continue;
@@ -266,18 +297,7 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
         if (activePubkey()) |pk| {
             if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
         }
-        var n: usize = 0;
-        for (ev.tags) |tag| {
-            if (n >= urls.len) break;
-            if (tag.len < 2) continue;
-            if (!std.mem.eql(u8, tag[0], "r")) continue;
-            // Only where they WRITE. A relay somebody merely reads from will
-            // never hold their notes, so routing a read there buys nothing.
-            if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
-            urls[n] = tag[1];
-            n += 1;
-        }
-        len = foldWriteRelays(&table, len, urls[0..n]);
+        len = foldWriteRelays(&table, len, urls[0..writeTagUrls(ev, &urls)]);
     }
     if (len == 0) return;
 
@@ -324,6 +344,109 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     // Published last, so a reader cannot see a half-rewritten table: the count
     // is what bounds every read of it.
     g_suggested_count.store(kept, .release);
+
+    // The same relays, the first few of them, are the ones worth connecting to.
+    // Filled from the same query, because it is the same question: who writes
+    // where. This runs while the table lock is held, and takes the discovered
+    // lock inside it, which is safe only because nothing on the discovered side
+    // ever reaches back for the table lock. Nested locks are exactly how the
+    // hang above happened, so the order is fixed here and stated: table first,
+    // discovered second, never the reverse.
+    fillDiscovered(result.events, g_suggested[0..kept], g_suggested_len[0..kept]);
+}
+
+/// Gives each discovered slot a relay and the people who write there.
+///
+/// `urls` are already ranked and already known not to be in the reader's pool,
+/// so this only has to find, for each of them, which authors named it.
+/// Built here, compared with what is live, and only then swapped in. Static
+/// rather than a local: four slots of five hundred pubkeys is sixty-odd
+/// kilobytes and this runs on the render thread.
+var g_discovered_next: [max_discovered_relays]DiscoveredRelay = @splat(.{});
+
+/// Whether two route tables ask the same question of the same relays.
+fn sameRoutes(a: *const DiscoveredRelay, b: *const DiscoveredRelay) bool {
+    if (a.url_len != b.url_len or a.authors_len != b.authors_len) return false;
+    if (!std.mem.eql(u8, a.url[0..a.url_len], b.url[0..b.url_len])) return false;
+    for (0..a.authors_len) |i| {
+        if (!std.mem.eql(u8, &a.authors[i], &b.authors[i])) return false;
+    }
+    return true;
+}
+
+fn fillDiscovered(events: []const nostr.event.Event, urls: []const [96]u8, lens: []const u8) void {
+    lockDiscovered();
+    defer unlockDiscovered();
+
+    for (&g_discovered_next) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+
+    const take = @min(@min(urls.len, g_discovered_next.len), lens.len);
+    for (0..take) |i| {
+        const url = urls[i][0..lens[i]];
+        const d = &g_discovered_next[i];
+        @memcpy(d.url[0..url.len], url);
+        d.url_len = @intCast(url.len);
+
+        for (events) |ev| {
+            if (d.authors_len >= discovered_authors_cap) break;
+            if (activePubkey()) |pk| {
+                if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+            }
+            // The SAME selection the ranking used, from the same function.
+            // Two copies of this rule drifted once already.
+            var raw: [32][]const u8 = undefined;
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(raw[0..writeTagUrls(ev, &raw)], &selected);
+            var writes_here = false;
+            for (selected[0..chosen]) |candidate| {
+                if (relayUrlEql(candidate, url)) {
+                    writes_here = true;
+                    break;
+                }
+            }
+            if (!writes_here) continue;
+            d.authors[d.authors_len] = ev.pubkey;
+            d.authors_len += 1;
+        }
+        // A backstop. Both loops now select through `selectWriteRelays` over
+        // the same query result, so a relay in the ranking should always have
+        // at least one writer here. If that ever stops being true the symptom
+        // is a connection asking about nobody, and this turns it into a missing
+        // connection instead, which is the quieter of the two failures.
+        if (d.authors_len == 0) d.url_len = 0;
+    }
+
+    // Only when the answer actually moved.
+    //
+    // The ranking reruns every time a relay list lands, and during a cold start
+    // hundreds of them land. Bumping the generation each time would drop and
+    // redial every discovered connection each time, so the pool would spend the
+    // whole startup reconnecting and never finish asking anything. Seen exactly
+    // that in a live run before this check: three connections, each redialled
+    // inside two minutes, for a route table that had not changed.
+    var moved = false;
+    for (0..g_discovered.len) |i| {
+        if (!sameRoutes(&g_discovered[i], &g_discovered_next[i])) {
+            moved = true;
+            break;
+        }
+    }
+    if (!moved) return;
+
+    for (0..g_discovered.len) |i| {
+        const src = &g_discovered_next[i];
+        const dst = &g_discovered[i];
+        dst.url_len = src.url_len;
+        @memcpy(dst.url[0..src.url_len], src.url[0..src.url_len]);
+        dst.authors_len = src.authors_len;
+        @memcpy(dst.authors[0..src.authors_len], src.authors[0..src.authors_len]);
+    }
+
+    // Last, so a thread reading the generation sees a table that is finished.
+    _ = g_discovered_gen.fetchAdd(1, .monotonic);
 }
 
 /// Set when a relay list that is not the reader's own reaches the store, so the
@@ -344,6 +467,100 @@ pub fn relayRankUrlForTest(e: *const RelayRank) []const u8 {
     return e.urlSlice();
 }
 pub const outboxRelaysPerAuthorForTest = outbox_relays_per_author;
+pub const maxDiscoveredRelaysForTest = max_discovered_relays;
+pub const discoveredAuthorsCapForTest = discovered_authors_cap;
+pub const discoveredWatchBaseForTest = discovered_watch_base;
+pub const relayWatchSlotsForTest = relay_watch_slots;
+pub fn discoveredGenerationForTest() u32 {
+    return g_discovered_gen.load(.acquire);
+}
+
+// -- Reading where your follows actually write -------------------------------
+//
+// The pool asks every relay in it about every person the reader follows. A
+// follow who writes only to relays the reader is not on is therefore invisible:
+// their notes never arrive, and nothing says so. No error, no empty state, no
+// loading spinner. They simply are not there.
+//
+// The ranking above already works out where the follows write. This dials the
+// top few of those that the reader is NOT already on, and asks each one only
+// about the people who write there, which is the whole point: a small relay
+// gets asked about its dozen writers rather than about two thousand strangers.
+//
+// A SEPARATE pool, and not a wider `g_relays`. `max_relays` is eight because
+// the outbox records deliveries in a `u8` bitmap, one bit per slot; a ninth
+// slot would silently stop being counted and notes would look undelivered
+// forever. These connections never publish, so they need no bit and no slot.
+//
+// Notedeck, the closest architectural match to this app, does not route by
+// author at all: it parses kind:10002 for the logged-in account only. So this
+// is not a prerequisite for being a credible client, and it is bounded
+// accordingly: four connections, and the reader's own pool remains the feed.
+const max_discovered_relays = 4;
+/// How many authors one discovered relay is asked about. Beyond this the
+/// question stops being "who writes here" and starts being another firehose.
+const discovered_authors_cap = 512;
+
+const DiscoveredRelay = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    authors: [discovered_authors_cap][32]u8 = undefined,
+    authors_len: u16 = 0,
+};
+
+var g_discovered: [max_discovered_relays]DiscoveredRelay = @splat(.{});
+var g_discovered_lock = std.atomic.Value(bool).init(false);
+/// Bumped whenever the table is rewritten. A thread compares it to the value it
+/// dialled under and drops the connection when it moves, which is how a slot
+/// changing hands takes effect now rather than at the next reconnect.
+var g_discovered_gen = std.atomic.Value(u32).init(0);
+
+fn lockDiscovered() void {
+    while (g_discovered_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockDiscovered() void {
+    g_discovered_lock.store(false, .release);
+}
+
+pub fn discoveredCount() usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    for (&g_discovered) |*d| {
+        if (d.url_len > 0) n += 1;
+    }
+    return n;
+}
+
+pub fn discoveredUrlCopy(index: usize, buf: *[96]u8) ?[]const u8 {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return null;
+    const d = &g_discovered[index];
+    if (d.url_len == 0) return null;
+    @memcpy(buf[0..d.url_len], d.url[0..d.url_len]);
+    return buf[0..d.url_len];
+}
+
+pub fn discoveredAuthorCount(index: usize) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return 0;
+    return g_discovered[index].authors_len;
+}
+
+/// Copies one slot's question for the thread about to ask it. Returns null when
+/// the slot emptied or the table was rewritten under it.
+fn discoveredSnapshot(index: usize, gen: u32, url: *[96]u8, authors: *[discovered_authors_cap][32]u8) ?struct { url_len: usize, authors_len: usize } {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (g_discovered_gen.load(.acquire) != gen) return null;
+    const d = &g_discovered[index];
+    if (d.url_len == 0 or d.authors_len == 0) return null;
+    @memcpy(url[0..d.url_len], d.url[0..d.url_len]);
+    @memcpy(authors[0..d.authors_len], d.authors[0..d.authors_len]);
+    return .{ .url_len = d.url_len, .authors_len = d.authors_len };
+}
 
 /// Records a relay a follow writes to, unless it is already in the pool or
 /// already suggested. First come, first kept: the table is small on purpose,
@@ -2331,8 +2548,14 @@ const relay_keeper_tick_ms: u64 = 5_000;
 /// held open indefinitely by a thread blocked in `receive`. When it half-opens,
 /// remote signing stops working with no error anywhere, which is the worst way
 /// for a signer to fail.
-const relay_watch_slots = max_relays + 1;
+const relay_watch_slots = max_relays + 1 + max_discovered_relays;
 const bunker_watch_slot = max_relays;
+/// The discovered connections sit past the pool and the bunker. They are
+/// watched the same way and deliberately have no entry in the pool's status
+/// table: they are not the reader's relays, they are where the reader's follows
+/// turned out to be, and a chip claiming otherwise would be a lie about whose
+/// list this is.
+const discovered_watch_base = max_relays + 1;
 
 var g_relay_live: [relay_watch_slots]?*nostr.relay.Relay = @splat(null);
 var g_relay_live_lock: [relay_watch_slots]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
@@ -2350,7 +2573,12 @@ fn unlockLiveRelay(index: usize) void {
 /// Offers this slot's connection to the keeper, or withdraws it. The owning
 /// thread calls this with the connection on the way in and with null on the way
 /// out, BEFORE the connection is freed.
-fn publishLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
+///
+/// Named "offer", not "publish". It hands over a POINTER; nothing here sends
+/// anything to a relay, and a name that reads as publishing an event on a code
+/// path near a signing key is the kind of thing that gets misread once and then
+/// trusted.
+fn offerLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
     lockLiveRelay(index);
     defer unlockLiveRelay(index);
     g_relay_live[index] = relay;
@@ -23743,8 +23971,8 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
     // Withdrawn before the connection is freed: declared after `deinit`, so it
     // runs before it.
     defer relay.deinit();
-    publishLiveRelay(bunker_watch_slot, relay);
-    defer publishLiveRelay(bunker_watch_slot, null);
+    offerLiveRelay(bunker_watch_slot, relay);
+    defer offerLiveRelay(bunker_watch_slot, null);
 
     var client_hex: [64]u8 = undefined;
     hexLower(&client_hex, client_kp.public_key);
@@ -24062,6 +24290,18 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
             continue;
         };
         thread.detach();
+    }
+
+    // And one per discovered relay: where the reader's follows turned out to
+    // be, which the pool would never ask because it only knows the reader's own
+    // list. Spawned even before the table has anything in it, because these are
+    // slot threads like the pool's: they park until a slot is filled.
+    for (0..max_discovered_relays) |i| {
+        if (std.Thread.spawn(.{}, discoveredRelayThread, .{ gpa, i })) |t| {
+            t.detach();
+        } else |err| {
+            std.debug.print("plaza: discovered relay {d} did not start: {s}\n", .{ i, @errorName(err) });
+        }
     }
 
     // One more, watching all of them. It has to be a separate thread and not
@@ -24662,6 +24902,89 @@ fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_
     relay.subscribe("plaza-engagement", &eng_filters) catch {};
 }
 
+/// One discovered relay's loop: dial, ask about the people who write there,
+/// ingest, and redial when the connection drops or the table moves under it.
+///
+/// Deliberately thinner than the pool's loop. No publish, no latency probe, no
+/// engagement subscription, no inbox: this connection exists to close one gap,
+/// which is that a follow writing somewhere the reader is not would otherwise
+/// never arrive at all.
+fn discoveredRelayThread(gpa: std.mem.Allocator, index: usize) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var attempts: u6 = 0;
+    while (true) {
+        const gen = g_discovered_gen.load(.acquire);
+        var url_buf: [96]u8 = undefined;
+        var authors: [discovered_authors_cap][32]u8 = undefined;
+        const snap = discoveredSnapshot(index, gen, &url_buf, &authors);
+        if (snap == null or relaysPaused()) {
+            attempts = 0;
+            io.sleep(std.Io.Duration.fromSeconds(2), .awake) catch {};
+            continue;
+        }
+        const opened_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        discoveredOnce(gpa, io, signer, index, url_buf[0..snap.?.url_len], authors[0..snap.?.authors_len], gen) catch {};
+        const lasted = std.Io.Timestamp.now(io, .awake).toMilliseconds() - opened_at;
+        // The pool's ladder, and its guard: a relay that accepts the handshake
+        // and drops the socket would otherwise reset the backoff on every
+        // connection and redial in a tight loop forever.
+        attempts = nextReconnectAttempts(attempts, lasted);
+        const base = reconnectDelayMs(attempts);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(base + reconnectJitterMs(base, index, attempts))), .awake) catch {};
+    }
+}
+
+fn discoveredOnce(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    signer: nostr.keys.Signer,
+    index: usize,
+    url: []const u8,
+    authors: []const [32]u8,
+    gen: u32,
+) !void {
+    var relay = try nostr.relay.dial(gpa, io, url);
+    // Declared after `deinit` so it runs before it: the keeper must have let go
+    // of the pointer before the connection is freed.
+    defer relay.deinit();
+    offerLiveRelay(discovered_watch_base + index, relay);
+    defer offerLiveRelay(discovered_watch_base + index, null);
+
+    var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
+    // No `self`: the reader's own notes come from the reader's own relays, and
+    // asking a stranger's relay about them would be asking the wrong place.
+    const filters = buildFeedFilters(authors, null, feedSince(), &filter_buf);
+    try relay.subscribe("plaza-outbox", filters);
+
+    while (true) {
+        if (relaysPaused()) return;
+        // The table moved: this connection is asking about people who may no
+        // longer be routed here. Drop it and let the loop take a fresh
+        // snapshot, the same way the pool re-asks on a follow change.
+        if (g_discovered_gen.load(.acquire) != gen) return;
+        var msg = (relay.receive() catch return) orelse return;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                // Verified before it is stored. This is a relay the reader
+                // never chose, reached because a follow named it, so it gets
+                // less trust than the pool rather than more.
+                const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                if (result == .invalid) continue;
+                if (e.event.kind == 1) noteFeedNewest(e.event.created_at);
+            },
+            .closed => return,
+            else => {},
+        }
+    }
+}
+
 /// One relay's ingest loop: dial, serve, and reconnect after a widening delay,
 /// forever.
 fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
@@ -24735,8 +25058,8 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // reverse, so this one is declared second and runs first. The other order
     // hands the keeper a pointer to a `Relay` that is already gone.
     defer relay.deinit();
-    publishLiveRelay(index, relay);
-    defer publishLiveRelay(index, null);
+    offerLiveRelay(index, relay);
+    defer offerLiveRelay(index, null);
     setRelayStatus(index, .connected);
 
     // Follow-scoped: the starter pack's recent notes for the feed, plus their

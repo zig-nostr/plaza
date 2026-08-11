@@ -14580,3 +14580,270 @@ test "a one-shot budget is shorter than the connection deadline it borrows" {
     // is nothing to wait for: the relay was asked one thing.
     try testing.expect(main.oneShotBudgetMsForTest < main.relayDeadAfterMsForTest);
 }
+
+// -- Reading where your follows actually write -------------------------------
+//
+// The pool asks every relay in it about every person the reader follows, so a
+// follow who writes only to relays the reader is not on is invisible: no error,
+// no empty state, they simply are not there. These connect to the top few
+// relays the ranking found that the reader is NOT already on, and ask each only
+// about the people who write there.
+
+test "a relay the reader is not on is dialled, and asked only about its writers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/outbox.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Four people on one relay the reader is not on, two on another.
+    var list: [6][32]u8 = undefined;
+    for (0..6) |i| {
+        var secret = [_]u8{5} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        list[i] = kp.public_key;
+        const tags = if (i < 4)
+            [_]nostr.event.Tag{&.{ "r", "wss://many.example.com" }}
+        else
+            [_]nostr.event.Tag{&.{ "r", "wss://few.example.com" }};
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(@as(usize, 2), main.discoveredCount());
+    var buf: [96]u8 = undefined;
+    // The busier relay first, and each asked only about its own writers. That
+    // is the whole point: a small relay gets asked about its handful of people,
+    // not about two thousand strangers.
+    try testing.expectEqualStrings("wss://many.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 4), main.discoveredAuthorCount(0));
+    try testing.expectEqualStrings("wss://few.example.com", main.discoveredUrlCopy(1, &buf).?);
+    try testing.expectEqual(@as(usize, 2), main.discoveredAuthorCount(1));
+}
+
+test "a relay the reader is already on gets no second connection" {
+    // It is already being asked about everybody. A discovered slot for it would
+    // be a duplicate socket asking a narrower version of the same question.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{6} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/dupe.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://mine.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(@as(usize, 0), main.discoveredCount());
+}
+
+test "rewriting the routes tells the connections to re-ask" {
+    // A thread holds the generation it dialled under and drops the connection
+    // when it moves. Without the bump, a slot changing hands would keep feeding
+    // the store answers to a question nobody is asking any more, until the
+    // socket happened to drop.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{7} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/gen.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://somewhere.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    const before = main.discoveredGenerationForTest();
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(main.discoveredGenerationForTest() != before);
+}
+
+test "the discovered pool is separate from the eight the outbox counts" {
+    // `max_relays` is eight because a delivery is recorded in a `u8` bitmap,
+    // one bit per slot. A ninth slot would silently stop being counted and
+    // every note would look undelivered forever, so these connections live
+    // past the pool and never publish.
+    try testing.expectEqual(main.maxRelaysForTest + 1, main.discoveredWatchBaseForTest);
+    try testing.expect(main.relayWatchSlotsForTest >= main.discoveredWatchBaseForTest + main.maxDiscoveredRelaysForTest);
+    // And a discovered connection is watched by the keeper like any other, or a
+    // relay nobody chose could half-open and sit there.
+    try testing.expect(main.maxDiscoveredRelaysForTest > 0);
+}
+
+test "the ranking and the routing pick the same relays for one author" {
+    // They did not, and the disagreement was invisible: an author listing
+    // [A, A, B, C, D] had D counted by the ranking (which skipped the repeat
+    // before counting against the cap) and dropped by the routing (which
+    // counted raw tags), so D got a connection with nobody on it. One function
+    // now, so they cannot drift again.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{8} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/drift.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // The repeat is what does it: counted once by the selection, so the fourth
+    // distinct relay is still inside the cap.
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://a.example.com" },
+        &.{ "r", "wss://a.example.com/" },
+        &.{ "r", "wss://b.example.com" },
+        &.{ "r", "wss://c.example.com" },
+        &.{ "r", "wss://d.example.com" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // FOUR distinct relays, which is exactly the cap, so all four must get a
+    // connection with this person on it.
+    //
+    // Counting them is the assertion, not "every slot that has a url has
+    // authors": the empty-relay guard makes that true whether or not the two
+    // selections agree, and it masked this drift when the test was first
+    // written. A relay the ranking counted and the routing dropped shows up
+    // here as a missing connection, which is the only place it is visible.
+    var routed: usize = 0;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        if (main.discoveredUrlCopy(i, &buf) == null) continue;
+        routed += 1;
+        try testing.expect(main.discoveredAuthorCount(i) > 0);
+    }
+    try testing.expectEqual(@as(usize, 4), routed);
+}
+
+test "an unchanged route table does not tell the connections to re-ask" {
+    // The ranking reruns every time a relay list lands, and during a cold start
+    // hundreds of them land. If each rerun bumped the generation, every
+    // discovered connection would drop and redial each time, and the pool would
+    // spend the whole startup reconnecting instead of reading. Seen in a live
+    // run before this: three connections, each redialled inside two minutes,
+    // for a route table that had not changed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{11} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/stable.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://steady.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    main.rankRelaySuggestionsForTest(&store);
+    const settled = main.discoveredGenerationForTest();
+    try testing.expectEqual(@as(usize, 1), main.discoveredCount());
+
+    // Five more runs over the same store. Nothing has moved, so nothing should
+    // be told that it has.
+    for (0..5) |_| main.rankRelaySuggestionsForTest(&store);
+    try testing.expectEqual(settled, main.discoveredGenerationForTest());
+
+    // But a real change still gets through: somebody else, writing elsewhere.
+    const other = try signer.keyPairFromSecretKey([_]u8{12} ** 32);
+    const other_tags = [_]nostr.event.Tag{&.{ "r", "wss://elsewhere.example.com" }};
+    const other_ev = try nostr.event.create(arena, signer, other, 1_800_000_001, 10002, &other_tags, "", null);
+    _ = try main.plazaIngestForTest(arena, other_ev);
+    const both = [_][32]u8{ kp.public_key, other.public_key };
+    _ = main.setFollowsForTest(&both, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(main.discoveredGenerationForTest() != settled);
+    try testing.expectEqual(@as(usize, 2), main.discoveredCount());
+}
