@@ -67,6 +67,28 @@ pub fn build(b: *std.Build) void {
     // holds the key links none of the UI's image or JSON parsers. Plaza spawns
     // it at launch and talks to it over loopback.
     addSigner(b, app.exe.root_module.resolved_target.?, app.exe.root_module.optimize.?);
+    addSeedFeed(b, app.exe.root_module.resolved_target.?);
+}
+
+/// Builds `seed-feed`, which fills a store with a fixed corpus so the frame
+/// budget measures the same app twice. Library-only, like the signer: it wants
+/// a store and nothing else.
+fn addSeedFeed(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/seed_feed/main.zig"),
+        .target = target,
+        // Debug: it runs once before a measurement and is not measured itself.
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    linkNostr(b, mod);
+
+    const exe = b.addExecutable(.{ .name = "seed-feed", .root_module = mod });
+    b.installArtifact(exe);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test-seed-feed", "Run the seed-feed tests").dependOn(&run_tests.step);
 }
 
 /// Builds the plaza-signer daemon and its test step. Library-only: it imports
