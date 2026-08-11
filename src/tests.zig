@@ -14960,3 +14960,211 @@ test "the pool's own relays still get a since" {
     }
     try testing.expect(with_since > 0);
 }
+
+// -- Every socket asks only about the people it can answer for ---------------
+//
+// The pool used to ask all eight of its relays about every followed author. Now
+// each is asked about the follows who write there, plus the residual: everyone
+// no relay in either set is being asked about.
+//
+// Defining the residual correctly is the whole risk. It is NOT "authors with no
+// relay list": an author who publishes only to a relay that did not make the
+// cut has a list and is still asked of nobody, and vanishes with no error and
+// no empty state. That is the exact failure the outbox model exists to fix.
+
+/// Seeds a store with one kind:10002 per author and returns the follow set.
+fn seedRelayLists(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    store: *nostr.store.Store,
+    specs: []const []const []const u8,
+    out: [][32]u8,
+) !void {
+    for (specs, 0..) |urls, i| {
+        var secret = [_]u8{21} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        out[i] = kp.public_key;
+        if (urls.len == 0) continue;
+        var tags = try arena.alloc(nostr.event.Tag, urls.len);
+        for (urls, 0..) |u, j| {
+            const t = try arena.alloc([]const u8, 2);
+            t[0] = "r";
+            t[1] = u;
+            tags[j] = t;
+        }
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), 10002, tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+}
+
+test "every followed author is asked of at least one relay" {
+    // THE invariant. A follow that appears in nobody's filters is a person who
+    // silently stops existing in the feed, which is worse than a slow feed and
+    // is the thing routing is most likely to break while improving reach.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/cover.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One who writes to the reader's own relay, two who write somewhere else,
+    // one with no relay list at all, and one who writes ONLY to a relay too
+    // unpopular to be chosen. That last one is the case that matters.
+    const specs = [_][]const []const u8{
+        &.{"wss://mine.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{},
+        &.{"wss://nobody-else.example.com"},
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Collect every author named anywhere: the routed relays, then the pool.
+    var seen = [_]bool{false} ** specs.len;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        var ubuf: [96]u8 = undefined;
+        if (main.discoveredUrlCopy(i, &ubuf) == null) continue;
+        var abuf: [main.discoveredAuthorsCapForTest][32]u8 = undefined;
+        const n = main.discoveredAuthorsForTest(i, &abuf);
+        for (abuf[0..n]) |a| {
+            for (follows, 0..) |f, k| {
+                if (std.mem.eql(u8, &a, &f)) seen[k] = true;
+            }
+        }
+    }
+    var pool_buf: [main.max_follows + 1][32]u8 = undefined;
+    const pn = main.poolAuthorsForTest(0, &pool_buf);
+    for (pool_buf[0..pn]) |a| {
+        for (follows, 0..) |f, k| {
+            if (std.mem.eql(u8, &a, &f)) seen[k] = true;
+        }
+    }
+
+    for (seen, 0..) |ok, k| {
+        if (!ok) {
+            std.debug.print("\nfollow {d} is asked of no relay at all\n", .{k});
+            return error.AuthorAskedOfNobody;
+        }
+    }
+}
+
+test "a pool relay is asked about the follows who write there" {
+    // The other half of the pivot: not everyone, just the people it can answer
+    // for, plus the residual.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/poolroute.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Two write to the reader's relay, three write only elsewhere and will be
+    // picked up by a routed relay instead.
+    const specs = [_][]const []const u8{
+        &.{"wss://mine.example.com"},
+        &.{"wss://mine.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var pool_buf: [main.max_follows + 1][32]u8 = undefined;
+    const pn = main.poolAuthorsForTest(0, &pool_buf);
+
+    // The two who write here are named, and nobody is left over, so the pool's
+    // question shrank from five to two.
+    try testing.expectEqual(@as(usize, 0), main.residualCountForTest());
+    try testing.expectEqual(@as(usize, 2), pn);
+    for (pool_buf[0..pn]) |a| {
+        try testing.expect(std.mem.eql(u8, &a, &follows[0]) or std.mem.eql(u8, &a, &follows[1]));
+    }
+}
+
+test "an author nobody was routed to lands in the residual" {
+    // The case that makes the pivot safe. This author HAS a relay list, so
+    // "authors with no list" would miss them, and their relay is too unpopular
+    // to be chosen, so routing misses them too.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/residual.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Enough distinct one-author relays to overflow the routed budget, so the
+    // last ones cannot be chosen.
+    const specs = [_][]const []const u8{
+        &.{"wss://a.example.com"}, &.{"wss://b.example.com"},
+        &.{"wss://c.example.com"}, &.{"wss://d.example.com"},
+        &.{"wss://e.example.com"}, &.{"wss://f.example.com"},
+        &.{"wss://g.example.com"},
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // More authors than the routed budget can hold, so somebody must be left
+    // over, and the residual is where they go rather than nowhere.
+    try testing.expect(main.residualCountForTest() > 0);
+}

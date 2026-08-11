@@ -352,7 +352,7 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     // ever reaches back for the table lock. Nested locks are exactly how the
     // hang above happened, so the order is fixed here and stated: table first,
     // discovered second, never the reverse.
-    fillDiscovered(result.events, g_suggested[0..kept], g_suggested_len[0..kept]);
+    fillDiscovered(result.events, g_suggested[0..kept], g_suggested_len[0..kept], authors[0..authors_len], &pool, &pool_len, pool_n);
 }
 
 /// Gives each discovered slot a relay and the people who write there.
@@ -374,7 +374,15 @@ fn sameRoutes(a: *const DiscoveredRelay, b: *const DiscoveredRelay) bool {
     return true;
 }
 
-fn fillDiscovered(events: []const nostr.event.Event, urls: []const [96]u8, lens: []const u8) void {
+fn fillDiscovered(
+    events: []const nostr.event.Event,
+    urls: []const [96]u8,
+    lens: []const u8,
+    authors: []const [32]u8,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+) void {
     lockDiscovered();
     defer unlockDiscovered();
 
@@ -418,6 +426,12 @@ fn fillDiscovered(events: []const nostr.event.Event, urls: []const [96]u8, lens:
         // connection instead, which is the quieter of the two failures.
         if (d.authors_len == 0) d.url_len = 0;
     }
+
+    // The pool's own slots and the residual, from the same events, while the
+    // lock is held and `g_discovered_next` is final. Order matters: the residual
+    // is "not covered by a ROUTED relay", so it has to be computed after they
+    // are chosen.
+    fillPoolRoutes(events, authors, pool_urls, pool_lens, pool_n);
 
     // Only when the answer actually moved.
     //
@@ -24973,6 +24987,152 @@ fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_
     relay.subscribe("plaza-engagement", &eng_filters) catch {};
 }
 
+// -- Every socket asks only about the people it can answer for ---------------
+//
+// The pool used to ask all eight of its relays about every followed author, and
+// the routed relays asked about theirs. That is a hybrid: the routing bought
+// reach, and none of it bought the pool relays a smaller question. Jumble and
+// Amethyst both route the WHOLE feed, and this is that.
+//
+// Each pool relay is asked about the follows who write THERE, plus the
+// residual: everyone no relay in either set is going to be asked about. The
+// residual is what makes the change safe, and defining it correctly is the
+// whole risk. It is NOT "authors with no relay list". It is every author not
+// covered by any chosen relay, list or no list, because an author who publishes
+// only to a relay that did not make the cut is otherwise asked of nobody at all
+// and simply vanishes from the feed. No error, no empty state, which is the
+// exact failure the outbox model exists to fix and the easiest one to
+// reintroduce while fixing it.
+//
+// So the invariant, and there is a test for it by name: every followed author
+// appears in at least one relay's filters.
+
+/// Authors routed to each POOL slot: the follows who write to that relay.
+var g_pool_routed: [max_relays]DiscoveredRelay = @splat(.{});
+/// Everyone no chosen relay covers. Goes to every read-capable pool relay,
+/// which is where they were all being asked before this.
+var g_residual: [max_follows][32]u8 = undefined;
+var g_residual_len: usize = 0;
+
+/// Whether `pubkey` is in `list`.
+fn authorListed(list: []const [32]u8, pubkey: [32]u8) bool {
+    for (list) |a| {
+        if (std.mem.eql(u8, &a, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Fills the pool's per-slot author lists and the residual, from the same query
+/// result the routed table is built from. Called with the discovered lock held.
+/// `pool_urls`/`pool_lens` are the reader's own read relays, ALREADY SNAPSHOTTED
+/// by the caller. Not read from the relay table here, and that is not a style
+/// choice: the caller holds the relay-table lock, `relaySnapshot` takes the same
+/// one, and it is a plain spinlock with no owner tracking. Reaching for it from
+/// in here is not a slow path, it is a thread waiting on a lock only it could
+/// release. That exact mistake hung the test suite twice today, in this file,
+/// once already inside this very call chain.
+fn fillPoolRoutes(
+    events: []const nostr.event.Event,
+    authors: []const [32]u8,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+) void {
+    for (&g_pool_routed) |*p| {
+        p.url_len = 0;
+        p.authors_len = 0;
+    }
+    g_residual_len = 0;
+
+    for (authors) |pubkey| {
+        var placed = false;
+
+        // Already going to a routed relay?
+        for (&g_discovered_next) |*d| {
+            if (d.url_len == 0) continue;
+            if (authorListed(d.authors[0..d.authors_len], pubkey)) {
+                placed = true;
+                break;
+            }
+        }
+
+        // Or writes to one of the reader's own relays. Checked even when a
+        // routed relay already has them: a second copy of the question is the
+        // redundancy that keeps one relay going down from hiding somebody.
+        const ev = eventFor(events, pubkey);
+        if (ev) |e| {
+            var raw: [32][]const u8 = undefined;
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(raw[0..writeTagUrls(e, &raw)], &selected);
+            for (0..pool_n) |i| {
+                if (pool_lens[i] == 0) continue;
+                if (g_pool_routed[i].authors_len >= discovered_authors_cap) continue;
+                for (selected[0..chosen]) |url| {
+                    if (!relayUrlEql(url, pool_urls[i][0..pool_lens[i]])) continue;
+                    const p = &g_pool_routed[i];
+                    @memcpy(p.url[0..pool_lens[i]], pool_urls[i][0..pool_lens[i]]);
+                    p.url_len = pool_lens[i];
+                    p.authors[p.authors_len] = pubkey;
+                    p.authors_len += 1;
+                    placed = true;
+                    break;
+                }
+            }
+        }
+
+        if (placed) continue;
+        if (g_residual_len >= g_residual.len) continue;
+        g_residual[g_residual_len] = pubkey;
+        g_residual_len += 1;
+    }
+}
+
+/// The stored relay list for `pubkey`, if the query returned one.
+fn eventFor(events: []const nostr.event.Event, pubkey: [32]u8) ?nostr.event.Event {
+    for (events) |e| {
+        if (std.mem.eql(u8, &e.pubkey, &pubkey)) return e;
+    }
+    return null;
+}
+
+/// What pool slot `index` should ask about: the follows who write there, then
+/// everyone nobody else is being asked about. Returns how many went into `out`.
+fn poolAuthors(index: usize, out: *[max_follows + 1][32]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    if (index < g_pool_routed.len) {
+        const p = &g_pool_routed[index];
+        const take = @min(p.authors_len, out.len);
+        @memcpy(out[0..take], p.authors[0..take]);
+        n = take;
+    }
+    for (g_residual[0..g_residual_len]) |pk| {
+        if (n >= out.len) break;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn poolAuthorsForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthors(index, out);
+}
+pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return 0;
+    const d = &g_discovered[index];
+    @memcpy(out[0..d.authors_len], d.authors[0..d.authors_len]);
+    return d.authors_len;
+}
+pub const discoveredAuthorsCapForTest = discovered_authors_cap;
+pub fn residualCountForTest() usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    return g_residual_len;
+}
+
 /// One discovered relay's loop: dial, ask about the people who write there,
 /// ingest, and redial when the connection drops or the table moves under it.
 ///
@@ -25137,7 +25297,17 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     var authors: [max_follows + 1][32]u8 = undefined;
     // Snapshotted, not borrowed: `followSet` hands back a slice of a table the
     // UI thread rewrites when a follow lands, and this filter outlives the frame.
-    var authors_len: usize = followSnapshot(@ptrCast(&authors));
+    // Not every follow: the ones who write HERE, plus everyone no relay in
+    // either set is being asked about. See `fillPoolRoutes`.
+    //
+    // Before the routing existed this was the whole follow list on all eight
+    // relays, which asked every relay about two thousand strangers and told
+    // each of them the reader's entire social graph.
+    var authors_len: usize = poolAuthors(index, &authors);
+    // Nothing routed yet (the first dial happens before any relay list has been
+    // read back) means ask about everyone, which is what this did before and is
+    // the only answer that cannot hide somebody.
+    if (authors_len == 0) authors_len = followSnapshot(@ptrCast(&authors));
     // The generation this subscription was built for. When it moves, this
     // connection is asking the wrong question and re-asks below.
     var subscribed_gen = followGeneration();
@@ -25227,7 +25397,8 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // leave following disabled for the whole session.
         if (reads and followGeneration() != subscribed_gen) {
             subscribed_gen = followGeneration();
-            authors_len = followSnapshot(@ptrCast(&authors));
+            authors_len = poolAuthors(index, &authors);
+            if (authors_len == 0) authors_len = followSnapshot(@ptrCast(&authors));
             var next_authors_len = authors_len;
             asked_about_me = false;
             if (activePubkey()) |pk| {
