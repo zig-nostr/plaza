@@ -18277,67 +18277,7 @@ fn elide(ui: *AppUi, text: []const u8, max: usize) []const u8 {
     return ui.fmt("{s}\u{2026}", .{text[0..end]});
 }
 
-/// The widest a single byte of text can render at the identity line's sizes.
-///
-/// Not a measurement of a particular glyph, an upper bound over all of them.
-/// One byte is at most one glyph, and a glyph at these sizes is at most about
-/// its em: 14px for the name, less for the handle. Sixteen is that with room
-/// to spare, and being generous here is the safe direction, because it only
-/// ever makes the app bound a string it did not have to.
-///
-/// Multi-byte text is further inside the bound, not outside it: a four-byte
-/// emoji is one glyph of roughly 18px, which is 4.5px per byte, and CJK is
-/// three bytes for about 14px.
-const identity_max_px_per_byte: f32 = 16;
-
-/// Whether `text` provably fits `room`, cheaply and without measuring it.
-///
-/// This exists to skip the `width` below, and skipping it is the whole point:
-/// a definite width is what lets the SDK ellipsize, and fitting bounded
-/// single-line text is what it costs. Two of these sit in every feed row, so a
-/// screenful pays for it eight to sixteen times a frame, and measured on the
-/// frame budget the pair are worth about 300us of the layout stage.
-///
-/// Conservative on purpose. A false "does not fit" costs the old behaviour for
-/// that one row; a false "fits" puts a stranger's display name through the
-/// side of the window, which is the bug #138 was reported for. So the test is
-/// an upper bound on the width, never an estimate of it.
-fn textProvablyFits(text: []const u8, room: f32) bool {
-    const fits = @as(f32, @floatFromInt(text.len)) * identity_max_px_per_byte <= room;
-    if (fits) g_identity_leaves_free += 1 else g_identity_leaves_bounded += 1;
-    return fits;
-}
-
-/// Identity leaves drawn with and without the width, counted.
-///
-/// The wall-clock saving cannot be measured by the frame budget: that harness
-/// varies 2.4x run to run because the feed is whatever the relays happened to
-/// send, and normalising by mounted node count does not stabilise it. So what
-/// is asserted is that the cheap path is the one a real feed takes, which is
-/// the claim this rests on. The microseconds are argued, not measured, and the
-/// commit says so.
-var g_identity_leaves_free: usize = 0;
-var g_identity_leaves_bounded: usize = 0;
-
-pub fn identityLeafCountsForTest() struct { free: usize, bounded: usize } {
-    return .{ .free = g_identity_leaves_free, .bounded = g_identity_leaves_bounded };
-}
-pub fn resetIdentityLeafCountsForTest() void {
-    g_identity_leaves_free = 0;
-    g_identity_leaves_bounded = 0;
-}
-
-pub fn textProvablyFitsForTest(text: []const u8, room: f32) bool {
-    return textProvablyFits(text, room);
-}
-pub const identityTextWidthForTest: f32 = identity_text_width;
-pub const identityMaxPxPerByteForTest: f32 = identity_max_px_per_byte;
-
 fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) AppUi.Node {
-    // Bounded only when it might need bounding. See `textProvablyFits`.
-    if (textProvablyFits(text, width)) {
-        return ui.paragraph(.{ .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
-    }
     return ui.paragraph(.{ .width = width, .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = meta_scale }});
 }
 
@@ -18434,19 +18374,10 @@ fn identityBlock(ui: *AppUi, note: *const Note) AppUi.Node {
     // takes the handle, the time and the card's right edge with it. Sixty-four
     // characters of display name reached 354px past the window.
     return ui.column(.{ .height = avatar_size, .width = identity_text_width, .main = .space_between }, .{
-        // Same rule as the handle below: the width is what makes an ellipsis
-        // possible and it is what layout pays for, so it goes on only when the
-        // name is long enough to conceivably need it.
-        if (textProvablyFits(note.author(), identity_text_width))
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
-            )
-        else
-            ui.paragraph(
-                .{ .width = identity_text_width, .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
-            ),
+        ui.paragraph(
+            .{ .width = identity_text_width, .style = .{ .foreground = p.text_primary } },
+            &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
+        ),
         handleLine(ui, note),
     });
 }
