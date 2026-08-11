@@ -2145,6 +2145,10 @@ var g_environ: ?*const std.process.Environ.Map = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
 var g_last_count: usize = std.math.maxInt(usize);
+/// The same, for whichever level is open. Separate from `g_last_count` because
+/// the feed consumes that one, and a level opened after a feed rebuild would
+/// otherwise see an unchanged count and never fill.
+var g_last_level_count: usize = std.math.maxInt(usize);
 
 // Plaza's local identity: the keypair that signs composed notes. Loaded in
 // `main` (returning user) or created by the onboarding action, both on the UI
@@ -18742,13 +18746,34 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
-                model.refreshThreadNotes(now);
-                // And the open person's notes, for the same reason and with the
-                // same consequence if it is missed: without this the backfill
-                // this screen fires never appears, and the quiet line saying
-                // they have written nothing stays up over a store that has
-                // since filled with their notes.
-                model.refreshProfileNotes(now);
+                //
+                // Only when the store actually moved, which is the guard the
+                // feed rebuild ten lines up has always had and these two never
+                // did. Unconditional, they were a full `store.query`, a
+                // `collectThreadIds` closure walk that queries again per level,
+                // and a re-parse of every reply into a fresh `Note` — once a
+                // second, on the render thread, for as long as a thread or a
+                // profile stayed open, almost always to produce exactly the
+                // list that was already on screen.
+                //
+                // The open paths call these directly, so a thread still fills
+                // the moment it is opened; this only skips the repeat.
+                const level_count = if (g_store) |st| (st.eventCount() catch g_last_level_count) else g_last_level_count;
+                if (level_count != g_last_level_count) {
+                    g_last_level_count = level_count;
+                    model.refreshThreadNotes(now);
+                    // And the open person's notes, for the same reason and with
+                    // the same consequence if it is missed: without this the
+                    // backfill this screen fires never appears, and the quiet
+                    // line saying they have written nothing stays up over a
+                    // store that has since filled with their notes.
+                    model.refreshProfileNotes(now);
+                }
+                // Relative times were a side effect of the rebuild, so they have
+                // to be kept up now that the rebuild is conditional. "2m" going
+                // stale is exactly the sort of thing a guard like this breaks
+                // quietly.
+                for (model.thread_notes[0..model.thread_notes_len]) |*note| note.setTime(now);
                 if (model.viewing_profile != null) {
                     model.thread_loading = model.thread_notes_len == 0 and
                         g_thread_done_seq.load(.acquire) < model.thread_seq;
