@@ -97,6 +97,15 @@ jobs:
       - name: Test
         run: zig build test
 
+      # The app ships ReleaseFast, and two things only exist there. The frame
+      # budgets skip themselves in Debug, because a Debug rebuild is six times
+      # slower and a budget loosened six times is no longer a frame; so the one
+      # guard on the feed staying inside a frame has never actually run on any
+      # machine but mine. And optimized builds have caught correctness bugs the
+      # Debug build could not, so this is not only about the timings.
+      - name: Test (ReleaseFast, the mode that ships)
+        run: zig build test -Doptimize=ReleaseFast
+
       - name: Check formatting
         shell: bash
         run: zig fmt --check src

@@ -730,6 +730,18 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
             }
         }
     }
+    // What the feed needs to know about this, and the only place that can say
+    // it: the store's own event count moves for every kind, so it cannot tell a
+    // note from a reaction, and the feed used to re-read everything on either.
+    switch (ev.kind) {
+        1 => if (result == .added) noteFeedArrival(ev.id),
+        // A deletion takes a note OUT, and no arrival describes a removal, so
+        // the list in hand has to be read again. Amethyst hit the mirror image
+        // of this: one kind:5 folded into an ordinary batch quietly emptied rows
+        // that had nothing to do with it, because their splice could only add.
+        5 => if (result != .invalid) invalidateFeed(),
+        else => {},
+    }
     return result;
 }
 
@@ -2151,6 +2163,100 @@ var g_last_count: usize = std.math.maxInt(usize);
 /// otherwise see an unchanged count and never fill.
 var g_last_level_count: usize = std.math.maxInt(usize);
 
+// -- What just arrived -------------------------------------------------------
+//
+// The feed used to answer "has anything changed" by asking the store for the
+// whole thing again, once a second, on the render thread: a cursor per followed
+// author and a linear pick across all of them per note returned. Measured in the
+// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
+// screenful and 10.8 ms once the reader has paged twenty pages down, against a
+// 16.7 ms frame. The cost is set by how many people the reader follows, not by
+// how much actually changed, and almost nothing changes between two ticks.
+//
+// So the ingest threads say what landed instead. No reference client re-reads
+// its store on arrival: Notedeck polls note keys ingested since the last poll
+// and merges them, Jumble splices the arriving event into a sorted array, and
+// Amethyst hands its filter only the new items. This is that, with the ids
+// carried across the thread boundary and the events read back by id, which is a
+// direct read each rather than a walk of the follow list.
+
+/// Ids of kind:1 events an ingest thread has just added to the store.
+///
+/// Sized well past a busy second so the common case never overflows. A backfill
+/// does overflow it, and that is not a loss: overflow means the list in hand
+/// cannot be brought up to date by splicing, so the next rebuild reads the store
+/// in full, which is exactly what a backfill wants anyway.
+const feed_arrival_cap = 1024;
+var g_arrival_lock = std.atomic.Value(bool).init(false);
+var g_arrival_ids: [feed_arrival_cap][32]u8 = undefined;
+var g_arrival_len: usize = 0;
+var g_arrival_overflowed: bool = false;
+/// Read on every tick without taking the lock, so a tick with nothing waiting
+/// costs one atomic load.
+var g_arrival_pending = std.atomic.Value(bool).init(false);
+/// The render thread's private copy, drained under the lock.
+var g_arrival_taken: [feed_arrival_cap][32]u8 = undefined;
+
+/// The list in hand is no longer a valid starting point: read the store in full
+/// on the next rebuild. Safe from any thread.
+///
+/// Set by everything that changes what the feed is a view OF (the author set,
+/// the identity, how deep the reader has paged) and by a deletion, which is the
+/// one arrival a splice cannot express: splicing only ever adds.
+var g_feed_rebuild_all = std.atomic.Value(bool).init(true);
+
+fn invalidateFeed() void {
+    g_feed_rebuild_all.store(true, .release);
+}
+
+fn lockArrivals() void {
+    while (g_arrival_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockArrivals() void {
+    g_arrival_lock.store(false, .release);
+}
+
+fn noteFeedArrival(id: [32]u8) void {
+    lockArrivals();
+    defer unlockArrivals();
+    if (g_arrival_len >= g_arrival_ids.len) {
+        g_arrival_overflowed = true;
+    } else {
+        g_arrival_ids[g_arrival_len] = id;
+        g_arrival_len += 1;
+    }
+    g_arrival_pending.store(true, .release);
+}
+
+/// Empties the buffer into the render thread's copy and reports whether anything
+/// was dropped on the way in.
+///
+/// Everything, in one locked step, at the top of the rebuild. That is what makes
+/// it safe: an event landing while the rebuild is running goes into the emptied
+/// buffer and is spliced on the next tick, rather than falling between the query
+/// and the clear. Taking the count first and clearing after the query would lose
+/// exactly those.
+fn takeFeedArrivals() struct { n: usize, lost: bool } {
+    lockArrivals();
+    defer unlockArrivals();
+    const n = g_arrival_len;
+    @memcpy(g_arrival_taken[0..n], g_arrival_ids[0..n]);
+    const lost = g_arrival_overflowed;
+    g_arrival_len = 0;
+    g_arrival_overflowed = false;
+    g_arrival_pending.store(false, .release);
+    return .{ .n = n, .lost = lost };
+}
+
+/// Forgets what is waiting. For a reset that is about to rebuild from nothing.
+fn clearFeedArrivals() void {
+    lockArrivals();
+    defer unlockArrivals();
+    g_arrival_len = 0;
+    g_arrival_overflowed = false;
+    g_arrival_pending.store(false, .release);
+}
+
 // Plaza's local identity: the keypair that signs composed notes. Loaded in
 // `main` (returning user) or created by the onboarding action, both on the UI
 // thread, and read only there, so no synchronisation is needed. The signer holds
@@ -3071,7 +3177,7 @@ fn adoptHelperIdentity(pk: [32]u8) void {
     g_signer_kind = .helper;
     const npub = abbreviateNpub(&g_identity_npub_buf, pk);
     g_identity_npub_len = npub.len;
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
 }
 
 /// Restores a helper identity from a persisted session pubkey. Synchronous: the
@@ -7487,7 +7593,16 @@ pub const Model = struct {
         const store = g_store orelse return;
 
         const count = store.eventCount() catch return;
-        if (count != g_last_count) {
+        // Three ways the view can be behind the store. The count catches
+        // anything landing by any route; the other two are the feed's own, and
+        // either can be true on a tick where the count has not moved (a
+        // deletion cancels an insert, or nothing was stored at all and the
+        // reader simply changed who they follow).
+        const stale = count != g_last_count or
+            g_arrival_pending.load(.acquire) or
+            g_feed_rebuild_all.load(.acquire) or
+            self.feed_limit != g_notes_feed_limit;
+        if (stale) {
             g_last_count = count;
             // Profiles first, so a note's mentions resolve to names as it builds.
             refreshProfiles(store);
@@ -7522,30 +7637,61 @@ pub const Model = struct {
         const limit = @min(self.feed_limit, ensureFeedCapacity(self.feed_limit));
         // After a growth the old slice is freed, so re-point before using it.
         self.notes = g_feed_notes;
-        var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(limit) }) catch return;
-        defer result.deinit();
 
-        // The store's count moves on every kind of ingest (profiles included),
-        // and the pool streams all day, so this runs about once a second. The
-        // notes themselves rarely change: reuse the already-parsed card whenever
-        // the event is one we hold, and parse only what is genuinely new.
         // Mention labels are baked into content at parse time, so a new display
         // name (the generation) forces one full parse pass to refresh them.
         const reuse_ok = g_names_generation == g_notes_names_generation;
         g_notes_names_generation = g_names_generation;
 
-        // Nothing new at all: the usual tick, when the count moved for some
-        // other kind of event. Keep every card exactly as it is.
-        if (reuse_ok and result.events.len == self.notes_len) {
-            var same = true;
-            for (result.events, 0..) |ev, i| {
-                if (noteIdOf(ev) != self.notes[i].id) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) return;
+        // Always, and before deciding anything: whatever is waiting is either
+        // spliced now or covered by the full read below, and leaving it in the
+        // buffer would splice it a second time on the next tick.
+        const arrived = takeFeedArrivals();
+
+        // What the list in hand cannot be brought up to date FROM. Everything
+        // else is an addition, and an addition is a merge.
+        //
+        //   the flag       the author set changed, the reader signed in or out,
+        //                  or a deletion landed
+        //   lost           more arrived between two ticks than the buffer holds
+        //   !reuse_ok      a name moved, so every card's baked text is stale
+        //   limit moved    the reader paged down, so notes below the old window
+        //                  belong now and no arrival describes them
+        const full = g_feed_rebuild_all.swap(false, .acq_rel) or
+            arrived.lost or
+            !reuse_ok or
+            limit != g_notes_limit or
+            self.feed_limit != g_notes_feed_limit;
+        g_notes_limit = limit;
+        g_notes_feed_limit = self.feed_limit;
+
+        if (full) {
+            self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
+            return;
         }
+        if (arrived.n == 0) return;
+        self.spliceArrivals(store, now_s, authors[0..authors_len], &kinds, limit, arrived.n);
+    }
+
+    /// Reads the whole window back from the store: a cursor per followed author
+    /// and a linear pick across all of them, per note returned. The expensive
+    /// one, and the reason for everything above it.
+    fn rebuildNotesFromStore(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        authors: []const [32]u8,
+        kinds: []const u16,
+        limit: usize,
+        reuse_ok: bool,
+    ) void {
+        var result = store.query(std.heap.page_allocator, .{
+            .authors = authors,
+            .kinds = kinds,
+            .limit = @intCast(limit),
+        }) catch return;
+        defer result.deinit();
+        g_feed_work.full_reads += 1;
 
         // The old cards, so new positions can take them over by id.
         const old = g_feed_scratch;
@@ -7556,16 +7702,117 @@ pub const Model = struct {
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= limit) break;
-            const id = noteIdOf(ev);
             self.notes[n] = blk: {
-                if (findReused(slots, old[0..old_len], id)) |prev| break :blk prev;
+                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                g_feed_work.parses += 1;
                 break :blk noteFrom(ev, now_s);
             };
             n += 1;
         }
         self.notes_len = n;
     }
+
+    /// Merges the notes that just landed into the list already on screen.
+    ///
+    /// The ids come from the ingest threads, so the store is asked for exactly
+    /// those and nothing else: a direct read per id, no cursor per follow and no
+    /// pick across two thousand streams. Everything already held is carried over
+    /// as it is, so no card is re-parsed and no picture is re-fetched.
+    fn spliceArrivals(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        authors: []const [32]u8,
+        kinds: []const u16,
+        limit: usize,
+        arrived: usize,
+    ) void {
+        var result = store.query(std.heap.page_allocator, .{
+            .ids = g_arrival_taken[0..arrived],
+            .kinds = kinds,
+        }) catch {
+            // The ids are gone with the buffer, so the only honest recovery is
+            // to read the window back next tick.
+            invalidateFeed();
+            return;
+        };
+        defer result.deinit();
+        g_feed_work.splices += 1;
+        if (result.events.len == 0) return;
+
+        // Which of them this feed is actually about. The store was asked by id,
+        // not by author, on purpose: an author list is checked one name at a
+        // time, and asking about a handful of arrivals should not walk two
+        // thousand follows per arrival. Only the ones that are NOT already held
+        // pay that walk, and those are few.
+        const held = buildReuseIndex(self.notes[0..self.notes_len]);
+        var keep: usize = 0;
+        for (result.events, 0..) |ev, i| {
+            if (keep >= g_splice_keep.len) break;
+            if (ev.kind != 1) continue;
+            if (heldIndex(held, self.notes[0..self.notes_len], ev.id) != null) continue;
+            if (!authorInSet(authors, ev.pubkey)) continue;
+            // The window is full and this is older than everything in it, so it
+            // would be dropped by the truncation below. Not worth parsing.
+            if (self.notes_len >= limit and self.notes_len > 0 and
+                !eventNewerThanNote(ev, self.notes[self.notes_len - 1])) continue;
+            g_splice_keep[keep] = @intCast(i);
+            keep += 1;
+        }
+        if (keep == 0) return;
+
+        // Two sorted runs into one. `result.events` is newest-first (the store
+        // sorts it) and so is the list on screen, so this is one pass with no
+        // sort and no search. Through the scratch copy rather than in place: an
+        // in-place merge is only safe in one direction, and which direction
+        // depends on whether the window is growing or already full.
+        const old = g_feed_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+
+        const total = @min(old_len + keep, limit);
+        var oi: usize = 0;
+        var fi: usize = 0;
+        for (0..total) |n| {
+            const take_new = blk: {
+                if (fi >= keep) break :blk false;
+                if (oi >= old_len) break :blk true;
+                break :blk eventNewerThanNote(result.events[g_splice_keep[fi]], old[oi]);
+            };
+            if (take_new) {
+                self.notes[n] = noteFrom(result.events[g_splice_keep[fi]], now_s);
+                g_feed_work.parses += 1;
+                fi += 1;
+            } else {
+                self.notes[n] = old[oi];
+                oi += 1;
+            }
+        }
+        self.notes_len = total;
+    }
 };
+
+/// Whether `pubkey` is one of the feed's authors. A walk, because the set is a
+/// plain array; only arrivals that are not already on screen reach it.
+fn authorInSet(authors: []const [32]u8, pubkey: [32]u8) bool {
+    for (authors) |a| {
+        if (std.mem.eql(u8, &a, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Whether `ev` sorts ahead of `note` in the feed: newer, or the same second and
+/// a higher id.
+///
+/// The tie-break is not decoration. It is the store's own ordering
+/// (`created_at` descending, then id descending), and a merge that broke ties
+/// differently would put two same-second notes in one order while a full read
+/// put them in the other, so the pair would swap places the next time anything
+/// forced a full read.
+fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
+    if (ev.created_at != note.created_at) return ev.created_at > note.created_at;
+    return std.mem.order(u8, &ev.id, &note.event_id) == .gt;
+}
 
 /// Adopts `secret` as the active local identity. For tests: the feed scopes
 /// its queries to the follow set plus the signed-in user, so a test that
@@ -7589,23 +7836,85 @@ pub fn clearIdentityForTest() void {
     g_signer_kind = .local;
 }
 
-/// Reconciles profiles and notes against `store` directly, bypassing the
-/// count guard. For tests, which drive the store themselves.
 /// Forces the next reconcile to do the full work rather than take the
 /// unchanged-store fast path, so a benchmark measures a rebuild.
 pub fn invalidateFeedForTest() void {
+    invalidateFeed();
+}
+
+/// Reconciles profiles and notes against `store` directly, bypassing change
+/// detection entirely. For tests that drive the store themselves rather than
+/// through `plazaIngest`, which is where an arrival announces itself: without
+/// the announcement there is nothing to splice, so this asks for the full read.
+///
+/// Tests of the change-detection layer itself go through `plazaIngestForTest`
+/// and `Model.refresh`, which is what the app runs.
+pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    invalidateFeed();
+    refreshProfiles(store);
+    model.rebuildNotes(store, now_s);
+}
+
+/// How the feed has been brought up to date, counted. Asserted on instead of
+/// timed: a stopwatch in a Debug test binary on a shared machine says nothing,
+/// and the whole point of this path is which of the two ran.
+pub const FeedWork = struct {
+    /// Windows read back from the store in full: a cursor per followed author.
+    full_reads: usize = 0,
+    /// Merges of what the ingest threads announced: a direct read per id.
+    splices: usize = 0,
+    /// Notes parsed from an event. A reused card costs nothing and is not here.
+    parses: usize = 0,
+};
+var g_feed_work: FeedWork = .{};
+
+pub fn feedWork() FeedWork {
+    return g_feed_work;
+}
+pub fn resetFeedWork() void {
+    g_feed_work = .{};
+}
+
+/// One tick, exactly as the app's timer runs it: change detection and all. The
+/// entry point for tests of how the feed decides what to do, as opposed to what
+/// a rebuild produces.
+pub fn tickForTest(model: *Model, now_s: i64) void {
+    model.refresh(now_s);
+}
+
+/// Empties the arrival buffer and asks for a full read next time, so a test
+/// starts from a known place rather than from whatever the last one left.
+pub fn resetFeedChangeDetectionForTest() void {
+    clearFeedArrivals();
+    invalidateFeed();
+    g_notes_limit = 0;
+    g_notes_feed_limit = 0;
     g_last_count = std.math.maxInt(usize);
 }
 
-pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
-    refreshProfiles(store);
-    model.rebuildNotes(store, now_s);
+/// Announces an id as newly arrived without storing anything. For the case the
+/// app is not supposed to produce and the splice guards against anyway.
+pub fn noteFeedArrivalForTest(id: [32]u8) void {
+    noteFeedArrival(id);
+}
+
+/// Fills the arrival buffer past its capacity, the way a backfill does.
+pub fn overflowFeedArrivalsForTest() void {
+    for (0..feed_arrival_cap + 1) |i| {
+        var id = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, id[0..8], i, .big);
+        noteFeedArrival(id);
+    }
 }
 
 /// The feed key derived from an event id: the first eight bytes, sign bit
 /// masked so the markup engine's i64 key round-trip never overflows.
 pub fn noteIdOf(ev: nostr.event.Event) i64 {
-    return @intCast(std.mem.readInt(u64, ev.id[0..8], .big) & std.math.maxInt(i64));
+    return feedKeyOf(ev.id);
+}
+
+fn feedKeyOf(id: [32]u8) i64 {
+    return @intCast(std.mem.readInt(u64, id[0..8], .big) & std.math.maxInt(i64));
 }
 
 // The previous feed, kept across one rebuild so unchanged notes carry over
@@ -7653,6 +7962,24 @@ fn ensureFeedCapacity(want: usize) usize {
 var g_reuse_slots: []u32 = &.{};
 const reuse_empty: u32 = std.math.maxInt(u32);
 
+/// Which of a splice's arrivals belong in the feed, as indices into the query
+/// result. Indices rather than parsed cards: a thousand `Note`s is over a
+/// megabyte of buffers, and the merge can parse each one straight into its final
+/// position instead.
+var g_splice_keep: [feed_arrival_cap]u32 = undefined;
+
+/// The window depth the list in hand was built for, as asked for and as it came
+/// out after clamping to the storage. A change in either means notes below the
+/// old bottom belong now, and no arrival says so.
+///
+/// Both, because they move for different reasons: the reader raises the ask by
+/// paging down, and the clamp lifts on its own when a growth that failed earlier
+/// succeeds. The ask is also what the tick's own staleness check reads, so that
+/// paging down wakes a tick that would otherwise see an unchanged store and
+/// skip the rebuild entirely.
+var g_notes_limit: usize = 0;
+var g_notes_feed_limit: usize = 0;
+
 fn reuseHash(id: i64, mask: usize) usize {
     // Fibonacci mixing: note ids are the first eight bytes of a hash, so the low
     // bits are already well spread, but the multiply costs nothing and protects
@@ -7683,14 +8010,20 @@ fn buildReuseIndex(old: []const Note) []u32 {
     return table;
 }
 
-/// The previous card for `id`, when there is one.
-fn findReused(table: []const u32, old: []const Note, id: i64) ?Note {
+/// Where `event_id` sits in `old`, when it is there at all.
+///
+/// Compares the full 32 bytes, not the eight-byte feed key the table is hashed
+/// on. The key is a render handle and two ids could in principle share one; the
+/// splice uses this answer to decide whether an arriving note is already on
+/// screen, and getting that wrong would show the same note twice or hide a real
+/// one behind a stranger's card.
+fn heldIndex(table: []const u32, old: []const Note, event_id: [32]u8) ?usize {
     if (table.len == 0) return null;
     const mask = table.len - 1;
-    var at = reuseHash(id, mask);
+    var at = reuseHash(feedKeyOf(event_id), mask);
     while (table[at] != reuse_empty) : (at = (at + 1) & mask) {
-        const prev = old[table[at]];
-        if (prev.id == id) return prev;
+        const i = table[at];
+        if (std.mem.eql(u8, &old[i].event_id, &event_id)) return i;
     }
     return null;
 }
@@ -13574,7 +13907,7 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     // Everything scoped to the follow set is now stale: the feed's query, the
     // relay filters, the names being fetched.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
     return true;
 }
 
@@ -19233,7 +19566,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.thread_outside_open[level] = !model.thread_outside_open[level];
         },
         .jump_to_newest => {
-            g_last_count = std.math.maxInt(usize);
+            invalidateFeed();
             model.menu = .none;
         },
         .copy_nevent => |id| {
@@ -19479,7 +19812,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // of what this app has been told about.
             const held = model.notes_len;
             model.feed_limit += feed_page;
-            g_last_count = std.math.maxInt(usize);
+            invalidateFeed();
             model.refresh(nowSeconds());
             // The store had no more to give, so ask the relays for what came
             // before the oldest note in hand. Store first, network second.
@@ -20257,7 +20590,7 @@ pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
 /// on the next tick by invalidating the change guard.
 fn enterFeed(model: *Model) void {
     model.stage = .ready;
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
     if (g_store == null) {
         if (g_io) |io| if (g_environ) |env| startFeed(io, env);
     }
@@ -23594,7 +23927,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     g_remote_secret_len = 0;
     g_remote_status.store(0, .release);
     g_login_error.store(@intFromEnum(LoginError.none), .release);
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
 
     // The relay list belongs to the ACCOUNT, not the machine: it came from their
     // kind:10002 and it names where they read and write. Carrying it into the
