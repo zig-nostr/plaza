@@ -14384,3 +14384,89 @@ test "coming back from quiet is not a network recovery" {
     main.setRelayStatusForTest(0, true);
     try testing.expect(!main.outboxWokeForTest());
 }
+
+// -- A fetch that cannot run forever ----------------------------------------
+//
+// Every fetch that is not the feed dials its own socket, asks one question and
+// reads until EOSE. A relay that accepts the REQ and then goes quiet used to
+// hold that thread for the life of the process, and a message-count bound does
+// not help: a relay that sends nothing never reaches the count either.
+//
+// The keeper holds an absolute deadline on each of them. Its decision is pure
+// over the deadline table, so it is asserted here without a socket or a thread.
+
+test "a fetch inside its budget is left alone" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(0, 10_000);
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(9_999, &out));
+}
+
+test "a fetch past its budget is cut off" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(3, 10_000);
+    const n = main.expiredOneShotsForTest(10_000, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 3), out[0]);
+}
+
+test "an empty slot is not a fetch that ran out of time" {
+    // Zero is the empty marker, and a keeper reading it as a deadline in 1970
+    // would try to shut down every unused slot on every tick.
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(std.math.maxInt(i64), &out));
+}
+
+test "a fetch already cut off is not cut off again" {
+    // The slot stays in the table until its owner clears it, because clearing
+    // it from the keeper would hand the slot to another fetch while the first
+    // one still holds the pointer. So the keeper has to stop acting on it
+    // without forgetting it.
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(5, 1_000);
+    try testing.expectEqual(@as(usize, 1), main.expiredOneShotsForTest(2_000, &out));
+    main.markOneShotCutForTest(5);
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(2_000, &out));
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(std.math.maxInt(i64), &out));
+}
+
+test "several overdue fetches are all cut, not just the first" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(0, 1_000);
+    main.seatOneShotForTest(1, 50_000);
+    main.seatOneShotForTest(2, 1_000);
+    const n = main.expiredOneShotsForTest(2_000, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 0), out[0]);
+    try testing.expectEqual(@as(usize, 2), out[1]);
+}
+
+test "the bunker listener is watched alongside the pool" {
+    // It is not a pool relay: no badge, no slot in the reader's list, never
+    // published to. It is the same kind of thing though, a socket held open by
+    // a thread blocked in `receive`, and when it half-opens remote signing
+    // stops with no error anywhere. Its slot sits past the pool's, which is why
+    // the keeper's status updates have to stay inside the pool's range.
+    try testing.expectEqual(main.maxRelaysForTest, main.bunkerWatchSlotForTest);
+}
+
+test "a one-shot budget is shorter than the connection deadline it borrows" {
+    // A fetch is a question with an answer; a pool connection is a
+    // conversation. Bounding the fetch by the connection's ninety seconds would
+    // leave a wedged profile lookup sitting for a minute and a half, and there
+    // is nothing to wait for: the relay was asked one thing.
+    try testing.expect(main.oneShotBudgetMsForTest < main.relayDeadAfterMsForTest);
+}

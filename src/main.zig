@@ -1257,6 +1257,32 @@ pub fn resetOutboxWokeForTest() void {
 pub fn relayStatusQuietForTest(i: usize) bool {
     return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .quiet;
 }
+/// Seats a deadline in the one-shot table without a socket, so what the keeper
+/// decides about it can be driven directly.
+pub fn seatOneShotForTest(slot: usize, deadline_ms: i64) void {
+    g_oneshot_deadline[slot] = deadline_ms;
+}
+pub fn clearOneShotsForTest() void {
+    for (0..one_shot_slots) |i| {
+        g_oneshot[i] = null;
+        g_oneshot_deadline[i] = 0;
+    }
+}
+pub fn expiredOneShotsForTest(now_ms: i64, out: []usize) usize {
+    var buf: [one_shot_slots]usize = undefined;
+    const n = expiredOneShots(now_ms, &buf);
+    const take = @min(n, out.len);
+    @memcpy(out[0..take], buf[0..take]);
+    return take;
+}
+pub fn markOneShotCutForTest(slot: usize) void {
+    g_oneshot_deadline[slot] = one_shot_already_cut;
+}
+pub const oneShotSlotsForTest = one_shot_slots;
+pub const oneShotBudgetMsForTest = one_shot_budget_ms;
+pub const bunkerWatchSlotForTest = bunker_watch_slot;
+pub const maxRelaysForTest = max_relays;
+
 pub const relayPingAfterMsForTest = relay_ping_after_ms;
 pub const relayDeadAfterMsForTest = relay_dead_after_ms;
 
@@ -2094,11 +2120,21 @@ const relay_keeper_tick_ms: u64 = 5_000;
 /// holds that lock for as long as it touches the pointer. Without it the keeper
 /// can be inside `ping` on a `Relay` whose owner has already returned and run
 /// its `deinit`.
-var g_relay_live: [max_relays]?*nostr.relay.Relay = @splat(null);
-var g_relay_live_lock: [max_relays]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+/// One per pool slot, plus one for the bunker listener.
+///
+/// The listener is not a pool relay (it is not in the reader's list, it is not
+/// published to, it has no badge) but it is the same kind of thing: a socket
+/// held open indefinitely by a thread blocked in `receive`. When it half-opens,
+/// remote signing stops working with no error anywhere, which is the worst way
+/// for a signer to fail.
+const relay_watch_slots = max_relays + 1;
+const bunker_watch_slot = max_relays;
+
+var g_relay_live: [relay_watch_slots]?*nostr.relay.Relay = @splat(null);
+var g_relay_live_lock: [relay_watch_slots]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
 /// When each slot was last pinged, so a socket that stops answering is pinged
 /// once per interval rather than once per keeper tick.
-var g_relay_pinged_ms: [max_relays]i64 = @splat(0);
+var g_relay_pinged_ms: [relay_watch_slots]i64 = @splat(0);
 
 fn lockLiveRelay(index: usize) void {
     while (g_relay_live_lock[index].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
@@ -2137,8 +2173,104 @@ fn keeperAction(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
     return if (since >= relay_ping_after_ms) .ping else .leave_it;
 }
 
+// -- A question that cannot be asked forever ---------------------------------
+//
+// Every fetch that is not the feed dials its own socket, asks one question and
+// reads until EOSE. `receive` has no deadline, so a relay that accepts the REQ
+// and then goes quiet holds that thread for the life of the process. Several of
+// these loops are bounded by a message COUNT, which does not help at all: a
+// relay that sends nothing never reaches the count either.
+//
+// The keeper already watches the pool's sockets and already knows how to
+// half-close one. A one-shot registers with it under a deadline and gets the
+// same treatment for the same reason: the thread that would notice is the
+// thread that is blocked.
+//
+// The deadline is ABSOLUTE, not idle. A fetch is a question with an answer, not
+// a conversation, so what needs bounding is how long the whole exchange may
+// take. A relay dribbling one event every few seconds forever is exactly as
+// stuck as one sending nothing, and an idle deadline would never fire on it.
+//
+// This does NOT stop a one-shot dialling its own socket, which is the other
+// half of the finding and a larger change: the eight pool threads already hold
+// connections these questions could go down, and no answer needs routing back
+// because every event reaches the render thread through the store either way.
+// Worth doing, and not this.
+const one_shot_slots = 16;
+/// Per relay, not per fetch. A fetch walks the pool one relay at a time, so a
+/// whole sweep can still take several of these; what it can no longer do is
+/// take forever.
+///
+/// Eight seconds sits among what the reference clients allow one request:
+/// welshman 3s, Amethyst 8s, NDK and Jumble 10s.
+const one_shot_budget_ms: i64 = 8_000;
+/// Written into a cut slot's deadline so the keeper does not cut the same
+/// socket again on every tick until its owner notices. The owner clears it.
+const one_shot_already_cut: i64 = std.math.maxInt(i64);
+
+var g_oneshot_lock = std.atomic.Value(bool).init(false);
+var g_oneshot: [one_shot_slots]?*nostr.relay.Relay = @splat(null);
+var g_oneshot_deadline: [one_shot_slots]i64 = @splat(0);
+
+fn lockOneShot() void {
+    while (g_oneshot_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockOneShot() void {
+    g_oneshot_lock.store(false, .release);
+}
+
+/// Puts `relay` under the keeper's deadline until `releaseOneShot`.
+///
+/// Returns null when the table is full, and the caller then runs unwatched
+/// rather than not at all. Sixteen concurrent one-shots is more than this app
+/// starts, and an unbounded read is bad where refusing to read is worse: it
+/// would turn a busy moment into a blank profile.
+fn watchOneShot(io: std.Io, relay: *nostr.relay.Relay, budget_ms: i64) ?usize {
+    const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    lockOneShot();
+    defer unlockOneShot();
+    for (0..one_shot_slots) |i| {
+        if (g_oneshot[i] != null) continue;
+        g_oneshot[i] = relay;
+        g_oneshot_deadline[i] = now + budget_ms;
+        return i;
+    }
+    return null;
+}
+
+/// Takes the connection back out of the keeper's reach. MUST run before the
+/// connection is freed. The keeper only ever holds the pointer under the lock,
+/// and this takes the same lock, which is the whole reason it can never be
+/// inside `shutdown` on a `Relay` that has already been deinit'd.
+fn releaseOneShot(slot: ?usize) void {
+    const i = slot orelse return;
+    lockOneShot();
+    defer unlockOneShot();
+    g_oneshot[i] = null;
+    g_oneshot_deadline[i] = 0;
+}
+
+/// Which one-shot slots have run out of time. Pure over the deadline table, so
+/// what the keeper decides here can be asserted without a socket or a thread.
+///
+/// A slot already cut carries `one_shot_already_cut` and is not returned again:
+/// its owner is on its way out, and shutting the same socket on every tick
+/// until then is noise rather than safety.
+fn expiredOneShots(now_ms: i64, out: *[one_shot_slots]usize) usize {
+    var n: usize = 0;
+    for (0..one_shot_slots) |i| {
+        if (g_oneshot_deadline[i] == 0) continue;
+        if (g_oneshot_deadline[i] == one_shot_already_cut) continue;
+        if (now_ms < g_oneshot_deadline[i]) continue;
+        out[n] = i;
+        n += 1;
+    }
+    return n;
+}
+
 /// Watches every slot's connection for silence: pings one that has gone quiet,
-/// and cuts off one that will not answer.
+/// and cuts off one that will not answer. Also holds the deadline on every
+/// one-shot fetch, for the same reason and by the same means.
 fn relayKeeper(gpa: std.mem.Allocator) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2147,7 +2279,7 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
     while (true) {
         io.sleep(std.Io.Duration.fromMilliseconds(relay_keeper_tick_ms), .awake) catch {};
         const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        for (0..max_relays) |i| {
+        for (0..relay_watch_slots) |i| {
             lockLiveRelay(i);
             defer unlockLiveRelay(i);
             const relay = g_relay_live[i] orelse continue;
@@ -2161,7 +2293,9 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
                     // here would race the owning thread's own error handling.
                     relay.ping(io) catch {};
                     g_relay_pinged_ms[i] = now;
-                    setRelayStatus(i, .quiet);
+                    // The bunker listener has no chip and no slot in the pool's
+                    // status table; it is watched, not displayed.
+                    if (i < max_relays) setRelayStatus(i, .quiet);
                 },
                 .give_up => {
                     // Half-close, so the owner's blocked `receive` returns and
@@ -2170,8 +2304,26 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
                     relay.shutdown(io);
                     g_relay_live[i] = null;
                     g_relay_pinged_ms[i] = 0;
-                    setRelayStatus(i, .offline);
+                    if (i < max_relays) setRelayStatus(i, .offline);
                 },
+            }
+        }
+
+        // And the one-shots. Same means, different clock: those above are idle
+        // deadlines on a standing connection, these are absolute deadlines on
+        // an exchange that is supposed to end.
+        {
+            lockOneShot();
+            defer unlockOneShot();
+            var expired: [one_shot_slots]usize = undefined;
+            const n = expiredOneShots(now, &expired);
+            for (expired[0..n]) |i| {
+                const relay = g_oneshot[i] orelse continue;
+                relay.shutdown(io);
+                // Left in the table on purpose. Clearing it here would let the
+                // slot be handed to another fetch while this one's owner still
+                // holds the pointer; the owner clears it on the way out.
+                g_oneshot_deadline[i] = one_shot_already_cut;
             }
         }
     }
@@ -3994,7 +4146,11 @@ fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8,
         // a filter is asking the wrong question of it.
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-mentions", &filters) catch continue;
         while (true) {
             var msg = (relay.receive() catch break) orelse break;
@@ -4742,7 +4898,11 @@ fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len
         // a filter is asking the wrong question of it.
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-quotes", &filters) catch continue;
         while (true) {
             var msg = (relay.receive() catch break) orelse break;
@@ -20603,7 +20763,11 @@ fn ownProfileWorker(pk: [32]u8) void {
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-me", &filters) catch continue;
         var seen: usize = 0;
         while (seen < 32) : (seen += 1) {
@@ -22478,7 +22642,11 @@ fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event
     for (0..urls_n) |i| {
         const url = urls[i][0..url_len[i]];
         var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.publish(ev) catch continue;
         // One read, to give the frame somewhere to flush to. The verdict is not
         // recorded, so there is nothing to wait around for.
@@ -22517,7 +22685,11 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
         // never reused for a different relay while the process lives.
         if (!entry.write) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.publish(ev) catch continue;
         // The relay's OK is the answer to "is my note out there", so it is READ
         // rather than merely waited for: which relay took it, and which refused,
@@ -22729,7 +22901,11 @@ fn fetchOlderWorker(until: i64) void {
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-older", filters[0..flen]) catch continue;
         var seen: usize = 0;
         // Bounded: `receive` has no deadline, and a relay that takes the
@@ -22933,7 +23109,11 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-person", &filters) catch continue;
 
         var ids: [engagement_watch_cap][64]u8 = undefined;
@@ -23067,7 +23247,11 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // a filter is asking the wrong question of it.
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
 
         // Phase 1: the replies themselves (kind:1 e-tagging the root). Collect
         // their ids as they arrive so phase 2 can watch their engagement too.
@@ -23308,6 +23492,12 @@ fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
 
     var relay = nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]) catch return;
     defer relay.deinit();
+    // The read below waits for the relay's OK. Without a deadline a bunker
+    // relay that accepts the publish and says nothing holds this thread, and
+    // this is the signing path: one wedged request would be one thread gone for
+    // the life of the process, every time the reader signed anything.
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
     relay.publish(sealed.event) catch return;
     // Read the relay's OK so the frame flushes before we close; best-effort.
     var msg = (relay.receive() catch return) orelse return;
@@ -23340,7 +23530,11 @@ fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
 /// until the connection drops or this listener's `generation` is superseded.
 fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, generation: u64) !void {
     var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
+    // Withdrawn before the connection is freed: declared after `deinit`, so it
+    // runs before it.
     defer relay.deinit();
+    publishLiveRelay(bunker_watch_slot, relay);
+    defer publishLiveRelay(bunker_watch_slot, null);
 
     var client_hex: [64]u8 = undefined;
     hexLower(&client_hex, client_kp.public_key);
