@@ -4383,6 +4383,96 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
     return out[0..n];
 }
 
+// -- Asking on a socket that is already open ---------------------------------
+//
+// A one-shot fetch used to dial its own connection to every relay, serially,
+// and read until EOSE. Eight relays meant eight TLS handshakes for one question
+// about one profile, a thread parked for the duration, and a connect bounded
+// only by the operating system.
+//
+// The pool already holds those sockets. No client dials for a one-shot:
+// NDK, Jumble and welshman all bottom out in a pool lookup, every one of them.
+//
+// What makes a shared socket safe here is that there is no reply to deliver.
+// Every event a relay sends is ingested into the store by the thread that owns
+// that socket, whoever asked for it, and the render thread reads the store.
+// That is welshman's ingest policy, and it means a subscription id only has to
+// name a question, never a caller waiting on an answer.
+//
+// So this WRITES the REQ from the asking thread. Writes on a connection are
+// serialized inside the library (nostr v0.8.0), which is what makes it sound
+// while the owning thread is blocked reading the same socket.
+
+/// Prefix for a one-shot's subscription id, so the relay threads can recognise
+/// one and close it at EOSE. Anything not the feed, the inbox or a one-shot is
+/// the engagement subscription, and that dispatch is by prefix rather than by a
+/// list of names precisely so a new question cannot land in the engagement
+/// branch and be counted as somebody liking something.
+const one_shot_sub_prefix = "plaza-ask-";
+
+fn isOneShotSub(sub_id: []const u8) bool {
+    return std.mem.startsWith(u8, sub_id, one_shot_sub_prefix);
+}
+
+/// Asks every READ relay in the pool one question, on the socket it already
+/// holds. Returns how many were asked.
+///
+/// Does not wait, and has nothing to wait for: the answers arrive in the store.
+/// A caller that needs to know when they have arrived watches the store, the
+/// way the profile cache and the feed already do.
+///
+/// A REQ under an existing id REPLACES it (NIP-01), so re-asking the same
+/// question costs one message and no CLOSE, and two batches of the same kind
+/// cannot pile up subscriptions on a relay.
+/// Which pool slots a one-shot question goes to: the ones that take reads.
+///
+/// Split out from the asking so it can be asserted. Inside `askPool` the choice
+/// is invisible to a test: with no live socket every slot is skipped anyway, so
+/// a test of "how many were asked" passes whether or not the read marker is
+/// honoured, which is the assertion looking right for the wrong reason.
+fn askableSlots(out: []usize) usize {
+    var n: usize = 0;
+    for (0..relaySlots()) |i| {
+        if (n >= out.len) break;
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(i, &url_buf) orelse continue;
+        // Asking a write-only relay to answer a filter is asking it the wrong
+        // question. It keeps its socket, for publishing.
+        if (!entry.read) continue;
+        out[n] = i;
+        n += 1;
+    }
+    return n;
+}
+
+fn askPool(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
+    std.debug.assert(isOneShotSub(sub_id));
+    var slots: [max_relays]usize = undefined;
+    const n = askableSlots(&slots);
+    var asked: usize = 0;
+    for (slots[0..n]) |i| {
+        // The lock is what stops the owning thread freeing this connection
+        // while the REQ is being written onto it.
+        lockLiveRelay(i);
+        defer unlockLiveRelay(i);
+        const relay = g_relay_live[i] orelse continue;
+        relay.subscribe(sub_id, filters) catch continue;
+        asked += 1;
+    }
+    return asked;
+}
+
+pub fn askPoolForTest(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
+    return askPool(sub_id, filters);
+}
+pub fn askableSlotsForTest(out: []usize) usize {
+    return askableSlots(out);
+}
+pub fn isOneShotSubForTest(sub_id: []const u8) bool {
+    return isOneShotSub(sub_id);
+}
+pub const oneShotSubPrefixForTest = one_shot_sub_prefix;
+
 // ------------------------------------------------------------------ profiles
 //
 // Kind:0 metadata gives each author a display name and an avatar. The pool
@@ -4556,47 +4646,20 @@ fn requestWantedProfiles() void {
             w.attempts +|= 1;
         }
     }
-    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, still_missing, missing }) catch return;
-    thread.detach();
+    askProfiles(still_missing, missing);
 }
 
-/// Fetches kind:0 for `batch` and ingests it, then closes. Its own io backend
-/// and signer, like every other background worker.
-fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8, len: usize) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-
+/// Asks the pool for these authors' metadata, on the sockets it already holds.
+///
+/// Was a thread that dialled every relay in turn and read each to EOSE: eight
+/// TLS handshakes and a parked thread to learn one display name. The answers
+/// land in the store either way, and the profile cache already reads them from
+/// there on the next tick, so there was never anything for that thread to wait
+/// for.
+fn askProfiles(batch: [wanted_profiles_cap][32]u8, len: usize) void {
     const kinds = [_]u16{0};
     const filters = [_]nostr.filter.Filter{.{ .authors = batch[0..len], .kinds = &kinds, .limit = @intCast(len) }};
-    for (0..relaySlots()) |ri| {
-        var url_buf: [96]u8 = undefined;
-        const entry = relaySnapshot(ri, &url_buf) orelse continue;
-        // A read-only or read-write relay. Asking a write-only relay to answer
-        // a filter is asking the wrong question of it.
-        if (!entry.read) continue;
-        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
-        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
-        // let go of this pointer before the connection is freed.
-        defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
-        defer releaseOneShot(watched);
-        relay.subscribe("plaza-mentions", &filters) catch continue;
-        while (true) {
-            var msg = (relay.receive() catch break) orelse break;
-            defer msg.deinit();
-            switch (msg.value) {
-                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
-                // Everything stored has been sent; no need to hold the socket.
-                .eose => break,
-                else => {},
-            }
-        }
-        // Keep going: no single relay holds everyone's metadata, and the store
-        // keeps only the newest copy of each anyway.
-    }
+    _ = askPool(one_shot_sub_prefix ++ "profiles", &filters);
 }
 
 // ------------------------------------------------------------------ quotes
@@ -5258,11 +5321,12 @@ fn quoteBackoffRounds(attempts: u8) u64 {
     return @min(@as(u64, 1) << shift, quote_backoff_max_rounds);
 }
 
-/// Every unresolved quote may be asked for again, now.
-///
-/// The pool changed, so the answer may have too: a relay the reader just added,
-/// or one that just finished dialling, can hold exactly the note that was
-/// written off while nothing was connected.
+/// Clears the quote cache. For tests, which share the process globals.
+pub fn resetQuotesForTest() void {
+    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
+    g_quote_clock = 0;
+}
+
 /// Whether this build may open a socket of its own accord.
 ///
 /// False under `zig build test`, and not as tidiness. The feed's background
@@ -5309,49 +5373,19 @@ fn requestWantedQuotes() void {
     }
     if (n == 0) return;
     if (!networkAllowed()) return;
-    const thread = std.Thread.spawn(.{}, fetchQuotesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
-    thread.detach();
+    askQuotes(batch, n);
 }
 
 /// Fetches the quoted events in `batch` by id and ingests them, then closes.
 /// The next store-growth tick flips them to `.loaded` via `refreshQuotes`.
-fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len: usize) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-
+/// Asks the pool for these quoted events, on the sockets it already holds.
+///
+/// Same shape as `askProfiles`, and for the same reason: the quote cache is
+/// filled from the store, so a thread holding a socket open until EOSE was
+/// waiting for something it did not read.
+fn askQuotes(batch: [quote_fetch_batch][32]u8, len: usize) void {
     const filters = [_]nostr.filter.Filter{.{ .ids = batch[0..len], .limit = @intCast(len) }};
-    for (0..relaySlots()) |ri| {
-        var url_buf: [96]u8 = undefined;
-        const entry = relaySnapshot(ri, &url_buf) orelse continue;
-        // A read-only or read-write relay. Asking a write-only relay to answer
-        // a filter is asking the wrong question of it.
-        if (!entry.read) continue;
-        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
-        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
-        // let go of this pointer before the connection is freed.
-        defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
-        defer releaseOneShot(watched);
-        relay.subscribe("plaza-quotes", &filters) catch continue;
-        while (true) {
-            var msg = (relay.receive() catch break) orelse break;
-            defer msg.deinit();
-            switch (msg.value) {
-                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
-                .eose => break,
-                else => {},
-            }
-        }
-    }
-}
-
-/// Clears the quote cache. For tests, which share the process globals.
-pub fn resetQuotesForTest() void {
-    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
-    g_quote_clock = 0;
+    _ = askPool(one_shot_sub_prefix ++ "quotes", &filters);
 }
 
 /// Builds a Note over `content` and runs the quote-reference scan, so a test can
@@ -25273,6 +25307,19 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                             feed_ids_len += 1;
                         }
                     }
+                } else if (isOneShotSub(e.subscription_id)) {
+                    // Somebody else's question, answered on this socket. It goes
+                    // to the store like everything else and nothing is routed
+                    // back, which is exactly why the socket can be shared: there
+                    // is no caller waiting on a reply.
+                    //
+                    // This branch has to exist before anything uses `askPool`.
+                    // Without it a one-shot's events fall into the engagement
+                    // arm below and every profile fetched gets counted as
+                    // somebody reacting to a note.
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind == 1) noteFeedNewest(e.event.created_at);
                 } else {
                     // The engagement subscription: fold into the counts, verified
                     // so a forged reaction cannot inflate a tally.
@@ -25289,6 +25336,14 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // probe became a standing subscription on every relay.
                     relay.unsubscribe(probe_sub) catch {};
                 }
+                // A one-shot has been answered. Close it: a REQ stays live past
+                // EOSE, and leaving them open is how the latency probe became a
+                // standing subscription on every relay in the pool.
+                //
+                // Closed HERE, on the thread that owns the socket, and never
+                // before EOSE: relays dislike a CLOSE for a subscription they
+                // are still answering, which NDK's source says in as many words.
+                if (isOneShotSub(eo.subscription_id)) relay.unsubscribe(eo.subscription_id) catch {};
                 if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
                     // Only when THIS subscription actually asked about the
                     // reader. A guest-era filter names nine strangers, and its
