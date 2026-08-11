@@ -12740,7 +12740,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     }
 
     var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = main.buildFeedFilters(authors, &buf);
+    const filters = main.buildFeedFilters(authors, null, &buf);
 
     // Two filters per chunk: the notes and the metadata.
     try testing.expectEqual(@as(usize, 10), filters.len);
@@ -12786,7 +12786,17 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // the rest of those people nameless.
     for (filters) |f| {
         if (f.kinds.?.len == 1) continue;
-        try testing.expectEqual(@as(u32, @intCast(f.authors.?.len * 3)), f.limit.?);
+        try testing.expectEqual(@as(u32, @intCast(f.authors.?.len * f.kinds.?.len)), f.limit.?);
+    }
+
+    // Nobody else's contact list. It is asked for in one place, the profile
+    // card's follow counts, and the worker that opens a profile fetches that
+    // person's kind:3 itself. Asking here asked every relay for the contact
+    // list of every follow at dial: two thousand `p` tags is well over a
+    // hundred kilobytes, so it was megabytes per relay for a question nobody
+    // had asked about people whose profile may never be opened.
+    for (filters) |f| {
+        for (f.kinds.?) |k| try testing.expect(k != 3);
     }
 
     // A list that fits in one chunk is still one chunk, not a special case.
@@ -12795,9 +12805,26 @@ test "a long follow list is split across filters that relays accept, in one REQ"
         @memset(a, 0);
         a[0] = @intCast(i);
     }
-    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, &buf).len);
+    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, null, &buf).len);
     // And nobody at all asks nothing, rather than asking about everybody.
-    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, null, &buf).len);
+
+    // The reader's OWN contact list is still asked for, on its own filter. That
+    // one is not a nicety: nothing may write over a replaceable record it has
+    // not read back, and the follow list is the one where getting that wrong
+    // empties an account. Dropping kind:3 from the bulk filter is only safe
+    // because this exists.
+    const me = [_]u8{0xC3} ** 32;
+    const with_me = main.buildFeedFilters(few, me, &buf);
+    try testing.expectEqual(@as(usize, 3), with_me.len);
+    const own = with_me[with_me.len - 1];
+    try testing.expectEqual(@as(usize, 1), own.authors.?.len);
+    try testing.expectEqualSlices(u8, &me, &own.authors.?[0]);
+    var asks_contacts = false;
+    for (own.kinds.?) |k| {
+        if (k == 3) asks_contacts = true;
+    }
+    try testing.expect(asks_contacts);
 }
 
 test "a relay that keeps dropping is asked less and less often" {
