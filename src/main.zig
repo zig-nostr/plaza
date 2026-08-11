@@ -793,6 +793,7 @@ fn keepReplaced(gpa: std.mem.Allocator, store: *nostr.store.Store, kind: u16, js
 /// Points the app's store at a test's own, so the funnel can be driven for real.
 pub fn setStoreForTest(store: ?*nostr.store.Store) void {
     g_store = store;
+    if (store) |st| seedFeedNewest(st);
 }
 
 pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
@@ -5558,6 +5559,55 @@ fn inboxMeHex(me: [32]u8) [64]u8 {
 /// and the limit does the bounding, which is what relays are good at.
 const inbox_backfill_cap: u32 = 200;
 const inbox_since_overlap_s: i64 = 60 * 60;
+
+/// The newest kind:1 this app holds, for the feed's `since`.
+///
+/// Updated by the ingest threads, seeded once from the store at startup so a
+/// relaunch does not re-download everything it already has.
+var g_feed_newest = std.atomic.Value(i64).init(0);
+
+/// How far back of the newest held note the feed re-asks from.
+///
+/// The same one hour `inboxSince` uses, and for the same reason: relays differ
+/// on whether `since` is inclusive, clocks differ, and an event can be stored
+/// with a `created_at` behind the one that arrived before it. An hour of
+/// overlap costs a few duplicate events, which the store rejects, and buys not
+/// silently missing the notes either side of a reconnect.
+const feed_since_overlap_s: i64 = 3600;
+
+fn noteFeedNewest(created_at: i64) void {
+    var seen = g_feed_newest.load(.monotonic);
+    while (created_at > seen) {
+        seen = g_feed_newest.cmpxchgWeak(seen, created_at, .monotonic, .monotonic) orelse break;
+    }
+}
+
+/// Reads the newest stored kind:1 once, so the first subscription after a
+/// launch is bounded too. One cursor on the kind index, not a merge.
+fn seedFeedNewest(store: *nostr.store.Store) void {
+    if (g_feed_newest.load(.monotonic) != 0) return;
+    const kinds = [_]u16{1};
+    var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .limit = 1 }) catch return;
+    defer result.deinit();
+    if (result.events.len > 0) noteFeedNewest(result.events[0].created_at);
+}
+
+/// What the feed asks relays to start from, or null on a cold store.
+///
+/// Every reconnect re-asked for the full three hundred per chunk, from every
+/// relay, because no feed filter ever carried a `since`. A flapping relay was
+/// therefore handed a fifteen-hundred-event question every few seconds, and
+/// every one of those events cost a Schnorr verify before the store recognised
+/// it as a duplicate. The app already knew the shape: `subscribeInbox` has done
+/// exactly this since it was written.
+///
+/// Null when nothing is held, which is Notedeck's rule: a cold store needs the
+/// whole backfill, and bounding it would leave a new install with an empty feed.
+fn feedSince() ?i64 {
+    const newest = g_feed_newest.load(.monotonic);
+    if (newest == 0) return null;
+    return @max(0, newest - feed_since_overlap_s);
+}
 
 fn inboxSince() i64 {
     const newest = inboxNewest();
@@ -13307,13 +13357,17 @@ var g_self_filter_author: [1][32]u8 = undefined;
 /// envelope that arrives. The per-chunk limit is NOT divided: each chunk names
 /// different people, and splitting the limit would starve whoever landed in the
 /// last one.
-pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, since: ?i64, out: []nostr.filter.Filter) []nostr.filter.Filter {
     var len: usize = 0;
     var start: usize = 0;
     while (start < authors.len) : (start += follow_chunk) {
         if (len + 2 > out.len) break;
         const chunk = authors[start..@min(start + follow_chunk, authors.len)];
-        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_request_limit };
+        // The notes carry `since`; the metadata filter deliberately does not.
+        // A profile or relay list edited while the app was closed has an older
+        // `created_at` than the newest note held, so bounding that filter would
+        // hide exactly the update the app most needs.
+        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .since = since, .limit = feed_request_limit };
         // One record per author per kind, which is what the filter can actually
         // return: these are all replaceable, so a relay holds at most one of
         // each. The old limit was `profile_cap`, a UI cache size, which for a
@@ -23071,6 +23125,7 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
         return;
     };
     g_store = store;
+    seedFeedNewest(store);
     // The reader's own follow list is already on disk from last session. Read it
     // before the first frame, so a local-first app opens on THEIR feed rather
     // than on nine strangers while it waits for a relay.
@@ -23788,7 +23843,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // actually accept. The per-chunk limit stays whole for the same reason:
     // dividing it would starve whoever landed in the last chunk.
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = buildFeedFilters(authors[0..authors_len], activePubkey(), &filter_buf);
+    const filters = buildFeedFilters(authors[0..authors_len], activePubkey(), feedSince(), &filter_buf);
     // What other people aimed at this reader. Its own subscription, never folded
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
@@ -23871,7 +23926,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // every reader takes: Plaza dials before anyone has signed in, so
             // the subscription that carries the actual account is always the
             // re-issued one, never the one built at dial.
-            const next_filters = buildFeedFilters(authors[0..next_authors_len], activePubkey(), &filter_buf);
+            const next_filters = buildFeedFilters(authors[0..next_authors_len], activePubkey(), feedSince(), &filter_buf);
             relay.subscribe("plaza-feed", next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
@@ -23939,7 +23994,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     if (result == .invalid) continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
-                    if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);
+                    if (e.event.kind == 1) {
+                        markRelaySeen(noteIdOf(e.event), index);
+                        // What the next subscription will start from.
+                        noteFeedNewest(e.event.created_at);
+                    }
                     if (e.event.kind == relay_list_kind) ingestRelayList(e.event);
                     if (e.event.kind == contact_list_kind) ingestContactList(e.event);
                     // Note this feed post so its engagement can be watched. Bounded

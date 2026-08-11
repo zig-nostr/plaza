@@ -12740,7 +12740,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     }
 
     var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = main.buildFeedFilters(authors, null, &buf);
+    const filters = main.buildFeedFilters(authors, null, null, &buf);
 
     // Two filters per chunk: the notes and the metadata.
     try testing.expectEqual(@as(usize, 10), filters.len);
@@ -12805,9 +12805,9 @@ test "a long follow list is split across filters that relays accept, in one REQ"
         @memset(a, 0);
         a[0] = @intCast(i);
     }
-    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, null, &buf).len);
+    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, null, null, &buf).len);
     // And nobody at all asks nothing, rather than asking about everybody.
-    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, null, &buf).len);
+    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, null, null, &buf).len);
 
     // The reader's OWN contact list is still asked for, on its own filter. That
     // one is not a nicety: nothing may write over a replaceable record it has
@@ -12815,7 +12815,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // empties an account. Dropping kind:3 from the bulk filter is only safe
     // because this exists.
     const me = [_]u8{0xC3} ** 32;
-    const with_me = main.buildFeedFilters(few, me, &buf);
+    const with_me = main.buildFeedFilters(few, me, null, &buf);
     try testing.expectEqual(@as(usize, 3), with_me.len);
     const own = with_me[with_me.len - 1];
     try testing.expectEqual(@as(usize, 1), own.authors.?.len);
@@ -13762,4 +13762,48 @@ test "reaching the bottom asks the relays for what came before" {
 
     // An empty follow set asks nothing rather than asking about everybody.
     try testing.expectEqual(@as(usize, 0), main.buildOlderFilters(&.{}, until, &buf).len);
+}
+
+test "the feed asks only for what it does not already hold" {
+    // No feed filter ever carried a `since`, so every reconnect re-asked for
+    // the full three hundred per chunk from every relay. A flapping relay was
+    // handed a fifteen-hundred-event question every few seconds, and each of
+    // those events cost a Schnorr verify before the store recognised it as a
+    // duplicate. `subscribeInbox` has done this correctly since it was written.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const authors = try arena.alloc([32]u8, 600);
+    for (authors, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i / 256);
+        a[1] = @intCast(i % 256);
+    }
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+
+    // A cold store asks for everything: bounding it would leave a new install
+    // looking at an empty feed. This is Notedeck's rule.
+    for (main.buildFeedFilters(authors, null, null, &buf)) |f| {
+        try testing.expect(f.since == null);
+    }
+
+    const newest: i64 = 1_800_000_000;
+    const filters = main.buildFeedFilters(authors, null, newest, &buf);
+    var notes: usize = 0;
+    var meta: usize = 0;
+    for (filters) |f| {
+        if (f.kinds.?.len == 1 and f.kinds.?[0] == 1) {
+            notes += 1;
+            try testing.expectEqual(newest, f.since.?);
+        } else {
+            meta += 1;
+            // Deliberately unbounded. A profile or relay list edited while the
+            // app was closed carries an older created_at than the newest note
+            // held, so a since here would hide the very update that matters.
+            try testing.expect(f.since == null);
+        }
+    }
+    try testing.expect(notes > 0);
+    try testing.expect(meta > 0);
 }
