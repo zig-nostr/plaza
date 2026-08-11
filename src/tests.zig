@@ -12712,6 +12712,48 @@ test "the feed rebuilds inside a frame with every account a reader can follow" {
         );
         return error.FeedRebuildTooSlow;
     }
+
+    // And what the app actually does between two ticks, at the same ceiling, on
+    // the same machine, in the same run: one note lands and the list already in
+    // hand is merged with it. The number above is what that replaces, and the
+    // pair is only comparable because nothing else moved between them.
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetFeedChangeDetectionForTest();
+    main.tickForTest(model, 1_800_002_000);
+
+    const own = try nostr.keys.Signer.init().keyPairFromSecretKey([_]u8{98} ** 32);
+    var splice_best: u64 = std.math.maxInt(u64);
+    var stamp: i64 = 1_800_003_000;
+    for (0..3) |_| {
+        const rounds = 5;
+        var elapsed_ns: u64 = 0;
+        for (0..rounds) |_| {
+            stamp += 1;
+            const body = try std.fmt.allocPrint(arena, "arriving at {d}", .{stamp});
+            const ev = try nostr.event.create(arena, signer, own, stamp, 1, &.{}, body, null);
+            _ = try main.plazaIngestForTest(arena, ev);
+            // Only the tick is timed. Signing and storing are the relay
+            // thread's work in the app and would swamp the thing being read.
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            main.tickForTest(model, 1_800_003_500);
+            const dt = t0.durationTo(std.Io.Timestamp.now(io, .awake));
+            elapsed_ns += @intCast(@max(dt.toNanoseconds(), 0));
+        }
+        splice_best = @min(splice_best, elapsed_ns / rounds);
+    }
+
+    std.debug.print(
+        "[perf] {d} follows (the ceiling): {d}us per tick with one note arriving\n",
+        .{ follows, splice_best / 1000 },
+    );
+
+    // The assertion is the counter, not the clock: the merge did not read the
+    // window back. A stopwatch says what this machine was doing; this says what
+    // the code did.
+    const work_before = main.feedWork();
+    main.tickForTest(model, 1_800_003_500);
+    try testing.expectEqual(work_before.full_reads, main.feedWork().full_reads);
 }
 
 test "a long follow list is split across filters that relays accept, in one REQ" {
@@ -13806,4 +13848,434 @@ test "the feed asks only for what it does not already hold" {
     }
     try testing.expect(notes > 0);
     try testing.expect(meta > 0);
+}
+
+// -- The feed brings itself up to date without re-reading the store ----------
+//
+// The feed used to answer "has anything changed" by asking the store for the
+// whole window again, once a second, on the render thread. Measured in the
+// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
+// screenful, 10.8 ms twenty pages down, against a 16.7 ms frame.
+//
+// These assert on WHICH PATH RAN and how much it parsed, never on a stopwatch.
+// The test binary is Debug and the machine is shared, so a timing assertion here
+// measures the machine. A counter measures the code.
+
+/// A store, an identity, a follow set and a model, wired the way the app wires
+/// them, with change detection reset so a test starts from a known place.
+const FeedFixture = struct {
+    tmp: std.testing.TmpDir,
+    store: nostr.store.Store,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    model: *main.Model,
+
+    fn init(arena: std.mem.Allocator, name: []const u8) !*FeedFixture {
+        const f = try arena.create(FeedFixture);
+        f.tmp = testing.tmpDir(.{});
+        var pbuf: [128]u8 = undefined;
+        const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/{s}.mdb", .{ f.tmp.sub_path, name });
+        f.store = try nostr.store.Store.open(db_path, .{});
+        f.signer = nostr.keys.Signer.init();
+        f.kp = try f.signer.keyPairFromSecretKey([_]u8{77} ** 32);
+        main.resetProfilesForTest();
+        main.resetMediaForTest();
+        main.setIdentityForTest([_]u8{77} ** 32);
+        main.setStoreForTest(&f.store);
+        main.resetFeedChangeDetectionForTest();
+        main.resetFeedWork();
+        f.model = try arena.create(main.Model);
+        f.model.* = main.initialModel();
+        f.model.stage = .ready;
+        return f;
+    }
+
+    fn deinit(f: *FeedFixture) void {
+        main.setStoreForTest(null);
+        main.clearIdentityForTest();
+        main.resetProfilesForTest();
+        f.signer.deinit();
+        f.store.deinit();
+        f.tmp.cleanup();
+    }
+
+    /// Stores an event the way the app does: through the one door, which is
+    /// where an arrival announces itself.
+    fn arrive(f: *FeedFixture, arena: std.mem.Allocator, created_at: i64, content: []const u8) !nostr.event.Event {
+        const ev = try signedNote(arena, f.signer, f.kp, created_at, content);
+        _ = try main.plazaIngestForTest(arena, ev);
+        return ev;
+    }
+
+    fn tick(f: *FeedFixture, now_s: i64) void {
+        main.tickForTest(f.model, now_s);
+    }
+
+    fn ids(f: *FeedFixture, out: []i64) []i64 {
+        for (f.model.notes[0..f.model.notes_len], 0..) |n, i| out[i] = n.id;
+        return out[0..f.model.notes_len];
+    }
+};
+
+test "a tick with nothing new does not read the feed back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "quiet");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+    const after_first = main.feedWork();
+
+    // Nine more ticks with nothing arriving. This is the app at rest, and it
+    // used to be nine more full reads of the whole follow list.
+    for (0..9) |_| f.tick(1_800_000_100);
+    const at_rest = main.feedWork();
+    try testing.expectEqual(after_first.full_reads, at_rest.full_reads);
+    try testing.expectEqual(after_first.splices, at_rest.splices);
+    try testing.expectEqual(after_first.parses, at_rest.parses);
+}
+
+test "an event of another kind does not read the feed back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "otherkind");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // A reaction to it. The store's event count moves, which is the only signal
+    // the feed used to have, and it meant a full read every time anyone liked
+    // anything anywhere.
+    const like = try nostr.event.create(arena, f.signer, f.kp, 1_800_000_010, 7, &.{}, "+", null);
+    _ = try main.plazaIngestForTest(arena, like);
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads, after.full_reads);
+    try testing.expectEqual(before.splices, after.splices);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a note that arrives is merged into the list, not fetched again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "splice");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "older");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    const newer = try f.arrive(arena, 1_800_000_050, "newer");
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads, after.full_reads);
+    try testing.expectEqual(before.splices + 1, after.splices);
+    // One note parsed, not two: the card already on screen carried over.
+    try testing.expectEqual(before.parses + 1, after.parses);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    try testing.expectEqual(main.noteIdOf(newer), f.model.notes[0].id);
+}
+
+test "a spliced feed holds the same notes in the same order as a full read" {
+    // The guard against the two paths drifting. Everything else here checks one
+    // path; this one checks they agree, which is the property that matters and
+    // the one a future change is most likely to break.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "agree");
+    defer f.deinit();
+
+    // Deliberately out of order, and with FIVE sharing one second. Five,
+    // because the tie-break is the part most easily got wrong and one pair
+    // catches it only half the time: an id order that happens to match arrival
+    // order proves nothing. Ids are hashes, so five in a row matching by chance
+    // is one in a hundred and twenty.
+    const tie = 1_800_000_030;
+    const stamps = [_]i64{ tie, 1_800_000_010, 1_800_000_070, tie, tie, 1_800_000_050, tie, 1_800_000_020, tie };
+    for (stamps, 0..) |at, i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        _ = try f.arrive(arena, at, body);
+        // A tick between each, so every one of them lands as a splice into a
+        // list that already exists rather than as part of one big read.
+        f.tick(1_800_000_100);
+    }
+    try testing.expectEqual(stamps.len, f.model.notes_len);
+
+    var spliced_buf: [16]i64 = undefined;
+    const spliced = f.ids(&spliced_buf);
+    var snapshot: [16]i64 = undefined;
+    @memcpy(snapshot[0..spliced.len], spliced);
+
+    // The store's rule, stated directly rather than inferred: created_at
+    // descending, then id descending. Asserting it here and not only against a
+    // full read means the two cannot agree on the WRONG order.
+    var prev: ?main.Note = null;
+    for (f.model.notes[0..f.model.notes_len]) |note| {
+        if (prev) |p| {
+            try testing.expect(p.created_at >= note.created_at);
+            if (p.created_at == note.created_at) {
+                try testing.expect(std.mem.order(u8, &p.event_id, &note.event_id) == .gt);
+            }
+        }
+        prev = note;
+    }
+
+    main.reconcileForTest(f.model, &f.store, 1_800_000_100);
+    var full_buf: [16]i64 = undefined;
+    const full = f.ids(&full_buf);
+
+    try testing.expectEqualSlices(i64, snapshot[0..spliced.len], full);
+}
+
+test "a card already on screen survives a splice unparsed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "sentinel");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "the original text");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    const sentinel = "SENTINEL";
+    @memcpy(f.model.notes[0].content_buf[0..sentinel.len], sentinel);
+    f.model.notes[0].content_len = sentinel.len;
+
+    _ = try f.arrive(arena, 1_800_000_050, "another note");
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    var found = false;
+    for (f.model.notes[0..f.model.notes_len]) |*note| {
+        if (std.mem.eql(u8, note.content(), sentinel)) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "a note from someone the reader does not follow is not spliced in" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "stranger");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "mine");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    // A thread fetch or a quote lookup stores notes by people the reader does
+    // not follow. They go through the same door and land in the same buffer, so
+    // the splice has to reject them the way the full read's author filter does.
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{88} ** 32);
+    const theirs = try signedNote(arena, other, other_kp, 1_800_000_090, "not in this feed");
+    _ = try main.plazaIngestForTest(arena, theirs);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    // And a full read agrees, which is the point: the splice is not allowed to
+    // be more or less permissive than the query it replaces.
+    main.reconcileForTest(f.model, &f.store, 1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a deletion is read back in full, because a splice can only add" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "deletion");
+    defer f.deinit();
+
+    const doomed = try f.arrive(arena, 1_800_000_000, "regrettable");
+    _ = try f.arrive(arena, 1_800_000_050, "fine");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    const before = main.feedWork();
+
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{doomed.id}) catch unreachable;
+    const tags = [_]nostr.event.Tag{&.{ "e", &hex }};
+    const del = try nostr.event.create(arena, f.signer, f.kp, 1_800_000_060, 5, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, del);
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads + 1, after.full_reads);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "paging down is read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "paging");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // Notes below the old window belong now, and nothing arriving says so.
+    main.loadOlderForTest(f.model);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(before.full_reads + 1, main.feedWork().full_reads);
+}
+
+test "more arrivals than the buffer holds are read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "overflow");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // A backfill: more lands between two ticks than the buffer can name. The
+    // list in hand cannot be brought up to date by splicing, and the honest
+    // answer is the expensive one, not a quietly incomplete feed.
+    main.overflowFeedArrivalsForTest();
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads + 1, after.full_reads);
+    try testing.expectEqual(before.splices, after.splices);
+}
+
+test "a changed follow set is read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "follows");
+    defer f.deinit();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{88} ** 32);
+    const list = [_][32]u8{other_kp.public_key};
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(before.full_reads + 1, main.feedWork().full_reads);
+}
+
+test "a note announced twice appears once" {
+    // `.added` fires only for an event the store did not have, so the app
+    // should never announce one that is already on screen. The splice checks
+    // anyway, because the failure is a note drawn twice with the same id, and
+    // the row keys, the media slots and the engagement counts are all keyed on
+    // that id.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "twice");
+    defer f.deinit();
+
+    const ev = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    main.noteFeedArrivalForTest(ev.id);
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a note older than a full window is not spliced into it" {
+    // The window holds the newest `feed_limit`. A note that arrives older than
+    // everything in a full window does not belong in it, and a splice that
+    // added it anyway would push the oldest note out and disagree with a full
+    // read, which is the drift these two paths must not have.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "toolate");
+    defer f.deinit();
+
+    f.model.feed_limit = 3;
+    for (0..3) |i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        _ = try f.arrive(arena, 1_800_000_100 + @as(i64, @intCast(i)), body);
+    }
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    const oldest_shown = f.model.notes[2].id;
+
+    _ = try f.arrive(arena, 1_800_000_000, "long ago");
+    f.tick(1_800_000_200);
+
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(oldest_shown, f.model.notes[2].id);
+    // Parsed nothing: it was rejected before `noteFrom` ran, which is the point
+    // of checking the window edge before parsing rather than after.
+    const before = main.feedWork().parses;
+    f.tick(1_800_000_200);
+    try testing.expectEqual(before, main.feedWork().parses);
+
+    // And a full read of the same store shows the same three.
+    main.reconcileForTest(f.model, &f.store, 1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(oldest_shown, f.model.notes[2].id);
+}
+
+test "a note that fills a gap below the window arrives when the reader pages down" {
+    // The other half: the note rejected above is not lost, it is simply not in
+    // this window. Paging down has to find it, or "not spliced in" would mean
+    // "dropped".
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "pagedown");
+    defer f.deinit();
+
+    f.model.feed_limit = 2;
+    for (0..2) |i| {
+        const body = try std.fmt.allocPrint(arena, "recent {d}", .{i});
+        _ = try f.arrive(arena, 1_800_000_100 + @as(i64, @intCast(i)), body);
+    }
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+
+    const old_one = try f.arrive(arena, 1_800_000_000, "long ago");
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+
+    f.model.feed_limit = 4;
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(main.noteIdOf(old_one), f.model.notes[2].id);
 }
