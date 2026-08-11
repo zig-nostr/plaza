@@ -14976,7 +14976,6 @@ test "the pool's own relays still get a since" {
 fn seedRelayLists(
     arena: std.mem.Allocator,
     signer: nostr.keys.Signer,
-    store: *nostr.store.Store,
     specs: []const []const []const u8,
     out: [][32]u8,
 ) !void {
@@ -15026,18 +15025,28 @@ test "every followed author is asked of at least one relay" {
     main.setIdentityForTest([_]u8{77} ** 32);
     defer main.clearIdentityForTest();
 
-    // One who writes to the reader's own relay, two who write somewhere else,
-    // one with no relay list at all, and one who writes ONLY to a relay too
-    // unpopular to be chosen. That last one is the case that matters.
+    // MORE distinct relays than the routed budget can hold, which is the whole
+    // point: with only a couple of relays everything gets routed and the
+    // residual is never exercised, so the test passes without testing anything.
+    // Removing the residual entirely failed nothing until this list grew.
+    //
+    // One writes to the reader's own relay, two share a popular one, one has no
+    // relay list at all, and the rest each write to a relay of their own that
+    // is too unpopular to be chosen.
     const specs = [_][]const []const u8{
         &.{"wss://mine.example.com"},
         &.{"wss://busy.example.com"},
         &.{"wss://busy.example.com"},
         &.{},
-        &.{"wss://nobody-else.example.com"},
+        &.{"wss://lonely-a.example.com"},
+        &.{"wss://lonely-b.example.com"},
+        &.{"wss://lonely-c.example.com"},
+        &.{"wss://lonely-d.example.com"},
+        &.{"wss://lonely-e.example.com"},
+        &.{"wss://lonely-f.example.com"},
     };
     var follows: [specs.len][32]u8 = undefined;
-    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    try seedRelayLists(arena, signer, &specs, &follows);
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
@@ -15068,6 +15077,10 @@ test "every followed author is asked of at least one relay" {
             return error.AuthorAskedOfNobody;
         }
     }
+
+    // And the residual is actually carrying people here, or the loop above
+    // proved coverage in a case where routing happened to reach everyone.
+    try testing.expect(main.residualCountForTest() > 0);
 }
 
 test "a pool relay is asked about the follows who write there" {
@@ -15107,7 +15120,7 @@ test "a pool relay is asked about the follows who write there" {
         &.{"wss://busy.example.com"},
     };
     var follows: [specs.len][32]u8 = undefined;
-    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    try seedRelayLists(arena, signer, &specs, &follows);
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
@@ -15160,11 +15173,36 @@ test "an author nobody was routed to lands in the residual" {
         &.{"wss://g.example.com"},
     };
     var follows: [specs.len][32]u8 = undefined;
-    try seedRelayLists(arena, signer, &store, &specs, &follows);
+    try seedRelayLists(arena, signer, &specs, &follows);
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
     // More authors than the routed budget can hold, so somebody must be left
     // over, and the residual is where they go rather than nowhere.
     try testing.expect(main.residualCountForTest() > 0);
+}
+
+test "before anything is routed, a pool relay still asks about everyone" {
+    // The first dial happens before any relay list has been read back, so the
+    // route table is empty. Asking about nobody then would open the app to a
+    // blank feed that fills only once somebody's kind:10002 arrives.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+    main.clearRoutesForTest();
+
+    var follows: [4][32]u8 = undefined;
+    for (&follows, 0..) |*f, i| {
+        f.* = [_]u8{0} ** 32;
+        f[0] = @intCast(i + 1);
+    }
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    var buf: [main.max_follows + 1][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), main.poolAuthorsForTest(0, &buf));
+    try testing.expectEqual(follows.len, main.poolAuthorsOrAllForTest(0, &buf));
 }

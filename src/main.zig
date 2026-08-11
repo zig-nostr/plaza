@@ -25115,8 +25115,24 @@ fn poolAuthors(index: usize, out: *[max_follows + 1][32]u8) usize {
     return n;
 }
 
+/// What pool slot `index` asks about, with the fallback the dial path uses.
+///
+/// Nothing routed yet (the first dial happens before any relay list has been
+/// read back) means ask about EVERYONE, which is what this did before routing
+/// existed and is the only answer that cannot hide somebody. Separate from
+/// `poolAuthors` so the fallback is a thing a test can reach; inside the relay
+/// loop it needs a socket.
+fn poolAuthorsOrAll(index: usize, out: *[max_follows + 1][32]u8) usize {
+    const n = poolAuthors(index, out);
+    if (n > 0) return n;
+    return followSnapshot(@ptrCast(out));
+}
+
 pub fn poolAuthorsForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
     return poolAuthors(index, out);
+}
+pub fn poolAuthorsOrAllForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthorsOrAll(index, out);
 }
 pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]u8) usize {
     lockDiscovered();
@@ -25126,7 +25142,15 @@ pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]
     @memcpy(out[0..d.authors_len], d.authors[0..d.authors_len]);
     return d.authors_len;
 }
-pub const discoveredAuthorsCapForTest = discovered_authors_cap;
+pub fn clearRoutesForTest() void {
+    lockDiscovered();
+    defer unlockDiscovered();
+    for (&g_pool_routed) |*p| {
+        p.url_len = 0;
+        p.authors_len = 0;
+    }
+    g_residual_len = 0;
+}
 pub fn residualCountForTest() usize {
     lockDiscovered();
     defer unlockDiscovered();
@@ -25303,11 +25327,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // Before the routing existed this was the whole follow list on all eight
     // relays, which asked every relay about two thousand strangers and told
     // each of them the reader's entire social graph.
-    var authors_len: usize = poolAuthors(index, &authors);
-    // Nothing routed yet (the first dial happens before any relay list has been
-    // read back) means ask about everyone, which is what this did before and is
-    // the only answer that cannot hide somebody.
-    if (authors_len == 0) authors_len = followSnapshot(@ptrCast(&authors));
+    var authors_len: usize = poolAuthorsOrAll(index, &authors);
     // The generation this subscription was built for. When it moves, this
     // connection is asking the wrong question and re-asks below.
     var subscribed_gen = followGeneration();
@@ -25397,8 +25417,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // leave following disabled for the whole session.
         if (reads and followGeneration() != subscribed_gen) {
             subscribed_gen = followGeneration();
-            authors_len = poolAuthors(index, &authors);
-            if (authors_len == 0) authors_len = followSnapshot(@ptrCast(&authors));
+            authors_len = poolAuthorsOrAll(index, &authors);
             var next_authors_len = authors_len;
             asked_about_me = false;
             if (activePubkey()) |pk| {
