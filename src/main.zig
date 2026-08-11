@@ -13262,15 +13262,38 @@ const follow_chunk = 500;
 /// a compile-time question rather than a truncated subscription.
 const max_follows_divided = (max_follows + 1 + follow_chunk - 1) / follow_chunk;
 
-/// How many filters the feed subscription can need: two per chunk.
-pub const max_feed_filters = 2 * (max_follows_divided + 1);
+/// How many filters the feed subscription can need: two per chunk, plus one for
+/// the reader's own records.
+pub const max_feed_filters = 2 * (max_follows_divided + 1) + 1;
 
 /// The feed's notes.
 const feed_filter_kinds = [_]u16{1};
-/// kind:0 is who they are, 10002 is where they are, and 3 is who the reader
-/// follows: their own contact list, which nothing may be written over until it
-/// has been read.
-const profile_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
+/// What the feed needs about the people in it: kind:0 is who they are, 10002 is
+/// where they are.
+///
+/// NOT kind:3. Somebody else's contact list is asked for in exactly one place,
+/// the profile card's follow counts, and the worker that opens a profile
+/// already fetches that person's kind:0 and kind:3 on its own. Asking for it
+/// here asked every relay for the contact list of all two thousand follows at
+/// dial: a list of two thousand `p` tags is well over a hundred kilobytes, so
+/// this was megabytes per relay, per connection, to answer a question nobody
+/// had asked, about people whose profile the reader may never open.
+const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
+
+/// What the feed needs about the READER, which is the above plus their own
+/// contact list.
+///
+/// Their own kind:3 is not optional and not a nicety: nothing may write over a
+/// replaceable record that has not been read back first, and the follow list is
+/// the one where getting that wrong empties somebody's account. It is one
+/// author and three records, so it costs nothing to ask for separately, which
+/// is the entire reason the bulk filter above can stop asking for it.
+const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
+
+/// Backing store for the reader's own author filter. A `Filter` borrows its
+/// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
+/// only there, and only from the relay threads that build a subscription.
+var g_self_filter_author: [1][32]u8 = undefined;
 
 /// Splits `authors` across filters small enough for a relay to accept, two per
 /// chunk, and returns the slice of `out` that was filled.
@@ -13280,7 +13303,7 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
 /// envelope that arrives. The per-chunk limit is NOT divided: each chunk names
 /// different people, and splitting the limit would starve whoever landed in the
 /// last one.
-pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
     var len: usize = 0;
     var start: usize = 0;
     while (start < authors.len) : (start += follow_chunk) {
@@ -13300,6 +13323,21 @@ pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []n
             .limit = @intCast(chunk.len * profile_filter_kinds.len),
         };
         len += 2;
+    }
+    // The reader's own three records, asked for once rather than folded into a
+    // five-hundred-author filter. `self_storage` outlives the returned slice
+    // because it is a module-level buffer: a filter borrows its authors, and a
+    // local array here would dangle the moment this function returned.
+    if (self) |pk| {
+        if (len < out.len) {
+            g_self_filter_author[0] = pk;
+            out[len] = .{
+                .authors = g_self_filter_author[0..1],
+                .kinds = &self_filter_kinds,
+                .limit = self_filter_kinds.len,
+            };
+            len += 1;
+        }
     }
     return out[0..len];
 }
@@ -23481,7 +23519,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // actually accept. The per-chunk limit stays whole for the same reason:
     // dividing it would starve whoever landed in the last chunk.
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = buildFeedFilters(authors[0..authors_len], &filter_buf);
+    const filters = buildFeedFilters(authors[0..authors_len], activePubkey(), &filter_buf);
     // What other people aimed at this reader. Its own subscription, never folded
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
@@ -23564,7 +23602,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // every reader takes: Plaza dials before anyone has signed in, so
             // the subscription that carries the actual account is always the
             // re-issued one, never the one built at dial.
-            const next_filters = buildFeedFilters(authors[0..next_authors_len], &filter_buf);
+            const next_filters = buildFeedFilters(authors[0..next_authors_len], activePubkey(), &filter_buf);
             relay.subscribe("plaza-feed", next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
