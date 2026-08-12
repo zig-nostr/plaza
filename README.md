@@ -72,10 +72,18 @@ ranked by how many of your follows use each relay, the connections are chosen by
 who they reach.
 
 Measured on an account following 257 people: between its own relays and the
-eight it routes to, 202 of them are covered, 156 of those by two relays each, so
+eight it routes to, 196 of them are covered, 147 of those by two relays each, so
 one relay being down does not hide anybody. It is bounded on purpose, eight
 routed connections alongside the eight in your own pool, and one is only opened
 while it would reach somebody not already covered twice.
+
+Carrying people is not the same as answering, so Plaza checks the second thing
+too. The relay with the most of those writers on that account is paid, and
+refuses the connection itself rather than the subscription, so there is nothing
+to authenticate and nothing to negotiate. A relay that will not have us after
+three tries gives up its slot to the next one down and is tried again in six
+hours. Before that, the same count said 202 and fifty of those people were
+behind a closed door.
 
 ## Performance
 

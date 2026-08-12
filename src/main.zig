@@ -335,6 +335,165 @@ pub fn routeCoverageForTest() RouteCoverage {
 }
 pub const routeCoverageTargetForTest = route_coverage_target;
 
+// -- Relays that will not have us ---------------------------------------------
+//
+// Coverage says which relays carry the people you follow. It does not say which
+// of them will talk to you, and those are not the same set. A paid relay refuses
+// the WEBSOCKET HANDSHAKE, before a single Nostr message is exchanged, so there
+// is no protocol answer to give it: no NIP-42 challenge arrives, and nothing to
+// authenticate with would help, because what it wants is a subscription.
+//
+// Found on my own account: `wss://nostr.wine` is the single best relay by
+// coverage, 50 of 257 follows write there, and it had a routed slot to itself
+// dialling and failing on a widening ladder forever. The coverage counter could
+// not see it. It reported those 50 people as reached.
+//
+// So a routed relay that will not have us gives up its slot and the greedy
+// spends it on the next relay down, which is a real one. This applies ONLY to
+// relays Plaza chose. A relay the reader added themselves keeps its seat and
+// keeps retrying however badly it behaves, because dropping somebody's own relay
+// quietly is the opposite of what they asked for.
+
+/// Failed connections in a row before a routed relay is set aside. Three,
+/// because a handshake also fails for a blip: the free relay in my own pool
+/// failed one in the same run and was fine on the retry.
+const routed_refusal_strikes: u6 = 3;
+/// How long a set-aside relay stays set aside. It is a subscription, a block or
+/// an outage, and all three end; none of them ends in a minute.
+const routed_refusal_ms: i64 = 6 * 60 * 60 * 1000;
+/// How many at once. Small on purpose: this is a list of relays that would
+/// otherwise hold a routed slot, and there are only eight of those.
+const routed_refusal_slots = 16;
+
+const RefusedRelay = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    strikes: u6 = 0,
+    /// When the last strike landed, monotonic ms, or -1 for never.
+    at_ms: i64 = -1,
+};
+var g_refused: [routed_refusal_slots]RefusedRelay = @splat(.{});
+var g_refused_lock = std.atomic.Value(bool).init(false);
+
+fn lockRefused() void {
+    while (g_refused_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockRefused() void {
+    g_refused_lock.store(false, .release);
+}
+
+/// Whether a relay with this record should be passed over right now.
+///
+/// A pure function so the two clocks it has to survive are testable: no clock at
+/// all (before `main` wires one, when nothing has been dialled either), and a
+/// record older than the window.
+fn relayIsRefused(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
+    if (strikes < routed_refusal_strikes) return false;
+    if (at_ms < 0) return false;
+    const now = now_ms orelse return true;
+    return now -| at_ms < routed_refusal_ms;
+}
+
+pub fn relayIsRefusedForTest(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
+    return relayIsRefused(strikes, at_ms, now_ms);
+}
+pub const routedRefusalStrikesForTest = routed_refusal_strikes;
+pub const routedRefusalMsForTest = routed_refusal_ms;
+
+/// Records one failed connection to a routed relay. Returns true when this is
+/// the strike that sets it aside, so the caller can ask for a rethink.
+fn noteRelayRefusal(url: []const u8) bool {
+    return noteRelayRefusalAt(url, nowMillis() orelse return false);
+}
+
+fn noteRelayRefusalAt(url: []const u8, now: i64) bool {
+    if (url.len == 0 or url.len > 96) return false;
+    lockRefused();
+    defer unlockRefused();
+
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayUrlEql(e.url[0..e.url_len], url)) continue;
+        const was = relayIsRefused(e.strikes, e.at_ms, now);
+        // A record that has aged out starts its count again rather than
+        // tripping on the first failure of the next attempt.
+        if (e.at_ms >= 0 and now -| e.at_ms >= routed_refusal_ms) e.strikes = 0;
+        e.strikes +|= 1;
+        e.at_ms = now;
+        return !was and relayIsRefused(e.strikes, e.at_ms, now);
+    }
+
+    // A free slot, or the stalest one. Evicting the stalest can only mean a
+    // relay is retried sooner than the window says, never that one is set aside
+    // for longer, so the failure mode is a wasted dial rather than a hidden
+    // person.
+    var pick: usize = 0;
+    for (&g_refused, 0..) |*e, i| {
+        if (e.url_len == 0) {
+            pick = i;
+            break;
+        }
+        if (e.at_ms < g_refused[pick].at_ms) pick = i;
+    }
+    const e = &g_refused[pick];
+    @memcpy(e.url[0..url.len], url);
+    e.url_len = @intCast(url.len);
+    e.strikes = 1;
+    e.at_ms = now;
+    return relayIsRefused(e.strikes, e.at_ms, now);
+}
+
+/// Forgets a relay's failures, because it just held a connection open.
+fn clearRelayRefusal(url: []const u8) void {
+    lockRefused();
+    defer unlockRefused();
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayUrlEql(e.url[0..e.url_len], url)) continue;
+        e.strikes = 0;
+        e.at_ms = -1;
+        return;
+    }
+}
+
+/// Copies out the relays currently set aside, so the choice can skip them
+/// without holding this lock while it runs.
+fn refusedRelays(urls: *[routed_refusal_slots][96]u8, lens: *[routed_refusal_slots]u8) usize {
+    const now = nowMillis();
+    lockRefused();
+    defer unlockRefused();
+    var n: usize = 0;
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayIsRefused(e.strikes, e.at_ms, now)) continue;
+        @memcpy(urls[n][0..e.url_len], e.url[0..e.url_len]);
+        lens[n] = e.url_len;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn refusedRelayCountForTest() usize {
+    var urls: [routed_refusal_slots][96]u8 = undefined;
+    var lens: [routed_refusal_slots]u8 = @splat(0);
+    return refusedRelays(&urls, &lens);
+}
+pub fn noteRelayRefusalAtForTest(url: []const u8, now: i64) bool {
+    return noteRelayRefusalAt(url, now);
+}
+pub fn clearRelayRefusalForTest(url: []const u8) void {
+    clearRelayRefusal(url);
+}
+pub fn forgetRefusedRelaysForTest() void {
+    lockRefused();
+    defer unlockRefused();
+    for (&g_refused) |*e| {
+        e.url_len = 0;
+        e.strikes = 0;
+        e.at_ms = -1;
+    }
+}
+
 /// How much better a challenger has to be before a relay already connected is
 /// dropped for it, as a percentage of what the incumbent still reaches.
 ///
@@ -386,6 +545,9 @@ fn chooseRoutedRelays(
     incumbent_urls: *const [max_discovered_relays][96]u8,
     incumbent_lens: *const [max_discovered_relays]u8,
     incumbent_n: usize,
+    refused_urls: *const [routed_refusal_slots][96]u8,
+    refused_lens: *const [routed_refusal_slots]u8,
+    refused_n: usize,
     budget: usize,
     out: []usize,
 ) usize {
@@ -429,6 +591,18 @@ fn chooseRoutedRelays(
                 }
             }
             if (in_pool) continue;
+            // Before the gain is even computed, and before the incumbent check
+            // below, so a relay that will not talk to us can neither win a slot
+            // nor defend one it already holds.
+            var refused = false;
+            for (0..refused_n) |ri| {
+                if (refused_lens[ri] == 0) continue;
+                if (relayUrlEql(refused_urls[ri][0..refused_lens[ri]], e.urlSlice())) {
+                    refused = true;
+                    break;
+                }
+            }
+            if (refused) continue;
             var gain: usize = 0;
             for (0..author_count) |ai| {
                 if (g_route_cover[ai] >= route_coverage_target) continue;
@@ -594,6 +768,11 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     var held_lens: [max_discovered_relays]u8 = @splat(0);
     const held_n = incumbentRoutes(&held_urls, &held_lens);
 
+    // And the ones that would not have us, read here for the same reason.
+    var refused_urls: [routed_refusal_slots][96]u8 = undefined;
+    var refused_lens: [routed_refusal_slots]u8 = @splat(0);
+    const refused_n = refusedRelays(&refused_urls, &refused_lens);
+
     lockRelayTable();
     defer unlockRelayTable();
     var kept: u8 = 0;
@@ -639,6 +818,9 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
         &held_urls,
         &held_lens,
         held_n,
+        &refused_urls,
+        &refused_lens,
+        refused_n,
         max_discovered_relays,
         &picked,
     );
@@ -2047,6 +2229,7 @@ pub fn resetRelaysForTest() void {
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     forgetDiscovered();
+    forgetRefusedRelaysForTest();
     seedBootstrapRelays();
 }
 
@@ -2075,6 +2258,7 @@ pub fn clearRelaysForTest() void {
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
     forgetDiscovered();
+    forgetRefusedRelaysForTest();
 }
 
 pub fn relayListStampForTest() i64 {
@@ -25776,12 +25960,23 @@ fn discoveredRelayThread(gpa: std.mem.Allocator, index: usize) void {
             continue;
         }
         const opened_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        discoveredOnce(gpa, io, signer, index, url_buf[0..snap.?.url_len], authors[0..snap.?.authors_len], gen) catch {};
+        const url = url_buf[0..snap.?.url_len];
+        discoveredOnce(gpa, io, signer, index, url, authors[0..snap.?.authors_len], gen) catch {};
         const lasted = std.Io.Timestamp.now(io, .awake).toMilliseconds() - opened_at;
         // The pool's ladder, and its guard: a relay that accepts the handshake
         // and drops the socket would otherwise reset the backoff on every
         // connection and redial in a tight loop forever.
         attempts = nextReconnectAttempts(attempts, lasted);
+        // Unlike the pool, this slot can be spent elsewhere. A connection that
+        // held is a relay that will have us; a run of short ones is a relay that
+        // will not, and the slot is worth more on the next relay down.
+        if (attempts == 0) {
+            clearRelayRefusal(url);
+        } else if (noteRelayRefusal(url)) {
+            // Ask for a rethink rather than waiting for somebody's relay list
+            // to land, which on a settled account may be never.
+            g_relay_ranks_dirty.store(true, .release);
+        }
         const base = reconnectDelayMs(attempts);
         io.sleep(std.Io.Duration.fromMilliseconds(@intCast(base + reconnectJitterMs(base, index, attempts))), .awake) catch {};
     }
