@@ -932,9 +932,18 @@ pub fn discoveredGenerationForTest(index: usize) u32 {
 //
 // Notedeck, the closest architectural match to this app, does not route by
 // author at all: it parses kind:10002 for the logged-in account only. So this
-// is not a prerequisite for being a credible client, and it is bounded
-// accordingly: four connections, and the reader's own pool remains the feed.
-const max_discovered_relays = 4;
+// is not a prerequisite for being a credible client, and it stays bounded: the
+// reader's own pool remains the feed, and these are what it cannot see.
+//
+// Eight, matching the pool, for sixteen sockets in all. Four was the number
+// picked before there was anything to measure it against. Measured since, on a
+// real account of 257 follows: four routed connections reach 193 of them and
+// leave 64 riding the pool, and eight reach 202 and leave 55, with 156 covered
+// by two relays rather than 134. The eighth connection is still earning its
+// thread, and the greedy stops on its own when one would not: it takes a relay
+// only while one reaches somebody not yet covered twice, so a quiet account
+// with a tidy follow list opens fewer than this and nothing is wasted.
+const max_discovered_relays = 8;
 /// How many authors one discovered relay is asked about. Beyond this the
 /// question stops being "who writes here" and starts being another firehose.
 const discovered_authors_cap = 512;
