@@ -14712,9 +14712,9 @@ test "rewriting the routes tells the connections to re-ask" {
     const follows = [_][32]u8{kp.public_key};
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
 
-    const before = main.discoveredGenerationForTest();
+    const before = main.discoveredGenerationForTest(0);
     main.rankRelaySuggestionsForTest(&store);
-    try testing.expect(main.discoveredGenerationForTest() != before);
+    try testing.expect(main.discoveredGenerationForTest(0) != before);
 }
 
 test "the discovered pool is separate from the eight the outbox counts" {
@@ -14835,13 +14835,14 @@ test "an unchanged route table does not tell the connections to re-ask" {
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
 
     main.rankRelaySuggestionsForTest(&store);
-    const settled = main.discoveredGenerationForTest();
+    const settled = main.discoveredGenerationForTest(0);
+    const settled_1 = main.discoveredGenerationForTest(1);
     try testing.expectEqual(@as(usize, 1), main.discoveredCount());
 
     // Five more runs over the same store. Nothing has moved, so nothing should
     // be told that it has.
     for (0..5) |_| main.rankRelaySuggestionsForTest(&store);
-    try testing.expectEqual(settled, main.discoveredGenerationForTest());
+    try testing.expectEqual(settled, main.discoveredGenerationForTest(0));
 
     // But a real change still gets through: somebody else, writing elsewhere.
     const other = try signer.keyPairFromSecretKey([_]u8{12} ** 32);
@@ -14851,8 +14852,336 @@ test "an unchanged route table does not tell the connections to re-ask" {
     const both = [_][32]u8{ kp.public_key, other.public_key };
     _ = main.setFollowsForTest(&both, 1_800_000_001);
     main.rankRelaySuggestionsForTest(&store);
-    try testing.expect(main.discoveredGenerationForTest() != settled);
     try testing.expectEqual(@as(usize, 2), main.discoveredCount());
+
+    // The NEW relay's slot moved. The one that was already connected did not,
+    // which is the whole point of a counter per slot: a stranger publishing a
+    // relay list must not cost the connections that were already right.
+    try testing.expect(main.discoveredGenerationForTest(1) != settled_1);
+    try testing.expectEqual(settled, main.discoveredGenerationForTest(0));
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://steady.example.com", main.discoveredUrlCopy(0, &buf).?);
+}
+
+test "a relay that stays in the set keeps its seat" {
+    // The choice comes back in coverage order, and that order moves whenever
+    // anybody's relay list does. Filling the slots in that order would hand one
+    // relay's socket to another because they swapped places in a ranking, and
+    // both connections would be dropped and redialled to do it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/seat.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One author on `quiet`, so it is the only relay worth dialling and it
+    // lands in slot 0.
+    const quiet = [_][]const u8{"wss://quiet.example.com"};
+    const one = [_][]const []const u8{&quiet};
+    var first: [1][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &one, &first);
+    _ = main.setFollowsForTest(&first, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://quiet.example.com", main.discoveredUrlCopy(0, &buf).?);
+    const seat_gen = main.discoveredGenerationForTest(0);
+
+    // Now three more people, all on `busy`. It outranks `quiet` by three to
+    // one, so a coverage-ordered fill would put it in slot 0 and push `quiet`
+    // into slot 1: two redials to learn nothing.
+    const busy = [_][]const u8{"wss://busy.example.com"};
+    const four = [_][]const []const u8{ &quiet, &busy, &busy, &busy };
+    var follows: [4][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &four, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Both are routed, and `quiet` is still where it was.
+    try testing.expectEqualStrings("wss://quiet.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://busy.example.com", main.discoveredUrlCopy(1, &buf).?);
+    // Its question did not change either, so its counter did not move: the
+    // socket is never touched.
+    try testing.expectEqual(seat_gen, main.discoveredGenerationForTest(0));
+}
+
+test "a live connection is not dropped for one more author" {
+    // Coverage is computed from relay lists that arrive one at a time, so the
+    // margin between two candidates moves all day. Without a margin the set
+    // flaps: one person's kind:10002 lands, a challenger passes the incumbent
+    // by a single author, and a live socket is torn down to gain one.
+    // One more author is not enough once a relay carries more than four, which
+    // is where the twenty-five per cent comes from.
+    try testing.expect(!main.worthEvictingForTest(6, 5));
+    try testing.expect(!main.worthEvictingForTest(9, 8));
+    try testing.expect(!main.worthEvictingForTest(31, 30));
+    // Nor is a draw.
+    try testing.expect(!main.worthEvictingForTest(4, 4));
+    // A quarter more is, exactly at the line and past it.
+    try testing.expect(main.worthEvictingForTest(5, 4));
+    try testing.expect(main.worthEvictingForTest(10, 8));
+    try testing.expect(main.worthEvictingForTest(40, 4));
+    // An incumbent reaching nobody new is defending nothing.
+    try testing.expect(main.worthEvictingForTest(1, 0));
+    try testing.expect(main.worthEvictingForTest(0, 0));
+}
+
+test "a narrowly better relay does not take a connected relay's place" {
+    // The margin, where it actually bites: the budget is full, and a candidate
+    // that reaches one more person than the relay already connected asks for
+    // its socket. It does not get it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/flap.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Everyone writes to exactly one relay, so no relay ever covers anybody
+    // twice and each one's gain is simply how many people are on it. Three
+    // relays of seven fill three of the four slots; `incumbent` takes the last
+    // with five.
+    const big_a = [_][]const u8{"wss://big-a.example.com"};
+    const big_b = [_][]const u8{"wss://big-b.example.com"};
+    const big_c = [_][]const u8{"wss://big-c.example.com"};
+    const inc = [_][]const u8{"wss://incumbent.example.com"};
+    const cha = [_][]const u8{"wss://challenger.example.com"};
+
+    var specs: [32][]const []const u8 = undefined;
+    for (0..7) |i| specs[i] = &big_a;
+    for (7..14) |i| specs[i] = &big_b;
+    for (14..21) |i| specs[i] = &big_c;
+    for (21..26) |i| specs[i] = &inc;
+    // The challenger's six are seeded now but not followed yet, so the first
+    // run cannot see them.
+    for (26..32) |i| specs[i] = &cha;
+
+    var follows: [32][32]u8 = undefined;
+    try seedRelayLists(arena, signer, specs[0..32], &follows);
+
+    // Round one: without the challenger's people, `incumbent` earns the seat.
+    _ = main.setFollowsForTest(follows[0..26], 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://incumbent.example.com"));
+    try testing.expect(!routedHolds("wss://challenger.example.com"));
+
+    // Round two: the challenger's six follows appear. Six beats five, but not
+    // by a quarter, so the socket stays where it is.
+    _ = main.setFollowsForTest(follows[0..32], 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://incumbent.example.com"));
+    try testing.expect(!routedHolds("wss://challenger.example.com"));
+
+    // And the margin is a margin, not a veto: a relay that reaches enough more
+    // people does take the seat. Nine against five is well past a quarter.
+    var wide: [35][]const []const u8 = undefined;
+    for (0..32) |i| wide[i] = specs[i];
+    for (32..35) |i| wide[i] = &cha;
+    var more: [35][32]u8 = undefined;
+    try seedRelayLists(arena, signer, wide[0..35], &more);
+    _ = main.setFollowsForTest(more[0..35], 1_800_000_002);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://challenger.example.com"));
+    try testing.expect(!routedHolds("wss://incumbent.example.com"));
+}
+
+/// Whether any routed slot is pointed at this relay.
+fn routedHolds(url: []const u8) bool {
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
+        if (std.mem.eql(u8, u, url)) return true;
+    }
+    return false;
+}
+
+test "a route that changed in its last author has changed" {
+    // Amethyst shipped this comparison as a `forEachIndexed` with a return
+    // inside it, which returns from the lambda rather than the function, so
+    // only the first filter was ever compared. A relay whose author list
+    // changed anywhere but the front looked unchanged, and its subscription was
+    // never replaced.
+    var a: [4][32]u8 = undefined;
+    for (&a, 0..) |*x, i| {
+        x.* = [_]u8{0} ** 32;
+        x[0] = @intCast(i + 1);
+    }
+    const url = "wss://same.example.com";
+
+    var b = a;
+    try testing.expect(main.sameRouteForTest(url, &a, url, &b));
+
+    // The first.
+    b = a;
+    b[0][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // The LAST. This is the one that was broken.
+    b = a;
+    b[b.len - 1][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // And one in the middle, for completeness.
+    b = a;
+    b[2][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // A different relay, and a shorter list.
+    b = a;
+    try testing.expect(!main.sameRouteForTest(url, &a, "wss://other.example.com", &b));
+    try testing.expect(!main.sameRouteForTest(url, &a, url, b[0..3]));
+}
+
+test "the same relay with a new question keeps its url and moves its counter" {
+    // The two facts a live connection branches on when its slot moves: if the
+    // url is the same it replaces its REQ in place, and if it is not it drops
+    // the socket. So a change of WHO must move the counter and leave the url
+    // alone, or the connection either never re-asks or redials to do it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/reask.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const there = [_][]const u8{"wss://there.example.com"};
+    const two = [_][]const []const u8{ &there, &there };
+    var follows: [2][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &two, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://there.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 2), main.discoveredAuthorCount(0));
+    const before = main.discoveredGenerationForTest(0);
+
+    // A third person, writing to the same relay. Same url, one more author.
+    const three = [_][]const []const u8{ &there, &there, &there };
+    var wider: [3][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &three, &wider);
+    _ = main.setFollowsForTest(&wider, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqualStrings("wss://there.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 3), main.discoveredAuthorCount(0));
+    try testing.expect(main.discoveredGenerationForTest(0) != before);
+}
+
+test "a socket whose owner is blocked reading it is re-asked by the keeper" {
+    // The owner of a routed connection cannot re-ask on its own. It spends its
+    // life inside `receive`, which blocks until the relay says something, and a
+    // relay with nothing new to say says nothing. Driving a route change under
+    // a live connection and watching it not notice took forty seconds of a
+    // real run, which is how this got written.
+    const here = "wss://here.example.com";
+    const there = "wss://there.example.com";
+
+    // Nothing connected in this slot: nothing to do to it.
+    try testing.expectEqual(main.RouteFollowUp.leave_it, main.routeFollowUpForTest("", 0, here, 7));
+    // Connected and current.
+    try testing.expectEqual(main.RouteFollowUp.leave_it, main.routeFollowUpForTest(here, 7, here, 7));
+    // Same relay, the slot moved: replace the question, keep the socket. This
+    // is the case the whole mechanism exists for.
+    try testing.expectEqual(main.RouteFollowUp.re_ask, main.routeFollowUpForTest(here, 7, here, 8));
+    // A trailing slash is the same relay, not a different one, or every
+    // recompute would look like a repoint and redial the whole set.
+    try testing.expectEqual(main.RouteFollowUp.re_ask, main.routeFollowUpForTest(here, 7, here ++ "/", 8));
+    // Pointed at somebody else: close it.
+    try testing.expectEqual(main.RouteFollowUp.retire, main.routeFollowUpForTest(here, 7, there, 8));
+    // Slot emptied: close it.
+    try testing.expectEqual(main.RouteFollowUp.retire, main.routeFollowUpForTest(here, 7, "", 8));
+}
+
+test "every routed connection asks under one subscription id" {
+    // A REQ under an id the relay already holds is a replacement rather than a
+    // second subscription, and that is the entire mechanism: two ids would
+    // leave the old question standing and the relay would send both answers.
+    try testing.expectEqualStrings("plaza-outbox", main.outboxSubIdForTest);
+    // And it must not look like a one-shot, which is swept on a deadline.
+    try testing.expect(!std.mem.startsWith(u8, main.outboxSubIdForTest, main.oneShotSubPrefixForTest));
+}
+
+test "the routing waits for the flurry to stop" {
+    // A cold start lands hundreds of relay lists in a few seconds, and each one
+    // is a reason to redo the ranking. Redoing it on each one is work the next
+    // one throws away, and every intermediate answer is a route table nobody
+    // should act on.
+    const settle = main.routeSettleMsForTest;
+    const floor = main.routeRecomputeMinMsForTest;
+    const cap = main.routeSettleMaxMsForTest;
+
+    // Nothing wanted, nothing to do.
+    try testing.expect(!main.routeRecomputeDueForTest(null, null, null));
+    // Wanted, and nothing has ever landed or run: the first ranking is not
+    // delayed by a window it has no reason to wait for.
+    try testing.expect(main.routeRecomputeDueForTest(0, null, null));
+
+    // A list just landed. Wait for quiet.
+    try testing.expect(!main.routeRecomputeDueForTest(1, 1, null));
+    try testing.expect(!main.routeRecomputeDueForTest(settle - 1, settle - 1, null));
+    try testing.expect(main.routeRecomputeDueForTest(settle, settle, null));
+
+    // Quiet, but the last run was moments ago. The floor still holds.
+    try testing.expect(!main.routeRecomputeDueForTest(settle, settle, floor - 1));
+    try testing.expect(main.routeRecomputeDueForTest(settle, settle, floor));
+
+    // A steady trickle, one list every second forever. Without the cap this
+    // never runs at all.
+    try testing.expect(!main.routeRecomputeDueForTest(cap - 1, 1, cap - 1));
+    try testing.expect(main.routeRecomputeDueForTest(cap, 1, cap));
 }
 
 // -- Asking on a socket that is already open ---------------------------------

@@ -335,6 +335,44 @@ pub fn routeCoverageForTest() RouteCoverage {
 }
 pub const routeCoverageTargetForTest = route_coverage_target;
 
+/// How much better a challenger has to be before a relay already connected is
+/// dropped for it, as a percentage of what the incumbent still reaches.
+///
+/// Coverage is computed from relay lists that arrive one at a time, so the
+/// margin between two candidates moves all day. Without this the set flaps: one
+/// person's kind:10002 lands, relay B passes relay A by a single author, and a
+/// live socket is torn down and a new one handshaked to gain one. Twenty-five
+/// per cent is the smallest margin that a single author cannot cross once a
+/// relay carries more than four.
+const route_evict_gain_percent: usize = 125;
+
+/// Whether a challenger reaches enough more people to be worth taking a live
+/// connection away for.
+fn worthEvicting(challenger_gain: usize, incumbent_gain: usize) bool {
+    // An incumbent that reaches nobody new is not defending anything.
+    if (incumbent_gain == 0) return true;
+    return challenger_gain * 100 >= incumbent_gain * route_evict_gain_percent;
+}
+
+pub fn worthEvictingForTest(challenger_gain: usize, incumbent_gain: usize) bool {
+    return worthEvicting(challenger_gain, incumbent_gain);
+}
+
+/// The relays currently holding a routed connection, copied out so the choice
+/// can prefer them without holding the discovered lock while it runs.
+fn incumbentRoutes(urls: *[max_discovered_relays][96]u8, lens: *[max_discovered_relays]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    for (&g_discovered) |*d| {
+        if (d.url_len == 0) continue;
+        @memcpy(urls[n][0..d.url_len], d.url[0..d.url_len]);
+        lens[n] = d.url_len;
+        n += 1;
+    }
+    return n;
+}
+
 /// Picks up to `budget` relays by marginal coverage, skipping any the reader is
 /// already connected to and counting their coverage as already paid for.
 ///
@@ -345,6 +383,9 @@ fn chooseRoutedRelays(
     pool_urls: *const [max_relays][96]u8,
     pool_lens: *const [max_relays]u8,
     pool_n: usize,
+    incumbent_urls: *const [max_discovered_relays][96]u8,
+    incumbent_lens: *const [max_discovered_relays]u8,
+    incumbent_n: usize,
     budget: usize,
     out: []usize,
 ) usize {
@@ -373,6 +414,10 @@ fn chooseRoutedRelays(
     while (chosen < budget and chosen < out.len) {
         var best: ?usize = null;
         var best_gain: usize = 0;
+        // The best of the relays already holding a connection, tracked
+        // alongside so a live socket is not dropped for a marginal gain.
+        var held: ?usize = null;
+        var held_gain: usize = 0;
         for (table, 0..) |e, ti| {
             if (taken[ti]) continue;
             var in_pool = false;
@@ -394,6 +439,26 @@ fn chooseRoutedRelays(
             if (gain > best_gain or (gain == best_gain and gain > 0 and best != null and rankBefore(e, table[best.?]))) {
                 best = ti;
                 best_gain = gain;
+            }
+            var is_held = false;
+            for (0..incumbent_n) |ii| {
+                if (incumbent_lens[ii] == 0) continue;
+                if (relayUrlEql(incumbent_urls[ii][0..incumbent_lens[ii]], e.urlSlice())) {
+                    is_held = true;
+                    break;
+                }
+            }
+            if (!is_held) continue;
+            if (gain > held_gain or (gain == held_gain and gain > 0 and held != null and rankBefore(e, table[held.?]))) {
+                held = ti;
+                held_gain = gain;
+            }
+        }
+        // Keep the socket unless the challenger is clearly worth the handshake.
+        if (held) |h| {
+            if (held_gain > 0 and !worthEvicting(best_gain, held_gain)) {
+                best = h;
+                best_gain = held_gain;
             }
         }
         // Nothing left to reach. Stopping here rather than spending the budget
@@ -521,6 +586,14 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
         pool_n += 1;
     }
 
+    // Which relays already hold a routed connection, read before the table lock
+    // for the same reason the pool is: `incumbentRoutes` takes the discovered
+    // lock, and the rule here is table first, discovered second, never both at
+    // once from a place that could be entered the other way round.
+    var held_urls: [max_discovered_relays][96]u8 = undefined;
+    var held_lens: [max_discovered_relays]u8 = @splat(0);
+    const held_n = incumbentRoutes(&held_urls, &held_lens);
+
     lockRelayTable();
     defer unlockRelayTable();
     var kept: u8 = 0;
@@ -557,7 +630,18 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     // people I cannot otherwise see", and the top of a popularity list is the
     // wrong answer to that because the popular relays all carry the same crowd.
     var picked: [max_discovered_relays]usize = undefined;
-    const picked_n = chooseRoutedRelays(table[0..len], authors_len, &pool, &pool_len, pool_n, max_discovered_relays, &picked);
+    const picked_n = chooseRoutedRelays(
+        table[0..len],
+        authors_len,
+        &pool,
+        &pool_len,
+        pool_n,
+        &held_urls,
+        &held_lens,
+        held_n,
+        max_discovered_relays,
+        &picked,
+    );
     var routed_urls: [max_discovered_relays][96]u8 = undefined;
     var routed_lens: [max_discovered_relays]u8 = @splat(0);
     for (picked[0..picked_n], 0..) |ti, i| {
@@ -577,14 +661,32 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
 /// kilobytes and this runs on the render thread.
 var g_discovered_next: [max_discovered_relays]DiscoveredRelay = @splat(.{});
 
-/// Whether two route tables ask the same question of the same relays.
-fn sameRoutes(a: *const DiscoveredRelay, b: *const DiscoveredRelay) bool {
-    if (a.url_len != b.url_len or a.authors_len != b.authors_len) return false;
-    if (!std.mem.eql(u8, a.url[0..a.url_len], b.url[0..b.url_len])) return false;
-    for (0..a.authors_len) |i| {
-        if (!std.mem.eql(u8, &a.authors[i], &b.authors[i])) return false;
+/// Whether two slots ask the same question of the same relay.
+///
+/// Every author, not the first one. Amethyst shipped this comparison as a
+/// `forEachIndexed` with a return inside it, which in Kotlin returns from the
+/// lambda, so only `filters[0]` was ever compared and a change further down the
+/// list was silently treated as no change at all.
+fn sameRoute(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
+    if (authors_a.len != authors_b.len) return false;
+    if (!std.mem.eql(u8, url_a, url_b)) return false;
+    for (authors_a, authors_b) |x, y| {
+        if (!std.mem.eql(u8, &x, &y)) return false;
     }
     return true;
+}
+
+pub fn sameRouteForTest(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
+    return sameRoute(url_a, authors_a, url_b, authors_b);
+}
+
+fn sameRoutes(a: *const DiscoveredRelay, b: *const DiscoveredRelay) bool {
+    return sameRoute(
+        a.url[0..a.url_len],
+        a.authors[0..a.authors_len],
+        b.url[0..b.url_len],
+        b.authors[0..b.authors_len],
+    );
 }
 
 fn fillDiscovered(
@@ -605,9 +707,42 @@ fn fillDiscovered(
     }
 
     const take = @min(@min(urls.len, g_discovered_next.len), lens.len);
+
+    // Where each chosen relay goes: the seat it is already sitting in.
+    //
+    // The choice comes back in coverage order, and that order moves whenever
+    // anybody's relay list does. Filling the slots in that order hands relay A's
+    // socket to relay B and B's to A for no reason other than that they swapped
+    // places in a ranking, and both connections are dropped and redialled to do
+    // it. Keeping a relay in its own slot means a table that still contains it
+    // costs nothing at all.
+    var slot_of: [max_discovered_relays]?usize = @splat(null);
+    var slot_taken: [max_discovered_relays]bool = @splat(false);
     for (0..take) |i| {
         const url = urls[i][0..lens[i]];
-        const d = &g_discovered_next[i];
+        for (0..g_discovered.len) |s| {
+            if (slot_taken[s]) continue;
+            const live = &g_discovered[s];
+            if (live.url_len == 0) continue;
+            if (!relayUrlEql(live.url[0..live.url_len], url)) continue;
+            slot_of[i] = s;
+            slot_taken[s] = true;
+            break;
+        }
+    }
+    for (0..take) |i| {
+        if (slot_of[i] != null) continue;
+        for (0..g_discovered.len) |s| {
+            if (slot_taken[s]) continue;
+            slot_of[i] = s;
+            slot_taken[s] = true;
+            break;
+        }
+    }
+
+    for (0..take) |i| {
+        const url = urls[i][0..lens[i]];
+        const d = &g_discovered_next[slot_of[i] orelse continue];
         @memcpy(d.url[0..url.len], url);
         d.url_len = @intCast(url.len);
 
@@ -646,7 +781,7 @@ fn fillDiscovered(
     // are chosen.
     fillPoolRoutes(events, authors, pool_urls, pool_lens, pool_n);
 
-    // Only when the answer actually moved.
+    // Only the slots whose answer actually moved.
     //
     // The ranking reruns every time a relay list lands, and during a cold start
     // hundreds of them land. Bumping the generation each time would drop and
@@ -654,31 +789,106 @@ fn fillDiscovered(
     // whole startup reconnecting and never finish asking anything. Seen exactly
     // that in a live run before this check: three connections, each redialled
     // inside two minutes, for a route table that had not changed.
-    var moved = false;
-    for (0..g_discovered.len) |i| {
-        if (!sameRoutes(&g_discovered[i], &g_discovered_next[i])) {
-            moved = true;
-            break;
-        }
-    }
-    if (!moved) return;
-
     for (0..g_discovered.len) |i| {
         const src = &g_discovered_next[i];
         const dst = &g_discovered[i];
+        if (sameRoutes(dst, src)) continue;
         dst.url_len = src.url_len;
         @memcpy(dst.url[0..src.url_len], src.url[0..src.url_len]);
         dst.authors_len = src.authors_len;
         @memcpy(dst.authors[0..src.authors_len], src.authors[0..src.authors_len]);
+        // Last for this slot, so a thread reading the counter sees a slot that
+        // is finished.
+        _ = g_discovered_gen[i].fetchAdd(1, .monotonic);
     }
-
-    // Last, so a thread reading the generation sees a table that is finished.
-    _ = g_discovered_gen.fetchAdd(1, .monotonic);
 }
 
 /// Set when a relay list that is not the reader's own reaches the store, so the
 /// ranking is redone once rather than on every tick.
 var g_relay_ranks_dirty = std.atomic.Value(bool).init(true);
+
+// -- When the routing is allowed to be recomputed -----------------------------
+//
+// A cold start lands hundreds of relay lists in a few seconds, and each one is
+// a reason to redo the ranking. Redoing it on each one is work thrown away by
+// the next one, and every intermediate answer is a route table nobody should
+// act on: the fifth list in changes the coverage that the tenth settles.
+//
+// Neither Jumble nor Amethyst needs this. Both recompute per event and pay a
+// socket for the churn; Plaza pays a thread, and the render thread does the
+// computing, so it waits for the flurry to stop first.
+
+/// Quiet time after the last relay list before the routing is recomputed.
+const route_settle_ms: i64 = 5_000;
+/// Floor between two recomputes, however much arrives in between.
+const route_recompute_min_ms: i64 = 10_000;
+/// How long the settle window may hold a wanted recompute back. A steady
+/// trickle of relay lists must not postpone the answer forever.
+const route_settle_max_ms: i64 = 30_000;
+
+/// Whether a wanted recompute may run now. All three arguments are ages in
+/// milliseconds, and null means "has not happened yet".
+fn routeRecomputeDue(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
+    const pending = pending_ms orelse return false;
+    if (pending >= route_settle_max_ms) return true;
+    if (since_run_ms) |t| {
+        if (t < route_recompute_min_ms) return false;
+    }
+    if (since_list_ms) |t| {
+        if (t < route_settle_ms) return false;
+    }
+    return true;
+}
+
+pub fn routeRecomputeDueForTest(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
+    return routeRecomputeDue(pending_ms, since_list_ms, since_run_ms);
+}
+pub const routeSettleMsForTest = route_settle_ms;
+pub const routeRecomputeMinMsForTest = route_recompute_min_ms;
+pub const routeSettleMaxMsForTest = route_settle_max_ms;
+
+/// Monotonic milliseconds since the app woke, or null before `main` wires the
+/// clock. Null and not zero: zero is a real reading, and a rate limit that
+/// stops working at a particular clock value is not a rate limit.
+fn nowMillis() ?i64 {
+    const io = g_io orelse return null;
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
+}
+
+/// When the last relay list landed, when the routing last ran, and when it was
+/// first wanted since then. All monotonic milliseconds, all -1 for "never".
+var g_route_list_at = std.atomic.Value(i64).init(-1);
+var g_route_ran_at: i64 = -1;
+var g_route_wanted_at: i64 = -1;
+
+fn ageMs(now_ms: i64, stamp: i64) ?i64 {
+    if (stamp < 0) return null;
+    return now_ms -| stamp;
+}
+
+/// Runs the ranking if one is wanted and the flurry has stopped. Called once a
+/// tick from the render thread.
+fn maybeRankRelaySuggestions(store: *nostr.store.Store) void {
+    if (!g_relay_ranks_dirty.load(.acquire)) return;
+    // No clock yet means no window to wait out. Better an early answer than a
+    // routing that never runs.
+    const now_ms = nowMillis() orelse {
+        if (g_relay_ranks_dirty.swap(false, .acq_rel)) rankRelaySuggestions(store);
+        return;
+    };
+    if (g_route_wanted_at < 0) g_route_wanted_at = now_ms;
+    if (!routeRecomputeDue(
+        ageMs(now_ms, g_route_wanted_at),
+        ageMs(now_ms, g_route_list_at.load(.acquire)),
+        ageMs(now_ms, g_route_ran_at),
+    )) return;
+    // Cleared BEFORE the query, so a list landing while this runs asks for
+    // another pass rather than being folded in and forgotten.
+    if (!g_relay_ranks_dirty.swap(false, .acq_rel)) return;
+    g_route_wanted_at = -1;
+    g_route_ran_at = now_ms;
+    rankRelaySuggestions(store);
+}
 
 pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
     rankRelaySuggestions(store);
@@ -698,8 +908,9 @@ pub const maxDiscoveredRelaysForTest = max_discovered_relays;
 pub const discoveredAuthorsCapForTest = discovered_authors_cap;
 pub const discoveredWatchBaseForTest = discovered_watch_base;
 pub const relayWatchSlotsForTest = relay_watch_slots;
-pub fn discoveredGenerationForTest() u32 {
-    return g_discovered_gen.load(.acquire);
+pub fn discoveredGenerationForTest(index: usize) u32 {
+    if (index >= g_discovered_gen.len) return 0;
+    return g_discovered_gen[index].load(.acquire);
 }
 
 // -- Reading where your follows actually write -------------------------------
@@ -737,10 +948,39 @@ const DiscoveredRelay = struct {
 
 var g_discovered: [max_discovered_relays]DiscoveredRelay = @splat(.{});
 var g_discovered_lock = std.atomic.Value(bool).init(false);
-/// Bumped whenever the table is rewritten. A thread compares it to the value it
-/// dialled under and drops the connection when it moves, which is how a slot
+/// Bumped whenever a slot is rewritten, ONE COUNTER PER SLOT. A thread compares
+/// its own slot's counter to the value it dialled under, which is how a slot
 /// changing hands takes effect now rather than at the next reconnect.
-var g_discovered_gen = std.atomic.Value(u32).init(0);
+///
+/// Per slot and not one counter for the table, because a single counter makes
+/// every routed connection the hostage of every other: one follow publishing a
+/// new relay list moves one slot and drops all four sockets, and during a cold
+/// start that happens over and over. The three other connections had nothing to
+/// re-ask.
+var g_discovered_gen: [max_discovered_relays]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(0));
+
+/// What one routed socket is connected to and asking about, so a thread that is
+/// not blocked reading it can replace its question.
+///
+/// The owner of a socket cannot re-ask on its own. It spends its life inside
+/// `receive`, which blocks until the relay says something, and a relay with
+/// nothing new to say says nothing: driving a route change through the owner
+/// means the change lands whenever the next note happens to arrive, which on a
+/// quiet relay is never. Measured, by moving a route under a live connection
+/// and watching it not notice for forty seconds.
+///
+/// So the keeper does it. It already holds a pointer to every live connection
+/// and a clock, and `sendFrame` is write-locked, which is what makes a second
+/// thread writing to a live socket safe at all.
+const RoutedLive = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    /// The generation this socket's standing REQ was built from.
+    gen: u32 = 0,
+};
+/// Guarded by the live-relay lock of `discovered_watch_base + i`, the same lock
+/// that guards the pointer it describes.
+var g_routed_live: [max_discovered_relays]RoutedLive = @splat(.{});
 
 fn lockDiscovered() void {
     while (g_discovered_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
@@ -781,7 +1021,8 @@ pub fn discoveredAuthorCount(index: usize) usize {
 fn discoveredSnapshot(index: usize, gen: u32, url: *[96]u8, authors: *[discovered_authors_cap][32]u8) ?struct { url_len: usize, authors_len: usize } {
     lockDiscovered();
     defer unlockDiscovered();
-    if (g_discovered_gen.load(.acquire) != gen) return null;
+    if (index >= g_discovered.len) return null;
+    if (g_discovered_gen[index].load(.acquire) != gen) return null;
     const d = &g_discovered[index];
     if (d.url_len == 0 or d.authors_len == 0) return null;
     @memcpy(url[0..d.url_len], d.url[0..d.url_len]);
@@ -1050,6 +1291,10 @@ fn ingestRelayList(ev: nostr.event.Event) void {
     // It used to walk the tags here and keep the first six write relays ever
     // seen. That made the offer depend on whose list arrived first: one
     // person's relay could sit above one two hundred people use.
+    //
+    // Stamped as well as flagged, because a cold start lands hundreds of these
+    // in a few seconds and the ranking is worth doing once they have stopped.
+    if (nowMillis()) |ms| g_route_list_at.store(ms, .release);
     g_relay_ranks_dirty.store(true, .release);
 }
 
@@ -1792,6 +2037,7 @@ pub fn resetRelaysForTest() void {
     forgetRelayRemovals();
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
+    forgetDiscovered();
     seedBootstrapRelays();
 }
 
@@ -1819,6 +2065,7 @@ pub fn clearRelaysForTest() void {
     forgetRelayRemovals();
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
+    forgetDiscovered();
 }
 
 pub fn relayListStampForTest() i64 {
@@ -2967,6 +3214,9 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
                 },
             }
         }
+
+        // Routed sockets whose slot moved while they were blocked reading.
+        followRouteChanges(io);
 
         // And the one-shots. Same means, different clock: those above are idle
         // deadlines on a standing connection, these are absolute deadlines on
@@ -8665,8 +8915,9 @@ pub const Model = struct {
         }
         // Off the store-changed guard, on its own flag: a relay list is rare
         // and the ranking reads every one of them, so it runs when one lands
-        // and not once a second because a reaction did.
-        if (g_relay_ranks_dirty.swap(false, .acq_rel)) rankRelaySuggestions(store);
+        // and not once a second because a reaction did. And not on the tick the
+        // list lands either, because they land in flurries.
+        maybeRankRelaySuggestions(store);
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
     }
 
@@ -25364,6 +25615,125 @@ pub fn clearRoutesForTest() void {
     }
     g_residual_len = 0;
 }
+
+/// Forgets which relays hold a routed connection.
+///
+/// Called from the pool resets, because the choice now PREFERS a relay it is
+/// already connected to and a table left behind by the previous test is an
+/// incumbent that would quietly win. Tests that pass only in the order they
+/// happen to run are worse than no tests.
+fn forgetDiscovered() void {
+    lockDiscovered();
+    defer unlockDiscovered();
+    for (&g_discovered) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+    for (&g_discovered_next) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+}
+
+pub fn forgetDiscoveredForTest() void {
+    forgetDiscovered();
+}
+
+/// The subscription id every routed connection asks under. One id, because a
+/// REQ under an id the relay already holds is a REPLACEMENT rather than a
+/// second subscription (NIP-01), and that is the whole mechanism: the question
+/// changes without the socket closing.
+const outbox_sub_id = "plaza-outbox";
+pub const outboxSubIdForTest = outbox_sub_id;
+
+fn setRoutedLive(index: usize, url: []const u8, gen: u32) void {
+    if (index >= g_routed_live.len or url.len > 96) return;
+    lockLiveRelay(discovered_watch_base + index);
+    defer unlockLiveRelay(discovered_watch_base + index);
+    const r = &g_routed_live[index];
+    @memcpy(r.url[0..url.len], url);
+    r.url_len = @intCast(url.len);
+    r.gen = gen;
+}
+
+fn clearRoutedLive(index: usize) void {
+    if (index >= g_routed_live.len) return;
+    lockLiveRelay(discovered_watch_base + index);
+    defer unlockLiveRelay(discovered_watch_base + index);
+    g_routed_live[index].url_len = 0;
+}
+
+/// Whether routed slot `index` still names the relay this connection dialled.
+fn routedSlotStillNames(index: usize, url: []const u8) bool {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return false;
+    const d = &g_discovered[index];
+    if (d.url_len == 0) return false;
+    return relayUrlEql(d.url[0..d.url_len], url);
+}
+
+/// What the keeper should do about a routed socket whose slot has moved.
+pub const RouteFollowUp = enum {
+    /// The socket is already asking the current question.
+    leave_it,
+    /// Same relay, different people: replace the standing REQ in place.
+    re_ask,
+    /// The slot names another relay, or none. Close it and let the owner redial.
+    retire,
+};
+
+fn routeFollowUp(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
+    if (live_url.len == 0) return .leave_it;
+    if (live_gen == slot_gen) return .leave_it;
+    if (slot_url.len == 0) return .retire;
+    if (!relayUrlEql(live_url, slot_url)) return .retire;
+    return .re_ask;
+}
+
+pub fn routeFollowUpForTest(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
+    return routeFollowUp(live_url, live_gen, slot_url, slot_gen);
+}
+
+/// Brings every live routed socket up to date with its slot, from a thread that
+/// is not blocked reading it. Called once per keeper tick.
+fn followRouteChanges(io: std.Io) void {
+    for (0..max_discovered_relays) |i| {
+        const slot_gen = g_discovered_gen[i].load(.acquire);
+        var slot_url: [96]u8 = undefined;
+        var authors: [discovered_authors_cap][32]u8 = undefined;
+        // Read before the live lock is taken: `discoveredSnapshot` takes the
+        // discovered lock, and the keeper's other loop already holds a live
+        // lock while it works. Two locks held at once is how the last hang
+        // happened, so they are never held at once here.
+        const snap = discoveredSnapshot(i, slot_gen, &slot_url, &authors);
+        const slot_url_len = if (snap) |s| s.url_len else 0;
+
+        const watch = discovered_watch_base + i;
+        lockLiveRelay(watch);
+        defer unlockLiveRelay(watch);
+        const r = &g_routed_live[i];
+        switch (routeFollowUp(r.url[0..r.url_len], r.gen, slot_url[0..slot_url_len], slot_gen)) {
+            .leave_it => {},
+            .re_ask => {
+                const relay = g_relay_live[watch] orelse continue;
+                var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
+                const filters = buildRoutedFilters(authors[0..snap.?.authors_len], &filter_buf);
+                relay.subscribe(outbox_sub_id, filters) catch continue;
+                r.gen = slot_gen;
+            },
+            .retire => {
+                const relay = g_relay_live[watch] orelse continue;
+                // Half-close, so the owner's blocked `receive` returns and it
+                // redials through its own path. NOT deinit: the owner still
+                // holds this and has to unwind.
+                relay.shutdown(io);
+                g_relay_live[watch] = null;
+                r.url_len = 0;
+            },
+        }
+    }
+}
 pub fn residualCountForTest() usize {
     lockDiscovered();
     defer unlockDiscovered();
@@ -25386,10 +25756,10 @@ fn discoveredRelayThread(gpa: std.mem.Allocator, index: usize) void {
     defer signer.deinit();
 
     var attempts: u6 = 0;
+    var url_buf: [96]u8 = undefined;
+    var authors: [discovered_authors_cap][32]u8 = undefined;
     while (true) {
-        const gen = g_discovered_gen.load(.acquire);
-        var url_buf: [96]u8 = undefined;
-        var authors: [discovered_authors_cap][32]u8 = undefined;
+        const gen = g_discovered_gen[index].load(.acquire);
         const snap = discoveredSnapshot(index, gen, &url_buf, &authors);
         if (snap == null or relaysPaused()) {
             attempts = 0;
@@ -25415,8 +25785,9 @@ fn discoveredOnce(
     index: usize,
     url: []const u8,
     authors: []const [32]u8,
-    gen: u32,
+    gen_in: u32,
 ) !void {
+    const authors_len_in = authors.len;
     var relay = try nostr.relay.dial(gpa, io, url);
     // Declared after `deinit` so it runs before it: the keeper must have let go
     // of the pointer before the connection is freed.
@@ -25425,15 +25796,22 @@ fn discoveredOnce(
     defer offerLiveRelay(discovered_watch_base + index, null);
 
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = buildRoutedFilters(authors, &filter_buf);
-    try relay.subscribe("plaza-outbox", filters);
+    try relay.subscribe(outbox_sub_id, buildRoutedFilters(authors[0..authors_len_in], &filter_buf));
+    // Published only now, so the keeper never replaces a question that has not
+    // been asked yet. Cleared on the way out, before the connection is freed.
+    setRoutedLive(index, url, gen_in);
+    defer clearRoutedLive(index);
 
     while (true) {
         if (relaysPaused()) return;
-        // The table moved: this connection is asking about people who may no
-        // longer be routed here. Drop it and let the loop take a fresh
-        // snapshot, the same way the pool re-asks on a follow change.
-        if (g_discovered_gen.load(.acquire) != gen) return;
+        // The slot was pointed at a DIFFERENT relay. Nothing here is worth
+        // keeping, so drop it and let the loop dial whatever the slot holds now.
+        //
+        // A change of WHO is not checked here and must not be: this thread only
+        // reaches this line when the relay says something, and a relay with
+        // nothing to say says nothing. The keeper replaces the question on the
+        // live socket instead.
+        if (!routedSlotStillNames(index, url)) return;
         var msg = (relay.receive() catch return) orelse return;
         defer msg.deinit();
         switch (msg.value) {
