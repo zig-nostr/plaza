@@ -51,22 +51,53 @@ signature you cannot inspect. Read the
 scripts/package-macos.sh   # -> dist/Plaza.app, ad-hoc signed
 ```
 
+## Where the feed comes from
+
+Following somebody on Nostr does not mean you will see them. If they publish
+only to relays you are not connected to, they are simply absent: no error, no
+empty state, nothing to say a person is missing.
+
+Plaza reads where the people you follow actually write. It takes their NIP-65
+relay lists, works out which relays reach the most of them, connects to the ones
+you are not already on, and asks each relay only about the people who write
+there. A small relay is asked about its dozen writers rather than about everyone
+you follow. Anybody no chosen relay carries is asked of your own relays, so
+nobody falls through.
+
+The relays it picks are not the popular ones. Popularity answers "what should I
+consider adding", which is a question for you. Connections answer "which relays
+reach people I cannot otherwise see", and the popular relays all carry the same
+crowd, so the two questions get two answers: the suggestions in settings are
+ranked by how many of your follows use each relay, the connections are chosen by
+who they reach.
+
+Measured on an account following 257 people: between its own relays and the
+eight it routes to, 202 of them are covered, 156 of those by two relays each, so
+one relay being down does not hide anybody. It is bounded on purpose, eight
+routed connections alongside the eight in your own pool, and one is only opened
+while it would reach somebody not already covered twice.
+
 ## Performance
 
 The feed is a windowed list: it builds only the rows near the viewport, so what
 it costs follows the window rather than the length of the feed. Measured on the
-build that ships (ReleaseFast), scrolling hard through a live feed on an account
-that follows three hundred people:
+build that ships (ReleaseFast), scrolling hard through a fixed feed of 246 notes
+that the harness seeds into a store of its own, so a run means the same thing
+twice:
 
 | Stage | p90 | Budget |
 | --- | --- | --- |
-| Rebuild | 315us | 700us |
-| Layout | 1700us | 2400us |
-| Patch | 57us | 200us |
+| Rebuild | 275us | 600us |
+| Layout | 1360us | 2200us |
+| Patch | 55us | 150us |
 
 A 120 Hz frame is 8333us, so a hard scroll spends about a quarter of one, and
-the GPU path never falls back to CPU pixels. A long feed mounts around 330
+the GPU path never falls back to CPU pixels. A long feed mounts around 460
 widget nodes rather than one per note.
+
+Timings on a shared machine only read high, never low, so the harness takes the
+best of three rounds and prints the power state it measured under. Compare a
+reading only against another taken in the same state.
 
 The number that matters is that it does not move with the size of the account.
 The same scroll on the same machine, before the feed stopped asking the database
