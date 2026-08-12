@@ -14773,14 +14773,15 @@ test "the ranking and the routing pick the same relays for one author" {
     _ = main.setFollowsForTest(&follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
-    // FOUR distinct relays, which is exactly the cap, so all four must get a
-    // connection with this person on it.
+    // The author names four distinct relays, and exactly two get connections:
+    // coverage stops at the target, so a third relay carrying only somebody
+    // already covered twice is a thread and a socket for nothing.
     //
-    // Counting them is the assertion, not "every slot that has a url has
-    // authors": the empty-relay guard makes that true whether or not the two
-    // selections agree, and it masked this drift when the test was first
-    // written. A relay the ranking counted and the routing dropped shows up
-    // here as a missing connection, which is the only place it is visible.
+    // Counting is the assertion, not "every slot with a url has authors": the
+    // empty-relay guard makes that true whether or not the two selections
+    // agree, and it masked this drift when the test was first written. A relay
+    // the ranking counted and the routing dropped shows up as a missing
+    // connection, which is the only place it is visible.
     var routed: usize = 0;
     var buf: [96]u8 = undefined;
     for (0..main.maxDiscoveredRelaysForTest) |i| {
@@ -14788,7 +14789,13 @@ test "the ranking and the routing pick the same relays for one author" {
         routed += 1;
         try testing.expect(main.discoveredAuthorCount(i) > 0);
     }
-    try testing.expectEqual(@as(usize, 4), routed);
+    try testing.expectEqual(@as(usize, main.routeCoverageTargetForTest), routed);
+
+    // And the one author really is covered twice, which is what stopped it.
+    const cov = main.routeCoverageForTest();
+    try testing.expectEqual(@as(usize, 1), cov.reached);
+    try testing.expectEqual(@as(usize, 1), cov.doubly_reached);
+    try testing.expectEqual(@as(usize, 0), cov.residual);
 }
 
 test "an unchanged route table does not tell the connections to re-ask" {
@@ -15205,4 +15212,170 @@ test "before anything is routed, a pool relay still asks about everyone" {
     var buf: [main.max_follows + 1][32]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), main.poolAuthorsForTest(0, &buf));
     try testing.expectEqual(follows.len, main.poolAuthorsOrAllForTest(0, &buf));
+}
+
+test "coverage beats popularity when the popular relays carry the same crowd" {
+    // The reason ranking and routing need different algorithms. Three relays
+    // are popular and carry an overlapping crowd; one quiet relay is the only
+    // way to reach two people. Top-N by popularity spends the whole budget on
+    // the crowd and never reaches them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/cover2.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Six people on all three popular relays, two people on one quiet relay.
+    const popular = [_][]const u8{ "wss://p1.example.com", "wss://p2.example.com", "wss://p3.example.com" };
+    const quiet = [_][]const u8{"wss://quiet.example.com"};
+    const specs = [_][]const []const u8{
+        &popular, &popular, &popular, &popular, &popular, &popular,
+        &quiet,   &quiet,
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Everybody reached, including the two nobody popular carries.
+    const cov = main.routeCoverageForTest();
+    try testing.expectEqual(@as(usize, specs.len), cov.reached);
+    try testing.expectEqual(@as(usize, 0), cov.residual);
+
+    // And the quiet relay really is one of the chosen, which is the whole
+    // point: by popularity it ranks last and would never be dialled.
+    var found_quiet = false;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
+        if (std.mem.eql(u8, u, "wss://quiet.example.com")) found_quiet = true;
+    }
+    try testing.expect(found_quiet);
+}
+
+test "a relay the reader is already on is not dialled again, but still counts as cover" {
+    // The pool is already connected. Spending a routed slot on it would be a
+    // duplicate socket, and ignoring what it carries would spend the budget
+    // re-reaching people who are already reachable.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/poolcover.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const mine = [_][]const u8{"wss://mine.example.com"};
+    const specs = [_][]const []const u8{ &mine, &mine, &mine };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Nothing to dial: everyone writes where the reader already is.
+    var buf: [96]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), main.discoveredUrlCopy(0, &buf));
+    // And they are not residual either, because the pool covers them.
+    try testing.expectEqual(@as(usize, 0), main.residualCountForTest());
+}
+
+test "the candidate cap is counted, not swallowed" {
+    // A cap that drops work in silence reads as a complete answer. This one was
+    // hit exactly on a real account (128 distinct relays for 257 follows) and
+    // nobody knew, because nothing said so.
+    const cov = main.routeCoverageForTest();
+    _ = cov;
+    try testing.expect(@hasField(main.RouteCoverage, "candidates_dropped"));
+}
+
+test "a relay carrying only people the pool already covers twice is not dialled" {
+    // What the pre-seed is for. The reader's own relays are already connected,
+    // so whoever they carry is already reached; a routed slot spent on a relay
+    // carrying only those people is a thread and a socket that reach nobody
+    // new. Without counting the pool's coverage first, the greedy sees a big
+    // number and takes it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/preseed.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    // TWO of the reader's own relays, so the crowd on them reaches the coverage
+    // target without any routed relay at all.
+    _ = main.addRelayForTest("wss://m1.example.com", true, true);
+    _ = main.addRelayForTest("wss://m2.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // The crowd writes to both of the reader's relays AND to a third the reader
+    // is not on. That third one reaches nobody new. One more person writes only
+    // somewhere else, and IS worth a slot.
+    const crowd = [_][]const u8{ "wss://m1.example.com", "wss://m2.example.com", "wss://redundant.example.com" };
+    const alone = [_][]const u8{"wss://only-here.example.com"};
+    const specs = [_][]const []const u8{ &crowd, &crowd, &crowd, &crowd, &alone };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var saw_redundant = false;
+    var saw_only_here = false;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
+        if (std.mem.eql(u8, u, "wss://redundant.example.com")) saw_redundant = true;
+        if (std.mem.eql(u8, u, "wss://only-here.example.com")) saw_only_here = true;
+    }
+    // The one that reaches somebody new is dialled; the one that does not is
+    // not, even though four follows write there and only one writes to the
+    // other. Popularity would have picked it first.
+    try testing.expect(saw_only_here);
+    try testing.expect(!saw_redundant);
 }
