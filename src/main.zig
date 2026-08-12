@@ -168,9 +168,17 @@ fn unlockRelayTable() void {
 /// about a dozen places their notes reliably are; taking the first few keeps
 /// one enthusiastic list from outvoting everyone else's.
 const outbox_relays_per_author = 4;
-/// How many relays the ranking considers before it stops. Bounded so a follow
-/// list of two thousand cannot make this allocate without limit.
-const relay_rank_candidates = 128;
+/// How many relays the ranking considers before it stops.
+///
+/// 128 was a guess and it was too small: on a real account of 257 follows the
+/// count hit it exactly and dropped 63 further relay references, silently,
+/// which is how it was found. Coverage cannot choose a relay it never saw.
+///
+/// 384 clears the measured need with room. The cost is the author bitsets, one
+/// bit per follow per candidate, so 384 x 2048 bits is 98 KB of static, and
+/// `RouteCoverage.candidates_dropped` says out loud when even this is not
+/// enough rather than quietly answering with less.
+const relay_rank_candidates = 384;
 
 /// A relay some of the reader's follows write to, and how many of them.
 const RelayRank = struct {
@@ -263,6 +271,154 @@ fn foldWriteRelays(table: []RelayRank, len_in: usize, urls: []const []const u8) 
     return len;
 }
 
+// -- Choosing which relays to connect to -------------------------------------
+//
+// Ranking by popularity answers "which relay should this reader consider
+// adding", which is a question for a human. It does not answer "which four
+// relays reach the most people", and taking the top four of a popularity list
+// is not the same thing: the top four all carry the same crowd, and the person
+// who publishes to one quiet relay is never reached however many popular ones
+// are dialled.
+//
+// Measured on a real account: 215 of 257 follows have a relay list, naming more
+// than 128 distinct relays between them. That is a long tail of relays with one
+// or two writers each, and no top-N of it can cover everybody.
+//
+// So the two questions get two algorithms. Suggestions stay ranked by how many
+// follows write there. Connections are chosen by marginal coverage: repeatedly
+// take the relay that reaches the most people not yet reached enough times.
+//
+// Amethyst wrote this algorithm and never called it
+// (RelayListRecommendationProcessor.kt:63, zero callers). Jumble approximates
+// it with a greedy PRUNE instead, dropping a relay only when every pubkey on it
+// is covered at least twice elsewhere, which is the same coverage-of-two idea
+// from the other end. Neither of them has to fit a budget, because a browser
+// tab can open sockets freely; Plaza holds one thread per socket, so the budget
+// is the reason it has to choose at all.
+
+/// How many chosen relays should carry each author, where possible. One is
+/// enough to see somebody; two is what keeps one relay being down from hiding
+/// them. Jumble's prune uses the same number for the same reason.
+const route_coverage_target: u8 = 2;
+
+const route_bitset_words = (max_follows + 63) / 64;
+/// Which authors each candidate relay carries, one bit per author, indexed the
+/// same as the caller's author slice.
+var g_route_bits: [relay_rank_candidates][route_bitset_words]u64 = undefined;
+/// How many chosen relays carry each author.
+var g_route_cover: [max_follows]u8 = @splat(0);
+
+fn bitSet(row: *[route_bitset_words]u64, i: usize) void {
+    row[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+}
+fn bitGet(row: *const [route_bitset_words]u64, i: usize) bool {
+    return row[i >> 6] & (@as(u64, 1) << @intCast(i & 63)) != 0;
+}
+
+/// What the routing achieved, for tests and for saying so out loud.
+pub const RouteCoverage = struct {
+    /// Follows carried by at least one chosen relay.
+    reached: usize = 0,
+    /// Follows carried by at least `route_coverage_target` of them.
+    doubly_reached: usize = 0,
+    /// Follows no chosen relay carries. These ride the pool.
+    residual: usize = 0,
+    /// Candidate relays the table could not hold. Counted rather than dropped
+    /// in silence: the cap was hit exactly on a real account, which is how it
+    /// was found.
+    candidates_dropped: usize = 0,
+};
+var g_route_coverage: RouteCoverage = .{};
+
+pub fn routeCoverageForTest() RouteCoverage {
+    return g_route_coverage;
+}
+pub const routeCoverageTargetForTest = route_coverage_target;
+
+/// Picks up to `budget` relays by marginal coverage, skipping any the reader is
+/// already connected to and counting their coverage as already paid for.
+///
+/// Returns how many were chosen, into `out` as indices into `table`.
+fn chooseRoutedRelays(
+    table: []const RelayRank,
+    author_count: usize,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+    budget: usize,
+    out: []usize,
+) usize {
+    @memset(g_route_cover[0..author_count], 0);
+
+    // The reader's own relays are already connected, so what they carry is
+    // covered before anything is chosen. Without this the greedy spends its
+    // whole budget re-reaching the crowd already on nos.lol.
+    for (table, 0..) |e, ti| {
+        var in_pool = false;
+        for (0..pool_n) |pi| {
+            if (pool_lens[pi] == 0) continue;
+            if (relayUrlEql(pool_urls[pi][0..pool_lens[pi]], e.urlSlice())) {
+                in_pool = true;
+                break;
+            }
+        }
+        if (!in_pool) continue;
+        for (0..author_count) |ai| {
+            if (bitGet(&g_route_bits[ti], ai)) g_route_cover[ai] +|= 1;
+        }
+    }
+
+    var chosen: usize = 0;
+    var taken: [relay_rank_candidates]bool = @splat(false);
+    while (chosen < budget and chosen < out.len) {
+        var best: ?usize = null;
+        var best_gain: usize = 0;
+        for (table, 0..) |e, ti| {
+            if (taken[ti]) continue;
+            var in_pool = false;
+            for (0..pool_n) |pi| {
+                if (pool_lens[pi] == 0) continue;
+                if (relayUrlEql(pool_urls[pi][0..pool_lens[pi]], e.urlSlice())) {
+                    in_pool = true;
+                    break;
+                }
+            }
+            if (in_pool) continue;
+            var gain: usize = 0;
+            for (0..author_count) |ai| {
+                if (g_route_cover[ai] >= route_coverage_target) continue;
+                if (bitGet(&g_route_bits[ti], ai)) gain += 1;
+            }
+            // Ties go to the relay more follows write to, then to the URL, so
+            // the set does not reshuffle between runs for no visible reason.
+            if (gain > best_gain or (gain == best_gain and gain > 0 and best != null and rankBefore(e, table[best.?]))) {
+                best = ti;
+                best_gain = gain;
+            }
+        }
+        // Nothing left to reach. Stopping here rather than spending the budget
+        // is the point: a fifth relay carrying only people already covered
+        // twice is a thread and a socket for nothing.
+        if (best == null or best_gain == 0) break;
+        taken[best.?] = true;
+        out[chosen] = best.?;
+        chosen += 1;
+        for (0..author_count) |ai| {
+            if (bitGet(&g_route_bits[best.?], ai)) g_route_cover[ai] +|= 1;
+        }
+    }
+
+    var cov: RouteCoverage = .{};
+    for (0..author_count) |ai| {
+        if (g_route_cover[ai] >= 1) cov.reached += 1;
+        if (g_route_cover[ai] >= route_coverage_target) cov.doubly_reached += 1;
+        if (g_route_cover[ai] == 0) cov.residual += 1;
+    }
+    cov.candidates_dropped = g_route_coverage.candidates_dropped;
+    g_route_coverage = cov;
+    return chosen;
+}
+
 /// Rebuilds the suggestions from every relay list the store holds for the
 /// people this reader follows, ordered by how many of them write there.
 ///
@@ -290,6 +446,8 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     var table: [relay_rank_candidates]RelayRank = undefined;
     var len: usize = 0;
     var urls: [32][]const u8 = undefined;
+    for (&g_route_bits) |*row| @memset(row, 0);
+    g_route_coverage.candidates_dropped = 0;
     for (result.events) |ev| {
         // The reader's own list says where THEY write. It is not a suggestion
         // about anyone else, and counting it would have the reader voting for
@@ -297,15 +455,55 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
         if (activePubkey()) |pk| {
             if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
         }
+        const before = len;
         len = foldWriteRelays(&table, len, urls[0..writeTagUrls(ev, &urls)]);
+
+        // Which author this event is, so the bitsets can be indexed the same
+        // way the caller's author slice is.
+        const ai = blk: {
+            for (authors[0..authors_len], 0..) |a, i| {
+                if (std.mem.eql(u8, &a, &ev.pubkey)) break :blk i;
+            }
+            break :blk null;
+        };
+        if (ai) |author_index| {
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(urls[0..writeTagUrls(ev, &urls)], &selected);
+            for (selected[0..chosen]) |url| {
+                var found = false;
+                for (table[0..len], 0..) |e, ti| {
+                    if (!relayUrlEql(e.urlSlice(), url)) continue;
+                    bitSet(&g_route_bits[ti], author_index);
+                    found = true;
+                    break;
+                }
+                // The table was full, so this relay is not a candidate at all.
+                // Counted, because a cap that drops work in silence reads as a
+                // complete answer, and this one was hit exactly on a real
+                // account before anybody noticed it existed.
+                if (!found and len == table.len) g_route_coverage.candidates_dropped += 1;
+            }
+        }
+        _ = before;
     }
     if (len == 0) return;
 
-    std.mem.sort(RelayRank, table[0..len], {}, struct {
-        fn lt(_: void, a: RelayRank, b: RelayRank) bool {
-            return rankBefore(a, b);
+    // Sort an ORDER, not the table.
+    //
+    // `g_route_bits` is indexed by table position, so sorting the table itself
+    // silently re-points every bitset at a different relay: the routing then
+    // reads one relay's authors and dials another. That is what this did on the
+    // first attempt, and the symptom was the routed set choosing the relay with
+    // two writers over the one with four.
+    var order: [relay_rank_candidates]usize = undefined;
+    for (0..len) |i| order[i] = i;
+    const Ctx = struct {
+        t: []const RelayRank,
+        fn lt(self: @This(), a: usize, b: usize) bool {
+            return rankBefore(self.t[a], self.t[b]);
         }
-    }.lt);
+    };
+    std.mem.sort(usize, order[0..len], Ctx{ .t = table[0..len] }, Ctx.lt);
 
     // The pool, copied out BEFORE the table lock is taken. `relaySnapshot` takes
     // that same lock and it is a plain spinlock with no owner tracking, so
@@ -326,7 +524,8 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     lockRelayTable();
     defer unlockRelayTable();
     var kept: u8 = 0;
-    for (table[0..len]) |e| {
+    for (order[0..len]) |oi| {
+        const e = table[oi];
         if (kept >= max_relay_suggestions) break;
         // A relay the reader is already on is not news.
         var in_pool = false;
@@ -352,7 +551,21 @@ fn rankRelaySuggestions(store: *nostr.store.Store) void {
     // ever reaches back for the table lock. Nested locks are exactly how the
     // hang above happened, so the order is fixed here and stated: table first,
     // discovered second, never the reverse.
-    fillDiscovered(result.events, g_suggested[0..kept], g_suggested_len[0..kept], authors[0..authors_len], &pool, &pool_len, pool_n);
+    // The routed set is chosen by COVERAGE, not by the popularity order above.
+    // The suggestions answer "what should this reader consider adding", which
+    // is a human question; connections answer "which relays reach the most
+    // people I cannot otherwise see", and the top of a popularity list is the
+    // wrong answer to that because the popular relays all carry the same crowd.
+    var picked: [max_discovered_relays]usize = undefined;
+    const picked_n = chooseRoutedRelays(table[0..len], authors_len, &pool, &pool_len, pool_n, max_discovered_relays, &picked);
+    var routed_urls: [max_discovered_relays][96]u8 = undefined;
+    var routed_lens: [max_discovered_relays]u8 = @splat(0);
+    for (picked[0..picked_n], 0..) |ti, i| {
+        const u = table[ti].urlSlice();
+        @memcpy(routed_urls[i][0..u.len], u);
+        routed_lens[i] = @intCast(u.len);
+    }
+    fillDiscovered(result.events, routed_urls[0..picked_n], routed_lens[0..picked_n], authors[0..authors_len], &pool, &pool_len, pool_n);
 }
 
 /// Gives each discovered slot a relay and the people who write there.
