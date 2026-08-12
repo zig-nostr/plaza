@@ -130,9 +130,31 @@ fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 fn linkNostr(b: *std.Build, mod: *std.Build.Module) void {
     const nostr = b.dependency("nostr", .{
         .target = mod.resolved_target.?,
-        .optimize = mod.optimize.?,
+        .optimize = libraryOptimize(mod.optimize.?),
     });
     mod.addImport("nostr", nostr.module("nostr"));
+}
+
+/// The library is built one notch safer than the app that links it.
+///
+/// Zig's bounds, overflow and cast checks are compiled OUT of ReleaseFast, and
+/// ReleaseFast is what ships. That is the right trade for the render thread and
+/// the wrong one for `nostr`, because everything the library parses is bytes a
+/// stranger chose: a relay's frames, an event's JSON, a tag, a bech32 string
+/// pasted out of somebody's note. An index derived from a length field in that
+/// input is exactly what a safety check is for.
+///
+/// So ReleaseFast gets a ReleaseSafe library, and Debug and ReleaseSafe are left
+/// alone. Measured on this app, that costs nothing anybody can see: the frame
+/// budget does not move, because parsing happens on the relay threads and the
+/// render thread's own work is Plaza's code, not the library's. Building the
+/// WHOLE app ReleaseSafe was measured too, and it is not free at all: rebuild
+/// 290us to 852us, layout 1377us to 2650us, three budgets blown.
+fn libraryOptimize(app: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    return switch (app) {
+        .ReleaseFast, .ReleaseSmall => .ReleaseSafe,
+        .Debug, .ReleaseSafe => app,
+    };
 }
 
 /// The `.min_width` the manifest declares for the startup window.

@@ -6,9 +6,14 @@
 # these numbers should stay flat no matter how long the feed grows. That is the
 # claim this script exists to keep honest.
 #
-# Run it against the build that ships (ReleaseFast). A Debug build is roughly
-# thirty times slower per rebuild and will fail every budget here, which is
-# correct: nobody runs Debug.
+# Run it against the build that ships (ReleaseFast, the default here). A Debug
+# build is roughly thirty times slower per rebuild and will fail every budget,
+# which is correct: nobody runs Debug. `OPTIMIZE=ReleaseSafe` measures the whole
+# app with safety checks on, which is how the cost of doing that was priced:
+# rebuild 290us to 852us, layout 1377us to 2650us, three budgets blown. The
+# `nostr` library is built ReleaseSafe either way, see `libraryOptimize` in
+# build.zig, and that part costs nothing measurable here, which is the point of
+# splitting them.
 #
 #   scripts/frame-budget.sh
 #
@@ -49,8 +54,9 @@ PLAN_P90_BUDGET=${PLAN_P90_BUDGET:-1400}
 cd "$(dirname "$0")/.."
 SNAPSHOT=".zig-cache/native-sdk-automation/snapshot.txt"
 
-echo "building (ReleaseFast, automation on)..."
-zig build -Doptimize=ReleaseFast -Dautomation=true
+OPTIMIZE="${OPTIMIZE:-ReleaseFast}"
+echo "building ($OPTIMIZE, automation on)..."
+zig build "-Doptimize=$OPTIMIZE" -Dautomation=true
 # Asked for by name, because a plain `zig build` no longer installs it: the
 # packager ships whatever build.zig installs, and a tool that fabricates a feed
 # has no business inside a signed app bundle. Built Debug, since it runs once
