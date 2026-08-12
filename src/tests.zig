@@ -15124,6 +15124,122 @@ test "the same relay with a new question keeps its url and moves its counter" {
     try testing.expect(main.discoveredGenerationForTest(0) != before);
 }
 
+test "a relay is set aside only after a run of failures, and not forever" {
+    // A handshake fails for a blip as well as for a refusal, so one is not a
+    // verdict. Measured in a single live run: the paid relay failed every time
+    // and a free one in my own pool failed once and was fine on the retry.
+    const strikes = main.routedRefusalStrikesForTest;
+    const window = main.routedRefusalMsForTest;
+    const t: i64 = 1_000_000;
+
+    try testing.expect(!main.relayIsRefusedForTest(0, t, t));
+    try testing.expect(!main.relayIsRefusedForTest(strikes - 1, t, t));
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, t));
+
+    // Pinned against the literal, not against the constant. Everything else
+    // here counts off `strikes`, so all of it stays true if the constant drops
+    // to one and a single blip starts costing a relay six hours. This is the
+    // line that refuses that, and it is the property, not the number.
+    try testing.expect(main.routedRefusalStrikesForTest > 1);
+    try testing.expect(!main.relayIsRefusedForTest(1, t, t));
+
+    // A record with no timestamp is not a verdict either. Zero is a real
+    // reading on some clocks, so "never" is -1 and it has to be distinguished.
+    try testing.expect(!main.relayIsRefusedForTest(strikes, -1, t));
+
+    // It expires. A subscription, a block and an outage all end.
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, t + window - 1));
+    try testing.expect(!main.relayIsRefusedForTest(strikes, t, t + window));
+
+    // With no clock, a strike already recorded still counts. Nothing is dialled
+    // before the clock exists, so this is the safe reading rather than a live
+    // case: it can only set a relay aside, never wrongly reinstate one.
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, null));
+    try testing.expect(!main.relayIsRefusedForTest(strikes - 1, t, null));
+}
+
+test "a relay that will not have us gives up its slot to the next one down" {
+    // Coverage says which relays carry the people you follow. It does not say
+    // which of them will talk to you. The best relay by coverage on my own
+    // account refuses the websocket handshake, and held a routed slot dialling
+    // and failing forever while the coverage counter reported its writers as
+    // reached.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/refused.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.forgetRefusedRelaysForTest();
+    defer main.forgetRefusedRelaysForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One relay each, two more relays than there are slots, so setting one
+    // aside has somewhere for the slot to go. With slots to spare the choice
+    // takes everything and being set aside costs nothing visible.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const specs = try arena.alloc([]const []const u8, budget + 2);
+    for (specs, 0..) |*spec, i| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://r{d:0>2}.example.com", .{i});
+        spec.* = one;
+    }
+    const follows = try arena.alloc([32]u8, specs.len);
+    try seedRelayLists(arena, signer, specs, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(budget, routedCount());
+    // Whichever one it picked first: that is the one to refuse.
+    var buf: [96]u8 = undefined;
+    const chosen = main.discoveredUrlCopy(0, &buf).?;
+    var chosen_owned: [96]u8 = undefined;
+    @memcpy(chosen_owned[0..chosen.len], chosen);
+    const victim = chosen_owned[0..chosen.len];
+
+    // One strike short of the line changes nothing: a blip must not cost a
+    // relay its slot.
+    const t: i64 = 5_000_000;
+    for (0..main.routedRefusalStrikesForTest - 1) |i| {
+        try testing.expect(!main.noteRelayRefusalAtForTest(victim, t + @as(i64, @intCast(i))));
+    }
+    try testing.expectEqual(@as(usize, 0), main.refusedRelayCountForTest());
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds(victim));
+
+    // The strike that does it says so, so the caller knows to ask for a rethink
+    // rather than waiting for somebody's relay list to land.
+    try testing.expect(main.noteRelayRefusalAtForTest(victim, t + 10));
+    try testing.expectEqual(@as(usize, 1), main.refusedRelayCountForTest());
+
+    main.rankRelaySuggestionsForTest(&store);
+    // Gone, and the slot went to a relay that might answer rather than being
+    // left empty. Both halves matter: dropping it and shrinking the pool would
+    // cost reach instead of recovering it.
+    try testing.expect(!routedHolds(victim));
+    try testing.expectEqual(budget, routedCount());
+
+    // And it comes back when it starts working.
+    main.clearRelayRefusalForTest(victim);
+    try testing.expectEqual(@as(usize, 0), main.refusedRelayCountForTest());
+}
+
 test "a socket whose owner is blocked reading it is re-asked by the keeper" {
     // The owner of a routed connection cannot re-ask on its own. It spends its
     // life inside `receive`, which blocks until the relay says something, and a
