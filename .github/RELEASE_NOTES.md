@@ -1,22 +1,16 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.4.0
+### What's new in v0.4.1
 
-**Your feed reaches further.** v0.3.0 began connecting to relays the people you follow write to. This finishes it. Each connection now asks only about the people it can answer for, so a small relay is asked about its dozen writers rather than about everyone you follow, and there are eight of those connections rather than four.
+**A relay that will not have you no longer keeps a connection to itself.** v0.4.0 picks the relays it connects to by how many of the people you follow write there. That says which relays carry them; it does not say which will talk to you, and those are not the same set. A paid relay refuses the connection itself, before any Nostr message is exchanged, so there is nothing to negotiate and no error anybody could see: it simply held one of the eight routed slots, dialling and failing, while the coverage counter reported its writers as reached.
 
-The relays are chosen by who they reach rather than by how popular they are, because the popular relays all carry the same crowd: somebody who publishes to one quiet relay is never reached however many busy ones you dial. Measured on an account following 257 people, **202 of them are now covered, 156 of those by two relays each**, up from 193 and 134. Anyone no chosen relay carries is still asked of every relay you picked yourself, so narrowing the questions never costs you a person.
+Plaza now sets such a relay aside after three failed connections and spends the slot on the next one down, trying it again six hours later. Three and not one, because a handshake also fails for a blip. Relays you added yourself are never dropped this way; they keep retrying however badly they behave, because quietly abandoning your own relay is the opposite of what you asked for.
 
-**A relay Plaza has just met is asked for what it holds.** A newly connected relay has answered nothing yet, so bounding its first question by the newest note already on your disk asked a relay full of history you are missing for the one slice it cannot supply. It now delivers hundreds of notes in the first minutes instead of almost none.
+On the account this was measured on, that moved the coverage figure from 202 to **196**, and the smaller number is the true one: fifty of those people had been behind a closed door, and the freed slot went somewhere that answers.
 
-**Your connections stop being dropped and redialled for nothing.** A routed connection used to be torn down whenever anything about the routing moved, including things that had nothing to do with it: one person publishing a relay list cost every routed socket a handshake, and hundreds of relay lists arrive in the first seconds of a cold start.
+**Under it: the protocol library is now built with its safety checks on.** Zig compiles bounds, overflow and cast checks out of the mode Plaza ships. That is the right trade for the code that draws a frame and the wrong one for the code that parses bytes a stranger sent, so the two are now built differently: `nostr` gets the checks, Plaza's own render path keeps the speed. Measured, it costs nothing you can see. Building the whole app that way was measured too, and it costs a great deal: the feed rebuild goes from 290 to 852 microseconds.
 
-Now each connection is told only about its own slot, a relay that stays in the set keeps its connection, a relay has to reach a quarter more people before a live socket is given up for it, and the routing waits for the flurry to settle before it recomputes at all. When the people on a relay do change, the question is replaced on the socket that is already open rather than by dialling a new one.
-
-### Under it
-
-The `nostr` library is unchanged at v0.8.0.
-
-The feed's own numbers, on the build that ships: a hard scroll costs 275us to rebuild, 1360us to lay out and 55us to patch, against the 8333us of a 120 Hz frame. Measured against a fixed feed the harness seeds itself, so a run means the same thing twice.
+Also: `seed-feed`, a tool that fabricates a feed for the frame-budget harness, was riding along inside the app bundle in v0.3.0 and v0.4.0. It is gone, and packaging now refuses a bundle carrying anything Plaza does not run.
 
 ### Install
 
