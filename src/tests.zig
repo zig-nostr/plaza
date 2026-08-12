@@ -14973,48 +14973,52 @@ test "a narrowly better relay does not take a connected relay's place" {
     defer main.clearIdentityForTest();
 
     // Everyone writes to exactly one relay, so no relay ever covers anybody
-    // twice and each one's gain is simply how many people are on it. Three
-    // relays of seven fill three of the four slots; `incumbent` takes the last
-    // with five.
-    const big_a = [_][]const u8{"wss://big-a.example.com"};
-    const big_b = [_][]const u8{"wss://big-b.example.com"};
-    const big_c = [_][]const u8{"wss://big-c.example.com"};
-    const inc = [_][]const u8{"wss://incumbent.example.com"};
-    const cha = [_][]const u8{"wss://challenger.example.com"};
+    // twice and each one's gain is simply how many people are on it.
+    //
+    // Enough big relays to fill every slot but one, counted off the budget. A
+    // spare slot means no contention, the margin is never consulted, and the
+    // test proves nothing while still passing.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const big_writers = 7;
+    const inc_writers = 5;
+    const narrow_writers = 6;
+    const wide_writers = 9;
 
-    var specs: [32][]const []const u8 = undefined;
-    for (0..7) |i| specs[i] = &big_a;
-    for (7..14) |i| specs[i] = &big_b;
-    for (14..21) |i| specs[i] = &big_c;
-    for (21..26) |i| specs[i] = &inc;
-    // The challenger's six are seeded now but not followed yet, so the first
-    // run cannot see them.
-    for (26..32) |i| specs[i] = &cha;
+    var specs = std.ArrayList([]const []const u8).empty;
+    for (0..budget - 1) |g| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://big-{d}.example.com", .{g});
+        for (0..big_writers) |_| try specs.append(arena, one);
+    }
+    const inc = try arena.alloc([]const u8, 1);
+    inc[0] = "wss://incumbent.example.com";
+    for (0..inc_writers) |_| try specs.append(arena, inc);
+    const without_challenger = specs.items.len;
 
-    var follows: [32][32]u8 = undefined;
-    try seedRelayLists(arena, signer, specs[0..32], &follows);
+    const cha = try arena.alloc([]const u8, 1);
+    cha[0] = "wss://challenger.example.com";
+    for (0..wide_writers) |_| try specs.append(arena, cha);
+    const narrowly_ahead = without_challenger + narrow_writers;
+
+    const follows = try arena.alloc([32]u8, specs.items.len);
+    try seedRelayLists(arena, signer, specs.items, follows);
 
     // Round one: without the challenger's people, `incumbent` earns the seat.
-    _ = main.setFollowsForTest(follows[0..26], 1_800_000_000);
+    _ = main.setFollowsForTest(follows[0..without_challenger], 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
     try testing.expect(routedHolds("wss://incumbent.example.com"));
     try testing.expect(!routedHolds("wss://challenger.example.com"));
 
-    // Round two: the challenger's six follows appear. Six beats five, but not
-    // by a quarter, so the socket stays where it is.
-    _ = main.setFollowsForTest(follows[0..32], 1_800_000_001);
+    // Round two: six of the challenger's follows appear. Six beats five, but
+    // not by a quarter, so the socket stays where it is.
+    _ = main.setFollowsForTest(follows[0..narrowly_ahead], 1_800_000_001);
     main.rankRelaySuggestionsForTest(&store);
     try testing.expect(routedHolds("wss://incumbent.example.com"));
     try testing.expect(!routedHolds("wss://challenger.example.com"));
 
     // And the margin is a margin, not a veto: a relay that reaches enough more
     // people does take the seat. Nine against five is well past a quarter.
-    var wide: [35][]const []const u8 = undefined;
-    for (0..32) |i| wide[i] = specs[i];
-    for (32..35) |i| wide[i] = &cha;
-    var more: [35][32]u8 = undefined;
-    try seedRelayLists(arena, signer, wide[0..35], &more);
-    _ = main.setFollowsForTest(more[0..35], 1_800_000_002);
+    _ = main.setFollowsForTest(follows, 1_800_000_002);
     main.rankRelaySuggestionsForTest(&store);
     try testing.expect(routedHolds("wss://challenger.example.com"));
     try testing.expect(!routedHolds("wss://incumbent.example.com"));
@@ -15501,21 +15505,26 @@ test "an author nobody was routed to lands in the residual" {
     defer main.clearIdentityForTest();
 
     // Enough distinct one-author relays to overflow the routed budget, so the
-    // last ones cannot be chosen.
-    const specs = [_][]const []const u8{
-        &.{"wss://a.example.com"}, &.{"wss://b.example.com"},
-        &.{"wss://c.example.com"}, &.{"wss://d.example.com"},
-        &.{"wss://e.example.com"}, &.{"wss://f.example.com"},
-        &.{"wss://g.example.com"},
-    };
-    var follows: [specs.len][32]u8 = undefined;
-    try seedRelayLists(arena, signer, &specs, &follows);
-    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    // last ones cannot be chosen. Counted off the budget rather than written
+    // out: with fewer relays than slots everybody is routed, the residual is
+    // trivially empty, and the test passes without ever reaching the case.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const spare = 3;
+    const specs = try arena.alloc([]const []const u8, budget + spare);
+    for (specs, 0..) |*spec, i| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://only-{d}.example.com", .{i});
+        spec.* = one;
+    }
+    const follows = try arena.alloc([32]u8, specs.len);
+    try seedRelayLists(arena, signer, specs, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
-    // More authors than the routed budget can hold, so somebody must be left
-    // over, and the residual is where they go rather than nowhere.
-    try testing.expect(main.residualCountForTest() > 0);
+    // Nobody shares a relay with anybody, so the budget reaches exactly its own
+    // number of people and the rest have to go somewhere. A count, not "more
+    // than nothing": the residual losing one person is the failure this guards.
+    try testing.expectEqual(@as(usize, spare), main.residualCountForTest());
 }
 
 test "before anything is routed, a pool relay still asks about everyone" {
@@ -15571,32 +15580,68 @@ test "coverage beats popularity when the popular relays carry the same crowd" {
     main.setIdentityForTest([_]u8{77} ** 32);
     defer main.clearIdentityForTest();
 
-    // Six people on all three popular relays, two people on one quiet relay.
-    const popular = [_][]const u8{ "wss://p1.example.com", "wss://p2.example.com", "wss://p3.example.com" };
-    const quiet = [_][]const u8{"wss://quiet.example.com"};
-    const specs = [_][]const []const u8{
-        &popular, &popular, &popular, &popular, &popular, &popular,
-        &quiet,   &quiet,
-    };
-    var follows: [specs.len][32]u8 = undefined;
-    try seedRelayLists(arena, signer, &specs, &follows);
-    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    // The crowd has to outnumber the budget or this proves nothing: with fewer
+    // candidate relays than slots everything is dialled and the two orderings
+    // cannot disagree. One person may name at most `outbox_relays_per_author`
+    // relays, so the crowd comes in groups of that many, each group's relays
+    // carrying only that group.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const per_author = main.outboxRelaysPerAuthorForTest;
+    const groups = (budget - 1) / 2;
+    const per_group = 5;
+    // Coverage needs two relays per group and one slot left for the quiet
+    // relay, and popularity has to run out of budget before it reaches that
+    // relay. If a change to the budget breaks either, this fails loudly rather
+    // than passing hollow.
+    try testing.expect(groups * 2 + 1 <= budget);
+    try testing.expect(groups * per_author > budget);
+
+    var specs = std.ArrayList([]const []const u8).empty;
+    for (0..groups) |g| {
+        const urls = try arena.alloc([]const u8, per_author);
+        for (urls, 0..) |*u, j| u.* = try std.fmt.allocPrint(arena, "wss://crowd-{d}-{d}.example.com", .{ g, j });
+        for (0..per_group) |_| try specs.append(arena, urls);
+    }
+    const quiet_url = "wss://onlyhere.example.com";
+    const quiet = try arena.alloc([]const u8, 1);
+    quiet[0] = quiet_url;
+    try specs.append(arena, quiet);
+
+    const follows = try arena.alloc([32]u8, specs.items.len);
+    try seedRelayLists(arena, signer, specs.items, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
     main.rankRelaySuggestionsForTest(&store);
 
-    // Everybody reached, including the two nobody popular carries.
+    // Everybody reached, including the one nobody popular carries.
     const cov = main.routeCoverageForTest();
-    try testing.expectEqual(@as(usize, specs.len), cov.reached);
+    try testing.expectEqual(specs.items.len, cov.reached);
     try testing.expectEqual(@as(usize, 0), cov.residual);
+    try testing.expect(routedHolds(quiet_url));
 
-    // And the quiet relay really is one of the chosen, which is the whole
-    // point: by popularity it ranks last and would never be dialled.
-    var found_quiet = false;
+    // And the popularity order really does leave that person out, which is the
+    // half of this the coverage numbers cannot show. Every crowd relay carries
+    // five writers against the quiet relay's one, so the suggestions never
+    // mention it while the routing dials it.
+    var sbuf: [96]u8 = undefined;
+    for (0..main.relaySuggestionCount()) |i| {
+        const u = main.relaySuggestionCopy(i, &sbuf) orelse continue;
+        try testing.expect(!std.mem.eql(u8, u, quiet_url));
+    }
+
+    // The budget is not spent, either. Two relays per group is enough to carry
+    // that group twice, so the greedy stops rather than opening sockets to
+    // relays whose people are already covered.
+    try testing.expectEqual(groups * 2 + 1, routedCount());
+}
+
+/// How many routed slots hold a relay.
+fn routedCount() usize {
+    var n: usize = 0;
     var buf: [96]u8 = undefined;
     for (0..main.maxDiscoveredRelaysForTest) |i| {
-        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
-        if (std.mem.eql(u8, u, "wss://quiet.example.com")) found_quiet = true;
+        if (main.discoveredUrlCopy(i, &buf) != null) n += 1;
     }
-    try testing.expect(found_quiet);
+    return n;
 }
 
 test "a relay the reader is already on is not dialled again, but still counts as cover" {
