@@ -51,6 +51,11 @@ SNAPSHOT=".zig-cache/native-sdk-automation/snapshot.txt"
 
 echo "building (ReleaseFast, automation on)..."
 zig build -Doptimize=ReleaseFast -Dautomation=true
+# Asked for by name, because a plain `zig build` no longer installs it: the
+# packager ships whatever build.zig installs, and a tool that fabricates a feed
+# has no business inside a signed app bundle. Built Debug, since it runs once
+# before a measurement and is not measured itself.
+zig build seed-feed
 
 # A FIXED FEED, and its own $HOME.
 #

@@ -84,7 +84,21 @@ fn addSeedFeed(b: *std.Build, target: std.Build.ResolvedTarget) void {
     linkNostr(b, mod);
 
     const exe = b.addExecutable(.{ .name = "seed-feed", .root_module = mod });
-    b.installArtifact(exe);
+    // Deliberately NOT `b.installArtifact`.
+    //
+    // `scripts/package-macos.sh` puts whatever build.zig installs into the app
+    // bundle, and derives that list rather than naming binaries, because naming
+    // them by hand once shipped a release with no signer daemon in it. The same
+    // rule read the other way: anything installed here is handed to everybody
+    // who downloads Plaza. This one fabricates a feed to measure against, and
+    // it went out in v0.3.0 and v0.4.0 doing nothing but taking up space in a
+    // signed bundle.
+    //
+    // So it is built on request. `zig build seed-feed` puts it in zig-out/bin
+    // for the harness; a plain `zig build` does not.
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("seed-feed", "Build the fixed-corpus seeder that scripts/frame-budget.sh measures against")
+        .dependOn(&install.step);
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);

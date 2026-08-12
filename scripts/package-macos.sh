@@ -100,5 +100,19 @@ codesign --verify --deep --strict "$out" || die "the bundle failed signature ver
 for required in plaza plaza-signer notary-window; do
   [ -x "$out/Contents/MacOS/$required" ] || die "$required is missing from the bundle."
 done
+
+# And the other direction, which cost two releases before anybody looked.
+#
+# Deriving the copy list from build.zig is what stops a helper going missing. It
+# also means every new install step ships to everybody who downloads Plaza, and
+# `seed-feed`, which exists to fabricate a feed for the frame budget, rode along
+# in v0.3.0 and v0.4.0. One check catches an omission, the other catches an
+# accident; the loop above still does the actual work.
+for bin in "$out/Contents/MacOS/"*; do
+  case "$(basename "$bin")" in
+    plaza | plaza-signer | notary-window) ;;
+    *) die "$(basename "$bin") is in the bundle and is not a binary Plaza runs. If it belongs, name it here; if it does not, stop installing it in build.zig." ;;
+  esac
+done
 say "Built $out"
 say "Carries: $(cd "$out/Contents/MacOS" && echo *)"
