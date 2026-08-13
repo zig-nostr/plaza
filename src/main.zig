@@ -32,6 +32,31 @@ const plaza_icons = @import("plaza_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
+// ------------------------------------------------- bytes that are not ours
+//
+// `@setRuntimeSafety(true)` appears at the top of every function below that
+// walks bytes somebody else chose. It is one rule, stated here once:
+//
+// Plaza ships ReleaseFast, and ReleaseFast compiles out the bounds check, the
+// overflow check and the cast check. That is the right trade for the render
+// thread, which walks this app's own data at 120 Hz, and the wrong one for a
+// parser, where an index comes off a length a stranger wrote. The `nostr`
+// library is already built one notch safer for exactly that reason (see
+// `libraryOptimize` in build.zig). The same argument covers the parsing this
+// file does for itself, which that setting does not reach.
+//
+// The question is not "does this touch a string". It is: does an INDEX, a
+// LENGTH or a CAST in here come from the input? A note's content, an `imeta`
+// tag, a blurhash, a kind:0 body, a fetched page's `<head>`, an image's
+// declared dimensions. Anything read start to end is left alone.
+//
+// It goes at the TOP of the function rather than around the interesting line,
+// so a check added inside it later is covered without anybody remembering to.
+//
+// It does not reach the vendored stb decoders. They are C, they are the largest
+// stranger-facing surface in the app, and no Zig setting changes what they do.
+// What stands in front of them is the size check in `decodeAndRegister`.
+
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
@@ -5589,6 +5614,7 @@ fn isPrivateAddress(host: []const u8) bool {
 /// URL is not one (it is drawn as the picture), and neither is anything inside a
 /// `nostr:` token.
 pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Scans a stranger's content for a URL run.
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
         if (!std.mem.startsWith(u8, content[i..], "https://") and !std.mem.startsWith(u8, content[i..], "http://")) continue;
@@ -5852,6 +5878,7 @@ pub const PageMeta = struct {
 /// lives, and anything it cannot make sense of simply leaves the card without
 /// that line rather than guessing.
 pub fn parsePageMeta(html: []const u8) PageMeta {
+    @setRuntimeSafety(true); // A fetched page's head, up to 256 KiB of it, and every offset below is read out of it.
     var out: PageMeta = .{};
     var i: usize = 0;
     while (i < html.len) : (i += 1) {
@@ -5897,6 +5924,7 @@ pub fn parsePageMeta(html: []const u8) PageMeta {
 
 /// One attribute's value out of a tag, single or double quoted.
 fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Quote positions inside a tag the page wrote.
     var i: usize = 0;
     while (std.ascii.indexOfIgnoreCasePos(tag, i, name)) |at| {
         i = at + name.len;
@@ -7825,6 +7853,7 @@ fn idxOf(p: *const Profile) usize {
 /// unchanged (it just keeps rendering from its npub). Prefers `display_name`
 /// (or the legacy `displayName`) over `name`.
 pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
+    @setRuntimeSafety(true); // A kind:0 body, which is whatever its author put there.
     const Metadata = struct {
         name: ?[]const u8 = null,
         display_name: ?[]const u8 = null,
@@ -10348,9 +10377,30 @@ fn storeCachedImage(url: []const u8, bytes: []const u8) void {
 /// at its real aspect instead of stretching it into whatever box it is given.
 const DecodedSize = struct { width: usize, height: usize };
 
+/// The largest single dimension worth decoding. Its only real job is to make the
+/// area check below safe to compute: squared it is 2^28, nowhere near overflowing
+/// a usize, so `w * h` cannot wrap before anybody looks at it.
+const image_max_dim = 16384;
+
+/// And the area, which is the number that actually costs memory: four bytes a
+/// pixel, so this is a 160 MB decode at the limit. A photograph does not reach
+/// it; a file built to make an app allocate does.
+const image_max_pixels = 40 * 1024 * 1024;
+
+/// Whether a decoded image's own declared size is one to go on with.
+pub fn imageSizeUsable(width: usize, height: usize) bool {
+    if (width == 0 or height == 0) return false;
+    // Both dimensions FIRST, so the multiply that follows cannot wrap. Checking
+    // the area alone would be the check computing the very number it exists to
+    // decide is safe.
+    if (width > image_max_dim or height > image_max_dim) return false;
+    return width * height <= image_max_pixels;
+}
+
 /// Decodes `bytes` and registers the pixels under `id`, downscaling so the long
 /// edge is at most `max_dim`. Returns the registered size, or null on failure.
 fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?DecodedSize {
+    @setRuntimeSafety(true); // Pixel dimensions a stranger's file declares, multiplied into a buffer size.
     // Fast path: let the platform decode and register directly. This succeeds
     // whenever the image already fits the registry's budget.
     if (fx.registerImageBytes(id, bytes)) |registered| {
@@ -10366,6 +10416,16 @@ fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?De
 
     const src_w: usize = @intCast(w);
     const src_h: usize = @intCast(h);
+    // What the C decoder handed back, checked before anything multiplies it.
+    //
+    // Every line below turns these two numbers into a buffer size, and they came
+    // out of a file somebody linked in a note. stb caps a single dimension at
+    // 2^24, which is a product of 2^48 pixels, so "it decoded" is not the same as
+    // "this is a size to allocate". The safety check above would catch the
+    // overflow itself, but catching it means the app stops; refusing the picture
+    // means the app carries on without it, which is the right answer for one
+    // oversized image in a feed.
+    if (!imageSizeUsable(src_w, src_h)) return null;
     const longest = @max(src_w, src_h);
     if (longest <= max_dim) {
         // The platform refused it for some other reason; the decoded pixels
@@ -11425,6 +11485,7 @@ pub const Ancestor = struct {
 /// body can split around it and draw an embedded quote card. A second reference,
 /// an `naddr`, or an undecodable token is left as plain text (`.none`).
 fn findQuoteRef(note: *Note) void {
+    @setRuntimeSafety(true); // Byte spans of a token inside the note's own content.
     const text = note.content();
     var scratch: [16 * 1024]u8 = undefined;
     var i: usize = 0;
@@ -11494,6 +11555,7 @@ pub const Imeta = struct {
 };
 
 pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
+    @setRuntimeSafety(true); // Reads fields out of a tag the note's author wrote.
     for (tags) |tag| {
         if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
         var matches_url = false;
@@ -11577,6 +11639,7 @@ pub fn urlHost(url: []const u8) []const u8 {
 }
 
 pub fn firstImageUrl(content: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Same walk as firstLinkUrl, matching an extension at the end of a run.
     const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
@@ -11610,6 +11673,7 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
 /// one is given. A note wants that table so the label can be pressed; a profile's
 /// "about" text is rendered the same way and has nowhere to put one.
 pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const u8, mentions: ?*MentionList) usize {
+    @setRuntimeSafety(true); // Copies a stranger's content into a fixed buffer, offset by offset.
     // Mention decoding needs an allocator for bech32 scratch; a stack buffer
     // covers it without touching the heap for every note parsed. A pathological
     // mention that will not fit simply stays as its raw token.
@@ -11657,6 +11721,7 @@ pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const u8, mentions:
 /// A parsed `nostr:` mention at `src[i]`: the byte just past its token, and the
 /// referenced pubkey. Null when `src[i]` is not the start of one.
 fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct { end: usize, pubkey: [32]u8 } {
+    @setRuntimeSafety(true); // Walks a bech32 run whose length the note chose.
     const prefix = "nostr:";
     var body_start = i;
     if (std.mem.startsWith(u8, src[i..], prefix)) {
@@ -11696,6 +11761,7 @@ fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct {
 /// Writes `@` + the cached display name (or a short npub) for `pubkey` into
 /// `buf`, returning the written slice. `buf` should be at least 80 bytes.
 fn mentionLabel(pubkey: [32]u8, buf: []u8) []const u8 {
+    @setRuntimeSafety(true); // Writes a display name of somebody else's choosing into a fixed buffer.
     buf[0] = '@';
     if (lookupProfile(pubkey)) |p| {
         if (p.name_len > 0) {
@@ -20116,6 +20182,7 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
 /// surname fell out of the run. A recorded range knows exactly how long the label
 /// is because it is what wrote it.
 pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef, base: usize) []const canvas.TextSpan {
+    @setRuntimeSafety(true); // Splits a stranger's text into runs, and does it on every rebuild.
     const max_spans = 32;
     if (text.len == 0) return &.{};
     const spans = ui.arena.alloc(canvas.TextSpan, max_spans) catch return &.{};
@@ -20416,6 +20483,7 @@ fn base83(c: u8) ?f32 {
 }
 
 fn base83Value(hash: []const u8, from: usize, len: usize) ?f32 {
+    @setRuntimeSafety(true); // Slices the hash at offsets its own header implied.
     if (from + len > hash.len) return null;
     var value: f32 = 0;
     for (hash[from .. from + len]) |c| {
@@ -20440,6 +20508,7 @@ fn linearToSrgb(v: f32) f32 {
 /// reference decoder runs per pixel, at the resolution the eye gets from a
 /// placeholder anyway.
 pub fn decodeBlurhash(hash: []const u8) Blur {
+    @setRuntimeSafety(true); // Component counts decoded out of the hash index a fixed array.
     var out: Blur = .{};
     if (hash.len < 6) return out;
     const size_flag = base83Value(hash, 0, 1) orelse return out;
