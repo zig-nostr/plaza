@@ -1799,7 +1799,7 @@ fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
 /// short: a backup for a kind nothing writes is a guess about the future, and
 /// this app writes exactly these.
 fn isOwnList(kind: u16) bool {
-    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind;
+    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind or kind == mute_list_kind;
 }
 
 /// The one door into the store.
@@ -1849,6 +1849,7 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
         // of this: one kind:5 folded into an ordinary batch quietly emptied rows
         // that had nothing to do with it, because their splice could only add.
         5 => if (result != .invalid) invalidateFeed(),
+        mute_list_kind => if (result != .invalid) ingestMuteList(ev),
         else => {},
     }
     return result;
@@ -6736,6 +6737,11 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     const claim: ?ZapClaim = if (ev.kind == 9735) (zapClaim(ev, me) orelse return false) else null;
     const author = if (claim) |c| c.payer else ev.pubkey;
     const identity = if (claim) |c| c.id else ev.id;
+    // Muted, so no row. Checked against the AUTHOR established above rather
+    // than the event's own pubkey, which for a zap is a payment server: muting
+    // somebody has to stop their zaps too, and their key is only in the request
+    // inside the receipt.
+    if (isMuted(author)) return false;
 
     // Deduped on that identity, which is why this runs here rather than on the
     // way in: twenty receipts wrapping one request have twenty ids of their own,
@@ -9121,6 +9127,11 @@ pub const Model = struct {
             if (n >= self.thread_notes.len) break;
             var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
             defer se.deinit();
+            // A muted person's reply is hidden the same way their note is. The
+            // thread's ROOT is not checked: opening a thread is asking to read
+            // that note, and answering with an empty screen would be the app
+            // refusing a question the reader just asked.
+            if (isMuted(se.event.pubkey)) continue;
             self.thread_notes[n] = noteFrom(se.event, now_s);
             // Queue the replier's profile so a name, avatar, and handle resolve
             // for a reply from someone outside the follow set.
@@ -9343,6 +9354,11 @@ pub const Model = struct {
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= limit) break;
+            // A muted author never becomes a card. Filtered here rather than in
+            // the query because the store has no idea who this reader muted, and
+            // rather than at render time because a hidden row would still hold a
+            // slot in a window that pages by count.
+            if (isMuted(ev.pubkey)) continue;
             self.notes[n] = blk: {
                 if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
                 g_feed_work.parses += 1;
@@ -9393,6 +9409,7 @@ pub const Model = struct {
             if (ev.kind != 1) continue;
             if (heldIndex(held, self.notes[0..self.notes_len], ev.id) != null) continue;
             if (!authorInSet(authors, ev.pubkey)) continue;
+            if (isMuted(ev.pubkey)) continue;
             // The window is full and this is older than everything in it, so it
             // would be dropped by the truncation below. Not worth parsing.
             if (self.notes_len >= limit and self.notes_len > 0 and
@@ -9490,6 +9507,12 @@ pub fn invalidateFeedForTest() void {
 ///
 /// Tests of the change-detection layer itself go through `plazaIngestForTest`
 /// and `Model.refresh`, which is what the app runs.
+/// Rebuilds the open thread's replies from the store. The real one runs off the
+/// tick, which a test has no way to turn.
+pub fn refreshThreadNotesForTest(model: *Model, now_s: i64) void {
+    model.refreshThreadNotes(now_s);
+}
+
 pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
     invalidateFeed();
     refreshProfiles(store);
@@ -15311,6 +15334,14 @@ fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) G
 /// this reader follows, everywhere, at once.
 const contact_list_kind: u16 = 3;
 
+/// NIP-51's mute list. Public entries are `p` tags; private ones live in the
+/// content, encrypted to yourself, and are read separately (see `privateMutes`).
+const mute_list_kind: u16 = 10000;
+
+/// How many muted accounts are held. Far past any real list: muting is a thing
+/// people do a handful of times, not two thousand.
+const max_mutes = 512;
+
 /// How many follows are TRACKED, which is not how many the feed reads.
 ///
 /// These are two different numbers and conflating them was a real bug: the feed
@@ -15377,7 +15408,7 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
 /// the one where getting that wrong empties somebody's account. It is one
 /// author and three records, so it costs nothing to ask for separately, which
 /// is the entire reason the bulk filter above can stop asking for it.
-const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
+const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind };
 
 /// Backing store for the reader's own author filter. A `Filter` borrows its
 /// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
@@ -15481,6 +15512,191 @@ fn followsAreOwned() bool {
     const pk = activePubkey() orelse return false;
     const owner = g_follow_owner orelse return false;
     return std.mem.eql(u8, &owner, &pk);
+}
+
+// ---------------------------------------------------------------- muting
+//
+// The reader's NIP-51 mute list, read and honoured. Not written: a mute list is
+// REPLACEABLE, and the rule this app already learned about contact lists holds
+// here too, that nothing may write over a record it has not read back first.
+// Jumble does the careful version of that write (it re-fetches immediately
+// before every change, and when the fetch comes back empty it ASKS rather than
+// assuming there is nothing there, because "not found" and "the fetch failed"
+// look identical). Doing that properly is its own change; honouring a list made
+// elsewhere costs nothing and is most of the value, because muting is something
+// people mostly did in whatever client they came from.
+
+var g_mutes: [max_mutes][32]u8 = undefined;
+var g_mute_count: usize = 0;
+var g_mute_owner: ?[32]u8 = null;
+var g_mute_created_at: i64 = 0;
+var g_mute_lock = std.atomic.Value(bool).init(false);
+
+fn lockMutes() void {
+    while (g_mute_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockMutes() void {
+    g_mute_lock.store(false, .release);
+}
+
+/// Whether the list in memory is THIS account's. Same question the follow set
+/// asks, and for the same reason: one account's mutes must never silently
+/// become another's.
+fn mutesAreOwned() bool {
+    const pk = activePubkey() orelse return false;
+    const owner = g_mute_owner orelse return false;
+    return std.mem.eql(u8, &owner, &pk);
+}
+
+/// Whether this reader has muted `pubkey`.
+///
+/// The one question the rest of the app asks. Answering false when no list is
+/// known is the right default in a way the follow set's is not: an unknown
+/// follow list falls back to a starter pack, but an unknown mute list has no
+/// stand-in, and inventing one would hide people nobody asked to hide.
+pub fn isMuted(pubkey: [32]u8) bool {
+    lockMutes();
+    defer unlockMutes();
+    if (!mutesAreOwned()) return false;
+    for (g_mutes[0..g_mute_count]) |m| {
+        if (std.mem.eql(u8, &m, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// How many accounts this reader has muted.
+pub fn muteCount() usize {
+    lockMutes();
+    defer unlockMutes();
+    if (!mutesAreOwned()) return 0;
+    return g_mute_count;
+}
+
+/// Installs a mute set as this account's. Returns whether anything changed.
+fn setMutes(list: []const [32]u8, created_at: i64) bool {
+    const pk = activePubkey() orelse return false;
+    lockMutes();
+    const same = blk: {
+        if (!mutesAreOwned()) break :blk false;
+        if (g_mute_count != @min(list.len, max_mutes)) break :blk false;
+        for (list[0..@min(list.len, max_mutes)], 0..) |m, i| {
+            if (!std.mem.eql(u8, &m, &g_mutes[i])) break :blk false;
+        }
+        break :blk true;
+    };
+    if (same) {
+        unlockMutes();
+        return false;
+    }
+    const n = @min(list.len, max_mutes);
+    @memcpy(g_mutes[0..n], list[0..n]);
+    g_mute_count = n;
+    g_mute_owner = pk;
+    g_mute_created_at = created_at;
+    unlockMutes();
+    // The feed in hand was built without this. Unlike a follow change, an empty
+    // list is a meaningful answer here (they unmuted everybody), so this runs on
+    // any change rather than only on a non-empty one.
+    invalidateFeed();
+    return true;
+}
+
+/// Forgets whose list this is, on any identity change.
+fn forgetMutes() void {
+    lockMutes();
+    g_mute_owner = null;
+    g_mute_count = 0;
+    g_mute_created_at = 0;
+    unlockMutes();
+}
+
+/// The pubkeys a kind:10000's public `p` tags name, deduped.
+///
+/// Only `p`. NIP-51 also allows `t` (hashtags), `word` and `e` (threads) here,
+/// and none of those is read yet: hiding a person is the whole of what the feed
+/// can act on today, and claiming to honour a word filter that does nothing
+/// would be worse than not claiming it.
+fn mutesFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
+    @setRuntimeSafety(true); // Tags off a relay, and `out` is indexed as they are walked.
+    var n: usize = 0;
+    for (tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "p")) continue;
+        if (tag[1].len != 64) continue;
+        var pk: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk, tag[1]) catch continue;
+        var seen = false;
+        for (out[0..n]) |had| {
+            if (std.mem.eql(u8, &had, &pk)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+/// Seeds the mute set from the local store, at boot and at sign-in, so a muted
+/// account is hidden from the first frame rather than after a round trip.
+fn loadMutesFromStore() void {
+    const gpa = std.heap.page_allocator;
+    const own = ownRecordJson(gpa, mute_list_kind) orelse return;
+    defer freeOwnProfile(gpa, own);
+    var list: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(own.tags, &list);
+    n += privateMutes(gpa, own.json, list[n..]);
+    // No `if (n == 0) return` here, deliberately, and this is the one place the
+    // mute list differs from the contact list. An empty contact list is a
+    // malformed event to be ignored, because a reader with no follows has no
+    // feed; an empty mute list is somebody who unmuted everybody, and refusing
+    // to adopt it would leave the last person they unmuted hidden.
+    _ = setMutes(list[0..n], own.created_at);
+}
+
+/// A mute list arriving from a relay. Newer wins; the reader's own only.
+fn ingestMuteList(ev: nostr.event.Event) void {
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    lockMutes();
+    const owned = mutesAreOwned();
+    const held_at = g_mute_created_at;
+    unlockMutes();
+    if (owned and ev.created_at <= held_at) return;
+    const gpa = std.heap.page_allocator;
+    var list: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(ev.tags, &list);
+    n += privateMutes(gpa, ev.content, list[n..]);
+    _ = setMutes(list[0..n], ev.created_at);
+}
+
+/// The private half of a mute list: `content` is a JSON array of tags,
+/// encrypted to yourself, which NIP-51 says may be NIP-04 or NIP-44.
+///
+/// Only readable with a LOCAL key. A bunker holds the secret and would have to
+/// be asked to decrypt over NIP-46, which is a round trip this path does not
+/// have; those readers see their public mutes honoured and their private ones
+/// not, which is the honest failure, and it is why part two of this must refuse
+/// to write a list whose private half it could not read. Jumble has exactly that
+/// bug: a failed decrypt leaves it writing an empty content, which publishes
+/// away every private mute the reader had.
+fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
+    if (content.len == 0 or out.len == 0) return 0;
+    const kp = g_identity_kp orelse return 0;
+    const signer = g_identity_signer orelse return 0;
+    const me = activePubkey() orelse return 0;
+    // To yourself, so both sides of the conversation key are this account's.
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return 0;
+    defer gpa.free(plain);
+    const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
+    defer parsed.deinit();
+    var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
+    defer gpa.free(tags);
+    for (parsed.value, 0..) |tag, i| tags[i] = tag;
+    return mutesFromTags(tags, out);
 }
 
 /// Who the FEED reads: a bounded slice of the follow list, or the starter pack
@@ -16185,6 +16401,22 @@ pub fn setFollowsForTest(list: []const [32]u8, created_at: i64) bool {
 
 pub fn forgetFollowsForTest() void {
     forgetFollows();
+}
+
+pub fn forgetMutesForTest() void {
+    forgetMutes();
+}
+
+pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
+    return setMutes(list, created_at);
+}
+
+pub fn loadMutesFromStoreForTest() void {
+    loadMutesFromStore();
+}
+
+pub fn ingestMuteListForTest(ev: nostr.event.Event) void {
+    ingestMuteList(ev);
 }
 
 pub fn loadFollowsFromStoreForTest() void {
@@ -22396,7 +22628,9 @@ fn enterFeed(model: *Model) void {
     // generation, which is what makes the open sockets re-ask for the records
     // of the account that is actually signed in.
     forgetFollows();
+    forgetMutes();
     loadFollowsFromStore();
+    loadMutesFromStore();
     // And what people sent this account while it was away.
     loadInbox();
 }
@@ -25377,6 +25611,7 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     // before the first frame, so a local-first app opens on THEIR feed rather
     // than on nine strangers while it waits for a relay.
     loadFollowsFromStore();
+    loadMutesFromStore();
     loadInbox();
 
     // The reader's own list, or the one the app was born with. Read before the
@@ -25882,6 +26117,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // And who the leaving account followed, so the next reader is not shown a
     // feed built from a stranger's list.
     forgetFollows();
+    forgetMutes();
     resetInbox();
     model.notifications_open = false;
     model.editing_profile = false;
