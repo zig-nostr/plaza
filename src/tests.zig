@@ -16093,3 +16093,177 @@ test "a decoded image is refused by size before anything multiplies it" {
     // dimension check, which is the point: the area check never runs on it.
     try testing.expect(!main.imageSizeUsable(1 << 24, 1 << 24));
 }
+
+// -- Reposting ----------------------------------------------------------------
+
+test "a repost carries the tags other clients read it by" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x41} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+    main.clearLastPublishedTagsForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x43} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "worth passing on");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+
+    const tags = main.lastPublishedTagsForTest();
+    const e = tagNamed(tags, "e") orelse return error.NoETagOnTheRepost;
+    const p = tagNamed(tags, "p") orelse return error.NoPTagOnTheRepost;
+
+    var id_hex: [64]u8 = undefined;
+    var author_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&id_hex, "{x}", .{ev.id});
+    _ = try std.fmt.bufPrint(&author_hex, "{x}", .{ev.pubkey});
+
+    try testing.expectEqualStrings(&id_hex, e[1]);
+    try testing.expectEqualStrings(&author_hex, p[1]);
+
+    // Four fields, and the THIRD is the empty relay hint. This is the one that
+    // matters to get right and the easy one to get wrong: the author belongs in
+    // the fourth field, so dropping the empty hint would slide the pubkey into
+    // the hint's place and tell every reader to dial it as a relay.
+    try testing.expectEqual(@as(usize, 4), e.len);
+    try testing.expectEqualStrings("", e[2]);
+    try testing.expectEqualStrings(&author_hex, e[3]);
+
+    // No `k` tag. Jumble and NDK both add one only for a kind other than 1, and
+    // every note in this feed is a kind:1.
+    try testing.expect(tagNamed(tags, "k") == null);
+}
+
+test "reposting fills the icon at once but leaves the count to the crowd" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x45} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x47} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "pass it on");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    try testing.expect(!main.engagementFor(id).reposted_by_me);
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+
+    try testing.expect(main.engagementFor(id).reposted_by_me);
+    // NOT the count. Our own kind:6 arrives through the same subscription as
+    // everybody else's and is counted there; adding one here would show two.
+    try testing.expectEqual(@as(u32, 0), main.engagementFor(id).reposts);
+}
+
+test "a guest reaching for repost is remembered rather than dropped" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x49} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "hello");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+    try testing.expectEqual(id, model.pending.repost);
+    try testing.expect(model.joining);
+    // Nothing published, so nothing claims to have been reposted.
+    try testing.expect(!main.engagementFor(id).reposted_by_me);
+}
+
+test "reposting twice is one repost" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x4B} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4D} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "once");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+    main.clearLastPublishedTagsForTest();
+    // The second press publishes nothing. There is no un-repost (Jumble simply
+    // disables the button, NDK offers none), so a second press must not send a
+    // duplicate either.
+    main.update(&model, Msg{ .repost = id }, &fx);
+    try testing.expectEqual(@as(usize, 0), main.lastPublishedTagsForTest().len);
+    try testing.expect(main.engagementFor(id).reposted_by_me);
+}
+
+test "a repost carries the note it repeats, so a reader needs no second fetch" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4F} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/repost.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "the words being repeated");
+    _ = try store.ingest(arena, ev, .{});
+
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // With the store in hand, the content is the reposted event itself. NIP-18
+    // says it should be, and Jumble and NDK both put it there, which is what
+    // lets a reader who has never seen the note render it without asking.
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    const content = main.repostContent(arena, &note);
+    try testing.expect(std.mem.indexOf(u8, content, "the words being repeated") != null);
+    try testing.expect(std.mem.startsWith(u8, content, "{\"id\":\""));
+    try testing.expect(std.mem.indexOf(u8, content, "\"sig\":\"") != null);
+
+    // And with no store it is empty rather than wrong. An empty content is
+    // legal, and is what those clients fall back to as well; a note the store
+    // has lost still reposts, it just costs the reader a fetch.
+    main.setStoreForTest(null);
+    try testing.expectEqualStrings("", main.repostContent(arena, &note));
+}

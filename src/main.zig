@@ -6385,6 +6385,15 @@ const Counts = struct {
     reposts: u32 = 0,
     likes: u32 = 0,
     zap_msat: u64 = 0,
+    /// Whether one of those reposts is ours.
+    ///
+    /// Read out of the crowd rather than kept in a table of our own, which is
+    /// what a like needs: an un-like has to name the exact reaction it deletes,
+    /// so that id is remembered locally. A repost has no undo (see `repost`), so
+    /// the only question is whether ours is in there, and the subscription that
+    /// counts them already carries the answer. It also means the filled icon
+    /// survives a relaunch, and is true for a repost sent from another client.
+    reposted_by_me: bool = false,
 };
 const Engagement = struct {
     used: bool = false,
@@ -7707,7 +7716,12 @@ fn countEngagement(ev: nostr.event.Event, feed_ids: []const i64) void {
     if (!markSeen(idPrefix(ev.id))) return;
     switch (ev.kind) {
         1 => row.counts.replies += 1,
-        6, 16 => row.counts.reposts += 1,
+        6, 16 => {
+            row.counts.reposts += 1;
+            if (activePubkey()) |me| {
+                if (std.mem.eql(u8, &ev.pubkey, &me)) row.counts.reposted_by_me = true;
+            }
+        },
         7 => row.counts.likes += 1,
         9735 => row.counts.zap_msat +|= zapMsat(ev),
         else => {},
@@ -8070,6 +8084,7 @@ pub const Intent = union(enum) {
     none,
     post,
     like: i64,
+    repost: i64,
     reply: i64,
     follow: [32]u8,
 
@@ -11911,6 +11926,7 @@ pub const Msg = union(enum) {
     /// a guest reached for it, 1 follow, 2 unfollow.
     follow_author: u8,
     /// Opens a person as a level of their own.
+    repost: i64,
     open_person: [32]u8,
     /// Follow or unfollow the person whose profile is open: 1 follow, 2 unfollow.
     follow_person: u8,
@@ -12064,7 +12080,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -13453,6 +13469,10 @@ fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
             std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your like is waiting."
         else
             "Your like is waiting.",
+        .repost => |id| if (model.noteById(id)) |note|
+            std.fmt.allocPrint(ui.arena, "Your repost of {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your repost is waiting."
+        else
+            "Your repost is waiting.",
         .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personLabel(ui, personName(ui, pk))}) catch "Your follow is waiting.",
     };
 }
@@ -13484,6 +13504,7 @@ fn pendingGlyph(ui: *AppUi, model: *const Model) AppUi.Node {
         .none, .post => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "edit"),
         .reply => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "reply"),
         .like => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_like } }, "like"),
+        .repost => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_success } }, "repeat"),
         .follow => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "plus"),
     };
 }
@@ -19341,7 +19362,7 @@ fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: b
             .style = .{ .quiet_hover = true },
             .semantics = .{ .role = .button, .label = "Reply" },
         })),
-        verbSlot(ui, verbWithCount(ui, ui.icon(glyph, "repeat"), if (counts) c.reposts else 0, p.text_metric, .{})),
+        verbSlot(ui, repostAction(ui, note, c, counts)),
         verbSlot(ui, likeAction(ui, note, counts)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
@@ -19438,6 +19459,19 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
+    });
+}
+
+/// The repost verb: pressable, and tinted once it is ours.
+///
+/// The tint is the same success green a repost notification uses, so the one
+/// colour means the same thing in both places.
+fn repostAction(ui: *AppUi, note: *const Note, c: Counts, counts: bool) AppUi.Node {
+    const tint = if (c.reposted_by_me) theme.palette.status_success else theme.palette.text_metric;
+    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts) c.reposts else 0, tint, .{
+        .style = .{ .quiet_hover = true },
+        .on_press = Msg{ .repost = note.id },
+        .semantics = .{ .role = .button, .label = if (c.reposted_by_me) "Reposted" else "Repost", .focusable = true },
     });
 }
 
@@ -21506,6 +21540,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},
         .like => |note_id| toggleLike(model, fx, note_id),
+        .repost => |note_id| repost(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
         .open_event => |id| {
             // The sheet closes on the PRESS, before the navigation is attempted,
@@ -23062,6 +23097,44 @@ fn buildLikeTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event
     return tags;
 }
 
+/// The NIP-18 tags on a repost: `["e", id, "", author]` and `["p", author]`.
+///
+/// Read off Jumble (`src/lib/draft-event.ts:126` `createRepostDraftEvent`, whose
+/// `buildETag(event.id, event.pubkey)` puts the author in the e-tag's fourth
+/// field) and NDK (`core/src/events/repost.ts`, which tags the event and then
+/// adds `k` only for a kind other than 1). Both send the e-tag and the p-tag and
+/// no `k` for a kind:1, which is every note Plaza's feed holds, so there is no
+/// `k` here and no kind:16.
+///
+/// The empty third field is the relay hint. It is empty rather than absent
+/// because the author sits in the fourth, and dropping the hint would move the
+/// pubkey into the hint's place and tell every reader to dial it as a relay.
+fn buildRepostTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, note.event_id) orelse return null;
+    const author_hex = hexAlloc(gpa, note.pubkey) orelse return null;
+    const e = gpa.dupe([]const u8, &.{ "e", id_hex, "", author_hex }) catch return null;
+    const p = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return null;
+    const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
+    tags[0] = e;
+    tags[1] = p;
+    return tags;
+}
+
+/// The reposted note itself, as JSON, which is what NIP-18 says the content
+/// should carry and what both clients above put there. A reader that has never
+/// seen the note can render it from this without going and asking for it.
+///
+/// Empty when the note is not in the store, which is legal and is what those
+/// clients fall back to as well. Plaza reads its own feed out of the store, so
+/// it is normally there; a note that has been evicted still reposts, it just
+/// costs the reader a fetch.
+pub fn repostContent(gpa: std.mem.Allocator, note: *const Note) []const u8 {
+    const store = g_store orelse return gpa.dupe(u8, "") catch "";
+    var se = (store.getEvent(gpa, note.event_id) catch null) orelse return gpa.dupe(u8, "") catch "";
+    defer se.deinit();
+    return nostr.event.toJson(gpa, se.event) catch gpa.dupe(u8, "") catch "";
+}
+
 /// The NIP-09 deletion tags to un-like: `["e", reaction_id]`, `["k", "7"]`.
 fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.event.Tag {
     const id_hex = hexAlloc(gpa, reaction_id) orelse return null;
@@ -23104,6 +23177,51 @@ fn like(model: *const Model, fx: *Effects, note_id: i64) void {
     signAndPublish(fx, gpa, created, 7, tags, content, false);
 }
 
+/// Publishes a kind:6 repost, and fills the icon at once.
+///
+/// One way, on purpose. Jumble disables its button once you have reposted
+/// (`RepostButton.tsx`, `canRepost = !hasReposted && …`) and NDK offers no undo
+/// at all; a like has one here only because an un-like has a reaction id to
+/// name in a kind:5, and every reader treats a deleted repost differently
+/// anyway. Pressing again is a no-op rather than a second repost.
+fn repost(model: *Model, fx: *Effects, note_id: i64) void {
+    if (model.is_guest()) {
+        model.pending = .{ .repost = note_id };
+        model.joining = true;
+        return;
+    }
+    if (!signerReady()) return;
+    if (engagementFor(note_id).reposted_by_me) return;
+    const note = model.noteById(note_id) orelse return;
+    const gpa = std.heap.page_allocator;
+    const tags = buildRepostTags(gpa, note) orelse return;
+    const content = repostContent(gpa, note);
+    // Filled before the signature comes back, the same way a like is. Our own
+    // kind:6 arrives through the engagement subscription a moment later and sets
+    // the same flag from the crowd, so this only covers the gap.
+    markRepostedByMe(note_id);
+    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false);
+}
+
+/// Sets the "ours" flag on a note's row before the crowd confirms it.
+///
+/// The FLAG only. Not the count, which is the part a like has to work at: a like
+/// shows an optimistic +1 and then has to retire it, which is why it remembers
+/// its reaction id and why `likeCountFor` subtracts. Adding one here would be
+/// added again a moment later, because our own kind:6 arrives through the same
+/// engagement subscription as everybody else's and `markSeen` is keyed by event
+/// id, so that fold is the first time that id has been seen and it counts.
+///
+/// So the icon fills at once and the number moves when the repost is really out.
+/// That is the honest pair: the icon is about what you did, the number is about
+/// what has been seen.
+fn markRepostedByMe(note_id: i64) void {
+    engagementLock();
+    defer engagementUnlock();
+    const row = ensureEngagement(note_id) orelse return;
+    row.counts.reposted_by_me = true;
+}
+
 /// Publishes a kind:5 deletion of our own reaction and empties the heart at once.
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
@@ -23134,6 +23252,11 @@ fn drivePendingIntent(model: *Model, fx: *Effects) void {
             if (isLiked(id)) return;
             like(model, fx, id);
             setToast(model, "Liked");
+        },
+        .repost => |id| {
+            if (engagementFor(id).reposted_by_me) return;
+            repost(model, fx, id);
+            setToast(model, "Reposted");
         },
         .follow => |pk| {
             // The follow-safety gate still applies: this publishes a replaceable
