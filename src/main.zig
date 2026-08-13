@@ -7946,6 +7946,96 @@ const QuoteRef = struct {
     len: u16 = 0,
 };
 
+/// How many mentions in one note can be pressed. Past this they still render as
+/// `@name`, they just do not open anything, which is the mild end of a note
+/// tagging a crowd.
+const note_max_mentions = 8;
+
+/// The cap, for a test that has to build a note carrying more than it.
+pub const noteMaxMentionsForTest = note_max_mentions;
+
+/// The link payload a mention span carries: `mention_link_tag` followed by the
+/// raw 32-byte pubkey.
+///
+/// Not a URL, and not meant to be read as one. A paragraph has exactly one link
+/// handler, so a mention and an ordinary `https://` link arrive at the same
+/// place and have to be told apart once they are there. The tag's second byte is
+/// zero, which no URL contains, so nothing a stranger can write in a note will
+/// be mistaken for a mention.
+///
+/// Carrying the pubkey rather than spelling it back out as `nostr:npub1…` is
+/// what keeps this cheap: the text form is 69 bytes per mention in every note
+/// the feed holds, and would then have to be decoded again on the press.
+const mention_link_tag = "p\x00";
+const mention_link_len = mention_link_tag.len + 32;
+
+/// One rendered NIP-27 mention: where its `@name` landed, and who it names.
+pub const MentionRef = struct {
+    /// Byte range of the label inside the note's `content_buf`.
+    off: u16 = 0,
+    len: u16 = 0,
+    link_buf: [mention_link_len]u8 = [_]u8{0} ** mention_link_len,
+
+    /// The payload for this mention's span. Borrowed from the note, which
+    /// outlives the frame that built the span, for the same reason the link
+    /// card's URL is: the press message holds the slice, and the opener reads it
+    /// after the arena that drew the frame is gone.
+    pub fn link(self: *const MentionRef) []const u8 {
+        return &self.link_buf;
+    }
+};
+
+/// The mentions of one note, filled in as its content is rendered.
+pub const MentionList = struct {
+    refs: [note_max_mentions]MentionRef = [_]MentionRef{.{}} ** note_max_mentions,
+    len: u8 = 0,
+
+    pub fn all(self: *const MentionList) []const MentionRef {
+        return self.refs[0..self.len];
+    }
+
+    fn record(self: *MentionList, off: usize, len: usize, pubkey: [32]u8) void {
+        if (self.len == self.refs.len) return;
+        const ref = &self.refs[self.len];
+        ref.off = std.math.cast(u16, off) orelse return;
+        ref.len = std.math.cast(u16, len) orelse return;
+        @memcpy(ref.link_buf[0..mention_link_tag.len], mention_link_tag);
+        @memcpy(ref.link_buf[mention_link_tag.len..], &pubkey);
+        self.len += 1;
+    }
+
+    /// Moves every offset back by the leading whitespace a trim removed, and
+    /// drops anything the trim cut into.
+    ///
+    /// The trim runs after the whole note is rendered, and it can shift the
+    /// buffer left, so offsets recorded during the walk describe the buffer as
+    /// it was rather than as it ends up. A note that is nothing but a mention
+    /// and some spaces is the ordinary case here, not a contrived one: lifting
+    /// an image URL out of the text is exactly what strands that whitespace.
+    fn rebase(self: *MentionList, lead: usize, len: usize) void {
+        var kept: u8 = 0;
+        for (self.refs[0..self.len]) |ref| {
+            if (ref.off < lead) continue;
+            const off = ref.off - lead;
+            if (off + ref.len > len) continue;
+            self.refs[kept] = ref;
+            self.refs[kept].off = @intCast(off);
+            kept += 1;
+        }
+        self.len = kept;
+    }
+};
+
+/// The pubkey behind a mention's link payload, or null if this is an ordinary
+/// link that should go to the browser instead.
+pub fn mentionLinkPubkey(link: []const u8) ?[32]u8 {
+    if (link.len != mention_link_len) return null;
+    if (!std.mem.startsWith(u8, link, mention_link_tag)) return null;
+    var pubkey: [32]u8 = undefined;
+    @memcpy(&pubkey, link[mention_link_tag.len..]);
+    return pubkey;
+}
+
 /// The verb a guest reached for, held until they have a key.
 pub const Intent = union(enum) {
     none,
@@ -8017,6 +8107,12 @@ pub const Note = struct {
     // `content_buf` so the body can split around it and render an embedded quote
     // card. `.none` when the note quotes nothing.
     quote: QuoteRef = .{},
+    // Where each `@name` in the rendered content sits, and whom it names, so a
+    // press on one can open that profile. The pubkey is gone from the text by
+    // the time it is drawn: rewriting `nostr:npub1…` into a readable name is
+    // what makes the note legible, and it is also what threw away the only
+    // thing a press could have acted on.
+    mentions: MentionList = .{},
     // The NIP-10 parent this note answers (the `e` tag marked `reply`, or the
     // thread root for a direct reply), extracted once at parse time so a thread
     // can seat each reply under the note it answers. Zero when it answers
@@ -10873,7 +10969,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
-    note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
+    note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, image_url, &note.mentions));
 
     // The first plain link, for the preview card. Read from the ORIGINAL content:
     // the rendered copy has mentions rewritten and may be capped.
@@ -11507,6 +11603,13 @@ pub fn firstImageUrl(content: []const u8) ?[]const u8 {
 /// Plain text is copied one whole codepoint at a time and stops at `dst`'s
 /// capacity, so the buffer never ends mid-sequence. Returns the byte length.
 pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
+    return renderContentInto(dst, src, omit, null);
+}
+
+/// The same, recording where each mention's label landed into `mentions` when
+/// one is given. A note wants that table so the label can be pressed; a profile's
+/// "about" text is rendered the same way and has nowhere to put one.
+pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const u8, mentions: ?*MentionList) usize {
     // Mention decoding needs an allocator for bech32 scratch; a stack buffer
     // covers it without touching the heap for every note parsed. A pathological
     // mention that will not fit simply stays as its raw token.
@@ -11524,7 +11627,11 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
         if (parseMentionAt(arena, src, i)) |m| {
             var label_buf: [80]u8 = undefined;
             const label = mentionLabel(m.pubkey, &label_buf);
+            // Before the copy, so a label that does not fit is not recorded as
+            // one that did: the break below leaves the buffer ending where the
+            // last whole thing ended.
             if (out + label.len > dst.len) break;
+            if (mentions) |list| list.record(out, label.len, m.pubkey);
             @memcpy(dst[out..][0..label.len], label);
             out += label.len;
             i = m.end;
@@ -11540,6 +11647,7 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
     // Lifting a URL out can leave whitespace stranded at either edge.
     const trimmed = std.mem.trim(u8, dst[0..out], " \t\r\n");
     if (trimmed.len != out) {
+        if (mentions) |list| list.rebase(@intFromPtr(trimmed.ptr) - @intFromPtr(dst.ptr), trimmed.len);
         std.mem.copyForwards(u8, dst[0..trimmed.len], trimmed);
         return trimmed.len;
     }
@@ -16285,7 +16393,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
 /// cut is made in the SPANS: building them from the whole text first keeps a
 /// mention reading as `@name` rather than as half of a bech32 token.
 fn ancestorBody(ui: *AppUi, note: *const Note) AppUi.Node {
-    const spans = clampSpansToLines(ui, contentSpans(ui, note.content()), ancestor_body_lines);
+    const spans = clampSpansToLines(ui, noteSpans(ui, note, note.content()), ancestor_body_lines);
     return textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
 }
 
@@ -19407,25 +19515,25 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
     const has_card = q.kind == .event and card_end <= cut;
 
     // Fast path unchanged: a plain note with no fold is exactly one paragraph.
-    if (!has_card and !long) return textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
+    if (!has_card and !long) return textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
 
     var kids: [5]AppUi.Node = undefined;
     var n: usize = 0;
     if (has_card) {
         const head = std.mem.trim(u8, full[0..q.off], " \t\r\n");
         if (head.len > 0) {
-            kids[n] = textParaAt(ui, contentSpans(ui, head), scale, ink);
+            kids[n] = textParaAt(ui, noteSpans(ui, note, head), scale, ink);
             n += 1;
         }
         kids[n] = quoteRule(ui, q.id);
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
         if (tail.len > 0) {
-            kids[n] = textParaAt(ui, contentSpans(ui, tail), scale, ink);
+            kids[n] = textParaAt(ui, noteSpans(ui, note, tail), scale, ink);
             n += 1;
         }
     } else {
-        kids[n] = textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
+        kids[n] = textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
         n += 1;
     }
     if (long) {
@@ -19519,7 +19627,7 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
 /// of filling the column beside the rule, it wrapped at about half the width the
 /// shot gives it and read as a column of its own rather than an aside.
 fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
-    const spans = clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines);
+    const spans = clampSpansToLines(ui, noteSpans(ui, note, note.content()), quote_body_lines);
     var node = textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
     node.widget.semantics.label = "Quoted note body";
     return node;
@@ -19992,6 +20100,22 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
 /// copied. A paragraph holds at most 32 runs, so a link-heavy note keeps its
 /// tail as one plain run rather than losing it.
 pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
+    return contentSpansIn(ui, text, &.{}, 0);
+}
+
+/// Spans for a piece of a note's rendered content, with its mentions pressable.
+///
+/// `mentions` are the note's, whose offsets are relative to the whole of
+/// `content_buf`; `base` is where `text` starts inside it. The body splits
+/// around a quote card and trims what is left, so what reaches one paragraph is
+/// usually a piece rather than the whole.
+///
+/// A recorded mention is authoritative and is checked before anything else. That
+/// is not only about the link: the `@` heuristic below reads a mention as ending
+/// at the first space, so `@Sepehr Safari` was styled as far as `@Sepehr` and the
+/// surname fell out of the run. A recorded range knows exactly how long the label
+/// is because it is what wrote it.
+pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef, base: usize) []const canvas.TextSpan {
     const max_spans = 32;
     if (text.len == 0) return &.{};
     const spans = ui.arena.alloc(canvas.TextSpan, max_spans) catch return &.{};
@@ -19999,7 +20123,35 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
     var n: usize = 0;
     var i: usize = 0;
     var plain_start: usize = 0;
+    // Mentions are recorded as the content is walked, so the table is in offset
+    // order, and this walk is in offset order too: one cursor covers it. Scanning
+    // the whole table at every byte would multiply the per-byte work in this loop
+    // by the number of mentions, and this loop runs over every note on screen.
+    // A piece of the body can start part-way in, so the cursor skips what is
+    // behind it rather than assuming it starts at the first.
+    var next: usize = 0;
     while (i < text.len) {
+        while (next < mentions.len and mentions[next].off < base + i) next += 1;
+        // A label straddling the end of this piece is passed over rather than
+        // clipped: the fold cuts the text at a character count, so the last
+        // mention before it can be half-present, and half a name is not
+        // something to make pressable.
+        if (next < mentions.len and mentions[next].off == base + i and mentions[next].len <= text.len - i) {
+            const ref = &mentions[next];
+            if (n + 2 > max_spans) break;
+            if (i > plain_start) {
+                spans[n] = .{ .text = text[plain_start..i] };
+                n += 1;
+            }
+            // The same colour and weight the heuristic gives a mention, plus the
+            // payload that makes it go somewhere. The renderer underlines every
+            // span carrying a link, so this reads as pressable without asking.
+            spans[n] = .{ .text = text[i..][0..ref.len], .color = .info, .weight = .medium, .link = ref.link() };
+            n += 1;
+            i += ref.len;
+            plain_start = i;
+            continue;
+        }
         const is_url = std.mem.startsWith(u8, text[i..], "https://") or std.mem.startsWith(u8, text[i..], "http://");
         const is_mention = text[i] == '@' and i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1]);
         // A hashtag is `#` + word characters at a word boundary, so `C#` and a
@@ -20053,6 +20205,17 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
         n += 1;
     }
     return spans[0..n];
+}
+
+/// Spans for a sub-slice of `note`'s content, with the note's mentions mapped
+/// onto it. `text` must be a piece of `note.content()`; anything else falls back
+/// to the plain reading, since the offsets would mean nothing.
+fn noteSpans(ui: *AppUi, note: *const Note, text: []const u8) []const canvas.TextSpan {
+    const whole = note.content();
+    const start = @intFromPtr(text.ptr);
+    const first = @intFromPtr(whole.ptr);
+    if (start < first or start + text.len > first + whole.len) return contentSpans(ui, text);
+    return contentSpansIn(ui, text, note.mentions.all(), start - first);
 }
 
 /// The height a note's picture occupies, whether or not it has loaded. Taken
@@ -20868,11 +21031,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending = .post;
             } else model.composing = true;
         },
-        .open_person => |pk| {
-            model.notifications_return = model.notifications_open;
-            model.notifications_open = false;
-            enterProfile(model, pk);
-        },
+        .open_person => |pk| openPerson(model, pk),
         .follow_person => |direction| {
             if (model.is_guest()) {
                 // REMEMBERED, not merely gated. This press used to open the sheet
@@ -21261,7 +21420,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
         .link_fetched => |response| handleLinkFetched(response),
-        .open_url => |url| openExternally(fx, url),
+        // A paragraph carries one link handler, so a mention arrives here beside
+        // the ordinary links. Its payload is not a URL and never reaches the
+        // browser; see `mention_link_tag`.
+        .open_url => |url| {
+            if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
+        },
         .expand_image => |note_id| model.expanded_note = note_id,
         .load_image => |note_id| {
             askForMedia(note_id);
@@ -21372,6 +21536,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// where it was and no reason at all. The most ordinary one is pressing Follow
 /// in the first seconds after opening the app, before this account's own list
 /// has come back from the relays.
+/// Open somebody's profile, remembering whether the notifications sheet was what
+/// we came from so closing it returns there rather than to the feed.
+fn openPerson(model: *Model, pubkey: [32]u8) void {
+    model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+    enterProfile(model, pubkey);
+}
+
 fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
     switch (outcome) {
         .published => if (following) setToast(model, "Following"),

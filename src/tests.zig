@@ -15869,3 +15869,202 @@ test "a relay carrying only people the pool already covers twice is not dialled"
     try testing.expect(saw_only_here);
     try testing.expect(!saw_redundant);
 }
+
+// -- A mention is a person, and pressing one says so --------------------------
+
+test "rendering a mention records where its label landed and whom it names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{7} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"jack\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hey nostr:{s} welcome", .{npub});
+    const n = main.renderContentInto(&buf, src, "", &mentions);
+
+    try testing.expectEqualStrings("hey @jack welcome", buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), mentions.all().len);
+    const ref = mentions.all()[0];
+    // The recorded range is the label in the RENDERED buffer, not the token in
+    // the source: the pubkey is gone from the text by then, which is the whole
+    // reason this table exists.
+    try testing.expectEqualStrings("@jack", buf[ref.off..][0..ref.len]);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(ref.link()).?));
+}
+
+test "a mention's link payload is a person and an http link is not" {
+    const pk = [_]u8{9} ** 32;
+    var mentions = main.MentionList{};
+    var buf: [64]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const npub = try nostr.nip19.encodeNpub(arena_state.allocator(), pk);
+    const src = try std.fmt.allocPrint(arena_state.allocator(), "nostr:{s}", .{npub});
+    _ = main.renderContentInto(&buf, src, "", &mentions);
+
+    try testing.expect(main.mentionLinkPubkey(mentions.all()[0].link()) != null);
+    // Everything a paragraph's one link handler can otherwise be given. The two
+    // share a message, so telling them apart is not a nicety: getting it wrong
+    // means either a profile press shelling out to the browser, or a stranger's
+    // URL being read as thirty-two bytes of pubkey.
+    try testing.expect(main.mentionLinkPubkey("https://example.com/x") == null);
+    try testing.expect(main.mentionLinkPubkey("") == null);
+    // Exactly the payload's length, and starting with the same letter, and still
+    // not a mention, because the byte after it is not zero.
+    try testing.expect(main.mentionLinkPubkey("p" ++ ("a" ** 33)) == null);
+    // Carrying the tag is not enough either. Without the length checked first,
+    // these two read a pubkey out of a buffer that is not one: the short one
+    // reaches past its end, and the long one takes the wrong thirty-two bytes.
+    try testing.expect(main.mentionLinkPubkey("p\x00short") == null);
+    try testing.expect(main.mentionLinkPubkey("p\x00" ++ ("z" ** 40)) == null);
+}
+
+test "a mention with a space in the name is one pressable span, not two" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena);
+
+    const pk = [_]u8{11} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"Sepehr Safari\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "gm nostr:{s} o/", .{npub});
+    const n = main.renderContentInto(&buf, src, "", &mentions);
+    const text = buf[0..n];
+
+    const spans = main.contentSpansIn(&ui, text, mentions.all(), 0);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try testing.expectEqualStrings("gm ", spans[0].text);
+    // The `@`-to-first-space heuristic reads this as `@Sepehr` and leaves the
+    // surname behind as plain text. The recorded range knows how long the label
+    // is because it is what wrote it.
+    try testing.expectEqualStrings("@Sepehr Safari", spans[1].text);
+    try testing.expectEqualStrings(" o/", spans[2].text);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(spans[1].link).?));
+}
+
+test "an offset recorded before the trim still points at the label after it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{13} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"ana\"}");
+
+    // The picture is lifted out of the text and drawn as a picture, which is
+    // what strands the whitespace the trim then removes, and the trim shifts
+    // everything after it to the left.
+    const image = "https://example.com/a.jpg";
+    const src = try std.fmt.allocPrint(arena, "{s} nostr:{s}", .{ image, npub });
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const n = main.renderContentInto(&buf, src, image, &mentions);
+
+    try testing.expectEqualStrings("@ana", buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), mentions.all().len);
+    const ref = mentions.all()[0];
+    try testing.expectEqual(@as(u16, 0), ref.off);
+    try testing.expectEqualStrings("@ana", buf[ref.off..][0..ref.len]);
+}
+
+test "mentions map onto a piece of the content, not only the whole of it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena);
+
+    const pk = [_]u8{17} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"bo\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hello nostr:{s}", .{npub});
+    const n = main.renderContentInto(&buf, src, "", &mentions);
+    const text = buf[0..n];
+
+    // What a body does when it splits around a quote card: the paragraph after
+    // the rule is handed a slice starting part-way in, and the offsets recorded
+    // against the whole have to be read relative to that.
+    const tail_at: usize = 6;
+    const spans = main.contentSpansIn(&ui, text[tail_at..], mentions.all(), tail_at);
+    try testing.expectEqual(@as(usize, 1), spans.len);
+    try testing.expectEqualStrings("@bo", spans[0].text);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(spans[0].link).?));
+
+    // And with the offset NOT applied, the same mention is not found, so the
+    // check above is testing the rebasing rather than passing for free.
+    const wrong = main.contentSpansIn(&ui, text[tail_at..], mentions.all(), 0);
+    try testing.expect(wrong.len == 0 or main.mentionLinkPubkey(wrong[0].link) == null);
+}
+
+test "past the cap a mention still reads as a name, it just does not open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var src = std.ArrayList(u8).empty;
+    defer src.deinit(arena);
+    const over = main.noteMaxMentionsForTest + 1;
+    for (0..over) |i| {
+        // A fill no other test names, so none of these has a cached display name
+        // and every one of them renders as `@npub1…`. The profile cache is
+        // global, and counting labels only works if they all look the same.
+        var pk = [_]u8{0xA5} ** 32;
+        pk[31] = @intCast(i);
+        const npub = try nostr.nip19.encodeNpub(arena, pk);
+        try src.print(arena, "nostr:{s} ", .{npub});
+    }
+
+    var buf: [2048]u8 = undefined;
+    var mentions = main.MentionList{};
+    const n = main.renderContentInto(&buf, src.items, "", &mentions);
+
+    // Every one of them is rendered.
+    try testing.expectEqual(over, std.mem.count(u8, buf[0..n], "@npub1"));
+    // The table holds what it can hold, and nothing beyond it is claimed.
+    try testing.expectEqual(main.noteMaxMentionsForTest, mentions.all().len);
+
+    // And they are in offset order. The span walk reads the table with a single
+    // cursor rather than searching it at every byte, which is only correct
+    // because recording happens as the content is walked. Nothing else in the
+    // code says so out loud, so it is said here.
+    var previous: u16 = 0;
+    for (mentions.all(), 0..) |ref, k| {
+        if (k > 0) try testing.expect(ref.off > previous);
+        previous = ref.off;
+    }
+}
+
+test "pressing a mention opens that profile, and pressing a link does not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{19} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hi nostr:{s}", .{npub});
+    _ = main.renderContentInto(&buf, src, "", &mentions);
+
+    var model = Model{};
+    var fx: main.EffectsForTest = undefined;
+    // The message a paragraph sends for ANY link it carries, which is the whole
+    // reason the payload has to say which kind it is.
+    main.update(&model, Msg{ .open_url = mentions.all()[0].link() }, &fx);
+    try testing.expect(model.viewing_profile != null);
+    try testing.expectEqualSlices(u8, &pk, &model.viewing_profile.?);
+}
