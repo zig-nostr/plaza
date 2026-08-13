@@ -1,16 +1,22 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.4.1
+### What's new in v0.5.0
 
-**A relay that will not have you no longer keeps a connection to itself.** v0.4.0 picks the relays it connects to by how many of the people you follow write there. That says which relays carry them; it does not say which will talk to you, and those are not the same set. A paid relay refuses the connection itself, before any Nostr message is exchanged, so there is nothing to negotiate and no error anybody could see: it simply held one of the eight routed slots, dialling and failing, while the coverage counter reported its writers as reached.
+**Mentions are people again.** A `nostr:npub…` in a note has always been drawn as `@name`, which is what makes a note readable and was also what threw away the only thing a press could have acted on. Pressing one now opens that profile. It fixes something visible on the way: a display name of two words was styled as far as the first word only, because the old reading of a mention stopped at the first space.
 
-Plaza now sets such a relay aside after three failed connections and spends the slot on the next one down, trying it again six hours later. Three and not one, because a handshake also fails for a blip. Relays you added yourself are never dropped this way; they keep retrying however badly they behave, because quietly abandoning your own relay is the opposite of what you asked for.
+**You can repost.** The icon has carried a real count and no action since the row was drawn. It sends now, built to what other clients actually send rather than to a reading of the spec: kind:6 for a kind:1, the reposted note carried in the content so a reader who has never seen it does not have to go and ask, and an `e` tag whose empty relay-hint field is load-bearing. There is no un-repost, which is what the clients that have thought about it do.
 
-On the account this was measured on, that moved the coverage figure from 202 to **196**, and the smaller number is the true one: fifty of those people had been behind a closed door, and the freed slot went somewhere that answers.
+**Your mute list works.** Plaza had never read one, so somebody muted years ago in whatever client you came from was still in the feed here, still able to ring the bell, and still under every thread. It reads NIP-51's mute list now and honours it in the feed, in threads and in notifications, and you can mute and unmute from a profile.
 
-**Under it: the protocol library is now built with its safety checks on.** Zig compiles bounds, overflow and cast checks out of the mode Plaza ships. That is the right trade for the code that draws a frame and the wrong one for the code that parses bytes a stranger sent, so the two are now built differently: `nostr` gets the checks, Plaza's own render path keeps the speed. Measured, it costs nothing you can see. Building the whole app that way was measured too, and it costs a great deal: the feed rebuild goes from 290 to 852 microseconds.
+Writing that list is the careful part, because it is a replaceable record: publishing one replaces what you have muted everywhere at once. Plaza will not write one it has not read back first, and says so rather than sitting there doing nothing. Everything it does not itself understand is carried through untouched, including muted words and hashtags set in another client, and including the private half. If your mute list has private entries Plaza cannot read, it refuses the write rather than publishing over them.
 
-Also: `seed-feed`, a tool that fabricates a feed for the frame-budget harness, was riding along inside the app bundle in v0.3.0 and v0.4.0. It is gone, and packaging now refuses a bundle carrying anything Plaza does not run.
+**A client you can make quiet.** Reaction counts, repost counts and zap totals can each be taken away, in Settings, under QUIET. The part that makes this more than a switch: what you hide, the feed stops asking relays for. Hide reaction counts and it stops requesting them, so it is less bandwidth, less parsing and a smaller store rather than a number painted over. Your notifications are a separate subscription and keep working, so you still hear when somebody reacts to your own note. One of the three says plainly that hiding it changes only what is drawn, because knowing whether you reposted something comes down the same stream as everybody else's reposts.
+
+Everything hideable is listed on that screen whether or not it is hidden, which is the point of it: hide something in the feed and there is nothing left there to press to get it back.
+
+**Underneath: the checks stay on where the bytes are not ours.** Plaza ships in a mode that compiles out Zig's bounds, overflow and cast checks. That is the right trade for the code drawing a frame and the wrong one for code parsing bytes a stranger sent, so the parsing this app does for itself now keeps its checks: note content, mentions, quote spans, image metadata, blurhashes, profile bodies, the head of a fetched page. Measured, it costs nothing you can see. It has already caught one real bug in this release.
+
+The vendored image decoders are C and no Zig setting reaches them, so what stands in front of them is a size check on what they hand back, before anything multiplies two numbers that came out of a stranger's file.
 
 ### Install
 
