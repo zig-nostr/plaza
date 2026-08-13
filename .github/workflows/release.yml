@@ -54,11 +54,43 @@ jobs:
       - name: Zip the .app (ditto preserves the signature)
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Plaza.app" "Plaza-${{ github.ref_name }}-macos.zip"
 
+      # The tag and the manifest have to agree, and this is the last place that
+      # can be checked. `app.zon` is where the app reads its own version from, so
+      # tagging v0.5.0 on a tree that still says 0.4.1 ships a build that tells
+      # people in Settings that they are running the previous release. That has
+      # happened here before, from the other direction: the version was typed
+      # twice and Settings was two releases stale until build.zig started reading
+      # the manifest instead.
+      - name: The tag and app.zon must agree
+        run: |
+          manifest="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' app.zon | head -1)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tagged" ]; then
+            echo "tag $GITHUB_REF_NAME says $tagged, app.zon says $manifest" >&2
+            exit 1
+          fi
+          echo "both say $manifest"
+
+      # `create` for a new tag, `upload --clobber` for one that already has a
+      # release. Re-running this job is otherwise a red X on work that succeeded,
+      # and the re-run is exactly what somebody reaches for when a publish failed
+      # halfway.
+      #
+      # This does not weaken the rule above it. Both suites gate this step, so
+      # nothing arrives here that has not passed them on the tag's own source. A
+      # release created by hand, which is the other way to reach this branch, has
+      # its artifact REPLACED by the one built here, which is the right way round:
+      # the tested artifact wins.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "${{ github.ref_name }}"
-          "Plaza-${{ github.ref_name }}-macos.zip"
-          --title "Plaza ${{ github.ref_name }}"
-          --notes-file .github/RELEASE_NOTES.md
+        run: |
+          asset="Plaza-${GITHUB_REF_NAME}-macos.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release exists; replacing its artifact with the one built here"
+            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" \
+              --title "Plaza $GITHUB_REF_NAME" \
+              --notes-file .github/RELEASE_NOTES.md
+          fi
