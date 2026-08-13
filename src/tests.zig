@@ -16575,3 +16575,124 @@ test "a muted person's reply is hidden, but the thread they are in still opens" 
     main.refreshThreadNotesForTest(&model, 1_800_000_300);
     try testing.expectEqualStrings("the opening note", model.thread_root.content());
 }
+
+// -- A client you can make quiet ----------------------------------------------
+
+test "hiding a count stops the app asking relays for it" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Everything on: replies, reposts, reactions, zaps.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    // This is the whole feature. Taking the number away has to take the REQUEST
+    // away, or it is a number painted over: the bytes still arrive, still parse,
+    // still land in the store, and the app is only pretending to be quieter.
+    main.setHidden(.reaction_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+
+    main.setHidden(.zap_totals, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+
+    // And back, so this is a preference rather than a one-way door.
+    main.setHidden(.reaction_counts, false);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7 }, main.engagementKindsForTest());
+}
+
+test "hiding repost counts does not claim to stop fetching them" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    main.setHidden(.repost_counts, true);
+    // Kind 6 stays. Whether YOU reposted something is read out of the same
+    // stream as everybody else's reposts, so dropping it would leave the repost
+    // icon unable to say it had already been pressed. The registry says so in
+    // the row's own words rather than letting the reader assume otherwise.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    for (main.hideables) |h| {
+        if (!std.mem.eql(u8, h.id, "repost_counts")) continue;
+        try testing.expectEqual(@as(usize, 0), h.drops.len);
+        try testing.expect(std.mem.indexOf(u8, h.detail, "Still fetched") != null);
+    }
+}
+
+test "every hideable has a stable id, a label and a sentence" {
+    // The ids go in a file and will go in a NIP-78 record, so a rename silently
+    // un-hides whatever somebody had already hidden. The sentence is what the
+    // settings screen shows instead of leaving a reader to guess whether hiding
+    // something stops it being downloaded.
+    for (main.hideables, 0..) |h, i| {
+        try testing.expect(h.id.len > 0);
+        try testing.expect(h.label.len > 0);
+        try testing.expect(h.detail.len > 0);
+        for (main.hideables[i + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, h.id, other.id));
+        }
+    }
+}
+
+test "the settings screen lists everything hideable, not only what is hidden" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    // Hide one, so the screen is in the state where a reader has forgotten what
+    // they did and has come looking. Every row is still here, which is the whole
+    // reason this screen exists: there is nothing left in the feed to press.
+    main.setHidden(.zap_totals, true);
+    const tree = try buildTree(arena, &model);
+    for (main.hideables) |h| {
+        try testing.expect(findAnyText(tree.root, h.label) != null);
+    }
+}
+
+test "what is hidden survives a restart, and is written by id" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("", main.hiddenLine(&buf));
+
+    main.setHidden(.reaction_counts, true);
+    main.setHidden(.zap_totals, true);
+    const line = main.hiddenLine(&buf);
+    // By NAME. A list of booleans in registry order would mean that adding an
+    // element, or reordering one, silently moves everybody's preferences onto
+    // different things.
+    try testing.expect(std.mem.indexOf(u8, line, "reaction_counts") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "zap_totals") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "repost_counts") == null);
+
+    // Round trip: what was written comes back as the same three answers.
+    var kept: [64]u8 = undefined;
+    @memcpy(kept[0..line.len], line);
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    main.applyHiddenLine(kept[0..line.len]);
+    try testing.expect(main.isTakenAway(.reaction_counts));
+    try testing.expect(main.isTakenAway(.zap_totals));
+    try testing.expect(!main.isTakenAway(.repost_counts));
+    // And the subscription is narrowed from the first frame, not once somebody
+    // opens settings.
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+}
+
+test "a settings file from a newer Plaza still opens here" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // An id this build has never heard of, beside two it has. Refusing the whole
+    // line would drop the preferences it does understand; this reader downgraded
+    // one version and should not lose the rest of their settings for it.
+    main.applyHiddenLine("reaction_counts,link_previews_from_the_future,zap_totals");
+    try testing.expect(main.isTakenAway(.reaction_counts));
+    try testing.expect(main.isTakenAway(.zap_totals));
+    try testing.expect(!main.isTakenAway(.repost_counts));
+}

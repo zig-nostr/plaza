@@ -2558,6 +2558,156 @@ const engagement_watch_cap = 128;
 const engagement_request_limit = 500;
 // What an engagement query asks for: replies, reposts, likes, zap receipts.
 const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
+
+// -------------------------------------------------- things you can take away
+//
+// A client you can make quiet.
+//
+// Every element here is one the reader can remove, and the point of the whole
+// thing is the second column: a hidden thing should not be FETCHED. Hide
+// reaction counts and the subscription stops asking relays for kind:7, so the
+// preference is less bandwidth, less parsing and a smaller store rather than a
+// number painted over. It is also what makes the claim honest. "The data is
+// absent" and "the data is covered up" are different promises, and only one of
+// them can be made about a thing that is still being downloaded.
+//
+// A registry rather than a handful of booleans on the Model, because the ids are
+// written to a file and will eventually be a NIP-78 `kind:30078` record, and
+// because the same table drives the settings list. That list is not decoration:
+// hide something, forget, and there is nothing left to right click. One screen
+// naming everything that can be hidden is how this avoids the way hide-based
+// customisation usually fails.
+//
+// Subtractive on purpose. Taking things away cannot make the app ugly or slow;
+// rearranging can, and it would mean making the feed's layout data-driven, which
+// is an architectural change rather than a preference.
+
+/// What can be hidden. The enum is the index into the registry below, so a call
+/// site is checked at compile time while the table stays data.
+pub const Hideable = enum { reaction_counts, repost_counts, zap_totals };
+
+pub const HideableInfo = struct {
+    /// Stable across releases: it is written to the settings file, so renaming
+    /// one silently un-hides whatever somebody had already hidden.
+    id: []const u8,
+    label: []const u8,
+    /// What hiding it says, in the one place a reader will look for it.
+    detail: []const u8,
+    /// The kinds the app stops asking for. Empty means hiding this one changes
+    /// what is drawn and nothing else, which has to be stated rather than
+    /// implied.
+    drops: []const u16 = &.{},
+};
+
+pub const hideables = [_]HideableInfo{
+    .{
+        .id = "reaction_counts",
+        .label = "Reaction counts",
+        .detail = "How many people liked a note. Hiding it stops Plaza asking relays for reactions at all. You can still like things; your own heart is remembered here.",
+        .drops = &.{7},
+    },
+    .{
+        // No `drops`, and this is the honest half of the feature rather than an
+        // oversight. Whether YOU reposted something is read out of the same
+        // kind:6 stream as everybody else's reposts, so dropping it would leave
+        // the repost icon unable to say it had already been pressed. Hiding the
+        // number is worth having; claiming the data is gone would not be true.
+        .id = "repost_counts",
+        .label = "Repost counts",
+        .detail = "How many people passed a note on. Still fetched: it is the same stream that tells Plaza whether you reposted something yourself.",
+    },
+    .{
+        .id = "zap_totals",
+        .label = "Zap totals",
+        .detail = "How many sats a note was sent. Hiding it stops Plaza asking relays for zap receipts.",
+        .drops = &.{9735},
+    },
+};
+
+var g_hidden: [hideables.len]bool = @splat(false);
+
+/// Whether the reader has taken `what` away.
+pub fn isTakenAway(what: Hideable) bool {
+    return g_hidden[@intFromEnum(what)];
+}
+
+pub fn setHidden(what: Hideable, off: bool) void {
+    if (g_hidden[@intFromEnum(what)] == off) return;
+    g_hidden[@intFromEnum(what)] = off;
+    // The open subscriptions are asking a question that has changed. Without
+    // this, turning reactions off stops the counts being drawn and leaves every
+    // relay still sending them, which is the cosmetic version of this feature
+    // and the one it exists not to be.
+    _ = g_follow_gen.fetchAdd(1, .monotonic);
+    invalidateFeed();
+}
+
+/// How many things are hidden right now, for the settings screen to say so.
+pub fn hiddenCount() usize {
+    var n: usize = 0;
+    for (g_hidden) |h| {
+        if (h) n += 1;
+    }
+    return n;
+}
+
+/// Backing store for the engagement filter's kinds. A `Filter` borrows its
+/// `kinds` slice, so it cannot be built on the caller's stack.
+var g_engagement_kinds: [engagement_kinds.len]u16 = undefined;
+
+/// The kinds an engagement subscription asks for, with the hidden ones left out.
+///
+/// This is the function that makes the preference real. Kind 1 is always in it
+/// (a reply count is not hideable, and replies are the notes themselves), and so
+/// are 6 and 16, for the reason in the registry.
+fn engagementKinds() []const u16 {
+    var n: usize = 0;
+    for (engagement_kinds) |k| {
+        const drop = switch (k) {
+            7 => isTakenAway(.reaction_counts),
+            9735 => isTakenAway(.zap_totals),
+            else => false,
+        };
+        if (drop) continue;
+        g_engagement_kinds[n] = k;
+        n += 1;
+    }
+    return g_engagement_kinds[0..n];
+}
+
+/// The settings file's `hidden=` value: the ids of what is hidden, comma
+/// separated.
+///
+/// By ID, never by position. A list of booleans in registry order would mean
+/// that adding an element, or reordering one, silently moves everybody's
+/// preferences onto different things. These ids are also the shape a NIP-78
+/// record will use when this syncs, so they are already the durable name.
+pub fn hiddenLine(buf: []u8) []const u8 {
+    var len: usize = 0;
+    for (hideables, 0..) |h, i| {
+        if (!g_hidden[i]) continue;
+        const sep = if (len == 0) "" else ",";
+        const wrote = std.fmt.bufPrint(buf[len..], "{s}{s}", .{ sep, h.id }) catch break;
+        len += wrote.len;
+    }
+    return buf[0..len];
+}
+
+/// The other half. An id this build does not know is skipped rather than
+/// refused: a settings file written by a newer Plaza should still open here with
+/// everything it does understand intact.
+pub fn applyHiddenLine(value: []const u8) void {
+    var ids = std.mem.splitScalar(u8, value, ',');
+    while (ids.next()) |id| {
+        for (hideables, 0..) |h, i| {
+            if (std.mem.eql(u8, h.id, id)) g_hidden[i] = true;
+        }
+    }
+}
+
+pub fn engagementKindsForTest() []const u16 {
+    return engagementKinds();
+}
 // How often the feed's engagement subscription may be widened as more notes
 // load. A REQ under an existing id replaces it, so widening is one message, but
 // a busy feed adds ids continuously and re-asking on each one would be its own
@@ -12050,6 +12200,8 @@ pub const Msg = union(enum) {
     proxy_save,
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
+    /// Index into `hideables`.
+    hide_toggle: u8,
     client_tag_toggle,
     /// The feed scrolled: remember where, so images load around the viewport.
     feed_scrolled: canvas.ScrollState,
@@ -12103,7 +12255,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -12130,7 +12282,9 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 /// the scroll is bounded by it rather than the other way round.
 fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    var sections: [6]AppUi.Node = undefined;
+    // Exactly the number of `sections[n] =` lines below. It was full when this
+    // screen grew a section, and the bounds check is what said so.
+    var sections: [7]AppUi.Node = undefined;
     var n: usize = 0;
 
     sections[n] = identitySection(ui, model);
@@ -12145,6 +12299,8 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     sections[n] = settingsSection(ui, "APPEARANCE", "", appearanceCard(ui));
     n += 1;
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
+    n += 1;
+    sections[n] = settingsSection(ui, "QUIET", "hidden things are not fetched", quietCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;
@@ -12423,6 +12579,55 @@ fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
             &.{.{ .text = label, .scale = menu_scale }},
         ),
     });
+}
+
+/// What the reader can take away, and what is gone right now.
+///
+/// The WHOLE registry is listed, not only what is hidden, and that is the point
+/// of the screen rather than a detail of it. Hide something in the feed and
+/// there is nothing left there to press to get it back; a list that showed only
+/// what was hidden would be empty exactly when somebody came looking for it.
+///
+/// Each row says what hiding it does to the fetching, in its own words, because
+/// two of these stop the app asking relays for anything and one does not, and a
+/// screen that let you assume they were the same would be making a promise the
+/// app does not keep.
+fn quietCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    var kids: [hideables.len * 3]AppUi.Node = undefined;
+    var n: usize = 0;
+    for (hideables, 0..) |h, i| {
+        if (n > 0) {
+            kids[n] = vgap(ui, 10);
+            n += 1;
+        }
+        kids[n] = ui.el(.checkbox, .{
+            .size = .sm,
+            // Checked means SHOWN. The registry stores what is hidden, which is
+            // the right way round for a file and the wrong way round for a
+            // person: a box you tick to make something disappear reads as a
+            // switch that does the opposite of what it says.
+            .checked = !g_hidden[i],
+            .text = h.label,
+            .on_toggle = Msg{ .hide_toggle = @intCast(i) },
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = h.label, .focusable = true },
+        }, .{});
+        n += 1;
+        kids[n] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = h.detail, .scale = mono_hint_scale }},
+        );
+        n += 1;
+    }
+    return settingsCard(ui, .{kids[0..n]});
 }
 
 /// The feed section: what the app is allowed to fetch on the reader's behalf,
@@ -15198,11 +15403,11 @@ fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
             vgap(ui, 33),
             statCount(ui, c.replies, "reply", "replies"),
             hgap(ui, 18),
-            statCount(ui, c.reposts, "repost", "reposts"),
+            statCount(ui, if (isTakenAway(.repost_counts)) 0 else c.reposts, "repost", "reposts"),
             hgap(ui, 18),
-            statCount(ui, c.likes, "like", "likes"),
+            statCount(ui, if (isTakenAway(.reaction_counts)) 0 else c.likes, "like", "likes"),
             hgap(ui, 18),
-            statCount(ui, c.zap_msat / 1000, "sat", "sats"),
+            statCount(ui, if (isTakenAway(.zap_totals)) 0 else c.zap_msat / 1000, "sat", "sats"),
             ui.spacer(1),
         }),
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
@@ -19598,7 +19803,7 @@ fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: b
         verbSlot(ui, likeAction(ui, note, counts)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts) c.zap_msat / 1000 else 0, p.text_metric, .{})),
+        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !isTakenAway(.zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
         verbSlot(ui, ui.appIcon(quiet, "bookmark")),
         // The one unfinished-looking glyph that is not unfinished: it opens the
         // note's menu, the same one the thread's header has always had, with the
@@ -19687,7 +19892,11 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     const liked = my_reaction != null;
     const count = likeCountFor(note.id, my_reaction);
     const tint = if (liked) theme.palette.status_like else theme.palette.text_metric;
-    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), if (counts) count else 0, tint, .{
+    // Hidden means the NUMBER goes, not the verb. You can still like a note
+    // with the count taken away; what you lose is being told how many others
+    // did, which is the part the preference is about.
+    const shown = if (counts and !isTakenAway(.reaction_counts)) count else 0;
+    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), shown, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
@@ -19700,7 +19909,7 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
 /// colour means the same thing in both places.
 fn repostAction(ui: *AppUi, note: *const Note, c: Counts, counts: bool) AppUi.Node {
     const tint = if (c.reposted_by_me) theme.palette.status_success else theme.palette.text_metric;
-    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts) c.reposts else 0, tint, .{
+    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts and !isTakenAway(.repost_counts)) c.reposts else 0, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .repost = note.id },
         .semantics = .{ .role = .button, .label = if (c.reposted_by_me) "Reposted" else "Repost", .focusable = true },
@@ -21739,6 +21948,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .client_tag_toggle => {
             setClientTag(!clientTag());
             saveSettings();
+        },
+        .hide_toggle => |i| {
+            if (i < hideables.len) {
+                setHidden(@enumFromInt(i), !g_hidden[i]);
+                saveSettings();
+            }
         },
         .previews_toggle => {
             setMediaPreviews(!mediaPreviews());
@@ -24954,7 +25169,7 @@ const profile_fetch_messages = 400;
 /// busy relay decided how much of four kinds across 128 note ids to send back.
 /// One function now, so there is nothing left to drift.
 pub fn engagementFilter(tags: []const nostr.filter.TagFilter) nostr.filter.Filter {
-    return .{ .kinds = &engagement_kinds, .tags = tags, .limit = engagement_request_limit };
+    return .{ .kinds = engagementKinds(), .tags = tags, .limit = engagement_request_limit };
 }
 
 /// Fetches a note's replies (and their engagement) into the store, on a detached
@@ -25960,6 +26175,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
     g_client_tag = false;
+    g_hidden = @splat(false);
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
@@ -25972,6 +26188,9 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // Written by id rather than by position, so adding an element to the
+        // registry, or reordering it, cannot silently un-hide something.
+        if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
     }
 }
 
@@ -25981,11 +26200,14 @@ fn saveSettings() void {
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-    var buf: [512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\n", .{
+    var hidden_buf: [256]u8 = undefined;
+    const hidden_ids = hiddenLine(&hidden_buf);
+    var buf: [768]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
+        hidden_ids,
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
