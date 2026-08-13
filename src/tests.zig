@@ -17038,3 +17038,46 @@ test "hiding a count narrows the feed's subscription and leaves notifications al
     // sentence is fixed; this is what keeps it fixed.
     try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, &main.inbox_kinds);
 }
+
+test "a muted author's note is dropped on arrival, not just on a full read" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetMutesForTest();
+    defer main.forgetMutesForTest();
+
+    const f = try FeedFixture.init(arena, "mutedsplice");
+    defer f.deinit();
+
+    var loud_signer = nostr.keys.Signer.init();
+    defer loud_signer.deinit();
+    const loud = try loud_signer.keyPairFromSecretKey([_]u8{0x91} ** 32);
+
+    // Followed, so the arrival is one this feed is otherwise about, and muted.
+    // BOTH set before the first tick: each of them invalidates the feed, and an
+    // invalidated feed reads the whole window back, which is the other path and
+    // the one already covered.
+    const follows = [_][32]u8{ f.kp.public_key, loud.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    const muted = [_][32]u8{loud.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_050);
+
+    // One note on screen, so the NEXT tick takes the splice path rather than
+    // reading the whole window back. That is the distinction this test is for:
+    // the feed has two ways in and only one of them was covered.
+    _ = try f.arrive(arena, 1_800_000_000, "before");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+    const before_splices = main.feedWork().splices;
+
+    const shouted = try signedNote(arena, loud_signer, loud, 1_800_000_200, "from the muted one");
+    _ = try main.plazaIngestForTest(arena, shouted);
+    f.tick(1_800_000_300);
+
+    // The splice ran, and it kept nothing.
+    try testing.expect(main.feedWork().splices > before_splices);
+    for (f.model.notes[0..f.model.notes_len]) |n| {
+        try testing.expect(!std.mem.eql(u8, &n.pubkey, &loud.public_key));
+    }
+}
