@@ -16696,3 +16696,327 @@ test "a settings file from a newer Plaza still opens here" {
     try testing.expect(main.isTakenAway(.zap_totals));
     try testing.expect(!main.isTakenAway(.repost_counts));
 }
+
+// -- Muting from here ---------------------------------------------------------
+
+/// A store, an identity, and this account's own kind:10000 in it. Returns the
+/// keypair so a test can talk about "me".
+fn muteFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.keys.KeyPair {
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10000, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadMutesFromStoreForTest();
+    return kp;
+}
+
+test "muting splices onto the list rather than replacing it" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mutew.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const already = [_]u8{0x82} ** 32;
+    var already_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&already_hex, "{x}", .{already});
+    // A list with somebody already muted, a muted hashtag, a muted word and a
+    // muted thread. NIP-51 puts all of those here and Plaza reads none of the
+    // last three.
+    const existing = [_]nostr.event.Tag{
+        &.{ "p", &already_hex },
+        &.{ "t", "politics" },
+        &.{ "word", "airdrop" },
+        &.{ "e", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" },
+    };
+    _ = try muteFixture(arena, &signer, &store, &existing, "");
+
+    const fresh = [_]u8{0x83} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, fresh, true));
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    var fresh_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&fresh_hex, "{x}", .{fresh});
+
+    // The new one is on it.
+    try testing.expect(std.mem.indexOf(u8, written, &fresh_hex) != null);
+    // And so is everything that was already there. THE PROPERTY: dropping what
+    // this app does not read would delete filters the reader set in a client
+    // that does.
+    try testing.expect(std.mem.indexOf(u8, written, &already_hex) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "politics") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "airdrop") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "00112233445566778899aabb") != null);
+}
+
+test "unmuting removes exactly one name" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/unmute.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const a = [_]u8{0x84} ** 32;
+    const b = [_]u8{0x85} ** 32;
+    var a_hex: [64]u8 = undefined;
+    var b_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&a_hex, "{x}", .{a});
+    _ = try std.fmt.bufPrint(&b_hex, "{x}", .{b});
+    const existing = [_]nostr.event.Tag{ &.{ "p", &a_hex }, &.{ "p", &b_hex } };
+    _ = try muteFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isMuted(a));
+    try testing.expect(main.isMuted(b));
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, a, false));
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, &a_hex) == null);
+    try testing.expect(std.mem.indexOf(u8, written, &b_hex) != null);
+    try testing.expect(!main.isMuted(a));
+    try testing.expect(main.isMuted(b));
+}
+
+test "with no mute list read back, nothing is published" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x86} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/nolist.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    // The whole point. "No mute list found" and "the fetch has not landed" are
+    // the same thing from here, and one of them ends with the reader's real
+    // mutes replaced by a list holding one name. So it refuses, and says so.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.no_list_yet, main.writeMuteForTest(&fx, [_]u8{0x87} ** 32, true));
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10000) == null);
+    try testing.expect(main.muteBlockedReason() != null);
+}
+
+test "a private half this app cannot read stops the write instead of erasing it" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/private.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kept = [_]u8{0x88} ** 32;
+    var kept_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&kept_hex, "{x}", .{kept});
+    const existing = [_]nostr.event.Tag{&.{ "p", &kept_hex }};
+    // Content that is present and is not something this app can decrypt: a
+    // NIP-04 payload, or a NIP-44 one sealed to a key it does not hold. Either
+    // way it holds private mutes, and they are not this app's to throw away.
+    _ = try muteFixture(arena, &signer, &store, &existing, "AgY7fT?iv=notreallyanythingwecanopen");
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(
+        main.MuteWrite.private_half_unreadable,
+        main.writeMuteForTest(&fx, [_]u8{0x89} ** 32, true),
+    );
+
+    // Jumble's bug, not reproduced: its decrypt failure yields an empty tag list
+    // and the write then publishes an empty content, taking every private mute
+    // with it. Nothing was published here at all.
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, &kept_hex) != null);
+    var new_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&new_hex, "{x}", .{[_]u8{0x89} ** 32});
+    try testing.expect(std.mem.indexOf(u8, written, &new_hex) == null);
+}
+
+test "muting yourself is not a thing" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/self.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kp = try muteFixture(arena, &signer, &store, &.{}, "");
+    var fx: main.EffectsForTest = undefined;
+    // It would hide your own notes from your own feed.
+    try testing.expectEqual(main.MuteWrite.nothing_to_do, main.writeMuteForTest(&fx, kp.public_key, true));
+}
+
+test "a private half this app CAN read survives a public mute" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/privkept.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const secretly = [_]u8{0x8A} ** 32;
+    var secretly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&secretly_hex, "{x}", .{secretly});
+    const plain = try std.fmt.allocPrint(arena, "[[\"p\",\"{s}\"]]", .{secretly_hex});
+    // NIP-51's private half: a JSON tag array, encrypted to yourself.
+    // The explicit-nonce form, so the ciphertext is the same on every run and
+    // the assertion below can compare it byte for byte.
+    const ck = try nostr.nip44.conversationKey(signer, kp.secret_key, kp.public_key);
+    const sealed = try nostr.nip44.encryptWithConversationKey(arena, ck, plain, [_]u8{0x5C} ** 32);
+
+    const publicly = [_]u8{0x8B} ** 32;
+    var publicly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&publicly_hex, "{x}", .{publicly});
+    const existing = [_]nostr.event.Tag{&.{ "p", &publicly_hex }};
+    _ = try muteFixture(arena, &signer, &store, &existing, sealed);
+
+    // Both halves are in force before the write.
+    try testing.expect(main.isMuted(publicly));
+    try testing.expect(main.isMuted(secretly));
+
+    var fx: main.EffectsForTest = undefined;
+    const fresh = [_]u8{0x8C} ** 32;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, fresh, true));
+
+    // THE PROPERTY, and the whole reason this write is careful. The content is
+    // opaque to the splice: it is somebody's private mutes, sealed. Publishing
+    // a public mute must carry those bytes through untouched, and must not
+    // replace them with an empty string, which is what Jumble does whenever its
+    // decrypt fails.
+    const content = main.ownRecordContentForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings(sealed, content);
+
+    // And they are still muted afterwards, read back through the write.
+    try testing.expect(main.isMuted(secretly));
+    try testing.expect(main.isMuted(publicly));
+    try testing.expect(main.isMuted(fresh));
+}
+
+test "the profile offers Mute, and says why when it cannot" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mutebtn.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const them = [_]u8{0x8D} ** 32;
+
+    // No mute list read yet: the control is there and disabled, with a reason.
+    // A control that vanishes is one the reader wonders about, and one that
+    // silently does nothing is worse.
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+    main.setStoreForTest(&store);
+    try testing.expect(main.muteBlockedReason() != null);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = them;
+    var tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Mute") != null);
+
+    // With a list in hand it becomes live, and reads back the state it is in.
+    main.clearIdentityForTest();
+    _ = try muteFixture(arena, &signer, &store, &.{}, "");
+    try testing.expect(main.muteBlockedReason() == null);
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, them, true));
+    var model2 = main.initialModel();
+    model2.stage = .ready;
+    model2.viewing_profile = them;
+    tree = try buildTree(arena, &model2);
+    try testing.expect(findAnyText(tree.root, "Muted") != null);
+}

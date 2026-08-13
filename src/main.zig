@@ -12103,6 +12103,8 @@ pub const Msg = union(enum) {
     open_person: [32]u8,
     /// Follow or unfollow the person whose profile is open: 1 follow, 2 unfollow.
     follow_person: u8,
+    /// 1 mutes the open profile, 2 unmutes.
+    mute_person: u8,
     /// Which of a profile's two tabs: 0 notes, 1 replies.
     profile_tab: u8,
     /// Opens the Edit profile sheet, and the three fields in it.
@@ -12255,7 +12257,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -15845,6 +15847,152 @@ fn mutesFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
     return n;
 }
 
+pub const MuteWrite = enum {
+    published,
+    /// Already muted, or already not, or the reader themselves.
+    nothing_to_do,
+    /// A signature is already out. One key signs one thing at a time.
+    signer_busy,
+    /// This account's mute list has not been read back yet. Publishing one now
+    /// would replace whatever is really out there with a list of one name.
+    no_list_yet,
+    /// The list has a private half this app could not decrypt, so it cannot
+    /// carry it forward and will not write without it.
+    private_half_unreadable,
+    /// The write would have dropped more people than the press asked for.
+    would_shrink,
+    failed,
+};
+
+/// Mutes or unmutes `pubkey`, by splicing this reader's own kind:10000.
+///
+/// The same discipline the contact list learned, for the same reason: this is a
+/// REPLACEABLE record, so publishing one replaces what the reader has muted
+/// everywhere at once.
+///
+/// Jumble asks the user when it cannot find a list, because "you have no mute
+/// list" and "the fetch failed" are indistinguishable from here. This refuses
+/// instead, which is the answer this app already gives for a contact list, and
+/// the button says why rather than silently doing nothing. A key minted here is
+/// the one case where having no list is a fact rather than a failed read.
+fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
+    if (!signerReady()) return .signer_busy;
+    const me = activePubkey() orelse return .failed;
+    // Muting yourself would hide your own notes from your own feed.
+    if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, mute_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    const have_base = previous != null;
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+
+    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+
+    // The private half, carried forward VERBATIM and only when it is understood.
+    //
+    // This is the bug in Jumble worth not copying. Its `getPrivateTags` returns
+    // an empty list when the decrypt throws, and the write then sets `content`
+    // to `''`, publishing away every private mute the reader had. A bunker
+    // reader hits that path every time, because the decrypt needs a NIP-46 round
+    // trip this app does not make.
+    //
+    // So: content that is present and cannot be read means no write at all. The
+    // reader keeps their private mutes and is told the app cannot do this one.
+    if (base_content.len > 0) {
+        var probe: [max_mutes][32]u8 = undefined;
+        if (privateMutes(gpa, base_content, &probe) == 0 and !privateHalfIsReadable(gpa, base_content)) {
+            return .private_half_unreadable;
+        }
+    }
+
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    var found = false;
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, pubkey);
+
+    // Every tag is carried, `p` and otherwise. NIP-51 also puts hashtags,
+    // words and threads in here, and this app reads none of those: dropping
+    // what it does not understand would delete a filter the reader set in a
+    // client that does.
+    for (base_tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and hexEqlIgnoreCase(tag[1], &hex)) {
+            found = true;
+            if (!muting) continue;
+        }
+        const copy = gpa.alloc([]const u8, tag.len) catch return .failed;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    }
+
+    if (muting) {
+        if (found) return .nothing_to_do;
+        const copy = gpa.alloc([]const u8, 2) catch return .failed;
+        copy[0] = gpa.dupe(u8, "p") catch return .failed;
+        copy[1] = gpa.dupe(u8, &hex) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    } else if (!found) {
+        return .nothing_to_do;
+    }
+
+    // The same shrink guard the contact list has. A mute adds exactly one name
+    // and an unmute removes exactly one, so a write that drops more than that is
+    // a bug here or a stale base, and refusing beats publishing it.
+    if (have_base and !shrinkAllowed(countPeople(base_tags), countPeople(tags.items), muting)) return .would_shrink;
+
+    const owned_tags = tags.toOwnedSlice(gpa) catch return .failed;
+    handed_off = true;
+    const content = gpa.dupe(u8, base_content) catch return .failed;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(mute_list_kind) + 1), base_created_at + 1);
+
+    // The live set moves first, so the feed reflects the press immediately.
+    var next: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(owned_tags, &next);
+    n += privateMutes(gpa, content, next[n..]);
+    _ = setMutes(next[0..n], created);
+
+    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false);
+    return .published;
+}
+
+/// Whether an encrypted content opens at all.
+///
+/// `privateMutes` returns zero for two completely different situations: a half
+/// that decrypted fine and simply names nobody, and a half that could not be
+/// decrypted. Carrying the first one forward is ordinary; carrying the second is
+/// the only thing this write must never do. This is what tells them apart, and
+/// the name says "readable" rather than "empty" on purpose: a reader glancing at
+/// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
+/// opposite of what the guard is for.
+fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
+    const kp = g_identity_kp orelse return false;
+    const signer = g_identity_signer orelse return false;
+    const me = activePubkey() orelse return false;
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return false;
+    defer gpa.free(plain);
+    const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
+    defer parsed.deinit();
+    // It decrypted and parsed. Whatever is in it, this app understood the half it
+    // is about to carry forward, which is the whole question.
+    return true;
+}
+
+pub fn writeMuteForTest(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
+    return writeMute(fx, pubkey, muting);
+}
+
 /// Seeds the mute set from the local store, at boot and at sign-in, so a muted
 /// account is hidden from the first frame rather than after a round trip.
 fn loadMutesFromStore() void {
@@ -16112,6 +16260,25 @@ pub fn followBlockedReason() ?[]const u8 {
     if (activePubkey() == null) return null;
     if (canWriteFollows()) return null;
     return "Looking for your follow list…";
+}
+
+/// Why muting is unavailable right now, in the words the button shows under it.
+///
+/// The same rule as following, and for a worse consequence: a mute list is
+/// replaceable, so writing one this app has not read back would replace whatever
+/// the reader really has with a list of one name. A key minted here is the one
+/// case where having none is a fact rather than a read that has not landed.
+pub fn muteBlockedReason() ?[]const u8 {
+    if (activePubkey() == null) return null;
+    if (g_identity_minted_here) return null;
+    // Free, and the right question. `mutesAreOwned` is true exactly when this
+    // account's own kind:10000 has been read, which is what the gate in
+    // `writeMute` decides on. No store query per frame: the button asks this,
+    // and `writeMute` asks the read itself, which is the lesson the follow path
+    // paid for (deciding a write from a SECOND query let a transient failure
+    // answer "they have no list").
+    if (mutesAreOwned()) return null;
+    return "Looking for your mute list…";
 }
 
 /// Whether this account's own kind:3 is in the local store, REMEMBERED.
@@ -18022,7 +18189,17 @@ fn profileActions(ui: *AppUi, model: *const Model, pubkey: [32]u8, is_me: bool) 
         return ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "This is you", .scale = meta_scale }});
     }
     const following = isFollowedByMe(pubkey);
+    const muted = isMuted(pubkey);
     return ui.row(.{ .cross = .center, .gap = 8 }, .{
+        // Muting is quieter than following, in the layout as well as in what it
+        // does: a ghost button beside the primary one, and it says the state it
+        // is in rather than the verb it performs when that state is unusual.
+        if (muteBlockedReason() != null)
+            ui.button(.{ .size = .sm, .variant = .ghost, .disabled = true, .on_press = Msg{ .mute_person = 1 } }, "Mute")
+        else if (muted)
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .mute_person = 2 } }, "Muted")
+        else
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .mute_person = 1 } }, "Mute"),
         // Disabled rather than absent while the app is still reading the
         // reader's own list: a control that vanishes is a control they will
         // wonder about, and one that silently no-ops is worse. The sentence
@@ -21589,6 +21766,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const who = model.viewing_profile orelse return;
             sayFollowWrite(model, writeFollow(fx, who, direction == 1), direction == 1);
         },
+        .mute_person => |direction| {
+            // A guest has nothing to mute FROM: there is no list to splice and
+            // no key to sign with. Unlike a follow, this is not worth
+            // remembering across a sign-in either, since muting is about a feed
+            // they do not have yet.
+            if (model.is_guest()) {
+                model.joining = true;
+                return;
+            }
+            const who = model.viewing_profile orelse return;
+            sayMuteWrite(model, writeMute(fx, who, direction == 1), direction == 1);
+        },
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
@@ -22110,6 +22299,22 @@ fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
     }
 }
 
+/// What a mute write did, in the reader's terms.
+fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
+    switch (outcome) {
+        .published => setToast(model, if (muting) "Muted" else "Unmuted"),
+        .nothing_to_do => {},
+        .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
+        .no_list_yet => setToast(model, "Still fetching your mute list. Try again in a moment."),
+        // The one message that is about a limit rather than a delay, so it does
+        // not say "try again": trying again will do the same thing. The reader's
+        // private mutes are safe precisely because nothing was published.
+        .private_half_unreadable => setToast(model, "Your mute list has private entries Plaza cannot read, so nothing was changed."),
+        .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .failed => setToast(model, "That did not save, and nothing was published."),
+    }
+}
+
 fn setToast(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.toast_buf.len);
     @memcpy(model.toast_buf[0..n], text[0..n]);
@@ -22299,6 +22504,15 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
 /// string. For tests that need to see what a publish actually WROTE rather than
 /// whether it returned true: a splice that quietly drops half the list still
 /// publishes, so the return value proves nothing about what went out.
+/// This account's newest stored event of `kind`, its CONTENT. For the one
+/// property that tags cannot show: that an encrypted half nobody here reads was
+/// carried through a write rather than replaced with nothing.
+pub fn ownRecordContentForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const own = ownRecordJson(gpa, kind) orelse return null;
+    defer freeOwnProfile(gpa, own);
+    return gpa.dupe(u8, own.json) catch null;
+}
+
 pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
     const own = ownRecordJson(gpa, kind) orelse return null;
     defer freeOwnProfile(gpa, own);
