@@ -2603,7 +2603,7 @@ pub const hideables = [_]HideableInfo{
     .{
         .id = "reaction_counts",
         .label = "Reaction counts",
-        .detail = "How many people liked a note. Hiding it stops Plaza asking relays for reactions at all. You can still like things; your own heart is remembered here.",
+        .detail = "How many people liked a note. Hiding it stops the FEED asking relays for reactions. Your notifications are a separate subscription and keep theirs, so you still hear when somebody reacts to you. You can still like things; your own heart is remembered here.",
         .drops = &.{7},
     },
     .{
@@ -2619,7 +2619,7 @@ pub const hideables = [_]HideableInfo{
     .{
         .id = "zap_totals",
         .label = "Zap totals",
-        .detail = "How many sats a note was sent. Hiding it stops Plaza asking relays for zap receipts.",
+        .detail = "How many sats a note was sent. Hiding it stops the FEED asking relays for zap receipts. You still hear when somebody zaps you.",
         .drops = &.{9735},
     },
 };
@@ -2660,6 +2660,14 @@ var g_engagement_kinds: [engagement_kinds.len]u16 = undefined;
 /// This is the function that makes the preference real. Kind 1 is always in it
 /// (a reply count is not hideable, and replies are the notes themselves), and so
 /// are 6 and 16, for the reason in the registry.
+///
+/// THE FEED'S subscription, and only that one. `inbox_kinds` asks the same
+/// relays for the same kinds and is deliberately left alone: hiding how many
+/// people liked a note is not asking to stop being told when somebody likes
+/// YOURS. Those are different questions and they get different answers, which
+/// is why the settings rows say "the feed" rather than "Plaza". Claiming a kind
+/// is no longer requested while another subscription still requests it is the
+/// exact shape of overclaim this feature exists not to make.
 fn engagementKinds() []const u16 {
     var n: usize = 0;
     for (engagement_kinds) |k| {
@@ -12302,7 +12310,7 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     n += 1;
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
     n += 1;
-    sections[n] = settingsSection(ui, "QUIET", "hidden things are not fetched", quietCard(ui, model));
+    sections[n] = settingsSection(ui, "QUIET", "what you hide, the feed stops asking for", quietCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;

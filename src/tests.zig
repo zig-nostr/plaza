@@ -17020,3 +17020,21 @@ test "the profile offers Mute, and says why when it cannot" {
     tree = try buildTree(arena, &model2);
     try testing.expect(findAnyText(tree.root, "Muted") != null);
 }
+
+test "hiding a count narrows the feed's subscription and leaves notifications alone" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    main.setHidden(.reaction_counts, true);
+    main.setHidden(.zap_totals, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+
+    // And the inbox keeps asking its own question. Hiding how many people liked
+    // a note is not asking to stop being told when somebody likes YOURS: two
+    // different questions, two subscriptions, and only one of them narrows.
+    //
+    // This is here because the settings copy said "stops Plaza asking relays for
+    // reactions at all", which was false while this array said otherwise. The
+    // sentence is fixed; this is what keeps it fixed.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, &main.inbox_kinds);
+}
