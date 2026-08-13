@@ -15905,7 +15905,7 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     // reader keeps their private mutes and is told the app cannot do this one.
     if (base_content.len > 0) {
         var probe: [max_mutes][32]u8 = undefined;
-        if (privateMutes(gpa, base_content, &probe) == 0 and !privateHalfIsEmpty(gpa, base_content)) {
+        if (privateMutes(gpa, base_content, &probe) == 0 and !privateHalfIsReadable(gpa, base_content)) {
             return .private_half_unreadable;
         }
     }
@@ -15967,10 +15967,16 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     return .published;
 }
 
-/// Whether an encrypted content decodes to an empty tag list, as opposed to not
-/// decoding at all. Both look like "no private mutes" from `privateMutes`, and
-/// only one of them is safe to write over.
-fn privateHalfIsEmpty(gpa: std.mem.Allocator, content: []const u8) bool {
+/// Whether an encrypted content opens at all.
+///
+/// `privateMutes` returns zero for two completely different situations: a half
+/// that decrypted fine and simply names nobody, and a half that could not be
+/// decrypted. Carrying the first one forward is ordinary; carrying the second is
+/// the only thing this write must never do. This is what tells them apart, and
+/// the name says "readable" rather than "empty" on purpose: a reader glancing at
+/// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
+/// opposite of what the guard is for.
+fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
     const kp = g_identity_kp orelse return false;
     const signer = g_identity_signer orelse return false;
     const me = activePubkey() orelse return false;
@@ -15978,8 +15984,8 @@ fn privateHalfIsEmpty(gpa: std.mem.Allocator, content: []const u8) bool {
     defer gpa.free(plain);
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
     defer parsed.deinit();
-    // It decrypted and parsed. Whatever is in it, this app understood the half
-    // it is about to carry forward.
+    // It decrypted and parsed. Whatever is in it, this app understood the half it
+    // is about to carry forward, which is the whole question.
     return true;
 }
 
