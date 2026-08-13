@@ -16267,3 +16267,311 @@ test "a repost carries the note it repeats, so a reader needs no second fetch" {
     main.setStoreForTest(null);
     try testing.expectEqualStrings("", main.repostContent(arena, &note));
 }
+
+// -- The mute list you already have -------------------------------------------
+
+test "a kind:10000 arriving names who this reader has muted" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const noisy = [_]u8{0x52} ** 32;
+    const quiet = [_]u8{0x53} ** 32;
+    var noisy_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&noisy_hex, "{x}", .{noisy});
+
+    // Signed by the READER, which is the only mute list that means anything to
+    // them. `p` is the public half.
+    const tags = [_]nostr.event.Tag{&.{ "p", &noisy_hex }};
+    const ev = try muteListEvent(arena, &signer, [_]u8{0x51} ** 32, 1_800_000_000, &tags, "");
+    main.ingestMuteListForTest(ev);
+
+    try testing.expect(main.isMuted(noisy));
+    try testing.expect(!main.isMuted(quiet));
+    try testing.expectEqual(@as(usize, 1), main.muteCount());
+}
+
+test "somebody else's mute list is not this reader's" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x54} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const victim = [_]u8{0x55} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{victim});
+    const tags = [_]nostr.event.Tag{&.{ "p", &hex }};
+
+    // A stranger's mute list, arriving through the same door as the reader's.
+    // Adopting it would let anybody on the network hide anybody from anybody.
+    const ev = try muteListEvent(arena, &signer, [_]u8{0x56} ** 32, 1_800_000_000, &tags, "");
+    main.ingestMuteListForTest(ev);
+    try testing.expect(!main.isMuted(victim));
+    try testing.expectEqual(@as(usize, 0), main.muteCount());
+}
+
+test "an older mute list does not undo a newer one" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x57} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x58} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_200, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A relay replaying an older copy. Replaceable events are decided by
+    // created_at, and a stale one arriving late must not unmute somebody.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &.{}, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A newer one that unmutes them does.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_300, &.{}, ""));
+    try testing.expect(!main.isMuted(who));
+}
+
+test "an empty mute list is an answer, not a malformed event" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x59} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x5A} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // This is where a mute list differs from a contact list. An empty kind:3 is
+    // ignored, because a reader with no follows has no feed; an empty kind:10000
+    // is somebody who unmuted everybody, and ignoring it would leave the last
+    // person they unmuted hidden for good.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_200, &.{}, ""));
+    try testing.expect(!main.isMuted(who));
+    try testing.expectEqual(@as(usize, 0), main.muteCount());
+}
+
+test "signing out takes the mute list with it" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x5B} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x5C} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A second account must not inherit the first one's hidden people, even
+    // before its own list has arrived.
+    main.setIdentityForTest([_]u8{0x5D} ** 32);
+    try testing.expect(!main.isMuted(who));
+}
+
+/// A kind:10000 signed by `author_secret`, for the mute tests above.
+fn muteListEvent(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    author_secret: [32]u8,
+    created_at: i64,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.event.Event {
+    const kp = try signer.keyPairFromSecretKey(author_secret);
+    return try nostr.event.create(arena, signer.*, kp, created_at, 10000, tags, content, null);
+}
+
+test "a muted author's notes never become cards" {
+    main.forgetMutesForTest();
+    main.forgetFollowsForTest();
+    const me = [_]u8{0x61} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.forgetFollowsForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const loud_kp = try signer.keyPairFromSecretKey([_]u8{0x62} ** 32);
+    const fine_kp = try signer.keyPairFromSecretKey([_]u8{0x63} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/muted.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    _ = try store.ingest(arena, try signedNote(arena, signer, loud_kp, 1_800_000_100, "from the muted one"), .{});
+    _ = try store.ingest(arena, try signedNote(arena, signer, fine_kp, 1_800_000_200, "from the other one"), .{});
+
+    const follows = [_][32]u8{ loud_kp.public_key, fine_kp.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    // Both, before anything is muted.
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_300);
+    try testing.expectEqual(@as(usize, 2), model.notes_len);
+
+    // And one, after.
+    const muted = [_][32]u8{loud_kp.public_key};
+    try testing.expect(main.setMutesForTest(&muted, 1_800_000_250));
+    main.reconcileForTest(&model, &store, 1_800_000_300);
+    try testing.expectEqual(@as(usize, 1), model.notes_len);
+    try testing.expectEqualStrings("from the other one", model.notes[0].content());
+}
+
+test "a muted person's reply does not reach the inbox" {
+    main.forgetMutesForTest();
+    const me_secret = [_]u8{0x65} ** 32;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me_kp = try signer.keyPairFromSecretKey(me_secret);
+
+    // The SECRET, which is what this takes: handing it a pubkey signs the app in
+    // as somebody else entirely, and every `p` tag below then names a stranger.
+    main.setIdentityForTest(me_secret);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    const heckler = try signer.keyPairFromSecretKey([_]u8{0x66} ** 32);
+    var me_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&me_hex, "{x}", .{me_kp.public_key});
+    const tags = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    const at_me = try nostr.event.create(arena, signer, heckler, 1_800_000_100, 1, &tags, "oi", null);
+
+    // Files, while they are not muted.
+    main.resetInboxForTest();
+    try testing.expect(main.inboxAddForTest(at_me, 1_800_000_200));
+
+    // And does not, once they are. A mute that hides somebody from the feed but
+    // still lets them ring the notification bell has not muted them.
+    main.resetInboxForTest();
+    const muted = [_][32]u8{heckler.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_150);
+    try testing.expect(!main.inboxAddForTest(at_me, 1_800_000_200));
+}
+
+test "a muted person's reply is hidden, but the thread they are in still opens" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x67} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/thread.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    const op = try signer.keyPairFromSecretKey([_]u8{0x68} ** 32);
+    const civil = try signer.keyPairFromSecretKey([_]u8{0x69} ** 32);
+    const heckler = try signer.keyPairFromSecretKey([_]u8{0x6A} ** 32);
+
+    const root = try signedNote(arena, signer, op, 1_800_000_000, "the opening note");
+    _ = try store.ingest(arena, root, .{});
+    var root_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&root_hex, "{x}", .{root.id});
+    const reply_tags = [_]nostr.event.Tag{&.{ "e", &root_hex, "", "root" }};
+    _ = try store.ingest(arena, try nostr.event.create(arena, signer, civil, 1_800_000_100, 1, &reply_tags, "a fair point", null), .{});
+    _ = try store.ingest(arena, try nostr.event.create(arena, signer, heckler, 1_800_000_200, 1, &reply_tags, "noise", null), .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = main.noteFrom(root, 1_800_000_300).id;
+    model.thread_root = main.noteFrom(root, 1_800_000_300);
+
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    const before = model.thread_notes_len;
+    try testing.expect(before >= 2);
+
+    const muted = [_][32]u8{heckler.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_250);
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    try testing.expectEqual(before - 1, model.thread_notes_len);
+    for (model.thread_notes[0..model.thread_notes_len]) |n| {
+        try testing.expect(!std.mem.eql(u8, &n.pubkey, &heckler.public_key));
+    }
+
+    // And muting the AUTHOR of the note does not close the thread on you. Opening
+    // one is asking to read that note; answering with an empty screen would be
+    // the app refusing a question the reader had just asked.
+    const muted_op = [_][32]u8{op.public_key};
+    _ = main.setMutesForTest(&muted_op, 1_800_000_260);
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    try testing.expectEqualStrings("the opening note", model.thread_root.content());
+}
