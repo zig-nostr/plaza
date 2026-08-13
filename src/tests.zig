@@ -16068,3 +16068,28 @@ test "pressing a mention opens that profile, and pressing a link does not" {
     try testing.expect(model.viewing_profile != null);
     try testing.expectEqualSlices(u8, &pk, &model.viewing_profile.?);
 }
+
+test "a decoded image is refused by size before anything multiplies it" {
+    // Ordinary pictures, including a large photograph.
+    try testing.expect(main.imageSizeUsable(1, 1));
+    try testing.expect(main.imageSizeUsable(4032, 3024));
+    try testing.expect(main.imageSizeUsable(8000, 4000));
+
+    // Nothing to decode.
+    try testing.expect(!main.imageSizeUsable(0, 100));
+    try testing.expect(!main.imageSizeUsable(100, 0));
+
+    // A single dimension past the cap, which is what keeps the area check from
+    // being computed on numbers that could wrap.
+    try testing.expect(!main.imageSizeUsable(20000, 4));
+    try testing.expect(!main.imageSizeUsable(4, 20000));
+
+    // Both dimensions plausible on their own, and their product is not: this is
+    // the shape a file built to make an app allocate takes, and it is the one a
+    // per-dimension limit alone lets through.
+    try testing.expect(!main.imageSizeUsable(16000, 16000));
+
+    // The largest thing stb itself will hand back. Reached only through the
+    // dimension check, which is the point: the area check never runs on it.
+    try testing.expect(!main.imageSizeUsable(1 << 24, 1 << 24));
+}
