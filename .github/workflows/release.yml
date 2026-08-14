@@ -31,7 +31,7 @@ jobs:
           node-version: 22
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.7.2
+        run: npm install -g @native-sdk/cli@0.9.0
 
       # The tests run on every pull request, but a tag can be pushed at any
       # commit, and a release is the one artifact nobody gets to re-check. So the
