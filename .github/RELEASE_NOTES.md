@@ -1,16 +1,18 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.6.0
+### What's new in v0.7.0
 
-**Your key is not in a plain file any more.** Plaza keeps your secret key in a separate process from the one that draws the screen, which is the right shape and was not the whole job: at rest it was raw hex in a file only your account could read. That file is handed over by a copied home folder, a Time Machine backup, or a stolen disk. It now lives in the macOS Keychain, which is encrypted with your login password, so none of those three give it up. An existing key moves across on the next launch, and only after the copy has been read back and checked, because it is the only copy on your Mac.
+**A note with several pictures draws them all.** Somebody posts three photos, which is what a phone's share sheet produces, and Plaza drew the first and left the other two underneath as raw URLs. It draws up to four now, as a row of cells, and no image link is left sitting in the text.
 
-Being precise about what that does not do, since it is easy to assume otherwise: it does not stop another program running as you from reading it. Plaza is ad-hoc signed, and a Keychain item's access control binds to a signing identity that ad-hoc signing does not have. This is encryption at rest, not app-level isolation, and the code says so where anyone would go looking.
+The pictures fill in as slots free up. There are sixteen image slots in the whole app and a gallery wants several at once, so the later cells of a busy screen borrow the note's own blurhash, which is drawn as flat colour rather than a registered image and so costs nothing. The row reads as photographs the whole time.
 
-**A client you can make quiet, properly.** Reaction counts, repost counts and zap totals could already be taken away. Reply counts could not, and the verbs themselves could not: you could hide the number beside the heart but not the heart. Both now, so if you never zap you can remove zapping rather than only its total.
+**Pictures that would not load, now load.** Some hosts came back as an empty frame saying so. The host was fine; the image proxy in front of it was refusing them by policy, and blossom servers were the common casualty. When the proxy refuses a host, Plaza now asks the host directly and the picture appears.
 
-Hiding a verb takes its count with it, and what you hide, the feed stops asking relays for. Hide reactions and it stops requesting them, which is less bandwidth, less parsing and a smaller store rather than a number painted over. Two exceptions are stated on the rows themselves rather than left to assumption: reposting is still fetched, because that is the same stream that tells Plaza whether you reposted something, and your notifications keep working, because that is a separate subscription. You still hear when somebody reacts to your own note.
+The proxy is still on by default, and still there for the reason it always was: without it, every image host in your feed learns your address as you scroll. The fallback fires only on a refusal, never on a host that is simply down, so a dead link does not turn into a second pointless request. Both are switches in Settings, with the privacy note beside them.
 
-The section was called QUIET, which reads like do-not-disturb. It is NOTES.
+**Reactions, replies and zap totals appear with the feed.** They were arriving only for whichever relay happened to answer the note first, so a note usually showed nothing until you opened it and came back, and then the numbers were there. They are counted on every relay that carries the note now, so they are there the first time you look.
+
+**Under it:** the check that decides whether your old key file may be deleted after moving into the Keychain is now tested against every way it can go wrong, rather than only read.
 
 ### Install
 
