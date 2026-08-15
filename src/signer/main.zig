@@ -576,6 +576,14 @@ fn handleConn(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream) !void {
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/reset")) {
         g_state.reset(io);
         return handlePubkey(gpa, w);
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/bunker")) {
+        return handleBunkerState(gpa, w);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker")) {
+        return handleBunkerToggle(gpa, io, w, body);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker/decide")) {
+        return handleBunkerDecide(gpa, w, body);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker/revoke")) {
+        return handleBunkerRevoke(gpa, w, body);
     }
     return respond(w, 404, "no such endpoint");
 }
@@ -786,4 +794,106 @@ test "the plain key file survives every way a migration can go wrong" {
     // And a stale item from some earlier install, which is the shape a wrong
     // read most plausibly takes on a machine that has run this before.
     try std.testing.expect(!safeToRemovePlainKey(true, [_]u8{0x22} ** 32, key));
+}
+
+// ------------------------------------------------------------- the bunker
+//
+// Four endpoints, all loopback and all behind the same bearer token as the rest
+// of this server. The UI polls `/bunker` and posts the reader's answers.
+
+var g_bunker: bunker.Bunker = .{};
+
+/// GET /bunker: everything the settings screen draws, in one answer.
+///
+/// One request rather than four, because the UI polls this on a timer and a
+/// screen that needs four round trips to say one thing is four chances to show a
+/// half-updated state.
+fn handleBunkerState(gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+
+    try out.appendSlice(gpa, "{\"enabled\":");
+    try out.appendSlice(gpa, if (g_bunker.isEnabled()) "true" else "false");
+    try out.appendSlice(gpa, ",\"version\":");
+    try out.print(gpa, "{d}", .{g_bunker.version.load(.acquire)});
+
+    // The URL only exists while it is on. Showing a stale one for a bunker that
+    // is off would be handing somebody a link that cannot work.
+    try out.appendSlice(gpa, ",\"url\":\"");
+    if (g_bunker.isEnabled()) {
+        var pk_hex: [64]u8 = undefined;
+        if (g_state.pubkeyHex(&pk_hex)) |hex| {
+            var url_buf: [512]u8 = undefined;
+            if (bunker.uri(&url_buf, hex, &bunker.default_relays, g_bunker.secret())) |url| {
+                try out.appendSlice(gpa, url);
+            } else |_| {}
+        }
+    }
+    try out.appendSlice(gpa, "\"");
+
+    try out.appendSlice(gpa, ",\"pending\":");
+    if (g_bunker.firstPending()) |p| {
+        var c_hex: [64]u8 = undefined;
+        try out.print(gpa, "{{\"id\":{d},\"client\":\"{s}\"}}", .{ p.id, hexLower(&c_hex, p.client) });
+    } else {
+        try out.appendSlice(gpa, "null");
+    }
+
+    try out.appendSlice(gpa, ",\"clients\":[");
+    var first = true;
+    for (g_bunker.clients) |c| {
+        if (!c.used) continue;
+        if (!first) try out.appendSlice(gpa, ",");
+        first = false;
+        var c_hex: [64]u8 = undefined;
+        try out.print(gpa, "{{\"pubkey\":\"{s}\"}}", .{hexLower(&c_hex, c.pubkey)});
+    }
+    try out.appendSlice(gpa, "]}");
+
+    return respondJson(w, 200, out.items);
+}
+
+/// POST /bunker {"on": true|false}
+fn handleBunkerToggle(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { on: bool = false };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+
+    if (!parsed.value.on) {
+        g_bunker.disable();
+        return handleBunkerState(gpa, w);
+    }
+    // Nothing to serve with. Turning a bunker on before there is a key would
+    // publish a pubkey that cannot sign.
+    const secret = g_state.take() orelse return respondErr(gpa, w, 409, "no key yet");
+    const was_on = g_bunker.isEnabled();
+    g_bunker.enable(io);
+    // Threads only on the transition, so a second press does not stack another
+    // three onto the relays.
+    if (!was_on) bunker.start(gpa, &g_bunker, secret);
+    return handleBunkerState(gpa, w);
+}
+
+/// POST /bunker/decide {"id": N, "allow": true|false}
+fn handleBunkerDecide(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { id: u64 = 0, allow: bool = false };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+    _ = g_bunker.decide(parsed.value.id, parsed.value.allow);
+    return handleBunkerState(gpa, w);
+}
+
+/// POST /bunker/revoke {"pubkey": "<hex>"}
+fn handleBunkerRevoke(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { pubkey: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+    if (parsed.value.pubkey.len != 64) return respondErr(gpa, w, 400, "bad pubkey");
+    var pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pk, parsed.value.pubkey) catch return respondErr(gpa, w, 400, "bad pubkey");
+    _ = g_bunker.revoke(pk);
+    return handleBunkerState(gpa, w);
 }
