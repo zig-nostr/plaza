@@ -24,8 +24,14 @@ const std = @import("std");
 const nostr = @import("nostr");
 const ipc = nostr.signer_ipc;
 const keystore = nostr.keystore;
+const bunker = @import("bunker.zig");
 
 const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
+
+test {
+    // The bunker lives in its own file; without this its tests never run.
+    _ = bunker;
+}
 
 // ------------------------------------------------------------- the keychain
 //
