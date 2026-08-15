@@ -8254,6 +8254,80 @@ fn activePubkey() ?[32]u8 {
 /// fetch, open, and cache key) and the byte span of its raw token within the
 /// note's `content_buf`, so the body can be split around it at render time
 /// without ever mutating the stored text.
+/// Stood in for a picture past the end, so `imageAt` can answer without the
+/// caller checking first: a zero-length URL is what every path already reads as
+/// "no image".
+const empty_note_image = NoteImage{};
+
+/// What a picture's chip says: its dimensions and its weight, as the note claims
+/// them, in the shot's own form (`1600x900 · 240 KB`). Either half may be
+/// missing, and it is empty when both are. Never taken from the decoded bytes,
+/// which are the proxy's box and would be a lie about the file, and never from
+/// the response, which carries no headers.
+fn imageChipLabelFor(img: *const NoteImage, arena: std.mem.Allocator) []const u8 {
+    const has_dims = img.w > 0 and img.h > 0;
+    if (has_dims and img.bytes > 0) {
+        return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ img.w, img.h, byteSize(arena, img.bytes) }) catch "";
+    }
+    if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ img.w, img.h }) catch "";
+    if (img.bytes > 0) return byteSize(arena, img.bytes);
+    return "";
+}
+
+/// How many pictures one note draws.
+///
+/// Four, which is what the clients that draw galleries settle on, and what a
+/// phone's share sheet produces. Past it the extra URLs stay in the body as
+/// links, which is the old behaviour for everything after the first and is the
+/// right fallback for a note carrying a dozen.
+pub const max_note_images = 4;
+
+/// One picture in a note: where it is, and what the note's own `imeta` claims
+/// about it before a single byte has been fetched.
+pub const NoteImage = struct {
+    url_buf: [300]u8 = [_]u8{0} ** 300,
+    url_len: u16 = 0,
+    /// Height divided by width, from the note's NIP-92 `imeta dim`. Knowing the
+    /// shape BEFORE the picture downloads is what lets the card reserve exactly
+    /// the right space, so nothing shifts when it arrives (or is evicted and
+    /// comes back).
+    aspect: f32 = 0,
+    /// The author's claim about the file: pixel dimensions and byte size, from
+    /// the same `imeta` tag, drawn as chips at rest.
+    w: u16 = 0,
+    h: u16 = 0,
+    bytes: u32 = 0,
+    /// Its colour before its bytes. Fixed buffer, because the tag's memory is
+    /// the event's.
+    blur_buf: [40]u8 = [_]u8{0} ** 40,
+    blur_len: u8 = 0,
+    /// Whether the note described it. The chip is one word; the description
+    /// itself would need a hover expand, which is not expressible.
+    has_alt: bool = false,
+
+    pub fn url(self: *const NoteImage) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+
+    pub fn blurhash(self: *const NoteImage) []const u8 {
+        return self.blur_buf[0..self.blur_len];
+    }
+
+    fn set(self: *NoteImage, link: []const u8, meta: Imeta) void {
+        const n = @min(link.len, self.url_buf.len);
+        @memcpy(self.url_buf[0..n], link[0..n]);
+        self.url_len = @intCast(n);
+        self.aspect = meta.aspect();
+        self.w = meta.width;
+        self.h = meta.height;
+        self.bytes = meta.size;
+        const b = @min(meta.blurhash.len, self.blur_buf.len);
+        @memcpy(self.blur_buf[0..b], meta.blurhash[0..b]);
+        self.blur_len = @intCast(b);
+        self.has_alt = meta.alt.len > 0;
+    }
+};
+
 const QuoteRef = struct {
     kind: enum(u8) { none, event } = .none,
     id: [32]u8 = [_]u8{0} ** 32,
@@ -8389,27 +8463,15 @@ pub const Note = struct {
     time_len: u8 = 0,
     content_buf: [note_content_cap]u8 = [_]u8{0} ** note_content_cap,
     content_len: u16 = 0,
-    // The first image URL in the note, lifted out of the text and rendered as a
-    // picture instead (see `renderContent`'s `omit`).
-    image_url_buf: [300]u8 = [_]u8{0} ** 300,
-    image_url_len: u16 = 0,
-    // Height divided by width, taken from the note's own NIP-92 `imeta dim`
-    // when it carries one. Knowing the shape BEFORE the picture downloads is
-    // what lets the card reserve exactly the right space, so nothing shifts
-    // when the image arrives (or is evicted and comes back).
-    image_aspect: f32 = 0,
-    /// What the picture's own chrome says: its pixel dimensions, from the same
-    /// `imeta` tag the aspect comes from, and its alt text. Both are the note
-    /// author's claim about the file, which is the only thing available before
-    /// the bytes are, and the chips read at rest rather than on hover (the
-    /// design's hover-expand is not expressible).
-    image_w: u16 = 0,
-    image_h: u16 = 0,
-    image_bytes: u32 = 0,
-    /// The picture's blurhash, when the note carries one: its colour before its
-    /// bytes. Fixed buffer, because the tag's memory is the event's.
-    image_blur_buf: [40]u8 = [_]u8{0} ** 40,
-    image_blur_len: u8 = 0,
+    /// Every picture the note carries, up to `max_note_images`, lifted out of
+    /// the text and drawn as pictures instead (see `renderContent`'s `omit`).
+    ///
+    /// A note with several images is ordinary, not exotic: a phone's share sheet
+    /// posts three at once and every other client draws them as a gallery. This
+    /// held exactly one, so the first was drawn and the rest were left in the
+    /// body as raw URLs, which is the worst of both.
+    images: [max_note_images]NoteImage = [_]NoteImage{.{}} ** max_note_images,
+    images_len: u8 = 0,
     /// The first plain link in the note, previewed as a card under the body. One
     /// per note, which is what 11o draws; the URL stays in the text as well.
     link_url_buf: [300]u8 = [_]u8{0} ** 300,
@@ -8457,9 +8519,29 @@ pub const Note = struct {
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
     }
-    /// The picture's blurhash, empty when the note carries none.
+    /// The first picture's blurhash, empty when the note carries none.
     pub fn imageBlurhash(self: *const Note) []const u8 {
-        return self.image_blur_buf[0..self.image_blur_len];
+        return self.imageAt(0).blurhash();
+    }
+    /// Picture `i`, or an empty one past the end so callers can read it without
+    /// checking first. An empty picture has a zero-length URL, which every
+    /// caller already treats as "no image".
+    pub fn imageAt(self: *const Note, i: usize) *const NoteImage {
+        if (i >= self.images_len) return &empty_note_image;
+        return &self.images[i];
+    }
+    /// How many pictures this note draws.
+    pub fn imageCount(self: *const Note) usize {
+        return self.images_len;
+    }
+    /// Gives a hand-built note a picture and hands it back so the test can state
+    /// its shape. For tests, which used to poke the Note's image fields directly.
+    pub fn setImageForTest(self: *Note, i: usize, link: []const u8) *NoteImage {
+        const n = @min(link.len, self.images[i].url_buf.len);
+        @memcpy(self.images[i].url_buf[0..n], link[0..n]);
+        self.images[i].url_len = @intCast(n);
+        if (self.images_len <= i) self.images_len = @intCast(i + 1);
+        return &self.images[i];
     }
     /// The link this note previews, empty when it has none.
     pub fn linkUrl(self: *const Note) []const u8 {
@@ -8470,7 +8552,7 @@ pub const Note = struct {
     }
     /// Whether this note carries an image to render.
     pub fn hasImage(self: *const Note) bool {
-        return self.image_url_len > 0;
+        return self.images_len > 0;
     }
     /// What the picture's chip says: its dimensions and its weight, as the note
     /// claims them, in the shot's own form (`1600x900 · 240 KB`). Either half may
@@ -8478,17 +8560,11 @@ pub const Note = struct {
     /// decoded bytes, which are the proxy's 480px box and would be a lie about
     /// the file, and never from the response, which carries no headers.
     pub fn imageChipLabel(self: *const Note, arena: std.mem.Allocator) []const u8 {
-        const has_dims = self.image_w > 0 and self.image_h > 0;
-        if (has_dims and self.image_bytes > 0) {
-            return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ self.image_w, self.image_h, byteSize(arena, self.image_bytes) }) catch "";
-        }
-        if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ self.image_w, self.image_h }) catch "";
-        if (self.image_bytes > 0) return byteSize(arena, self.image_bytes);
-        return "";
+        return imageChipLabelFor(self.imageAt(0), arena);
     }
-    /// The note's image URL (empty when it has none).
+    /// The note's first image URL (empty when it has none).
     pub fn imageUrl(self: *const Note) []const u8 {
-        return self.image_url_buf[0..self.image_url_len];
+        return self.imageAt(0).url();
     }
     /// The registered image id for this note's picture, or 0 while it is
     /// loading, unavailable, or absent.
@@ -11391,33 +11467,32 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         note.client_len = @intCast(n);
     }
 
-    // An image link becomes a picture, so lift it out of the text and omit it
-    // from the rendered content rather than showing a bare URL beside it.
-    var image_url: []const u8 = "";
-    if (firstImageUrl(ev.content)) |url| {
-        if (url.len <= note.image_url_buf.len) {
-            @memcpy(note.image_url_buf[0..url.len], url);
-            note.image_url_len = @intCast(url.len);
-            image_url = note.imageUrl();
-            const meta = imetaFor(ev.tags, url);
-            note.image_aspect = meta.aspect();
-            note.image_w = meta.width;
-            note.image_h = meta.height;
-            note.image_bytes = meta.size;
-            const blur_len = @min(meta.blurhash.len, note.image_blur_buf.len);
-            @memcpy(note.image_blur_buf[0..blur_len], meta.blurhash[0..blur_len]);
-            note.image_blur_len = @intCast(blur_len);
-            note.image_has_alt = meta.alt.len > 0;
-        }
+    // Image links become pictures, so lift them out of the text and omit them
+    // from the rendered content rather than showing bare URLs beside a gallery.
+    //
+    // The URLs are borrowed from the EVENT while it is still in hand, and the
+    // omit list below borrows them again; the note keeps its own copies. A URL
+    // too long for the buffer is left in the text, which is the honest fallback:
+    // it is still a link the reader can open.
+    var found: [max_note_images][]const u8 = undefined;
+    const found_len = collectImageUrls(ev.content, &found);
+    var omit: [max_note_images][]const u8 = undefined;
+    var omit_len: usize = 0;
+    for (found[0..found_len]) |url| {
+        if (url.len > note.images[0].url_buf.len) continue;
+        note.images[note.images_len].set(url, imetaFor(ev.tags, url));
+        omit[omit_len] = url;
+        omit_len += 1;
+        note.images_len += 1;
     }
 
     // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
-    note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, image_url, &note.mentions));
+    note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, omit[0..omit_len], &note.mentions));
 
     // The first plain link, for the preview card. Read from the ORIGINAL content:
     // the rendered copy has mentions rewritten and may be capped.
-    if (firstLinkUrl(ev.content, image_url)) |link| {
+    if (firstLinkUrl(ev.content, note.imageUrl())) |link| {
         if (link.len <= note.link_url_buf.len) {
             @memcpy(note.link_url_buf[0..link.len], link);
             note.link_url_len = @intCast(link.len);
@@ -12044,19 +12119,51 @@ pub fn firstImageUrl(content: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Every image URL in `content`, in the order written, up to `out.len`.
+///
+/// The same walk as `firstImageUrl`, which it now backs: a note carrying three
+/// pictures is ordinary, and taking only the first left the other two sitting in
+/// the body as raw links beside a gallery that had room for them.
+pub fn collectImageUrls(content: []const u8, out: [][]const u8) usize {
+    @setRuntimeSafety(true); // Walks a stranger's content and indexes `out` as it goes.
+    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i < content.len and found < out.len) : (i += 1) {
+        if (content[i] != 'h') continue;
+        if (!std.mem.startsWith(u8, content[i..], "http://") and !std.mem.startsWith(u8, content[i..], "https://")) continue;
+        var j = i;
+        while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+        const url = content[i..j];
+        const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+        const path = url[0..path_end];
+        for (exts) |ext| {
+            if (std.ascii.endsWithIgnoreCase(path, ext)) {
+                out[found] = url;
+                found += 1;
+                break;
+            }
+        }
+        i = j;
+    }
+    return found;
+}
+
 /// Copies note content into `dst`, rewriting NIP-27 `nostr:npub…`/`nostr:nprofile…`
 /// mentions into a readable `@name` (from the profile cache) or a short `@npub`,
-/// and dropping `omit` (the URL rendered as a picture) wherever it appears.
+/// and dropping every URL in `omit` (the ones drawn as pictures) wherever they
+/// appear.
 /// Plain text is copied one whole codepoint at a time and stops at `dst`'s
 /// capacity, so the buffer never ends mid-sequence. Returns the byte length.
 pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
-    return renderContentInto(dst, src, omit, null);
+    const one = [_][]const u8{omit};
+    return renderContentInto(dst, src, if (omit.len == 0) &.{} else &one, null);
 }
 
 /// The same, recording where each mention's label landed into `mentions` when
 /// one is given. A note wants that table so the label can be pressed; a profile's
 /// "about" text is rendered the same way and has nowhere to put one.
-pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const u8, mentions: ?*MentionList) usize {
+pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, mentions: ?*MentionList) usize {
     @setRuntimeSafety(true); // Copies a stranger's content into a fixed buffer, offset by offset.
     // Mention decoding needs an allocator for bech32 scratch; a stack buffer
     // covers it without touching the heap for every note parsed. A pathological
@@ -12068,8 +12175,15 @@ pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const u8, mentions:
     var out: usize = 0;
     var i: usize = 0;
     while (i < src.len) {
-        if (omit.len > 0 and std.mem.startsWith(u8, src[i..], omit)) {
-            i += omit.len;
+        // Every picture's URL comes out, not just the first. Longest match wins,
+        // so one URL that is a prefix of another cannot leave the tail of the
+        // longer one stranded in the text.
+        var skipped: usize = 0;
+        for (omit) |gone| {
+            if (gone.len > skipped and std.mem.startsWith(u8, src[i..], gone)) skipped = gone.len;
+        }
+        if (skipped > 0) {
+            i += skipped;
             continue;
         }
         if (parseMentionAt(arena, src, i)) |m| {
@@ -21196,7 +21310,7 @@ pub fn pictureHeight(note: *const Note) f32 {
 /// when it was last decoded (remembered past its slot, so an evicted picture does
 /// not shrink and shift the feed), else a landscape guess.
 fn pictureAspect(note: *const Note) f32 {
-    if (note.image_aspect > 0) return note.image_aspect;
+    if (note.imageAt(0).aspect > 0) return note.imageAt(0).aspect;
     return recalledAspect(note.id) orelse picture_default_aspect;
 }
 
@@ -21323,8 +21437,14 @@ fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) A
 /// and may be missing, in which case the chip does not invent one.
 fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    const label = if (note.image_bytes > 0)
-        ui.fmt("image · {s} · load", .{byteSize(ui.arena, note.image_bytes)})
+    const bytes = note.imageAt(0).bytes;
+    const many = note.imageCount() > 1;
+    const label = if (many and bytes > 0)
+        ui.fmt("{d} images · from {s} · load", .{ note.imageCount(), byteSize(ui.arena, bytes) })
+    else if (many)
+        ui.fmt("{d} images · load", .{note.imageCount()})
+    else if (bytes > 0)
+        ui.fmt("image · {s} · load", .{byteSize(ui.arena, bytes)})
     else
         "image · load";
     return ui.row(.{ .gap = 0 }, .{
