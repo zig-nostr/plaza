@@ -17221,3 +17221,42 @@ test "a hidden verb is gone from the note row, not just its number" {
         try testing.expect(findByLabel(tree.root, "Like") != null);
     }
 }
+
+test "a note's id is remembered once, and the table is bounded" {
+    var ids: [main.engagementWatchCapForTest]i64 = undefined;
+    var hex: [main.engagementWatchCapForTest][64]u8 = undefined;
+    var len: usize = 0;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x81} ** 32);
+
+    const one = try signedNote(arena, signer, kp, 1_800_000_000, "first");
+    main.rememberFeedIdForTest(&ids, &hex, &len, one);
+    try testing.expectEqual(@as(usize, 1), len);
+
+    // The same note arriving again, which is the ordinary case: several relays
+    // carry it. It must not take a second slot, or the `#e` filter fills with
+    // duplicates and the cap is reached on a fraction of the feed.
+    main.rememberFeedIdForTest(&ids, &hex, &len, one);
+    try testing.expectEqual(@as(usize, 1), len);
+
+    const two = try signedNote(arena, signer, kp, 1_800_000_001, "second");
+    main.rememberFeedIdForTest(&ids, &hex, &len, two);
+    try testing.expectEqual(@as(usize, 2), len);
+
+    // And it stops at the cap rather than writing past the array. The `#e`
+    // filter has to stay a size relays accept.
+    //
+    // A note NOT already in the table, which the first version of this got
+    // wrong: reusing `two` meant the dedup scan found it and returned before the
+    // cap was ever consulted, so the assertion passed while the branch it exists
+    // for was never reached.
+    const fresh = try signedNote(arena, signer, kp, 1_800_000_002, "past the cap");
+    len = main.engagementWatchCapForTest;
+    main.rememberFeedIdForTest(&ids, &hex, &len, fresh);
+    try testing.expectEqual(main.engagementWatchCapForTest, len);
+}
