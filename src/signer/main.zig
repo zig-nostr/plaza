@@ -65,6 +65,22 @@ fn keychainStore(secret: [32]u8) bool {
     return plaza_keychain_set(keychain_service, keychain_account, &secret, secret.len) == 0;
 }
 
+/// Whether the plain key file may be removed after a migration attempt.
+///
+/// All three have to hold, and this is the one decision in the app that can
+/// destroy an identity: the file is the only copy of somebody's key on this Mac,
+/// and there is no undo. `keychainStore` returning true says the call succeeded,
+/// not that the bytes are retrievable, so the copy is read back and compared
+/// before anything is deleted.
+///
+/// A key still in a plain file is a weaker position. A key in neither is not a
+/// position at all, so every doubt keeps the file.
+fn safeToRemovePlainKey(stored: bool, read_back: ?[32]u8, original: [32]u8) bool {
+    if (!stored) return false;
+    const back = read_back orelse return false;
+    return std.mem.eql(u8, &back, &original);
+}
+
 /// Reads the secret back, or null when there is none, which from here is the
 /// same as the Keychain being unavailable: try the file.
 fn keychainLoad() ?[32]u8 {
@@ -209,12 +225,13 @@ const State = struct {
         // bytes are retrievable. If the copy cannot be read back exactly, the
         // file stays and nothing was migrated: a key still in a plain file is a
         // weaker position, and a key in neither is not a position at all.
-        if (keychainStore(secret)) {
-            if (keychainLoad()) |back| {
-                if (std.mem.eql(u8, &back, &secret)) {
-                    self.key_dir.deleteFile(io, self.key_path) catch {};
-                }
-            }
+        const stored = keychainStore(secret);
+        // Read back only when the write claimed to succeed: a user whose
+        // Keychain refuses writes should not also pay a pointless read on every
+        // launch.
+        const read_back: ?[32]u8 = if (stored) keychainLoad() else null;
+        if (safeToRemovePlainKey(stored, read_back, secret)) {
+            self.key_dir.deleteFile(io, self.key_path) catch {};
         }
 
         self.lock();
@@ -736,4 +753,31 @@ test "the keychain round-trips a secret and forgetting it removes it" {
     try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
     try std.testing.expect(plaza_keychain_get(keychain_service, account, &out, out.len, &n) != 0);
     try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
+}
+
+test "the plain key file survives every way a migration can go wrong" {
+    const key = [_]u8{0x11} ** 32;
+
+    // The only case that removes it: written, read back, and identical.
+    try std.testing.expect(safeToRemovePlainKey(true, key, key));
+
+    // The Keychain refused the write. Nothing is there, so the file is
+    // everything.
+    try std.testing.expect(!safeToRemovePlainKey(false, null, key));
+
+    // The write claimed success and the read came back empty. This is the case
+    // the comparison exists for: a store call returning 0 says the call
+    // succeeded, not that the bytes are retrievable.
+    try std.testing.expect(!safeToRemovePlainKey(true, null, key));
+
+    // Read back, but not what we put in. One byte is enough: a key that is
+    // nearly right is not a key at all, and deleting the file here would leave
+    // the reader with an identity they can no longer sign as.
+    var off_by_one = key;
+    off_by_one[31] ^= 0x01;
+    try std.testing.expect(!safeToRemovePlainKey(true, off_by_one, key));
+
+    // And a stale item from some earlier install, which is the shape a wrong
+    // read most plausibly takes on a machine that has run this before.
+    try std.testing.expect(!safeToRemovePlainKey(true, [_]u8{0x22} ** 32, key));
 }
