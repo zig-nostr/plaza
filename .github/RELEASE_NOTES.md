@@ -1,20 +1,10 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.8.0
+### What's new in v0.8.1
 
-**Plaza can sign for other apps.** Turn it on in Settings, copy the link, paste it into Coracle or Jumble or anything else that speaks NIP-46, and that app signs with your key without ever holding it. This is the thing a browser extension does, done by the process on your Mac that already holds your key instead of by an extension living inside your browser.
+A maintenance release. Nothing here changes what Plaza does.
 
-It is off unless you turn it on. While it is on, Plaza connects to relays and other apps can reach it, and an app nobody asked to be a signer should not open that up because it happens to hold a key.
-
-**Nothing signs without you.** An app has to be let in first, and being let in does not let it sign: the first time it wants to do something, Plaza asks, and asks again separately for each kind of thing. Signing a note and changing who you follow are different questions, because they are different risks.
-
-Each answer carries how long it lasts. Allow once, allow for a day, always, or deny. A denial is remembered too, so an app that asks for something you do not want can be told no and stop asking. When an answer runs out the question simply opens again, and a prompt you never answered is not treated as a no: walking away from your machine is not a decision.
-
-The question is asked in terms of what would happen, not which method was called. "An app wants to change who you follow" rather than "sign_event kind 3".
-
-**You can see and undo all of it.** Settings lists every app that is connected, with a button to disconnect any of them. Turning the whole thing off ends every session at once. That visibility is the point: a signer you cannot audit is one you have to trust.
-
-The link also appears in the Notary window, so it is where the key is, not only in Settings.
+The permission model behind the signer, which decides what a connected app may do and for how long your answer stands, has moved into the `nostr` library that Plaza and Notary both build on. It was written twice, once in each, and two copies of a rule about what may sign with your key is one copy too many. Now there is one, with one set of tests over it, and both signers behave the same way by construction rather than by my keeping them in step.
 
 ### Install
 
