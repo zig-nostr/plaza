@@ -309,6 +309,107 @@ pub const Bunker = struct {
     }
 };
 
+/// Starts one relay thread per default relay.
+///
+/// Called once, when the reader turns the bunker on. The threads outlive a
+/// switch-off: they see `enabled` go false, finish whatever they were doing and
+/// return, which is what makes turning it off actually stop serving rather than
+/// leaving sockets open. Turning it on again starts fresh ones.
+pub fn start(gpa: std.mem.Allocator, b: *Bunker, secret_key: [32]u8) void {
+    for (default_relays) |url| {
+        const t = std.Thread.spawn(.{}, serveRelay, .{ gpa, b, url, secret_key }) catch |err| {
+            // Said out loud rather than swallowed: a bunker that is on and
+            // serving two relays instead of three is a thing the reader would
+            // want to know, and it looks like nothing from the outside.
+            std.debug.print("plaza-signer: bunker relay {s} did not start ({s})\n", .{ url, @errorName(err) });
+            continue;
+        };
+        t.detach();
+    }
+}
+
+/// The policy the library consults on a `connect`.
+///
+/// It holds the bunker, so `decide` can file the request and park this relay
+/// thread until the reader answers. Blocking here is what the library's hook
+/// gives us and it is bounded two ways: only `connect` reaches it (every other
+/// method is refused first for a client that has not connected), and the wait
+/// fails closed after two minutes.
+pub const ConnectPolicy = struct {
+    b: *Bunker,
+    io: std.Io,
+
+    pub fn asPolicy(self: *const ConnectPolicy) nip46.Policy {
+        return .{ .ctx = @constCast(self), .decideFn = decide };
+    }
+
+    fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46.Decision {
+        const self: *ConnectPolicy = @ptrCast(@alignCast(ctx.?));
+        // A signer that has been switched off answers nothing, including to a
+        // client it approved earlier. The relay threads are winding down, and
+        // one that is mid-request must not sign on the way out.
+        if (!self.b.isEnabled()) return .reject;
+        // `ping` is how a client checks the socket is alive. Asking a human
+        // about it is what trains people to stop reading prompts.
+        if (std.mem.eql(u8, request.method, "ping")) return .approve;
+        if (!std.mem.eql(u8, request.method, "connect")) {
+            // Everything else: the library has already refused it unless the
+            // client is authorized, so reaching here means it is. Approving the
+            // client approved these, which the module header states.
+            return .approve;
+        }
+        return switch (self.b.askToConnect(self.io, client, "")) {
+            .allow => .approve,
+            else => .reject,
+        };
+    }
+};
+
+/// Serves one relay until the connection drops or the bunker is switched off.
+///
+/// One thread per relay, each with its own `io` and its own secp256k1 context,
+/// which is why the connect state and the answered-request record are the
+/// caller's and shared: a client that connected over one relay has to be
+/// recognised on another, and one intent arriving on three relays must be
+/// answered once.
+pub fn serveRelay(
+    gpa: std.mem.Allocator,
+    b: *Bunker,
+    url: []const u8,
+    secret_key: [32]u8,
+) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret_key) catch return;
+
+    var policy = ConnectPolicy{ .b = b, .io = io };
+    var nip46_bunker = nip46.Bunker.initSingleKey(signer, kp, policy.asPolicy(), &b.authorized);
+    nip46_bunker.secret = b.secret();
+
+    while (b.isEnabled()) {
+        serveOnce(gpa, io, b, url, &nip46_bunker, kp) catch {};
+        if (!b.isEnabled()) break;
+        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+    }
+}
+
+fn serveOnce(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    b: *Bunker,
+    url: []const u8,
+    nip46_bunker: *nip46.Bunker,
+    remote: keys.KeyPair,
+) !void {
+    var relay = try nostr.relay.dial(gpa, io, url);
+    defer relay.deinit();
+    try nostr.signer.serve(gpa, io, relay, nip46_bunker, remote, url, &b.seen);
+}
+
 /// Builds the `bunker://` URL the reader hands to another app.
 ///
 /// Every relay it serves on is named, because a client publishes its request to
@@ -504,4 +605,44 @@ test "approving a waiting client remembers it, so it is listed and revocable" {
     try std.testing.expect(b.isKnown(client));
     try std.testing.expect(b.revoke(client));
     try std.testing.expect(!b.isKnown(client));
+}
+
+test "a switched-off bunker signs nothing, even for a client it approved" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var b = Bunker{};
+    b.enable(threaded.io());
+
+    const client = [_]u8{0x71} ** 32;
+    b.remember(client, "Coracle");
+    var policy = ConnectPolicy{ .b = &b, .io = threaded.io() };
+    const p = policy.asPolicy();
+
+    const sign = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{} };
+    try std.testing.expectEqual(nip46.Decision.approve, p.decide(&sign, client));
+
+    // Off means off. The relay threads are winding down and one mid-request
+    // must not sign on the way out, which is the window a reader who just
+    // pressed the switch is most likely to care about.
+    b.disable();
+    try std.testing.expectEqual(nip46.Decision.reject, p.decide(&sign, client));
+}
+
+test "ping never asks a human" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var b = Bunker{};
+    b.enable(threaded.io());
+
+    var policy = ConnectPolicy{ .b = &b, .io = threaded.io() };
+    const p = policy.asPolicy();
+    const ping = nip46.Request{ .id = "1", .method = "ping", .params = &.{} };
+
+    // A stranger's ping is answered without a prompt and without approving
+    // them. Clients ping to check the socket; a prompt for each one is what
+    // teaches people to approve without reading.
+    const stranger = [_]u8{0x72} ** 32;
+    try std.testing.expectEqual(nip46.Decision.approve, p.decide(&ping, stranger));
+    try std.testing.expect(!b.isKnown(stranger));
+    try std.testing.expect(b.firstPending() == null);
 }
