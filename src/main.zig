@@ -8285,7 +8285,17 @@ pub const max_note_images = 4;
 /// One picture in a note: where it is, and what the note's own `imeta` claims
 /// about it before a single byte has been fetched.
 pub const NoteImage = struct {
-    url_buf: [300]u8 = [_]u8{0} ** 300,
+    /// 192 and not the 300 a single image used to get, because there are four of
+    /// these in every Note now and the feed copies whole Notes on every rebuild
+    /// and every splice. At 300 the rebuild went from 272us to 400us and the
+    /// layout from 1303 to 1907, with the node count and the planning stage
+    /// unmoved: that is bytes being copied, not work being done.
+    ///
+    /// It fits what image hosts actually emit. A Blossom URL is its 64-character
+    /// hash plus a host and an extension, about 90; nostr.build and primal sit
+    /// in the same range. A longer one is left in the body as a link, which is
+    /// the same fallback a note past the picture cap gets.
+    url_buf: [192]u8 = [_]u8{0} ** 192,
     url_len: u16 = 0,
     /// Height divided by width, from the note's NIP-92 `imeta dim`. Knowing the
     /// shape BEFORE the picture downloads is what lets the card reserve exactly
@@ -8566,10 +8576,14 @@ pub const Note = struct {
     pub fn imageUrl(self: *const Note) []const u8 {
         return self.imageAt(0).url();
     }
-    /// The registered image id for this note's picture, or 0 while it is
+    /// The registered image id for this note's first picture, or 0 while it is
     /// loading, unavailable, or absent.
     pub fn media_id(self: *const Note) u64 {
-        if (mediaSlotFor(self.id)) |m| {
+        return self.mediaIdAt(0);
+    }
+    /// The same for picture `i`.
+    pub fn mediaIdAt(self: *const Note, i: usize) u64 {
+        if (mediaSlotFor(mediaKey(self.id, i))) |m| {
             if (m.state == .loaded) return m.image_id;
         }
         return 0;
@@ -8780,6 +8794,9 @@ pub const Model = struct {
     relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
+    /// Which of that note's pictures the viewer is showing. Zero for a note with
+    /// one, which is every note the viewer could open before galleries existed.
+    expanded_image: u8 = 0,
     /// Whether the mention picker has been dismissed for the query now in the
     /// draft. It has no open flag of its own: it shows whenever the draft ends
     /// in a `@word`, so Escape and a press outside had nothing to clear and it
@@ -10999,6 +11016,27 @@ pub fn resetMediaForTest() void {
 }
 
 /// The slot holding `note_id`'s image, if any.
+/// The media-slot key for one picture of a note.
+///
+/// Picture ZERO keeps the note's own id, deliberately: every slot already on
+/// disk was cached under it, and every path that still speaks in note ids keeps
+/// working unchanged. Only the second and later pictures need a key of their
+/// own.
+///
+/// A derived key colliding with some other note's id would show that note's
+/// picture here. Note ids are already 63 bits taken from an event id, so this is
+/// the same order of unlikely as two notes colliding outright, which the feed
+/// has always lived with.
+fn mediaKey(note_id: i64, index: usize) i64 {
+    if (index == 0) return note_id;
+    const mixed = @as(u64, @bitCast(note_id)) ^ (0x9E37_79B9_7F4A_7C15 *% @as(u64, index));
+    return @bitCast(mixed & 0x7FFF_FFFF_FFFF_FFFF);
+}
+
+pub fn mediaKeyForTest(note_id: i64, index: usize) i64 {
+    return mediaKey(note_id, index);
+}
+
 fn mediaSlotFor(note_id: i64) ?*MediaSlot {
     for (&g_media) |*m| {
         if (m.used and m.note_id == note_id) return m;
@@ -11239,25 +11277,40 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
 /// Marks the picture slot for `note_id` wanted this pass (if it has one), so the
 /// claim pass does not evict a picture still on screen.
 fn markMediaWanted(note_id: i64) void {
-    if (mediaSlotFor(note_id)) |m| m.last_used = g_media_clock;
+    // Every picture of the note, not just the first: a gallery's later cells are
+    // as much on screen as its first, and leaving them unmarked let the claim
+    // pass evict one to feed another in the same row.
+    var i: usize = 0;
+    while (i < max_note_images) : (i += 1) {
+        if (mediaSlotFor(mediaKey(note_id, i))) |m| m.last_used = g_media_clock;
+    }
 }
 
 /// Loads one note's picture: claims a slot, serves it from the disk cache, or
 /// fetches it over the network (up to `per_tick` fetches a pass). A note with no
 /// picture, or one whose slot is already loading or done, is a no-op.
 fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) void {
-    if (!note.hasImage()) return;
+    // Every picture the note carries, in reading order, so the first one is the
+    // first to get a slot when there are not enough to go round. The ones that
+    // miss out draw their blurhash, which costs no slot at all.
+    var i: usize = 0;
+    while (i < note.imageCount()) : (i += 1) fireMediaAt(fx, note, i, fired, per_tick);
+}
+
+fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per_tick: usize) void {
+    const link = note.imageAt(index).url();
+    if (link.len == 0) return;
     // With previews off, nothing leaves the machine until the reader asks for
-    // this one picture. That is the point of the setting: not bandwidth, but
+    // this note's pictures. That is the point of the setting: not bandwidth, but
     // that reading a feed should not tell every host in it that you did.
     if (!g_media_previews and !isMediaAsked(note.id)) return;
-    const slot = claimMediaSlot(fx, note.id) orelse return;
+    const slot = claimMediaSlot(fx, mediaKey(note.id, index)) orelse return;
     slot.last_used = g_media_clock;
     if (slot.state != .idle) return;
 
     var url_buf: [1024]u8 = undefined;
-    const gif = isGifUrl(note.imageUrl());
-    const url = feedImageUrlDirect(&url_buf, note.imageUrl(), slot.direct);
+    const gif = isGifUrl(link);
+    const url = feedImageUrlDirect(&url_buf, link, slot.direct);
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
@@ -12528,6 +12581,9 @@ pub const Msg = union(enum) {
     profiles: native_sdk.EffectTimer,
     /// Expand a note's picture to fill the window.
     expand_image: i64,
+    /// Which picture of a gallery to open. A single picture still uses
+    /// `expand_image`, which is the same thing with an implied zero.
+    expand_image_at: struct { note: i64, index: u8 },
     /// One picture, asked for by the reader while previews are off.
     load_image: i64,
     /// Dismiss the expanded picture.
@@ -12569,7 +12625,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -15695,7 +15751,7 @@ fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) A
             ui.column(.{ .grow = 1, .gap = 0 }, .{
                 focalBody(ui, note),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
@@ -17340,7 +17396,7 @@ fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_a
                 vgap(ui, 5),
                 noteBody(ui, note, true),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, model, note),
@@ -21139,7 +21195,7 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                         // shape whether or not it has loaded, so the feed never
                         // shifts as images arrive.
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                         if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                         vgap(ui, 10),
                         engagementRow(ui, model, note),
@@ -21350,6 +21406,76 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
     return pictureBox(ui, note, height, picture);
+}
+
+/// Gap between gallery cells, and the height a multi-picture row draws at.
+///
+/// One height for every cell, because a row of pictures at their own aspects is
+/// a ragged edge, and the point of a gallery is that it reads as one object.
+/// Each picture is drawn `cover` inside its cell, which is the crop every other
+/// client uses here: `contain` would letterbox portrait shots into slivers.
+const gallery_gap: f32 = 4;
+const gallery_height: f32 = 190;
+
+/// A note's pictures. One fills the column at its own shape, as it always has;
+/// several become a row of equal cells.
+fn noteGallery(ui: *AppUi, note: *const Note) AppUi.Node {
+    const count = note.imageCount();
+    if (count <= 1) return notePicture(ui, note);
+
+    // Previews off: one chip for the whole set rather than one per picture,
+    // because the reader is deciding about the note, not about picture three.
+    if (!g_media_previews and !isMediaAsked(note.id)) return pictureAskChip(ui, note);
+
+    const cells = @min(count, max_note_images);
+    const width = (picture_column_width - gallery_gap * @as(f32, @floatFromInt(cells - 1))) / @as(f32, @floatFromInt(cells));
+
+    var kids: [max_note_images * 2 - 1]AppUi.Node = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < cells) : (i += 1) {
+        if (i > 0) {
+            kids[n] = hgap(ui, gallery_gap);
+            n += 1;
+        }
+        kids[n] = galleryCell(ui, note, i, width);
+        n += 1;
+    }
+    return ui.row(.{ .gap = 0, .cross = .start }, .{kids[0..n]});
+}
+
+/// One cell of a gallery: the picture once it has a slot, its blurhash while it
+/// does not, and a plain box when it will not come.
+///
+/// The blurhash matters more here than for a single picture. There are sixteen
+/// registration slots in the whole app and a gallery wants several at once, so
+/// the later cells of a busy screen routinely have none. A blurhash is drawn as
+/// flat colour cells rather than a registered image, so it costs nothing and the
+/// row still reads as photographs.
+fn galleryCell(ui: *AppUi, note: *const Note, index: usize, width: f32) AppUi.Node {
+    const p = theme.palette;
+    const image_id = note.mediaIdAt(index);
+    const failed = image_id == 0 and mediaFailed(mediaKey(note.id, index));
+
+    const inner: AppUi.Node = if (image_id != 0) blk: {
+        var picture = ui.image(.{ .image = image_id, .grow = 1 });
+        // `cover`, not `contain`: every cell is the same height, so a portrait
+        // shot letterboxed into one would be a sliver in a band of background.
+        picture.widget.image_fit = .cover;
+        break :blk picture;
+    } else if (failed)
+        ui.el(.panel, .{ .grow = 1, .style = .{ .background = p.surface_inset } }, .{})
+    else
+        blurGrid(ui, note.imageAt(index).blurhash(), gallery_height);
+
+    return ui.el(.list_item, .{
+        .width = width,
+        .height = gallery_height,
+        .padding = 0,
+        .on_press = Msg{ .expand_image_at = .{ .note = note.id, .index = @intCast(index) } },
+        .style = .{ .radius = 10, .background = p.surface_inset, .quiet_hover = true },
+        .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
+    }, .{inner});
 }
 
 /// A quoted note on its way: the SHAPE of the card that will replace it.
@@ -21588,7 +21714,12 @@ fn signPow(value: f32, exp: f32) f32 {
 /// What a picture that has not arrived looks like: its own colours when the note
 /// carries a blurhash, stripes when it does not.
 fn pictureBlur(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
-    const hash = note.imageBlurhash();
+    return blurGrid(ui, note.imageBlurhash(), height);
+}
+
+/// The same, for a picture that is not the note's first: a gallery cell knows
+/// its own hash and has no business asking the note for it.
+fn blurGrid(ui: *AppUi, hash: []const u8, height: f32) AppUi.Node {
     if (hash.len == 0) return pictureStripes(ui, height);
     const blur = decodeBlurhash(hash);
     if (!blur.ok) return pictureStripes(ui, height);
@@ -22537,7 +22668,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_url => |url| {
             if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
         },
-        .expand_image => |note_id| model.expanded_note = note_id,
+        .expand_image => |note_id| {
+            model.expanded_note = note_id;
+            model.expanded_image = 0;
+        },
+        .expand_image_at => |what| {
+            model.expanded_note = what.note;
+            model.expanded_image = what.index;
+        },
         .load_image => |note_id| {
             askForMedia(note_id);
             scanMediaFetches(fx, model);

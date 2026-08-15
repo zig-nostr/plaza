@@ -17297,3 +17297,139 @@ test "the proxy toggle decides whether a URL is rewritten at all" {
     var buf2: [1024]u8 = undefined;
     try testing.expectEqualStrings(original, main.feedImageUrlForTest(&buf2, original));
 }
+
+// -- A note with more than one picture ----------------------------------------
+
+test "every image in a note becomes a picture, and none is left in the text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x81} ** 32);
+
+    // Derek's note, in shape: three images on one line, each with its own imeta.
+    const a = "https://blossom.example/aaa.jpeg";
+    const b = "https://blossom.example/bbb.jpeg";
+    const c = "https://blossom.example/ccc.jpeg";
+    const content = try std.fmt.allocPrint(arena, "Bon dia, Nostr. {s} {s} {s}", .{ a, b, c });
+    const tags = [_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ a, "dim 2040x1536", "blurhash abc" },
+        &.{ "imeta", "url " ++ b, "dim 768x1020" },
+        &.{ "imeta", "url " ++ c, "dim 768x1020" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &tags, content, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 3), note.imageCount());
+    try testing.expectEqualStrings(a, note.imageAt(0).url());
+    try testing.expectEqualStrings(b, note.imageAt(1).url());
+    try testing.expectEqualStrings(c, note.imageAt(2).url());
+
+    // The whole point of the bug report: none of them may be left behind as a
+    // raw link beside the pictures. Before this, the first became a picture and
+    // the other two sat in the body as URLs.
+    try testing.expectEqualStrings("Bon dia, Nostr.", note.content());
+
+    // Each keeps its OWN imeta, not the first one's, which is what lets a
+    // portrait shot beside a landscape reserve the right space.
+    try testing.expectEqual(@as(u16, 2040), note.imageAt(0).w);
+    try testing.expectEqual(@as(u16, 768), note.imageAt(1).w);
+    try testing.expectEqualStrings("abc", note.imageAt(0).blurhash());
+    try testing.expectEqualStrings("", note.imageAt(1).blurhash());
+}
+
+test "a note past the picture cap keeps the rest as links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x82} ** 32);
+
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(arena);
+    const over = main.max_note_images + 2;
+    for (0..over) |i| try content.print(arena, "https://blossom.example/{d}.jpeg ", .{i});
+
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, content.items, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(main.max_note_images, note.imageCount());
+    // The overflow stays readable rather than vanishing: it is still a link the
+    // reader can open, which is what the single-image build did for everything
+    // after the first.
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/4.jpeg") != null);
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/0.jpeg") == null);
+}
+
+test "each picture of a note gets its own media slot" {
+    // They shared one key before, so a gallery's cells fought over a single slot
+    // and only ever one of them could be loaded.
+    const note_id: i64 = 0x0123_4567;
+    const first = main.mediaKeyForTest(note_id, 0);
+    try testing.expectEqual(note_id, first);
+
+    var seen: [main.max_note_images]i64 = undefined;
+    for (0..main.max_note_images) |i| {
+        seen[i] = main.mediaKeyForTest(note_id, i);
+        try testing.expect(seen[i] >= 0);
+        for (seen[0..i]) |earlier| try testing.expect(earlier != seen[i]);
+    }
+}
+
+test "a URL that prefixes another does not strand the longer one's tail" {
+    // `.../a.jpeg` is a prefix of `.../a.jpeg?x=1`. Removing the short one first
+    // would leave `?x=1` sitting in the body as debris.
+    var buf: [512]u8 = undefined;
+    const short = "https://h.example/a.jpeg";
+    const long = "https://h.example/a.jpeg?w=9";
+    const omit = [_][]const u8{ short, long };
+    const n = main.renderContentInto(&buf, "look " ++ long ++ " end", &omit, null);
+    try testing.expectEqualStrings("look  end", buf[0..n]);
+}
+
+test "three pictures draw as three cells across the column, not one and two links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x83} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 91;
+    _ = model.notes[0].setImageForTest(0, "https://h.example/a.jpg");
+    _ = model.notes[0].setImageForTest(1, "https://h.example/b.jpg");
+    _ = model.notes[0].setImageForTest(2, "https://h.example/c.jpg");
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    // One pressable cell per picture. The single-image build drew exactly one
+    // whatever the note carried.
+    try testing.expectEqual(@as(usize, 3), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
+
+test "one picture still fills the column, so nothing about a plain note moved" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x84} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 92;
+    const img = model.notes[0].setImageForTest(0, "https://h.example/only.jpg");
+    img.aspect = 0.6;
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expectEqual(@as(usize, 1), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
