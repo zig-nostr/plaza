@@ -116,6 +116,28 @@ fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     linkNostr(b, mod);
 
+    // The Keychain shim, and the frameworks behind it. Only the daemon links
+    // this: it is the process that holds the key, and the render process has no
+    // business being able to read it.
+    mod.addCSourceFile(.{ .file = b.path("src/keychain.c"), .flags = &.{"-O2"} });
+    mod.addIncludePath(b.path("src"));
+    // The SDK's framework directory, asked for rather than assumed. This module
+    // is built plainly, without the `--sysroot` the app build passes, so Zig has
+    // nowhere to look for Security.framework and says so ("searched paths:
+    // none"). `xcrun` is how every other tool on this machine answers the same
+    // question, and hardcoding a versioned SDK path would break on the next
+    // Xcode update.
+    if (target.result.os.tag == .macos) {
+        const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
+        mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+        // And the SDK's headers: Security.framework's own headers include
+        // `libDER/DERItem.h`, which lives in usr/include rather than inside the
+        // framework. The app build gets this from `-isysroot`.
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+        mod.linkFramework("Security", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    }
+
     const exe = b.addExecutable(.{ .name = "plaza-signer", .root_module = mod });
     b.installArtifact(exe);
 
