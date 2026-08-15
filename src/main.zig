@@ -2828,6 +2828,7 @@ else
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
 const copy_nevent_key: u64 = 103;
+const copy_bunker_key: u64 = 104;
 const copy_note_text_key: u64 = 104;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
@@ -12549,6 +12550,7 @@ pub const Msg = union(enum) {
     bunker_toggle,
     bunker_decide: struct { id: u64, allow: bool },
     bunker_revoke: u8,
+    copy_bunker_url,
     /// A /setup (create) answered: adopt the new helper identity.
     helper_setup: native_sdk.EffectResponse,
     /// A /sign answered: ingest and publish the signed event.
@@ -12630,7 +12632,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "copy_bunker_url", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -13032,9 +13034,12 @@ fn bunkerLinkRow(ui: *AppUi) AppUi.Node {
         ),
         vgap(ui, 7),
         ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = bunkerUrl() } }, "Copy link"),
+            ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker_url }, "Copy link"),
             ui.paragraph(
-                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                // `grow` as well as `wrap`: a wrapping paragraph with no width to
+                // wrap INTO lays out at its natural width and runs off the card,
+                // which is what this did.
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
                 &.{.{ .text = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.", .scale = mono_hint_scale }},
             ),
         }),
@@ -13611,6 +13616,24 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The root view: one screen at a time, chosen by the stage, with an expanded
 /// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const view = appViewLayers(ui, model);
+    // An app asking to sign as you goes on TOP of whatever was built, rather
+    // than instead of it.
+    //
+    // Not because it outranks reading, but because it is the only thing here
+    // with somebody waiting on the other end: a relay thread is parked on the
+    // answer and the client gives up long before Plaza's own two-minute window
+    // closes. A question buried under whatever screen happens to be open is a
+    // question that times out, which is exactly how this failed the first time
+    // it met a real client. An earlier version of this returned early and threw
+    // away the screen underneath, which is why it is a layer and not a branch.
+    if (bunkerPendingClient().len > 0) {
+        return ui.stack(.{ .grow = 1 }, .{ view, bunkerAskSheet(ui) });
+    }
+    return view;
+}
+
+fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     const base = switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
         // Settings layers OVER the feed rather than replacing it, like every
@@ -14202,6 +14225,51 @@ fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The first-intent sheet: the join ladder over the dimmed feed. Three ways in,
 /// most confident first, and always the way back to reading. When the guest
 /// reached for the composer, the sheet says the note is waiting.
+/// An app asking to sign as you, over whatever the reader was doing.
+///
+/// No dismiss and no press-to-close, unlike every other sheet here. The two
+/// buttons ARE the answer, and a scrim that closes on a stray click would leave
+/// a client hanging on a question the reader thinks they dealt with. Denying is
+/// one press away and costs nothing: the app can ask again.
+fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "An app wants to sign as you" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 24),
+                settingsCard(ui, .{
+                    ui.column(.{ .gap = 0, .grow = 1 }, .{
+                        ui.paragraph(
+                            .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
+                            &.{.{ .text = "An app wants to sign as you", .scale = 1.1 }},
+                        ),
+                        vgap(ui, 7),
+                        ui.paragraph(
+                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                            &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
+                        ),
+                        vgap(ui, 7),
+                        ui.paragraph(
+                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                            &.{.{ .text = "Approving lets it sign anything as you until you disconnect it in Settings. If it already gave up waiting, approve anyway and connect again from the app: this is remembered.", .scale = mono_hint_scale }},
+                        ),
+                        vgap(ui, 12),
+                        ui.row(.{ .gap = 8, .cross = .center }, .{
+                            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true } } }, "Approve"),
+                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false } } }, "Deny"),
+                        }),
+                    }),
+                }),
+            }),
+        }),
+    });
+}
+
 fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     return ui.el(.dialog, .{
         .grow = 1,
@@ -22825,6 +22893,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s}}}", .{ what.id, if (what.allow) "true" else "false" }) catch return;
             helperFetch(fx, bunker_decide_key, "/bunker/decide", body, Effects.responseMsg(.bunker_state));
         },
+        .copy_bunker_url => {
+            const url = bunkerUrl();
+            if (url.len == 0) return;
+            fx.writeClipboard(.{ .key = copy_bunker_key, .text = url });
+            setToast(model, "Link copied");
+        },
         .bunker_revoke => |index| {
             const pubkey = bunkerClientAt(index);
             if (pubkey.len == 0) return;
@@ -28314,7 +28388,19 @@ pub fn resetBunkerForTest() void {
 /// Asks the daemon what it is doing, at most once a second and only while the
 /// screen that shows it is open.
 fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
-    if (model.stage != .settings) return;
+    // NOT gated on the settings screen, and that was the bug that made this
+    // feature not work at all.
+    //
+    // The reader copies the link in Settings, switches to a browser, and pastes
+    // it into another app. Plaza is in the BACKGROUND at the moment the client
+    // connects, which is the only moment that matters: the relay thread is
+    // parked waiting for an approval, and if nothing is polling, nothing ever
+    // asks. The client waits, gets nothing, and times out. That is exactly what
+    // happened the first time this was tried against a real client.
+    //
+    // So it polls whenever the bunker is on, wherever the reader is, and the
+    // approval is a sheet rather than a row on one screen.
+    if (!g_bunker_on and model.stage != .settings) return;
     if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
     g_bunker_polled_at = now_ms;
     var url_buf: [48]u8 = undefined;

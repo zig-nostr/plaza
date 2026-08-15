@@ -17530,3 +17530,35 @@ test "the settings screen carries the signing section" {
         try testing.expect(findAnyText(tree.root, "Disconnect") != null);
     }
 }
+
+test "the signing card's text stays inside the window" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x93} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://3e294d2fd339bb16a5403a86e3664947dd408c4d87a0066524f8a573ae53ca8e?relay=wss%3A%2F%2Fnostr.oxtr.dev&relay=wss%3A%2F%2Ftheforest.nostr1.com&relay=wss%3A%2F%2Frelay.primal.net&secret=9f4184c6ddbdf3f185f7d32839457b72","pending":null,"clients":[]}
+    );
+
+    const p = try painted.Painted.render(arena, &model);
+    const hint = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.";
+    const frame = frameOfText(p, hint) orelse return error.HintNotDrawn;
+
+    // The reported bug, as a number. A wrapping paragraph with nothing bounding
+    // its width lays out at its natural width, so `wrap` is obeyed and useless:
+    // this sentence ran off the right edge of the card and out of the window.
+    // The window is the outer bound and the one a reader actually sees broken.
+    const window_right = main.window_width;
+    try testing.expect(frame.x + frame.width <= window_right);
+
+    // And the link itself, which is longer and would go first.
+    const url_frame = frameOfTextContaining(p, "bunker://3e294d2f") orelse return error.UrlNotDrawn;
+    try testing.expect(url_frame.x + url_frame.width <= window_right);
+}

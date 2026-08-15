@@ -29,6 +29,8 @@ const import_key: u64 = 1;
 const copy_key: u64 = 2;
 const create_key: u64 = 3;
 const status_key: u64 = 4;
+const bunker_key: u64 = 5;
+const copy_bunker_key: u64 = 6;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
 
 // 452 wide per the design, and one height for every state rather than a window
@@ -105,7 +107,27 @@ const Model = struct {
     npub_len: usize = 0,
     msg_buf: [96]u8 = undefined,
     msg_len: usize = 0,
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub" };
+    /// The bunker link, when the daemon is serving one. Empty otherwise, and
+    /// this window then says nothing about it rather than showing a dead link.
+    bunker_url_buf: [512]u8 = undefined,
+    bunker_len: usize = 0,
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub", "bunker_url_buf", "bunker_len" };
+
+    /// Reads the daemon's bunker state. Only the URL is wanted here: approving
+    /// clients and disconnecting them belong on Plaza's own settings screen,
+    /// which is where somebody would go looking for them.
+    fn adoptBunker(self: *Model, json: []const u8) void {
+        const Body = struct { enabled: bool = false, url: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(Body, std.heap.page_allocator, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        if (!parsed.value.enabled) {
+            self.bunker_len = 0;
+            return;
+        }
+        const n = @min(parsed.value.url.len, self.bunker_url_buf.len);
+        @memcpy(self.bunker_url_buf[0..n], parsed.value.url[0..n]);
+        self.bunker_len = n;
+    }
 
     pub fn key(self: *const Model) []const u8 {
         return std.mem.trim(u8, self.key_buffer.text(), " \t\r\n");
@@ -175,9 +197,11 @@ const Msg = union(enum) {
     import_done: native_sdk.EffectResponse,
     create_done: native_sdk.EffectResponse,
     status_done: native_sdk.EffectResponse,
+    bunker_done: native_sdk.EffectResponse,
+    copy_bunker,
     close,
 
-    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "close" };
+    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "copy_bunker", "close" };
 };
 
 pub const AppUi = canvas.Ui(Msg);
@@ -253,6 +277,7 @@ fn boot(model: *Model, fx: *Effects) void {
     if (g_mode == .status) {
         model.stage = .looking;
         requestStatus(model, fx);
+        requestBunker(model, fx);
     }
 }
 
@@ -278,6 +303,27 @@ fn requestCreate(model: *Model, fx: *Effects) void {
         .headers = &.{.{ .name = "Authorization", .value = auth }},
         .body = "{\"method\":\"create\"}",
         .on_response = Effects.responseMsg(.create_done),
+    });
+}
+
+/// Asks the daemon for the bunker link, if it is serving one.
+///
+/// Fired alongside the status request rather than on a timer: this window is
+/// opened, read and closed, so one look when it opens is the whole of what it
+/// needs. Plaza's settings screen is the live view.
+fn requestBunker(model: *Model, fx: *Effects) void {
+    _ = model;
+    if (g_token_len == 0) return;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{daemon_port}) catch return;
+    var auth_buf: [160]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token()}) catch return;
+    fx.fetch(.{
+        .key = bunker_key,
+        .url = url,
+        .method = .GET,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.bunker_done),
     });
 }
 
@@ -329,6 +375,18 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .pass_edit => |e| model.pass_buffer.apply(e),
         .copy_command => fx.writeClipboard(.{ .key = copy_key, .text = import_command }),
+        .copy_bunker => {
+            if (model.bunker_len == 0) return;
+            fx.writeClipboard(.{ .key = copy_bunker_key, .text = model.bunker_url_buf[0..model.bunker_len] });
+            setNotice(model, "Link copied");
+        },
+        .bunker_done => |response| {
+            // Best effort. This window's job is the key ceremony; the link is
+            // something it can show when the daemon happens to be serving one,
+            // and a daemon that is not says so by leaving it out.
+            if (response.outcome != .ok or response.status != 200) return;
+            model.adoptBunker(response.body);
+        },
         .do_create => {
             model.stage = .minting;
             requestCreate(model, fx);
@@ -657,6 +715,10 @@ fn resultView(ui: *AppUi, model: *const Model, mark: AppUi.Node, title: []const 
                     )
                 else
                     ui.spacer(0),
+                // Inside the bounded column, for the reason stated above it: a
+                // bunker link is longer than an npub and would run off the edge
+                // exactly the same way.
+                bunkerRow(ui, model),
             }),
             hgap(ui, 61),
         }),
@@ -706,6 +768,30 @@ fn holdingView(ui: *AppUi, model: *const Model) AppUi.Node {
         "It signs when Plaza asks. The key is on this Mac, in this process, and has never been in Plaza.",
         "Close",
     );
+}
+
+/// The bunker link, under the result, when the daemon is serving one.
+///
+/// Read-only here plus a copy: approving an app and disconnecting it live on
+/// Plaza's settings screen, which is where somebody would go looking for them,
+/// and splitting one decision across two windows is how a switch gets flipped
+/// without its consequences being read.
+fn bunkerRow(ui: *AppUi, model: *const Model) AppUi.Node {
+    if (model.bunker_len == 0) return ui.spacer(0);
+    return ui.column(.{ .gap = 0, .cross = .center }, .{
+        vgap(ui, 14),
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.chrome_text } },
+            &.{.{ .text = "Other apps can sign with this key", .scale = px(11) }},
+        ),
+        vgap(ui, 6),
+        ui.paragraph(
+            .{ .wrap = true, .grow = 1, .text_alignment = .center, .style = .{ .foreground = ink.body } },
+            &.{.{ .text = model.bunker_url_buf[0..model.bunker_len], .monospace = true, .scale = px(9.5) }},
+        ),
+        vgap(ui, 8),
+        ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker }, "Copy link"),
+    });
 }
 
 fn waitingView(ui: *AppUi, line: []const u8) AppUi.Node {
