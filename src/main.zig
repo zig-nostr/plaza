@@ -2584,7 +2584,19 @@ const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
 
 /// What can be hidden. The enum is the index into the registry below, so a call
 /// site is checked at compile time while the table stays data.
-pub const Hideable = enum { reaction_counts, repost_counts, zap_totals };
+/// What can be taken away. Each verb has two, and they are a hierarchy rather
+/// than two independent switches: hiding the VERB hides its count with it,
+/// because an icon that is not drawn has nowhere to put a number.
+pub const Hideable = enum {
+    replies,
+    reply_counts,
+    reposts,
+    repost_counts,
+    reactions,
+    reaction_counts,
+    zaps,
+    zap_totals,
+};
 
 pub const HideableInfo = struct {
     /// Stable across releases: it is written to the settings file, so renaming
@@ -2601,20 +2613,50 @@ pub const HideableInfo = struct {
 
 pub const hideables = [_]HideableInfo{
     .{
+        .id = "replies",
+        .label = "Replying",
+        .detail = "The reply verb itself. Hiding it takes the count with it, and stops the feed asking relays for replies to the notes on screen. You can still open a note and answer it there.",
+        .drops = &.{1},
+    },
+    .{
+        .id = "reply_counts",
+        .label = "Reply counts",
+        .detail = "How many people answered a note, with the verb left in place. The number alone is enough to stop the feed asking for them.",
+        .drops = &.{1},
+    },
+    .{
+        // No `drops` on either repost row, and this is the honest half of the
+        // feature rather than an oversight. Whether YOU reposted something is
+        // read out of the same kind:6 stream as everybody else's reposts, so
+        // dropping it would leave the repost verb unable to say it had already
+        // been pressed. Hiding it is worth having; claiming the data is gone
+        // would not be true.
+        .id = "reposts",
+        .label = "Reposting",
+        .detail = "The repost verb itself. Still fetched either way: it is the same stream that tells Plaza whether you reposted something.",
+    },
+    .{
+        .id = "repost_counts",
+        .label = "Repost counts",
+        .detail = "How many people passed a note on. Still fetched, for the same reason as the row above.",
+    },
+    .{
+        .id = "reactions",
+        .label = "Reacting",
+        .detail = "The like verb itself. Hiding it takes the count with it and stops the feed asking relays for reactions. Your own likes are still remembered here.",
+        .drops = &.{7},
+    },
+    .{
         .id = "reaction_counts",
         .label = "Reaction counts",
         .detail = "How many people liked a note. Hiding it stops the FEED asking relays for reactions. Your notifications are a separate subscription and keep theirs, so you still hear when somebody reacts to you. You can still like things; your own heart is remembered here.",
         .drops = &.{7},
     },
     .{
-        // No `drops`, and this is the honest half of the feature rather than an
-        // oversight. Whether YOU reposted something is read out of the same
-        // kind:6 stream as everybody else's reposts, so dropping it would leave
-        // the repost icon unable to say it had already been pressed. Hiding the
-        // number is worth having; claiming the data is gone would not be true.
-        .id = "repost_counts",
-        .label = "Repost counts",
-        .detail = "How many people passed a note on. Still fetched: it is the same stream that tells Plaza whether you reposted something yourself.",
+        .id = "zaps",
+        .label = "Zapping",
+        .detail = "The zap verb itself. Hiding it takes the total with it and stops the feed asking relays for zap receipts.",
+        .drops = &.{9735},
     },
     .{
         .id = "zap_totals",
@@ -2623,6 +2665,22 @@ pub const hideables = [_]HideableInfo{
         .drops = &.{9735},
     },
 };
+
+// The registry is indexed by `Hideable`, so the two have to stay in step. They
+// are checked here rather than trusted: a row inserted in the wrong place would
+// hide the wrong thing, and nothing about that failure looks like a mistake.
+// Making the id the tag's own name is what lets this be a compile error.
+comptime {
+    if (hideables.len != @typeInfo(Hideable).@"enum".fields.len) {
+        @compileError("every Hideable needs exactly one registry row");
+    }
+    for (@typeInfo(Hideable).@"enum".fields) |field| {
+        const row = hideables[field.value];
+        if (!std.mem.eql(u8, row.id, field.name)) {
+            @compileError("Hideable." ++ field.name ++ " does not line up with registry id \"" ++ row.id ++ "\"");
+        }
+    }
+}
 
 var g_hidden: [hideables.len]bool = @splat(false);
 
@@ -2672,8 +2730,10 @@ fn engagementKinds() []const u16 {
     var n: usize = 0;
     for (engagement_kinds) |k| {
         const drop = switch (k) {
-            7 => isTakenAway(.reaction_counts),
-            9735 => isTakenAway(.zap_totals),
+            1 => countHidden(.replies, .reply_counts),
+            7 => countHidden(.reactions, .reaction_counts),
+            9735 => countHidden(.zaps, .zap_totals),
+            // 6 and 16 stay whatever is hidden, for the reason in the registry.
             else => false,
         };
         if (drop) continue;
@@ -2681,6 +2741,16 @@ fn engagementKinds() []const u16 {
         n += 1;
     }
     return g_engagement_kinds[0..n];
+}
+
+/// Whether a verb's number is gone, either because the number was hidden or
+/// because the whole verb was.
+///
+/// The hierarchy, in one place. Hiding a verb hides its count with it: an icon
+/// that is not drawn has nowhere to put a number, so treating the two as
+/// independent would leave a count that could never be seen still being fetched.
+pub fn countHidden(verb: Hideable, count: Hideable) bool {
+    return isTakenAway(verb) or isTakenAway(count);
 }
 
 /// The settings file's `hidden=` value: the ids of what is hidden, comma
@@ -12310,7 +12380,7 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     n += 1;
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
     n += 1;
-    sections[n] = settingsSection(ui, "QUIET", "what you hide, the feed stops asking for", quietCard(ui, model));
+    sections[n] = settingsSection(ui, "NOTES", "what each one shows · what the feed stops asking for", notesCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;
@@ -12602,7 +12672,7 @@ fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
 /// two of these stop the app asking relays for anything and one does not, and a
 /// screen that let you assume they were the same would be making a promise the
 /// app does not keep.
-fn quietCard(ui: *AppUi, model: *const Model) AppUi.Node {
+fn notesCard(ui: *AppUi, model: *const Model) AppUi.Node {
     _ = model;
     const p = theme.palette;
     var kids: [hideables.len * 3]AppUi.Node = undefined;
@@ -15411,13 +15481,13 @@ fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, thread_inset + 2),
             vgap(ui, 33),
-            statCount(ui, c.replies, "reply", "replies"),
+            statCount(ui, if (countHidden(.replies, .reply_counts)) 0 else c.replies, "reply", "replies"),
             hgap(ui, 18),
-            statCount(ui, if (isTakenAway(.repost_counts)) 0 else c.reposts, "repost", "reposts"),
+            statCount(ui, if (countHidden(.reposts, .repost_counts)) 0 else c.reposts, "repost", "reposts"),
             hgap(ui, 18),
-            statCount(ui, if (isTakenAway(.reaction_counts)) 0 else c.likes, "like", "likes"),
+            statCount(ui, if (countHidden(.reactions, .reaction_counts)) 0 else c.likes, "like", "likes"),
             hgap(ui, 18),
-            statCount(ui, if (isTakenAway(.zap_totals)) 0 else c.zap_msat / 1000, "sat", "sats"),
+            statCount(ui, if (countHidden(.zaps, .zap_totals)) 0 else c.zap_msat / 1000, "sat", "sats"),
             ui.spacer(1),
         }),
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
@@ -19979,16 +20049,16 @@ fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: b
         // A plain pressable row, never a `.list_item`: that kind carries a 28px
         // intrinsic height floor and its padding walks the cluster off the rail
         // the disc, name and body share.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts) c.replies else 0, p.text_metric, .{
+        if (isTakenAway(.replies)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts and !countHidden(.replies, .reply_counts)) c.replies else 0, p.text_metric, .{
             .on_press = Msg{ .open_thread = note.id },
             .style = .{ .quiet_hover = true },
             .semantics = .{ .role = .button, .label = "Reply" },
         })),
-        verbSlot(ui, repostAction(ui, note, c, counts)),
-        verbSlot(ui, likeAction(ui, note, counts)),
+        if (isTakenAway(.reposts)) ui.spacer(0) else verbSlot(ui, repostAction(ui, note, c, counts)),
+        if (isTakenAway(.reactions)) ui.spacer(0) else verbSlot(ui, likeAction(ui, note, counts)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !isTakenAway(.zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
+        if (isTakenAway(.zaps)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !countHidden(.zaps, .zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
         verbSlot(ui, ui.appIcon(quiet, "bookmark")),
         // The one unfinished-looking glyph that is not unfinished: it opens the
         // note's menu, the same one the thread's header has always had, with the
@@ -20080,7 +20150,7 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     // Hidden means the NUMBER goes, not the verb. You can still like a note
     // with the count taken away; what you lose is being told how many others
     // did, which is the part the preference is about.
-    const shown = if (counts and !isTakenAway(.reaction_counts)) count else 0;
+    const shown = if (counts and !countHidden(.reactions, .reaction_counts)) count else 0;
     return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), shown, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
@@ -20094,7 +20164,7 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
 /// colour means the same thing in both places.
 fn repostAction(ui: *AppUi, note: *const Note, c: Counts, counts: bool) AppUi.Node {
     const tint = if (c.reposted_by_me) theme.palette.status_success else theme.palette.text_metric;
-    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts and !isTakenAway(.repost_counts)) c.reposts else 0, tint, .{
+    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts and !countHidden(.reposts, .repost_counts)) c.reposts else 0, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .repost = note.id },
         .semantics = .{ .role = .button, .label = if (c.reposted_by_me) "Reposted" else "Repost", .focusable = true },

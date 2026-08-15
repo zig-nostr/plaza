@@ -17081,3 +17081,143 @@ test "a muted author's note is dropped on arrival, not just on a full read" {
         try testing.expect(!std.mem.eql(u8, &n.pubkey, &loud.public_key));
     }
 }
+
+test "hiding a verb hides its count and stops its fetch too" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    // The hierarchy. Hiding the VERB has to take the count with it: an icon
+    // that is not drawn has nowhere to put a number, so treating the two as
+    // independent would leave a count nobody can see still being downloaded.
+    main.setHidden(.reactions, true);
+    try testing.expect(main.countHidden(.reactions, .reaction_counts));
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+
+    // And it holds with only the count hidden, which is the other half.
+    main.setHidden(.reactions, false);
+    main.setHidden(.reaction_counts, true);
+    try testing.expect(main.countHidden(.reactions, .reaction_counts));
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+}
+
+test "reply counts can be hidden, and that stops the feed asking for replies" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Kind 1 here is the engagement subscription asking for REPLIES to the
+    // notes on screen, which is a different question from the feed's own
+    // subscription asking for notes by author. Dropping it costs the reply
+    // count and nothing else; a thread still fetches its own replies.
+    main.setHidden(.reply_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 6, 7, 9735 }, main.engagementKindsForTest());
+
+    main.setHidden(.reply_counts, false);
+    main.setHidden(.replies, true);
+    try testing.expectEqualSlices(u16, &.{ 6, 7, 9735 }, main.engagementKindsForTest());
+}
+
+test "reposting is hideable but never claims to stop being fetched" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Both repost rows, verb and count, leave kind 6 in place. Whether YOU
+    // reposted something arrives on that same stream, so dropping it would
+    // leave the verb unable to say it had already been pressed.
+    main.setHidden(.reposts, true);
+    main.setHidden(.repost_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    for (main.hideables) |h| {
+        if (!std.mem.eql(u8, h.id, "reposts") and !std.mem.eql(u8, h.id, "repost_counts")) continue;
+        try testing.expectEqual(@as(usize, 0), h.drops.len);
+        try testing.expect(std.mem.indexOf(u8, h.detail, "Still fetched") != null);
+    }
+}
+
+test "every hideable lines up with its enum tag" {
+    // The registry is indexed by the enum, and a row in the wrong place would
+    // hide the wrong thing. There is a comptime check for exactly this; this is
+    // the runtime statement of the same property, so the intent is visible to
+    // somebody reading the tests rather than only to the compiler.
+    try testing.expectEqual(@typeInfo(main.Hideable).@"enum".fields.len, main.hideables.len);
+    inline for (@typeInfo(main.Hideable).@"enum".fields) |field| {
+        try testing.expectEqualStrings(field.name, main.hideables[field.value].id);
+    }
+}
+
+test "the notes settings screen lists all eight, verbs and counts" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x73} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    main.setHidden(.zaps, true);
+    const tree = try buildTree(arena, &model);
+    for (main.hideables) |h| {
+        try testing.expect(findAnyText(tree.root, h.label) != null);
+    }
+    // And the section is not called QUIET any more, which read as
+    // do-not-disturb: a switch about notifications rather than about what a
+    // note row draws.
+    try testing.expect(findAnyText(tree.root, "QUIET") == null);
+    try testing.expect(findAnyText(tree.root, "NOTES") != null);
+}
+
+test "a hidden verb is gone from the note row, not just its number" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x75} ** 32);
+
+    main.setIdentityForTest([_]u8{0x76} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(try signedNote(arena, signer, kp, 1_800_000_000, "a note with a verb row"), 1_800_000_100);
+    model.notes_len = 1;
+
+    // All four verbs are on the row to begin with.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") != null);
+        try testing.expect(findByLabel(tree.root, "Reply") != null);
+        try testing.expect(findByLabel(tree.root, "Repost") != null);
+    }
+
+    // Hiding the verb removes the control itself. Hiding only its count would
+    // leave the icon sitting there, which is the thing this is not.
+    main.setHidden(.reactions, true);
+    main.setHidden(.replies, true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") == null);
+        try testing.expect(findByLabel(tree.root, "Reply") == null);
+        // Untouched, so this is the verb being hidden rather than the whole row
+        // failing to build.
+        try testing.expect(findByLabel(tree.root, "Repost") != null);
+    }
+
+    // Hiding only the COUNT leaves the verb pressable, which is the other half
+    // of the pair and the reason there are two rows per verb.
+    main.setHidden(.reactions, false);
+    main.setHidden(.reaction_counts, true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") != null);
+    }
+}
