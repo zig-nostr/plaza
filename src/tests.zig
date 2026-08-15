@@ -3958,11 +3958,10 @@ test "with previews off a picture is one chip, and asking for it loads that one"
     model.notes[0] = threadNote(0xA1, 100, 0);
     model.notes[0].id = 7;
     const url = "https://host.example/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = @intCast(url.len);
-    model.notes[0].image_w = 1600;
-    model.notes[0].image_h = 900;
-    model.notes[0].image_bytes = 240_000;
+    const img = model.notes[0].setImageForTest(0, url);
+    img.w = 1600;
+    img.h = 900;
+    img.bytes = 240_000;
     model.notes_len = 1;
 
     main.setMediaPreviews(false);
@@ -4073,12 +4072,11 @@ test "a picture with a blurhash shows its colours before its bytes" {
     model.notes[0] = threadNote(0xA1, 100, 0);
     model.notes[0].id = 7;
     const url = "https://host.example/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = @intCast(url.len);
-    model.notes[0].image_aspect = 0.5;
+    const img = model.notes[0].setImageForTest(0, url);
+    img.aspect = 0.5;
     const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
-    @memcpy(model.notes[0].image_blur_buf[0..hash.len], hash);
-    model.notes[0].image_blur_len = @intCast(hash.len);
+    @memcpy(img.blur_buf[0..hash.len], hash);
+    img.blur_len = @intCast(hash.len);
     model.notes_len = 1;
 
     const p = try painted.Painted.render(arena, &model);
@@ -4176,9 +4174,8 @@ test "the pressable box is the picture, not the space around it" {
     // viewer for a picture the reader was not pointing at.
     var note = threadNote(0xA1, 100, 0);
     const url = "https://host.example/tall.jpg";
-    @memcpy(note.image_url_buf[0..url.len], url);
-    note.image_url_len = @intCast(url.len);
-    note.image_aspect = 2.0;
+    const img = note.setImageForTest(0, url);
+    img.aspect = 2.0;
 
     const height = main.pictureHeight(&note);
     const width = main.pictureWidth(&note);
@@ -4187,7 +4184,7 @@ test "the pressable box is the picture, not the space around it" {
     try testing.expectApproxEqAbs(height / 2.0, width, 0.5);
 
     // A landscape picture fills the column.
-    note.image_aspect = 0.5625;
+    img.aspect = 0.5625;
     try testing.expectApproxEqAbs(main.picture_column_width_for_test, main.pictureWidth(&note), 0.5);
 }
 
@@ -10558,8 +10555,7 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
     model.notes[0].id = 1;
     const url = "https://example.com/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = url.len;
+    _ = model.notes[0].setImageForTest(0, url);
     model.notes_len = 1;
     model.expanded_note = 1;
 
@@ -11841,8 +11837,7 @@ test "picture slots follow the reader down a long thread" {
         model.thread_notes[i].pubkey = [_]u8{0x55} ** 32;
         model.thread_notes[i].event_id = [_]u8{@intCast(i + 1)} ** 32;
         const url = "https://example.com/a.jpg";
-        @memcpy(model.thread_notes[i].image_url_buf[0..url.len], url);
-        model.thread_notes[i].image_url_len = url.len;
+        _ = model.thread_notes[i].setImageForTest(0, url);
     }
     model.thread_notes_len = count;
     _ = try painted.Painted.render(arena, &model);
@@ -11951,8 +11946,7 @@ test "a picture that will not load says so instead of waiting forever" {
     model.notes[0].id = 4242;
     model.notes[0].pubkey = [_]u8{0x2b} ** 32;
     const url = "https://haven.example.com/gone.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = url.len;
+    _ = model.notes[0].setImageForTest(0, url);
     model.notes_len = 1;
 
     // Still coming: no failure said, because none has happened.
@@ -15885,7 +15879,7 @@ test "rendering a mention records where its label landed and whom it names" {
     var buf: [220]u8 = undefined;
     var mentions = main.MentionList{};
     const src = try std.fmt.allocPrint(arena, "hey nostr:{s} welcome", .{npub});
-    const n = main.renderContentInto(&buf, src, "", &mentions);
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
 
     try testing.expectEqualStrings("hey @jack welcome", buf[0..n]);
     try testing.expectEqual(@as(usize, 1), mentions.all().len);
@@ -15905,7 +15899,7 @@ test "a mention's link payload is a person and an http link is not" {
     defer arena_state.deinit();
     const npub = try nostr.nip19.encodeNpub(arena_state.allocator(), pk);
     const src = try std.fmt.allocPrint(arena_state.allocator(), "nostr:{s}", .{npub});
-    _ = main.renderContentInto(&buf, src, "", &mentions);
+    _ = main.renderContentInto(&buf, src, &.{}, &mentions);
 
     try testing.expect(main.mentionLinkPubkey(mentions.all()[0].link()) != null);
     // Everything a paragraph's one link handler can otherwise be given. The two
@@ -15938,7 +15932,7 @@ test "a mention with a space in the name is one pressable span, not two" {
     var buf: [220]u8 = undefined;
     var mentions = main.MentionList{};
     const src = try std.fmt.allocPrint(arena, "gm nostr:{s} o/", .{npub});
-    const n = main.renderContentInto(&buf, src, "", &mentions);
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
     const text = buf[0..n];
 
     const spans = main.contentSpansIn(&ui, text, mentions.all(), 0);
@@ -15969,7 +15963,7 @@ test "an offset recorded before the trim still points at the label after it" {
     const src = try std.fmt.allocPrint(arena, "{s} nostr:{s}", .{ image, npub });
     var buf: [220]u8 = undefined;
     var mentions = main.MentionList{};
-    const n = main.renderContentInto(&buf, src, image, &mentions);
+    const n = main.renderContentInto(&buf, src, &.{image}, &mentions);
 
     try testing.expectEqualStrings("@ana", buf[0..n]);
     try testing.expectEqual(@as(usize, 1), mentions.all().len);
@@ -15992,7 +15986,7 @@ test "mentions map onto a piece of the content, not only the whole of it" {
     var buf: [220]u8 = undefined;
     var mentions = main.MentionList{};
     const src = try std.fmt.allocPrint(arena, "hello nostr:{s}", .{npub});
-    const n = main.renderContentInto(&buf, src, "", &mentions);
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
     const text = buf[0..n];
 
     // What a body does when it splits around a quote card: the paragraph after
@@ -16030,7 +16024,7 @@ test "past the cap a mention still reads as a name, it just does not open" {
 
     var buf: [2048]u8 = undefined;
     var mentions = main.MentionList{};
-    const n = main.renderContentInto(&buf, src.items, "", &mentions);
+    const n = main.renderContentInto(&buf, src.items, &.{}, &mentions);
 
     // Every one of them is rendered.
     try testing.expectEqual(over, std.mem.count(u8, buf[0..n], "@npub1"));
@@ -16058,7 +16052,7 @@ test "pressing a mention opens that profile, and pressing a link does not" {
     var buf: [220]u8 = undefined;
     var mentions = main.MentionList{};
     const src = try std.fmt.allocPrint(arena, "hi nostr:{s}", .{npub});
-    _ = main.renderContentInto(&buf, src, "", &mentions);
+    _ = main.renderContentInto(&buf, src, &.{}, &mentions);
 
     var model = Model{};
     var fx: main.EffectsForTest = undefined;
@@ -17302,4 +17296,140 @@ test "the proxy toggle decides whether a URL is rewritten at all" {
     main.setMediaProxyOn(false);
     var buf2: [1024]u8 = undefined;
     try testing.expectEqualStrings(original, main.feedImageUrlForTest(&buf2, original));
+}
+
+// -- A note with more than one picture ----------------------------------------
+
+test "every image in a note becomes a picture, and none is left in the text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x81} ** 32);
+
+    // Derek's note, in shape: three images on one line, each with its own imeta.
+    const a = "https://blossom.example/aaa.jpeg";
+    const b = "https://blossom.example/bbb.jpeg";
+    const c = "https://blossom.example/ccc.jpeg";
+    const content = try std.fmt.allocPrint(arena, "Bon dia, Nostr. {s} {s} {s}", .{ a, b, c });
+    const tags = [_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ a, "dim 2040x1536", "blurhash abc" },
+        &.{ "imeta", "url " ++ b, "dim 768x1020" },
+        &.{ "imeta", "url " ++ c, "dim 768x1020" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &tags, content, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 3), note.imageCount());
+    try testing.expectEqualStrings(a, note.imageAt(0).url());
+    try testing.expectEqualStrings(b, note.imageAt(1).url());
+    try testing.expectEqualStrings(c, note.imageAt(2).url());
+
+    // The whole point of the bug report: none of them may be left behind as a
+    // raw link beside the pictures. Before this, the first became a picture and
+    // the other two sat in the body as URLs.
+    try testing.expectEqualStrings("Bon dia, Nostr.", note.content());
+
+    // Each keeps its OWN imeta, not the first one's, which is what lets a
+    // portrait shot beside a landscape reserve the right space.
+    try testing.expectEqual(@as(u16, 2040), note.imageAt(0).w);
+    try testing.expectEqual(@as(u16, 768), note.imageAt(1).w);
+    try testing.expectEqualStrings("abc", note.imageAt(0).blurhash());
+    try testing.expectEqualStrings("", note.imageAt(1).blurhash());
+}
+
+test "a note past the picture cap keeps the rest as links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x82} ** 32);
+
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(arena);
+    const over = main.max_note_images + 2;
+    for (0..over) |i| try content.print(arena, "https://blossom.example/{d}.jpeg ", .{i});
+
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, content.items, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(main.max_note_images, note.imageCount());
+    // The overflow stays readable rather than vanishing: it is still a link the
+    // reader can open, which is what the single-image build did for everything
+    // after the first.
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/4.jpeg") != null);
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/0.jpeg") == null);
+}
+
+test "each picture of a note gets its own media slot" {
+    // They shared one key before, so a gallery's cells fought over a single slot
+    // and only ever one of them could be loaded.
+    const note_id: i64 = 0x0123_4567;
+    const first = main.mediaKeyForTest(note_id, 0);
+    try testing.expectEqual(note_id, first);
+
+    var seen: [main.max_note_images]i64 = undefined;
+    for (0..main.max_note_images) |i| {
+        seen[i] = main.mediaKeyForTest(note_id, i);
+        try testing.expect(seen[i] >= 0);
+        for (seen[0..i]) |earlier| try testing.expect(earlier != seen[i]);
+    }
+}
+
+test "a URL that prefixes another does not strand the longer one's tail" {
+    // `.../a.jpeg` is a prefix of `.../a.jpeg?x=1`. Removing the short one first
+    // would leave `?x=1` sitting in the body as debris.
+    var buf: [512]u8 = undefined;
+    const short = "https://h.example/a.jpeg";
+    const long = "https://h.example/a.jpeg?w=9";
+    const omit = [_][]const u8{ short, long };
+    const n = main.renderContentInto(&buf, "look " ++ long ++ " end", &omit, null);
+    try testing.expectEqualStrings("look  end", buf[0..n]);
+}
+
+test "three pictures draw as three cells across the column, not one and two links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x83} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 91;
+    _ = model.notes[0].setImageForTest(0, "https://h.example/a.jpg");
+    _ = model.notes[0].setImageForTest(1, "https://h.example/b.jpg");
+    _ = model.notes[0].setImageForTest(2, "https://h.example/c.jpg");
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    // One pressable cell per picture. The single-image build drew exactly one
+    // whatever the note carried.
+    try testing.expectEqual(@as(usize, 3), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
+
+test "one picture still fills the column, so nothing about a plain note moved" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x84} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 92;
+    const img = model.notes[0].setImageForTest(0, "https://h.example/only.jpg");
+    img.aspect = 0.6;
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expectEqual(@as(usize, 1), countByLabel(tree.root, "Attached image, press to enlarge"));
 }
