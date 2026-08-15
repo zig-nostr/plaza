@@ -891,7 +891,7 @@ fn handleBunkerDecide(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u
     defer parsed.deinit();
     // An unrecognised duration is `once`, the shortest one. A typo must not
     // silently grant something forever.
-    const how_long: bunker.Remember = if (std.mem.eql(u8, parsed.value.remember, "hour"))
+    const how_long: nostr.nip46.Remember = if (std.mem.eql(u8, parsed.value.remember, "hour"))
         .hour
     else if (std.mem.eql(u8, parsed.value.remember, "day"))
         .day
