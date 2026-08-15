@@ -1,18 +1,20 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.7.0
+### What's new in v0.8.0
 
-**A note with several pictures draws them all.** Somebody posts three photos, which is what a phone's share sheet produces, and Plaza drew the first and left the other two underneath as raw URLs. It draws up to four now, as a row of cells, and no image link is left sitting in the text.
+**Plaza can sign for other apps.** Turn it on in Settings, copy the link, paste it into Coracle or Jumble or anything else that speaks NIP-46, and that app signs with your key without ever holding it. This is the thing a browser extension does, done by the process on your Mac that already holds your key instead of by an extension living inside your browser.
 
-The pictures fill in as slots free up. There are sixteen image slots in the whole app and a gallery wants several at once, so the later cells of a busy screen borrow the note's own blurhash, which is drawn as flat colour rather than a registered image and so costs nothing. The row reads as photographs the whole time.
+It is off unless you turn it on. While it is on, Plaza connects to relays and other apps can reach it, and an app nobody asked to be a signer should not open that up because it happens to hold a key.
 
-**Pictures that would not load, now load.** Some hosts came back as an empty frame saying so. The host was fine; the image proxy in front of it was refusing them by policy, and blossom servers were the common casualty. When the proxy refuses a host, Plaza now asks the host directly and the picture appears.
+**Nothing signs without you.** An app has to be let in first, and being let in does not let it sign: the first time it wants to do something, Plaza asks, and asks again separately for each kind of thing. Signing a note and changing who you follow are different questions, because they are different risks.
 
-The proxy is still on by default, and still there for the reason it always was: without it, every image host in your feed learns your address as you scroll. The fallback fires only on a refusal, never on a host that is simply down, so a dead link does not turn into a second pointless request. Both are switches in Settings, with the privacy note beside them.
+Each answer carries how long it lasts. Allow once, allow for a day, always, or deny. A denial is remembered too, so an app that asks for something you do not want can be told no and stop asking. When an answer runs out the question simply opens again, and a prompt you never answered is not treated as a no: walking away from your machine is not a decision.
 
-**Reactions, replies and zap totals appear with the feed.** They were arriving only for whichever relay happened to answer the note first, so a note usually showed nothing until you opened it and came back, and then the numbers were there. They are counted on every relay that carries the note now, so they are there the first time you look.
+The question is asked in terms of what would happen, not which method was called. "An app wants to change who you follow" rather than "sign_event kind 3".
 
-**Under it:** the check that decides whether your old key file may be deleted after moving into the Keychain is now tested against every way it can go wrong, rather than only read.
+**You can see and undo all of it.** Settings lists every app that is connected, with a button to disconnect any of them. Turning the whole thing off ends every session at once. That visibility is the point: a signer you cannot audit is one you have to trust.
+
+The link also appears in the Notary window, so it is where the key is, not only in Settings.
 
 ### Install
 
