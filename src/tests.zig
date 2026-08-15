@@ -17562,3 +17562,75 @@ test "the signing card's text stays inside the window" {
     const url_frame = frameOfTextContaining(p, "bunker://3e294d2f") orelse return error.UrlNotDrawn;
     try testing.expect(url_frame.x + url_frame.width <= window_right);
 }
+
+test "the prompt says what is being asked, in words a person can act on" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A connect is the client asking to be let in, which is a different
+    // question from being allowed to do something.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":1,"client":"aa","ask":"","kind":-1},"clients":[]}
+    );
+    try testing.expect(main.bunkerAskIsConnect());
+    try testing.expectEqualStrings("wants to sign as you", main.bunkerAskLine(arena));
+
+    // A signature names what it would DO. "Sign a kind 3" and "change who you
+    // follow" are the same thing to a signer and very different to a person,
+    // and this app's own history is why: a bad kind:3 empties a follow list.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":2,"client":"aa","ask":"sign_event","kind":3},"clients":[]}
+    );
+    try testing.expect(!main.bunkerAskIsConnect());
+    try testing.expectEqualStrings("wants to change who you follow", main.bunkerAskLine(arena));
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":3,"client":"aa","ask":"sign_event","kind":1},"clients":[]}
+    );
+    try testing.expectEqualStrings("wants to post a note as you", main.bunkerAskLine(arena));
+
+    // An unnamed kind is honest about being a number rather than pretending to
+    // know what it is.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":4,"client":"aa","ask":"sign_event","kind":31337},"clients":[]}
+    );
+    try testing.expect(std.mem.indexOf(u8, main.bunkerAskLine(arena), "31337") != null);
+
+    // And decryption is named for what it exposes, not for its method.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":5,"client":"aa","ask":"nip44_decrypt","kind":-1},"clients":[]}
+    );
+    try testing.expectEqualStrings("wants to read an encrypted message of yours", main.bunkerAskLine(arena));
+}
+
+test "the prompt offers a duration, not just yes and no" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x95} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":9,"client":"bb","ask":"sign_event","kind":1},"clients":[]}
+    );
+
+    const tree = try buildTree(arena, &model);
+    // A prompt with only yes and no is one people learn to hit yes on. All
+    // four of Amber's positions have to be one press away.
+    try testing.expect(findAnyText(tree.root, "Allow once") != null);
+    try testing.expect(findAnyText(tree.root, "Allow for a day") != null);
+    try testing.expect(findAnyText(tree.root, "Always") != null);
+    try testing.expect(findAnyText(tree.root, "Deny") != null);
+    // And it appears over the FEED, not only in Settings: the reader is not in
+    // Settings when another app asks.
+    try testing.expect(findAnyTextContaining(tree.root, "wants to post a note as you"));
+}

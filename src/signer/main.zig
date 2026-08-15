@@ -832,9 +832,17 @@ fn handleBunkerState(gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
     try out.appendSlice(gpa, "\"");
 
     try out.appendSlice(gpa, ",\"pending\":");
-    if (g_bunker.firstPending()) |p| {
+    if (g_bunker.firstPendingFull()) |p| {
         var c_hex: [64]u8 = undefined;
-        try out.print(gpa, "{{\"id\":{d},\"client\":\"{s}\"}}", .{ p.id, hexLower(&c_hex, p.client) });
+        // `ask` is empty for a connect, which is the client asking to be let in
+        // rather than asking to do something. The screen words those two
+        // differently and cannot tell them apart from the pubkey alone.
+        try out.print(gpa, "{{\"id\":{d},\"client\":\"{s}\",\"ask\":\"{s}\",\"kind\":{d}}}", .{
+            p.id,
+            hexLower(&c_hex, p.client),
+            if (p.ask) |a| @tagName(a) else "",
+            p.kind,
+        });
     } else {
         try out.appendSlice(gpa, "null");
     }
@@ -877,11 +885,21 @@ fn handleBunkerToggle(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, bod
 
 /// POST /bunker/decide {"id": N, "allow": true|false}
 fn handleBunkerDecide(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u8) !void {
-    const Body = struct { id: u64 = 0, allow: bool = false };
+    const Body = struct { id: u64 = 0, allow: bool = false, remember: []const u8 = "once" };
     const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
         return respondErr(gpa, w, 400, "bad request");
     defer parsed.deinit();
-    _ = g_bunker.decide(parsed.value.id, parsed.value.allow);
+    // An unrecognised duration is `once`, the shortest one. A typo must not
+    // silently grant something forever.
+    const how_long: bunker.Remember = if (std.mem.eql(u8, parsed.value.remember, "hour"))
+        .hour
+    else if (std.mem.eql(u8, parsed.value.remember, "day"))
+        .day
+    else if (std.mem.eql(u8, parsed.value.remember, "always"))
+        .always
+    else
+        .once;
+    _ = g_bunker.decideFor(parsed.value.id, parsed.value.allow, how_long);
     return handleBunkerState(gpa, w);
 }
 
