@@ -66,89 +66,6 @@ pub const default_relays = [_][]const u8{
 
 pub const max_clients = 16;
 pub const max_pending = 8;
-pub const max_permissions = 64;
-
-/// What a client is asking to do. Only the three that need a decision: `ping`
-/// and `get_public_key` leak nothing a relay does not already carry, and
-/// `connect` is the client itself being let in.
-pub const Ask = enum {
-    sign_event,
-    nip44_encrypt,
-    nip44_decrypt,
-
-    pub fn fromMethod(method: []const u8) ?Ask {
-        if (std.mem.eql(u8, method, "sign_event")) return .sign_event;
-        if (std.mem.eql(u8, method, "nip44_encrypt")) return .nip44_encrypt;
-        if (std.mem.eql(u8, method, "nip44_decrypt")) return .nip44_decrypt;
-        return null;
-    }
-
-    pub fn label(self: Ask) []const u8 {
-        return switch (self) {
-            .sign_event => "sign a note",
-            .nip44_encrypt => "encrypt a message",
-            .nip44_decrypt => "read an encrypted message",
-        };
-    }
-};
-
-/// How long an answer lasts.
-///
-/// Amber's `RememberType`, trimmed to four. Its eight steps are the right idea
-/// at a granularity nobody uses; what matters is that "not now", "for a while"
-/// and "stop asking" are all reachable in one press.
-pub const Remember = enum(u8) {
-    once,
-    hour,
-    day,
-    always,
-
-    pub fn millis(self: Remember) i64 {
-        return switch (self) {
-            // `once` is never stored, so it has no duration to ask for. This
-            // was a 0 that made an already-expired record, which meant TWO
-            // mechanisms held the same property and neither could be tested:
-            // removing either left the other quietly covering for it. One
-            // mechanism, and a caller that gets here is a bug that says so.
-            .once => unreachable,
-            .hour => 60 * 60 * 1000,
-            .day => 24 * 60 * 60 * 1000,
-            // Never lapses, so there is no moment to compute.
-            .always => 0,
-        };
-    }
-};
-
-/// One remembered answer, keyed the way Amber keys it: the app, the method, and
-/// for a signature the event KIND.
-///
-/// Per kind because signing a note and signing a contact list are different
-/// risks. This app's own history is the argument: a bad kind:3 write empties
-/// somebody's follow list, and "you allowed signing once" should not have
-/// covered that.
-///
-/// Allow and deny each carry their own expiry, again following Amber. "No, and
-/// stop asking for an hour" is a real answer, and folding it into one field
-/// would make a denial either permanent or worthless.
-pub const Permission = struct {
-    used: bool = false,
-    client: [32]u8 = [_]u8{0} ** 32,
-    ask: Ask = .sign_event,
-    /// The event kind for `sign_event`, or -1 for the methods that have none.
-    kind: i32 = -1,
-    allow: bool = false,
-    /// When it lapses. Zero means never, which is what `always` stores.
-    until_ms: i64 = 0,
-
-    fn matches(self: *const Permission, client: [32]u8, ask: Ask, kind: i32) bool {
-        return self.used and self.ask == ask and self.kind == kind and
-            std.mem.eql(u8, &self.client, &client);
-    }
-
-    fn live(self: *const Permission, now_ms: i64) bool {
-        return self.until_ms == 0 or now_ms < self.until_ms;
-    }
-};
 
 /// How long a connect request waits for the reader before it is refused.
 ///
@@ -175,11 +92,11 @@ pub const Pending = struct {
     decision: std.atomic.Value(Decision) = .init(.pending),
     /// What is being asked. Null for a `connect`, which is the client itself
     /// asking to be let in rather than asking to do something.
-    ask: ?Ask = null,
+    ask: ?nip46.Method = null,
     kind: i32 = -1,
     /// How long the reader's answer should last, written by the UI beside the
     /// decision itself.
-    remember: std.atomic.Value(Remember) = .init(.once),
+    remember: std.atomic.Value(nip46.Remember) = .init(.once),
 
     pub fn name(self: *const Pending) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -216,7 +133,9 @@ pub const Bunker = struct {
     pending: [max_pending]Pending = [_]Pending{.{}} ** max_pending,
     next_id: u64 = 1,
     clients: [max_clients]Client = [_]Client{.{}} ** max_clients,
-    permissions: [max_permissions]Permission = [_]Permission{.{}} ** max_permissions,
+    /// The reader's answers, owned by the library so this signer and Notary
+    /// cannot drift apart on what a permission means.
+    permissions: nip46.Permissions = .{},
 
     /// How long a prompt waits, as a field rather than the constant, so a test
     /// can drive the timeout without waiting two minutes for it.
@@ -334,7 +253,7 @@ pub const Bunker = struct {
     }
 
     /// The first waiting request in full: who, and what they want.
-    pub fn firstPendingFull(self: *Bunker) ?struct { id: u64, client: [32]u8, ask: ?Ask, kind: i32 } {
+    pub fn firstPendingFull(self: *Bunker) ?struct { id: u64, client: [32]u8, ask: ?nip46.Method, kind: i32 } {
         self.acquire();
         defer self.release();
         for (self.pending) |p| {
@@ -383,50 +302,22 @@ pub const Bunker = struct {
     /// Null when nothing has been remembered and the reader has to be asked. A
     /// LAPSED permission is null too rather than a denial: "allow for an hour"
     /// expiring means the question is open again, not that the answer became no.
-    pub fn remembered(self: *Bunker, client: [32]u8, ask: Ask, kind: i32, now_ms: i64) ?bool {
-        self.acquire();
-        defer self.release();
-        for (&self.permissions) |*perm| {
-            if (!perm.matches(client, ask, kind)) continue;
-            if (!perm.live(now_ms)) {
-                perm.* = .{};
-                continue;
-            }
-            return perm.allow;
-        }
-        return null;
+    pub fn remembered(self: *Bunker, client: [32]u8, ask: nip46.Method, kind: i32, now_ms: i64) ?bool {
+        return self.permissions.remembered(client, ask, kind, now_ms);
     }
 
     /// Writes the reader's answer down for as long as they asked.
     ///
     /// `once` stores nothing: the answer covered this request and the next one
     /// is a fresh question, which is the whole meaning of once.
-    pub fn rememberAnswer(self: *Bunker, client: [32]u8, ask: Ask, kind: i32, allow: bool, how_long: Remember, now_ms: i64) void {
-        if (how_long == .once) return;
-        const until: i64 = if (how_long == .always) 0 else now_ms + how_long.millis();
-        self.acquire();
-        defer self.release();
-        // An existing answer for the same question is replaced, not added
-        // beside: two records for one question is a coin toss over which is
-        // read, and the reader's latest word is the one that counts.
-        for (&self.permissions) |*perm| {
-            if (!perm.matches(client, ask, kind)) continue;
-            perm.allow = allow;
-            perm.until_ms = until;
-            _ = self.version.fetchAdd(1, .monotonic);
-            return;
-        }
-        for (&self.permissions) |*perm| {
-            if (perm.used) continue;
-            perm.* = .{ .used = true, .client = client, .ask = ask, .kind = kind, .allow = allow, .until_ms = until };
-            _ = self.version.fetchAdd(1, .monotonic);
-            return;
-        }
+    pub fn rememberAnswer(self: *Bunker, client: [32]u8, ask: nip46.Method, kind: i32, allow: bool, how_long: nip46.Remember, now_ms: i64) void {
+        self.permissions.remember(client, ask, kind, allow, how_long, now_ms);
+        _ = self.version.fetchAdd(1, .monotonic);
     }
 
     /// Asks the reader whether this client may do this, and remembers the answer
     /// for as long as they said.
-    pub fn askTo(self: *Bunker, io: std.Io, client: [32]u8, ask: Ask, kind: i32) Decision {
+    pub fn askTo(self: *Bunker, io: std.Io, client: [32]u8, ask: nip46.Method, kind: i32) Decision {
         const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
         if (self.remembered(client, ask, kind, now_ms)) |allowed| {
             return if (allowed) .allow else .deny;
@@ -457,7 +348,7 @@ pub const Bunker = struct {
         return if (decision == .allow) .allow else .deny;
     }
 
-    fn fileAsk(self: *Bunker, client: [32]u8, ask: Ask, kind: i32) ?usize {
+    fn fileAsk(self: *Bunker, client: [32]u8, ask: nip46.Method, kind: i32) ?usize {
         self.acquire();
         defer self.release();
         for (&self.pending, 0..) |*p, i| {
@@ -476,7 +367,7 @@ pub const Bunker = struct {
     }
 
     /// The same, with how long it should last.
-    pub fn decideFor(self: *Bunker, id: u64, allow: bool, how_long: Remember) bool {
+    pub fn decideFor(self: *Bunker, id: u64, allow: bool, how_long: nip46.Remember) bool {
         self.acquire();
         defer self.release();
         for (&self.pending) |*p| {
@@ -572,7 +463,14 @@ pub const ConnectPolicy = struct {
             // Reaching here means the library already established this client
             // connected. What it may DO is a separate question, asked per method
             // and, for a signature, per event kind.
-            const ask = Ask.fromMethod(request.method) orelse return .approve;
+            const method = nip46.Method.fromString(request.method) orelse return .approve;
+            // Only these three need a decision. `ping` and `get_public_key`
+            // leak nothing a relay does not already carry, and prompting for
+            // them teaches people to approve without reading.
+            const ask = switch (method) {
+                .sign_event, .nip44_encrypt, .nip44_decrypt => method,
+                else => return .approve,
+            };
             const kind: i32 = if (ask == .sign_event) templateKind(request) else -1;
             return switch (self.b.askTo(self.io, client, ask, kind)) {
                 .allow => .approve,
@@ -891,85 +789,10 @@ test "ping never asks a human" {
     try std.testing.expect(b.firstPending() == null);
 }
 
-test "a remembered answer covers only the question it answered" {
-    var b = Bunker{};
-    const client = [_]u8{0x81} ** 32;
-    const now: i64 = 1_000_000;
-
-    // Nothing remembered yet: every question is open.
-    try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
-
-    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
-    try std.testing.expectEqual(true, b.remembered(client, .sign_event, 1, now).?);
-
-    // A DIFFERENT KIND is a different question. Signing a note and signing a
-    // contact list are different risks, and this app's own history is the
-    // argument: a bad kind:3 write empties somebody's follow list.
-    try std.testing.expect(b.remembered(client, .sign_event, 3, now) == null);
-    // A different method is too.
-    try std.testing.expect(b.remembered(client, .nip44_decrypt, -1, now) == null);
-    // And a different client, which is the one that would be a real breach.
-    try std.testing.expect(b.remembered([_]u8{0x82} ** 32, .sign_event, 1, now) == null);
-}
-
-test "a denial is remembered, and both kinds of answer lapse" {
-    var b = Bunker{};
-    const client = [_]u8{0x83} ** 32;
-    const now: i64 = 1_000_000;
-
-    // "No, and stop asking for an hour" is a real answer. Folding it into the
-    // same field as an allow would make a denial either permanent or worthless.
-    b.rememberAnswer(client, .nip44_decrypt, -1, false, .hour, now);
-    try std.testing.expectEqual(false, b.remembered(client, .nip44_decrypt, -1, now).?);
-    try std.testing.expectEqual(false, b.remembered(client, .nip44_decrypt, -1, now + 59 * 60 * 1000).?);
-
-    // Lapsed answers are NULL, not denials: an hour running out means the
-    // question is open again, not that the answer became no.
-    try std.testing.expect(b.remembered(client, .nip44_decrypt, -1, now + 61 * 60 * 1000) == null);
-
-    b.rememberAnswer(client, .sign_event, 1, true, .day, now);
-    try std.testing.expectEqual(true, b.remembered(client, .sign_event, 1, now + 23 * 60 * 60 * 1000).?);
-    try std.testing.expect(b.remembered(client, .sign_event, 1, now + 25 * 60 * 60 * 1000) == null);
-}
-
-test "once is not written down" {
-    var b = Bunker{};
-    const client = [_]u8{0x84} ** 32;
-    const now: i64 = 1_000_000;
-
-    // The answer covered this request and the next one is a fresh question,
-    // which is the whole meaning of once.
-    b.rememberAnswer(client, .sign_event, 1, true, .once, now);
-    try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
-}
-
-test "the reader's latest word replaces the earlier one" {
-    var b = Bunker{};
-    const client = [_]u8{0x85} ** 32;
-    const now: i64 = 1_000_000;
-
-    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
-    b.rememberAnswer(client, .sign_event, 1, false, .always, now);
-    // One record per question. Two would be a coin toss over which is read.
-    try std.testing.expectEqual(false, b.remembered(client, .sign_event, 1, now).?);
-    var records: usize = 0;
-    for (b.permissions) |perm| {
-        if (perm.used) records += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), records);
-}
-
-test "an unreadable template asks separately rather than reusing a permission" {
-    var b = Bunker{};
-    const client = [_]u8{0x86} ** 32;
-    const now: i64 = 1_000_000;
-
-    // A client's template is JSON it wrote. If the kind cannot be read it
-    // buckets as -1, and must NOT quietly ride on the permission granted for
-    // some other kind.
-    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
-    try std.testing.expect(b.remembered(client, .sign_event, -1, now) == null);
-
+test "a template's kind is read, and an unreadable one is its own question" {
+    // A client's template is JSON it wrote. When the kind cannot be read it
+    // buckets as -1, which the library's store then treats as a question of its
+    // own rather than letting it ride on a permission granted for another kind.
     const bad = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{"not json"} };
     try std.testing.expectEqual(@as(i32, -1), templateKind(&bad));
     const none = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{} };
