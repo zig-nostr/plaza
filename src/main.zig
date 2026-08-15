@@ -12548,7 +12548,7 @@ pub const Msg = union(enum) {
     /// The daemon's answer to the bunker poll, and the reader's three actions.
     bunker_state: native_sdk.EffectResponse,
     bunker_toggle,
-    bunker_decide: struct { id: u64, allow: bool },
+    bunker_decide: struct { id: u64, allow: bool, remember: BunkerRemember = .once },
     bunker_revoke: u8,
     copy_bunker_url,
     /// A /setup (create) answered: adopt the new helper identity.
@@ -13063,8 +13063,8 @@ fn bunkerAskRow(ui: *AppUi) AppUi.Node {
         ),
         vgap(ui, 7),
         ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true } } }, "Approve"),
-            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false } } }, "Deny"),
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Approve"),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
         }),
     });
 }
@@ -14245,8 +14245,8 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
                 settingsCard(ui, .{
                     ui.column(.{ .gap = 0, .grow = 1 }, .{
                         ui.paragraph(
-                            .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
-                            &.{.{ .text = "An app wants to sign as you", .scale = 1.1 }},
+                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
+                            &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
                         ),
                         vgap(ui, 7),
                         ui.paragraph(
@@ -14256,12 +14256,24 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
                         vgap(ui, 7),
                         ui.paragraph(
                             .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                            &.{.{ .text = "Approving lets it sign anything as you until you disconnect it in Settings. If it already gave up waiting, approve anyway and connect again from the app: this is remembered.", .scale = mono_hint_scale }},
+                            &.{.{
+                                .text = if (bunkerAskIsConnect())
+                                    "Letting it in does not let it sign yet: it is asked again the first time it wants to. If it already gave up waiting, approve anyway and connect again from the app, because this is remembered."
+                                else
+                                    "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
+                                .scale = mono_hint_scale,
+                            }},
                         ),
                         vgap(ui, 12),
+                        // Four answers rather than two. Amber's shape: "not now",
+                        // "for a while" and "stop asking" all reachable in one
+                        // press, because a prompt with only yes and no is one
+                        // people learn to hit yes on.
                         ui.row(.{ .gap = 8, .cross = .center }, .{
-                            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true } } }, "Approve"),
-                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false } } }, "Deny"),
+                            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
+                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
+                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
+                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
                         }),
                     }),
                 }),
@@ -22890,7 +22902,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .bunker_decide => |what| {
             var body_buf: [64]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s}}}", .{ what.id, if (what.allow) "true" else "false" }) catch return;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s},\"remember\":\"{s}\"}}", .{ what.id, if (what.allow) "true" else "false", @tagName(what.remember) }) catch return;
             helperFetch(fx, bunker_decide_key, "/bunker/decide", body, Effects.responseMsg(.bunker_state));
         },
         .copy_bunker_url => {
@@ -28288,6 +28300,9 @@ test {
 // relays. A UI that kept its own copy would eventually disagree with the thing
 // actually signing, and the disagreement would be invisible.
 
+/// How long an approval lasts, mirroring the daemon's own four.
+pub const BunkerRemember = enum { once, hour, day, always };
+
 const bunker_state_key: u64 = 44;
 const bunker_toggle_key: u64 = 45;
 const bunker_decide_key: u64 = 46;
@@ -28306,6 +28321,12 @@ var g_bunker_url_len: usize = 0;
 var g_bunker_pending_id: u64 = 0;
 var g_bunker_pending_client: [64]u8 = undefined;
 var g_bunker_pending_len: usize = 0;
+/// What the waiting client wants. Empty means it is asking to CONNECT, which
+/// the screen words differently: being let in at all is a different question
+/// from being allowed to sign something.
+var g_bunker_pending_ask: [24]u8 = undefined;
+var g_bunker_pending_ask_len: usize = 0;
+var g_bunker_pending_kind: i32 = -1;
 var g_bunker_clients: [8][64]u8 = undefined;
 var g_bunker_client_count: usize = 0;
 var g_bunker_polled_at: i64 = 0;
@@ -28326,6 +28347,35 @@ pub fn bunkerClientCount() usize {
     return g_bunker_client_count;
 }
 
+/// What the waiting client is asking for, in the reader's words.
+///
+/// A kind number is in there for a signature, because "sign a note" and "change
+/// who you follow" are the same sentence to a signer and very different things
+/// to a person. Only the kinds worth naming are named; the rest are honest about
+/// being a number nobody can read at a glance.
+pub fn bunkerAskLine(arena: std.mem.Allocator) []const u8 {
+    const ask = g_bunker_pending_ask[0..g_bunker_pending_ask_len];
+    if (ask.len == 0) return "wants to sign as you";
+    if (std.mem.eql(u8, ask, "nip44_encrypt")) return "wants to encrypt a message as you";
+    if (std.mem.eql(u8, ask, "nip44_decrypt")) return "wants to read an encrypted message of yours";
+    return switch (g_bunker_pending_kind) {
+        1 => "wants to post a note as you",
+        3 => "wants to change who you follow",
+        5 => "wants to delete something of yours",
+        6, 16 => "wants to repost as you",
+        7 => "wants to react as you",
+        0 => "wants to change your profile",
+        10000 => "wants to change who you have muted",
+        10002 => "wants to change your relay list",
+        else => std.fmt.allocPrint(arena, "wants to sign a kind {d} event as you", .{g_bunker_pending_kind}) catch "wants to sign something as you",
+    };
+}
+
+/// Whether the waiting request is a connect rather than an action.
+pub fn bunkerAskIsConnect() bool {
+    return g_bunker_pending_ask_len == 0;
+}
+
 /// Reads the daemon's answer into the mirror above.
 ///
 /// Everything is replaced, never merged: this is a snapshot of what the daemon
@@ -28334,7 +28384,7 @@ pub fn bunkerClientCount() usize {
 pub fn applyBunkerState(json: []const u8) void {
     const gpa = std.heap.page_allocator;
     const Client = struct { pubkey: []const u8 = "" };
-    const Pending = struct { id: u64 = 0, client: []const u8 = "" };
+    const Pending = struct { id: u64 = 0, client: []const u8 = "", ask: []const u8 = "", kind: i32 = -1 };
     const Body = struct {
         enabled: bool = false,
         url: []const u8 = "",
@@ -28354,9 +28404,15 @@ pub fn applyBunkerState(json: []const u8) void {
         const c = @min(p.client.len, g_bunker_pending_client.len);
         @memcpy(g_bunker_pending_client[0..c], p.client[0..c]);
         g_bunker_pending_len = c;
+        const a = @min(p.ask.len, g_bunker_pending_ask.len);
+        @memcpy(g_bunker_pending_ask[0..a], p.ask[0..a]);
+        g_bunker_pending_ask_len = a;
+        g_bunker_pending_kind = p.kind;
     } else {
         g_bunker_pending_id = 0;
         g_bunker_pending_len = 0;
+        g_bunker_pending_ask_len = 0;
+        g_bunker_pending_kind = -1;
     }
 
     g_bunker_client_count = 0;

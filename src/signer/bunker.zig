@@ -32,12 +32,21 @@
 //! Requests from a client that has not connected never reach approval at all:
 //! the library refuses them before the policy is consulted.
 //!
-//! What is NOT here yet, said plainly because the difference matters: once a
-//! client is approved it signs without a further prompt. Amber prompts per
-//! method with a remembered duration (`RememberType` in its SettingsScreen),
-//! which is the right shape and is the next slice. Until it lands, approving a
-//! client is approving everything it will ever ask for, and the settings copy
-//! says so.
+//! Connecting is not the same as being allowed to do things. A connected client
+//! is asked again the first time it wants to sign, and separately per METHOD and
+//! per event KIND, because signing a note and signing a contact list are
+//! different risks: a bad kind:3 write empties somebody's follow list.
+//!
+//! Each answer carries how long it lasts, following Amber's `RememberType`:
+//! once, an hour, a day, or always. A denial is remembered on the same terms,
+//! because "no, and stop asking for an hour" is a real answer. An answer that
+//! lapses leaves the question OPEN rather than becoming a denial, and a prompt
+//! that times out is not written down at all: silence from a reader who walked
+//! away is not a decision.
+//!
+//! `ping` and `get_public_key` are never asked about. They leak nothing a relay
+//! does not already carry, and prompting for them is what teaches people to
+//! approve without reading.
 
 const std = @import("std");
 const nostr = @import("nostr");
@@ -57,6 +66,89 @@ pub const default_relays = [_][]const u8{
 
 pub const max_clients = 16;
 pub const max_pending = 8;
+pub const max_permissions = 64;
+
+/// What a client is asking to do. Only the three that need a decision: `ping`
+/// and `get_public_key` leak nothing a relay does not already carry, and
+/// `connect` is the client itself being let in.
+pub const Ask = enum {
+    sign_event,
+    nip44_encrypt,
+    nip44_decrypt,
+
+    pub fn fromMethod(method: []const u8) ?Ask {
+        if (std.mem.eql(u8, method, "sign_event")) return .sign_event;
+        if (std.mem.eql(u8, method, "nip44_encrypt")) return .nip44_encrypt;
+        if (std.mem.eql(u8, method, "nip44_decrypt")) return .nip44_decrypt;
+        return null;
+    }
+
+    pub fn label(self: Ask) []const u8 {
+        return switch (self) {
+            .sign_event => "sign a note",
+            .nip44_encrypt => "encrypt a message",
+            .nip44_decrypt => "read an encrypted message",
+        };
+    }
+};
+
+/// How long an answer lasts.
+///
+/// Amber's `RememberType`, trimmed to four. Its eight steps are the right idea
+/// at a granularity nobody uses; what matters is that "not now", "for a while"
+/// and "stop asking" are all reachable in one press.
+pub const Remember = enum(u8) {
+    once,
+    hour,
+    day,
+    always,
+
+    pub fn millis(self: Remember) i64 {
+        return switch (self) {
+            // `once` is never stored, so it has no duration to ask for. This
+            // was a 0 that made an already-expired record, which meant TWO
+            // mechanisms held the same property and neither could be tested:
+            // removing either left the other quietly covering for it. One
+            // mechanism, and a caller that gets here is a bug that says so.
+            .once => unreachable,
+            .hour => 60 * 60 * 1000,
+            .day => 24 * 60 * 60 * 1000,
+            // Never lapses, so there is no moment to compute.
+            .always => 0,
+        };
+    }
+};
+
+/// One remembered answer, keyed the way Amber keys it: the app, the method, and
+/// for a signature the event KIND.
+///
+/// Per kind because signing a note and signing a contact list are different
+/// risks. This app's own history is the argument: a bad kind:3 write empties
+/// somebody's follow list, and "you allowed signing once" should not have
+/// covered that.
+///
+/// Allow and deny each carry their own expiry, again following Amber. "No, and
+/// stop asking for an hour" is a real answer, and folding it into one field
+/// would make a denial either permanent or worthless.
+pub const Permission = struct {
+    used: bool = false,
+    client: [32]u8 = [_]u8{0} ** 32,
+    ask: Ask = .sign_event,
+    /// The event kind for `sign_event`, or -1 for the methods that have none.
+    kind: i32 = -1,
+    allow: bool = false,
+    /// When it lapses. Zero means never, which is what `always` stores.
+    until_ms: i64 = 0,
+
+    fn matches(self: *const Permission, client: [32]u8, ask: Ask, kind: i32) bool {
+        return self.used and self.ask == ask and self.kind == kind and
+            std.mem.eql(u8, &self.client, &client);
+    }
+
+    fn live(self: *const Permission, now_ms: i64) bool {
+        return self.until_ms == 0 or now_ms < self.until_ms;
+    }
+};
 
 /// How long a connect request waits for the reader before it is refused.
 ///
@@ -81,6 +173,13 @@ pub const Pending = struct {
     name_buf: [64]u8 = [_]u8{0} ** 64,
     name_len: u8 = 0,
     decision: std.atomic.Value(Decision) = .init(.pending),
+    /// What is being asked. Null for a `connect`, which is the client itself
+    /// asking to be let in rather than asking to do something.
+    ask: ?Ask = null,
+    kind: i32 = -1,
+    /// How long the reader's answer should last, written by the UI beside the
+    /// decision itself.
+    remember: std.atomic.Value(Remember) = .init(.once),
 
     pub fn name(self: *const Pending) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -117,6 +216,11 @@ pub const Bunker = struct {
     pending: [max_pending]Pending = [_]Pending{.{}} ** max_pending,
     next_id: u64 = 1,
     clients: [max_clients]Client = [_]Client{.{}} ** max_clients,
+    permissions: [max_permissions]Permission = [_]Permission{.{}} ** max_permissions,
+
+    /// How long a prompt waits, as a field rather than the constant, so a test
+    /// can drive the timeout without waiting two minutes for it.
+    decision_timeout_ms: u64 = connect_decision_timeout_ms,
 
     /// The connect state the library keeps, shared across every relay thread so
     /// a client that connected over one relay is recognised on another.
@@ -199,7 +303,7 @@ pub const Bunker = struct {
         const step_ms = 50;
         var waited: u64 = 0;
         var decision = self.pending[idx].decision.load(.acquire);
-        while (decision == .pending and waited < connect_decision_timeout_ms) {
+        while (decision == .pending and waited < self.decision_timeout_ms) {
             io.sleep(std.Io.Duration.fromMilliseconds(step_ms), .awake) catch {};
             waited += step_ms;
             decision = self.pending[idx].decision.load(.acquire);
@@ -225,6 +329,18 @@ pub const Bunker = struct {
             self.next_id += 1;
             _ = self.version.fetchAdd(1, .monotonic);
             return i;
+        }
+        return null;
+    }
+
+    /// The first waiting request in full: who, and what they want.
+    pub fn firstPendingFull(self: *Bunker) ?struct { id: u64, client: [32]u8, ask: ?Ask, kind: i32 } {
+        self.acquire();
+        defer self.release();
+        for (self.pending) |p| {
+            if (p.used and p.decision.load(.monotonic) == .pending) {
+                return .{ .id = p.id, .client = p.client, .ask = p.ask, .kind = p.kind };
+            }
         }
         return null;
     }
@@ -262,13 +378,113 @@ pub const Bunker = struct {
         }
     }
 
+    /// Whether this client may do this, without asking anybody.
+    ///
+    /// Null when nothing has been remembered and the reader has to be asked. A
+    /// LAPSED permission is null too rather than a denial: "allow for an hour"
+    /// expiring means the question is open again, not that the answer became no.
+    pub fn remembered(self: *Bunker, client: [32]u8, ask: Ask, kind: i32, now_ms: i64) ?bool {
+        self.acquire();
+        defer self.release();
+        for (&self.permissions) |*perm| {
+            if (!perm.matches(client, ask, kind)) continue;
+            if (!perm.live(now_ms)) {
+                perm.* = .{};
+                continue;
+            }
+            return perm.allow;
+        }
+        return null;
+    }
+
+    /// Writes the reader's answer down for as long as they asked.
+    ///
+    /// `once` stores nothing: the answer covered this request and the next one
+    /// is a fresh question, which is the whole meaning of once.
+    pub fn rememberAnswer(self: *Bunker, client: [32]u8, ask: Ask, kind: i32, allow: bool, how_long: Remember, now_ms: i64) void {
+        if (how_long == .once) return;
+        const until: i64 = if (how_long == .always) 0 else now_ms + how_long.millis();
+        self.acquire();
+        defer self.release();
+        // An existing answer for the same question is replaced, not added
+        // beside: two records for one question is a coin toss over which is
+        // read, and the reader's latest word is the one that counts.
+        for (&self.permissions) |*perm| {
+            if (!perm.matches(client, ask, kind)) continue;
+            perm.allow = allow;
+            perm.until_ms = until;
+            _ = self.version.fetchAdd(1, .monotonic);
+            return;
+        }
+        for (&self.permissions) |*perm| {
+            if (perm.used) continue;
+            perm.* = .{ .used = true, .client = client, .ask = ask, .kind = kind, .allow = allow, .until_ms = until };
+            _ = self.version.fetchAdd(1, .monotonic);
+            return;
+        }
+    }
+
+    /// Asks the reader whether this client may do this, and remembers the answer
+    /// for as long as they said.
+    pub fn askTo(self: *Bunker, io: std.Io, client: [32]u8, ask: Ask, kind: i32) Decision {
+        const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        if (self.remembered(client, ask, kind, now_ms)) |allowed| {
+            return if (allowed) .allow else .deny;
+        }
+
+        const idx = self.fileAsk(client, ask, kind) orelse return .deny;
+        const step_ms = 50;
+        var waited: u64 = 0;
+        var decision = self.pending[idx].decision.load(.acquire);
+        while (decision == .pending and waited < self.decision_timeout_ms) {
+            io.sleep(std.Io.Duration.fromMilliseconds(step_ms), .awake) catch {};
+            waited += step_ms;
+            decision = self.pending[idx].decision.load(.acquire);
+        }
+        const how_long = self.pending[idx].remember.load(.acquire);
+        // Only a real answer is written down. A timeout refuses this request and
+        // leaves the question open, because nobody said no: remembering silence
+        // as a denial would lock a client out for an hour over a reader who was
+        // away from the machine.
+        if (decision != .pending) {
+            self.rememberAnswer(client, ask, kind, decision == .allow, how_long, now_ms);
+        }
+
+        self.acquire();
+        self.pending[idx] = .{};
+        self.release();
+        _ = self.version.fetchAdd(1, .monotonic);
+        return if (decision == .allow) .allow else .deny;
+    }
+
+    fn fileAsk(self: *Bunker, client: [32]u8, ask: Ask, kind: i32) ?usize {
+        self.acquire();
+        defer self.release();
+        for (&self.pending, 0..) |*p, i| {
+            if (p.used) continue;
+            p.* = .{ .used = true, .id = self.next_id, .client = client, .ask = ask, .kind = kind };
+            self.next_id += 1;
+            _ = self.version.fetchAdd(1, .monotonic);
+            return i;
+        }
+        return null;
+    }
+
     /// The reader's answer to a waiting connect request.
     pub fn decide(self: *Bunker, id: u64, allow: bool) bool {
+        return self.decideFor(id, allow, .once);
+    }
+
+    /// The same, with how long it should last.
+    pub fn decideFor(self: *Bunker, id: u64, allow: bool, how_long: Remember) bool {
         self.acquire();
         defer self.release();
         for (&self.pending) |*p| {
             if (!p.used or p.id != id) continue;
             if (p.decision.load(.monotonic) != .pending) return false;
+            // The duration first, so the waiting thread cannot wake on the
+            // decision and read a remember value that has not been written yet.
+            p.remember.store(how_long, .release);
             p.decision.store(if (allow) .allow else .deny, .release);
             _ = self.version.fetchAdd(1, .monotonic);
             return true;
@@ -353,10 +569,15 @@ pub const ConnectPolicy = struct {
         // about it is what trains people to stop reading prompts.
         if (std.mem.eql(u8, request.method, "ping")) return .approve;
         if (!std.mem.eql(u8, request.method, "connect")) {
-            // Everything else: the library has already refused it unless the
-            // client is authorized, so reaching here means it is. Approving the
-            // client approved these, which the module header states.
-            return .approve;
+            // Reaching here means the library already established this client
+            // connected. What it may DO is a separate question, asked per method
+            // and, for a signature, per event kind.
+            const ask = Ask.fromMethod(request.method) orelse return .approve;
+            const kind: i32 = if (ask == .sign_event) templateKind(request) else -1;
+            return switch (self.b.askTo(self.io, client, ask, kind)) {
+                .allow => .approve,
+                else => .reject,
+            };
         }
         return switch (self.b.askToConnect(self.io, client, "")) {
             .allow => .approve,
@@ -364,6 +585,25 @@ pub const ConnectPolicy = struct {
         };
     }
 };
+
+/// The `kind` out of a `sign_event` request's template.
+///
+/// Read rather than trusted for anything but the prompt and the permission key:
+/// it is a number in JSON a client wrote, and the event it actually signs is
+/// built from that same template by the library. Unreadable means -1, which
+/// buckets with "no kind" and asks separately rather than silently reusing the
+/// permission granted for some other kind.
+fn templateKind(request: *const nip46.Request) i32 {
+    if (request.params.len < 1) return -1;
+    const Template = struct { kind: i32 = -1 };
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const parsed = std.json.parseFromSlice(Template, fba.allocator(), request.params[0], .{
+        .ignore_unknown_fields = true,
+    }) catch return -1;
+    defer parsed.deinit();
+    return parsed.value.kind;
+}
 
 /// Serves one relay until the connection drops or the bunker is switched off.
 ///
@@ -615,10 +855,14 @@ test "a switched-off bunker signs nothing, even for a client it approved" {
 
     const client = [_]u8{0x71} ** 32;
     b.remember(client, "Coracle");
+    // Standing permission, so this test is about the switch and not about the
+    // prompt: without one, signing asks, which is what the per-method change
+    // made it do.
+    b.rememberAnswer(client, .sign_event, 1, true, .always, 0);
     var policy = ConnectPolicy{ .b = &b, .io = threaded.io() };
     const p = policy.asPolicy();
 
-    const sign = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{} };
+    const sign = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{"{\"kind\":1}"} };
     try std.testing.expectEqual(nip46.Decision.approve, p.decide(&sign, client));
 
     // Off means off. The relay threads are winding down and one mid-request
@@ -645,4 +889,126 @@ test "ping never asks a human" {
     try std.testing.expectEqual(nip46.Decision.approve, p.decide(&ping, stranger));
     try std.testing.expect(!b.isKnown(stranger));
     try std.testing.expect(b.firstPending() == null);
+}
+
+test "a remembered answer covers only the question it answered" {
+    var b = Bunker{};
+    const client = [_]u8{0x81} ** 32;
+    const now: i64 = 1_000_000;
+
+    // Nothing remembered yet: every question is open.
+    try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
+
+    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
+    try std.testing.expectEqual(true, b.remembered(client, .sign_event, 1, now).?);
+
+    // A DIFFERENT KIND is a different question. Signing a note and signing a
+    // contact list are different risks, and this app's own history is the
+    // argument: a bad kind:3 write empties somebody's follow list.
+    try std.testing.expect(b.remembered(client, .sign_event, 3, now) == null);
+    // A different method is too.
+    try std.testing.expect(b.remembered(client, .nip44_decrypt, -1, now) == null);
+    // And a different client, which is the one that would be a real breach.
+    try std.testing.expect(b.remembered([_]u8{0x82} ** 32, .sign_event, 1, now) == null);
+}
+
+test "a denial is remembered, and both kinds of answer lapse" {
+    var b = Bunker{};
+    const client = [_]u8{0x83} ** 32;
+    const now: i64 = 1_000_000;
+
+    // "No, and stop asking for an hour" is a real answer. Folding it into the
+    // same field as an allow would make a denial either permanent or worthless.
+    b.rememberAnswer(client, .nip44_decrypt, -1, false, .hour, now);
+    try std.testing.expectEqual(false, b.remembered(client, .nip44_decrypt, -1, now).?);
+    try std.testing.expectEqual(false, b.remembered(client, .nip44_decrypt, -1, now + 59 * 60 * 1000).?);
+
+    // Lapsed answers are NULL, not denials: an hour running out means the
+    // question is open again, not that the answer became no.
+    try std.testing.expect(b.remembered(client, .nip44_decrypt, -1, now + 61 * 60 * 1000) == null);
+
+    b.rememberAnswer(client, .sign_event, 1, true, .day, now);
+    try std.testing.expectEqual(true, b.remembered(client, .sign_event, 1, now + 23 * 60 * 60 * 1000).?);
+    try std.testing.expect(b.remembered(client, .sign_event, 1, now + 25 * 60 * 60 * 1000) == null);
+}
+
+test "once is not written down" {
+    var b = Bunker{};
+    const client = [_]u8{0x84} ** 32;
+    const now: i64 = 1_000_000;
+
+    // The answer covered this request and the next one is a fresh question,
+    // which is the whole meaning of once.
+    b.rememberAnswer(client, .sign_event, 1, true, .once, now);
+    try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
+}
+
+test "the reader's latest word replaces the earlier one" {
+    var b = Bunker{};
+    const client = [_]u8{0x85} ** 32;
+    const now: i64 = 1_000_000;
+
+    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
+    b.rememberAnswer(client, .sign_event, 1, false, .always, now);
+    // One record per question. Two would be a coin toss over which is read.
+    try std.testing.expectEqual(false, b.remembered(client, .sign_event, 1, now).?);
+    var records: usize = 0;
+    for (b.permissions) |perm| {
+        if (perm.used) records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), records);
+}
+
+test "an unreadable template asks separately rather than reusing a permission" {
+    var b = Bunker{};
+    const client = [_]u8{0x86} ** 32;
+    const now: i64 = 1_000_000;
+
+    // A client's template is JSON it wrote. If the kind cannot be read it
+    // buckets as -1, and must NOT quietly ride on the permission granted for
+    // some other kind.
+    b.rememberAnswer(client, .sign_event, 1, true, .always, now);
+    try std.testing.expect(b.remembered(client, .sign_event, -1, now) == null);
+
+    const bad = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{"not json"} };
+    try std.testing.expectEqual(@as(i32, -1), templateKind(&bad));
+    const none = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{} };
+    try std.testing.expectEqual(@as(i32, -1), templateKind(&none));
+    const ok = nip46.Request{ .id = "1", .method = "sign_event", .params = &.{"{\"kind\":30023,\"content\":\"x\"}"} };
+    try std.testing.expectEqual(@as(i32, 30023), templateKind(&ok));
+}
+
+const TimeoutCtx = struct {
+    b: *Bunker,
+    gpa: std.mem.Allocator,
+    client: [32]u8,
+    result: Decision = .pending,
+};
+
+fn askAndTimeOut(ctx: *TimeoutCtx) void {
+    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    defer threaded.deinit();
+    ctx.result = ctx.b.askTo(threaded.io(), ctx.client, .sign_event, 1);
+}
+
+test "a prompt nobody answered is refused, and not written down" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var b = Bunker{};
+    b.enable(threaded.io());
+    b.decision_timeout_ms = 150;
+
+    const client = [_]u8{0x87} ** 32;
+    var ctx = TimeoutCtx{ .b = &b, .gpa = std.testing.allocator, .client = client };
+    const t = try std.Thread.spawn(.{}, askAndTimeOut, .{&ctx});
+    t.join();
+
+    // Refused, because a prompt nobody answered is not consent.
+    try std.testing.expectEqual(Decision.deny, ctx.result);
+
+    // But NOT remembered as a denial. A reader who walked away from the machine
+    // said nothing, and turning silence into "no for an hour" would lock an app
+    // out over an absence. The question stays open.
+    const now = std.Io.Timestamp.now(threaded.io(), .real).toMilliseconds();
+    try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
 }
