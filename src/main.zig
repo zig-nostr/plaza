@@ -26749,6 +26749,42 @@ pub fn reconnectJitterMs(wait: u64, index: usize, attempts: u6) u64 {
 ///
 /// A REQ under an existing id IS a replacement, so widening the watched set
 /// costs one message and no CLOSE.
+/// Records a feed note's id so its engagement can be watched, deduped and
+/// bounded.
+///
+/// Shared by the pool threads and the routed ones, because they had drifted:
+/// the pool watched engagement and the routed relays did not, and after the
+/// outbox landed the routed relays are the ones carrying most of the feed. One
+/// function is what stops that happening again.
+///
+/// The cap keeps the `#e` filter a size relays actually accept.
+pub const engagementWatchCapForTest = engagement_watch_cap;
+
+pub fn rememberFeedIdForTest(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: *usize,
+    ev: nostr.event.Event,
+) void {
+    rememberFeedId(ids, hex, len, ev);
+}
+
+fn rememberFeedId(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: *usize,
+    ev: nostr.event.Event,
+) void {
+    if (len.* >= engagement_watch_cap) return;
+    const nid = noteIdOf(ev);
+    for (ids[0..len.*]) |seen| {
+        if (seen == nid) return;
+    }
+    ids[len.*] = nid;
+    hexLower(&hex[len.*], ev.id);
+    len.* += 1;
+}
+
 fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_cap][64]u8, count: usize) void {
     if (count == 0) return;
     var evals: [engagement_watch_cap][]const u8 = undefined;
@@ -27115,6 +27151,21 @@ fn discoveredOnce(
 
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
     try relay.subscribe(outbox_sub_id, buildRoutedFilters(authors[0..authors_len_in], &filter_buf));
+
+    // The notes this relay carries, so their engagement can be watched HERE.
+    //
+    // The pool threads have done this since counts existed, and these have not,
+    // and after the outbox landed these are the relays that carry most of the
+    // feed. So a note routed here showed no replies, no likes and no zaps for as
+    // long as it was on screen: the numbers only appeared once the note was
+    // opened, because a thread fetches engagement on its own path, and then they
+    // were in the table and the feed looked fine. That is why this reads as
+    // "counts load late" rather than as "counts are missing".
+    var feed_ids: [engagement_watch_cap]i64 = undefined;
+    var feed_id_hex: [engagement_watch_cap][64]u8 = undefined;
+    var feed_ids_len: usize = 0;
+    var engagement_watching: usize = 0;
+    var engagement_at: i64 = 0;
     // Published only now, so the keeper never replaces a question that has not
     // been asked yet. Cleared on the way out, before the connection is freed.
     setRoutedLive(index, url, gen_in);
@@ -27122,6 +27173,17 @@ fn discoveredOnce(
 
     while (true) {
         if (relaysPaused()) return;
+        // Widen as more of this relay's feed arrives, on the same rule the pool
+        // threads use: a subscription opened once at EOSE leaves every note that
+        // arrives afterwards reading zero forever.
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
+            now_ms - engagement_at > engagement_widen_ms)
+        {
+            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+            engagement_watching = feed_ids_len;
+            engagement_at = now_ms;
+        }
         // The slot was pointed at a DIFFERENT relay. Nothing here is worth
         // keeping, so drop it and let the loop dial whatever the slot holds now.
         //
@@ -27134,12 +27196,33 @@ fn discoveredOnce(
         defer msg.deinit();
         switch (msg.value) {
             .event => |e| {
-                // Verified before it is stored. This is a relay the reader
-                // never chose, reached because a follow named it, so it gets
-                // less trust than the pool rather than more.
-                const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
-                if (result == .invalid) continue;
-                if (e.event.kind == 1) noteFeedNewest(e.event.created_at);
+                if (std.mem.eql(u8, e.subscription_id, outbox_sub_id)) {
+                    // Verified before it is stored. This is a relay the reader
+                    // never chose, reached because a follow named it, so it gets
+                    // less trust than the pool rather than more.
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind == 1) {
+                        noteFeedNewest(e.event.created_at);
+                        rememberFeedId(&feed_ids, &feed_id_hex, &feed_ids_len, e.event);
+                    }
+                } else {
+                    // The engagement subscription. Verified too, so a forged
+                    // reaction cannot inflate a tally.
+                    if (nostr.event.verify(gpa, signer, e.event) catch false) {
+                        countEngagement(e.event, feed_ids[0..feed_ids_len]);
+                    }
+                }
+            },
+            .eose => |eo| {
+                // What this relay had, drained: now watch those notes.
+                if (engagement_watching == 0 and feed_ids_len > 0 and
+                    std.mem.eql(u8, eo.subscription_id, outbox_sub_id))
+                {
+                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                    engagement_watching = feed_ids_len;
+                    engagement_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+                }
             },
             .closed => return,
             else => {},
@@ -27426,21 +27509,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     if (e.event.kind == contact_list_kind) ingestContactList(e.event);
                     // Note this feed post so its engagement can be watched. Bounded
                     // to keep the `#e` filter a size relays accept.
-                    if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {
-                        const nid = noteIdOf(e.event);
-                        var known = false;
-                        for (feed_ids[0..feed_ids_len]) |fid| {
-                            if (fid == nid) {
-                                known = true;
-                                break;
-                            }
-                        }
-                        if (!known) {
-                            feed_ids[feed_ids_len] = nid;
-                            hexLower(&feed_id_hex[feed_ids_len], e.event.id);
-                            feed_ids_len += 1;
-                        }
-                    }
+                    if (e.event.kind == 1) rememberFeedId(&feed_ids, &feed_id_hex, &feed_ids_len, e.event);
                 } else if (isOneShotSub(e.subscription_id)) {
                     // Somebody else's question, answered on this socket. It goes
                     // to the store like everything else and nothing is routed
