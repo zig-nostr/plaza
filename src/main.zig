@@ -12544,6 +12544,11 @@ pub const Msg = union(enum) {
     notary_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
+    /// The daemon's answer to the bunker poll, and the reader's three actions.
+    bunker_state: native_sdk.EffectResponse,
+    bunker_toggle,
+    bunker_decide: struct { id: u64, allow: bool },
+    bunker_revoke: u8,
     /// A /setup (create) answered: adopt the new helper identity.
     helper_setup: native_sdk.EffectResponse,
     /// A /sign answered: ingest and publish the signed event.
@@ -12625,7 +12630,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -12654,7 +12659,7 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // Exactly the number of `sections[n] =` lines below. It was full when this
     // screen grew a section, and the bounds check is what said so.
-    var sections: [7]AppUi.Node = undefined;
+    var sections: [8]AppUi.Node = undefined;
     var n: usize = 0;
 
     sections[n] = identitySection(ui, model);
@@ -12671,6 +12676,8 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
     n += 1;
     sections[n] = settingsSection(ui, "NOTES", "what each one shows · what the feed stops asking for", notesCard(ui, model));
+    n += 1;
+    sections[n] = settingsSection(ui, "SIGNING", "let other apps sign with your key · NIP-46", signingCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;
@@ -12949,6 +12956,135 @@ fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
             &.{.{ .text = label, .scale = menu_scale }},
         ),
     });
+}
+
+/// Signing for other apps: the switch, the link, whoever is waiting, and
+/// whoever is already connected.
+///
+/// Four things in one card because they are one decision. A switch with the
+/// consequences on another screen is a switch people flip without reading, and
+/// the whole argument for this over a browser extension is that you can see what
+/// it is doing.
+fn signingCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    var kids: [10]AppUi.Node = undefined;
+    var n: usize = 0;
+
+    kids[n] = ui.el(.checkbox, .{
+        .size = .sm,
+        .checked = bunkerOn(),
+        .text = "Sign for other apps",
+        .on_toggle = Msg.bunker_toggle,
+        .style = .{
+            .accent = p.surface_control_solid,
+            .accent_foreground = p.on_accent,
+            .border = p.border_radio,
+            .radius = 4,
+            .stroke_width = 1.5,
+        },
+        .semantics = .{ .label = "Sign for other apps", .focusable = true },
+    }, .{});
+    n += 1;
+    kids[n] = vgap(ui, 7);
+    n += 1;
+    kids[n] = ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+        &.{.{ .text = "Off unless you turn it on. While it is on, Plaza connects to relays and other apps can ask it to sign as you. Each one has to be approved here first, and approving it approves everything it will ever ask for.", .scale = mono_hint_scale }},
+    );
+    n += 1;
+
+    if (bunkerOn()) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerLinkRow(ui);
+        n += 1;
+    }
+
+    if (bunkerPendingClient().len > 0) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerAskRow(ui);
+        n += 1;
+    }
+
+    if (bunkerClientCount() > 0) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerClientRows(ui);
+        n += 1;
+    }
+
+    return settingsCard(ui, .{kids[0..n]});
+}
+
+/// The link, and the one button that matters: copy.
+///
+/// Shown in full rather than truncated. It carries a secret, and a reader who
+/// cannot see the whole thing cannot tell whether what they pasted is what this
+/// screen is showing.
+fn bunkerLinkRow(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+            &.{.{ .text = bunkerUrl(), .monospace = true, .scale = mono_meta_scale }},
+        ),
+        vgap(ui, 7),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = bunkerUrl() } }, "Copy link"),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.", .scale = mono_hint_scale }},
+            ),
+        }),
+    });
+}
+
+/// Somebody is waiting. Named by pubkey, because that is the only thing about a
+/// client this app actually knows: a name in a connection token is a string a
+/// stranger chose.
+fn bunkerAskRow(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
+            &.{.{ .text = "An app wants to sign as you", .scale = meta_scale }},
+        ),
+        vgap(ui, 5),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
+        ),
+        vgap(ui, 7),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true } } }, "Approve"),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false } } }, "Deny"),
+        }),
+    });
+}
+
+/// Who is connected, and the button that ends it.
+fn bunkerClientRows(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    var kids: [8 * 2]AppUi.Node = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < bunkerClientCount()) : (i += 1) {
+        if (n > 0) {
+            kids[n] = vgap(ui, 7);
+            n += 1;
+        }
+        kids[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = bunkerClientAt(i), .monospace = true, .scale = mono_hint_scale }},
+            ),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_revoke = @intCast(i) } }, "Disconnect"),
+        });
+        n += 1;
+    }
+    return ui.column(.{ .gap = 0 }, .{kids[0..n]});
 }
 
 /// What the reader can take away, and what is gone right now.
@@ -22130,6 +22266,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
+                // What the signer is doing as a bunker, while the screen showing
+                // it is open. A connect request waits two minutes for an answer,
+                // so this is what puts it in front of somebody in time.
+                pollBunker(fx, model, nowMillis() orelse 0);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
                 drivePendingIntent(model, fx);
@@ -22667,6 +22807,30 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // browser; see `mention_link_tag`.
         .open_url => |url| {
             if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
+        },
+        .bunker_state => |response| {
+            if (response.outcome == .ok and response.status == 200) applyBunkerState(response.body);
+        },
+        .bunker_toggle => {
+            // The reader's press goes to the daemon and the answer comes back as
+            // a fresh state, rather than being applied here and hoped for. The
+            // daemon owns whether the bunker is on; it holds the key and it is
+            // the thing relays talk to.
+            var body_buf: [32]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"on\":{s}}}", .{if (g_bunker_on) "false" else "true"}) catch return;
+            helperFetch(fx, bunker_toggle_key, "/bunker", body, Effects.responseMsg(.bunker_state));
+        },
+        .bunker_decide => |what| {
+            var body_buf: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s}}}", .{ what.id, if (what.allow) "true" else "false" }) catch return;
+            helperFetch(fx, bunker_decide_key, "/bunker/decide", body, Effects.responseMsg(.bunker_state));
+        },
+        .bunker_revoke => |index| {
+            const pubkey = bunkerClientAt(index);
+            if (pubkey.len == 0) return;
+            var body_buf: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"pubkey\":\"{s}\"}}", .{pubkey}) catch return;
+            helperFetch(fx, bunker_revoke_key, "/bunker/revoke", body, Effects.responseMsg(.bunker_state));
         },
         .expand_image => |note_id| {
             model.expanded_note = note_id;
@@ -28037,4 +28201,131 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
 test {
     _ = @import("tests.zig");
+}
+
+// ---------------------------------------------------------------- the bunker
+//
+// Plaza signing for OTHER apps. The work is all in `plaza-signer` (see
+// src/signer/bunker.zig); this is the screen for it.
+//
+// The state here is a MIRROR of the daemon's, refreshed by polling, never the
+// source of truth. The daemon owns whether the bunker is on, who is connected
+// and who is waiting, because it is the process holding the key and answering
+// relays. A UI that kept its own copy would eventually disagree with the thing
+// actually signing, and the disagreement would be invisible.
+
+const bunker_state_key: u64 = 44;
+const bunker_toggle_key: u64 = 45;
+const bunker_decide_key: u64 = 46;
+const bunker_revoke_key: u64 = 47;
+
+/// How often the screen asks the daemon what it is doing.
+///
+/// Only while Settings is open. A connect request waits two minutes for an
+/// answer, so a second is quick enough that a reader watching the screen sees it
+/// appear, and idle enough to cost nothing when nobody is looking.
+const bunker_poll_ms: i64 = 1000;
+
+var g_bunker_on: bool = false;
+var g_bunker_url_buf: [512]u8 = undefined;
+var g_bunker_url_len: usize = 0;
+var g_bunker_pending_id: u64 = 0;
+var g_bunker_pending_client: [64]u8 = undefined;
+var g_bunker_pending_len: usize = 0;
+var g_bunker_clients: [8][64]u8 = undefined;
+var g_bunker_client_count: usize = 0;
+var g_bunker_polled_at: i64 = 0;
+
+pub fn bunkerOn() bool {
+    return g_bunker_on;
+}
+
+pub fn bunkerUrl() []const u8 {
+    return g_bunker_url_buf[0..g_bunker_url_len];
+}
+
+pub fn bunkerPendingClient() []const u8 {
+    return g_bunker_pending_client[0..g_bunker_pending_len];
+}
+
+pub fn bunkerClientCount() usize {
+    return g_bunker_client_count;
+}
+
+/// Reads the daemon's answer into the mirror above.
+///
+/// Everything is replaced, never merged: this is a snapshot of what the daemon
+/// believes, and merging would let a stale client linger in the list after it
+/// had been revoked, which is the one thing this list exists to show truthfully.
+pub fn applyBunkerState(json: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const Client = struct { pubkey: []const u8 = "" };
+    const Pending = struct { id: u64 = 0, client: []const u8 = "" };
+    const Body = struct {
+        enabled: bool = false,
+        url: []const u8 = "",
+        pending: ?Pending = null,
+        clients: []const Client = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Body, gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    g_bunker_on = parsed.value.enabled;
+    const n = @min(parsed.value.url.len, g_bunker_url_buf.len);
+    @memcpy(g_bunker_url_buf[0..n], parsed.value.url[0..n]);
+    g_bunker_url_len = n;
+
+    if (parsed.value.pending) |p| {
+        g_bunker_pending_id = p.id;
+        const c = @min(p.client.len, g_bunker_pending_client.len);
+        @memcpy(g_bunker_pending_client[0..c], p.client[0..c]);
+        g_bunker_pending_len = c;
+    } else {
+        g_bunker_pending_id = 0;
+        g_bunker_pending_len = 0;
+    }
+
+    g_bunker_client_count = 0;
+    for (parsed.value.clients) |c| {
+        if (g_bunker_client_count >= g_bunker_clients.len) break;
+        const len = @min(c.pubkey.len, g_bunker_clients[0].len);
+        @memcpy(g_bunker_clients[g_bunker_client_count][0..len], c.pubkey[0..len]);
+        g_bunker_client_count += 1;
+    }
+}
+
+pub fn bunkerClientAt(i: usize) []const u8 {
+    if (i >= g_bunker_client_count) return "";
+    return &g_bunker_clients[i];
+}
+
+pub fn applyBunkerStateForTest(json: []const u8) void {
+    applyBunkerState(json);
+}
+
+pub fn resetBunkerForTest() void {
+    g_bunker_on = false;
+    g_bunker_url_len = 0;
+    g_bunker_pending_id = 0;
+    g_bunker_pending_len = 0;
+    g_bunker_client_count = 0;
+}
+
+/// Asks the daemon what it is doing, at most once a second and only while the
+/// screen that shows it is open.
+fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
+    if (model.stage != .settings) return;
+    if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
+    g_bunker_polled_at = now_ms;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{helper_port}) catch return;
+    var auth_buf: [96]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
+    fx.fetch(.{
+        .key = bunker_state_key,
+        .url = url,
+        .method = .GET,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.bunker_state),
+    });
 }

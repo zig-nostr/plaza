@@ -17433,3 +17433,100 @@ test "one picture still fills the column, so nothing about a plain note moved" {
     const tree = try buildTree(arena, &model);
     try testing.expectEqual(@as(usize, 1), countByLabel(tree.root, "Attached image, press to enlarge"));
 }
+
+// -- Signing for other apps ---------------------------------------------------
+
+test "the signing screen mirrors the daemon, and a revoked client leaves it" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    // Off, with nothing to show.
+    try testing.expect(!main.bunkerOn());
+    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1",
+        \\ "pending":{"id":7,"client":"aa11"},
+        \\ "clients":[{"pubkey":"bb22"},{"pubkey":"cc33"}]}
+    );
+    try testing.expect(main.bunkerOn());
+    try testing.expectEqualStrings("bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1", main.bunkerUrl());
+    try testing.expectEqualStrings("aa11", main.bunkerPendingClient());
+    try testing.expectEqual(@as(usize, 2), main.bunkerClientCount());
+
+    // The daemon is the source of truth and every answer REPLACES the mirror.
+    // Merging would let a client that had just been disconnected linger in the
+    // list, which is the one thing this list exists to show truthfully.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc","pending":null,"clients":[{"pubkey":"cc33"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), main.bunkerClientCount());
+    try testing.expectEqualStrings("cc33", main.bunkerClientAt(0)[0..4]);
+    // And the prompt goes when the daemon says it is gone, rather than sticking
+    // around for somebody to answer a question nobody is asking any more.
+    try testing.expectEqual(@as(usize, 0), main.bunkerPendingClient().len);
+}
+
+test "switching the bunker off empties what the screen shows" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"bb22"}]}
+    );
+    try testing.expect(main.bunkerUrl().len > 0);
+
+    // The daemon drops every session when it is switched off, and the screen
+    // has to follow. A URL still on screen for a bunker that is off is a link
+    // somebody would paste into another app and then wonder about.
+    main.applyBunkerStateForTest(
+        \\{"enabled":false,"url":"","pending":null,"clients":[]}
+    );
+    try testing.expect(!main.bunkerOn());
+    try testing.expectEqual(@as(usize, 0), main.bunkerUrl().len);
+    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
+}
+
+test "the settings screen carries the signing section" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "SIGNING") != null);
+        try testing.expect(findByLabel(tree.root, "Sign for other apps") != null);
+        // Off: no link, because there is nothing to hand anybody yet.
+        try testing.expect(findAnyText(tree.root, "Copy link") == null);
+    }
+
+    // A waiting client puts the question on the screen, with both answers.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":{"id":3,"client":"dd44"},"clients":[]}
+    );
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Copy link") != null);
+        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") != null);
+        try testing.expect(findAnyText(tree.root, "Approve") != null);
+        try testing.expect(findAnyText(tree.root, "Deny") != null);
+    }
+
+    // And a connected one can be disconnected from the same place.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"ee55"}]}
+    );
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") == null);
+        try testing.expect(findAnyText(tree.root, "Disconnect") != null);
+    }
+}
