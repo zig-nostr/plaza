@@ -5227,6 +5227,44 @@ pub fn mediaProxy() []const u8 {
 }
 
 /// Sets the proxy base URL (trimmed; empty disables proxying).
+/// Whether image URLs are routed through the proxy at all.
+///
+/// ON by default, and not only for privacy: the proxy RESIZES. The registry
+/// decodes at most 512x512, so a 2040x1536 photograph is 611 KB direct and a
+/// fraction of that proxied, and the difference is downloaded and thrown away.
+/// One note with three pictures measured 825 KB direct.
+var g_media_proxy_on: bool = true;
+
+/// Whether a picture the proxy REFUSES is then fetched from its own host.
+///
+/// ON by default, because the alternative is a broken picture, and a broken
+/// picture reads as a broken app. The public proxy blocks whole TLDs by policy
+/// (code 400, "Domain or TLD blocked by policy") for Blossom hosts that serve
+/// the same file directly without complaint, and that is not something this app
+/// can fix from here.
+///
+/// The cost is stated rather than hidden: a fallback fetch is a request to that
+/// host, so it sees the reader's address. Turning it off means those pictures do
+/// not load at all, which is a legitimate thing to want and is why this is a
+/// switch rather than a silent behaviour.
+var g_media_direct_fallback: bool = true;
+
+pub fn mediaProxyOn() bool {
+    return g_media_proxy_on;
+}
+
+pub fn setMediaProxyOn(on: bool) void {
+    g_media_proxy_on = on;
+}
+
+pub fn mediaDirectFallback() bool {
+    return g_media_direct_fallback;
+}
+
+pub fn setMediaDirectFallback(on: bool) void {
+    g_media_direct_fallback = on;
+}
+
 pub fn setMediaProxy(url: []const u8) void {
     const trimmed = std.mem.trim(u8, url, " \t\r\n");
     const n = @min(trimmed.len, g_media_proxy_buf.len);
@@ -5270,7 +5308,7 @@ pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u
         return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
     }
     const proxy = mediaProxy();
-    if (proxy.len == 0) return src;
+    if (!g_media_proxy_on or proxy.len == 0) return src;
 
     var encoded_buf: [768]u8 = undefined;
     const encoded = percentEncode(&encoded_buf, src) orelse return src;
@@ -9142,6 +9180,24 @@ pub const Model = struct {
         return "Pictures, faces, link previews and NIP-05 checks are fetched from the hosts a note names. " ++
             "Off, none of that is asked for until you press a picture, and only your relays learn you are reading.";
     }
+    pub fn proxy_on(self: *const Model) bool {
+        _ = self;
+        return g_media_proxy_on;
+    }
+    pub fn proxy_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return "On, a picture's host never sees you, and it arrives already resized: a 2040x1536 photograph is 611 KB from the source and a fraction of that through the proxy. " ++
+            "Off, pictures come straight from whoever hosts them, who then learn your address and how much you scroll.";
+    }
+    pub fn direct_fallback_on(self: *const Model) bool {
+        _ = self;
+        return g_media_direct_fallback;
+    }
+    pub fn direct_fallback_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return "Public proxies refuse whole domains by policy, and those pictures simply never appear. " ++
+            "On, Plaza asks that one host itself, which lets that host see you. Off, the picture stays blank and nobody new learns anything.";
+    }
     pub fn previews_state(self: *const Model) []const u8 {
         _ = self;
         return if (g_media_previews) "On" else "Off. Press a picture to load that one.";
@@ -10584,6 +10640,16 @@ fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?Decode
 /// test could compare two spellings; sharing the function means there are not
 /// two to compare.
 fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
+    return feedImageUrlDirect(buf, src, false);
+}
+
+/// The same, with `direct` skipping the proxy and asking the host itself.
+///
+/// The picture is still resized afterwards, by us: `decodeAndRegister` scales
+/// anything over the registry's budget. What a direct fetch costs is the bytes
+/// on the way in, since the proxy would have shrunk them first.
+fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    if (direct) return src;
     return if (isGifUrl(src))
         mediaUrl(buf, src, gif_target_px, .animation)
     else
@@ -10737,6 +10803,18 @@ const MediaSlot = struct {
     /// The resolved URL this image is fetched from, which is also its cache key.
     url_buf: [1024]u8 = [_]u8{0} ** 1024,
     url_len: u16 = 0,
+    /// Ask this picture's own host next time, skipping the proxy.
+    ///
+    /// Set when a proxied fetch came back unusable, so the retry goes to the
+    /// source. The public proxy refuses whole TLDs by policy and answers 400 for
+    /// hosts that serve the same file directly without complaint, and from here
+    /// that is indistinguishable from any other refusal: what is observable is
+    /// that the proxy would not produce the picture.
+    ///
+    /// One flag rather than a counter, because it is one alternative: proxy,
+    /// then source, then give up. Reset with the rest of the slot when it is
+    /// handed to a different note.
+    direct: bool = false,
     /// Every frame of an animated GIF, decoded once and owned by stb (freed on
     /// eviction). Null for a still picture.
     frames: ?[*]u8 = null,
@@ -11103,7 +11181,7 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
 
     var url_buf: [1024]u8 = undefined;
     const gif = isGifUrl(note.imageUrl());
-    const url = feedImageUrl(&url_buf, note.imageUrl());
+    const url = feedImageUrlDirect(&url_buf, note.imageUrl(), slot.direct);
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
@@ -11153,6 +11231,22 @@ pub fn classifyImageFailure(outcome: native_sdk.EffectFetchOutcome, status: u16)
     return .retry;
 }
 
+/// Whether this answer is the proxy refusing the HOST, rather than telling us
+/// something about the picture.
+///
+/// The three statuses a proxy uses to decline on policy. wsrv.nl answers 400
+/// with `{"message":"Domain or TLD blocked by policy"}` for Blossom hosts that
+/// serve the same file directly; 403 is the same refusal by another name, and
+/// 451 is one made for it by somebody else.
+///
+/// Deliberately NOT 404, which is the source missing and will be missing
+/// directly too, and not a 200 that produced no usable image, which is our own
+/// size limit and is only worse without the proxy shrinking it first.
+pub fn proxyRefusedHost(outcome: native_sdk.EffectFetchOutcome, status: u16) bool {
+    if (outcome != .ok) return false;
+    return status == 400 or status == 403 or status == 451;
+}
+
 /// How many times a picture or avatar may come back unusable for a reason worth
 /// retrying before Plaza stops asking.
 ///
@@ -11179,6 +11273,30 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         // a picture that is simply too big is different again: it will be the
         // same size next time, so asking again is a download with a known
         // answer. Only something that can change goes back to idle.
+        // One more try, at the source, before this is a failure at all.
+        //
+        // Only for the answers that are about the PROXY rather than about the
+        // picture. The public one refuses whole TLDs by policy and answers 400
+        // for Blossom hosts that hand over the same file without complaint, so
+        // those say "not through here" and the host has not been asked yet.
+        //
+        // Narrow on purpose. A 404 through the proxy is the SOURCE missing,
+        // and a body too large to decode is our own limit on the response,
+        // which a direct fetch only makes worse because the proxy was the thing
+        // shrinking it. Falling back on either is a second download with a known
+        // answer, and two tests said so before this comment existed.
+        //
+        // Once per slot, and only while the proxy is what was used, so it can
+        // never loop and never fires for a fetch that was already direct. The
+        // attempt counter is untouched: this is a different question, not
+        // another go at the same one.
+        if (g_media_direct_fallback and g_media_proxy_on and !slot.direct and
+            proxyRefusedHost(response.outcome, response.status))
+        {
+            slot.direct = true;
+            slot.state = .idle;
+            return;
+        }
         slot.state = switch (classifyImageFailure(response.outcome, response.status)) {
             .give_up => .failed,
             .retry => blk: {
@@ -12280,6 +12398,8 @@ pub const Msg = union(enum) {
     proxy_save,
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
+    proxy_toggle,
+    direct_fallback_toggle,
     /// Index into `hideables`.
     hide_toggle: u8,
     client_tag_toggle,
@@ -12335,7 +12455,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -12758,11 +12878,51 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
             &.{.{ .text = model.client_tag_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.proxy_on(),
+            .text = "Load pictures through a proxy",
+            .on_toggle = Msg.proxy_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Load pictures through a proxy", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.proxy_explainer(), .scale = mono_hint_scale }},
+        ),
+        vgap(ui, 9),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.direct_fallback_on(),
+            .text = "Ask the host when the proxy refuses",
+            .on_toggle = Msg.direct_fallback_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Ask the host when the proxy refuses", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.direct_fallback_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
         ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, &.{.{ .text = "Media proxy", .scale = menu_scale }}),
         vgap(ui, 7),
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-            &.{.{ .text = "Pictures are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.", .scale = mono_hint_scale }},
+            &.{.{ .text = "Which service does the resizing. Point it at your own instance if you would rather not use a public one.", .scale = mono_hint_scale }},
         ),
         vgap(ui, 9),
         ui.inputGroup(
@@ -22216,6 +22376,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             setClientTag(!clientTag());
             saveSettings();
         },
+        .proxy_toggle => {
+            setMediaProxyOn(!mediaProxyOn());
+            saveSettings();
+            // Every picture's URL is built from this, so what is on screen was
+            // fetched under the old answer. Retrying the ones that failed is the
+            // point of the switch: turning the proxy off is how somebody fixes a
+            // blank picture, and it would be a strange switch that left it blank.
+            retryFailedImages();
+        },
+        .direct_fallback_toggle => {
+            setMediaDirectFallback(!mediaDirectFallback());
+            saveSettings();
+            if (mediaDirectFallback()) retryFailedImages();
+        },
         .hide_toggle => |i| {
             if (i < hideables.len) {
                 setHidden(@enumFromInt(i), !g_hidden[i]);
@@ -26467,6 +26641,8 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
     g_client_tag = false;
+    g_media_proxy_on = true;
+    g_media_direct_fallback = true;
     g_hidden = @splat(false);
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
@@ -26480,6 +26656,8 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "media_direct_fallback")) g_media_direct_fallback = std.mem.eql(u8, line[eq + 1 ..], "on");
         // Written by id rather than by position, so adding an element to the
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
@@ -26495,11 +26673,13 @@ fn saveSettings() void {
     var hidden_buf: [256]u8 = undefined;
     const hidden_ids = hiddenLine(&hidden_buf);
     var buf: [768]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
         hidden_ids,
+        if (g_media_proxy_on) "on" else "off",
+        if (g_media_direct_fallback) "on" else "off",
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",

@@ -17260,3 +17260,46 @@ test "a note's id is remembered once, and the table is bounded" {
     main.rememberFeedIdForTest(&ids, &hex, &len, fresh);
     try testing.expectEqual(main.engagementWatchCapForTest, len);
 }
+
+test "the proxy is only bypassed when it refused the host, not the picture" {
+    // 400 with "Domain or TLD blocked by policy" is what wsrv.nl answers for a
+    // Blossom host that serves the same file directly. 403 and 451 are the same
+    // refusal by other names.
+    try testing.expect(main.proxyRefusedHost(.ok, 400));
+    try testing.expect(main.proxyRefusedHost(.ok, 403));
+    try testing.expect(main.proxyRefusedHost(.ok, 451));
+
+    // NOT a 404: the source is missing and will be missing directly too, so a
+    // fallback is a second download with a known answer.
+    try testing.expect(!main.proxyRefusedHost(.ok, 404));
+
+    // NOT a 200 that produced no usable image. That is our own size limit, and
+    // going direct only makes it worse, because the proxy was the thing
+    // shrinking the picture. Two existing tests caught this when the fallback
+    // fired on every failure.
+    try testing.expect(!main.proxyRefusedHost(.ok, 200));
+
+    // And nothing that never reached a host: a retry, not a refusal.
+    try testing.expect(!main.proxyRefusedHost(.ok, 500));
+    try testing.expect(!main.proxyRefusedHost(.ok, 429));
+}
+
+test "the proxy toggle decides whether a URL is rewritten at all" {
+    const original = "https://blossom.ditto.pub/abc.jpeg";
+    var buf: [1024]u8 = undefined;
+
+    // The proxy URL too: a test process never loads the settings file, so this
+    // starts empty, and an empty proxy means "use the original" whatever the
+    // switch says.
+    main.setMediaProxy("https://wsrv.nl/");
+    main.setMediaProxyOn(true);
+    defer main.setMediaProxyOn(true);
+    const proxied = main.feedImageUrlForTest(&buf, original);
+    try testing.expect(std.mem.indexOf(u8, proxied, "wsrv.nl") != null);
+
+    // Off, the picture's own URL is used untouched, which is what somebody
+    // reaches for when a proxy is refusing their images.
+    main.setMediaProxyOn(false);
+    var buf2: [1024]u8 = undefined;
+    try testing.expectEqualStrings(original, main.feedImageUrlForTest(&buf2, original));
+}
