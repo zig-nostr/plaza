@@ -45,6 +45,12 @@ const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
 // the secret with no prompt at all. The transcript is in keychain.c. Nothing in
 // this app may claim app-level isolation on the strength of this.
 
+/// macOS only. Everywhere else these compile out and the key file is used,
+/// which is what those platforms had before this existed: there is no Keychain
+/// to move into, and pretending otherwise would be a fallback that silently
+/// stores nothing.
+const has_keychain = @import("builtin").os.tag == .macos;
+
 extern fn plaza_keychain_set(service: [*:0]const u8, account: [*:0]const u8, data: [*]const u8, len: c_ulong) c_int;
 extern fn plaza_keychain_get(service: [*:0]const u8, account: [*:0]const u8, out: [*]u8, out_cap: c_ulong, out_len: *c_ulong) c_int;
 extern fn plaza_keychain_delete(service: [*:0]const u8, account: [*:0]const u8) c_int;
@@ -55,12 +61,14 @@ const keychain_account = "signer-key";
 /// Stores the secret in the Keychain. False when it refused, and the caller
 /// falls back to the file.
 fn keychainStore(secret: [32]u8) bool {
+    if (comptime !has_keychain) return false;
     return plaza_keychain_set(keychain_service, keychain_account, &secret, secret.len) == 0;
 }
 
 /// Reads the secret back, or null when there is none, which from here is the
 /// same as the Keychain being unavailable: try the file.
 fn keychainLoad() ?[32]u8 {
+    if (comptime !has_keychain) return null;
     var out: [32]u8 = undefined;
     var n: c_ulong = 0;
     if (plaza_keychain_get(keychain_service, keychain_account, &out, out.len, &n) != 0) return null;
@@ -74,6 +82,7 @@ fn keychainLoad() ?[32]u8 {
 }
 
 fn keychainForget() void {
+    if (comptime !has_keychain) return;
     _ = plaza_keychain_delete(keychain_service, keychain_account);
 }
 
@@ -701,6 +710,7 @@ test "hex encoding is lowercase and full width" {
 }
 
 test "the keychain round-trips a secret and forgetting it removes it" {
+    if (comptime !has_keychain) return error.SkipZigTest;
     // A real Keychain call against this machine, under a test-only account so
     // it can never touch the one a running Plaza uses.
     const account = "signer-key-test";
