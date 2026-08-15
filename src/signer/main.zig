@@ -27,6 +27,65 @@ const keystore = nostr.keystore;
 
 const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
 
+// ------------------------------------------------------------- the keychain
+//
+// Where the key lives now. The 0600 file is still read, so an existing install
+// keeps working and is migrated on the next start, and it is still written when
+// the Keychain refuses, which is the shape Amethyst's desktop side uses: OS
+// credential manager, encrypted-file fallback.
+//
+// What moving it buys, exactly: the login keychain is encrypted, so a copied
+// home directory, a Time Machine backup and a stolen disk yield nothing without
+// the login password. A 0600 file hands all three over.
+//
+// What it does NOT buy, measured rather than assumed: protection from another
+// process running as this user. A keychain item's ACL binds to the creating
+// app's designated requirement, and an AD-HOC signature has none. Two ad-hoc
+// binaries read each other's items, and `security find-generic-password` printed
+// the secret with no prompt at all. The transcript is in keychain.c. Nothing in
+// this app may claim app-level isolation on the strength of this.
+
+/// macOS only. Everywhere else these compile out and the key file is used,
+/// which is what those platforms had before this existed: there is no Keychain
+/// to move into, and pretending otherwise would be a fallback that silently
+/// stores nothing.
+const has_keychain = @import("builtin").os.tag == .macos;
+
+extern fn plaza_keychain_set(service: [*:0]const u8, account: [*:0]const u8, data: [*]const u8, len: c_ulong) c_int;
+extern fn plaza_keychain_get(service: [*:0]const u8, account: [*:0]const u8, out: [*]u8, out_cap: c_ulong, out_len: *c_ulong) c_int;
+extern fn plaza_keychain_delete(service: [*:0]const u8, account: [*:0]const u8) c_int;
+
+const keychain_service = "com.zig-nostr.plaza";
+const keychain_account = "signer-key";
+
+/// Stores the secret in the Keychain. False when it refused, and the caller
+/// falls back to the file.
+fn keychainStore(secret: [32]u8) bool {
+    if (comptime !has_keychain) return false;
+    return plaza_keychain_set(keychain_service, keychain_account, &secret, secret.len) == 0;
+}
+
+/// Reads the secret back, or null when there is none, which from here is the
+/// same as the Keychain being unavailable: try the file.
+fn keychainLoad() ?[32]u8 {
+    if (comptime !has_keychain) return null;
+    var out: [32]u8 = undefined;
+    var n: c_ulong = 0;
+    if (plaza_keychain_get(keychain_service, keychain_account, &out, out.len, &n) != 0) return null;
+    // Length checked rather than trusted: the item is whatever sits in the
+    // keychain under that name, which is not necessarily what this app put there.
+    if (n != out.len) {
+        std.crypto.secureZero(u8, &out);
+        return null;
+    }
+    return out;
+}
+
+fn keychainForget() void {
+    if (comptime !has_keychain) return;
+    _ = plaza_keychain_delete(keychain_service, keychain_account);
+}
+
 // ------------------------------------------------------------------- state
 
 /// The keyholder's live state, shared read-only across connection threads after
@@ -81,13 +140,17 @@ const State = struct {
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return error.BadKey;
 
-        var hexbuf: [64]u8 = undefined;
-        _ = hexLower(&hexbuf, secret);
-        keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+        // The Keychain first. The file is written only when it refuses, so a
+        // healthy install never has the secret sitting in a plain file at all.
+        if (!keychainStore(secret)) {
+            var hexbuf: [64]u8 = undefined;
+            _ = hexLower(&hexbuf, secret);
+            keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+                std.crypto.secureZero(u8, &hexbuf);
+                return e;
+            };
             std.crypto.secureZero(u8, &hexbuf);
-            return e;
-        };
-        std.crypto.secureZero(u8, &hexbuf);
+        }
 
         self.secret = secret;
         self.pubkey = kp.public_key;
@@ -102,11 +165,26 @@ const State = struct {
         if (self.secret) |*sk| std.crypto.secureZero(u8, sk[0..]);
         self.secret = null;
         self.pubkey = null;
+        // BOTH, whichever this install happens to use. Clearing one and leaving
+        // the other is a logout the next start quietly undoes.
+        keychainForget();
         self.key_dir.deleteFile(io, self.key_path) catch {};
     }
 
     /// Loads a persisted secret at startup, if any.
     fn load(self: *State, gpa: std.mem.Allocator, io: std.Io) void {
+        if (keychainLoad()) |secret| {
+            var signer = nostr.keys.Signer.init();
+            defer signer.deinit();
+            if (signer.keyPairFromSecretKey(secret)) |kp| {
+                self.lock();
+                defer self.unlock();
+                self.secret = secret;
+                self.pubkey = kp.public_key;
+                return;
+            } else |_| {}
+        }
+
         // A plain read of the raw-hex key file: keystore.readKeyFile is for
         // ncryptsec content only, which this is deliberately not.
         const hex = self.key_dir.readFileAlloc(io, self.key_path, gpa, std.Io.Limit.limited(128)) catch return;
@@ -121,6 +199,24 @@ const State = struct {
         var signer = nostr.keys.Signer.init();
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return;
+        // Migrate: this install predates the Keychain. Moved rather than copied,
+        // because leaving the plain file behind would leave the weaker of the
+        // two deciding how exposed the key is.
+        //
+        // READ BACK AND COMPARED before the file goes, and that is not a
+        // formality. This is the only copy of somebody's identity on this Mac,
+        // and `keychainStore` returning 0 says the call succeeded, not that the
+        // bytes are retrievable. If the copy cannot be read back exactly, the
+        // file stays and nothing was migrated: a key still in a plain file is a
+        // weaker position, and a key in neither is not a position at all.
+        if (keychainStore(secret)) {
+            if (keychainLoad()) |back| {
+                if (std.mem.eql(u8, &back, &secret)) {
+                    self.key_dir.deleteFile(io, self.key_path) catch {};
+                }
+            }
+        }
+
         self.lock();
         defer self.unlock();
         self.secret = secret;
@@ -611,4 +707,33 @@ test "hex encoding is lowercase and full width" {
     var out: [64]u8 = undefined;
     const bytes = [_]u8{0xab} ** 32;
     try std.testing.expectEqualStrings("ab" ** 32, hexLower(&out, bytes));
+}
+
+test "the keychain round-trips a secret and forgetting it removes it" {
+    if (comptime !has_keychain) return error.SkipZigTest;
+    // A real Keychain call against this machine, under a test-only account so
+    // it can never touch the one a running Plaza uses.
+    const account = "signer-key-test";
+    defer _ = plaza_keychain_delete(keychain_service, account);
+
+    const secret = [_]u8{0x5a} ** 32;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_set(keychain_service, account, &secret, secret.len));
+
+    var out: [32]u8 = undefined;
+    var n: c_ulong = 0;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_get(keychain_service, account, &out, out.len, &n));
+    try std.testing.expectEqual(@as(c_ulong, 32), n);
+    try std.testing.expectEqualSlices(u8, &secret, &out);
+
+    // Storing again replaces rather than failing on a duplicate, which is what
+    // adopting a new key does.
+    const second = [_]u8{0x5b} ** 32;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_set(keychain_service, account, &second, second.len));
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_get(keychain_service, account, &out, out.len, &n));
+    try std.testing.expectEqualSlices(u8, &second, &out);
+
+    // And forgetting means gone, including a second forget of nothing.
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
+    try std.testing.expect(plaza_keychain_get(keychain_service, account, &out, out.len, &n) != 0);
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
 }
