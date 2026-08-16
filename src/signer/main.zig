@@ -439,9 +439,9 @@ fn runImport(init: std.process.Init) !void {
     std.debug.print("Imported {s}\nStart Plaza to use it.\n", .{npub});
 }
 
-/// Reads one secret line. On a terminal, echo is disabled so nothing is shown;
-/// when stdin is a pipe, it just reads the line. The returned slice points into
-/// `buf` (which the caller zeroes).
+/// Reads ONE secret line. On a terminal, echo is disabled so nothing is shown;
+/// when stdin is a pipe, it takes exactly one line and leaves the rest. The
+/// returned slice points into `buf` (which the caller zeroes).
 fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
     _ = io;
     const stdin_fd: std.posix.fd_t = 0;
@@ -458,9 +458,23 @@ fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
         std.posix.tcsetattr(stdin_fd, .NOW, base) catch {};
         std.debug.print("\n", .{});
     };
-    const n = std.posix.read(stdin_fd, buf) catch return null;
-    if (n == 0) return null;
-    return std.mem.trim(u8, buf[0..n], " \t\r\n");
+    // A byte at a time, because this is asked twice in a row for an ncryptsec
+    // and a plain read into a big buffer takes whatever the pipe has: the first
+    // call would swallow the key AND the passphrase, and the second would find
+    // nothing left. A terminal hides it (canonical mode hands over one line per
+    // read), so it only shows up when the input is piped, which is how a script
+    // would drive this.
+    var len: usize = 0;
+    while (len < buf.len) {
+        var one: [1]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &one) catch return null;
+        if (n == 0) break; // end of input: whatever was read is the line
+        if (one[0] == '\n') break;
+        buf[len] = one[0];
+        len += 1;
+    }
+    if (len == 0) return null;
+    return std.mem.trim(u8, buf[0..len], " \t\r");
 }
 
 /// POSTs an import to a running daemon over loopback. Returns null when nothing
