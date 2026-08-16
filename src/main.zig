@@ -2589,7 +2589,16 @@ const thread_loading_grace_s = 6;
 // How much of a note's text is stored. A long note is collapsed in the feed to
 // `note_collapse_chars` with a "Show more" that reveals the rest, up to this cap
 // (a kind:1 past it is truncated: long-form is kind:30023, not a note).
-const note_content_cap = 1024;
+//
+// This was 1024, which is under an ordinary long note: a release announcement
+// with a feature list runs 1500 to 2500 bytes, and "Show more" opened onto a
+// note that stopped mid-sentence anyway. The cap was invisible in the UI because
+// the text simply ended, so it read as a rendering bug rather than a limit.
+//
+// 4096 rather than more because `Note` carries its text inline and lives 100
+// deep in a thread. Anything past a few kilobytes is long-form (kind:30023),
+// which is a different surface, not a bigger note.
+const note_content_cap = 4096;
 const note_collapse_chars = 300;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
@@ -3467,16 +3476,79 @@ fn claimArrival(table: *ArrivalTable, id: [32]u8, live: []const Note) u32 {
 /// A thread level's reading order: the batch a reply arrived in, then when it was
 /// written. ONE comparator, called by the open thread and by every level under
 /// it, so a level reads the same both ways round.
+/// Orders a thread's replies: arrival first, then chronological within a batch,
+/// so a reply that showed up later sits after the ones already read even when it
+/// was written earlier.
+///
+/// Sorts an array of INDICES and permutes once, rather than sorting the notes
+/// themselves. Two reasons, and the second one is a hard constraint rather than
+/// a preference.
+///
+/// A `Note` is kilobytes, because it carries the note's text inline. Sorting
+/// them directly means the sort swaps whole notes around: ~100 log 100 moves of
+/// a multi-kilobyte struct to order a list whose keys are two integers. Indices
+/// are four bytes and the permutation touches each note once.
+///
+/// The constraint: `std.mem.sort` is a stable block sort, and its rotate step
+/// calls `std.mem.reverse`, which asks `std.simd.suggestVectorLength` for a
+/// vector width. That computes `ceilPowerOfTwo(u16, @bitSizeOf(T))`, so ANY
+/// element type over 4096 bytes overflows a u16 and fails to compile, inside
+/// the standard library, with no mention of the caller. That put a hard ceiling
+/// of 4096 bytes on `Note` and therefore on how much of a note Plaza could hold,
+/// which is not a limit anybody chose. Sorting `u32` keeps the stdlib on a small
+/// type and the ceiling disappears.
 pub fn sortThreadNotes(notes: []Note) void {
-    std.mem.sort(Note, notes, {}, struct {
-        fn lt(_: void, a: Note, b: Note) bool {
-            // Arrival first, then chronological within a batch: a reply that
-            // showed up later sits after the ones already read, even when it was
-            // written earlier.
-            if (a.arrival != b.arrival) return a.arrival < b.arrival;
-            return a.created_at < b.created_at;
+    if (notes.len < 2) return;
+    var order: [thread_reply_cap]u32 = undefined;
+    if (notes.len > order.len) return;
+    for (0..notes.len) |i| order[i] = @intCast(i);
+
+    const Ctx = struct {
+        notes: []const Note,
+        fn lt(self: @This(), a: u32, b: u32) bool {
+            const x = &self.notes[a];
+            const y = &self.notes[b];
+            if (x.arrival != y.arrival) return x.arrival < y.arrival;
+            return x.created_at < y.created_at;
         }
-    }.lt);
+    };
+    // The STABLE sort, so a batch that arrived together keeps the order it
+    // arrived in. A thread loaded in one go stamps every reply with the same
+    // arrival, and relays answer in whatever order they please, so without this
+    // the conversation could reshuffle between rebuilds under the reader.
+    //
+    // Stability comes from the algorithm and not from a tiebreak in the
+    // comparator. I wrote the tiebreak version first and could not make any
+    // probe fail: the unstable sort preserves equal elements anyway at these
+    // sizes, so the tiebreak was a second mechanism for a property already held,
+    // and one that no test could show was doing anything.
+    //
+    // Sorting `u32` rather than `Note` is what makes this legal at all: see the
+    // ceiling described above.
+    std.mem.sort(u32, order[0..notes.len], Ctx{ .notes = notes }, Ctx.lt);
+
+    // Permute in place by following each cycle, so this costs one move per note
+    // and needs no second array of notes.
+    var scratch: Note = undefined;
+    var done = [_]bool{false} ** thread_reply_cap;
+    for (0..notes.len) |start| {
+        if (done[start] or order[start] == start) {
+            done[start] = true;
+            continue;
+        }
+        scratch = notes[start];
+        var at = start;
+        while (true) {
+            const from = order[at];
+            done[at] = true;
+            if (from == start) {
+                notes[at] = scratch;
+                break;
+            }
+            notes[at] = notes[from];
+            at = from;
+        }
+    }
 }
 
 /// Sets relay `index`'s live connection state.
@@ -12674,6 +12746,11 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
 /// The same, recording where each mention's label landed into `mentions` when
 /// one is given. A note wants that table so the label can be pressed; a profile's
 /// "about" text is rendered the same way and has nowhere to put one.
+pub const note_content_cap_for_test = note_content_cap;
+pub fn noteContentCapForTest() usize {
+    return note_content_cap;
+}
+
 pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, mentions: ?*MentionList) usize {
     @setRuntimeSafety(true); // Copies a stranger's content into a fixed buffer, offset by offset.
     // Mention decoding needs an allocator for bech32 scratch; a stack buffer
