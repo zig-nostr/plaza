@@ -17992,3 +17992,115 @@ test "the indexers are asked, never joined, and never published as ours" {
     try testing.expect(main.indexerChunkForTest() <= 100);
     try testing.expect(main.indexerChunkForTest() > 0);
 }
+
+test "a long note is kept whole, not cut where the old buffer ended" {
+    // The reported bug: a release announcement of ~1900 bytes was stored into a
+    // 1024-byte buffer, so "Show more" expanded onto a note that stopped
+    // mid-sentence. Nothing in the UI said a limit had been hit, because the
+    // text just ended.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Built to the shape that broke: many short lines, well past the old cap.
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(arena);
+    var line: usize = 0;
+    while (body.items.len < 1900) : (line += 1) {
+        try body.print(arena, "line {d}: something worth reading to the end\n", .{line});
+    }
+    const written = try arena.dupe(u8, body.items);
+    try testing.expect(written.len > 1024); // the old cap
+    try testing.expect(written.len < main.noteContentCapForTest());
+
+    var out: [main.note_content_cap_for_test]u8 = undefined;
+    const n = main.renderContentInto(&out, written, &.{}, null);
+
+    // Whole, and byte-identical against the SOURCE TRIMMED, because the renderer
+    // strips leading and trailing whitespace on purpose. Trimming is the only
+    // difference allowed here: nothing else about this content is rewritten, so
+    // any other shortfall is a cut.
+    const want = std.mem.trim(u8, written, " \t\r\n");
+    try testing.expectEqual(want.len, n);
+    try testing.expectEqualStrings(want, out[0..n]);
+
+    // And the tail specifically, because a cut shows up at the END and a test
+    // that only checks a length can pass on a buffer of zeroes.
+    try testing.expect(std.mem.endsWith(u8, out[0..n], "to the end"));
+}
+
+test "thread replies order by arrival then time, and ties keep their order" {
+    // sortThreadNotes sorts an array of indices and permutes the notes by
+    // following cycles, because a Note is kilobytes and the standard library
+    // refuses to sort an element type that large at all. The permutation is the
+    // part worth pinning: a cycle walked wrong loses or duplicates a reply.
+    var notes: [6]main.Note = .{ .{}, .{}, .{}, .{}, .{}, .{} };
+
+    // Deliberately not already sorted, and with a tie in the middle: two notes
+    // sharing (arrival, created_at) must come out in the order they went in.
+    const seed = [_]struct { id: i64, arrival: u32, created_at: i64 }{
+        .{ .id = 10, .arrival = 2, .created_at = 500 },
+        .{ .id = 11, .arrival = 1, .created_at = 900 },
+        .{ .id = 12, .arrival = 1, .created_at = 100 },
+        .{ .id = 13, .arrival = 3, .created_at = 50 },
+        .{ .id = 14, .arrival = 1, .created_at = 900 }, // ties with id 11
+        .{ .id = 15, .arrival = 2, .created_at = 400 },
+    };
+    for (seed, 0..) |sd, i| {
+        notes[i].id = sd.id;
+        notes[i].arrival = sd.arrival;
+        notes[i].created_at = sd.created_at;
+    }
+
+    main.sortThreadNotes(&notes);
+
+    // arrival 1: 12 (t=100), then 11 and 14 (both t=900, input order kept).
+    // arrival 2: 15 (t=400), then 10 (t=500). arrival 3: 13.
+    const want = [_]i64{ 12, 11, 14, 15, 10, 13 };
+    for (want, 0..) |id, i| {
+        if (notes[i].id != id) {
+            std.debug.print("position {d}: want id {d}, got {d}\n", .{ i, id, notes[i].id });
+            return error.WrongOrder;
+        }
+    }
+
+    // Every note still present exactly once: a mishandled cycle drops one and
+    // duplicates another, which an order check alone can miss.
+    var seen: [6]bool = @splat(false);
+    for (notes) |n| {
+        const idx: usize = @intCast(n.id - 10);
+        if (seen[idx]) return error.DuplicatedNote;
+        seen[idx] = true;
+    }
+    for (seen) |ok| try testing.expect(ok);
+}
+
+test "a whole batch arriving at once keeps the order it arrived in" {
+    // A thread that loads in one go gives every reply the same arrival stamp,
+    // and relays answer in whatever order they please, so this is the case that
+    // decides whether a conversation can reshuffle under the reader between
+    // rebuilds.
+    //
+    // Honest about what this test is: it pins the behaviour, it does not catch a
+    // regression. Swapping the stable sort for the unstable one leaves it green,
+    // because the unstable sort happens to preserve equal elements at these
+    // sizes too. That is exactly why the comparator carries no tiebreak: a
+    // second mechanism no probe can falsify is one to delete, not to keep.
+    const n = 40;
+    var notes: [n]main.Note = @splat(.{});
+    for (0..n) |i| {
+        notes[i].id = @intCast(1000 + i);
+        notes[i].arrival = 7; // one batch
+        notes[i].created_at = 12345; // written the same second
+    }
+
+    main.sortThreadNotes(&notes);
+
+    for (0..n) |i| {
+        const want: i64 = @intCast(1000 + i);
+        if (notes[i].id != want) {
+            std.debug.print("tie at {d}: want id {d}, got {d}\n", .{ i, want, notes[i].id });
+            return error.TiesReordered;
+        }
+    }
+}
