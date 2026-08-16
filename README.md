@@ -64,6 +64,11 @@ there. A small relay is asked about its dozen writers rather than about everyone
 you follow. Anybody no chosen relay carries is asked of your own relays, so
 nobody falls through.
 
+Getting those lists is its own problem, because you cannot ask somebody's relays
+where their relays are. Plaza asks four well-known relays that one question, and
+only about the people it has no answer for. They are never joined, never
+published as yours, and never counted among your eight.
+
 The relays it picks are not the popular ones. Popularity answers "what should I
 consider adding", which is a question for you. Connections answer "which relays
 reach people I cannot otherwise see", and the popular relays all carry the same
