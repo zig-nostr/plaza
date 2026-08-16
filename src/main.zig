@@ -3158,8 +3158,14 @@ pub const engagement_row_height: f32 = verb_slot_height;
 /// redesign's own number, so the estimate cannot drift from the layout.
 pub const feed_row_chrome: f32 = row_pad_top + avatar_size + 5 + 10 + engagement_row_height + row_pad_bottom + 1;
 
-pub const max_avatar_images = 9;
-const max_media_images = 6;
+/// How many pictures the app can be showing at once.
+///
+/// A POLICY cap inside the shared pool, not a reserved share of it: a screen of
+/// two four-picture notes plus a three-picture one is what a Nostr feed
+/// actually looks like, and the old six was a reservation that made the fourth
+/// picture of the second note impossible however idle the rest of the registry
+/// was. The registry still decides how many of these hold pixels at once.
+const max_media_images = 12;
 
 /// A span of feed rows, inclusive at both ends. Named rather than anonymous so
 /// the visible span and the warmed span are the same type and one can be built
@@ -3173,6 +3179,15 @@ pub const RowRange = struct { first: usize, last: usize };
 /// is about a screen either way at the feed's row height, which is the distance
 /// a flick covers before the next tick can react.
 const feed_prefetch_rows: usize = 16;
+/// SUPERSEDED, kept for the argument it lost.
+///
+/// The banner had a reserved id, on the reasoning that one non-scrolling
+/// consumer does not exercise an allocator. That was true, and it stopped being
+/// the point: pictures did cross the pools, so the allocator exists now, and a
+/// reserved id would be the one slot it could not reach.
+///
+/// The old note:
+///
 /// The profile banner's own id, taken out of the avatar pool rather than
 /// borrowed from either LRU.
 ///
@@ -3190,16 +3205,11 @@ const feed_prefetch_rows: usize = 16;
 /// visible window, and a window this size holds a handful of rows, so the tenth id
 /// only ever lengthened the LRU tail. A reclaimed avatar returns from the disk
 /// cache, not the network.
-const banner_image_id: u64 = max_avatar_images + 1;
-comptime {
-    // The split may never promise more ids than the registry owns: overshooting
-    // shows up as a silent `error.ImageRegistryFull` at the 17th registration,
-    // which reads as "this author has no avatar" rather than as a budget bug.
-    if (max_avatar_images + 1 + max_media_images > image_registry_slots) {
-        @compileError("the image budget oversubscribes the canvas registry");
-    }
-}
-const media_image_id_base: u64 = banner_image_id + 1;
+/// Which registry id the banner is holding, or 0 for none. A variable now,
+/// because the banner takes its slot from the same pool as everything else.
+var g_banner_image_id: u64 = 0;
+/// The tick the banner was last on screen.
+var g_banner_seen: u64 = 0;
 /// What a banner is asked for and bounded to.
 ///
 /// 512 and not a pixel more: `decodeAndRegister` scales the LONG edge to this,
@@ -3216,9 +3226,21 @@ const banner_target_px: u32 = 512;
 // blows it. 480x480 leaves honest headroom under the cap.
 const avatar_target_px: u32 = 128;
 const media_target_px: u32 = 480;
-// The largest body we accept from a fetch. The effect caps at 256 KiB anyway;
+// The largest body we accept from ONE fetch. The effect caps at 256 KiB anyway;
 // stopping a little short keeps the decode budget for images that will fit.
 const max_image_bytes = 240 * 1024;
+// The largest picture we will assemble out of several of those.
+//
+// A response body is capped at `max_image_bytes`, and an ordinary phone photo
+// is several times that: every picture in a Nostr feed shot on a phone is
+// 300 KB to 2 MB, so "one body" was never a size a photo fits in. A picture
+// over it is asked for in slices (HTTP Range) and reassembled here.
+//
+// The ceiling is a real refusal, not a formality: bytes arriving from a
+// stranger's host are held whole in memory before they decode, so something
+// has to say when to stop. Four MiB covers a full-frame camera JPEG and
+// refuses a file that is not a feed picture at all.
+const max_image_download_bytes = 4 * 1024 * 1024;
 // The registry's own ceiling on one decoded image.
 const max_registered_image_bytes = 1024 * 1024;
 // Animated GIFs decode every frame up front, so they are bounded twice over: by
@@ -6486,7 +6508,14 @@ var g_profiles = [_]Profile{.{}} ** profile_cap;
 
 // The avatar-id LRU clock (see `assignAvatarSlots`): bumped once per avatar
 // pass; a profile's `avatar_clock` records the last pass it was on screen.
-var g_avatar_clock: u64 = 0;
+/// The tick that the avatar pass, the picture pass and the banner all mark
+/// against.
+///
+/// ONE clock, because the slots are one pool: an avatar marked at tick N and a
+/// picture marked at tick N+1 are not comparable, and eviction is nothing but
+/// that comparison. Two clocks would have made whichever pass ticked second
+/// look permanently newer, so the other kind would always be the one evicted.
+var g_image_clock: u64 = 0;
 
 // Bumped whenever a profile gains or changes a display name. Mention labels are
 // baked into note text at parse time, so the feed re-parses (rather than
@@ -6499,7 +6528,7 @@ pub fn resetProfilesForTest() void {
     @memset(&g_profile_index, 0);
     g_names_generation = 0;
     g_notes_names_generation = 0;
-    g_avatar_clock = 0;
+    g_image_clock = 0;
 }
 
 /// Drops a cached avatar. `parseMetadataInto` only ever REPLACES a picture URL,
@@ -6545,6 +6574,7 @@ pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
 /// Runs one avatar-id assignment pass, for tests.
 pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
     wantProfilesAhead(model);
+    beginImagePass();
     assignAvatarSlots(fx, model);
 }
 
@@ -8112,7 +8142,7 @@ pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     var victim: ?*Profile = null;
     for (&g_profiles) |*p| {
         if (p.avatar_state == .fetching or p.nip05_state == .fetching) continue;
-        if (p.avatar_clock == g_avatar_clock) continue;
+        if (p.avatar_clock == g_image_clock) continue;
         if (victim == null or p.avatar_clock < victim.?.avatar_clock) victim = p;
     }
     const v = victim orelse return null;
@@ -10158,7 +10188,7 @@ fn refreshProfiles(store: *nostr.store.Store) void {
 /// Marks `pubkey`'s profile as on screen this pass (creating the slot if new),
 /// so the id LRU keeps its avatar and evicts someone off screen instead.
 fn markAvatarWanted(pubkey: [32]u8) void {
-    if (upsertProfile(pubkey)) |p| p.avatar_clock = g_avatar_clock;
+    if (upsertProfile(pubkey)) |p| p.avatar_clock = g_image_clock;
 }
 
 /// Lends the `max_avatar_images` registry ids to the authors on screen right
@@ -10208,8 +10238,18 @@ fn wantProfilesAhead(model: *const Model) void {
     while (i <= w.last and i < model.notes_len) : (i += 1) wantProfile(model.notes[i].pubkey);
 }
 
+/// Opens one pass of the image passes: everything they mark as on screen is
+/// marked against this tick.
+///
+/// Its own step, called by the tick rather than hidden inside whichever pass
+/// happens to run first. Burying it in the avatar pass would have made the
+/// picture pass silently depend on running second, and a later reordering would
+/// have shown up as pictures thrashing rather than as anything named.
+fn beginImagePass() void {
+    g_image_clock += 1;
+}
+
 fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
-    g_avatar_clock += 1;
 
     // Collect the on-screen authors in READING ORDER (the active user, then the
     // thread's root and replies top-down, or the feed's visible window). Order
@@ -10270,35 +10310,126 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
     }
 }
 
-/// Assigns `p` a free registry id, or the id of the author least-recently on
-/// screen (never one mid-fetch, never one on screen this pass, so a just-lent id
-/// is safe). A no-op when every id is held by an on-screen author (that author
-/// keeps initials this frame). A reclaimed id's old image is unregistered and its
-/// former owner reset to reload from cache when it returns.
-fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
-    var held = [_]bool{false} ** (max_avatar_images + 1);
-    for (&g_profiles) |*q| {
-        if (q.used and q.image_id >= 1 and q.image_id <= max_avatar_images) held[@intCast(q.image_id)] = true;
+// ------------------------------------------------- the whole-app image pool
+//
+// ONE allocator over all `image_registry_slots`, serving avatars, pictures and
+// the profile banner alike. The block at the top of this file argues for it;
+// this is it. Consumers differ only in what they downscale to, never in a
+// reserved share, because a reserved share is capacity that sits idle on the
+// screen that needs it: a profile page wants a banner and many faces and no
+// feed pictures at all, and a feed of four-picture notes wants the opposite.
+
+/// Who is holding each id. Derived from the consumers on every pass rather than
+/// stored beside them: they already record which id they hold, and a second
+/// table saying the same thing is a second thing that can be wrong.
+const IdOwner = union(enum) {
+    free,
+    avatar: *Profile,
+    banner,
+    media: *MediaSlot,
+};
+
+/// One pass over the consumers, rather than a scan per id: the profile cache is
+/// thousands of entries and this runs whenever a face or a picture appears.
+fn imageIdOwners() [image_registry_slots + 1]IdOwner {
+    var owners = [_]IdOwner{.free} ** (image_registry_slots + 1);
+    if (g_banner_image_id >= 1 and g_banner_image_id <= image_registry_slots) {
+        owners[@intCast(g_banner_image_id)] = .banner;
     }
-    var id: usize = 1;
-    while (id <= max_avatar_images) : (id += 1) {
-        if (!held[id]) {
-            p.image_id = @intCast(id);
-            return;
+    for (&g_profiles) |*p| {
+        if (p.used and p.image_id >= 1 and p.image_id <= image_registry_slots) {
+            owners[@intCast(p.image_id)] = .{ .avatar = p };
         }
     }
-    var victim: ?*Profile = null;
-    for (&g_profiles) |*q| {
-        if (!q.used or q.image_id == 0) continue;
-        if (q.avatar_clock == g_avatar_clock or q.avatar_state == .fetching) continue;
-        if (victim == null or q.avatar_clock < victim.?.avatar_clock) victim = q;
+    for (&g_media) |*m| {
+        if (m.used and m.image_id >= 1 and m.image_id <= image_registry_slots) {
+            owners[@intCast(m.image_id)] = .{ .media = m };
+        }
     }
-    const v = victim orelse return;
-    const reclaimed = v.image_id;
-    _ = fx.unregisterImage(reclaimed);
-    v.image_id = 0;
-    v.avatar_state = .idle;
-    p.image_id = reclaimed;
+    return owners;
+}
+
+/// When a held id was last on screen, or null if it may not be taken at all.
+///
+/// Two things make an id untouchable, and they are the same two for every kind
+/// of consumer: it is on screen THIS pass (taking it would evict something the
+/// reader is looking at, and with the marking done first, that means a sibling
+/// that has not been served yet), or a fetch is in flight for it (taking it
+/// would hand the arriving bytes to whoever holds the id next).
+fn imageIdSeen(owner: IdOwner) ?u64 {
+    return switch (owner) {
+        .free => null,
+        .avatar => |p| if (p.avatar_clock == g_image_clock or p.avatar_state == .fetching) null else p.avatar_clock,
+        .media => |m| if (m.last_used == g_image_clock or m.state == .fetching) null else m.last_used,
+        .banner => if (g_banner_seen == g_image_clock) null else g_banner_seen,
+    };
+}
+
+/// Takes an id back from whoever holds it: the registered pixels go, and the
+/// former owner is reset so it reloads (from the disk cache, usually) if the
+/// reader comes back to it.
+fn releaseImageId(fx: *Effects, owner: IdOwner, id: u64) void {
+    _ = fx.unregisterImage(id);
+    switch (owner) {
+        .free => {},
+        .avatar => |p| {
+            p.image_id = 0;
+            p.avatar_state = .idle;
+        },
+        .media => |m| {
+            m.releaseFrames();
+            m.image_id = 0;
+            m.state = .idle;
+        },
+        .banner => {
+            g_banner_image_id = 0;
+            g_banner_state = .idle;
+        },
+    }
+}
+
+const IdPick = struct { id: u64, owner: IdOwner };
+
+/// WHICH id the next image should get: a free one, or the one whose holder has
+/// been off screen longest. Null when every id is held by something on screen
+/// or mid-fetch, which is the honest answer: the caller shows initials, or a
+/// blurhash, for this frame and asks again next pass.
+///
+/// Separate from taking it because this is the whole rule, and taking it needs
+/// the effects channel to drop the old pixels. The decision is what a test can
+/// ask about.
+fn chooseImageId(owners: *const [image_registry_slots + 1]IdOwner) ?IdPick {
+    var id: u64 = 1;
+    while (id <= image_registry_slots) : (id += 1) {
+        if (owners[@intCast(id)] == .free) return .{ .id = id, .owner = .free };
+    }
+
+    var pick: ?IdPick = null;
+    var oldest: u64 = std.math.maxInt(u64);
+    id = 1;
+    while (id <= image_registry_slots) : (id += 1) {
+        const owner = owners[@intCast(id)];
+        const seen = imageIdSeen(owner) orelse continue;
+        if (seen < oldest) {
+            oldest = seen;
+            pick = .{ .id = id, .owner = owner };
+        }
+    }
+    return pick;
+}
+
+/// Takes the id `chooseImageId` picked, dropping whatever was in it.
+fn acquireImageId(fx: *Effects) ?u64 {
+    const owners = imageIdOwners();
+    const pick = chooseImageId(&owners) orelse return null;
+    if (pick.owner != .free) releaseImageId(fx, pick.owner, pick.id);
+    return pick.id;
+}
+
+/// Assigns `p` an id from the shared pool. A no-op when everything is spoken
+/// for, and that author keeps initials this frame.
+fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
+    p.image_id = acquireImageId(fx) orelse return;
 }
 
 /// Pulls the bytes for rows NEAR the viewport into the disk cache, without
@@ -10477,6 +10608,12 @@ fn handleMediaWarmed(response: native_sdk.EffectResponse) void {
     const slot = response.key - media_warm_key_base;
     if (slot >= g_warm_ring.len) return;
     if (response.outcome != .ok or response.status != 200 or response.truncated) return;
+    // Warming stays one request, so a picture bigger than one body is not warmed
+    // at all: it is fetched in slices when its row reaches the screen, and
+    // cached then. The cost is that a big picture arrives a moment late the
+    // first time and instantly ever after, which is worth more than holding a
+    // prefetch slot open across several round trips for a row nobody has
+    // reached yet.
     if (response.body.len == 0 or response.body.len > max_image_bytes) return;
     // The ring is what remembers the address: a response carries a key and a
     // body, and the cache is keyed by the URL. A slot reused by a later warm
@@ -10718,7 +10855,7 @@ fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?Decode
     var name_buf: [64]u8 = undefined;
     const name = cacheName(&name_buf, url);
     const gpa = std.heap.page_allocator;
-    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return null;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_download_bytes)) catch return null;
     defer gpa.free(bytes);
     return decodeAndRegister(fx, id, bytes, max_dim);
 }
@@ -10909,6 +11046,15 @@ const MediaSlot = struct {
     /// then source, then give up. Reset with the rest of the slot when it is
     /// handed to a different note.
     direct: bool = false,
+    /// A picture too big for one response body, assembled out of Range slices.
+    ///
+    /// Allocated only when a first slice comes back full, which is the signal
+    /// that there is more to ask for; a picture that fits in one body decodes
+    /// straight from the response and never touches this. Freed when the
+    /// picture decodes, when the slot is handed to another note, or when the
+    /// fetch gives up.
+    partial: ?[]u8 = null,
+    partial_len: usize = 0,
     /// Every frame of an animated GIF, decoded once and owned by stb (freed on
     /// eviction). Null for a still picture.
     frames: ?[*]u8 = null,
@@ -10931,10 +11077,17 @@ const MediaSlot = struct {
         self.frame_count = 0;
         self.frame_index = 0;
     }
+    /// Drops a half-assembled picture. Called wherever a fetch ends, however it
+    /// ends, and before a slot is handed to another note: a slice buffer that
+    /// outlives its fetch is bytes nobody will ever decode.
+    fn releasePartial(self: *MediaSlot) void {
+        if (self.partial) |buf| std.heap.page_allocator.free(buf);
+        self.partial = null;
+        self.partial_len = 0;
+    }
 };
 
 var g_media = [_]MediaSlot{.{}} ** max_media_images;
-var g_media_clock: u64 = 0;
 
 // The rows the windowed list last put on screen. Written by the view (which is
 // where the runtime resolves the window) and read by the fetch pass in
@@ -10981,7 +11134,7 @@ fn recalledAspect(note_id: i64) ?f32 {
 /// has to ask about.
 pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
     const m = mediaSlotFor(note_id) orelse return null;
-    return m.last_used == g_media_clock;
+    return m.last_used == g_image_clock;
 }
 
 pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
@@ -11012,8 +11165,19 @@ pub fn maxMediaImagesForTest() usize {
 }
 
 pub fn resetMediaForTest() void {
+    for (&g_media) |*m| m.releasePartial();
     g_media = [_]MediaSlot{.{}} ** max_media_images;
-    g_media_clock = 0;
+    g_image_clock = 0;
+}
+
+/// How many slots are holding a half-assembled picture. Zero at rest: a slice
+/// buffer belongs to one fetch and dies with it.
+pub fn mediaPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_media) |*m| {
+        if (m.partial != null) n += 1;
+    }
+    return n;
 }
 
 /// The slot holding `note_id`'s image, if any.
@@ -11073,6 +11237,31 @@ pub fn mediaIdleForTest(note_id: i64) bool {
 
 /// Delivers one picture-fetch response for `note_id` the way the runtime would,
 /// so a test can drive the failure paths rather than the classifier alone.
+pub fn maxImageBytesForTest() usize {
+    return max_image_bytes;
+}
+
+pub fn maxImageDownloadBytesForTest() usize {
+    return max_image_download_bytes;
+}
+
+pub fn rangeHeaderForTest(buf: []u8, offset: usize) ?[]const u8 {
+    return rangeHeader(buf, offset);
+}
+
+/// Feeds one delivered slice to a note's slot, exactly as a 206 response does.
+pub fn appendMediaSliceForTest(note_id: i64, body: []const u8) ?SliceOutcome {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return appendMediaSlice(m, body);
+}
+
+/// What a note's slot has assembled so far, or null if it is holding nothing.
+pub fn mediaPartialForTest(note_id: i64) ?[]const u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    const buf = m.partial orelse return null;
+    return buf[0..m.partial_len];
+}
+
 pub fn deliverMediaResponseForTest(
     fx: *Effects,
     note_id: i64,
@@ -11082,7 +11271,7 @@ pub fn deliverMediaResponseForTest(
 ) void {
     const m = mediaSlotFor(note_id) orelse return;
     handleMediaFetched(fx, .{
-        .key = media_fetch_key_base + (m.image_id - media_image_id_base),
+        .key = media_fetch_key_base + mediaSlotIndex(m),
         .outcome = outcome,
         .status = status,
         .body = body,
@@ -11094,29 +11283,72 @@ pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
 }
 
 pub fn touchMediaClockForTest() u64 {
-    g_media_clock += 1;
-    return g_media_clock;
+    beginImagePass();
+    return g_image_clock;
+}
+
+pub fn acquireImageIdForTest(fx: *Effects) ?u64 {
+    return acquireImageId(fx);
+}
+
+/// The id the pool would hand out next, without taking it. Lets a test ask what
+/// the rule decides without an effects channel to drop pixels through.
+pub fn chooseImageIdForTest() ?u64 {
+    const owners = imageIdOwners();
+    const pick = chooseImageId(&owners) orelse return null;
+    return pick.id;
+}
+
+pub fn imageClockForTest() u64 {
+    return g_image_clock;
+}
+
+pub fn markAvatarWantedForTest(pubkey: [32]u8) void {
+    markAvatarWanted(pubkey);
+}
+
+pub fn beginImagePassForTest() void {
+    beginImagePass();
+}
+
+/// The slot's position in `g_media`, which is its identity for everything
+/// outside the registry: its fetch key is derived from it, so an arriving
+/// response finds the slot that asked even after the registry id it holds has
+/// been lent to somebody else.
+fn mediaSlotIndex(m: *const MediaSlot) usize {
+    return (@intFromPtr(m) - @intFromPtr(&g_media[0])) / @sizeOf(MediaSlot);
 }
 
 fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     if (mediaSlotFor(note_id)) |m| return m;
-    for (&g_media, 0..) |*m, i| {
+    for (&g_media) |*m| {
         if (!m.used) {
-            m.* = .{ .used = true, .note_id = note_id, .image_id = media_image_id_base + i };
+            // A slot with no registry id yet. It gets one when there is a
+            // picture to put in it, from the same pool as everything else.
+            m.* = .{ .used = true, .note_id = note_id };
             return m;
         }
     }
     var victim: ?*MediaSlot = null;
     for (&g_media) |*m| {
         if (m.state == .fetching) continue;
-        if (m.last_used == g_media_clock) continue; // still wanted on screen
+        if (m.last_used == g_image_clock) continue; // still wanted on screen
         if (victim == null or m.last_used < victim.?.last_used) victim = m;
     }
     const v = victim orelse return null;
     const id = v.image_id;
-    // Free the registry slot and any decoded frames before reusing the id.
-    _ = fx.unregisterImage(id);
+    // Free the registry slot and any decoded frames before reusing the slot.
+    if (id != 0) _ = fx.unregisterImage(id);
     v.releaseFrames();
+    // Not a second cleanup: every way a fetch can end already drops its slices,
+    // and a slot still assembling one is `.fetching`, which is never a victim.
+    // This says so out loud, so a terminal path that forgets fails here in a
+    // test rather than quietly handing the next note half of somebody else's
+    // picture.
+    std.debug.assert(v.partial == null);
+    // The id it was holding comes with it: the picture that was in it has just
+    // been unregistered, so the slot is empty and nobody else can be lent it
+    // between here and the next registration.
     v.* = .{ .used = true, .note_id = note_id, .image_id = id };
     return v;
 }
@@ -11181,7 +11413,7 @@ fn loadCachedMedia(fx: *Effects, slot: *MediaSlot, gif: bool) bool {
     var name_buf: [64]u8 = undefined;
     const name = cacheName(&name_buf, slot.url());
     const gpa = std.heap.page_allocator;
-    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return false;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_download_bytes)) catch return false;
     defer gpa.free(bytes);
 
     if (gif and loadAnimatedGif(fx, slot, bytes)) return true;
@@ -11237,7 +11469,10 @@ fn advanceAnimations(fx: *Effects, model: *const Model) void {
 fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     const per_tick = 6;
     var fired: usize = 0;
-    g_media_clock += 1;
+    // No tick of its own: `beginImagePass` advances the one clock every image
+    // pass marks against. A second bump here would put every picture a tick
+    // ahead of every face, so the allocator would read faces as permanently
+    // older and evict them first, forever.
 
     if (model.viewing_profile != null or model.viewing_thread != 0) {
         // A level occludes the feed, so the picture budget goes to the level,
@@ -11283,7 +11518,7 @@ fn markMediaWanted(note_id: i64) void {
     // pass evict one to feed another in the same row.
     var i: usize = 0;
     while (i < max_note_images) : (i += 1) {
-        if (mediaSlotFor(mediaKey(note_id, i))) |m| m.last_used = g_media_clock;
+        if (mediaSlotFor(mediaKey(note_id, i))) |m| m.last_used = g_image_clock;
     }
 }
 
@@ -11306,8 +11541,18 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     // that reading a feed should not tell every host in it that you did.
     if (!g_media_previews and !isMediaAsked(note.id)) return;
     const slot = claimMediaSlot(fx, mediaKey(note.id, index)) orelse return;
-    slot.last_used = g_media_clock;
+    slot.last_used = g_image_clock;
     if (slot.state != .idle) return;
+    // A slot is a place to put a picture; an id is the registry capacity to
+    // hold one, and there are fewer of those. Take one now, marked on screen
+    // first so this cannot evict a sibling picture in the same note. Nothing
+    // free means the reader sees this cell as a blurhash for a frame and the
+    // next pass tries again, which is what the shared pool is for: the id it
+    // needs is whichever face or picture has been off screen longest, not one
+    // reserved for pictures and idle.
+    if (slot.image_id == 0) {
+        slot.image_id = acquireImageId(fx) orelse return;
+    }
 
     var url_buf: [1024]u8 = undefined;
     const gif = isGifUrl(link);
@@ -11321,12 +11566,78 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     if (loadCachedMedia(fx, slot, gif)) return;
     if (fired.* >= per_tick) return;
     slot.state = .fetching;
+    slot.releasePartial();
+    fetchMediaSlice(fx, slot, 0);
+    fired.* += 1;
+}
+
+/// Asks `slot`'s host for the `max_image_bytes` of the picture that start at
+/// `offset`.
+///
+/// Every request is a Range request, including the first, so one code path
+/// covers a thumbnail and a full-frame photo alike: a picture smaller than one
+/// slice comes back whole on the first answer and costs no extra round trip.
+/// A host that does not do ranges answers 200 with the whole body instead of
+/// 206 with a slice, which is a difference the caller can see, so ignoring the
+/// header can never be mistaken for a complete picture.
+fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
+    var range_buf: [64]u8 = undefined;
+    const range = rangeHeader(&range_buf, offset) orelse return;
     fx.fetch(.{
-        .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
+        .key = media_fetch_key_base + mediaSlotIndex(slot),
         .url = slot.url(),
+        // `identity` is not politeness, it is what makes the arithmetic true.
+        // The HTTP client asks for gzip by default, and a range together with a
+        // content encoding means the slice boundaries are in ENCODED bytes
+        // while what arrives is decoded ones: "a short slice is the last slice"
+        // would then be measuring the wrong thing, and the picture would
+        // assemble out of the wrong pieces and still decode. Pictures are
+        // already compressed, so asking for none costs nothing.
+        .headers = &.{
+            .{ .name = "range", .value = range },
+            .{ .name = "accept-encoding", .value = "identity" },
+        },
         .on_response = Effects.responseMsg(.media_fetched),
     });
-    fired.* += 1;
+}
+
+/// The value of a `Range` header asking for the slice that starts at `offset`.
+///
+/// Inclusive at both ends, which is what the header means: the window is
+/// `max_image_bytes` wide, so the last byte asked for is one before the next
+/// offset. An off-by-one here would either drop a byte between slices (a
+/// corrupt picture that still decodes, which is the worst outcome) or overlap
+/// them (a picture longer than the file).
+fn rangeHeader(buf: []u8, offset: usize) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ offset, offset + max_image_bytes - 1 }) catch null;
+}
+
+/// Appends one delivered slice to `slot`, and reports whether the picture is
+/// whole.
+///
+/// A slice that came back SHORT is the last one: the host had nothing more to
+/// give from that offset. A full slice means there is probably more, so the
+/// caller asks again from the new end. `null` means the picture cannot be
+/// assembled (out of memory, or past the ceiling) and the fetch is over.
+pub const SliceOutcome = enum { complete, want_more };
+fn appendMediaSlice(slot: *MediaSlot, body: []const u8) ?SliceOutcome {
+    if (slot.partial == null) {
+        // The first slice arrives before there is anywhere to put it, and the
+        // first slice is the only one that can be the whole picture: a short
+        // one decodes straight from the response body with nothing allocated.
+        if (body.len < max_image_bytes) return .complete;
+        slot.partial = std.heap.page_allocator.alloc(u8, max_image_download_bytes) catch return null;
+    }
+    const buf = slot.partial.?;
+    const filled = slot.partial_len + body.len;
+    // The buffer IS the ceiling, and there is deliberately no second check
+    // saying the same thing: a host that answers a full slice every time has to
+    // run out of room, and one bound that the append cannot cross is easier to
+    // trust than two that can drift apart.
+    if (filled > buf.len) return null;
+    @memcpy(buf[slot.partial_len..filled], body);
+    slot.partial_len = filled;
+    return if (body.len < max_image_bytes) .complete else .want_more;
 }
 
 /// What a fetch that produced no usable image says about trying again.
@@ -11395,10 +11706,35 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (!slot.used) return;
 
     if (response.outcome == .rejected) {
+        slot.releasePartial();
         slot.state = .idle;
         return;
     }
+    // A 206 is a slice of a picture that does not fit in one body. Take it, and
+    // ask for the next unless the host just told us there is no next.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = appendMediaSlice(slot, response.body) orelse {
+            // Too big to assemble, or no memory to assemble it in. Both are
+            // facts about this picture rather than about the network, so this
+            // is finished rather than retried.
+            slot.releasePartial();
+            slot.state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchMediaSlice(fx, slot, slot.partial_len);
+            return;
+        }
+        // Whole. The bytes are in the slice buffer unless this was a single
+        // short first slice, which never allocated one.
+        const whole = if (slot.partial) |buf| buf[0..slot.partial_len] else response.body;
+        finishMedia(fx, slot, whole);
+        slot.releasePartial();
+        return;
+    }
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
+        // Whatever was assembled so far is bytes nobody will decode now.
+        slot.releasePartial();
         // A host that said NO is different from a host that did not answer, and
         // a picture that is simply too big is different again: it will be the
         // same size next time, so asking again is a download with a known
@@ -11436,22 +11772,28 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         };
         return;
     }
+    slot.releasePartial();
+    finishMedia(fx, slot, response.body);
+}
+
+/// Decodes a complete picture into `slot` and remembers it.
+fn finishMedia(fx: *Effects, slot: *MediaSlot, bytes: []const u8) void {
     // Whatever it took to get here, this URL answers, so the count of tries
     // worth making starts again.
     slot.attempts = 0;
     // An animated GIF keeps all its frames; anything else (including a GIF with
     // only one frame) takes the still path.
-    if (loadAnimatedGif(fx, slot, response.body)) {
-        storeCachedImage(slot.url(), response.body);
+    if (loadAnimatedGif(fx, slot, bytes)) {
+        storeCachedImage(slot.url(), bytes);
         return;
     }
-    if (decodeAndRegister(fx, slot.image_id, response.body, media_target_px)) |size| {
+    if (decodeAndRegister(fx, slot.image_id, bytes, media_target_px)) |size| {
         slot.state = .loaded;
         slot.width = size.width;
         slot.height = size.height;
         rememberAspect(slot.note_id, size.width, size.height);
         // Keep it for next launch: the feed should come back with its pictures.
-        storeCachedImage(slot.url(), response.body);
+        storeCachedImage(slot.url(), bytes);
     } else {
         slot.state = .failed;
     }
@@ -18138,7 +18480,7 @@ fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
 /// the strip rather than letterboxing inside it.
 fn bannerImage(ui: *AppUi) AppUi.Node {
     var node = ui.image(.{
-        .image = banner_image_id,
+        .image = g_banner_image_id,
         .height = profile_banner_height,
         .grow = 1,
         .semantics = .{ .label = "Profile banner" },
@@ -18170,11 +18512,20 @@ fn bannerReady(pubkey: [32]u8) bool {
 /// Asks for the open profile's banner, once per person.
 fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     const pubkey = model.viewing_profile orelse {
-        // Left the screen: the next person starts clean.
+        // Left the screen: the next person starts clean, and the slot goes back
+        // to the pool rather than sitting on a picture nobody can see. The feed
+        // underneath is exactly what wants it.
+        if (g_banner_image_id != 0) {
+            _ = fx.unregisterImage(g_banner_image_id);
+            g_banner_image_id = 0;
+        }
         g_banner_for = null;
         g_banner_state = .idle;
         return;
     };
+    // On screen this pass, so the allocator will not take it out from under the
+    // reader while they are looking at it.
+    g_banner_seen = g_image_clock;
     if (!g_media_previews) return;
     const changed = if (g_banner_for) |who| !std.mem.eql(u8, &who, &pubkey) else true;
     if (changed) {
@@ -18192,7 +18543,13 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     @memcpy(g_banner_url_buf[0..n], url[0..n]);
     g_banner_url_len = @intCast(n);
 
-    if (loadCachedImage(fx, banner_image_id, bannerUrl(), banner_target_px)) |_| {
+    // A slot from the shared pool, the same one faces and pictures come from.
+    // The banner marks itself on screen every pass a profile is open, so the
+    // allocator will not take it back underneath the reader.
+    if (g_banner_image_id == 0) {
+        g_banner_image_id = acquireImageId(fx) orelse return;
+    }
+    if (loadCachedImage(fx, g_banner_image_id, bannerUrl(), banner_target_px)) |_| {
         g_banner_state = .loaded;
         return;
     }
@@ -18235,7 +18592,7 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         g_banner_state = .failed;
         return;
     }
-    if (decodeAndRegister(fx, banner_image_id, response.body, banner_target_px)) |_| {
+    if (decodeAndRegister(fx, g_banner_image_id, response.body, banner_target_px)) |_| {
         g_banner_state = .loaded;
         storeCachedImage(bannerUrl(), response.body);
     } else {
@@ -22200,6 +22557,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // than a tick later. Only what is on disk resolves now; the rest is fetched
     // from the first tick onward.
     wantProfilesAhead(model);
+    beginImagePass();
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
@@ -22339,6 +22697,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
                 wantProfilesAhead(model);
+                beginImagePass();
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanBannerFetch(fx, model);

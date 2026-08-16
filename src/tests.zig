@@ -1084,14 +1084,15 @@ test "a slot wanted on screen is never evicted for another visible picture" {
     // what the touch pass does for pictures on screen.
     const clock = main.touchMediaClockForTest();
     var fx: main.EffectsForTest = undefined;
+    const cap = main.maxMediaImagesForTest();
     var i: i64 = 1;
-    while (i <= 6) : (i += 1) {
+    while (i <= @as(i64, @intCast(cap))) : (i += 1) {
         const slot = main.claimMediaSlotForTest(&fx, i) orelse return error.NoSlot;
         slot.last_used = clock;
     }
-    // A seventh visible picture must get NOTHING rather than steal a wanted
+    // One more visible picture must get NOTHING rather than steal a wanted
     // slot: stealing is the thrash that decoded images every pass.
-    try testing.expect(main.claimMediaSlotForTest(&fx, 7) == null);
+    try testing.expect(main.claimMediaSlotForTest(&fx, @intCast(cap + 1)) == null);
 }
 
 test "avatar ids go to the authors on screen, and never exceed the registry cap" {
@@ -1135,7 +1136,7 @@ test "avatar ids go to the authors on screen, and never exceed the registry cap"
     var fx: main.EffectsForTest = undefined;
     main.assignAvatarSlotsForTest(&fx, &model);
 
-    const cap = main.max_avatar_images;
+    const cap = main.image_registry_slots;
     var seen = [_]bool{false} ** (cap + 1);
     var lent: usize = 0;
     for (keys) |k| {
@@ -1209,7 +1210,7 @@ test "an author deep in a thread gets a face once they are on screen" {
         std.debug.print("an author on screen still holds no face (was {d})\n", .{before});
         return error.DeepAuthorStarved;
     }
-    try testing.expect(after >= 1 and after <= main.max_avatar_images);
+    try testing.expect(after >= 1 and after <= main.image_registry_slots);
 }
 
 test "the logout confirmation replaces the log-out button" {
@@ -11853,6 +11854,7 @@ test "picture slots follow the reader down a long thread" {
     // Now the reader is at the BOTTOM. The pass runs over what is on screen.
     const bottom = [_]i64{ 925, 926, 927 };
     main.recordVisibleNotesForTest(&bottom);
+    main.beginImagePassForTest();
     main.scanMediaFetchesForTest(&fx, &model);
 
     // The pictures that scrolled away are no longer claimed as wanted, which is
@@ -17633,4 +17635,208 @@ test "the prompt offers a duration, not just yes and no" {
     // And it appears over the FEED, not only in Settings: the reader is not in
     // Settings when another app asks.
     try testing.expect(findAnyTextContaining(tree.root, "wants to post a note as you"));
+}
+
+test "a picture bigger than one response body is assembled from its slices" {
+    // The bug this exists for: every photo in a Nostr feed is 300 KB to 2 MB,
+    // and one response body carries at most 240 KiB, so before this the whole
+    // class of pictures simply never appeared.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_001;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const slice = main.maxImageBytesForTest();
+    const first = try arena.alloc(u8, slice);
+    @memset(first, 0xAA);
+    const second = try arena.alloc(u8, slice);
+    @memset(second, 0xBB);
+    const last = try arena.alloc(u8, 131_761); // short: the host had no more
+    @memset(last, 0xCC);
+
+    // A full slice always means "ask again": the host gave exactly what was
+    // asked for, so there is no way to tell from the length alone that the
+    // picture ended there.
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendMediaSliceForTest(note_id, first).?);
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendMediaSliceForTest(note_id, second).?);
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendMediaSliceForTest(note_id, last).?);
+
+    // Byte-identical, in order. A gap or an overlap between slices would still
+    // decode into a picture, just the wrong one, so length alone is not enough.
+    const whole = main.mediaPartialForTest(note_id) orelse return error.NothingAssembled;
+    try testing.expectEqual(slice * 2 + last.len, whole.len);
+    try testing.expect(std.mem.allEqual(u8, whole[0..slice], 0xAA));
+    try testing.expect(std.mem.allEqual(u8, whole[slice .. slice * 2], 0xBB));
+    try testing.expect(std.mem.allEqual(u8, whole[slice * 2 ..], 0xCC));
+    main.resetMediaForTest();
+}
+
+test "a picture that fits in one slice is whole without allocating anything" {
+    // The common case, and the one that must not get slower: a thumbnail comes
+    // back short on the first answer and decodes straight from the response.
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_002;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendMediaSliceForTest(note_id, "small").?);
+    try testing.expect(main.mediaPartialForTest(note_id) == null);
+    main.resetMediaForTest();
+}
+
+test "the ranges asked for tile the file, with no gap and no overlap" {
+    var buf: [64]u8 = undefined;
+    const slice = main.maxImageBytesForTest();
+    try testing.expectEqualStrings("bytes=0-245759", main.rangeHeaderForTest(&buf, 0).?);
+    // The second request starts at the byte after the first window's last, which
+    // is exactly the length assembled so far.
+    var buf2: [64]u8 = undefined;
+    try testing.expectEqualStrings("bytes=245760-491519", main.rangeHeaderForTest(&buf2, slice).?);
+}
+
+test "a picture past the ceiling is refused rather than assembled forever" {
+    // The bytes are a stranger's, held whole in memory before they decode, so
+    // something has to say when to stop. A host that answers a full slice every
+    // time would otherwise be a download with no end.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_003;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const slice = main.maxImageBytesForTest();
+    const full = try arena.alloc(u8, slice);
+    @memset(full, 0xDD);
+
+    var sent: usize = 0;
+    while (sent < main.maxImageDownloadBytesForTest()) : (sent += slice) {
+        if (main.appendMediaSliceForTest(note_id, full)) |outcome| {
+            try testing.expectEqual(main.SliceOutcome.want_more, outcome);
+        } else {
+            main.resetMediaForTest();
+            return; // refused, which is the point
+        }
+    }
+    std.debug.print("assembled past the ceiling without refusing\n", .{});
+    return error.NoCeiling;
+}
+
+test "a slice buffer never outlives the fetch that was filling it" {
+    // A half-assembled picture is bytes nobody will decode. Every way a fetch
+    // can end has to drop it, or a feed of failing hosts leaks megabytes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_004;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const full = try arena.alloc(u8, main.maxImageBytesForTest());
+    @memset(full, 0xEE);
+    _ = main.appendMediaSliceForTest(note_id, full);
+    try testing.expect(main.mediaPartialForTest(note_id) != null);
+
+    // The host stops answering partway through.
+    main.deliverMediaResponseForTest(&fx, note_id, .timed_out, 0, "");
+    try testing.expect(main.mediaPartialForTest(note_id) == null);
+    main.resetMediaForTest();
+}
+
+test "a screen of picture-heavy notes gets more slots than the old fixed share" {
+    // The reported bug, as a number. Two notes, four pictures and three, is what
+    // a Nostr feed actually looks like, and the reserved share of six meant the
+    // seventh cell could never hold a picture however idle the rest of the
+    // registry was. Seven has to be reachable now.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    main.beginImagePassForTest();
+
+    var lent: usize = 0;
+    var seen = [_]bool{false} ** (main.image_registry_slots + 1);
+    for (0..7) |i| {
+        const slot = main.claimMediaSlotForTest(&fx, @intCast(80_100 + i)) orelse continue;
+        const id = main.acquireImageIdForTest(&fx) orelse continue;
+        slot.image_id = id;
+        slot.last_used = main.imageClockForTest();
+        // Never the same id twice: two pictures sharing one would draw the same
+        // pixels, which is worse than one of them missing.
+        if (seen[@intCast(id)]) {
+            std.debug.print("registry id {d} lent twice\n", .{id});
+            return error.DuplicateImageId;
+        }
+        seen[@intCast(id)] = true;
+        lent += 1;
+    }
+    if (lent < 7) {
+        std.debug.print("only {d} of 7 pictures on screen could hold pixels\n", .{lent});
+        return error.StillCappedAtTheOldShare;
+    }
+}
+
+test "a face and a picture draw from the same pool, oldest off screen first" {
+    // The point of one allocator. A profile page wants a banner and many faces
+    // and no pictures; a feed of photo notes wants the opposite. Under reserved
+    // shares each screen left the other kind's capacity idle, so what decides is
+    // time off screen, not what kind of image it is.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    // Every id held by a face that is on screen right now.
+    main.beginImagePassForTest();
+    for (0..main.image_registry_slots) |i| {
+        const pk = [_]u8{@intCast(i + 1)} ** 32;
+        main.setProfileAvatarForTest(pk, @intCast(i + 1), .loaded);
+        main.markAvatarWantedForTest(pk);
+    }
+
+    // Nothing may be taken while every holder is visible: the caller shows
+    // initials this frame rather than evicting something the reader can see.
+    if (main.chooseImageIdForTest()) |id| {
+        std.debug.print("id {d} was offered while its holder was on screen\n", .{id});
+        return error.WouldEvictSomethingVisible;
+    }
+
+    // Now give them DIFFERENT ages: each pass marks one more face, so the one
+    // marked earliest and never again has been off screen longest.
+    for (0..main.image_registry_slots) |i| {
+        main.beginImagePassForTest();
+        // Everyone from `i` onward is still being read; everyone before has
+        // scrolled away, and how long ago is what separates them.
+        for (i..main.image_registry_slots) |j| {
+            main.markAvatarWantedForTest([_]u8{@intCast(j + 1)} ** 32);
+        }
+    }
+
+    // The reader scrolls to a note with pictures. The oldest face is the one a
+    // picture gets: which one is decided by time off screen, not by kind.
+    main.beginImagePassForTest();
+    const offered = main.chooseImageIdForTest() orelse return error.NoSlotForPicture;
+    if (offered != 1) {
+        std.debug.print("offered id {d}, but id 1 has been off screen longest\n", .{offered});
+        return error.TookTheWrongOne;
+    }
+
+    // And the face the reader IS looking at is never the one taken.
+    main.beginImagePassForTest();
+    main.markAvatarWantedForTest([_]u8{1} ** 32);
+    const next = main.chooseImageIdForTest() orelse return error.NoSlotForPicture;
+    if (next == 1) {
+        std.debug.print("took the face that is on screen instead of one that is not\n", .{});
+        return error.EvictedTheVisibleFace;
+    }
 }
