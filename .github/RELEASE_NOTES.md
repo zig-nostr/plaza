@@ -1,12 +1,14 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.10.0
+### What's new in v0.11.0
 
-**The signer stays on.** Turning Plaza into a signer for your other apps did not survive quitting it, and the toggle switching itself off was the smaller half of that. Plaza also handed out a new connect secret each launch, which meant the link you had already pasted into another app quietly stopped working. From that app's side it does not look like Plaza forgot anything, it looks like the connection broke.
+**Some of the people you follow were invisible, and now they are not.** Plaza works out where each person you follow publishes, and connects there, so you see them even when they are nowhere near your own relays. That has been true since v0.4.0 with one gap nobody could see: to find out where somebody publishes, Plaza has to read a small note they signed saying so, and it only ever looked for that note on relays it was already connected to.
 
-Now it stays as you left it: on if it was on, with the same link. The link survives being switched off and on again, so you never have to go and re-paste it. Removing your key removes the link with it, because the next key set up on this Mac must not inherit one that other apps are already holding.
+If yours were not among them, that person stayed missing. Not with an error, not with an empty space, just absent, exactly the thing the whole feature exists to prevent.
 
-**Faces and profile banners show up now too.** The last release fixed photos in the feed that were too large to arrive in one piece. Profile pictures and banners had the same problem and were still landing on the old path, so somebody whose picture was a full-size photo showed up as initials, and their banner as a flat colour band. All three now arrive the same way.
+Plaza now asks four well-known relays that one question, and only about the people it has no answer for. They are asked and nothing more: never joined, never published as yours, and never counted among your relays.
+
+Whether you notice depends on who you follow. On an account whose relays already cover its follows there is nothing to fix and you will see no difference. On a fresh install it found relay lists for every single account it could not previously place.
 
 ### Install
 
