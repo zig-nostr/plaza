@@ -189,6 +189,26 @@ pub const Bunker = struct {
         _ = self.version.fetchAdd(1, .monotonic);
     }
 
+    /// Adopts a secret written down by a previous run, so a bunker:// URL keeps
+    /// working across restarts.
+    ///
+    /// Only ever called before the relay threads start, and only with what this
+    /// process wrote itself. A shorter or longer string than the one `enable`
+    /// mints is refused rather than padded: a secret is either the one the
+    /// reader handed out or it is not.
+    pub fn adoptSecret(self: *Bunker, saved: []const u8) bool {
+        if (saved.len != self.secret_buf.len) return false;
+        for (saved) |c| {
+            const hex_digit = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+            if (!hex_digit) return false;
+        }
+        self.acquire();
+        defer self.release();
+        @memcpy(&self.secret_buf, saved);
+        self.secret_len = @intCast(saved.len);
+        return true;
+    }
+
     /// Turns it off and ends every session with it.
     ///
     /// Revoking on the way down is the point rather than tidiness: a client
@@ -834,4 +854,42 @@ test "a prompt nobody answered is refused, and not written down" {
     // out over an absence. The question stays open.
     const now = std.Io.Timestamp.now(threaded.io(), .real).toMilliseconds();
     try std.testing.expect(b.remembered(client, .sign_event, 1, now) == null);
+}
+
+test "a secret written down by the last run is adopted, and a broken one is not" {
+    // What makes the URL survive a restart. A fresh secret would leave the
+    // toggle looking right while every bunker:// URL the reader handed out was
+    // refused, which reads as the other app breaking.
+    var b = Bunker{};
+    try std.testing.expect(b.adoptSecret("0123456789abcdef0123456789abcdef"));
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", b.secret());
+
+    // Anything that is not the shape `enable` mints is refused outright rather
+    // than padded or truncated: a secret is the one the reader handed out or it
+    // is not, and half of one is worse than none.
+    var short = Bunker{};
+    try std.testing.expect(!short.adoptSecret("0123"));
+    try std.testing.expectEqualStrings("", short.secret());
+
+    var long = Bunker{};
+    try std.testing.expect(!long.adoptSecret("0123456789abcdef0123456789abcdef0"));
+    try std.testing.expectEqualStrings("", long.secret());
+
+    var junk = Bunker{};
+    try std.testing.expect(!junk.adoptSecret("0123456789ABCDEF0123456789abcdef")); // upper case is not what we write
+    try std.testing.expect(!junk.adoptSecret("0123456789abcdef0123456789abcdeg"));
+    try std.testing.expectEqualStrings("", junk.secret());
+}
+
+test "an adopted secret is the one a client has to present" {
+    // Adopting is only worth anything if `connect` then accepts it, which is
+    // the whole point of writing it down.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var b = Bunker{};
+    try std.testing.expect(b.adoptSecret("00112233445566778899aabbccddeeff"));
+    b.enable(io); // must NOT mint over the adopted one
+    try std.testing.expectEqualStrings("00112233445566778899aabbccddeeff", b.secret());
 }

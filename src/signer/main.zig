@@ -27,6 +27,10 @@ const keystore = nostr.keystore;
 const bunker = @import("bunker.zig");
 
 const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
+/// Whether the reader turned the signer on, and the secret their bunker:// URL
+/// carries. 0600 like the key beside it: the secret is not the key, but it is
+/// the one thing standing between a public pubkey and a connect attempt.
+const bunker_file_name = "signer.bunker";
 
 test {
     // The bunker lives in its own file; without this its tests never run.
@@ -317,6 +321,15 @@ pub fn main(init: std.process.Init) !void {
     var dir = std.Io.Dir.cwd().createDirPathOpen(io, state_dir, .{}) catch std.Io.Dir.cwd();
     g_state = .{ .key_dir = dir, .key_path = key_file_name };
     g_state.load(gpa, io);
+    g_bunker_dir = dir;
+
+    // Back on if it was on when the app last closed, with the SAME secret.
+    //
+    // Both halves matter, and the secret is the half that is easy to miss: a
+    // fresh one would leave the toggle looking right while every bunker:// URL
+    // the reader had already handed out was refused, which reads as "the other
+    // app broke" rather than as anything Plaza did.
+    restoreBunker(gpa, io, dir);
 
     // The bearer token: read the file Plaza wrote (0600). Every request carries
     // it, so a stray process on the machine cannot drive the signer.
@@ -426,9 +439,9 @@ fn runImport(init: std.process.Init) !void {
     std.debug.print("Imported {s}\nStart Plaza to use it.\n", .{npub});
 }
 
-/// Reads one secret line. On a terminal, echo is disabled so nothing is shown;
-/// when stdin is a pipe, it just reads the line. The returned slice points into
-/// `buf` (which the caller zeroes).
+/// Reads ONE secret line. On a terminal, echo is disabled so nothing is shown;
+/// when stdin is a pipe, it takes exactly one line and leaves the rest. The
+/// returned slice points into `buf` (which the caller zeroes).
 fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
     _ = io;
     const stdin_fd: std.posix.fd_t = 0;
@@ -445,9 +458,23 @@ fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
         std.posix.tcsetattr(stdin_fd, .NOW, base) catch {};
         std.debug.print("\n", .{});
     };
-    const n = std.posix.read(stdin_fd, buf) catch return null;
-    if (n == 0) return null;
-    return std.mem.trim(u8, buf[0..n], " \t\r\n");
+    // A byte at a time, because this is asked twice in a row for an ncryptsec
+    // and a plain read into a big buffer takes whatever the pipe has: the first
+    // call would swallow the key AND the passphrase, and the second would find
+    // nothing left. A terminal hides it (canonical mode hands over one line per
+    // read), so it only shows up when the input is piped, which is how a script
+    // would drive this.
+    var len: usize = 0;
+    while (len < buf.len) {
+        var one: [1]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &one) catch return null;
+        if (n == 0) break; // end of input: whatever was read is the line
+        if (one[0] == '\n') break;
+        buf[len] = one[0];
+        len += 1;
+    }
+    if (len == 0) return null;
+    return std.mem.trim(u8, buf[0..len], " \t\r");
 }
 
 /// POSTs an import to a running daemon over loopback. Returns null when nothing
@@ -575,6 +602,12 @@ fn handleConn(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream) !void {
         return handleCipher(gpa, io, w, body, .decrypt);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/reset")) {
         g_state.reset(io);
+        // The signer goes with the key it was signing for. Leaving the secret
+        // behind would mean the next key set up on this Mac inherited a URL
+        // strangers already hold, and `disable` is also what ends the sessions
+        // that were granted against the key just removed.
+        g_bunker.disable();
+        forgetBunker(io);
         return handlePubkey(gpa, w);
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/bunker")) {
         return handleBunkerState(gpa, w);
@@ -802,6 +835,61 @@ test "the plain key file survives every way a migration can go wrong" {
 // of this server. The UI polls `/bunker` and posts the reader's answers.
 
 var g_bunker: bunker.Bunker = .{};
+/// Where the on/off and the secret are written down. Set at boot beside the
+/// key dir, because that is the one directory this process is given.
+var g_bunker_dir: ?std.Io.Dir = null;
+
+/// Writes down whether the signer is on, and the secret its URL carries.
+///
+/// Best-effort, like Plaza's own settings: a machine that cannot write this
+/// still signs, it just forgets by the next launch. The secret is written even
+/// when the answer is off, so turning it back on hands out the URL the reader
+/// already gave to their other apps rather than a new one.
+fn saveBunker(io: std.Io) void {
+    const dir = g_bunker_dir orelse return;
+    var buf: [128]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "on={s}\nsecret={s}\n", .{
+        if (g_bunker.isEnabled()) "yes" else "no",
+        g_bunker.secret(),
+    }) catch return;
+    dir.writeFile(io, .{
+        .sub_path = bunker_file_name,
+        .data = data,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch {};
+}
+
+/// Drops what was written down, secret and all.
+fn forgetBunker(io: std.Io) void {
+    const dir = g_bunker_dir orelse return;
+    dir.deleteFile(io, bunker_file_name) catch {};
+}
+
+/// Puts the signer back the way the reader left it.
+///
+/// The secret is adopted whether or not it was on, so an "off" that the reader
+/// flips back on keeps the URL they had. Turning it on needs a key, and there
+/// may not be one yet (a fresh install, or a locked one): then this does
+/// nothing and the reader turns it on themselves once there is.
+fn restoreBunker(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) void {
+    const raw = dir.readFileAlloc(io, bunker_file_name, gpa, std.Io.Limit.limited(256)) catch return;
+    defer gpa.free(raw);
+
+    var on = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const name = line[0..eq];
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
+        if (std.mem.eql(u8, name, "on")) on = std.mem.eql(u8, value, "yes");
+        if (std.mem.eql(u8, name, "secret")) _ = g_bunker.adoptSecret(value);
+    }
+    if (!on) return;
+
+    const secret = g_state.take() orelse return;
+    g_bunker.enable(io);
+    bunker.start(gpa, &g_bunker, secret);
+}
 
 /// GET /bunker: everything the settings screen draws, in one answer.
 ///
@@ -870,6 +958,7 @@ fn handleBunkerToggle(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, bod
 
     if (!parsed.value.on) {
         g_bunker.disable();
+        saveBunker(io);
         return handleBunkerState(gpa, w);
     }
     // Nothing to serve with. Turning a bunker on before there is a key would
@@ -880,6 +969,8 @@ fn handleBunkerToggle(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, bod
     // Threads only on the transition, so a second press does not stack another
     // three onto the relays.
     if (!was_on) bunker.start(gpa, &g_bunker, secret);
+    // After `enable`, which is what mints the secret on the first ever press.
+    saveBunker(io);
     return handleBunkerState(gpa, w);
 }
 
