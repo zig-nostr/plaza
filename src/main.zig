@@ -6466,6 +6466,11 @@ const Profile = struct {
     /// Cleared on a successful load, on a changed picture URL, and by the
     /// Settings retry.
     avatar_attempts: u8 = 0,
+    /// A face too big for one response body. Same problem as a feed picture and
+    /// the same answer: a profile picture straight from its own host is often a
+    /// full-size photo, and one that drew initials was never undecodable, only
+    /// too long to arrive in one piece.
+    down: Download = .{},
     /// Whether this face's BYTES have been pulled into the disk cache ahead of
     /// being needed. Separate from `avatar_state` because that one is about a
     /// registry id and there are only nine of those: warming is what a row just
@@ -10649,11 +10654,8 @@ fn scanAvatarFetches(fx: *Effects) void {
         }
         if (fired >= per_tick) continue;
         p.avatar_state = .fetching;
-        fx.fetch(.{
-            .key = avatar_fetch_key_base + @as(u64, @intCast(i)),
-            .url = p.url(),
-            .on_response = Effects.responseMsg(.avatar_fetched),
-        });
+        p.down.release();
+        fetchSlice(fx, avatar_fetch_key_base + @as(u64, @intCast(i)), p.url(), 0, Effects.responseMsg(.avatar_fetched));
         fired += 1;
     }
 }
@@ -10669,7 +10671,25 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
 
     // A rejection means every effect slot was busy: try again next tick.
     if (response.outcome == .rejected) {
+        p.down.release();
         p.avatar_state = .idle;
+        return;
+    }
+    // A slice of a face bigger than one body: take it, and ask for the next
+    // unless the host just said there is no next.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = p.down.append(response.body) orelse {
+            p.down.release();
+            p.avatar_state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchSlice(fx, response.key, p.url(), p.down.len, Effects.responseMsg(.avatar_fetched));
+            return;
+        }
+        const whole = p.down.bytes() orelse response.body;
+        finishAvatar(fx, p, whole);
+        p.down.release();
         return;
     }
     // Anything but a clean, whole, OK image body. Which of those is worth asking
@@ -10677,6 +10697,7 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     // answer: a face used to be given up on for the rest of the session over one
     // 503, one rate limit, or one dropped connection.
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
+        p.down.release();
         p.avatar_state = switch (classifyImageFailure(response.outcome, response.status)) {
             .give_up => .failed,
             .retry => blk: {
@@ -10686,13 +10707,18 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         };
         return;
     }
-    // Decode into this profile's fixed image id, downscaling if the platform
-    // decoder will not take it as-is. Only a genuinely undecodable body falls
-    // back to initials now.
-    if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) |_| {
+    p.down.release();
+    finishAvatar(fx, p, response.body);
+}
+
+/// Decodes a complete face into `p`'s registry id and remembers it.
+fn finishAvatar(fx: *Effects, p: *Profile, bytes: []const u8) void {
+    // Downscaling if the platform decoder will not take it as-is. Only a
+    // genuinely undecodable body falls back to initials now.
+    if (decodeAndRegister(fx, p.image_id, bytes, avatar_target_px)) |_| {
         p.avatar_state = .loaded;
         p.avatar_attempts = 0;
-        storeCachedImage(p.url(), response.body);
+        storeCachedImage(p.url(), bytes);
     } else {
         // Undecodable bytes are a fact about the picture, not about the network.
         p.avatar_state = .failed;
@@ -11047,14 +11073,7 @@ const MediaSlot = struct {
     /// handed to a different note.
     direct: bool = false,
     /// A picture too big for one response body, assembled out of Range slices.
-    ///
-    /// Allocated only when a first slice comes back full, which is the signal
-    /// that there is more to ask for; a picture that fits in one body decodes
-    /// straight from the response and never touches this. Freed when the
-    /// picture decodes, when the slot is handed to another note, or when the
-    /// fetch gives up.
-    partial: ?[]u8 = null,
-    partial_len: usize = 0,
+    down: Download = .{},
     /// Every frame of an animated GIF, decoded once and owned by stb (freed on
     /// eviction). Null for a still picture.
     frames: ?[*]u8 = null,
@@ -11076,14 +11095,6 @@ const MediaSlot = struct {
         self.frames = null;
         self.frame_count = 0;
         self.frame_index = 0;
-    }
-    /// Drops a half-assembled picture. Called wherever a fetch ends, however it
-    /// ends, and before a slot is handed to another note: a slice buffer that
-    /// outlives its fetch is bytes nobody will ever decode.
-    fn releasePartial(self: *MediaSlot) void {
-        if (self.partial) |buf| std.heap.page_allocator.free(buf);
-        self.partial = null;
-        self.partial_len = 0;
     }
 };
 
@@ -11165,7 +11176,7 @@ pub fn maxMediaImagesForTest() usize {
 }
 
 pub fn resetMediaForTest() void {
-    for (&g_media) |*m| m.releasePartial();
+    for (&g_media) |*m| m.down.release();
     g_media = [_]MediaSlot{.{}} ** max_media_images;
     g_image_clock = 0;
 }
@@ -11175,7 +11186,7 @@ pub fn resetMediaForTest() void {
 pub fn mediaPartialCountForTest() usize {
     var n: usize = 0;
     for (&g_media) |*m| {
-        if (m.partial != null) n += 1;
+        if (m.down.buf != null) n += 1;
     }
     return n;
 }
@@ -11237,6 +11248,38 @@ pub fn mediaIdleForTest(note_id: i64) bool {
 
 /// Delivers one picture-fetch response for `note_id` the way the runtime would,
 /// so a test can drive the failure paths rather than the classifier alone.
+/// How many faces are holding a half-assembled picture. Zero at rest.
+pub fn avatarPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_profiles) |*p| {
+        if (p.used and p.down.buf != null) n += 1;
+    }
+    return n;
+}
+
+/// Feeds one delivered slice to a profile's face, exactly as a 206 does.
+pub fn appendAvatarSliceForTest(pubkey: [32]u8, body: []const u8) ?SliceOutcome {
+    const p = lookupProfile(pubkey) orelse return null;
+    return p.down.append(body);
+}
+
+pub fn deliverAvatarResponseForTest(
+    fx: *Effects,
+    pubkey: [32]u8,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const p = lookupProfile(pubkey) orelse return;
+    const index = (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
+    handleAvatarFetched(fx, .{
+        .key = avatar_fetch_key_base + index,
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
+}
+
 pub fn maxImageBytesForTest() usize {
     return max_image_bytes;
 }
@@ -11252,14 +11295,13 @@ pub fn rangeHeaderForTest(buf: []u8, offset: usize) ?[]const u8 {
 /// Feeds one delivered slice to a note's slot, exactly as a 206 response does.
 pub fn appendMediaSliceForTest(note_id: i64, body: []const u8) ?SliceOutcome {
     const m = mediaSlotFor(note_id) orelse return null;
-    return appendMediaSlice(m, body);
+    return m.down.append(body);
 }
 
 /// What a note's slot has assembled so far, or null if it is holding nothing.
 pub fn mediaPartialForTest(note_id: i64) ?[]const u8 {
     const m = mediaSlotFor(note_id) orelse return null;
-    const buf = m.partial orelse return null;
-    return buf[0..m.partial_len];
+    return m.down.bytes();
 }
 
 pub fn deliverMediaResponseForTest(
@@ -11345,7 +11387,7 @@ fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     // This says so out loud, so a terminal path that forgets fails here in a
     // test rather than quietly handing the next note half of somebody else's
     // picture.
-    std.debug.assert(v.partial == null);
+    std.debug.assert(v.down.buf == null);
     // The id it was holding comes with it: the picture that was in it has just
     // been unregistered, so the slot is empty and nobody else can be lent it
     // between here and the next registration.
@@ -11566,7 +11608,7 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     if (loadCachedMedia(fx, slot, gif)) return;
     if (fired.* >= per_tick) return;
     slot.state = .fetching;
-    slot.releasePartial();
+    slot.down.release();
     fetchMediaSlice(fx, slot, 0);
     fired.* += 1;
 }
@@ -11581,11 +11623,16 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
 /// 206 with a slice, which is a difference the caller can see, so ignoring the
 /// header can never be mistaken for a complete picture.
 fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
+    fetchSlice(fx, media_fetch_key_base + mediaSlotIndex(slot), slot.url(), offset, Effects.responseMsg(.media_fetched));
+}
+
+/// One slice of one image, whoever wants it.
+fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_response: anytype) void {
     var range_buf: [64]u8 = undefined;
     const range = rangeHeader(&range_buf, offset) orelse return;
     fx.fetch(.{
-        .key = media_fetch_key_base + mediaSlotIndex(slot),
-        .url = slot.url(),
+        .key = key,
+        .url = url,
         // `identity` is not politeness, it is what makes the arithmetic true.
         // The HTTP client asks for gzip by default, and a range together with a
         // content encoding means the slice boundaries are in ENCODED bytes
@@ -11597,7 +11644,7 @@ fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
             .{ .name = "range", .value = range },
             .{ .name = "accept-encoding", .value = "identity" },
         },
-        .on_response = Effects.responseMsg(.media_fetched),
+        .on_response = on_response,
     });
 }
 
@@ -11612,33 +11659,60 @@ fn rangeHeader(buf: []u8, offset: usize) ?[]const u8 {
     return std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ offset, offset + max_image_bytes - 1 }) catch null;
 }
 
-/// Appends one delivered slice to `slot`, and reports whether the picture is
-/// whole.
-///
 /// A slice that came back SHORT is the last one: the host had nothing more to
 /// give from that offset. A full slice means there is probably more, so the
-/// caller asks again from the new end. `null` means the picture cannot be
-/// assembled (out of memory, or past the ceiling) and the fetch is over.
+/// caller asks again from the new end.
 pub const SliceOutcome = enum { complete, want_more };
-fn appendMediaSlice(slot: *MediaSlot, body: []const u8) ?SliceOutcome {
-    if (slot.partial == null) {
-        // The first slice arrives before there is anywhere to put it, and the
-        // first slice is the only one that can be the whole picture: a short
-        // one decodes straight from the response body with nothing allocated.
-        if (body.len < max_image_bytes) return .complete;
-        slot.partial = std.heap.page_allocator.alloc(u8, max_image_download_bytes) catch return null;
+
+/// One picture arriving in Range slices.
+///
+/// Every image Plaza draws goes through this: a face, a feed picture and a
+/// profile banner are the same problem, because a response body carries at most
+/// `max_image_bytes` and none of the three is reliably under it. It was written
+/// for feed pictures first and the other two were left on one request, which
+/// meant a full-size profile picture fetched from its own host drew initials
+/// for exactly the same reason a photo drew a blank cell.
+const Download = struct {
+    buf: ?[]u8 = null,
+    len: usize = 0,
+
+    /// Appends one delivered slice. `null` means this picture cannot be
+    /// assembled (no memory, or past the ceiling) and the fetch is over.
+    fn append(self: *Download, body: []const u8) ?SliceOutcome {
+        if (self.buf == null) {
+            // The first slice arrives before there is anywhere to put it, and
+            // it is the only one that can be the whole picture: a short first
+            // slice decodes straight from the response with nothing allocated.
+            if (body.len < max_image_bytes) return .complete;
+            self.buf = std.heap.page_allocator.alloc(u8, max_image_download_bytes) catch return null;
+        }
+        const buf = self.buf.?;
+        const filled = self.len + body.len;
+        // The buffer IS the ceiling, and there is deliberately no second check
+        // saying the same thing: a host that answers a full slice every time
+        // has to run out of room, and one bound that the append cannot cross is
+        // easier to trust than two that can drift apart.
+        if (filled > buf.len) return null;
+        @memcpy(buf[self.len..filled], body);
+        self.len = filled;
+        return if (body.len < max_image_bytes) .complete else .want_more;
     }
-    const buf = slot.partial.?;
-    const filled = slot.partial_len + body.len;
-    // The buffer IS the ceiling, and there is deliberately no second check
-    // saying the same thing: a host that answers a full slice every time has to
-    // run out of room, and one bound that the append cannot cross is easier to
-    // trust than two that can drift apart.
-    if (filled > buf.len) return null;
-    @memcpy(buf[slot.partial_len..filled], body);
-    slot.partial_len = filled;
-    return if (body.len < max_image_bytes) .complete else .want_more;
-}
+
+    /// What has been assembled, or null when nothing was: a picture that fit in
+    /// one slice decodes from the response body instead.
+    fn bytes(self: *const Download) ?[]const u8 {
+        const buf = self.buf orelse return null;
+        return buf[0..self.len];
+    }
+
+    /// Drops a half-assembled picture. Called wherever a fetch ends, however it
+    /// ends: bytes that outlive their fetch are bytes nobody will ever decode.
+    fn release(self: *Download) void {
+        if (self.buf) |buf| std.heap.page_allocator.free(buf);
+        self.buf = null;
+        self.len = 0;
+    }
+};
 
 /// What a fetch that produced no usable image says about trying again.
 pub const ImageFailure = enum { retry, give_up };
@@ -11706,35 +11780,35 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (!slot.used) return;
 
     if (response.outcome == .rejected) {
-        slot.releasePartial();
+        slot.down.release();
         slot.state = .idle;
         return;
     }
     // A 206 is a slice of a picture that does not fit in one body. Take it, and
     // ask for the next unless the host just told us there is no next.
     if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
-        const outcome = appendMediaSlice(slot, response.body) orelse {
+        const outcome = slot.down.append(response.body) orelse {
             // Too big to assemble, or no memory to assemble it in. Both are
             // facts about this picture rather than about the network, so this
             // is finished rather than retried.
-            slot.releasePartial();
+            slot.down.release();
             slot.state = .failed;
             return;
         };
         if (outcome == .want_more) {
-            fetchMediaSlice(fx, slot, slot.partial_len);
+            fetchMediaSlice(fx, slot, slot.down.len);
             return;
         }
         // Whole. The bytes are in the slice buffer unless this was a single
         // short first slice, which never allocated one.
-        const whole = if (slot.partial) |buf| buf[0..slot.partial_len] else response.body;
+        const whole = slot.down.bytes() orelse response.body;
         finishMedia(fx, slot, whole);
-        slot.releasePartial();
+        slot.down.release();
         return;
     }
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
         // Whatever was assembled so far is bytes nobody will decode now.
-        slot.releasePartial();
+        slot.down.release();
         // A host that said NO is different from a host that did not answer, and
         // a picture that is simply too big is different again: it will be the
         // same size next time, so asking again is a download with a known
@@ -11772,7 +11846,7 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         };
         return;
     }
-    slot.releasePartial();
+    slot.down.release();
     finishMedia(fx, slot, response.body);
 }
 
@@ -18555,12 +18629,13 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     }
     g_banner_state = .fetching;
     g_banner_asked_for = pubkey;
-    fx.fetch(.{
-        .key = banner_fetch_key,
-        .url = bannerUrl(),
-        .on_response = Effects.responseMsg(.banner_fetched),
-    });
+    g_banner_down.release();
+    fetchSlice(fx, banner_fetch_key, bannerUrl(), 0, Effects.responseMsg(.banner_fetched));
 }
+
+/// A banner too big for one response body. The widest of the three, drawn at
+/// 660x132, so the least likely of them to arrive in one piece.
+var g_banner_down: Download = .{};
 
 /// Deliberately not 4000: that is `link_fetch_key_base + 0`, and the runtime
 /// rejects a second fetch under a key already in flight, so a banner and the
@@ -18576,12 +18651,30 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     const asked_for = g_banner_asked_for orelse return;
     const showing = g_banner_for orelse return;
     if (!std.mem.eql(u8, &asked_for, &showing)) {
+        g_banner_down.release();
         g_banner_state = .idle;
         return;
     }
     // Every effect slot was busy: ask again next tick.
     if (response.outcome == .rejected) {
+        g_banner_down.release();
         g_banner_state = .idle;
+        return;
+    }
+    // A slice of a banner bigger than one body.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = g_banner_down.append(response.body) orelse {
+            g_banner_down.release();
+            g_banner_state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchSlice(fx, banner_fetch_key, bannerUrl(), g_banner_down.len, Effects.responseMsg(.banner_fetched));
+            return;
+        }
+        const whole = g_banner_down.bytes() orelse response.body;
+        finishBanner(fx, whole);
+        g_banner_down.release();
         return;
     }
     // Anything but a clean, whole, OK image body leaves the flat band, which is
@@ -18589,12 +18682,19 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.outcome != .ok or response.status != 200 or response.truncated or
         response.body.len == 0 or response.body.len > max_image_bytes)
     {
+        g_banner_down.release();
         g_banner_state = .failed;
         return;
     }
-    if (decodeAndRegister(fx, g_banner_image_id, response.body, banner_target_px)) |_| {
+    g_banner_down.release();
+    finishBanner(fx, response.body);
+}
+
+/// Decodes a complete banner into the slot it holds.
+fn finishBanner(fx: *Effects, bytes: []const u8) void {
+    if (decodeAndRegister(fx, g_banner_image_id, bytes, banner_target_px)) |_| {
         g_banner_state = .loaded;
-        storeCachedImage(bannerUrl(), response.body);
+        storeCachedImage(bannerUrl(), bytes);
     } else {
         g_banner_state = .failed;
     }
@@ -28815,7 +28915,13 @@ fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
     //
     // So it polls whenever the bunker is on, wherever the reader is, and the
     // approval is a sheet rather than a row on one screen.
-    if (!g_bunker_on and model.stage != .settings) return;
+    // The FIRST poll is unconditional, because "is it on" is exactly what this
+    // does not know yet. The signer puts itself back the way it was left, so a
+    // reader who turned it on last week starts with it serving; if Plaza waited
+    // to be told before asking, it would only find out when they next opened
+    // Settings, and until then a client connecting to that URL would park on an
+    // approval nobody was fetching.
+    if (g_bunker_polled_at != 0 and !g_bunker_on and model.stage != .settings) return;
     if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
     g_bunker_polled_at = now_ms;
     var url_buf: [48]u8 = undefined;

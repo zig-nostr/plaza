@@ -17840,3 +17840,40 @@ test "a face and a picture draw from the same pool, oldest off screen first" {
         return error.EvictedTheVisibleFace;
     }
 }
+
+test "a face assembles from slices too, and never outlives its fetch" {
+    // Faces and banners were left on one request when pictures moved to slices,
+    // so a full-size profile picture straight from its own host still drew
+    // initials for exactly the reason a photo drew a blank cell. One Download,
+    // three consumers.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    const pk = [_]u8{0x2a} ** 32;
+    main.setProfileAvatarForTest(pk, 1, .fetching);
+
+    const full = try arena.alloc(u8, main.maxImageBytesForTest());
+    @memset(full, 0x5a);
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendAvatarSliceForTest(pk, full).?);
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendAvatarSliceForTest(pk, "tail").?);
+    try testing.expectEqual(@as(usize, 1), main.avatarPartialCountForTest());
+
+    // The host stops answering partway through the next one: the bytes go with
+    // the fetch, or a feed of failing hosts leaks megabytes of faces.
+    main.deliverAvatarResponseForTest(&fx, pk, .timed_out, 0, "");
+    try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
+
+    // And a busy effect table is the other way a fetch ends without an answer.
+    // It sends the face back to idle to be asked again from the start, so what
+    // it already had has to go with it: keeping it would splice the front of
+    // one download onto the front of the next.
+    _ = main.appendAvatarSliceForTest(pk, full);
+    try testing.expectEqual(@as(usize, 1), main.avatarPartialCountForTest());
+    main.deliverAvatarResponseForTest(&fx, pk, .rejected, 0, "");
+    try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
+}
