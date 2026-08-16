@@ -1,10 +1,14 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.8.1
+### What's new in v0.9.0
 
-A maintenance release. Nothing here changes what Plaza does.
+**Photos show up now.** A whole class of pictures never appeared in the feed: a blank cell, or a blurred placeholder that never resolved. It was not the picture, and it was not the host. Plaza could only take a picture that arrived in one piece under 240 KB, and an ordinary phone photo is several times that. Every photo in the notes I was staring at was between 313 KB and 612 KB.
 
-The permission model behind the signer, which decides what a connected app may do and for how long your answer stands, has moved into the `nostr` library that Plaza and Notary both build on. It was written twice, once in each, and two copies of a rule about what may sign with your key is one copy too many. Now there is one, with one set of tests over it, and both signers behave the same way by construction rather than by my keeping them in step.
+It had been hidden by the image proxy, which hands back a shrunken copy. The proxy refuses some hosts outright, and the ones it refuses are exactly where a lot of Nostr photos live, so those notes fell through to a direct download and hit the limit. Plaza now asks for a big picture in pieces and puts it back together, so the size of the file stopped being the thing that decides whether you see it.
+
+**More pictures on screen at once.** There are sixteen slots for every image in the app, and they were carved up in advance: nine for faces, one for a profile banner, six for photos. A feed with two four-picture notes in it needs seven, so the seventh cell could never hold anything no matter how much of the rest sat idle.
+
+There is no carve-up now. Faces, photos and banners draw from the same sixteen, and what gets a slot is whatever has been on your screen most recently. A page of photos can use nearly all of them; a profile page full of faces can too. Whichever you are looking at is the one that gets the room.
 
 ### Install
 
