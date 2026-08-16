@@ -136,6 +136,42 @@ const bootstrap_relays = [_][]const u8{
     "wss://relay.snort.social",
 };
 
+/// Relays asked one question only: where does this person publish?
+///
+/// The outbox bootstrap. To route to somebody's write relays you must first
+/// hold their kind:10002, and you cannot ask their write relays for it, because
+/// finding them is the thing you are trying to do. Plaza only ever learned a
+/// relay list from a relay it was already reading, so a followed account whose
+/// list lives anywhere else was never routed to and simply never appeared. No
+/// error, no empty state, which is the exact failure the outbox model exists to
+/// fix and the easiest one to leave behind while fixing it.
+///
+/// The set is READ FROM FOUR SHIPPING CLIENTS rather than picked. nos.lol is in
+/// three of them (Jumble, Amethyst desktop, NDK), purplepag.es in two (Amethyst
+/// mobile, NDK), primal in two (Jumble, Amethyst desktop). kindpag.es is
+/// Amethyst mobile alone and is here because it is the only one of the four
+/// built for indexing rather than a general relay that happens to keep
+/// replaceables; Amethyst's own desktop source carries a comment saying its
+/// purpose-built list is the better one and adopting it is a separate ticket.
+///
+/// These are NOT pool relays. They are never published in the reader's
+/// kind:10002, never routed to for notes, and never counted in the eight, which
+/// is Jumble's `filterOutBigRelays` discipline rather than Notedeck's, where
+/// the bootstrap set gets spliced into the user's own advertised relays the
+/// first time they edit their list.
+const indexer_relays = [_][]const u8{
+    "wss://purplepag.es",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://user.kindpag.es",
+};
+/// Authors per REQ. Amethyst desktop chunks at exactly this and sets its limit
+/// to the chunk size; Amethyst ANDROID puts the whole follow list in one filter
+/// and a 2000-entry `authors` array is past what most relays accept, so they
+/// truncate or CLOSE without saying which. Chunked at the wire, because in this
+/// codebase the frame writer IS the wire and nothing merges behind it.
+const indexer_chunk = 100;
+
 var g_relays = [_]RelayEntry{.{}} ** max_relays;
 /// How many slots have ever been claimed. It never shrinks, because a slot's
 /// index is a promise to everything that recorded one.
@@ -1095,6 +1131,11 @@ fn maybeRankRelaySuggestions(store: *nostr.store.Store) void {
     g_route_wanted_at = -1;
     g_route_ran_at = now_ms;
     rankRelaySuggestions(store);
+    // Right after the routing is rebuilt, because that is the moment the set of
+    // people nobody can be asked about is known and correct. Off the render
+    // thread and one at a time; the sweep marks who it asked, so this settling
+    // to a no-op is what the marking is for.
+    sweepRelayLists();
 }
 
 pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
@@ -26607,6 +26648,166 @@ pub fn engagementFilter(tags: []const nostr.filter.TagFilter) nostr.filter.Filte
 
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so
+// --------------------------------------------------------- the relay-list sweep
+//
+// Who to ask about the people nobody in the pool can answer for.
+//
+// Every author whose kind:10002 Plaza does not hold is asked of the indexers,
+// once per run. Eager over the whole follow list rather than lazily on a miss,
+// because the routing table has to be warm BEFORE the first feed REQ or the
+// feed goes to the wrong relays and the round trip is paid twice: three of the
+// four clients read do the eager sweep for exactly that reason, and welshman,
+// the one that does not, is also the one with no negative caching and an
+// unbounded retry.
+//
+// DEFERRED, and named rather than quietly skipped: the answer is not written
+// down across launches, so an author who has genuinely never published a
+// relay list is asked again next time Plaza starts. Within a run they are
+// asked once. Jumble is the only client of the five that persists a negative
+// result, and doing it properly means a `checked_at` per pubkey in the store
+// with a staleness rule, which is its own change.
+
+/// Pubkeys already put to the indexers this run, so a follow with no relay list
+/// anywhere is asked once rather than on every rebuild of the routing table.
+var g_indexed = std.atomic.Value(u32).init(0);
+var g_indexer_asked: [max_follows][32]u8 = undefined;
+var g_indexer_asked_len: usize = 0;
+var g_indexer_running = std.atomic.Value(bool).init(false);
+
+/// The follows Plaza holds no relay list for and has not yet asked about.
+///
+/// Reads the store rather than the routing table: "no relay list" is a fact
+/// about what is on disk, while a residual author may simply write somewhere
+/// that did not make the cut, and asking an indexer about them would be asking
+/// a question already answered.
+fn collectUnrouted(out: [][32]u8) usize {
+    const store = g_store orelse return 0;
+    var n: usize = 0;
+    for (followSet()) |pk| {
+        if (n >= out.len) break;
+        if (authorListed(g_indexer_asked[0..g_indexer_asked_len], pk)) continue;
+        const kinds = [_]u16{relay_list_kind};
+        var one: [1][32]u8 = .{pk};
+        var result = store.query(std.heap.page_allocator, .{
+            .authors = one[0..1],
+            .kinds = &kinds,
+            .limit = 1,
+        }) catch continue;
+        defer result.deinit();
+        if (result.events.len > 0) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+/// Asks the indexers about everyone the pool cannot place. One pass, off the
+/// UI thread, on its own sockets.
+fn sweepRelayLists() void {
+    if (g_store == null) return;
+    if (g_indexer_running.swap(true, .acq_rel)) return; // one sweep at a time
+    const t = std.Thread.spawn(.{}, sweepRelayListsWorker, .{}) catch {
+        g_indexer_running.store(false, .release);
+        return;
+    };
+    t.detach();
+}
+
+fn sweepRelayListsWorker() void {
+    defer g_indexer_running.store(false, .release);
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const wanted = gpa.alloc([32]u8, max_follows) catch return;
+    defer gpa.free(wanted);
+    const n = collectUnrouted(wanted);
+    if (n == 0) return;
+
+    // Marked as asked BEFORE the network, not after. A relay that never answers
+    // must not leave these authors queued for the next rebuild to ask again:
+    // the point of the set is one attempt per run, and an attempt that failed
+    // is still an attempt. Amethyst's equivalent is an LRU that fails OPEN when
+    // it evicts, resurrecting questions it had already given up on.
+    for (wanted[0..n]) |pk| {
+        if (g_indexer_asked_len >= g_indexer_asked.len) break;
+        g_indexer_asked[g_indexer_asked_len] = pk;
+        g_indexer_asked_len += 1;
+    }
+
+    for (indexer_relays) |url| {
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        // The clock starts once the socket is up, which is what NDK gets wrong:
+        // its budget races its own TCP handshake on a cold start and everything
+        // that misses is written off as "this person has no relay list".
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+
+        var start: usize = 0;
+        while (start < n) : (start += indexer_chunk) {
+            const chunk = wanted[start..@min(start + indexer_chunk, n)];
+            const kinds = [_]u16{relay_list_kind};
+            // No `since` and no `until`: all four clients agree, and a relay
+            // list edited while the app was closed is older than anything a
+            // `since` would admit. `limit` is the chunk size because these are
+            // replaceable, so a relay holds at most one per author.
+            const filters = [_]nostr.filter.Filter{.{
+                .authors = chunk,
+                .kinds = &kinds,
+                .limit = @intCast(chunk.len),
+            }};
+            relay.subscribe("plaza-ask-relaylists", &filters) catch break;
+            while (true) {
+                var msg = (relay.receive() catch break) orelse break;
+                defer msg.deinit();
+                switch (msg.value) {
+                    .event => |e| {
+                        _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                        _ = g_indexed.fetchAdd(1, .monotonic);
+                    },
+                    .eose => break,
+                    else => {},
+                }
+            }
+        }
+    }
+    // Whatever arrived changes who can be routed to, so the table is rebuilt
+    // rather than waiting for the next thing that happens to touch it.
+    // The same flag an arriving relay list sets. A rebuild is wanted, not
+    // forced: it runs on the render thread when the flurry has stopped, which
+    // is what stops a burst of lists redialling the discovered pool repeatedly.
+    if (g_indexed.load(.monotonic) > 0) g_relay_ranks_dirty.store(true, .release);
+}
+
+pub fn sweepRelayListsForTest() void {
+    sweepRelayLists();
+}
+pub fn collectUnroutedForTest(out: [][32]u8) usize {
+    return collectUnrouted(out);
+}
+pub fn indexerRelaysForTest() []const []const u8 {
+    return &indexer_relays;
+}
+pub fn indexerChunkForTest() usize {
+    return indexer_chunk;
+}
+pub fn resetIndexerAskedForTest() void {
+    g_indexer_asked_len = 0;
+    g_indexed.store(0, .monotonic);
+}
+pub fn markIndexerAskedForTest(pk: [32]u8) void {
+    if (g_indexer_asked_len >= g_indexer_asked.len) return;
+    g_indexer_asked[g_indexer_asked_len] = pk;
+    g_indexer_asked_len += 1;
+}
+pub fn indexerAskedLenForTest() usize {
+    return g_indexer_asked_len;
+}
+
 /// a throwaway connection keeps the ingest loops untouched, exactly like
 /// publishing. `seq` tags the fetch so its completion is attributable.
 fn fetchThreadReplies(root_id: [32]u8, seq: u64) void {

@@ -17877,3 +17877,118 @@ test "a face assembles from slices too, and never outlives its fetch" {
     main.deliverAvatarResponseForTest(&fx, pk, .rejected, 0, "");
     try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
 }
+
+test "only the follows nobody can be routed to are put to the indexers" {
+    // The outbox bootstrap. To route to somebody you need their kind:10002, and
+    // you cannot ask their write relays for it, because finding them IS the
+    // question. Plaza only ever learned a relay list from a relay it was
+    // already reading, so a follow whose list lives anywhere else was never
+    // routed to and never appeared, with no error and no empty state.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const known = try signer.keyPairFromSecretKey([_]u8{3} ** 32);
+    const unknown = try signer.keyPairFromSecretKey([_]u8{4} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/indexer.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.resetIndexerAskedForTest();
+    defer main.resetIndexerAskedForTest();
+    // Without an identity the follow table is not owned and `followSet` hands
+    // back the starter pack, so the sweep would be measuring the wrong people.
+    main.setIdentityForTest([_]u8{88} ** 32);
+    defer main.clearIdentityForTest();
+
+    const follows = [_][32]u8{ known.public_key, unknown.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    // One of the two has published a relay list Plaza already holds.
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://writes.example.com", "write" }};
+    const ev = try nostr.event.create(arena, signer, known, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    var out: [8][32]u8 = undefined;
+    const n = main.collectUnroutedForTest(&out);
+
+    // Exactly the one with nothing on disk. Asking about the other would be
+    // asking a question already answered.
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(std.mem.eql(u8, &out[0], &unknown.public_key));
+}
+
+test "a follow with no relay list anywhere is asked once, not on every rebuild" {
+    // The routing table is rebuilt whenever a relay list lands, and somebody who
+    // has never published one is unroutable at every one of those rebuilds. If
+    // the sweep re-asked each time, a single account with no kind:10002 would
+    // put a REQ to four relays for the life of the session.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const nobody = try signer.keyPairFromSecretKey([_]u8{5} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/asked.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.resetIndexerAskedForTest();
+    defer main.resetIndexerAskedForTest();
+    main.setIdentityForTest([_]u8{89} ** 32);
+    defer main.clearIdentityForTest();
+
+    const follows = [_][32]u8{nobody.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), main.collectUnroutedForTest(&out));
+
+    // Once the sweep has put them to the indexers, they are off the list even
+    // though the store still holds nothing for them: an attempt that came back
+    // empty is still an attempt, which is what Amethyst's LRU gets wrong when
+    // it evicts and resurrects a question already given up on.
+    main.markIndexerAskedForTest(nobody.public_key);
+    try testing.expectEqual(@as(usize, 0), main.collectUnroutedForTest(&out));
+}
+
+test "the indexers are asked, never joined, and never published as ours" {
+    // They answer one question and are not part of the reader's identity. The
+    // failure to avoid is Notedeck's, where the bootstrap set is spliced into
+    // the user's own advertised relays the first time they edit their list, so
+    // editing one relay publishes four you never chose.
+    main.resetRelaysForTest();
+
+    const before = main.relaySlots();
+    for (main.indexerRelaysForTest()) |url| {
+        try testing.expect(std.mem.startsWith(u8, url, "wss://"));
+    }
+    // Naming them does not dial them into the pool.
+    try testing.expectEqual(before, main.relaySlots());
+
+    // And the chunk stays inside what a relay will accept in one filter: an
+    // unchunked 2000-author array is past the limit on most, and they truncate
+    // or CLOSE without saying which.
+    try testing.expect(main.indexerChunkForTest() <= 100);
+    try testing.expect(main.indexerChunkForTest() > 0);
+}
