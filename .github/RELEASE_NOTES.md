@@ -1,14 +1,12 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.9.0
+### What's new in v0.10.0
 
-**Photos show up now.** A whole class of pictures never appeared in the feed: a blank cell, or a blurred placeholder that never resolved. It was not the picture, and it was not the host. Plaza could only take a picture that arrived in one piece under 240 KB, and an ordinary phone photo is several times that. Every photo in the notes I was staring at was between 313 KB and 612 KB.
+**The signer stays on.** Turning Plaza into a signer for your other apps did not survive quitting it, and the toggle switching itself off was the smaller half of that. Plaza also handed out a new connect secret each launch, which meant the link you had already pasted into another app quietly stopped working. From that app's side it does not look like Plaza forgot anything, it looks like the connection broke.
 
-It had been hidden by the image proxy, which hands back a shrunken copy. The proxy refuses some hosts outright, and the ones it refuses are exactly where a lot of Nostr photos live, so those notes fell through to a direct download and hit the limit. Plaza now asks for a big picture in pieces and puts it back together, so the size of the file stopped being the thing that decides whether you see it.
+Now it stays as you left it: on if it was on, with the same link. The link survives being switched off and on again, so you never have to go and re-paste it. Removing your key removes the link with it, because the next key set up on this Mac must not inherit one that other apps are already holding.
 
-**More pictures on screen at once.** There are sixteen slots for every image in the app, and they were carved up in advance: nine for faces, one for a profile banner, six for photos. A feed with two four-picture notes in it needs seven, so the seventh cell could never hold anything no matter how much of the rest sat idle.
-
-There is no carve-up now. Faces, photos and banners draw from the same sixteen, and what gets a slot is whatever has been on your screen most recently. A page of photos can use nearly all of them; a profile page full of faces can too. Whichever you are looking at is the one that gets the room.
+**Faces and profile banners show up now too.** The last release fixed photos in the feed that were too large to arrive in one piece. Profile pictures and banners had the same problem and were still landing on the old path, so somebody whose picture was a full-size photo showed up as initials, and their banner as a flat colour band. All three now arrive the same way.
 
 ### Install
 
