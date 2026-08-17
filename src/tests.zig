@@ -18252,3 +18252,89 @@ test "building a reply queues the note it answers, so the line can fill in" {
         return error.ParentNeverRequested;
     }
 }
+
+test "a mode is read out of a stranger's event, and its relay is checked" {
+    // Every field here was signed by somebody else, so the parser is the
+    // boundary. The relay URL is the sharp one: it decides where the app
+    // connects.
+    const gpa = testing.allocator;
+
+    const good =
+        \\{"name":"Bass Pistol","home":"# Rules\n\n- be interesting",
+        \\ "feeds":[{"name":"The relay","relay":"wss://basspistol.org"}]}
+    ;
+    const m = main.parseMode(gpa, good) orelse return error.NoMode;
+    try testing.expectEqualStrings("Bass Pistol", m.name());
+    try testing.expectEqualStrings("# Rules\n\n- be interesting", m.home());
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("The relay", m.feeds[0].name());
+    try testing.expectEqualStrings("wss://basspistol.org", m.feeds[0].relay());
+
+    // A later version's fields are ignored, not fatal: a v3 mode still applies
+    // the parts this version understands.
+    const newer =
+        \\{"name":"Later","primaryColor":"#ff6600","kinds":[1,30023],
+        \\ "feeds":[{"name":"x","relay":"wss://a.example","pubkeys":["ab"]}]}
+    ;
+    const n = main.parseMode(gpa, newer) orelse return error.NoMode;
+    try testing.expectEqualStrings("Later", n.name());
+    try testing.expectEqual(@as(u8, 1), n.feeds_len);
+
+    // Not a mode at all. kind:30078 is shared by every app that stores
+    // settings, so an empty document must not be applied as one.
+    try testing.expect(main.parseMode(gpa, "{}") == null);
+    try testing.expect(main.parseMode(gpa, "{\"unrelated\":true}") == null);
+    try testing.expect(main.parseMode(gpa, "not json") == null);
+}
+
+test "a mode cannot point Plaza at a relay it should not dial" {
+    // The relay URL is the one field that reaches the network, so it is checked
+    // rather than trusted. A feed whose relay is refused is dropped and the
+    // rest of the mode still applies.
+    const gpa = testing.allocator;
+
+    const refused = [_][]const u8{
+        "ws://plain.example", // cleartext
+        "http://not.a.relay",
+        "wss://", // nothing after the scheme
+        "wss://has space.example",
+        "wss://has\nnewline.example", // would smuggle a line into a frame
+        "wss://has\ttab.example",
+    };
+    for (refused) |url| {
+        if (main.isSafeRelayUrl(url)) {
+            std.debug.print("accepted a relay it should refuse: {s}\n", .{url});
+            return error.UnsafeRelayAccepted;
+        }
+    }
+    try testing.expect(main.isSafeRelayUrl("wss://basspistol.org"));
+
+    // And end to end: the bad feed goes, the mode stays.
+    const mixed =
+        \\{"name":"Mixed","feeds":[{"name":"bad","relay":"ws://plain.example"}]}
+    ;
+    const m = main.parseMode(gpa, mixed) orelse return error.NoMode;
+    try testing.expectEqualStrings("Mixed", m.name());
+    try testing.expectEqual(@as(u8, 0), m.feeds_len);
+}
+
+test "an overlong mode field is cut on a character boundary" {
+    // A name or home text longer than the buffer is a stranger's choice, not an
+    // error, so it is cut. Cut mid-character it would draw a replacement glyph.
+    const gpa = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"name\":\"");
+    var i: usize = 0;
+    while (i < 40) : (i += 1) try buf.appendSlice(gpa, "\u{1F600}"); // 4 bytes each, 160 total
+    try buf.appendSlice(gpa, "\"}");
+
+    const m = main.parseMode(gpa, buf.items) orelse return error.NoMode;
+    try testing.expect(m.name_len > 0);
+    try testing.expect(m.name_len <= 64);
+    if (!std.unicode.utf8ValidateSlice(m.name())) {
+        std.debug.print("the cut name is not valid UTF-8: {any}\n", .{m.name()});
+        return error.CutMidCharacter;
+    }
+}

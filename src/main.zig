@@ -2609,6 +2609,153 @@ const engagement_request_limit = 500;
 // What an engagement query asks for: replies, reposts, likes, zap receipts.
 const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
 
+// ------------------------------------------------------------------- modes
+//
+// A mode is somebody else's Plaza, published as an event.
+//
+// fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
+// static site on your own domain. That works, and it costs a deploy per variant,
+// so you only get variants worth a deploy. His own suggestion for a native app
+// was the other shape: one binary, several modes, each instantiated from a URL
+// or an event shared by whoever runs the community. Then a mode costs nothing to
+// make, and you get the ones nobody would have deployed a site for: one
+// conference weekend, a reading group of nine people.
+//
+// This is the first slice of that. A mode carries an app name, a home text, and
+// the relays its feeds read from. v1 reads the first two and one feed; the rest
+// of Hallway's surface (colours, kinds, publish targets, densities) arrives in
+// later versions against the same document.
+//
+// EVERYTHING HERE COMES FROM A STRANGER. A mode is an event by definition
+// somebody else signed, so every field is bounded, copied into fixed storage,
+// and never trusted for its length. The relay URL is the sharp one: it decides
+// where the app connects.
+
+/// How much of each field a mode may carry. Small on purpose: this is chrome,
+/// not content, and a mode that wants to say more than this wants to be a note.
+const mode_name_cap = 64;
+const mode_home_cap = 2048;
+const mode_feed_name_cap = 48;
+const mode_relay_cap = 96;
+/// v1 reads one feed. The array is here so the parser does not have to change
+/// shape when v3 reads several.
+const mode_feeds_cap = 1;
+
+const ModeFeed = struct {
+    name_buf: [mode_feed_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    relay_buf: [mode_relay_cap]u8 = @splat(0),
+    relay_len: u8 = 0,
+
+    pub fn name(self: *const ModeFeed) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn relay(self: *const ModeFeed) []const u8 {
+        return self.relay_buf[0..self.relay_len];
+    }
+};
+
+pub const Mode = struct {
+    name_buf: [mode_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    home_buf: [mode_home_cap]u8 = @splat(0),
+    home_len: u16 = 0,
+    feeds: [mode_feeds_cap]ModeFeed = @splat(.{}),
+    feeds_len: u8 = 0,
+    /// Who published it and under what `d`, so the applied mode can be named,
+    /// re-fetched, and told apart from another mode with the same title.
+    author: [32]u8 = @splat(0),
+    ident_buf: [64]u8 = @splat(0),
+    ident_len: u8 = 0,
+
+    pub fn name(self: *const Mode) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn home(self: *const Mode) []const u8 {
+        return self.home_buf[0..self.home_len];
+    }
+    pub fn ident(self: *const Mode) []const u8 {
+        return self.ident_buf[0..self.ident_len];
+    }
+};
+
+/// The kind a mode is published under. NIP-78 is application-specific data
+/// keyed by a `d` tag, which is exactly what this is: one publisher can keep
+/// several modes apart, and editing one replaces it rather than adding a
+/// second.
+const mode_kind: u16 = 30078;
+
+/// Reads a mode out of an event's content. Null when it is not one.
+///
+/// Deliberately tolerant about what it ignores and strict about what it takes:
+/// an unknown field is a later version's, not an error, so a v3 mode still
+/// applies its name and home text here. A field that is present but the wrong
+/// shape IS an error, because silently treating a malformed relay list as an
+/// empty one would connect to nothing and look like a network problem.
+pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
+    @setRuntimeSafety(true); // A stranger's JSON, sized into fixed buffers.
+    const Wire = struct {
+        name: []const u8 = "",
+        home: []const u8 = "",
+        feeds: []const struct {
+            name: []const u8 = "",
+            relay: []const u8 = "",
+        } = &.{},
+    };
+    var parsed = std.json.parseFromSlice(Wire, gpa, content, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const w = parsed.value;
+
+    var m = Mode{};
+    m.name_len = @intCast(copyBounded(&m.name_buf, w.name));
+    m.home_len = @intCast(copyBounded(&m.home_buf, w.home));
+    for (w.feeds) |f| {
+        if (m.feeds_len == m.feeds.len) break;
+        // A feed with no relay is not a feed. Skipped rather than refused: a
+        // later version may describe a feed by pubkey alone, and that mode
+        // should still apply everything else it carries.
+        if (!isSafeRelayUrl(f.relay)) continue;
+        var out = ModeFeed{};
+        out.name_len = @intCast(copyBounded(&out.name_buf, f.name));
+        out.relay_len = @intCast(copyBounded(&out.relay_buf, f.relay));
+        m.feeds[m.feeds_len] = out;
+        m.feeds_len += 1;
+    }
+
+    // A mode with nothing to say is not a mode. This is what stops any random
+    // kind:30078 (the kind is shared by every app that stores settings) from
+    // being applied as one.
+    if (m.name_len == 0 and m.home_len == 0 and m.feeds_len == 0) return null;
+    return m;
+}
+
+/// Copies as much of `src` as fits, on a UTF-8 boundary, and returns the length.
+fn copyBounded(dst: []u8, src: []const u8) usize {
+    var n = @min(src.len, dst.len);
+    // Same boundary rule as the reply snippet: a field cut mid-character draws
+    // a replacement glyph, which is worse than a shorter field.
+    if (n < src.len) {
+        while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
+    }
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+/// Whether a relay URL from a mode is one this app will dial.
+///
+/// The sharpest field in the document: it decides where the app connects. Plain
+/// `wss://` only, no control bytes, no spaces, and short enough to hold. A mode
+/// cannot point Plaza at `ws://` in the clear, and cannot smuggle a newline into
+/// a frame.
+pub fn isSafeRelayUrl(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "wss://")) return false;
+    if (url.len <= "wss://".len or url.len > mode_relay_cap) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
 // -------------------------------------------------- things you can take away
 //
 // A client you can make quiet.
