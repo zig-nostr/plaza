@@ -3047,6 +3047,8 @@ const reply_row_extent: f32 = 62;
 const nested_avatar_size: f32 = 28;
 const nested_name_scale: f32 = 13.0 / 14.5;
 const nested_body_scale: f32 = 13.5 / 14.5;
+/// How much of the answered note the reply line shows before it elides.
+const reply_context_snippet_chars: usize = 80;
 const nested_meta_scale: f32 = 11.5 / 14.5;
 const op_chip_scale: f32 = 9.0 / 14.5;
 /// A nested reply minus its body, the branch line, and the show-more line, all
@@ -12137,10 +12139,15 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     findQuoteRef(&note);
     if (note.quote.kind == .event) wantQuote(note.quote.id);
 
-    // Which note this one answers, for thread nesting.
+    // Which note this one answers, for thread nesting AND for the line the feed
+    // draws above a reply. Queued into the same cache a quote uses: a reply
+    // parent is the same problem, an event referenced by id that may or may not
+    // be on the reader's relays, and it already has the fetching, the backoff
+    // and the eviction.
     if (nip10Parent(ev.tags)) |parent_id| {
         note.reply_parent = parent_id;
         note.has_reply_parent = true;
+        wantQuote(parent_id);
     }
 
     note.setTime(now_s);
@@ -15719,6 +15726,11 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
+    // The reply line and its gap, priced whatever state it is in: it occupies
+    // one line while it says "reply to a note" and one line once it names
+    // somebody, so the row does not resize under the reader when the parent
+    // resolves a moment later.
+    if (note.has_reply_parent) extent += line_height + 4;
     if (!media) return extent;
     // A link card, once the page has answered; nothing before that.
     if (note.hasLink()) {
@@ -21531,6 +21543,109 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
     return ui.column(.{ .gap = 8 }, .{kids[0..n]});
 }
 
+/// The line above a reply saying what it answers.
+///
+/// A feed that mixes replies in with root notes shows half a conversation: an
+/// answer with no question reads as a non sequitur, and worse, as though the
+/// person said it unprompted. Every other client puts the missing half back,
+/// and this is that line.
+///
+/// Deliberately ONE line and no avatar. The picture would want a registry slot,
+/// and there are sixteen for the whole app; a screenful of replies would spend
+/// them all on thumbnails of notes the reader is not reading. The name and the
+/// opening words are what identify a conversation anyway.
+fn replyContext(ui: *AppUi, note: *const Note) AppUi.Node {
+    const e = quoteFor(note.reply_parent);
+    if (e == null) {
+        // The parent's cache slot was reclaimed (it is one LRU shared with
+        // quotes). Ask again so the next tick fills it, and say the neutral
+        // thing meanwhile rather than flickering a wrong name.
+        wantQuote(note.reply_parent);
+        return replyContextLine(ui, "reply to a note", "");
+    }
+    const q = e.?;
+    if (q.state == .idle or q.state == .fetching) return replyContextLine(ui, "reply to a note", "");
+    if (q.state == .missing) {
+        // The same sentence the thread's ancestor row uses for the same fact,
+        // because it IS the same fact.
+        return replyContextLine(ui, "reply to a note not on your relays yet", "");
+    }
+
+    const name = quoteAuthorName(ui, q.pubkey);
+    const label = std.fmt.allocPrint(ui.arena, "reply to {s}", .{name}) catch "reply to a note";
+    return replyContextLine(ui, label, q.text_buf[0..q.text_len]);
+}
+
+/// One muted line: who was answered, then the opening of what they said.
+///
+/// The snippet is a SEPARATE span so it can carry its own dimmer colour, which
+/// is what keeps the name readable when the two run together. Both elide rather
+/// than wrap: this is a pointer at a conversation, not a second note.
+fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.Node {
+    const p = theme.palette;
+    var spans: [2]canvas.TextSpan = undefined;
+    var n: usize = 0;
+    // The name carries the weight and the snippet does not, so the two read
+    // apart on one line without needing a second colour.
+    spans[n] = .{ .text = label, .scale = nested_body_scale, .weight = .medium };
+    n += 1;
+    if (snippet.len > 0) {
+        // One line's worth. The cache already clamps to `quote_text_cap`, and a
+        // paragraph that elides needs less than that or it never reaches the
+        // ellipsis before running out of box.
+        const cut = firstLineOf(snippet, reply_context_snippet_chars);
+        if (cut.len > 0) {
+            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = nested_body_scale };
+            n += 1;
+        }
+    }
+    return ui.paragraph(
+        .{ .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
+        spans[0..n],
+    );
+}
+
+/// The opening of `text`, stopping at the first newline and at `max` bytes, on a
+/// UTF-8 boundary. A snippet cut mid-codepoint draws a replacement glyph, which
+/// is a worse thing to show than a shorter snippet.
+fn firstLineOf(text: []const u8, max: usize) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    var end = @min(trimmed.len, max);
+    if (std.mem.indexOfScalar(u8, trimmed[0..end], '\n')) |nl| end = nl;
+    // Back off to a character boundary by looking at the byte AT the cut, not
+    // the one before it. Stripping trailing continuation bytes is not enough:
+    // it leaves the lead byte they belonged to, which is a broken sequence of
+    // its own. If the first EXCLUDED byte is a continuation, the cut landed
+    // mid-character, so walk back until it is not.
+    if (end < trimmed.len) {
+        while (end > 0 and (trimmed[end] & 0xc0) == 0x80) end -= 1;
+    }
+    return std.mem.trimEnd(u8, trimmed[0..end], " \t\r");
+}
+
+pub fn firstLineOfForTest(text: []const u8, max: usize) []const u8 {
+    return firstLineOf(text, max);
+}
+
+/// Renders just the reply line and returns its concatenated text, so a test can
+/// read what a reader would see without standing up a whole feed.
+pub fn buildReplyContextForTest(arena: std.mem.Allocator, note: *const Note) ![]const u8 {
+    var ui = AppUi.init(arena);
+    const node = replyContext(&ui, note);
+    const tree = try ui.finalize(node);
+    var out: std.ArrayList(u8) = .empty;
+    try collectText(tree.root, arena, &out);
+    return out.items;
+}
+
+fn collectText(w: canvas.Widget, arena: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    if (w.text.len > 0) {
+        try out.appendSlice(arena, w.text);
+        try out.append(arena, ' ');
+    }
+    for (w.children) |c| try collectText(c, arena, out);
+}
+
 /// An embedded quote card for a quoted event `id`: a bordered inset showing the
 /// quoted author and a truncated body, tappable to open it. Loading and
 /// unavailable states are non-pressable and hold the same height, so the feed
@@ -21827,6 +21942,17 @@ pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []con
     e.state = .loaded;
 }
 
+/// Puts a resolved parent in the cache, as an answered fetch would.
+pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
+    wantQuote(id);
+    const q = quoteFor(id) orelse return;
+    q.state = .loaded;
+    q.pubkey = pubkey;
+    const n = @min(text.len, q.text_buf.len);
+    @memcpy(q.text_buf[0..n], text[0..n]);
+    q.text_len = @intCast(n);
+}
+
 pub fn wantQuoteForTest(id: [32]u8) void {
     wantQuote(id);
 }
@@ -22048,6 +22174,11 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                             ),
                         }),
                         vgap(ui, 5),
+                        // What this answers, above the answer. Feed only: in a
+                        // thread the parent is the row directly above, so the
+                        // line would restate what is already on screen.
+                        if (note.has_reply_parent) replyContext(ui, note) else ui.spacer(0),
+                        if (note.has_reply_parent) vgap(ui, 4) else ui.spacer(0),
                         noteBody(ui, note, true),
                         // The picture. The space is reserved at the picture's own
                         // shape whether or not it has loaded, so the feed never
