@@ -10952,6 +10952,18 @@ fn handleNip05Fetched(response: native_sdk.EffectResponse) void {
 // them itself: the platform decoder is tried first (it knows every format the
 // OS does, WebP and HEIC included), and stb takes over when it refuses.
 
+/// Whether the vendored decoder can read `bytes` at all. Test seam: what makes
+/// the platform fallback in `decodeAndRegister` load-bearing is precisely which
+/// formats stb was NOT built for.
+pub fn stbCanDecodeForTest(bytes: []const u8) bool {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
+    stbi_image_free(px);
+    return true;
+}
+
 extern fn stbi_load_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) ?[*]u8;
 extern fn stbi_load_gif_from_memory(buffer: [*]const u8, len: c_int, delays: *?[*]c_int, x: *c_int, y: *c_int, z: *c_int, comp: ?*c_int, req_comp: c_int) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
@@ -11120,9 +11132,17 @@ fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?De
     // avatar drawn at 40pt and asked for at 128 it is four times the pixels on
     // each edge, so sixteen times the texture bytes, for every face on screen.
     //
-    // So the small consumers go straight to the vendored decoder, which honours
-    // `max_dim` exactly. Cheaper in memory, and the only cost is a decode Plaza
-    // was doing anyway before 0.9.2.
+    // So the small consumers TRY the vendored decoder first, which honours
+    // `max_dim` exactly. They do not skip the platform: that broke every face in
+    // the app. stb is compiled for JPEG, PNG and GIF only, and the image proxy
+    // hands back WEBP, which is 327 of the 400 files in my own media cache. A
+    // gate that sent avatars straight to stb sent them to a decoder that cannot
+    // read the format they arrive in, so they all fell back to initials.
+    //
+    // Hence: platform first when the size it picks is the size we want, stb in
+    // the middle because it honours `max_dim`, and platform LAST as the format
+    // fallback. Every image gets a decoder that can read it, and only the ones
+    // stb can read pay for the smaller texture.
     if (max_dim >= media_target_px) {
         if (fx.registerImageBytes(id, bytes)) |registered| {
             return .{ .width = registered.width, .height = registered.height };
@@ -11132,7 +11152,17 @@ fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?De
     var w: c_int = 0;
     var h: c_int = 0;
     var comp: c_int = 0;
-    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return null;
+    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse {
+        // A format stb was not built for, which in practice means WEBP. The
+        // platform decoder reads it, so ask even though it will come back
+        // larger than `max_dim`: a face at the wrong size beats no face.
+        if (max_dim < media_target_px) {
+            if (fx.registerImageBytes(id, bytes)) |registered| {
+                return .{ .width = registered.width, .height = registered.height };
+            } else |_| {}
+        }
+        return null;
+    };
     defer stbi_image_free(pixels);
     if (w <= 0 or h <= 0) return null;
 
