@@ -18140,3 +18140,28 @@ test "a whole batch arriving at once keeps the order it arrived in" {
         }
     }
 }
+
+test "the vendored decoder cannot read WEBP, which is why avatars need the platform" {
+    // This is the fact the avatar path rests on, and it is worth a test because
+    // getting it wrong broke every face in the app.
+    //
+    // src/stb_impl.c builds stb for JPEG, PNG and GIF only. The image proxy
+    // hands back WEBP: 327 of the 400 files in my own media cache. So a decode
+    // path that sends small images to stb ALONE sends them to a decoder that
+    // cannot read the format they arrive in, and every avatar falls back to
+    // initials. `decodeAndRegister` therefore keeps the platform decoder as a
+    // format fallback for the small consumers, even though it returns a larger
+    // image than they asked for.
+    //
+    // A bare RIFF/WEBP signature is enough: stb refusing it proves no WEBP
+    // decoder is compiled in. If somebody later enables one, or vendors
+    // libwebp, this goes red and the fallback can be revisited on purpose
+    // rather than deleted by accident.
+    const webp_signature = "RIFF\x24\x00\x00\x00WEBPVP8 ";
+    try testing.expect(!main.stbCanDecodeForTest(webp_signature));
+
+    // The formats it IS built for still decode, so the assertion above is about
+    // WEBP and not about the buffer being short.
+    const png_1x1 = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0aIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB\x60\x82";
+    try testing.expect(main.stbCanDecodeForTest(png_1x1));
+}
