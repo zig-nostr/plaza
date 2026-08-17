@@ -18165,3 +18165,90 @@ test "the vendored decoder cannot read WEBP, which is why avatars need the platf
     const png_1x1 = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0aIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB\x60\x82";
     try testing.expect(main.stbCanDecodeForTest(png_1x1));
 }
+
+test "a reply in the feed says what it answers" {
+    // A feed that mixes replies in with root notes shows half a conversation:
+    // an answer with no question reads as a non sequitur, or worse as something
+    // the person said unprompted.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+
+    const parent_id = [_]u8{0xab} ** 32;
+    const parent_author = [_]u8{0xcd} ** 32;
+
+    var note = main.Note{};
+    note.id = 4242;
+    note.reply_parent = parent_id;
+    note.has_reply_parent = true;
+
+    // Before the parent resolves the line is still there, holding its place,
+    // saying the neutral thing rather than flickering a name in later.
+    {
+        const tree = try main.buildReplyContextForTest(arena, &note);
+        try testing.expect(std.mem.indexOf(u8, tree, "reply to") != null);
+    }
+
+    // Once it resolves it names the author and shows the opening words.
+    main.fillQuoteForTest(parent_id, parent_author, "sorry, only cold snow up here :D");
+    {
+        const tree = try main.buildReplyContextForTest(arena, &note);
+        try testing.expect(std.mem.indexOf(u8, tree, "reply to") != null);
+        if (std.mem.indexOf(u8, tree, "cold snow") == null) {
+            std.debug.print("the line does not carry the answered note's words: {s}\n", .{tree});
+            return error.NoSnippet;
+        }
+    }
+
+    // A root note gets no line at all.
+    var root = main.Note{};
+    root.id = 99;
+    try testing.expect(!root.has_reply_parent);
+}
+
+test "the snippet stops at one line and on a character boundary" {
+    // A snippet cut mid-codepoint draws a replacement glyph, which is a worse
+    // thing to show than a shorter snippet.
+    const multi = "first line\nsecond line should never appear";
+    try testing.expectEqualStrings("first line", main.firstLineOfForTest(multi, 200));
+
+    // Cut inside a multi-byte character: the result must still be valid UTF-8.
+    const emoji = "aaa\u{1F600}bbb";
+    const cut = main.firstLineOfForTest(emoji, 5); // lands inside the 4-byte emoji
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expectEqualStrings("aaa", cut);
+}
+
+test "building a reply queues the note it answers, so the line can fill in" {
+    // The line is only ever useful if something actually goes and fetches the
+    // parent. `noteFrom` is where that has to happen, because it is the one
+    // place every note in the feed passes through, and a test that fills the
+    // cache by hand proves nothing about it.
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+
+    const parent_hex = "ab" ** 32;
+    const tags = [_]nostr.event.Tag{
+        &.{ "e", parent_hex, "", "reply" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0x11} ** 32,
+        .pubkey = [_]u8{0x22} ** 32,
+        .created_at = 1000,
+        .kind = 1,
+        .tags = &tags,
+        .content = "answering you",
+        .sig = [_]u8{0} ** 64,
+    };
+
+    const note = main.noteFrom(ev, 2000);
+    try testing.expect(note.has_reply_parent);
+
+    if (main.quoteForTest(note.reply_parent) == null) {
+        std.debug.print("the answered note was never queued, so the line stays generic forever\n", .{});
+        return error.ParentNeverRequested;
+    }
+}
