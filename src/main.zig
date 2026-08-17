@@ -2687,19 +2687,32 @@ const mode_kind: u16 = 30078;
 
 /// Reads a mode out of an event's content. Null when it is not one.
 ///
-/// Deliberately tolerant about what it ignores and strict about what it takes:
-/// an unknown field is a later version's, not an error, so a v3 mode still
-/// applies its name and home text here. A field that is present but the wrong
-/// shape IS an error, because silently treating a malformed relay list as an
-/// empty one would connect to nothing and look like a network problem.
+/// THE FIELD NAMES ARE HALLWAY'S, EXACTLY. fiatjaf's deployer ships its whole
+/// configuration as one flat JSON object, `window.hallway.universe`, embedded in
+/// every site it deploys: 41 keys, camelCase. Matching it means a mode published
+/// once means the same thing in both clients, which is worth more than a format
+/// of our own. I guessed at `name`/`home`/`feeds` first and every one was wrong.
+///
+/// v1 reads three of the 41: `appName`, `homeMarkdown`, and the first entry of
+/// `hardcodedFeeds`. The other 38 are ignored HERE and not forgotten: unknown
+/// fields are skipped rather than refused, so a mode carrying the full object
+/// already applies the parts this version understands and picks up the rest as
+/// later versions learn them.
 pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
     @setRuntimeSafety(true); // A stranger's JSON, sized into fixed buffers.
     const Wire = struct {
-        name: []const u8 = "",
-        home: []const u8 = "",
-        feeds: []const struct {
+        appName: []const u8 = "",
+        homeMarkdown: []const u8 = "",
+        hardcodedFeeds: []const struct {
+            /// Optional in Hallway's own data: one feed on the site I read
+            /// carries only `relays`, so a feed with no name falls back to its
+            /// relay's host rather than drawing blank.
             name: []const u8 = "",
-            relay: []const u8 = "",
+            icon: []const u8 = "",
+            /// An ARRAY, and a feed can name several. v1 reads the first one it
+            /// will dial and says so; reading all of them is v3's job.
+            relays: []const []const u8 = &.{},
+            pubkeys: []const []const u8 = &.{},
         } = &.{},
     };
     var parsed = std.json.parseFromSlice(Wire, gpa, content, .{ .ignore_unknown_fields = true }) catch return null;
@@ -2707,17 +2720,25 @@ pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
     const w = parsed.value;
 
     var m = Mode{};
-    m.name_len = @intCast(copyBounded(&m.name_buf, w.name));
-    m.home_len = @intCast(copyBounded(&m.home_buf, w.home));
-    for (w.feeds) |f| {
+    m.name_len = @intCast(copyBounded(&m.name_buf, w.appName));
+    m.home_len = @intCast(copyBounded(&m.home_buf, w.homeMarkdown));
+    for (w.hardcodedFeeds) |f| {
         if (m.feeds_len == m.feeds.len) break;
-        // A feed with no relay is not a feed. Skipped rather than refused: a
-        // later version may describe a feed by pubkey alone, and that mode
-        // should still apply everything else it carries.
-        if (!isSafeRelayUrl(f.relay)) continue;
+        // The first relay of this feed that is safe to dial. A feed whose relays
+        // are all refused is skipped, and the rest of the mode still applies.
+        var chosen: []const u8 = "";
+        for (f.relays) |r| {
+            if (isSafeRelayUrl(r)) {
+                chosen = r;
+                break;
+            }
+        }
+        if (chosen.len == 0) continue;
+
         var out = ModeFeed{};
-        out.name_len = @intCast(copyBounded(&out.name_buf, f.name));
-        out.relay_len = @intCast(copyBounded(&out.relay_buf, f.relay));
+        out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
+        const label = if (f.name.len > 0) f.name else relayHost(chosen);
+        out.name_len = @intCast(copyBounded(&out.name_buf, label));
         m.feeds[m.feeds_len] = out;
         m.feeds_len += 1;
     }
@@ -2727,6 +2748,14 @@ pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
     // being applied as one.
     if (m.name_len == 0 and m.home_len == 0 and m.feeds_len == 0) return null;
     return m;
+}
+
+/// A relay URL without its scheme or trailing slash, for naming a feed that did
+/// not name itself.
+fn relayHost(url: []const u8) []const u8 {
+    var h = url;
+    if (std.mem.startsWith(u8, h, "wss://")) h = h["wss://".len..];
+    return std.mem.trimEnd(u8, h, "/");
 }
 
 /// Copies as much of `src` as fits, on a UTF-8 boundary, and returns the length.
@@ -13173,6 +13202,9 @@ pub const Msg = union(enum) {
     open_join,
     /// Dismiss the join sheet; a remembered intent is forgotten with it.
     close_join,
+    mode_apply,
+    mode_dismiss,
+    mode_leave,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
     /// The sheet's import path: open the Notary window (a separate process),
@@ -14389,6 +14421,12 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
             return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
         }
     }
+    // Above everything, wherever the reader is. A mode arrives from a link that
+    // could be clicked while they are anywhere, and it changes what the app
+    // connects to, so it is a decision to take rather than a screen to find.
+    if (offeredMode()) |m| {
+        return ui.stack(.{ .grow = 1 }, .{ base, modeOfferSheet(ui, m) });
+    }
     if (model.stage == .ready and model.joining) {
         return ui.stack(.{ .grow = 1 }, .{ base, joinSheet(ui, model) });
     }
@@ -15009,6 +15047,70 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
                         ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
                     }),
                 }),
+            }),
+        }),
+    });
+}
+
+/// What a mode is about to change, before it changes it.
+///
+/// A mode sets where the app connects, so applying is never automatic. This is
+/// the whole trust surface of the feature: it names the publisher, shows the
+/// text they wrote, and lists the relay it would add, and none of that happens
+/// until the reader presses the button.
+fn modeOfferSheet(ui: *AppUi, m: *const Mode) AppUi.Node {
+    const p = theme.palette;
+    var rows: [8]AppUi.Node = undefined;
+    var n: usize = 0;
+
+    rows[n] = ui.paragraph(
+        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
+        &.{.{ .text = ui.fmt("Open {s}?", .{if (m.name_len > 0) m.name() else "this place"}), .scale = 1.1, .weight = .medium }},
+    );
+    n += 1;
+    rows[n] = vgap(ui, 7);
+    n += 1;
+
+    // Who signed it. A mode is somebody's, and knowing whose is most of
+    // deciding whether to open it.
+    rows[n] = ui.paragraph(
+        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+        &.{.{ .text = ui.fmt("published by {s}", .{quoteAuthorName(ui, m.author)}), .scale = mono_hint_scale }},
+    );
+    n += 1;
+    rows[n] = vgap(ui, 10);
+    n += 1;
+
+    // What it would change, stated plainly and completely for v1: the name, the
+    // relay, and that a text comes with it. Nothing else in a v1 mode reaches
+    // the app, so nothing else is claimed.
+    if (m.feeds_len > 0) {
+        rows[n] = ui.paragraph(
+            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = ui.fmt("It adds one feed, reading from {s}. That relay is not joined, is not published as yours, and nothing is posted to it.", .{m.feeds[0].relay()}), .scale = mono_hint_scale }},
+        );
+        n += 1;
+        rows[n] = vgap(ui, 10);
+        n += 1;
+    }
+
+    rows[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
+        ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.mode_apply }, "Open it"),
+        ui.button(.{ .size = .sm, .on_press = Msg.mode_dismiss }, "Not now"),
+    });
+    n += 1;
+
+    return ui.el(.dialog, .{
+        .grow = 1,
+        .padding = 16,
+        .on_dismiss = .mode_dismiss,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = "Open this place?" },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 24),
+                settingsCard(ui, .{ui.column(.{ .gap = 0, .grow = 1 }, .{rows[0..n]})}),
             }),
         }),
     });
@@ -20032,6 +20134,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
+        if (appliedMode()) |m| modeStrip(ui, m) else ui.spacer(0),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
@@ -20357,6 +20460,41 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The feed's scope line: which feed this is (the starter pack) and how wide it
 /// reaches. A property of the feed, not a destination to choose between.
+/// The strip that says which place you are in, and how to leave it.
+///
+/// v1's whole visible payload: the name somebody chose, the text they wrote,
+/// and one press back out. Above the scope line rather than replacing it,
+/// because a mode is a place you are visiting, not a different app: your feed,
+/// your account and your relays are all still underneath.
+fn modeStrip(ui: *AppUi, m: *const Mode) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
+        vgap(ui, 11),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = scope_title_scale }},
+            ),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.mode_leave }, "Leave"),
+            hgap(ui, chrome_inset),
+        }),
+        // The text whoever set the place up wrote. Markdown, because that is
+        // what Hallway's field is and what people put in it: a heading, a
+        // sentence, and the house rules as a list.
+        if (m.home_len > 0) ui.row(.{ .cross = .start, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.column(.{ .width = picture_column_width, .gap = 0 }, .{
+                canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
+            }),
+            hgap(ui, chrome_inset),
+        }) else ui.spacer(0),
+        vgap(ui, 6),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = theme.palette.divider_row, .background = theme.palette.divider_row } }),
+    })});
+}
+
 fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // The scope name and the pack's size, on one line with the redesign's 11/16/9
@@ -23104,7 +23242,209 @@ pub const EffectsForTest = Effects;
 
 /// Boot: seed the feed once, register whatever images are already cached, then
 /// arm the repeating timers.
+/// Receiving a `plaza://` link. See `src/urlscheme.m`: the SDK registers the
+/// scheme but hands the app nothing, so Plaza installs its own Apple Event
+/// handler. macOS-only; elsewhere these are stubs and a link does nothing,
+/// which is honest because no other platform routes one here either.
+/// Not in test builds: the suite does not link AppKit (nothing in it receives
+/// an Apple Event, and linking it would make the tests need a window server),
+/// so referencing the symbols there would fail to link.
+const has_url_scheme = builtin.os.tag == .macos and !builtin.is_test;
+extern fn plaza_url_scheme_install() void;
+extern fn plaza_url_scheme_take(out: [*]u8, cap: usize) usize;
+
+/// The link macOS handed us since the last tick, if any.
+fn takePendingLink(buf: []u8) ?[]const u8 {
+    if (!has_url_scheme) return null;
+    const n = plaza_url_scheme_take(buf.ptr, buf.len);
+    if (n == 0) return null;
+    return buf[0..n];
+}
+
+/// What a `plaza://` link asks for.
+///
+/// One shape in v1: `plaza://mode/<naddr>`, which applies somebody's published
+/// mode. The path segment is there so a later version can add others without
+/// the first form becoming ambiguous.
+///
+/// Untrusted: a link can come from a note, a DM, or anywhere else. It names
+/// what to fetch and never carries the mode itself, so the worst a hostile link
+/// can do is point Plaza at an event that is not a mode, which the parser
+/// refuses, or one that is, which is then shown before it applies.
+pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
+    const prefix = "plaza://mode/";
+    if (!std.mem.startsWith(u8, link, prefix)) return null;
+    var rest = link[prefix.len..];
+    // A query or fragment is ordinary link decoration (a tracker, an anchor)
+    // and is cut off.
+    if (std.mem.indexOfAny(u8, rest, "?#")) |cut| rest = rest[0..cut];
+    if (rest.len == 0 or rest.len > 1024) return null;
+    if (!std.mem.startsWith(u8, rest, "naddr1")) return null;
+    // bech32 is lowercase alphanumeric. Checked here so nothing downstream has
+    // to wonder what a stranger put in the path, and it is also what refuses an
+    // extra path segment: `plaza://mode/<naddr>` has exactly one, and a `/`
+    // is not a bech32 character. I wrote a separate check for that first and no
+    // probe could fail it, because this one already covered it.
+    for (rest) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
+        if (!ok) return null;
+    }
+    return rest;
+}
+
+/// The mode currently applied, if any. Null is Plaza being itself.
+var g_mode: ?Mode = null;
+/// A mode that has been fetched and is waiting to be looked at. Applying is
+/// never automatic: a mode sets where the app connects, so a link opens an
+/// offer, not a new client.
+var g_mode_offer: ?Mode = null;
+/// What we are fetching, while we fetch it.
+var g_mode_want: ?struct {
+    pubkey: [32]u8,
+    ident_buf: [64]u8,
+    ident_len: u8,
+    /// Ticks the fetch has been outstanding, so it can give up and say so.
+    waited: u16 = 0,
+} = null;
+
+pub fn appliedMode() ?*const Mode {
+    return if (g_mode) |*m| m else null;
+}
+pub fn offeredMode() ?*const Mode {
+    return if (g_mode_offer) |*m| m else null;
+}
+
+fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
+    _ = model;
+    const naddr = parsePlazaLink(link) orelse return;
+    const gpa = std.heap.page_allocator;
+    var ptr = nostr.nip19.decodeNaddr(gpa, naddr) catch return;
+    defer ptr.deinit(gpa);
+    // Only ever a mode. The link says `mode`, so an address pointing at some
+    // other kind is a link that lies, not a kind to go and fetch.
+    if (ptr.kind != mode_kind) return;
+
+    var want: @TypeOf(g_mode_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
+    g_mode_want = want;
+    askMode(fx, ptr.relays);
+}
+
+/// Asks for a mode event: the pool, plus the relays the address itself named.
+///
+/// The hints matter more here than anywhere else in the app. A mode is
+/// published by whoever runs a community, on that community's relay, and the
+/// reader has by definition not joined it yet: that is the thing the link is
+/// for. Asking only the reader's own relays would fail for exactly the case
+/// this feature exists to serve.
+fn askMode(fx: *Effects, hints: []const []const u8) void {
+    _ = fx;
+    const want = g_mode_want orelse return;
+    const ident = want.ident_buf[0..want.ident_len];
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{mode_kind};
+    const values = [_][]const u8{ident};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{
+        .authors = &authors,
+        .kinds = &kinds,
+        .tags = &tags,
+        .limit = 1,
+    }};
+    _ = askPool(one_shot_sub_prefix ++ "mode", &filters);
+
+    // And the hinted relays, which the pool does not hold. One throwaway socket
+    // each, bounded, the same shape every other one-shot in this app uses.
+    var n: usize = 0;
+    for (hints) |h| {
+        if (n >= 3) break;
+        if (!isSafeRelayUrl(h)) continue;
+        var url_buf: [mode_relay_cap]u8 = undefined;
+        const len = copyBounded(&url_buf, h);
+        const t = std.Thread.spawn(.{}, askModeAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
+        t.detach();
+        n += 1;
+    }
+}
+
+fn askModeAt(url_buf: [mode_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
+
+    const authors = [_][32]u8{pubkey};
+    const kinds = [_]u16{mode_kind};
+    const values = [_][]const u8{ident_buf[0..ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }};
+    relay.subscribe(one_shot_sub_prefix ++ "mode", &filters) catch return;
+    while (true) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .eose => break,
+            else => {},
+        }
+    }
+}
+
+/// Looks for the mode being waited on, once the store has grown. Called from
+/// the tick, which is where every other "did it arrive yet" check in this app
+/// lives.
+fn refreshModeOffer() void {
+    const want = g_mode_want orelse return;
+    if (g_mode_offer != null) return;
+    const store = g_store orelse return;
+    const gpa = std.heap.page_allocator;
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{mode_kind};
+    const values = [_][]const u8{want.ident_buf[0..want.ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return;
+    defer result.deinit();
+
+    if (result.events.len == 0) {
+        // Give up eventually rather than spinning on a store read forever. A
+        // mode nobody can find is a fact worth showing, not a spinner.
+        g_mode_want.?.waited +|= 1;
+        if (g_mode_want.?.waited > mode_fetch_ticks) g_mode_want = null;
+        return;
+    }
+    var m = parseMode(gpa, result.events[0].content) orelse {
+        // It exists and is not a mode. Stop asking.
+        g_mode_want = null;
+        return;
+    };
+    m.author = want.pubkey;
+    m.ident_len = want.ident_len;
+    m.ident_buf = want.ident_buf;
+    g_mode_offer = m;
+    g_mode_want = null;
+}
+
+/// How many ticks a mode fetch may go unanswered. The tick is a second, and a
+/// relay that has not answered in fifteen is one that does not have it.
+const mode_fetch_ticks = 15;
+
 pub fn boot(model: *Model, fx: *Effects) void {
+    // FIRST, before anything slow. On a cold launch macOS sends the Apple Event
+    // moments after the app starts, so a handler installed after the store is
+    // opened misses the very link that launched Plaza.
+    if (has_url_scheme) plaza_url_scheme_install();
+    if (g_io) |io| {
+        if (g_environ) |environ| loadMode(io, environ);
+    }
     model.refresh(nowSeconds());
     // What was written but not sent when the app last closed, back in the
     // composer where it was left.
@@ -23157,6 +23497,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome == .fired) {
                 const now = nowSeconds();
+                // A `plaza://` link somebody clicked, drained once per tick.
+                // Polling rather than an effect because the Apple Event lands
+                // on the main thread outside the SDK's event loop entirely,
+                // so there is nothing to subscribe to.
+                var link_buf: [2048]u8 = undefined;
+                if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+                refreshModeOffer();
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
@@ -23518,6 +23865,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             saveDraft(model.draft());
         },
         .open_join => model.joining = true,
+        .mode_apply => {
+            if (g_mode_offer) |m| {
+                g_mode = m;
+                g_mode_offer = null;
+                saveMode();
+            }
+        },
+        .mode_dismiss => g_mode_offer = null,
+        .mode_leave => {
+            g_mode = null;
+            saveMode();
+        },
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
@@ -28253,6 +28612,49 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
     }
+}
+
+/// Where the applied mode is written, so opening a place survives a restart.
+///
+/// Its own file rather than a line in `settings`: a mode is somebody else's
+/// document, and keeping it whole means the next version can read fields this
+/// one ignored without a migration.
+const mode_file = "mode";
+
+fn saveMode() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    const m = g_mode orelse {
+        dir.deleteFile(io, mode_file) catch {};
+        return;
+    };
+    // Written back in Hallway's own shape, so the file is the document and not
+    // a private encoding of it.
+    var buf: [mode_home_cap + 512]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf,
+        \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}]}}
+    , .{
+        std.json.fmt(m.name(), .{}),
+        std.json.fmt(m.home(), .{}),
+        std.json.fmt(if (m.feeds_len > 0) m.feeds[0].name() else "", .{}),
+        std.json.fmt(if (m.feeds_len > 0) m.feeds[0].relay() else "", .{}),
+    }) catch return;
+    dir.writeFile(io, .{
+        .sub_path = mode_file,
+        .data = data,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+fn loadMode(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, mode_file, gpa, std.Io.Limit.limited(mode_home_cap + 1024)) catch return;
+    defer gpa.free(raw);
+    g_mode = parseMode(gpa, raw);
 }
 
 /// Persists app-wide settings. Best-effort, like the session file.

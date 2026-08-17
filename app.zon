@@ -8,6 +8,12 @@
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "clipboard" },
     .capabilities = .{ "native_views", "gpu_surfaces" },
+    // `plaza://` links, so a mode can be shared in a note and opened from
+    // anywhere. This writes CFBundleURLTypes into the packaged Info.plist;
+    // receiving the URL is src/urlscheme.m, because the SDK does not.
+    .url_schemes = .{
+        .{ .scheme = "plaza" },
+    },
     .shell = .{
         .windows = .{
             .{

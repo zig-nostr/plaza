@@ -18253,32 +18253,37 @@ test "building a reply queues the note it answers, so the line can fill in" {
     }
 }
 
-test "a mode is read out of a stranger's event, and its relay is checked" {
-    // Every field here was signed by somebody else, so the parser is the
-    // boundary. The relay URL is the sharp one: it decides where the app
-    // connects.
+test "a mode is read out of a stranger's event, using Hallway's own field names" {
+    // The names are fiatjaf's, not mine: `window.hallway.universe` is a flat
+    // object of 41 camelCase keys embedded in every site his deployer ships. A
+    // mode published once should mean the same thing in both clients.
     const gpa = testing.allocator;
 
     const good =
-        \\{"name":"Bass Pistol","home":"# Rules\n\n- be interesting",
-        \\ "feeds":[{"name":"The relay","relay":"wss://basspistol.org"}]}
+        \\{"appName":"nOasis","homeMarkdown":"# Rules\n\n- be interesting",
+        \\ "hardcodedFeeds":[{"name":"Spatia-Arcana","relays":["wss://spatia-arcana.com"]}]}
     ;
     const m = main.parseMode(gpa, good) orelse return error.NoMode;
-    try testing.expectEqualStrings("Bass Pistol", m.name());
+    try testing.expectEqualStrings("nOasis", m.name());
     try testing.expectEqualStrings("# Rules\n\n- be interesting", m.home());
     try testing.expectEqual(@as(u8, 1), m.feeds_len);
-    try testing.expectEqualStrings("The relay", m.feeds[0].name());
-    try testing.expectEqualStrings("wss://basspistol.org", m.feeds[0].relay());
+    try testing.expectEqualStrings("Spatia-Arcana", m.feeds[0].name());
+    try testing.expectEqualStrings("wss://spatia-arcana.com", m.feeds[0].relay());
 
-    // A later version's fields are ignored, not fatal: a v3 mode still applies
-    // the parts this version understands.
-    const newer =
-        \\{"name":"Later","primaryColor":"#ff6600","kinds":[1,30023],
-        \\ "feeds":[{"name":"x","relay":"wss://a.example","pubkeys":["ab"]}]}
+    // The other 38 keys are ignored rather than refused, so a mode carrying the
+    // whole object still applies the three this version reads.
+    const full =
+        \\{"appName":"Later","defaultPrimaryColor":"CYAN","feedKinds":[1,6,20],
+        \\ "kindGroups":[{"kinds":[1,6],"label":"Notes"}],
+        \\ "indexerUrls":["wss://purplepag.es"],"dearrowYoutube":true,
+        \\ "hardcodedFeeds":[{"relays":["wss://a.example"],"pubkeys":["abcd"]}]}
     ;
-    const n = main.parseMode(gpa, newer) orelse return error.NoMode;
+    const n = main.parseMode(gpa, full) orelse return error.NoMode;
     try testing.expectEqualStrings("Later", n.name());
     try testing.expectEqual(@as(u8, 1), n.feeds_len);
+    // A feed with no name of its own is labelled by its host: Hallway's own
+    // data has one like this, so it is a real case and not a hypothetical.
+    try testing.expectEqualStrings("a.example", n.feeds[0].name());
 
     // Not a mode at all. kind:30078 is shared by every app that stores
     // settings, so an empty document must not be applied as one.
@@ -18289,8 +18294,7 @@ test "a mode is read out of a stranger's event, and its relay is checked" {
 
 test "a mode cannot point Plaza at a relay it should not dial" {
     // The relay URL is the one field that reaches the network, so it is checked
-    // rather than trusted. A feed whose relay is refused is dropped and the
-    // rest of the mode still applies.
+    // rather than trusted.
     const gpa = testing.allocator;
 
     const refused = [_][]const u8{
@@ -18309,13 +18313,16 @@ test "a mode cannot point Plaza at a relay it should not dial" {
     }
     try testing.expect(main.isSafeRelayUrl("wss://basspistol.org"));
 
-    // And end to end: the bad feed goes, the mode stays.
+    // A feed picks the first relay it WILL dial, rather than the first listed:
+    // one bad entry must not cost the whole feed.
     const mixed =
-        \\{"name":"Mixed","feeds":[{"name":"bad","relay":"ws://plain.example"}]}
+        \\{"appName":"Mixed","hardcodedFeeds":[
+        \\ {"name":"ok","relays":["ws://plain.example","wss://good.example"]},
+        \\ {"name":"none","relays":["http://nope.example"]}]}
     ;
     const m = main.parseMode(gpa, mixed) orelse return error.NoMode;
-    try testing.expectEqualStrings("Mixed", m.name());
-    try testing.expectEqual(@as(u8, 0), m.feeds_len);
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("wss://good.example", m.feeds[0].relay());
 }
 
 test "an overlong mode field is cut on a character boundary" {
@@ -18325,7 +18332,7 @@ test "an overlong mode field is cut on a character boundary" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
-    try buf.appendSlice(gpa, "{\"name\":\"");
+    try buf.appendSlice(gpa, "{\"appName\":\"");
     var i: usize = 0;
     while (i < 40) : (i += 1) try buf.appendSlice(gpa, "\u{1F600}"); // 4 bytes each, 160 total
     try buf.appendSlice(gpa, "\"}");
@@ -18336,5 +18343,37 @@ test "an overlong mode field is cut on a character boundary" {
     if (!std.unicode.utf8ValidateSlice(m.name())) {
         std.debug.print("the cut name is not valid UTF-8: {any}\n", .{m.name()});
         return error.CutMidCharacter;
+    }
+}
+
+test "a plaza:// link names what to fetch and nothing else" {
+    // A link can arrive from a note, a DM, anywhere. It carries an address, not
+    // a mode, so the worst a hostile one can do is point Plaza at an event that
+    // is not a mode (refused by the parser) or one that is (shown before it
+    // applies).
+    const ok = main.parsePlazaLink("plaza://mode/naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n", ok);
+
+    // A trailing slash, query or fragment is a link shortener's, not the address.
+    const trimmed = main.parsePlazaLink("plaza://mode/naddr1abc?utm_source=x") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1abc", trimmed);
+
+    const refused = [_][]const u8{
+        "plaza://mode/", // nothing to fetch
+        "plaza://mode/nevent1abc", // not an address
+        "plaza://mode/NADDR1ABC", // bech32 is lowercase
+        "plaza://mode/naddr1 abc", // a space is not bech32
+        "plaza://something/naddr1abc", // an action this version does not know
+        "plaza://naddr1abc", // no action at all
+        "https://evil.example/naddr1abc", // not our scheme
+        "plaza://mode/naddr1abc/../../etc", // path games
+    };
+    for (refused) |link| {
+        if (main.parsePlazaLink(link) != null) {
+            std.debug.print("accepted a link it should refuse: {s}\n", .{link});
+            return error.BadLinkAccepted;
+        }
     }
 }
