@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // The Native SDK framework, pinned to the tag matching the `native`
-        // CLI (0.9.0 -> commit 9ce03701). `native eject` writes a machine-local
+        // CLI (0.9.2 -> commit 8d0da34e). `native eject` writes a machine-local
         // `.path` into the npm install here; this git pin is committable and
         // reproducible instead, CI fetches the exact framework by hash.
         //
@@ -14,8 +14,8 @@
         // CLI and the framework speak different protocol versions, and moving
         // one alone does not fail the build: it silently breaks every live test.
         .native_sdk = .{
-            .url = "git+https://github.com/vercel-labs/native.git#9ce0370181f70889a82700e5f74e3215f5933cb1",
-            .hash = "native_sdk-0.1.0-hzDzQlM2mgKEu6l3E3xOtFop1ZPIe9Jka7EYf2doPkow",
+            .url = "git+https://github.com/vercel-labs/native.git#8d0da34e62cf5da25aa1d1eb95e60e6504dd00e8",
+            .hash = "native_sdk-0.1.0-hzDzQsUNqQKw1x-wc3wEyiXTWBHhciSI2Y_Kf_EklrFf",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the

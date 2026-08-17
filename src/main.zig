@@ -3104,6 +3104,11 @@ const compose_sheet_width: f32 = 560;
 /// around a single input reads as a form.
 const join_sheet_width: f32 = 372;
 const name_card_width: f32 = 340;
+/// The two other modal card widths, named because a `.dialog` now needs its
+/// width stated: the SDK centres a modal at its preferred size and falls back to
+/// a 420pt default, which silently clamped the profile card's 400 + 16 padding.
+const profile_edit_card_width: f32 = 400;
+const join_card_width: f32 = 420;
 const join_title_scale: f32 = 17.0 / 14.5;
 const join_sub_scale: f32 = 11.5 / 14.5;
 const join_label_scale: f32 = 9.0 / 14.5;
@@ -11103,11 +11108,26 @@ pub fn imageSizeUsable(width: usize, height: usize) bool {
 /// edge is at most `max_dim`. Returns the registered size, or null on failure.
 fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?DecodedSize {
     @setRuntimeSafety(true); // Pixel dimensions a stranger's file declares, multiplied into a buffer size.
-    // Fast path: let the platform decode and register directly. This succeeds
-    // whenever the image already fits the registry's budget.
-    if (fx.registerImageBytes(id, bytes)) |registered| {
-        return .{ .width = registered.width, .height = registered.height };
-    } else |_| {}
+    // Fast path: let the platform decode and register directly, but only when
+    // what it produces is close to what this caller asked for.
+    //
+    // SDK 0.9.2 taught the platform decoder to downsample (thumbnail-at-index
+    // against a pixel budget), so this stopped failing on real photos and
+    // started succeeding on nearly all of them. That is the fix I asked for and
+    // it is worth taking. The catch is that it fits the REGISTRY BUDGET, not
+    // `max_dim`: it hands back roughly 512x512 whatever the caller wanted. For
+    // feed media (480) and a banner (512) that is the right answer. For an
+    // avatar drawn at 40pt and asked for at 128 it is four times the pixels on
+    // each edge, so sixteen times the texture bytes, for every face on screen.
+    //
+    // So the small consumers go straight to the vendored decoder, which honours
+    // `max_dim` exactly. Cheaper in memory, and the only cost is a decode Plaza
+    // was doing anyway before 0.9.2.
+    if (max_dim >= media_target_px) {
+        if (fx.registerImageBytes(id, bytes)) |registered| {
+            return .{ .width = registered.width, .height = registered.height };
+        } else |_| {}
+    }
 
     var w: c_int = 0;
     var h: c_int = 0;
@@ -14224,77 +14244,72 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
 /// is not blank. Fully skippable; the remembered intent replays either way.
 fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
+    return modalScrim(ui, "Name", .name_skip, ui.el(.dialog, .{
+        .width = name_card_width,
         .on_dismiss = .name_skip,
-        .on_press = .name_skip,
-        .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Name" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
-                ),
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                    &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
-                ),
-                ui.el(.textarea, .{
-                    .text = model.name_draft(),
-                    .placeholder = "A name people will see",
-                    .on_input = AppUi.inputMsg(.name_edit),
-                    .autofocus = true,
-                    .on_submit = .name_save,
-                    .height = 38,
-                    .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
-                }, .{}),
-                ui.row(.{ .gap = 0, .cross = .center }, .{
-                    // Never disabled. Blank is a valid answer to "want a name on
-                    // it?", and it means the same thing as Skip, so Done takes it
-                    // and moves on rather than sitting there greyed out while the
-                    // reader wonders what is wrong with an empty field.
-                    // Painted by a `.panel`, pressed by the row around it. A
-                    // `.list_item` given a background draws none, so the first
-                    // version of this button was white text on the card's own
-                    // dark surface: present, pressable, and unreadable.
-                    ui.row(.{
+        modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
+            ),
+            ui.el(.textarea, .{
+                .text = model.name_draft(),
+                .placeholder = "A name people will see",
+                .on_input = AppUi.inputMsg(.name_edit),
+                .autofocus = true,
+                .on_submit = .name_save,
+                .height = 38,
+                .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
+            }, .{}),
+            ui.row(.{ .gap = 0, .cross = .center }, .{
+                // Never disabled. Blank is a valid answer to "want a name on
+                // it?", and it means the same thing as Skip, so Done takes it
+                // and moves on rather than sitting there greyed out while the
+                // reader wonders what is wrong with an empty field.
+                // Painted by a `.panel`, pressed by the row around it. A
+                // `.list_item` given a background draws none, so the first
+                // version of this button was white text on the card's own
+                // dark surface: present, pressable, and unreadable.
+                ui.row(.{
+                    .grow = 1,
+                    .gap = 0,
+                    .on_press = Msg.name_save,
+                    .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                }, .{
+                    ui.el(.panel, .{
                         .grow = 1,
-                        .gap = 0,
-                        .on_press = Msg.name_save,
-                        .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                        .padding = 0.01,
+                        .style = .{ .background = p.accent, .radius = 8 },
                     }, .{
-                        ui.el(.panel, .{
-                            .grow = 1,
-                            .padding = 0.01,
-                            .style = .{ .background = p.accent, .radius = 8 },
-                        }, .{
-                            ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
-                                ui.paragraph(
-                                    .{ .style = .{ .foreground = p.on_accent } },
-                                    &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
-                                ),
-                            }),
+                        ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
+                            ui.paragraph(
+                                .{ .style = .{ .foreground = p.on_accent } },
+                                &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
+                            ),
                         }),
                     }),
-                    hgap(ui, 12),
-                    ui.el(.list_item, .{
-                        .padding = 0.01,
-                        .on_press = Msg.name_skip,
-                        .style = .{ .quiet_hover = true },
-                        .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
-                    }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_muted } },
-                            &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
-                        ),
-                    }),
                 }),
-            })),
-        }),
-    });
+                hgap(ui, 12),
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .on_press = Msg.name_skip,
+                    .style = .{ .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
+                }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
+                    ),
+                }),
+            }),
+        })),
+    }));
 }
 
 /// The Edit profile sheet. No mock draws it, so it is the modal-card recipe with
@@ -14306,52 +14321,47 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const status = model.profile_status();
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
+    return modalScrim(ui, "Edit profile", Msg.close_profile_edit, ui.el(.dialog, .{
+        .width = profile_edit_card_width,
         .on_dismiss = Msg.close_profile_edit,
-        .on_press = Msg.close_profile_edit,
-        .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Edit profile" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, 400, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
+            ),
+            profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
+            profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
+            profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
+            if (status.len > 0)
                 ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
-                ),
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                    &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
-                ),
-                profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
-                profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
-                profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
-                if (status.len > 0)
-                    ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
-                        &.{.{ .text = status, .scale = mono_hint_scale }},
-                    )
+                    .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
+                    &.{.{ .text = status, .scale = mono_hint_scale }},
+                )
+            else
+                ui.spacer(0),
+            ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
+                ui.spacer(1),
+                if (model.profile_stage == .unread)
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
                 else
                     ui.spacer(0),
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
-                    ui.spacer(1),
-                    if (model.profile_stage == .unread)
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
-                    else
-                        ui.spacer(0),
-                    if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
-                    ui.button(.{
-                        .size = .sm,
-                        .variant = .primary,
-                        .disabled = !model.profile_can_save(),
-                        .on_press = Msg.profile_save,
-                    }, "Save"),
-                }),
-            })),
-        }),
-    });
+                if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .primary,
+                    .disabled = !model.profile_can_save(),
+                    .on_press = Msg.profile_save,
+                }, "Save"),
+            }),
+        })),
+    }));
 }
 
 /// One labelled field in the sheet.
@@ -14767,48 +14777,52 @@ fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
 /// one press away and costs nothing: the app can ask again.
 fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.dialog, .{
+    // No dismiss and no backdrop press, deliberately: an app is asking to sign as
+    // this person and the only ways out are the four answers on the card. The
+    // scrim is still here to dim what is behind it and to swallow presses that
+    // would otherwise land on the feed.
+    return ui.el(.panel, .{
         .grow = 1,
-        .padding = 16,
+        .on_press = Msg.absorb_press,
         .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "An app wants to sign as you" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.column(.{ .gap = 0 }, .{
-                vgap(ui, 24),
-                settingsCard(ui, .{
-                    ui.column(.{ .gap = 0, .grow = 1 }, .{
-                        ui.paragraph(
-                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
-                            &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
-                        ),
-                        vgap(ui, 7),
-                        ui.paragraph(
-                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                            &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
-                        ),
-                        vgap(ui, 7),
-                        ui.paragraph(
-                            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                            &.{.{
-                                .text = if (bunkerAskIsConnect())
-                                    "Letting it in does not let it sign yet: it is asked again the first time it wants to. If it already gave up waiting, approve anyway and connect again from the app, because this is remembered."
-                                else
-                                    "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
-                                .scale = mono_hint_scale,
-                            }},
-                        ),
-                        vgap(ui, 12),
-                        // Four answers rather than two. Amber's shape: "not now",
-                        // "for a while" and "stop asking" all reachable in one
-                        // press, because a prompt with only yes and no is one
-                        // people learn to hit yes on.
-                        ui.row(.{ .gap = 8, .cross = .center }, .{
-                            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
-                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
-                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
-                            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
-                        }),
+        ui.el(.dialog, .{
+            .width = settings_column_width,
+            .semantics = .{ .label = "An app wants to sign as you" },
+        }, .{
+            settingsCard(ui, .{
+                ui.column(.{ .gap = 0, .grow = 1 }, .{
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
+                        &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
+                    ),
+                    vgap(ui, 7),
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                        &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
+                    ),
+                    vgap(ui, 7),
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                        &.{.{
+                            .text = if (bunkerAskIsConnect())
+                                "Letting it in does not let it sign yet: it is asked again the first time it wants to. If it already gave up waiting, approve anyway and connect again from the app, because this is remembered."
+                            else
+                                "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
+                            .scale = mono_hint_scale,
+                        }},
+                    ),
+                    vgap(ui, 12),
+                    // Four answers rather than two. Amber's shape: "not now",
+                    // "for a while" and "stop asking" all reachable in one
+                    // press, because a prompt with only yes and no is one
+                    // people learn to hit yes on.
+                    ui.row(.{ .gap = 8, .cross = .center }, .{
+                        ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
                     }),
                 }),
             }),
@@ -14817,23 +14831,13 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
 }
 
 fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
+    return modalScrim(ui, "Join", .close_join, ui.el(.dialog, .{
+        .width = join_card_width,
         .on_dismiss = .close_join,
-        .on_press = .close_join,
-        .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Join" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            // 40px down from the window, which is the design's offset: 16 of it is
-            // the dialog's own padding, so this is the rest.
-            ui.column(.{ .gap = 0 }, .{
-                vgap(ui, 24),
-                if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
-            }),
-        }),
-    });
+        if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+    }));
 }
 
 /// Why the sheet appeared, in the reader's own terms: the thing they reached for
@@ -15015,6 +15019,34 @@ fn joinLabel(ui: *AppUi, text: []const u8) AppUi.Node {
 /// a full-window dialog that closes when pressed, and a `.card` claims no press
 /// of its own, so without this a click on the sheet's own background walks past
 /// the card to the dialog and closes the sheet mid-use. See `Msg.absorb_press`.
+/// The full-window dim behind a modal, and the press target that closes it.
+///
+/// The SDK owns where a `.dialog` sits: since 0.9.2 a dialog, drawer or sheet is
+/// placed against the ROOT surface and centred there, its proposed frame
+/// discarded, so `.grow = 1` on one does nothing at all. Plaza used to be the
+/// dialog AND the backdrop in one element, which meant the upgrade quietly
+/// shrank every scrim to a 420pt box: the dim stopped covering the window and a
+/// press outside that box stopped closing anything.
+///
+/// So the two jobs are two elements now. This is the backdrop: a plain panel
+/// that fills the window, carries the dim, and closes on a press. The `.dialog`
+/// goes inside it and is nothing but the card, which is the shape the SDK's own
+/// examples use.
+///
+/// `.grow = 1` here is belt and braces and I checked: removing it keeps every
+/// test green, because the layer stack these sheets are mounted in stretches its
+/// children anyway. It stays because a backdrop that only fills the window when
+/// its parent happens to stretch it is one reparenting away from the bug this
+/// function exists to fix. The dismiss press is the part a probe does catch.
+fn modalScrim(ui: *AppUi, label: []const u8, dismiss: Msg, child: AppUi.Node) AppUi.Node {
+    return ui.el(.panel, .{
+        .grow = 1,
+        .on_press = dismiss,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = label },
+    }, .{child});
+}
+
 fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
     const p = theme.palette;
     return ui.el(.card, .{
@@ -15550,10 +15582,15 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
     // surface and always claim their own input, so the feed underneath neither
     // shows through nor scrolls, and Escape or a click outside closes it.
     // Stacking kinds layer their children, so the contents go in a column.
-    return ui.el(.dialog, .{
+    // A PANEL rather than a dialog, and it is the one modal here that is not a
+    // card. A picture wants the whole window; a `.dialog` since 0.9.2 is centred
+    // at its preferred size inside a 24pt margin, which would frame the viewer
+    // with a border of feed showing around it. The cost is Escape: dismissal is
+    // a modal-surface event, so it goes with the dialog. A press anywhere still
+    // closes, which is how the viewer was mostly used anyway.
+    return ui.el(.panel, .{
         .grow = 1,
         .padding = 16,
-        .on_dismiss = .close_image,
         .on_press = .close_image,
         .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Expanded image" },
@@ -22103,11 +22140,12 @@ pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef
         // token (a span names a token field, not a Color). A @mention
         // additionally sits one weight up, the way a name does.
         //
-        // The redesign draws an in-text URL colored and NOTHING more, but the
-        // renderer underlines every span that carries a link payload
-        // (`span.underline or is_link`), so a clickable URL is always underlined.
-        // Clickability wins over the hairline: `underline` stays unset here to
-        // say what we asked for, and the extra rule is the renderer's.
+        // Colour and nothing else, which the renderer now honours. It used to
+        // underline every span carrying a link payload whatever `underline`
+        // said, so a paragraph with three URLs came out striped; leaving
+        // `underline` unset stated the intent and got a hairline anyway. SDK
+        // 0.9.2 made the flag mean what it says, so the intent and the pixels
+        // finally agree. Mentions are marked by weight and colour, not a rule.
         spans[n] = if (is_url)
             .{ .text = run, .color = .info, .link = run }
         else if (is_mention)

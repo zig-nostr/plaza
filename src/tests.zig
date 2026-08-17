@@ -749,9 +749,10 @@ test "note text splits into link, mention, and plain runs, colored by the identi
     try testing.expectEqualStrings("https://example.com/x", spans[3].text);
     try testing.expectEqualStrings("https://example.com/x", spans[3].link);
     try testing.expect(spans[3].color != null and spans[3].color.? == .info);
-    // We ask for no underline (the redesign's in-text URL is colored and
-    // nothing more). The renderer still draws one under any span carrying a
-    // link payload, which is why this asserts the REQUEST, not the pixels.
+    // No underline: an in-text URL is coloured and nothing more. This used to
+    // assert only the REQUEST, because the renderer drew a rule under any span
+    // carrying a link payload regardless. SDK 0.9.2 made the flag authoritative,
+    // so the request and the pixels are the same claim again.
     try testing.expect(!spans[3].underline);
     // Plain text has no link payload.
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
@@ -10373,6 +10374,23 @@ const modal_cases = [_]ModalCase{
 };
 
 /// The node index of the dialog labelled `label`.
+/// A modal SURFACE by its accessible label: the panel or dialog that carries it,
+/// never a text node that happens to share the wording. A card's heading is
+/// usually the same words as its dialog's label ("Edit profile" both names the
+/// sheet and titles it), and matching that instead found a 62x18 label where the
+/// backdrop should be.
+fn modalSurfaceIndex(p: painted.Painted, label: []const u8) ?usize {
+    for (p.layout.nodes, 0..) |node, i| {
+        switch (node.widget.kind) {
+            .panel, .dialog => {},
+            else => continue,
+        }
+        if (!std.mem.eql(u8, node.widget.semantics.label, label)) continue;
+        return i;
+    }
+    return null;
+}
+
 fn modalDialogIndex(p: painted.Painted, label: []const u8) ?usize {
     for (p.layout.nodes, 0..) |node, i| {
         if (node.widget.kind != .dialog) continue;
@@ -10465,6 +10483,21 @@ test "a press outside a modal's card closes it, and a press inside never does" {
         // Cards are centred and far narrower than the window, so the band to the
         // left of one is backdrop at every height.
         try testing.expect(card.x > 8);
+
+        // The BACKDROP fills the window. This is the property SDK 0.9.2 broke and
+        // the reason these five surfaces were restructured: a dialog is placed
+        // and sized by the runtime now, so the dim and the dismiss target had to
+        // stop being the dialog. Asserting the frame rather than trusting the
+        // markup, because the whole failure mode was markup that still read as
+        // full-window while laying out as a 420pt box.
+        const scrim = p.layout.nodes[modalSurfaceIndex(p, c.label) orelse root].widget.frame;
+        if (scrim.width < main.window_width or scrim.height < main.window_height) {
+            std.debug.print(
+                "{s}: the backdrop is {d:.0}x{d:.0} inside a {d:.0}x{d:.0} window, so it does not cover it\n",
+                .{ c.name, scrim.width, scrim.height, main.window_width, main.window_height },
+            );
+            return error.BackdropDoesNotCoverTheWindow;
+        }
 
         // Outside: halfway between the window edge and the card, at three
         // heights, so a rule that happens to hold level with the card's middle
@@ -10561,7 +10594,10 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     model.expanded_note = 1;
 
     const p = try painted.Painted.render(arena, &model);
-    const viewer = modalDialogIndex(p, "Expanded image") orelse return error.NoViewer;
+    // By LABEL, not by kind: the viewer is a panel rather than a dialog, because
+    // a picture wants the whole window and a dialog is centred at its preferred
+    // size. What the test cares about is the surface that closes on a press.
+    const viewer = modalSurfaceIndex(p, "Expanded image") orelse return error.NoViewer;
     const centre = try p.pressMsgAt(main.window_width / 2, main.window_height / 2) orelse
         return error.ViewerBackdropIsDead;
     try testing.expectEqualStrings(@tagName(Msg.close_image), @tagName(centre));
