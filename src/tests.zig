@@ -18674,10 +18674,10 @@ test "a visit is not thrown away by pressing Home" {
     try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
 }
 
-test "entering and leaving both clear the seat a visit was holding" {
-    // The seat is for a visit in progress. A place that is now in the list has
-    // its own row, and a place that was LEFT must not reappear as one you are
-    // visiting: that would be the app declining to take the answer.
+test "entering a place takes it out of the visiting seat" {
+    // The seat is for a visit in progress. Once the place is in the list it has
+    // a row of its own, and leaving the seat set would draw it twice: once
+    // under Visiting and once under Entered.
     var fx: main.EffectsForTest = undefined;
     var model = main.initialModel();
     main.resetPlacesForTest();
@@ -18689,17 +18689,9 @@ test "entering and leaving both clear the seat a visit was holding" {
 
     main.resumeVisitForTest();
     main.update(&model, .place_enter, &fx);
-    if (main.visitingPlaceForTest()) |m| {
-        // Only because it is the OPEN place now, not because a seat is held.
-        try testing.expect(main.placeIsKept());
-        _ = m;
-    }
     main.goHomeForTest(&model);
     if (main.visitingPlaceForTest() != null) return error.AnEnteredPlaceIsStillAVisit;
-
-    main.openKeptPlaceForTest(0);
-    main.update(&model, .place_leave, &fx);
-    if (main.visitingPlaceForTest() != null) return error.ALeftPlaceCameBackAsAVisit;
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
 }
 
 test "reopening lands on the place that was open, not the last one entered" {
@@ -18720,19 +18712,26 @@ test "reopening lands on the place that was open, not the last one entered" {
     const line = main.activePlaceLine(&buf);
     try testing.expect(line.len > 65);
 
-    // The restart: the list is read back, then the line says which one.
+    // The restart, as boot actually does it: the list is read back, the line
+    // says which one, and the app opens it. Asserting on the index alone left
+    // the decision itself untested, which a probe that put "the last one
+    // entered" back walked straight through.
     main.applyActivePlaceLineForTest(line);
-    const landing = main.bootPlaceIndexForTest() orelse return error.BootFoundNoPlace;
+    main.goToOwnPlazaForTest();
+    main.restoreOpenPlaceForTest();
+    const landing = main.activePlaceIndexForTest() orelse return error.BootOpenedNoPlace;
     if (landing != 0) {
-        std.debug.print("boot would open place {d}, not the one that was open (0)\n", .{landing});
+        std.debug.print("boot opened place {d}, not the one that was open (0)\n", .{landing});
         return error.BootOpenedTheWrongPlace;
     }
+    try testing.expectEqual(main.RailSection.places, main.railSection());
 
     // Home at quit means home at launch.
     main.goToOwnPlazaForTest();
     try testing.expectEqualStrings("", main.activePlaceLine(&buf));
     main.applyActivePlaceLineForTest("");
-    try testing.expect(main.bootPlaceIndexForTest() == null);
+    main.restoreOpenPlaceForTest();
+    if (main.activePlace() != null) return error.BootOpenedAPlaceNobodyWasIn;
 
     // Written by author and `d`, so a place leaving the list cannot hand its
     // index to whichever one slid into it.
@@ -18832,17 +18831,23 @@ test "every place you have entered has a seat on the rail" {
     main.setRailForTest(.places, true);
     const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
 
-    var seats: usize = 0;
+    // Three DISTINCT names, not three matching nodes. Counting matches let a
+    // probe that drew place 0 three times pass: the same seat repeated is
+    // exactly the failure this is here to catch.
+    const wanted = [_][]const u8{ "Bass Pistol", "Coldcard Hack", "Sparc Noasis" };
+    var seen = [_]bool{false} ** wanted.len;
     var still_empty = false;
     for (p.layout.nodes) |n| {
-        if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) seats += 1;
-        if (std.mem.eql(u8, n.widget.text, "Coldcard Hack")) seats += 1;
-        if (std.mem.eql(u8, n.widget.text, "Sparc Noasis")) seats += 1;
+        for (wanted, 0..) |w, i| {
+            if (std.mem.eql(u8, n.widget.text, w)) seen[i] = true;
+        }
         if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) still_empty = true;
     }
-    if (seats != 3) {
-        std.debug.print("the rail drew {d} of 3 places\n", .{seats});
-        return error.APlaceHasNoSeat;
+    for (wanted, seen) |w, ok| {
+        if (!ok) {
+            std.debug.print("the rail drew no seat for \"{s}\"\n", .{w});
+            return error.APlaceHasNoSeat;
+        }
     }
     if (still_empty) return error.TheRailStillSaysItIsEmpty;
 

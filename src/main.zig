@@ -24070,6 +24070,24 @@ pub fn applyActivePlaceLine(value: []const u8) void {
     g_boot_place_set = true;
 }
 
+/// Land back where you were: the place that was open at quit, or your own
+/// Plaza if that is what was open.
+///
+/// Its own function so a test can drive the decision boot makes rather than a
+/// helper beside it. Restoring the most recently ENTERED place unconditionally
+/// was right while entering was the only way to be in one, and became wrong the
+/// moment Home stopped meaning "leave"; a probe that put that line back left
+/// the suite green, because nothing exercised this.
+fn restoreOpenPlace() void {
+    const i = bootPlaceIndex() orelse return;
+    selectRail(.places);
+    openKeptPlace(i);
+}
+
+pub fn restoreOpenPlaceForTest() void {
+    restoreOpenPlace();
+}
+
 /// Where boot should land, when what was open is still in the list.
 fn bootPlaceIndex() ?usize {
     if (!g_boot_place_set) return null;
@@ -24229,15 +24247,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     if (g_io) |io| {
         if (g_environ) |environ| {
             loadPlaces(io, environ);
-            // Land back where you were: the place that was open at quit, or
-            // your own Plaza if that is what was open. Restoring the most
-            // recently ENTERED place unconditionally was right while entering
-            // was the only way to be in one, and became wrong the moment Home
-            // stopped meaning "leave".
-            if (bootPlaceIndex()) |i| {
-                selectRail(.places);
-                openKeptPlace(i);
-            }
+            restoreOpenPlace();
         }
     }
     model.refresh(nowSeconds());
@@ -24692,9 +24702,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             g_place = null;
             g_place_kept = false;
-            // Left is left. Coming back as "visiting" would be the app
-            // declining to take the answer.
-            g_visited = null;
+            // The visiting seat is deliberately NOT cleared here, and it took a
+            // probe to see why: entering already clears it, and the seat only
+            // ever holds a place that is not in the list, so a place being left
+            // cannot be the one sitting in it. A second clear for a case that
+            // cannot happen is a line no test can ever fail on.
             clearPlaceFeed();
             g_feed_rebuild_all.store(true, .release);
             saveSettings();
