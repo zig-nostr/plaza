@@ -2640,6 +2640,9 @@ const mode_relay_cap = 96;
 /// v1 reads one feed. The array is here so the parser does not have to change
 /// shape when v3 reads several.
 const mode_feeds_cap = 1;
+/// How many ids are remembered per place. A screenful and then some; the point
+/// is that the room is not empty on arrival, not that it is complete.
+const place_seed_cap = 60;
 
 const ModeFeed = struct {
     name_buf: [mode_feed_name_cap]u8 = @splat(0),
@@ -2662,6 +2665,11 @@ pub const Mode = struct {
     home_len: u16 = 0,
     feeds: [mode_feeds_cap]ModeFeed = @splat(.{}),
     feeds_len: u8 = 0,
+    /// The last notes seen here, so returning shows the room rather than an
+    /// empty screen while a stranger's relay is dialled. Bounded and cheap:
+    /// these are ids, and the notes themselves are already in the store.
+    seen: [place_seed_cap][32]u8 = undefined,
+    seen_len: u16 = 0,
     /// Who published it and under what `d`, so the applied mode can be named,
     /// re-fetched, and told apart from another mode with the same title.
     author: [32]u8 = @splat(0),
@@ -23342,6 +23350,31 @@ fn unlockPlaceIds() void {
     g_place_ids_lock.store(false, .release);
 }
 
+/// Seeds the place's list from what was remembered last time.
+///
+/// The rest of this app is local-first and a place was not: entering one showed
+/// "Connecting to the relay pool" and nothing else until a stranger's relay
+/// answered, which on a slow one is a long time to look at an empty room. The
+/// notes are already in the store from last visit; the only thing missing was
+/// knowing WHICH of them belong to this place, since nothing records the relay
+/// an event arrived on. So the ids are remembered with the place.
+fn seedPlaceFeed(ids: []const [32]u8) void {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = @min(ids.len, g_place_ids.len);
+    @memcpy(g_place_ids[0..g_place_ids_len], ids[0..g_place_ids_len]);
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+/// A snapshot of the current place's ids, for writing down.
+fn placeIdsSnapshot(out: [][32]u8) usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    const n = @min(g_place_ids_len, out.len);
+    @memcpy(out[0..n], g_place_ids[0..n]);
+    return n;
+}
+
 fn clearPlaceFeed() void {
     _ = g_place_gen.fetchAdd(1, .monotonic);
     lockPlaceIds();
@@ -23363,8 +23396,13 @@ pub fn placeFeedCount() usize {
 /// never written into their kind:10002, which is the same discipline the
 /// indexer set and the discovered pool already follow.
 fn startPlaceFeed(m: *const Mode) void {
-    if (m.feeds_len == 0) return;
     clearPlaceFeed();
+    // What was here last time, on screen before anything is dialled, and BEFORE
+    // the check below: the ids are already known whether or not there is a
+    // relay to go and ask. Seeding after that early return meant a place whose
+    // feed could not be dialled showed nothing, having remembered everything.
+    if (m.seen_len > 0) seedPlaceFeed(m.seen[0..m.seen_len]);
+    if (m.feeds_len == 0) return;
     const gen = g_place_gen.load(.monotonic);
     var url_buf: [mode_relay_cap]u8 = undefined;
     const len = copyBounded(&url_buf, m.feeds[0].relay());
@@ -23424,6 +23462,31 @@ var g_mode_want: ?struct {
     /// Ticks the fetch has been outstanding, so it can give up and say so.
     waited: u16 = 0,
 } = null;
+
+/// Drives the REAL entry path. It spawns a worker that dials and fails without
+/// a relay, which is harmless: the seeding this asserts happens before it.
+pub fn startPlaceFeedForTest(i: usize) void {
+    startPlaceFeed(&g_places[i]);
+}
+pub fn savePlacesForTest() void {
+    savePlaces();
+}
+
+pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
+    seedPlaceFeed(ids);
+}
+pub fn clearPlaceFeedForTest() void {
+    clearPlaceFeed();
+}
+pub fn rememberPlaceIdsForTest() void {
+    rememberPlaceIds();
+}
+pub fn keptPlaceSeenLenForTest(i: usize) u16 {
+    return g_places[i].seen_len;
+}
+pub fn seedFromKeptPlaceForTest(i: usize) void {
+    seedPlaceFeed(g_places[i].seen[0..g_places[i].seen_len]);
+}
 
 pub fn resetPlacesForTest() void {
     g_place = null;
@@ -28814,7 +28877,16 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
 /// documents and not a private encoding of them.
 const places_file = "places";
 
+/// Copies what the live place has seen back onto its entry in the list, so the
+/// file records the room as it was left.
+fn rememberPlaceIds() void {
+    const m = g_place orelse return;
+    const i = placeIndexOf(m.author, m.ident()) orelse return;
+    g_places[i].seen_len = @intCast(placeIdsSnapshot(&g_places[i].seen));
+}
+
 fn savePlaces() void {
+    rememberPlaceIds();
     const io = g_io orelse return;
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
@@ -28828,7 +28900,7 @@ fn savePlaces() void {
     defer out.deinit(gpa);
     for (g_places[0..g_places_len]) |*m| {
         out.print(gpa,
-            \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}],"host":{f},"d":{f}}}
+            \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}],"host":{f},"d":{f}
         , .{
             std.json.fmt(m.name(), .{}),
             std.json.fmt(m.home(), .{}),
@@ -28837,6 +28909,15 @@ fn savePlaces() void {
             std.json.fmt(&std.fmt.bytesToHex(m.author, .lower), .{}),
             std.json.fmt(m.ident(), .{}),
         }) catch return;
+        // The ids, so returning here is instant. Written last and by hand
+        // rather than through the struct formatter, because they are ours and
+        // not part of Hallway's document.
+        out.appendSlice(gpa, ",\"seen\":[") catch return;
+        for (m.seen[0..m.seen_len], 0..) |id, i| {
+            if (i > 0) out.append(gpa, ',') catch return;
+            out.print(gpa, "\"{s}\"", .{&std.fmt.bytesToHex(id, .lower)}) catch return;
+        }
+        out.appendSlice(gpa, "]}") catch return;
         out.append(gpa, '\n') catch return;
     }
     dir.writeFile(io, .{
@@ -28850,7 +28931,7 @@ fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((mode_home_cap + 1024) * max_places)) catch return;
+    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((mode_home_cap + place_seed_cap * 70 + 1024) * max_places)) catch return;
     defer gpa.free(raw);
 
     var lines = std.mem.splitScalar(u8, raw, '\n');
@@ -28861,13 +28942,21 @@ fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
         // `host` and `d` are ours, not Hallway's, so they are read here rather
         // than in the shared parser: they are how a place is told apart from
         // another with the same title, and how it is re-fetched later.
-        const Extra = struct { host: []const u8 = "", d: []const u8 = "" };
+        const Extra = struct { host: []const u8 = "", d: []const u8 = "", seen: []const []const u8 = &.{} };
         if (std.json.parseFromSlice(Extra, gpa, line, .{ .ignore_unknown_fields = true })) |ex| {
             defer ex.deinit();
             if (ex.value.host.len == 64) {
                 _ = std.fmt.hexToBytes(&m.author, ex.value.host) catch {};
             }
             m.ident_len = @intCast(copyBounded(&m.ident_buf, ex.value.d));
+            for (ex.value.seen) |hex| {
+                if (m.seen_len == m.seen.len) break;
+                if (hex.len != 64) continue;
+                var id: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&id, hex) catch continue;
+                m.seen[m.seen_len] = id;
+                m.seen_len += 1;
+            }
         } else |_| {}
         g_places[g_places_len] = m;
         g_places_len += 1;

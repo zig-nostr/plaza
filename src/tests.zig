@@ -18434,3 +18434,44 @@ test "returning to a place already entered arrives kept, not visiting" {
     }
     try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
 }
+
+test "a place remembers what was in it, so returning is not an empty room" {
+    // Reported: entering a place showed "Connecting to the relay pool" and
+    // nothing else until a stranger's relay answered, which on a slow one is a
+    // long time to stare at nothing. The rest of this app is local-first and a
+    // place was not.
+    //
+    // The notes are already in the store from last visit. The only missing
+    // piece was knowing WHICH of them belong to this place, because nothing
+    // records the relay an event arrived on, so the ids ride with the place.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x5a} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+
+    // Notes arrive from the place's relay.
+    var ids: [3][32]u8 = .{ @splat(1), @splat(2), @splat(3) };
+    main.seedPlaceFeedForTest(&ids);
+    try testing.expectEqual(@as(usize, 3), main.placeFeedCount());
+
+    // The REAL save path has to carry them onto the kept entry, not a helper
+    // called only by this test.
+    main.savePlacesForTest();
+    if (main.keptPlaceSeenLenForTest(0) != 3) {
+        std.debug.print("saving did not remember the room: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.NotRemembered;
+    }
+
+    // And the REAL entry path has to put them back before any socket answers.
+    main.clearPlaceFeedForTest();
+    try testing.expectEqual(@as(usize, 0), main.placeFeedCount());
+    main.startPlaceFeedForTest(0);
+    if (main.placeFeedCount() != 3) {
+        std.debug.print("returned to an empty room: {d} ids\n", .{main.placeFeedCount()});
+        return error.EmptyOnReturn;
+    }
+}
