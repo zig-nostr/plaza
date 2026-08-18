@@ -13288,6 +13288,17 @@ pub const Msg = union(enum) {
     close_join,
     place_enter,
     place_leave,
+    /// The primary rail: select a section, or fold the secondary rail away when
+    /// the section pressed is the one already showing.
+    rail_press: RailSection,
+    /// Open one of the places you have entered, by its index in the list.
+    place_open: u8,
+    /// Back into the visit Home closed.
+    place_resume,
+    /// The keyboard's places grammar: out of the room and back into it, and
+    /// walking the list either way.
+    place_bounce,
+    place_step: i8,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
     /// The sheet's import path: open the Notary window (a separate process),
@@ -20057,12 +20068,21 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
     // the feed owns the full width below the OS titlebar.
+    const second_rail = g_rail == .places and g_rail_open;
     return ui.row(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         railView(ui, model),
         // A 1px vertical rule between the rail and the content. No `grow`: in a
         // row that would stretch it along the WIDTH and eat the feed's space; it
         // fills the height on its own via the row's cross-axis stretch.
         ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        // The second rail, and its own rule. Contents are a pure function of
+        // which primary section is selected, so there is nothing to consult here
+        // beyond that: Home has no second rail, Places is a list of yours.
+        if (second_rail) placesRail(ui) else ui.spacer(0),
+        if (second_rail)
+            ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } })
+        else
+            ui.spacer(0),
         // The bar sits BESIDE the rail and BELOW everything else, which is the
         // only place it is always visible. It used to be the last row of the
         // feed's own column, so every level layered over the feed (a thread, a
@@ -20147,8 +20167,12 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
-        if (activePlace()) |m| placeHeader(ui, m) else ui.spacer(0),
-        scopeHeader(ui, model),
+        // ONE header, not two. A place stacked its own banner on top of the
+        // scope line, so the top of the room was the place's name over the
+        // place's feed name over a rule, in two different rhythms. In a place
+        // the place header IS the scope line, and it keeps the same 11/9 insets
+        // so nothing jumps on the way in or out.
+        if (activePlace()) |m| placeHeader(ui, m) else scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
@@ -20162,13 +20186,22 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The 56px navigation rail: Home (the mark) up top, then the compose verb, the
+/// The 56px primary rail: the destinations up top, then the compose verb, the
 /// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
 /// titlebar of buttons: destinations on the edge, the feed owns the width. A
-/// guest's gated tiles (compose, settings, you) route to the join sheet. Search
-/// is not shown until the feature exists.
+/// guest's gated tiles (compose, settings, you) route to the join sheet.
+///
+/// Three of the five destinations the design names. Search and Messages are not
+/// built and are therefore not here: a rail item that goes nowhere is worse than
+/// one fewer, which is the same rule that keeps Groups off until NIP-29 ships.
+///
+/// Our split is inverted from the strongest prior art and that is a choice.
+/// Flotilla and Discord put the COMMUNITIES on the primary rail with three or
+/// four fixed destinations pinned under them; we put destinations primary and
+/// places secondary, which is Slack's shape. The deciding factor is how many
+/// top-level things the app ends up with: Discord has essentially one, so
+/// servers earn the outer rail, and Plaza is heading for five or six.
 fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
     const guest = model.is_guest();
     const compose_press: Msg = if (guest) .open_join else .open_compose;
     const settings_press: Msg = if (guest) .open_join else .open_settings;
@@ -20176,33 +20209,220 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
     // one uniform padding cannot state. The 10 on each side is exactly what
     // centring a 36px tile in the 56px rail leaves, so it stays as padding.
     return ui.column(.{ .width = 56, .cross = .center, .gap = 0, .padding = 10, .style_tokens = .{ .background = .background } }, .{
-        // Home: the mark on a raised plate, and the way back to the feed from
-        // wherever the reader has got to. It looked like the app's own button
-        // for a long time and did nothing when pressed, which is the one thing
-        // a mark in that position should never be.
-        ui.row(.{
-            .on_press = Msg.go_home,
-            .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "Home", .focusable = true },
-        }, .{
-            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark")),
-        }),
+        // Home: the mark, and the way back to your own feed from wherever the
+        // reader has got to, INCLUDING out of a place. It looked like the app's
+        // own button for a long time and did nothing when pressed, which is the
+        // one thing a mark in that position should never be.
+        railDest(ui, "mark", 21, Msg.go_home, "Home", g_rail == .home),
+        vgap(ui, rail_gap),
+        // The bell, with what is waiting on it. Signed out there is no inbox to
+        // have, so there is no bell: a tile that could only ever say zero is a
+        // tile that says nothing.
+        //
+        // It takes no selected plate, and that is not an oversight: it opens a
+        // SHEET over whatever is underneath rather than being a section of its
+        // own, so a plate would claim a selection the app does not have.
+        if (guest) ui.spacer(0) else railBell(ui),
+        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
+        // Places. Shown even with an empty list: the second rail's empty state
+        // is how somebody learns what a place is and that a link opens one,
+        // which in v1 is the only way in. That is a destination with nothing in
+        // it yet, not a destination that goes nowhere.
+        railDest(ui, "places", 17, Msg{ .rail_press = .places }, "Places", g_rail == .places),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
         railTile(ui, "edit", 15, compose_press, "New note", true),
         vgap(ui, rail_gap),
-        // The bell, with what is waiting on it. Signed out there is no inbox to
-        // have, so there is no bell: a tile that could only ever say zero is a
-        // tile that says nothing.
-        if (guest) ui.spacer(0) else railBell(ui),
-        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
         // Settings.
         railTile(ui, "settings", 16, settings_press, "Settings", false),
         vgap(ui, rail_gap),
         // The account seat: a dashed "you" as a guest, the account once signed in.
         railYou(ui, guest),
         vgap(ui, 2),
+    });
+}
+
+/// A primary-rail destination: the same 36px tile as a verb, plus the one thing
+/// a destination has that a verb does not, which is being the current one.
+///
+/// Selection is the PLATE, so exactly one destination carries one at a time and
+/// the language is uniform. Discord's left-edge indicator bar reads better but
+/// has nowhere to live here: the 56px rail is a 36px tile between two 10px
+/// insets, and a bar inside the tile's own box paints on top of the plate
+/// instead of beside it.
+fn railDest(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label: []const u8, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const tint = if (selected) p.text_primary else p.text_muted;
+    const glyph = ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon);
+    return ui.row(.{
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = true },
+    }, .{
+        if (selected)
+            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", glyph)
+        else
+            ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{glyph}),
+    });
+}
+
+/// The width of the second rail. Every point of it is added to the window's
+/// floor in `app.zon`, because a floor cannot be conditional and the narrowest
+/// window has to hold the widest arrangement.
+const places_rail_width: f32 = 180;
+/// Everything to the left of the reading area when both rails are out: the two
+/// rails and the 1pt rule after each. The window's default size is stated in
+/// terms of this, so a rail that changes width takes the window with it.
+pub const rails_width: f32 = 56 + 1 + places_rail_width + 1;
+const place_row_height: f32 = 34;
+const place_tile_size: f32 = 24;
+const places_rail_inset: f32 = 12;
+/// What is left for a name once the inset, the tile and the gap are spent. A
+/// DEFINITE width, so a long one ellipsizes instead of pushing the rail wide.
+const place_name_width: f32 = places_rail_width - places_rail_inset * 2 - place_tile_size - 8;
+
+/// The second rail: the places you have entered, and the one you are visiting.
+///
+/// Contents are a pure function of which primary section is selected, which is
+/// why this takes nothing but the arena: Places is the only section with a
+/// second rail, so being drawn at all is the whole of the condition.
+///
+/// It does not scroll and needs no overflow rule. Flotilla computes an item
+/// limit from the window height and moves the rest into a popover, which is the
+/// right answer at its scale; eight places at 34 points fit inside the 680pt
+/// window floor with room to spare, and a rule for a case that cannot happen is
+/// a rule nobody can check.
+fn placesRail(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const visiting = visitingPlace();
+    const rows = ui.arena.alloc(AppUi.Node, g_places_len) catch {
+        ui.failed = true;
+        return ui.column(.{ .width = places_rail_width }, .{});
+    };
+    for (rows, 0..) |*row, i| {
+        const open = if (activePlaceIndex()) |c| c == i else false;
+        row.* = placeRow(ui, &g_places[i], Msg{ .place_open = @intCast(i) }, open);
+    }
+    return ui.column(.{ .width = places_rail_width, .gap = 0, .style = .{ .background = p.surface_subbar } }, .{
+        vgap(ui, 14),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Places", .weight = .bold, .scale = scope_title_scale }},
+            ),
+        }),
+        vgap(ui, 10),
+        // The visit sits above the list and outside it, because that is exactly
+        // what a visit is: you are in this place, and it is not one of yours.
+        if (visiting != null) railSectionLabel(ui, "Visiting") else ui.spacer(0),
+        if (visiting) |m| placeRow(
+            ui,
+            m,
+            // Nothing to press while you are already in it.
+            if (g_place != null and !g_place_kept) null else Msg.place_resume,
+            g_place != null and !g_place_kept,
+        ) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) vgap(ui, 10) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) railSectionLabel(ui, "Entered") else ui.spacer(0),
+        ui.column(.{ .gap = 0 }, .{rows}),
+        if (g_places_len == 0 and visiting == null) placesRailEmpty(ui) else ui.spacer(0),
+        ui.spacer(1),
+    });
+}
+
+/// A small quiet label over a group of rail rows.
+fn railSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = text, .monospace = true, .scale = mono_meta_scale }},
+            ),
+        }),
+        vgap(ui, 4),
+    });
+}
+
+/// One place on the second rail: a letter tile and a name.
+///
+/// A LETTER tile, not the host's picture, and that is a budget decision rather
+/// than a taste one. The canvas registers sixteen images at a time, and a rail
+/// of eight would spend half of them on chrome that is always on screen, taken
+/// from the faces in the feed. `image_src` (a source-crop rect) would let one
+/// 512x512 slot hold sixty-four tiles at 64x64; it exists on the internal widget
+/// and is not exposed on the app-facing options, which is filed upstream as
+/// vercel-labs/native#387. Until that lands, letters.
+fn placeRow(ui: *AppUi, m: *const Mode, press: ?Msg, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const name = if (m.name_len > 0) m.name() else "A place";
+    // The first BYTE, uppercased when it is a lowercase ASCII letter. A name
+    // starting with a multi-byte character would be cut mid-codepoint by a
+    // one-byte slice, so anything that is not printable ASCII falls back to a
+    // dot rather than to half a character.
+    const head = name[0];
+    const initial: []const u8 = if (head >= 'a' and head <= 'z')
+        ui.fmt("{c}", .{head - 32})
+    else if (head > 0x20 and head < 0x7f)
+        ui.fmt("{c}", .{head})
+    else
+        "\u{2022}";
+    return ui.el(.data_row, .{
+        .width = places_rail_width,
+        .height = place_row_height,
+        .cross = .center,
+        .padding = 0,
+        .on_press = press,
+        .style = if (selected)
+            .{ .background = p.surface_menu_selected }
+        else
+            .{ .quiet_hover = true },
+        .semantics = .{
+            .role = if (press == null) .none else .button,
+            .label = if (press == null) name else ui.fmt("Open {s}", .{name}),
+            .focusable = press != null,
+        },
+    }, .{
+        ui.row(.{ .cross = .center, .gap = 0, .height = place_row_height }, .{
+            hgap(ui, places_rail_inset),
+            ui.el(.panel, .{
+                .width = place_tile_size,
+                .height = place_tile_size,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_link_tile, .radius = 6, .stroke_width = 0 },
+            }, .{
+                ui.column(.{ .width = place_tile_size, .height = place_tile_size, .main = .center, .cross = .center }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = initial, .monospace = true, .weight = .medium, .scale = mono_meta_scale }},
+                    ),
+                }),
+            }),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .width = place_name_width, .style = .{ .foreground = if (selected) p.text_primary else p.text_muted } },
+                &.{.{ .text = name, .scale = meta_scale }},
+            ),
+        }),
+    });
+}
+
+/// What the rail says before there is anything in it.
+///
+/// It names the one way in that v1 has. A link is the only door, so a rail that
+/// simply looked empty would be the feature failing to explain itself on the
+/// only screen where it could.
+fn placesRailEmpty(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .start, .gap = 0 }, .{
+        hgap(ui, places_rail_inset),
+        ui.paragraph(
+            .{ .wrap = true, .width = places_rail_width - places_rail_inset * 2, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "No places yet. A plaza:// link opens one, and entering it keeps it here. Only you can see this list.", .scale = mono_hint_scale }},
+        ),
     });
 }
 
@@ -20483,15 +20703,34 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 /// It says entering is private on the spot rather than in settings, because a
 /// list of the communities somebody belongs to is sensitive and they should
 /// learn that where the decision is, not afterwards.
+/// How much of a stranger's naming fits on the room's one header line.
+///
+/// The line is the name, the connection state, the feed's name and the verb,
+/// all inside the 620pt column with 16pt insets. The connection state and the
+/// button are the app's own strings and are therefore the budget; the two names
+/// arrive from a mode a stranger published, at 64 and 48 bytes, and both of
+/// them at full length overflowed the window by 240pt at its floor.
+const place_title_cap = 24;
+const place_feed_name_cap = 18;
+
+/// The header of a room, which is the scope line while you are in one.
+///
+/// The place's name is the title, the feed it is reading is the meta on the
+/// right where the follow feed puts its count of voices, and the verb is one
+/// button. The host's own text and the note about privacy are shown only while
+/// VISITING: they are the pitch, and a pitch that stays on screen after the
+/// answer is a banner in the way of the thing it was selling.
 fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
     const p = theme.palette;
+    const visiting = !g_place_kept;
+    const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
     return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
         vgap(ui, 11),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, chrome_inset),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = scope_title_scale }},
+                &.{.{ .text = elide(ui, if (m.name_len > 0) m.name() else "A place", place_title_cap), .weight = .bold, .scale = scope_title_scale }},
             ),
             hgap(ui, 8),
             // What THIS place's socket is doing, which the status bar cannot
@@ -20510,31 +20749,36 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
                 else => ui.spacer(0),
             },
             ui.spacer(1),
-            if (g_place_kept)
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave }, "Leave")
+            if (feed_name.len > 0) ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint_alt } },
+                &.{.{ .text = elide(ui, feed_name, place_feed_name_cap), .monospace = true, .scale = mono_meta_scale }},
+            ) else ui.spacer(0),
+            if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
+            if (visiting)
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter")
             else
-                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter"),
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave }, "Leave"),
             hgap(ui, chrome_inset),
         }),
-        // Only while visiting. Once it is kept, saying so again is noise.
-        if (!g_place_kept) ui.row(.{ .cross = .start, .gap = 0 }, .{
+        if (visiting) vgap(ui, 6) else ui.spacer(0),
+        if (visiting) ui.row(.{ .cross = .start, .gap = 0 }, .{
             hgap(ui, chrome_inset),
             ui.paragraph(
                 .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                &.{.{ .text = "You are just visiting. Entering keeps this place in your Plaza, and only you can see the places you have entered.", .scale = mono_hint_scale }},
+                &.{.{ .text = "Just visiting. Entering keeps this place on your rail, and nobody else can see which places you have entered.", .scale = mono_hint_scale }},
             ),
             hgap(ui, chrome_inset),
         }) else ui.spacer(0),
-        if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
-        if (m.home_len > 0) ui.row(.{ .cross = .start, .gap = 0 }, .{
+        if (visiting and m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
+        if (visiting and m.home_len > 0) ui.row(.{ .cross = .start, .gap = 0 }, .{
             hgap(ui, chrome_inset),
             ui.column(.{ .width = picture_column_width, .gap = 0 }, .{
                 canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
             }),
             hgap(ui, chrome_inset),
         }) else ui.spacer(0),
-        vgap(ui, 6),
-        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = theme.palette.divider_row, .background = theme.palette.divider_row } }),
+        vgap(ui, 9),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     })});
 }
 
@@ -23277,7 +23521,17 @@ const PlazaApp = native_sdk.UiApp(Model, Msg);
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "new-note")) return .open_compose;
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    // The same message the rail's own tile sends, so the key and the tile
+    // cannot drift into two behaviours.
+    if (std.mem.eql(u8, name, "places-rail")) return Msg{ .rail_press = .places };
+    if (std.mem.eql(u8, name, "place-bounce")) return .place_bounce;
+    if (std.mem.eql(u8, name, "place-prev")) return Msg{ .place_step = -1 };
+    if (std.mem.eql(u8, name, "place-next")) return Msg{ .place_step = 1 };
     return null;
+}
+
+pub fn onCommandForTest(name: []const u8) ?Msg {
+    return onCommand(name);
 }
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
@@ -23501,6 +23755,62 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
     if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
 }
 
+/// Which section of the primary rail is selected.
+///
+/// Only two of the five the design names are here, because only two exist:
+/// Search and Messages are not built, and Notifications is a sheet rather than
+/// a destination. A rail item that cannot go anywhere is worse than one fewer,
+/// which is the same rule that keeps Groups off the rail until NIP-29 ships.
+pub const RailSection = enum(u8) { home, places };
+
+/// The selected section, and whether the secondary rail is out.
+///
+/// The secondary rail's CONTENTS are a pure function of the selection: Places
+/// lists your places, Home has no secondary rail at all. Its VISIBILITY is this
+/// one persisted boolean and nothing else. That split is deliberate. Every
+/// client read for this derives the second rail from the route, and the reason
+/// to care is that a second variable beside the route is a second thing that
+/// can disagree with it: a link that opens a place would then need a rule for
+/// who wins, and there is no good answer.
+var g_rail: RailSection = .home;
+var g_rail_open: bool = true;
+
+pub fn railSection() RailSection {
+    return g_rail;
+}
+pub fn railOpen() bool {
+    return g_rail_open;
+}
+
+/// Pressing a primary rail item.
+///
+/// An inactive one selects it and forces the secondary out; the active one
+/// folds the secondary away and back. Every other route into a section (a
+/// link, a keyboard bounce, opening a place) goes through `selectRail`, which
+/// forces it out, so navigation never lands on a section whose rail is folded.
+fn pressRail(section: RailSection) void {
+    if (g_rail == section) {
+        g_rail_open = !g_rail_open;
+    } else {
+        g_rail = section;
+        g_rail_open = true;
+    }
+    saveSettings();
+}
+
+fn selectRail(section: RailSection) void {
+    g_rail = section;
+    g_rail_open = true;
+}
+
+pub fn pressRailForTest(section: RailSection) void {
+    pressRail(section);
+}
+pub fn setRailForTest(section: RailSection, open: bool) void {
+    g_rail = section;
+    g_rail_open = open;
+}
+
 /// The places kept across restarts. Small on purpose for v1.
 const max_places = 8;
 var g_places: [max_places]Mode = @splat(.{});
@@ -23563,10 +23873,14 @@ pub fn seedFromKeptPlaceForTest(i: usize) void {
 pub fn resetPlacesForTest() void {
     // The feed ids too, or one test's room leaks into the next one's.
     clearPlaceFeed();
+    g_rail = .home;
+    g_rail_open = true;
     g_place_flushed_at = 0;
     g_place_flushed_rev = 0;
     g_place = null;
     g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
     g_places = @splat(.{});
     g_places_len = 0;
 }
@@ -23602,6 +23916,177 @@ fn placeIndexOf(author: [32]u8, ident: []const u8) ?usize {
         if (std.mem.eql(u8, &p.author, &author) and std.mem.eql(u8, p.ident(), ident)) return i;
     }
     return null;
+}
+
+/// Which entry of the list is open, when the open place is one of them. Null
+/// while visiting, because a visit is deliberately not in the list.
+fn activePlaceIndex() ?usize {
+    const m = g_place orelse return null;
+    return placeIndexOf(m.author, m.ident());
+}
+
+/// The last place opened from the rail, so `Cmd+Option+Right` has somewhere to
+/// bounce back to. An index rather than an address because it is a convenience:
+/// leaving a place shifts the ones after it, and the read below clamps, so the
+/// worst a stale value does is bounce into a neighbour.
+var g_place_last: usize = 0;
+
+/// Opens a place already in the list.
+///
+/// The room being left is written down FIRST. Switching places is precisely
+/// when its ids stop being reachable: `rememberPlaceIds` reads the live list,
+/// and the next `startPlaceFeed` clears it.
+fn openKeptPlace(i: usize) void {
+    if (i >= g_places_len) return;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place_last = i;
+    g_place = g_places[i];
+    g_place_kept = true;
+    startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen.
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// The place being visited, held for this session only.
+///
+/// A visit is transient by design, and Home closing the room turned that into a
+/// trap: peek at your own feed for a second and the room is gone, with nothing
+/// on the rail to get back to it because a visit is deliberately not in the
+/// list. This is the seat it keeps until the app quits, which is exactly as
+/// long as a visit was ever promised to last.
+var g_visited: ?Mode = null;
+
+/// What the rail's "Visiting" row stands for: the place open right now if it is
+/// a visit, otherwise the last one visited this session.
+fn visitingPlace() ?*const Mode {
+    if (g_place) |*m| {
+        if (!g_place_kept) return m;
+    }
+    return if (g_visited) |*m| m else null;
+}
+
+/// Back into the visit that Home closed.
+fn resumeVisit() void {
+    if (g_visited == null) return;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place = g_visited;
+    g_place_kept = false;
+    startPlaceFeed(&g_place.?);
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// Back to your own feed, without leaving the place.
+///
+/// Home and Leave were the same button for as long as there was no rail, and
+/// they are not the same verb: this closes the room, and the place stays in the
+/// list with its ids intact, one press away.
+fn goToOwnPlaza() void {
+    if (g_place == null) return;
+    if (g_place_kept) savePlaces() else g_visited = g_place;
+    g_place = null;
+    g_place_kept = false;
+    clearPlaceFeed();
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// `Cmd+Option+Right`: out of the room, and back into the one you were in.
+///
+/// This one earns a key more here than it does in the clients it is borrowed
+/// from. A place is a ROOM, so being in one hides your own feed entirely, and
+/// the way out has to be as cheap as the way in.
+fn bouncePlace() void {
+    if (g_place != null) {
+        goToOwnPlaza();
+        return;
+    }
+    if (g_places_len == 0) return;
+    selectRail(.places);
+    openKeptPlace(@min(g_place_last, g_places_len - 1));
+}
+
+/// `Cmd+Option+Up` / `Down`: the place before or after the open one, wrapping.
+///
+/// Discord and Slack both spend this pair on walking the community list, which
+/// is what our places are even though they sit on the second rail rather than
+/// the first. Matching the muscle memory is worth more than matching the rail.
+fn stepPlace(delta: i8) void {
+    if (g_places_len == 0) return;
+    const n: isize = @intCast(g_places_len);
+    const next: usize = if (activePlaceIndex()) |c|
+        @intCast(@mod(@as(isize, @intCast(c)) + delta, n))
+    else if (delta > 0) 0 else g_places_len - 1;
+    selectRail(.places);
+    openKeptPlace(next);
+}
+
+pub fn openKeptPlaceForTest(i: usize) void {
+    openKeptPlace(i);
+}
+pub fn goToOwnPlazaForTest() void {
+    goToOwnPlaza();
+}
+pub fn bouncePlaceForTest() void {
+    bouncePlace();
+}
+pub fn stepPlaceForTest(delta: i8) void {
+    stepPlace(delta);
+}
+pub fn activePlaceIndexForTest() ?usize {
+    return activePlaceIndex();
+}
+
+/// The place that was open when the app last quit.
+///
+/// Reopening used to land in the most recently ENTERED place no matter what,
+/// because entering was the only way to be in one. With a rail there is a way
+/// out that is not leaving, so "the last one entered" and "the one I was
+/// looking at" came apart, and restoring the wrong one reads as the app
+/// ignoring you.
+var g_boot_place_author: [32]u8 = @splat(0);
+var g_boot_place_ident_buf: [64]u8 = @splat(0);
+var g_boot_place_ident_len: u8 = 0;
+var g_boot_place_set: bool = false;
+
+/// `<64 hex>:<d>`, or empty for your own Plaza. Written by author and `d`
+/// rather than by position, so leaving a place cannot silently reopen whichever
+/// one slid into its index.
+pub fn activePlaceLine(buf: []u8) []const u8 {
+    const m = g_place orelse return "";
+    if (!g_place_kept) return "";
+    const hex = std.fmt.bytesToHex(m.author, .lower);
+    return std.fmt.bufPrint(buf, "{s}:{s}", .{ &hex, m.ident() }) catch "";
+}
+
+pub fn applyActivePlaceLine(value: []const u8) void {
+    g_boot_place_set = false;
+    if (value.len < 65 or value[64] != ':') return;
+    _ = std.fmt.hexToBytes(&g_boot_place_author, value[0..64]) catch return;
+    g_boot_place_ident_len = @intCast(copyBounded(&g_boot_place_ident_buf, value[65..]));
+    g_boot_place_set = true;
+}
+
+/// Where boot should land, when what was open is still in the list.
+fn bootPlaceIndex() ?usize {
+    if (!g_boot_place_set) return null;
+    return placeIndexOf(g_boot_place_author, g_boot_place_ident_buf[0..g_boot_place_ident_len]);
+}
+
+pub fn bootPlaceIndexForTest() ?usize {
+    return bootPlaceIndex();
+}
+pub fn applyActivePlaceLineForTest(value: []const u8) void {
+    applyActivePlaceLine(value);
+}
+pub fn visitingPlaceForTest() ?*const Mode {
+    return visitingPlace();
+}
+pub fn resumeVisitForTest() void {
+    resumeVisit();
 }
 
 fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
@@ -23744,16 +24229,14 @@ pub fn boot(model: *Model, fx: *Effects) void {
     if (g_io) |io| {
         if (g_environ) |environ| {
             loadPlaces(io, environ);
-            // Land back where you were. Entering a place is a statement that
-            // you want to be there, and until the rail exists there is no other
-            // way back in: the reader was dropped on their own feed with the
-            // place still in the file and nothing to click. The most recently
-            // entered one wins, which is the only ordering v1 has.
-            if (g_places_len > 0) {
-                g_place = g_places[g_places_len - 1];
-                g_place_kept = true;
-                startPlaceFeed(&g_place.?);
-                g_feed_rebuild_all.store(true, .release);
+            // Land back where you were: the place that was open at quit, or
+            // your own Plaza if that is what was open. Restoring the most
+            // recently ENTERED place unconditionally was right while entering
+            // was the only way to be in one, and became wrong the moment Home
+            // stopped meaning "leave".
+            if (bootPlaceIndex()) |i| {
+                selectRail(.places);
+                openKeptPlace(i);
             }
         }
     }
@@ -24185,7 +24668,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     g_places[g_places_len] = m;
                     g_places_len += 1;
                     g_place_kept = true;
+                    g_place_last = g_places_len - 1;
+                    // In the list now, so it is no longer the visit the rail
+                    // holds a seat for.
+                    g_visited = null;
                     savePlaces();
+                    // Entering is the moment the second rail has something to
+                    // show, so it shows it: the place the reader just kept,
+                    // now with a seat of its own.
+                    selectRail(.places);
+                    saveSettings();
                 }
             }
         },
@@ -24200,9 +24692,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             g_place = null;
             g_place_kept = false;
+            // Left is left. Coming back as "visiting" would be the app
+            // declining to take the answer.
+            g_visited = null;
             clearPlaceFeed();
             g_feed_rebuild_all.store(true, .release);
+            saveSettings();
         },
+        .rail_press => |section| pressRail(section),
+        .place_resume => resumeVisit(),
+        .place_open => |i| {
+            selectRail(.places);
+            openKeptPlace(i);
+        },
+        .place_bounce => bouncePlace(),
+        .place_step => |delta| stepPlace(delta),
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
@@ -27581,6 +28085,11 @@ fn goHome(model: *Model) void {
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
+    // Home is YOUR feed, so the mark closes the room. Not the same verb as
+    // Leave: the place stays in the list with its ids intact, one press away on
+    // the second rail.
+    selectRail(.home);
+    goToOwnPlaza();
 }
 
 pub fn goHomeForTest(model: *Model) void {
@@ -28920,10 +29429,13 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     g_hidden = @splat(false);
+    g_rail = .home;
+    g_rail_open = true;
+    g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(1024)) catch return;
+    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(2048)) catch return;
     defer gpa.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
@@ -28937,6 +29449,9 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // Written by id rather than by position, so adding an element to the
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
+        if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // An empty value is meaningful here too: it is your own Plaza.
+        if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
     }
 }
 
@@ -29070,14 +29585,18 @@ fn saveSettings() void {
     defer dir.close(io);
     var hidden_buf: [256]u8 = undefined;
     const hidden_ids = hiddenLine(&hidden_buf);
-    var buf: [768]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\n", .{
+    var place_buf: [160]u8 = undefined;
+    const place = activePlaceLine(&place_buf);
+    var buf: [1024]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
         hidden_ids,
         if (g_media_proxy_on) "on" else "off",
         if (g_media_direct_fallback) "on" else "off",
+        if (g_rail_open) "on" else "off",
+        place,
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",

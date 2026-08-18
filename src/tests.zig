@@ -10071,10 +10071,15 @@ test "the pool the app is born with holds no retired relay" {
     try testing.expect(main.relayCount() >= 3);
 }
 
-test "the window is square" {
+test "the window is square where the reading happens" {
     // A feed is a column of rows. The wide-and-short default spent its extra
     // width on margin while showing four notes at a time.
-    try testing.expectEqual(main.window_width, main.window_height);
+    //
+    // The square is the READING AREA, not the window. It was the same thing
+    // until the second rail existed; now the window carries 238pt of chrome
+    // down its left side, and asserting the window itself would either shrink
+    // the room by that much or quietly stop meaning anything.
+    try testing.expectEqual(main.window_width - main.rails_width, main.window_height);
 }
 
 test "there is always something under a name" {
@@ -12281,7 +12286,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -12302,6 +12307,11 @@ test "no view paints past the right edge at the narrowest the window can be" {
     const long_site = "https://" ++ ("a" ** 112) ++ ".example";
     const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
     const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
+    // A place's name and its feed's name, at the capacity of the buffers that
+    // receive them (`mode_name_cap`, `mode_feed_name_cap`). Both are a
+    // stranger's, and both land in fixed-width chrome.
+    const long_place = "P" ** 64;
+    const long_feed = "F" ** 48;
     // Exactly the 128 bytes `lud16_buf` holds. A single byte over and the
     // parser drops the field without a word, which is correct of it and made
     // the first version of this measure an empty line.
@@ -12382,6 +12392,9 @@ test "no view paints past the right edge at the narrowest the window can be" {
         _ = main.addRelayForTest(long_relay, true, true);
         _ = main.addRelayForTest("wss://relay.example.org", true, true);
         main.seedInboxUnreadForTest(3);
+        // Every state starts out of every place, or one state's room and one
+        // state's rail leak into the next one's measurement.
+        main.resetPlacesForTest();
         switch (st) {
             .feed, .feed_with_link => {},
             .thread => {
@@ -12407,6 +12420,29 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 _ = main.enqueueOutboxForTest(model.notes[0].pubkey, model.notes[0].pubkey, 1_800_000_000);
                 model.outbox_pending = 1;
                 model.menu = .outbox;
+            },
+            // The second rail, full, with a visit above the list: every string
+            // on it is a stranger's, and the rail is a fixed 180pt column that
+            // cannot grow to fit one.
+            .places_rail => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceForTest([_]u8{0x71} ** 32, "one", long_place);
+                main.update(model, .place_enter, &fx);
+                main.visitPlaceForTest([_]u8{0x72} ** 32, "two", "Bass Pistol");
+                main.update(model, .place_enter, &fx);
+                main.goToOwnPlazaForTest();
+                main.visitPlaceForTest([_]u8{0x73} ** 32, "three", long_place);
+                main.goToOwnPlazaForTest();
+                main.setRailForTest(.places, true);
+            },
+            // Inside a place, which replaces the scope line with a header of a
+            // stranger's name, their feed's name, and their markdown.
+            .place_visiting => {
+                main.visitPlaceWithFeedForTest([_]u8{0x74} ** 32, "four", long_place, long_feed);
+                // The longest thing the header can say about the connection,
+                // measured with the longest name and feed name beside it.
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(.places, true);
             },
             .menu_note => model.note_menu = model.notes[0].id,
         }
@@ -12452,7 +12488,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -18551,5 +18587,270 @@ test "a place says what its own connection is doing" {
     if (main.placeLink() != .idle) {
         std.debug.print("a new place inherited the last one's state: {t}\n", .{main.placeLink()});
         return error.StaleLinkState;
+    }
+}
+
+/// Three places in the list, entered in order, and out of all of them.
+fn seedPlacesForRail(model: *main.Model, fx: *main.EffectsForTest) void {
+    main.visitPlaceForTest([_]u8{0xa1} ** 32, "one", "Bass Pistol");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "two", "Coldcard Hack");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa3} ** 32, "three", "Sparc Noasis");
+    main.update(model, .place_enter, fx);
+    main.goToOwnPlazaForTest();
+}
+
+test "the second rail folds on a second press and comes back on the next one" {
+    // Contents are a pure function of the selection; visibility is one boolean
+    // beside it. The press grammar is the whole of what that boolean answers
+    // to, so it is what this pins down.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqual(main.RailSection.home, main.railSection());
+
+    main.pressRailForTest(.places);
+    try testing.expectEqual(main.RailSection.places, main.railSection());
+    try testing.expect(main.railOpen());
+
+    // The active one folds it.
+    main.pressRailForTest(.places);
+    try testing.expectEqual(main.RailSection.places, main.railSection());
+    try testing.expect(!main.railOpen());
+
+    // An inactive one selects AND forces it out, so no navigation can land on
+    // a section whose rail is folded away.
+    main.pressRailForTest(.home);
+    try testing.expectEqual(main.RailSection.home, main.railSection());
+    try testing.expect(main.railOpen());
+}
+
+test "Home closes the room without leaving the place" {
+    // Two different verbs that were one button for as long as there was no rail
+    // to put the place back on. Home means your own feed; the place stays.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xb1} ** 32, "bass", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.activePlace() != null);
+
+    main.goHomeForTest(&model);
+    if (main.activePlace() != null) return error.HomeStayedInTheRoom;
+    if (main.keptPlaceCount() != 1) {
+        std.debug.print("Home dropped the place from the list: {d} left\n", .{main.keptPlaceCount()});
+        return error.HomeLeftThePlace;
+    }
+
+    // And the rail puts you straight back.
+    main.openKeptPlaceForTest(0);
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(main.placeIsKept());
+}
+
+test "a visit is not thrown away by pressing Home" {
+    // A visit is deliberately not in the list, so once Home could close a room
+    // there was nothing on the rail to get back to one. Peeking at your own
+    // feed for a second destroyed the room you were reading.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xc1} ** 32, "guest", "Somewhere");
+    try testing.expect(!main.placeIsKept());
+
+    var model = main.initialModel();
+    main.goHomeForTest(&model);
+    try testing.expect(main.activePlace() == null);
+    if (main.visitingPlaceForTest() == null) return error.TheVisitWasLost;
+
+    main.resumeVisitForTest();
+    const back = main.activePlace() orelse return error.CouldNotGoBackToTheVisit;
+    try testing.expectEqualStrings("Somewhere", back.name());
+    // Still a visit. Going back into it is not the same as entering it.
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+}
+
+test "entering and leaving both clear the seat a visit was holding" {
+    // The seat is for a visit in progress. A place that is now in the list has
+    // its own row, and a place that was LEFT must not reappear as one you are
+    // visiting: that would be the app declining to take the answer.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xd1} ** 32, "one", "Bass Pistol");
+    main.goHomeForTest(&model);
+    try testing.expect(main.visitingPlaceForTest() != null);
+
+    main.resumeVisitForTest();
+    main.update(&model, .place_enter, &fx);
+    if (main.visitingPlaceForTest()) |m| {
+        // Only because it is the OPEN place now, not because a seat is held.
+        try testing.expect(main.placeIsKept());
+        _ = m;
+    }
+    main.goHomeForTest(&model);
+    if (main.visitingPlaceForTest() != null) return error.AnEnteredPlaceIsStillAVisit;
+
+    main.openKeptPlaceForTest(0);
+    main.update(&model, .place_leave, &fx);
+    if (main.visitingPlaceForTest() != null) return error.ALeftPlaceCameBackAsAVisit;
+}
+
+test "reopening lands on the place that was open, not the last one entered" {
+    // Restoring `g_places_len - 1` was right while entering was the only way
+    // to be in a place. With a way out that is not leaving, "the last one
+    // entered" and "the one I was looking at" came apart.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    try testing.expectEqual(@as(usize, 3), main.keptPlaceCount());
+
+    // Open the FIRST, which is not the last one entered.
+    main.openKeptPlaceForTest(0);
+    var buf: [160]u8 = undefined;
+    const line = main.activePlaceLine(&buf);
+    try testing.expect(line.len > 65);
+
+    // The restart: the list is read back, then the line says which one.
+    main.applyActivePlaceLineForTest(line);
+    const landing = main.bootPlaceIndexForTest() orelse return error.BootFoundNoPlace;
+    if (landing != 0) {
+        std.debug.print("boot would open place {d}, not the one that was open (0)\n", .{landing});
+        return error.BootOpenedTheWrongPlace;
+    }
+
+    // Home at quit means home at launch.
+    main.goToOwnPlazaForTest();
+    try testing.expectEqualStrings("", main.activePlaceLine(&buf));
+    main.applyActivePlaceLineForTest("");
+    try testing.expect(main.bootPlaceIndexForTest() == null);
+
+    // Written by author and `d`, so a place leaving the list cannot hand its
+    // index to whichever one slid into it.
+    main.openKeptPlaceForTest(2);
+    const third = main.activePlaceLine(&buf);
+    var addr: [160]u8 = undefined;
+    const third_len = third.len;
+    @memcpy(addr[0..third_len], third);
+    main.openKeptPlaceForTest(0);
+    main.update(&model, .place_leave, &fx);
+    main.applyActivePlaceLineForTest(addr[0..third_len]);
+    const shifted = main.bootPlaceIndexForTest() orelse return error.BootLostThePlaceAfterALeave;
+    try testing.expectEqual(@as(usize, 1), shifted);
+}
+
+test "walking the places goes both ways and wraps" {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+
+    // From your own feed, forward is the first and back is the last.
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 1), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(-1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+
+    // And it puts the rail where the eye is going to look.
+    try testing.expectEqual(main.RailSection.places, main.railSection());
+    try testing.expect(main.railOpen());
+}
+
+test "the bounce goes out of the room and back into the same one" {
+    // The key exists because a place is a ROOM: being in one hides your own
+    // feed entirely, so the way out has to be as cheap as the way in, and the
+    // way back must not land somewhere else.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    main.openKeptPlaceForTest(1);
+
+    main.bouncePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+
+    main.bouncePlaceForTest();
+    const landed = main.activePlaceIndexForTest() orelse return error.BounceLandedNowhere;
+    if (landed != 1) {
+        std.debug.print("the bounce came back into place {d}, not the one it left (1)\n", .{landed});
+        return error.BounceLandedInTheWrongRoom;
+    }
+}
+
+test "a shortcut sends the message its tile sends" {
+    // A key that reimplements what a control does is a second implementation to
+    // keep in step, and this app has one already declared for compose and
+    // settings. The places keys go through the same messages.
+    try testing.expectEqual(main.Msg{ .rail_press = .places }, main.onCommandForTest("places-rail").?);
+    try testing.expectEqual(main.Msg.place_bounce, main.onCommandForTest("place-bounce").?);
+    try testing.expectEqual(main.Msg{ .place_step = -1 }, main.onCommandForTest("place-prev").?);
+    try testing.expectEqual(main.Msg{ .place_step = 1 }, main.onCommandForTest("place-next").?);
+    try testing.expect(main.onCommandForTest("no-such-key") == null);
+}
+
+test "every place you have entered has a seat on the rail" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Empty first: the rail has to explain itself, because a link is the only
+    // door v1 has and a blank column teaches nobody where to find one.
+    main.setRailForTest(.places, true);
+    {
+        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+        var said_how = false;
+        for (p.layout.nodes) |n| {
+            if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) said_how = true;
+        }
+        if (!said_how) return error.TheEmptyRailSaysNothing;
+    }
+
+    seedPlacesForRail(&model, &fx);
+    main.setRailForTest(.places, true);
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    var seats: usize = 0;
+    var still_empty = false;
+    for (p.layout.nodes) |n| {
+        if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) seats += 1;
+        if (std.mem.eql(u8, n.widget.text, "Coldcard Hack")) seats += 1;
+        if (std.mem.eql(u8, n.widget.text, "Sparc Noasis")) seats += 1;
+        if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) still_empty = true;
+    }
+    if (seats != 3) {
+        std.debug.print("the rail drew {d} of 3 places\n", .{seats});
+        return error.APlaceHasNoSeat;
+    }
+    if (still_empty) return error.TheRailStillSaysItIsEmpty;
+
+    // Folded away, it draws nothing at all: contents follow the selection, and
+    // the one boolean beside it decides whether they are on screen.
+    main.setRailForTest(.places, false);
+    const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    for (folded.layout.nodes) |n| {
+        if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) return error.TheFoldedRailIsStillDrawn;
     }
 }
