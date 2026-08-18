@@ -10018,7 +10018,15 @@ pub const Model = struct {
         //   !reuse_ok      a name moved, so every card's baked text is stale
         //   limit moved    the reader paged down, so notes below the old window
         //                  belong now and no arrival describes them
+        // A place's notes arrive on its own socket, not through the ingest
+        // buffer the splice path drains, so nothing in `arrived` ever describes
+        // them. Its revision counter is what says there is something new.
+        const place_rev = g_place_rev.load(.monotonic);
+        const place_moved = place_rev != g_notes_place_rev;
+        g_notes_place_rev = place_rev;
+
         const full = g_feed_rebuild_all.swap(false, .acq_rel) or
+            place_moved or
             arrived.lost or
             !reuse_ok or
             limit != g_notes_limit or
@@ -10411,6 +10419,8 @@ var g_splice_keep: [feed_arrival_cap]u32 = undefined;
 /// skip the rebuild entirely.
 var g_notes_limit: usize = 0;
 var g_notes_feed_limit: usize = 0;
+/// The place revision the notes on screen were built from.
+var g_notes_place_rev: u32 = 0;
 
 fn reuseHash(id: i64, mask: usize) usize {
     // Fibonacci mixing: note ids are the first eight bytes of a hash, so the low
@@ -23576,6 +23586,11 @@ fn refreshPlaceFetch() void {
     g_place_kept = placeIndexOf(m.author, m.ident()) != null;
     g_mode_want = null;
     startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen. Without this the reader enters a place and keeps
+    // looking at their own follows, which is exactly what was reported.
+    g_feed_rebuild_all.store(true, .release);
 }
 
 /// How many ticks a mode fetch may go unanswered. The tick is a second, and a
@@ -23588,7 +23603,20 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // opened misses the very link that launched Plaza.
     if (has_url_scheme) plaza_url_scheme_install();
     if (g_io) |io| {
-        if (g_environ) |environ| loadPlaces(io, environ);
+        if (g_environ) |environ| {
+            loadPlaces(io, environ);
+            // Land back where you were. Entering a place is a statement that
+            // you want to be there, and until the rail exists there is no other
+            // way back in: the reader was dropped on their own feed with the
+            // place still in the file and nothing to click. The most recently
+            // entered one wins, which is the only ordering v1 has.
+            if (g_places_len > 0) {
+                g_place = g_places[g_places_len - 1];
+                g_place_kept = true;
+                startPlaceFeed(&g_place.?);
+                g_feed_rebuild_all.store(true, .release);
+            }
+        }
     }
     model.refresh(nowSeconds());
     // What was written but not sent when the app last closed, back in the
@@ -24033,6 +24061,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_place = null;
             g_place_kept = false;
             clearPlaceFeed();
+            g_feed_rebuild_all.store(true, .release);
         },
         .close_join => {
             model.joining = false;
