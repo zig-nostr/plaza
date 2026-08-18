@@ -12433,7 +12433,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 main.goToOwnPlazaForTest();
                 main.visitPlaceForTest([_]u8{0x73} ** 32, "three", long_place);
                 main.goToOwnPlazaForTest();
-                main.setRailForTest(.places, true);
+                main.setRailForTest(true);
             },
             // Inside a place, which replaces the scope line with a header of a
             // stranger's name, their feed's name, and their markdown.
@@ -12442,7 +12442,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 // The longest thing the header can say about the connection,
                 // measured with the longest name and feed name beside it.
                 main.setPlaceLinkForTest(.unreachable_relay);
-                main.setRailForTest(.places, true);
+                main.setRailForTest(true);
             },
             .menu_note => model.note_menu = model.notes[0].id,
         }
@@ -18601,29 +18601,33 @@ fn seedPlacesForRail(model: *main.Model, fx: *main.EffectsForTest) void {
     main.goToOwnPlazaForTest();
 }
 
-test "the second rail folds on a second press and comes back on the next one" {
-    // Contents are a pure function of the selection; visibility is one boolean
-    // beside it. The press grammar is the whole of what that boolean answers
-    // to, so it is what this pins down.
+test "the places rail folds and comes back, and Home leaves it alone" {
+    // Home hiding the switcher is what the first version did, and it made
+    // coming back from your own feed to a room cost two presses. The rail is
+    // the Places icon's to open and close, and nothing else touches it.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
     main.resetPlacesForTest();
     defer main.resetPlacesForTest();
 
-    try testing.expectEqual(main.RailSection.home, main.railSection());
-
-    main.pressRailForTest(.places);
-    try testing.expectEqual(main.RailSection.places, main.railSection());
-    try testing.expect(main.railOpen());
-
-    // The active one folds it.
-    main.pressRailForTest(.places);
-    try testing.expectEqual(main.RailSection.places, main.railSection());
+    // Off until there is something to put in it.
     try testing.expect(!main.railOpen());
 
-    // An inactive one selects AND forces it out, so no navigation can land on
-    // a section whose rail is folded away.
-    main.pressRailForTest(.home);
-    try testing.expectEqual(main.RailSection.home, main.railSection());
+    main.togglePlacesRailForTest();
     try testing.expect(main.railOpen());
+    main.togglePlacesRailForTest();
+    try testing.expect(!main.railOpen());
+
+    // Entering a place turns it on, because that is the moment it has a seat
+    // to show.
+    main.visitPlaceForTest([_]u8{0xe1} ** 32, "one", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.railOpen());
+
+    // And Home does not take it away again.
+    main.goHomeForTest(&model);
+    if (!main.railOpen()) return error.HomeFoldedTheSwitcher;
+    try testing.expect(main.activePlace() == null);
 }
 
 test "Home closes the room without leaving the place" {
@@ -18724,7 +18728,6 @@ test "reopening lands on the place that was open, not the last one entered" {
         std.debug.print("boot opened place {d}, not the one that was open (0)\n", .{landing});
         return error.BootOpenedTheWrongPlace;
     }
-    try testing.expectEqual(main.RailSection.places, main.railSection());
 
     // Home at quit means home at launch.
     main.goToOwnPlazaForTest();
@@ -18768,7 +18771,6 @@ test "walking the places goes both ways and wraps" {
     try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
 
     // And it puts the rail where the eye is going to look.
-    try testing.expectEqual(main.RailSection.places, main.railSection());
     try testing.expect(main.railOpen());
 }
 
@@ -18799,7 +18801,7 @@ test "a shortcut sends the message its tile sends" {
     // A key that reimplements what a control does is a second implementation to
     // keep in step, and this app has one already declared for compose and
     // settings. The places keys go through the same messages.
-    try testing.expectEqual(main.Msg{ .rail_press = .places }, main.onCommandForTest("places-rail").?);
+    try testing.expectEqual(main.Msg.toggle_places_rail, main.onCommandForTest("places-rail").?);
     try testing.expectEqual(main.Msg.place_bounce, main.onCommandForTest("place-bounce").?);
     try testing.expectEqual(main.Msg{ .place_step = -1 }, main.onCommandForTest("place-prev").?);
     try testing.expectEqual(main.Msg{ .place_step = 1 }, main.onCommandForTest("place-next").?);
@@ -18817,7 +18819,7 @@ test "every place you have entered has a seat on the rail" {
 
     // Empty first: the rail has to explain itself, because a link is the only
     // door v1 has and a blank column teaches nobody where to find one.
-    main.setRailForTest(.places, true);
+    main.setRailForTest(true);
     {
         const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
         var said_how = false;
@@ -18828,7 +18830,7 @@ test "every place you have entered has a seat on the rail" {
     }
 
     seedPlacesForRail(&model, &fx);
-    main.setRailForTest(.places, true);
+    main.setRailForTest(true);
     const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
 
     // Three DISTINCT names, not three matching nodes. Counting matches let a
@@ -18853,7 +18855,7 @@ test "every place you have entered has a seat on the rail" {
 
     // Folded away, it draws nothing at all: contents follow the selection, and
     // the one boolean beside it decides whether they are on screen.
-    main.setRailForTest(.places, false);
+    main.setRailForTest(false);
     const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
     for (folded.layout.nodes) |n| {
         if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) return error.TheFoldedRailIsStillDrawn;

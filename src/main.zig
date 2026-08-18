@@ -13288,9 +13288,8 @@ pub const Msg = union(enum) {
     close_join,
     place_enter,
     place_leave,
-    /// The primary rail: select a section, or fold the secondary rail away when
-    /// the section pressed is the one already showing.
-    rail_press: RailSection,
+    /// The Places icon: the switcher rail out, or folded away.
+    toggle_places_rail,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
     /// Back into the visit Home closed.
@@ -20068,7 +20067,7 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
     // the feed owns the full width below the OS titlebar.
-    const second_rail = g_rail == .places and g_rail_open;
+    const second_rail = g_rail_open;
     return ui.row(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         railView(ui, model),
         // A 1px vertical rule between the rail and the content. No `grow`: in a
@@ -20213,7 +20212,7 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
         // reader has got to, INCLUDING out of a place. It looked like the app's
         // own button for a long time and did nothing when pressed, which is the
         // one thing a mark in that position should never be.
-        railDest(ui, "mark", 21, Msg.go_home, "Home", g_rail == .home),
+        railDest(ui, "mark", 21, Msg.go_home, "Home", g_place == null),
         vgap(ui, rail_gap),
         // The bell, with what is waiting on it. Signed out there is no inbox to
         // have, so there is no bell: a tile that could only ever say zero is a
@@ -20224,11 +20223,12 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
         // own, so a plate would claim a selection the app does not have.
         if (guest) ui.spacer(0) else railBell(ui),
         if (guest) ui.spacer(0) else vgap(ui, rail_gap),
-        // Places. Shown even with an empty list: the second rail's empty state
-        // is how somebody learns what a place is and that a link opens one,
-        // which in v1 is the only way in. That is a destination with nothing in
-        // it yet, not a destination that goes nowhere.
-        railDest(ui, "places", 17, Msg{ .rail_press = .places }, "Places", g_rail == .places),
+        // Places: the switcher rail, out or folded away. Shown even with an
+        // empty list, because the rail's empty state is how somebody learns
+        // what a place is and that a link opens one, which in v1 is the only
+        // way in. The plate says you are IN a place, which is the fact worth
+        // showing; whether the rail happens to be out is visible on its own.
+        railDest(ui, "places", 17, Msg.toggle_places_rail, "Places", g_place != null),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
@@ -20244,10 +20244,11 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
 }
 
 /// A primary-rail destination: the same 36px tile as a verb, plus the one thing
-/// a destination has that a verb does not, which is being the current one.
+/// a destination has that a verb does not, which is being where you are.
 ///
-/// Selection is the PLATE, so exactly one destination carries one at a time and
-/// the language is uniform. Discord's left-edge indicator bar reads better but
+/// The plate says where you are, and the two that have one are exclusive by
+/// construction: Home is plated out of a place, the pin is plated in one, and
+/// there is no third state. Discord's left-edge indicator bar reads better but
 /// has nowhere to live here: the 56px rail is a 36px tile between two 10px
 /// insets, and a bar inside the tile's own box paints on top of the plate
 /// instead of beside it.
@@ -23523,7 +23524,7 @@ fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
     // The same message the rail's own tile sends, so the key and the tile
     // cannot drift into two behaviours.
-    if (std.mem.eql(u8, name, "places-rail")) return Msg{ .rail_press = .places };
+    if (std.mem.eql(u8, name, "places-rail")) return .toggle_places_rail;
     if (std.mem.eql(u8, name, "place-bounce")) return .place_bounce;
     if (std.mem.eql(u8, name, "place-prev")) return Msg{ .place_step = -1 };
     if (std.mem.eql(u8, name, "place-next")) return Msg{ .place_step = 1 };
@@ -23755,59 +23756,49 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
     if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
 }
 
-/// Which section of the primary rail is selected.
+/// Whether the places rail is out. One boolean, persisted, and that is the
+/// whole of the second rail's state.
 ///
-/// Only two of the five the design names are here, because only two exist:
-/// Search and Messages are not built, and Notifications is a sheet rather than
-/// a destination. A rail item that cannot go anywhere is worse than one fewer,
-/// which is the same rule that keeps Groups off the rail until NIP-29 ships.
-pub const RailSection = enum(u8) { home, places };
-
-/// The selected section, and whether the secondary rail is out.
+/// The design called for a SECTION here, one of Home / Search / Notifications /
+/// Messages / Places, with the second rail's contents a pure function of it.
+/// Driving the built version is what argued against it: with only Places
+/// carrying a second rail, making Home a section that has none meant pressing
+/// Home hid the list of places, so coming back from your own feed to a room
+/// cost two presses. That is the opposite of switching between them with ease,
+/// which is the whole point of the rail.
 ///
-/// The secondary rail's CONTENTS are a pure function of the selection: Places
-/// lists your places, Home has no secondary rail at all. Its VISIBILITY is this
-/// one persisted boolean and nothing else. That split is deliberate. Every
-/// client read for this derives the second rail from the route, and the reason
-/// to care is that a second variable beside the route is a second thing that
-/// can disagree with it: a link that opens a place would then need a rule for
-/// who wins, and there is no good answer.
-var g_rail: RailSection = .home;
-var g_rail_open: bool = true;
+/// So the Places icon is a toggle for the switcher, exactly as it was asked
+/// for, and Home is a content destination that leaves the rail alone. The
+/// section comes back when a second one actually needs a second rail (Messages
+/// and its conversations, most likely), and it can be designed then against two
+/// real cases instead of one imagined one.
+///
+/// Off by default: a reader with no places should never be given a column that
+/// only says it is empty. Entering a place turns it on, and it stays on.
+var g_rail_open: bool = false;
 
-pub fn railSection() RailSection {
-    return g_rail;
-}
 pub fn railOpen() bool {
     return g_rail_open;
 }
 
-/// Pressing a primary rail item.
-///
-/// An inactive one selects it and forces the secondary out; the active one
-/// folds the secondary away and back. Every other route into a section (a
-/// link, a keyboard bounce, opening a place) goes through `selectRail`, which
-/// forces it out, so navigation never lands on a section whose rail is folded.
-fn pressRail(section: RailSection) void {
-    if (g_rail == section) {
-        g_rail_open = !g_rail_open;
-    } else {
-        g_rail = section;
-        g_rail_open = true;
-    }
+/// The Places icon, and `Cmd+Option+S`.
+fn togglePlacesRail() void {
+    g_rail_open = !g_rail_open;
     saveSettings();
 }
 
-fn selectRail(section: RailSection) void {
-    g_rail = section;
+/// Navigation reveals the switcher: entering a place, walking the list, or
+/// bouncing back into a room all put the rail where the eye is going to look.
+/// Opening one FROM the rail does not go through this, so folding it and then
+/// pressing a seat cannot make it spring back open.
+fn showPlacesRail() void {
     g_rail_open = true;
 }
 
-pub fn pressRailForTest(section: RailSection) void {
-    pressRail(section);
+pub fn togglePlacesRailForTest() void {
+    togglePlacesRail();
 }
-pub fn setRailForTest(section: RailSection, open: bool) void {
-    g_rail = section;
+pub fn setRailForTest(open: bool) void {
     g_rail_open = open;
 }
 
@@ -23873,8 +23864,7 @@ pub fn seedFromKeptPlaceForTest(i: usize) void {
 pub fn resetPlacesForTest() void {
     // The feed ids too, or one test's room leaks into the next one's.
     clearPlaceFeed();
-    g_rail = .home;
-    g_rail_open = true;
+    g_rail_open = false;
     g_place_flushed_at = 0;
     g_place_flushed_rev = 0;
     g_place = null;
@@ -23974,6 +23964,7 @@ fn resumeVisit() void {
     if (g_place != null and g_place_kept) savePlaces();
     g_place = g_visited;
     g_place_kept = false;
+    showPlacesRail();
     startPlaceFeed(&g_place.?);
     g_feed_rebuild_all.store(true, .release);
     saveSettings();
@@ -24005,7 +23996,7 @@ fn bouncePlace() void {
         return;
     }
     if (g_places_len == 0) return;
-    selectRail(.places);
+    showPlacesRail();
     openKeptPlace(@min(g_place_last, g_places_len - 1));
 }
 
@@ -24020,7 +24011,7 @@ fn stepPlace(delta: i8) void {
     const next: usize = if (activePlaceIndex()) |c|
         @intCast(@mod(@as(isize, @intCast(c)) + delta, n))
     else if (delta > 0) 0 else g_places_len - 1;
-    selectRail(.places);
+    showPlacesRail();
     openKeptPlace(next);
 }
 
@@ -24080,7 +24071,6 @@ pub fn applyActivePlaceLine(value: []const u8) void {
 /// the suite green, because nothing exercised this.
 fn restoreOpenPlace() void {
     const i = bootPlaceIndex() orelse return;
-    selectRail(.places);
     openKeptPlace(i);
 }
 
@@ -24683,10 +24673,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // holds a seat for.
                     g_visited = null;
                     savePlaces();
-                    // Entering is the moment the second rail has something to
-                    // show, so it shows it: the place the reader just kept,
-                    // now with a seat of its own.
-                    selectRail(.places);
+                    // Entering is the moment the rail has something to show,
+                    // so it shows it: the place the reader just kept, now with
+                    // a seat of its own. It is off until then, because a column
+                    // that can only say it is empty is worse than no column.
+                    showPlacesRail();
                     saveSettings();
                 }
             }
@@ -24711,12 +24702,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_feed_rebuild_all.store(true, .release);
             saveSettings();
         },
-        .rail_press => |section| pressRail(section),
+        .toggle_places_rail => togglePlacesRail(),
         .place_resume => resumeVisit(),
-        .place_open => |i| {
-            selectRail(.places);
-            openKeptPlace(i);
-        },
+        // No `showPlacesRail` here: the press came FROM the rail, so it is
+        // already out, and forcing it would undo a fold the reader just did.
+        .place_open => |i| openKeptPlace(i),
         .place_bounce => bouncePlace(),
         .place_step => |delta| stepPlace(delta),
         .close_join => {
@@ -28099,8 +28089,8 @@ fn goHome(model: *Model) void {
     model.stage = .ready;
     // Home is YOUR feed, so the mark closes the room. Not the same verb as
     // Leave: the place stays in the list with its ids intact, one press away on
-    // the second rail.
-    selectRail(.home);
+    // the rail, which is deliberately left exactly as it was. Hiding it here is
+    // what made coming back cost two presses.
     goToOwnPlaza();
 }
 
@@ -29441,8 +29431,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     g_hidden = @splat(false);
-    g_rail = .home;
-    g_rail_open = true;
+    g_rail_open = false;
     g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
