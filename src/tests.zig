@@ -3515,8 +3515,11 @@ test "an ancestor row is priced at what it draws, one line and two" {
         One.a = .{ .note = note, .lines = @intFromFloat(main.ancestorBodyLinesForTest(&note)) };
 
         const measured = try measuredHeight(arena, &model, One.row);
+        // The NESTED unit: an ancestor's body is set one register down, and
+        // that register is now boxed at the height it draws rather than at a
+        // full body line.
         const priced = main.ancestor_top_pad + main.ancestor_row_chrome_for_test +
-            @as(f32, @floatFromInt(One.a.lines)) * main.body_line_height;
+            @as(f32, @floatFromInt(One.a.lines)) * main.nested_line_height;
         if (@abs(measured - priced) > 0.5) {
             std.debug.print("\nancestor ({d} chars): draws {d}, priced {d}, lines {d}\n", .{ body.len, measured, priced, main.ancestorBodyLinesForTest(&One.a.note) });
             return error.EstimateDisagreesWithLayout;
@@ -18885,4 +18888,173 @@ test "the status bar does not call a place the starter pack" {
         return error.ThePlaceIsCalledTheStarterPack;
     }
     try testing.expectEqualStrings("Caught up · The relay · 3 notes", line);
+}
+
+test "a place whose notes are already stored still fills" {
+    // The report: open the app with no places entered, follow a link to one you
+    // have been in before, and it sits on "Connecting" forever while its relay
+    // is connected and answering. Enter it and restart, and it works.
+    //
+    // The cause was one level above the rebuild. A place's notes arrive on its
+    // own socket and are ingested like anything else, so a room the reader has
+    // never seen fires the store-count check and fills. A room they HAVE seen
+    // does not: every note is a duplicate, the count never moves, and the tick
+    // decides there is nothing to do without ever asking the place. Restarting
+    // hid it, because boot's first tick is stale for other reasons anyway.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5b} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/place-stale.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+    defer main.setStoreForTest(null);
+
+    // Everything the place will send is ALREADY in the store, which is the
+    // whole point: this is a room the reader has been in before.
+    var ids: [3][32]u8 = undefined;
+    for (0..3) |i| {
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), "a note from the room");
+        _ = try store.ingest(arena, ev, .{});
+        ids[i] = ev.id;
+    }
+
+    // A tick with no place, so the store count is settled and the next one
+    // cannot ride in on it.
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.refreshForTest(&model, &store, 1_800_000_100);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    // Now visit, and let the place's socket deliver. Nothing new reaches the
+    // store, so the revision counter is the only thing that says so.
+    main.visitPlaceWithFeedForTest([_]u8{0x5c} ** 32, "room", "Bass Pistol", "The relay");
+    main.seedPlaceFeedForTest(&ids);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    if (model.notes_len == 0) {
+        std.debug.print("the place stayed empty: \"{s}\"\n", .{model.empty_text()});
+        return error.ThePlaceNeverFilled;
+    }
+    try testing.expectEqual(@as(usize, 3), model.notes_len);
+}
+
+test "an empty place says what its own relay is doing, not the pool's" {
+    // A place's relay is deliberately outside the eight, so "Connecting to the
+    // relay pool" under a place header describes a connection that has nothing
+    // to do with the empty screen it is explaining.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    var model = main.initialModel();
+    try testing.expectEqualStrings("Connecting to the relay pool…", model.empty_text());
+
+    main.visitPlaceWithFeedForTest([_]u8{0x5d} ** 32, "room", "Bass Pistol", "The relay");
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqualStrings("Connecting to this place…", model.empty_text());
+
+    main.setPlaceLinkForTest(.unreachable_relay);
+    const failed = model.empty_text();
+    if (std.mem.indexOf(u8, failed, "pool") != null) {
+        std.debug.print("an unreachable place blames the pool: \"{s}\"\n", .{failed});
+        return error.ThePlaceBlamedThePool;
+    }
+
+    main.setPlaceLinkForTest(.connected);
+    try testing.expectEqualStrings("Nothing here yet.", model.empty_text());
+}
+
+test "a smaller line is asked for by its size, not by scaling every span" {
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 means a paragraph whose spans are ALL scaled DOWN
+    // keeps a full-size baseline in a full-size box: 13.5pt text drawn on a
+    // 14.5pt baseline inside an 18.125pt box. A point lower than the text
+    // around it, with a point and a quarter of extra air above, which is what
+    // the reply-context line looked like next to the note it belongs to.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest("");
+    const body = "hop on @primal august workout challenge.";
+    const b = @min(body.len, model.notes[0].content_buf.len);
+    @memcpy(model.notes[0].content_buf[0..b], body[0..b]);
+    model.notes[0].content_len = @intCast(b);
+    model.notes[0].reply_parent = [_]u8{0x42} ** 32;
+    model.notes[0].has_reply_parent = true;
+    model.notes_len = 1;
+    main.seedQuoteForTest([_]u8{0x42} ** 32, [_]u8{0x31} ** 32, 1_800_000_000, "the note being answered");
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    // Every run of the context line, by the size it actually draws at.
+    var line_y: ?f32 = null;
+    var runs: usize = 0;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.indexOf(u8, t.text, "reply to") != null or
+                std.mem.indexOf(u8, t.text, "being answered") != null;
+            if (!mine) continue;
+            runs += 1;
+            // 13.5, the `.sm` token, NOT 14.5 scaled down to look like it.
+            try testing.expectApproxEqAbs(@as(f32, 13.5), t.size, 0.001);
+            // Both runs of the line share one baseline, whatever their weight.
+            if (line_y) |y| {
+                if (@abs(y - t.origin.y) > 0.001) {
+                    std.debug.print("the context line draws runs at y={d:.3} and y={d:.3}\n", .{ y, t.origin.y });
+                    return error.RunsOffTheirSharedBaseline;
+                }
+            } else line_y = t.origin.y;
+        },
+        else => {},
+    };
+    if (runs < 2) return error.TheContextLineNeverDrewBothRuns;
+
+    // And the box is the height that size needs: 13.5 * 1.25, not 14.5 * 1.25.
+    var boxed = false;
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, "reply to") == null) continue;
+        boxed = true;
+        if (@abs(n.widget.frame.height - 16.875) > 0.01) {
+            std.debug.print(
+                "the context line reserves {d:.3}pt for 13.5pt text (16.875 is its own height)\n",
+                .{n.widget.frame.height},
+            );
+            return error.TheLineIsBoxedForATextItDoesNotDraw;
+        }
+    }
+    try testing.expect(boxed);
+
+    // The body around it is untouched: full size, one baseline across the
+    // plain text and the mention that sits in the middle of it.
+    var body_y: ?f32 = null;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.eql(u8, t.text, "hop on ") or
+                std.mem.eql(u8, t.text, "@primal") or
+                std.mem.eql(u8, t.text, " august workout challenge.");
+            if (!mine) continue;
+            try testing.expectApproxEqAbs(@as(f32, 14.5), t.size, 0.001);
+            if (body_y) |y| try testing.expectApproxEqAbs(y, t.origin.y, 0.001) else body_y = t.origin.y;
+        },
+        else => {},
+    };
+    try testing.expect(body_y != null);
 }

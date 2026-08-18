@@ -3352,11 +3352,20 @@ const quote_aside_chrome: f32 = 62.125;
 /// states draw a bar or a single line where the identity would be.
 const quote_quiet_chrome: f32 = 5 + 4 + 2 + 2;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
-/// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
-/// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
-/// DOWN still gets `14.5 * 1.25`. Scale shrinks glyphs, never the line box, and
-/// every term here that priced a scaled run at its own size was short.
-const ancestor_line_height: f32 = body_line_height;
+/// A nested line, at the height it now actually draws.
+///
+/// This used to be `body_line_height`, with a comment explaining that a body
+/// line is a body line whatever register it is set in: `textSpansMaxScale`
+/// starts at 1 and only takes the max, so a paragraph whose spans were all
+/// scaled DOWN still got a full `14.5 * 1.25` box. That was a true description
+/// of the engine and a workaround for a defect, and pricing around it kept the
+/// defect: the glyphs shrank and the line box did not, so every nested line sat
+/// a point low with a point and a quarter of air above it.
+///
+/// The nested register is asked for by its SIZE now (`.sm`, which is
+/// `body_size - 1`), so the box is the one the text needs and the estimate is
+/// the height it draws.
+const ancestor_line_height: f32 = nested_line_height;
 const ancestor_row_chrome: f32 = avatar_size + ancestor_identity_gap + ancestor_bottom_pad;
 /// A ghost row: its two quiet lines set the height, not the dashed disc. Both are
 /// scaled down and both still take a full body line box (see
@@ -3373,6 +3382,9 @@ const focal_leading_pad: f32 = 16;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
+/// The same for the nested register, which is `.sm` (`body_size - 1`) and so
+/// lays out at `13.5 * 1.25`.
+pub const nested_line_height: f32 = 16.875;
 /// The redesign's metadata register: 12px for handles, timestamps and counts.
 /// `.size = .sm` cannot say it (the size enum steps by exactly one from the 14.5
 /// body, giving 13.5), so these runs are scaled spans, which take an exact
@@ -9686,6 +9698,16 @@ pub const Model = struct {
         return "Connecting…";
     }
     pub fn empty_text(self: *const Model) []const u8 {
+        // In a place, the pool is not what the reader is waiting on. Its relay
+        // is deliberately outside the eight, so "Connecting to the relay pool"
+        // under a place header describes a connection that has nothing to do
+        // with the empty screen it is explaining, and says "connecting" about a
+        // socket that may have failed a minute ago.
+        if (g_place != null) return switch (placeLink()) {
+            .idle, .connecting => "Connecting to this place…",
+            .unreachable_relay => "Can't reach this place. Retrying…",
+            .connected => "Nothing here yet.",
+        };
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
         return "Connecting to the relay pool…";
     }
@@ -9969,9 +9991,21 @@ pub const Model = struct {
         // either can be true on a tick where the count has not moved (a
         // deletion cancels an insert, or nothing was stored at all and the
         // reader simply changed who they follow).
+        // A place's notes arrive on its own socket and go into the store like
+        // anything else, so for a place the reader has never seen this fires on
+        // the count alone. For one they HAVE seen it does not: every note is
+        // already stored, the ingest is a duplicate, the count does not move,
+        // and nothing below ever runs. That is a room that sits on "Connecting"
+        // forever while its relay is connected and answering.
+        //
+        // `rebuildNotes` already treats this counter as a reason to rebuild.
+        // The bug was one level up: it never got the chance, because deciding
+        // whether to call it at all did not know about places.
+        const place_rev = g_place_rev.load(.monotonic);
         const stale = count != g_last_count or
             g_arrival_pending.load(.acquire) or
             g_feed_rebuild_all.load(.acquire) or
+            place_rev != g_notes_place_rev or
             self.feed_limit != g_notes_feed_limit;
         if (stale) {
             g_last_count = count;
@@ -10035,7 +10069,8 @@ pub const Model = struct {
         //                  belong now and no arrival describes them
         // A place's notes arrive on its own socket, not through the ingest
         // buffer the splice path drains, so nothing in `arrived` ever describes
-        // them. Its revision counter is what says there is something new.
+        // them. Its revision counter is what says there is something new, and
+        // `refresh` consults the same counter before it gets here.
         const place_rev = g_place_rev.load(.monotonic);
         const place_moved = place_rev != g_notes_place_rev;
         g_notes_place_rev = place_rev;
@@ -10308,6 +10343,19 @@ pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) vo
     invalidateFeed();
     refreshProfiles(store);
     model.rebuildNotes(store, now_s);
+}
+
+/// A tick as the app actually takes one, including the gate that decides
+/// whether the feed is rebuilt AT ALL.
+///
+/// `reconcileForTest` goes straight to `rebuildNotes` and invalidates on the
+/// way in, so every test using it rebuilds unconditionally. That is the right
+/// tool for asking what a rebuild produces, and it is why a place could sit on
+/// "Connecting" forever with nothing red: the decision NOT to rebuild is the
+/// part it skips.
+pub fn refreshForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    setStoreForTest(store);
+    model.refresh(now_s);
 }
 
 /// How the feed has been brought up to date, counted. Asserted on instead of
@@ -19703,8 +19751,8 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
                 if (about.len > 0)
                     ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = p.text_body_soft } },
-                        &.{.{ .text = about, .scale = nested_body_scale }},
+                        .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_body_soft } },
+                        &.{.{ .text = about }},
                     )
                 else
                     ui.spacer(0),
@@ -22061,6 +22109,30 @@ fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
 /// The same paragraph at a stated register and ink: the thread's focal note reads
 /// one step up from a feed row, and a shade brighter.
 fn textParaAt(ui: *AppUi, spans: []const canvas.TextSpan, scale: f32, ink: canvas.Color) AppUi.Node {
+    // A paragraph one step DOWN is asked for by its SIZE, never by scaling
+    // every span in it, and the difference is a point of vertical position.
+    //
+    // The line box and the baseline come from `size * max(1, largest span
+    // scale)`. That floor of 1 is the whole problem: a paragraph whose spans
+    // are all scaled DOWN is still boxed and baselined as though it were full
+    // size, so the nested register drew 13.5pt text on a 14.5pt baseline inside
+    // an 18.125pt box instead of a 13.5pt baseline in a 16.875pt one. A point
+    // lower than the text around it, with a point and a quarter of extra air
+    // above, which is what a reply's context line looked like next to the note
+    // it belongs to.
+    //
+    // `.sm` is `body_size - 1`, which is exactly the 13.5 the ratio was
+    // approximating, and the spans then sit at scale 1 of a genuinely smaller
+    // paragraph. Scaling UP is unaffected and stays a scale: the floor only
+    // bites below 1.
+    if (scale == nested_body_scale) {
+        return ui.paragraph(.{
+            .size = .sm,
+            .wrap = true,
+            .on_link = AppUi.linkMsg(.open_url),
+            .style = .{ .foreground = ink },
+        }, spans);
+    }
     const sized = if (scale == 1) spans else blk: {
         const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch break :blk spans;
         for (spans, out) |src, *dst| {
@@ -22172,7 +22244,7 @@ fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.No
     var n: usize = 0;
     // The name carries the weight and the snippet does not, so the two read
     // apart on one line without needing a second colour.
-    spans[n] = .{ .text = label, .scale = nested_body_scale, .weight = .medium };
+    spans[n] = .{ .text = label, .weight = .medium };
     n += 1;
     if (snippet.len > 0) {
         // One line's worth. The cache already clamps to `quote_text_cap`, and a
@@ -22180,12 +22252,25 @@ fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.No
         // ellipsis before running out of box.
         const cut = firstLineOf(snippet, reply_context_snippet_chars);
         if (cut.len > 0) {
-            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = nested_body_scale };
+            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = 0 };
             n += 1;
         }
     }
+    // `.sm`, not spans scaled to 13.5/14.5, and the difference is a point of
+    // vertical position rather than a nicety.
+    //
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 is what matters: a paragraph whose spans are ALL
+    // scaled DOWN is still boxed and baselined as though it were full size, so
+    // this line drew its 13.5pt text on a 14.5pt baseline inside an 18.125pt box
+    // instead of a 13.5pt baseline in a 16.875pt one. A point lower than the
+    // text beside it, with a point and a quarter of extra air above.
+    //
+    // The size TOKEN says the same thing without the floor applying: `.sm` is
+    // `body_size - 1`, which is exactly the 13.5 the ratio was approximating,
+    // and the spans then sit at scale 1 of a genuinely smaller paragraph.
     return ui.paragraph(
-        .{ .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
+        .{ .size = .sm, .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
         spans[0..n],
     );
 }
@@ -22254,8 +22339,8 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // sentence the ancestor row above a thread has always used for the same
         // situation, which is the other reason to use it.
         return quoteAside(ui, null, ui.paragraph(
-            .{ .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = "Not on your relays yet", .scale = nested_body_scale }},
+            .{ .size = .sm, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = "Not on your relays yet" }},
         ));
     }
 
