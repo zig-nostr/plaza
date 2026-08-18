@@ -10027,7 +10027,14 @@ pub const Model = struct {
         g_notes_feed_limit = self.feed_limit;
 
         if (full) {
-            self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
+            // In a place, the feed IS the place. Not your follows with a
+            // header on top, which is what a lens would be and is exactly the
+            // thing the room decision rejected.
+            if (g_place != null) {
+                self.rebuildNotesFromPlace(store, now_s, limit, reuse_ok);
+            } else {
+                self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
+            }
             return;
         }
         if (arrived.n == 0) return;
@@ -10037,6 +10044,58 @@ pub const Model = struct {
     /// Reads the whole window back from the store: a cursor per followed author
     /// and a linear pick across all of them, per note returned. The expensive
     /// one, and the reason for everything above it.
+    /// The same rebuild, reading the ids the place's relay sent rather than a
+    /// set of authors. Shares `noteFrom`, the reuse index and the mute filter,
+    /// because a note in a place is a note.
+    fn rebuildNotesFromPlace(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        limit: usize,
+        reuse_ok: bool,
+    ) void {
+        var ids: [place_feed_cap][32]u8 = undefined;
+        var ids_len: usize = 0;
+        {
+            lockPlaceIds();
+            defer unlockPlaceIds();
+            ids_len = g_place_ids_len;
+            @memcpy(ids[0..ids_len], g_place_ids[0..ids_len]);
+        }
+        if (ids_len == 0) {
+            self.notes_len = 0;
+            return;
+        }
+
+        var result = store.query(std.heap.page_allocator, .{
+            .ids = ids[0..ids_len],
+            .limit = @intCast(limit),
+        }) catch return;
+        defer result.deinit();
+        g_feed_work.full_reads += 1;
+
+        const old = g_feed_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+        const slots = if (reuse_ok) buildReuseIndex(old[0..old_len]) else &.{};
+
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= limit) break;
+            // The reader's own mutes still apply inside a place. So what they
+            // see is not exactly what the host published, and that is the right
+            // way round: a host cannot un-mute somebody for you.
+            if (isMuted(ev.pubkey)) continue;
+            self.notes[n] = blk: {
+                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                g_feed_work.parses += 1;
+                break :blk noteFrom(ev, now_s);
+            };
+            n += 1;
+        }
+        self.notes_len = n;
+    }
+
     fn rebuildNotesFromStore(
         self: *Model,
         store: *nostr.store.Store,
@@ -23249,6 +23308,100 @@ pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
 var g_place: ?Mode = null;
 var g_place_kept: bool = false;
 
+/// What the place's relay has told us about, newest first.
+///
+/// A ROOM, per the decision: while you are in a place you see IT, not your own
+/// feed with a header on top. Nothing in the store records which relay an event
+/// arrived on, so the connection keeps its own list of ids and the rebuild reads
+/// exactly those. That also makes leaving instant: drop the list.
+const place_feed_cap = 200;
+var g_place_ids: [place_feed_cap][32]u8 = undefined;
+var g_place_ids_len: usize = 0;
+var g_place_ids_lock = std.atomic.Value(bool).init(false);
+/// Bumped by the relay thread so the UI knows there is something new to read,
+/// the same shape the arrival buffer uses.
+var g_place_rev = std.atomic.Value(u32).init(0);
+/// Which place the live connection belongs to, so a thread whose place has been
+/// left stops writing into the list the next one is filling.
+var g_place_gen = std.atomic.Value(u32).init(0);
+
+fn lockPlaceIds() void {
+    while (g_place_ids_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockPlaceIds() void {
+    g_place_ids_lock.store(false, .release);
+}
+
+fn clearPlaceFeed() void {
+    _ = g_place_gen.fetchAdd(1, .monotonic);
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = 0;
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+pub fn placeFeedCount() usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    return g_place_ids_len;
+}
+
+/// Opens the place's relay and keeps reading it.
+///
+/// Its own socket, outside the eight. Entering a place must never cost the
+/// reader one of their own relays, and this connection never publishes and is
+/// never written into their kind:10002, which is the same discipline the
+/// indexer set and the discovered pool already follow.
+fn startPlaceFeed(m: *const Mode) void {
+    if (m.feeds_len == 0) return;
+    clearPlaceFeed();
+    const gen = g_place_gen.load(.monotonic);
+    var url_buf: [mode_relay_cap]u8 = undefined;
+    const len = copyBounded(&url_buf, m.feeds[0].relay());
+    const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, gen }) catch return;
+    t.detach();
+}
+
+fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+
+    const kinds = [_]u16{1};
+    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = place_feed_cap }};
+    relay.subscribe("plaza-place", &filters) catch return;
+
+    while (g_place_gen.load(.monotonic) == gen) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                // The reader left, or moved: this thread's list is not the one
+                // being shown any more, so it stops rather than writing into it.
+                if (g_place_gen.load(.monotonic) != gen) break;
+                wantProfile(e.event.pubkey);
+                lockPlaceIds();
+                defer unlockPlaceIds();
+                if (g_place_ids_len < g_place_ids.len) {
+                    g_place_ids[g_place_ids_len] = e.event.id;
+                    g_place_ids_len += 1;
+                    _ = g_place_rev.fetchAdd(1, .monotonic);
+                }
+            },
+            // NOT closed at EOSE: a place is somewhere you sit, so the socket
+            // stays open and new notes arrive while the reader is looking.
+            else => {},
+        }
+    }
+}
+
 /// The places kept across restarts. Small on purpose for v1.
 const max_places = 8;
 var g_places: [max_places]Mode = @splat(.{});
@@ -23422,6 +23575,7 @@ fn refreshPlaceFetch() void {
     g_place = m;
     g_place_kept = placeIndexOf(m.author, m.ident()) != null;
     g_mode_want = null;
+    startPlaceFeed(&g_place.?);
 }
 
 /// How many ticks a mode fetch may go unanswered. The tick is a second, and a
@@ -23878,6 +24032,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             g_place = null;
             g_place_kept = false;
+            clearPlaceFeed();
         },
         .close_join => {
             model.joining = false;
