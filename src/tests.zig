@@ -18509,3 +18509,49 @@ test "the room is written down while it is being read, not only when entered" {
     main.flushPlaceIdsForTest(7200);
     try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
 }
+
+test "inside a place the feed is not called Following" {
+    // It said "Following" under a place header, which is simply false: those
+    // are not the reader's follows, which is the whole point of a room.
+    var fx: main.EffectsForTest = undefined;
+    const model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const own = model.scope_name();
+    try testing.expect(std.mem.eql(u8, own, "Following") or std.mem.eql(u8, own, "Starter pack"));
+
+    main.visitPlaceWithFeedForTest([_]u8{0x4d} ** 32, "somewhere", "Somewhere", "The relay");
+    const inside = model.scope_name();
+    if (std.mem.eql(u8, inside, "Following") or std.mem.eql(u8, inside, "Starter pack")) {
+        std.debug.print("a place still calls its feed \"{s}\"\n", .{inside});
+        return error.PlaceCalledFollowing;
+    }
+    try testing.expectEqualStrings("The relay", inside);
+
+    // A place whose feed has no name of its own still must not borrow yours.
+    main.visitPlaceForTest([_]u8{0x4e} ** 32, "nameless", "Nameless");
+    try testing.expectEqualStrings("This place", model.scope_name());
+    _ = fx;
+}
+
+test "a place says what its own connection is doing" {
+    // The status bar counts the pool, and a place's relay is deliberately not
+    // in it, so a place that is slow or unreachable looked exactly like a
+    // connected one while the bar reported 5/5.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqual(main.PlaceLink.idle, main.placeLink());
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqual(main.PlaceLink.connecting, main.placeLink());
+
+    // Walking out resets it, so the next place never inherits the last one's
+    // failure.
+    main.setPlaceLinkForTest(.unreachable_relay);
+    main.clearPlaceFeedForTest();
+    if (main.placeLink() != .idle) {
+        std.debug.print("a new place inherited the last one's state: {t}\n", .{main.placeLink()});
+        return error.StaleLinkState;
+    }
+}

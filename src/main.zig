@@ -9733,6 +9733,13 @@ pub const Model = struct {
     /// statements too.
     pub fn scope_name(self: *const Model) []const u8 {
         _ = self;
+        // Inside a place the feed is the place's, so saying "Following" is
+        // simply false: those are not the reader's follows. It names the
+        // place's own feed instead.
+        if (g_place) |*m| {
+            if (m.feeds_len > 0 and m.feeds[0].name_len > 0) return m.feeds[0].name();
+            return "This place";
+        }
         return if (followsAreOwned()) "Following" else "Starter pack";
     }
 
@@ -20486,6 +20493,22 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = scope_title_scale }},
             ),
+            hgap(ui, 8),
+            // What THIS place's socket is doing, which the status bar cannot
+            // say: it counts the pool, and this relay is deliberately not in
+            // it. Silent once connected, because a working connection is not
+            // news.
+            switch (placeLink()) {
+                .connecting => ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint } },
+                    &.{.{ .text = "connecting", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                .unreachable_relay => ui.paragraph(
+                    .{ .style = .{ .foreground = p.status_warning } },
+                    &.{.{ .text = "cannot reach this place", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                else => ui.spacer(0),
+            },
             ui.spacer(1),
             if (g_place_kept)
                 ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave }, "Leave")
@@ -23375,8 +23398,26 @@ fn placeIdsSnapshot(out: [][32]u8) usize {
     return n;
 }
 
+/// What the place's own socket is doing.
+///
+/// Its own state, because the status bar counts the POOL and a place's relay is
+/// deliberately not in it. So a place that is slow, or refusing, or simply not
+/// there looked exactly like a connected one while the bar cheerfully reported
+/// 5/5 relays. That is the reader being told the wrong thing about the only
+/// connection they are actually waiting on.
+pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay };
+var g_place_link = std.atomic.Value(u8).init(@intFromEnum(PlaceLink.idle));
+
+pub fn placeLink() PlaceLink {
+    return @enumFromInt(g_place_link.load(.monotonic));
+}
+fn setPlaceLink(state: PlaceLink) void {
+    g_place_link.store(@intFromEnum(state), .monotonic);
+}
+
 fn clearPlaceFeed() void {
     _ = g_place_gen.fetchAdd(1, .monotonic);
+    setPlaceLink(.idle);
     lockPlaceIds();
     defer unlockPlaceIds();
     g_place_ids_len = 0;
@@ -23418,8 +23459,15 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
-    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    setPlaceLink(.connecting);
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch {
+        // Only if this thread still owns the place. A dial that fails after the
+        // reader has already walked out must not paint the next room's header.
+        if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+        return;
+    };
     defer relay.deinit();
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.connected);
 
     const kinds = [_]u16{1};
     const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = place_feed_cap }};
@@ -23448,6 +23496,9 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
             else => {},
         }
     }
+    // The loop only ends when the socket died or the reader left. The first is
+    // worth saying out loud; the second already reset this.
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
 }
 
 /// The places kept across restarts. Small on purpose for v1.
@@ -23470,6 +23521,20 @@ pub fn startPlaceFeedForTest(i: usize) void {
 }
 pub fn savePlacesForTest() void {
     savePlaces();
+}
+
+pub fn setPlaceLinkForTest(state: PlaceLink) void {
+    setPlaceLink(state);
+}
+
+/// Arrives in a place that has a named feed, which is the ordinary case.
+pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []const u8, feed: []const u8) void {
+    visitPlaceForTest(author, ident, name);
+    if (g_place) |*m| {
+        m.feeds[0].name_len = @intCast(copyBounded(&m.feeds[0].name_buf, feed));
+        m.feeds[0].relay_len = @intCast(copyBounded(&m.feeds[0].relay_buf, "wss://example.test"));
+        m.feeds_len = 1;
+    }
 }
 
 pub fn flushPlaceIdsForTest(now_s: i64) void {
