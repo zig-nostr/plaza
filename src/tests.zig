@@ -18377,3 +18377,60 @@ test "a plaza:// link names what to fetch and nothing else" {
         }
     }
 }
+
+test "entering a place keeps it, and nothing else is gated on it" {
+    // The correction that reshaped this feature: entering is about KEEPING a
+    // place, not about permission. Somebody may enter, stay across restarts,
+    // and never post; somebody else may read and post while only visiting.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x77} ** 32;
+    main.visitPlaceForTest(host, "plaza-mode-test", "Bass Pistol");
+
+    // Visiting: you are in it, and it is not kept.
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Entering twice is not two places. A link followed again while already
+    // entered must not duplicate the row.
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Leaving takes it out of the list AND out of the place.
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expect(!main.placeIsKept());
+}
+
+test "returning to a place already entered arrives kept, not visiting" {
+    // The link works whether or not the place is in the list. Following it for
+    // one already entered must not offer to enter it again.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x33} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+
+    // Walk out without leaving, then follow the link again.
+    main.clearActivePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    if (!main.placeIsKept()) {
+        std.debug.print("a place already entered came back as visiting\n", .{});
+        return error.KeptPlaceForgotten;
+    }
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+}

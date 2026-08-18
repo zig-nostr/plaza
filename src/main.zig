@@ -13202,9 +13202,8 @@ pub const Msg = union(enum) {
     open_join,
     /// Dismiss the join sheet; a remembered intent is forgotten with it.
     close_join,
-    mode_apply,
-    mode_dismiss,
-    mode_leave,
+    place_enter,
+    place_leave,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
     /// The sheet's import path: open the Notary window (a separate process),
@@ -14421,12 +14420,6 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
             return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
         }
     }
-    // Above everything, wherever the reader is. A mode arrives from a link that
-    // could be clicked while they are anywhere, and it changes what the app
-    // connects to, so it is a decision to take rather than a screen to find.
-    if (offeredMode()) |m| {
-        return ui.stack(.{ .grow = 1 }, .{ base, modeOfferSheet(ui, m) });
-    }
     if (model.stage == .ready and model.joining) {
         return ui.stack(.{ .grow = 1 }, .{ base, joinSheet(ui, model) });
     }
@@ -15047,70 +15040,6 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
                         ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
                     }),
                 }),
-            }),
-        }),
-    });
-}
-
-/// What a mode is about to change, before it changes it.
-///
-/// A mode sets where the app connects, so applying is never automatic. This is
-/// the whole trust surface of the feature: it names the publisher, shows the
-/// text they wrote, and lists the relay it would add, and none of that happens
-/// until the reader presses the button.
-fn modeOfferSheet(ui: *AppUi, m: *const Mode) AppUi.Node {
-    const p = theme.palette;
-    var rows: [8]AppUi.Node = undefined;
-    var n: usize = 0;
-
-    rows[n] = ui.paragraph(
-        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
-        &.{.{ .text = ui.fmt("Open {s}?", .{if (m.name_len > 0) m.name() else "this place"}), .scale = 1.1, .weight = .medium }},
-    );
-    n += 1;
-    rows[n] = vgap(ui, 7);
-    n += 1;
-
-    // Who signed it. A mode is somebody's, and knowing whose is most of
-    // deciding whether to open it.
-    rows[n] = ui.paragraph(
-        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-        &.{.{ .text = ui.fmt("published by {s}", .{quoteAuthorName(ui, m.author)}), .scale = mono_hint_scale }},
-    );
-    n += 1;
-    rows[n] = vgap(ui, 10);
-    n += 1;
-
-    // What it would change, stated plainly and completely for v1: the name, the
-    // relay, and that a text comes with it. Nothing else in a v1 mode reaches
-    // the app, so nothing else is claimed.
-    if (m.feeds_len > 0) {
-        rows[n] = ui.paragraph(
-            .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = ui.fmt("It adds one feed, reading from {s}. That relay is not joined, is not published as yours, and nothing is posted to it.", .{m.feeds[0].relay()}), .scale = mono_hint_scale }},
-        );
-        n += 1;
-        rows[n] = vgap(ui, 10);
-        n += 1;
-    }
-
-    rows[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
-        ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.mode_apply }, "Open it"),
-        ui.button(.{ .size = .sm, .on_press = Msg.mode_dismiss }, "Not now"),
-    });
-    n += 1;
-
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
-        .on_dismiss = .mode_dismiss,
-        .style_tokens = .{ .background = .scrim },
-        .semantics = .{ .label = "Open this place?" },
-    }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            ui.column(.{ .gap = 0 }, .{
-                vgap(ui, 24),
-                settingsCard(ui, .{ui.column(.{ .gap = 0, .grow = 1 }, .{rows[0..n]})}),
             }),
         }),
     });
@@ -20134,7 +20063,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
-        if (appliedMode()) |m| modeStrip(ui, m) else ui.spacer(0),
+        if (activePlace()) |m| placeHeader(ui, m) else ui.spacer(0),
         scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
@@ -20460,13 +20389,17 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The feed's scope line: which feed this is (the starter pack) and how wide it
 /// reaches. A property of the feed, not a destination to choose between.
-/// The strip that says which place you are in, and how to leave it.
+/// The header of the place you are in: who it belongs to, what they wrote, and
+/// the way out.
 ///
-/// v1's whole visible payload: the name somebody chose, the text they wrote,
-/// and one press back out. Above the scope line rather than replacing it,
-/// because a mode is a place you are visiting, not a different app: your feed,
-/// your account and your relays are all still underneath.
-fn modeStrip(ui: *AppUi, m: *const Mode) AppUi.Node {
+/// While VISITING it also carries the one affordance that matters, and it is a
+/// quiet line rather than a wall: entering keeps the place, and nothing else in
+/// the app is gated on it. You can already read here and post here.
+///
+/// It says entering is private on the spot rather than in settings, because a
+/// list of the communities somebody belongs to is sensitive and they should
+/// learn that where the decision is, not afterwards.
+fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
     const p = theme.palette;
     return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
         vgap(ui, 11),
@@ -20477,12 +20410,22 @@ fn modeStrip(ui: *AppUi, m: *const Mode) AppUi.Node {
                 &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = scope_title_scale }},
             ),
             ui.spacer(1),
-            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.mode_leave }, "Leave"),
+            if (g_place_kept)
+                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave }, "Leave")
+            else
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter"),
             hgap(ui, chrome_inset),
         }),
-        // The text whoever set the place up wrote. Markdown, because that is
-        // what Hallway's field is and what people put in it: a heading, a
-        // sentence, and the house rules as a list.
+        // Only while visiting. Once it is kept, saying so again is noise.
+        if (!g_place_kept) ui.row(.{ .cross = .start, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "You are just visiting. Entering keeps this place in your Plaza, and only you can see the places you have entered.", .scale = mono_hint_scale }},
+            ),
+            hgap(ui, chrome_inset),
+        }) else ui.spacer(0),
+        if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
         if (m.home_len > 0) ui.row(.{ .cross = .start, .gap = 0 }, .{
             hgap(ui, chrome_inset),
             ui.column(.{ .width = picture_column_width, .gap = 0 }, .{
@@ -23292,12 +23235,24 @@ pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
     return rest;
 }
 
-/// The mode currently applied, if any. Null is Plaza being itself.
-var g_mode: ?Mode = null;
-/// A mode that has been fetched and is waiting to be looked at. Applying is
-/// never automatic: a mode sets where the app connects, so a link opens an
-/// offer, not a new client.
-var g_mode_offer: ?Mode = null;
+/// The place you are in right now. Null is your own Plaza.
+///
+/// Three states, and only two of them are stored. VISITING is this being set
+/// while `g_place_kept` is false: you followed a link, you are in the place,
+/// you can read it and post to it, and closing the app forgets it. ENTERED is
+/// the same thing with the place also in the list below, which is the only
+/// thing entering does. LEFT is out of the list; the link still works.
+///
+/// Nothing is gated on entering. Whether a post lands is between the reader and
+/// the place's relays: if they refuse the write, that is theirs to say, not a
+/// wall this app invents.
+var g_place: ?Mode = null;
+var g_place_kept: bool = false;
+
+/// The places kept across restarts. Small on purpose for v1.
+const max_places = 8;
+var g_places: [max_places]Mode = @splat(.{});
+var g_places_len: usize = 0;
 /// What we are fetching, while we fetch it.
 var g_mode_want: ?struct {
     pubkey: [32]u8,
@@ -23307,11 +23262,44 @@ var g_mode_want: ?struct {
     waited: u16 = 0,
 } = null;
 
-pub fn appliedMode() ?*const Mode {
-    return if (g_mode) |*m| m else null;
+pub fn resetPlacesForTest() void {
+    g_place = null;
+    g_place_kept = false;
+    g_places = @splat(.{});
+    g_places_len = 0;
 }
-pub fn offeredMode() ?*const Mode {
-    return if (g_mode_offer) |*m| m else null;
+
+/// Arrives in a place the way a link does: in it, kept only if it already was.
+pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
+    var m = Mode{};
+    m.author = author;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    m.name_len = @intCast(copyBounded(&m.name_buf, name));
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+}
+
+pub fn clearActivePlaceForTest() void {
+    g_place = null;
+    g_place_kept = false;
+}
+
+pub fn activePlace() ?*const Mode {
+    return if (g_place) |*m| m else null;
+}
+pub fn placeIsKept() bool {
+    return g_place_kept;
+}
+pub fn keptPlaceCount() usize {
+    return g_places_len;
+}
+
+/// Whether a place with this author and identifier is already in the list.
+fn placeIndexOf(author: [32]u8, ident: []const u8) ?usize {
+    for (g_places[0..g_places_len], 0..) |*p, i| {
+        if (std.mem.eql(u8, &p.author, &author) and std.mem.eql(u8, p.ident(), ident)) return i;
+    }
+    return null;
 }
 
 fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
@@ -23401,9 +23389,9 @@ fn askModeAt(url_buf: [mode_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_
 /// Looks for the mode being waited on, once the store has grown. Called from
 /// the tick, which is where every other "did it arrive yet" check in this app
 /// lives.
-fn refreshModeOffer() void {
+fn refreshPlaceFetch() void {
     const want = g_mode_want orelse return;
-    if (g_mode_offer != null) return;
+    if (g_place != null) return;
     const store = g_store orelse return;
     const gpa = std.heap.page_allocator;
 
@@ -23429,7 +23417,10 @@ fn refreshModeOffer() void {
     m.author = want.pubkey;
     m.ident_len = want.ident_len;
     m.ident_buf = want.ident_buf;
-    g_mode_offer = m;
+    // Straight in, visiting. No sheet: the destination of following a link is
+    // the place, not a question about it.
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
     g_mode_want = null;
 }
 
@@ -23443,7 +23434,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // opened misses the very link that launched Plaza.
     if (has_url_scheme) plaza_url_scheme_install();
     if (g_io) |io| {
-        if (g_environ) |environ| loadMode(io, environ);
+        if (g_environ) |environ| loadPlaces(io, environ);
     }
     model.refresh(nowSeconds());
     // What was written but not sent when the app last closed, back in the
@@ -23503,7 +23494,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // so there is nothing to subscribe to.
                 var link_buf: [2048]u8 = undefined;
                 if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
-                refreshModeOffer();
+                refreshPlaceFetch();
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
@@ -23865,17 +23856,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             saveDraft(model.draft());
         },
         .open_join => model.joining = true,
-        .mode_apply => {
-            if (g_mode_offer) |m| {
-                g_mode = m;
-                g_mode_offer = null;
-                saveMode();
+        // Enter: keep this place. That is all it does, and it is private.
+        .place_enter => {
+            if (g_place) |m| {
+                if (g_places_len < g_places.len and placeIndexOf(m.author, m.ident()) == null) {
+                    g_places[g_places_len] = m;
+                    g_places_len += 1;
+                    g_place_kept = true;
+                    savePlaces();
+                }
             }
         },
-        .mode_dismiss => g_mode_offer = null,
-        .mode_leave => {
-            g_mode = null;
-            saveMode();
+        // Leave: out of the list, and out of the place. The link still works.
+        .place_leave => {
+            if (g_place) |m| {
+                if (placeIndexOf(m.author, m.ident())) |i| {
+                    for (i..g_places_len - 1) |j| g_places[j] = g_places[j + 1];
+                    g_places_len -= 1;
+                    savePlaces();
+                }
+            }
+            g_place = null;
+            g_place_kept = false;
         },
         .close_join => {
             model.joining = false;
@@ -28614,47 +28616,78 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     }
 }
 
-/// Where the applied mode is written, so opening a place survives a restart.
+/// Where the places you have entered are written.
 ///
-/// Its own file rather than a line in `settings`: a mode is somebody else's
-/// document, and keeping it whole means the next version can read fields this
-/// one ignored without a migration.
-const mode_file = "mode";
+/// A local file for v1, and that is a privacy decision as much as a simplicity
+/// one: a list of the communities somebody belongs to is sensitive, and a file
+/// on their own disk exposes nothing at all. The encrypted `kind:30078` version
+/// that syncs across devices is v2, and it has two hazards already written down
+/// in the notes: it is replaceable, so it must be read back before it is
+/// written, and NIP-44 decrypt is a signer capability a remote bunker may not
+/// offer.
+///
+/// Written in Hallway's own shape, one document per line, so the file is the
+/// documents and not a private encoding of them.
+const places_file = "places";
 
-fn saveMode() void {
+fn savePlaces() void {
     const io = g_io orelse return;
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-    const m = g_mode orelse {
-        dir.deleteFile(io, mode_file) catch {};
+    if (g_places_len == 0) {
+        dir.deleteFile(io, places_file) catch {};
         return;
-    };
-    // Written back in Hallway's own shape, so the file is the document and not
-    // a private encoding of it.
-    var buf: [mode_home_cap + 512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf,
-        \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}]}}
-    , .{
-        std.json.fmt(m.name(), .{}),
-        std.json.fmt(m.home(), .{}),
-        std.json.fmt(if (m.feeds_len > 0) m.feeds[0].name() else "", .{}),
-        std.json.fmt(if (m.feeds_len > 0) m.feeds[0].relay() else "", .{}),
-    }) catch return;
+    }
+    const gpa = std.heap.page_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (g_places[0..g_places_len]) |*m| {
+        out.print(gpa,
+            \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}],"host":{f},"d":{f}}}
+        , .{
+            std.json.fmt(m.name(), .{}),
+            std.json.fmt(m.home(), .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].name() else "", .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].relay() else "", .{}),
+            std.json.fmt(&std.fmt.bytesToHex(m.author, .lower), .{}),
+            std.json.fmt(m.ident(), .{}),
+        }) catch return;
+        out.append(gpa, '\n') catch return;
+    }
     dir.writeFile(io, .{
-        .sub_path = mode_file,
-        .data = data,
+        .sub_path = places_file,
+        .data = out.items,
         .flags = .{ .permissions = secret_file_permissions },
     }) catch {};
 }
 
-fn loadMode(io: std.Io, environ: *const std.process.Environ.Map) void {
+fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, mode_file, gpa, std.Io.Limit.limited(mode_home_cap + 1024)) catch return;
+    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((mode_home_cap + 1024) * max_places)) catch return;
     defer gpa.free(raw);
-    g_mode = parseMode(gpa, raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (g_places_len == g_places.len) break;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        var m = parseMode(gpa, line) orelse continue;
+        // `host` and `d` are ours, not Hallway's, so they are read here rather
+        // than in the shared parser: they are how a place is told apart from
+        // another with the same title, and how it is re-fetched later.
+        const Extra = struct { host: []const u8 = "", d: []const u8 = "" };
+        if (std.json.parseFromSlice(Extra, gpa, line, .{ .ignore_unknown_fields = true })) |ex| {
+            defer ex.deinit();
+            if (ex.value.host.len == 64) {
+                _ = std.fmt.hexToBytes(&m.author, ex.value.host) catch {};
+            }
+            m.ident_len = @intCast(copyBounded(&m.ident_buf, ex.value.d));
+        } else |_| {}
+        g_places[g_places_len] = m;
+        g_places_len += 1;
+    }
 }
 
 /// Persists app-wide settings. Best-effort, like the session file.
