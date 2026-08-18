@@ -18513,7 +18513,6 @@ test "the room is written down while it is being read, not only when entered" {
 test "inside a place the feed is not called Following" {
     // It said "Following" under a place header, which is simply false: those
     // are not the reader's follows, which is the whole point of a room.
-    var fx: main.EffectsForTest = undefined;
     const model = main.initialModel();
     main.resetPlacesForTest();
     defer main.resetPlacesForTest();
@@ -18532,7 +18531,6 @@ test "inside a place the feed is not called Following" {
     // A place whose feed has no name of its own still must not borrow yours.
     main.visitPlaceForTest([_]u8{0x4e} ** 32, "nameless", "Nameless");
     try testing.expectEqualStrings("This place", model.scope_name());
-    _ = fx;
 }
 
 test "a place says what its own connection is doing" {
