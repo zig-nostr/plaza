@@ -18861,3 +18861,28 @@ test "every place you have entered has a seat on the rail" {
         if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) return error.TheFoldedRailIsStillDrawn;
     }
 }
+
+test "the status bar does not call a place the starter pack" {
+    // It lowered "Following" and returned "starter pack" for everything else,
+    // which was safe while those were the only two scopes and became a lie the
+    // moment a place could be one: the bar said "caught up, starter pack" under
+    // a header naming somebody else's room.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqualStrings("following", main.lowerScopeForTest("Following"));
+    try testing.expectEqualStrings("starter pack", main.lowerScopeForTest("Starter pack"));
+    try testing.expectEqualStrings("The relay", main.lowerScopeForTest("The relay"));
+
+    var model = main.initialModel();
+    model.notes_len = 3;
+    main.visitPlaceWithFeedForTest([_]u8{0xf1} ** 32, "bass", "Bass Pistol", "The relay");
+    const line = model.caught_up(arena_state.allocator());
+    if (std.mem.indexOf(u8, line, "starter pack") != null) {
+        std.debug.print("the status bar says \"{s}\" inside a place\n", .{line});
+        return error.ThePlaceIsCalledTheStarterPack;
+    }
+    try testing.expectEqualStrings("Caught up · The relay · 3 notes", line);
+}

@@ -20867,9 +20867,21 @@ fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
 }
 
 /// A scope name as it reads mid-sentence.
+///
+/// Only the app's OWN two names are lowered. It used to return "starter pack"
+/// for anything that was not "Following", which was safe while those were the
+/// only two scopes there were, and became a plain lie the moment a place could
+/// be one: the status bar said "caught up, starter pack" under a header naming
+/// somebody else's room. A place's feed name is a stranger's proper noun and is
+/// left exactly as they wrote it.
 fn lowerScope(scope: []const u8) []const u8 {
     if (std.mem.eql(u8, scope, "Following")) return "following";
-    return "starter pack";
+    if (std.mem.eql(u8, scope, "Starter pack")) return "starter pack";
+    return scope;
+}
+
+pub fn lowerScopeForTest(scope: []const u8) []const u8 {
+    return lowerScope(scope);
 }
 
 /// What a note offers beyond its verbs: where it is, what it says, and what to
