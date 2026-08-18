@@ -18475,3 +18475,37 @@ test "a place remembers what was in it, so returning is not an empty room" {
         return error.EmptyOnReturn;
     }
 }
+
+test "the room is written down while it is being read, not only when entered" {
+    // The bug behind an empty room on relaunch: the file was written on Enter
+    // and never again, and at that moment the place has no notes yet. So the
+    // place was remembered and its contents never were.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0x6b} ** 32, "later", "Later");
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Notes arrive after entering, which is always.
+    var ids: [2][32]u8 = .{ @splat(9), @splat(8) };
+    main.seedPlaceFeedForTest(&ids);
+
+    // Too soon: a flush every tick would rewrite the file constantly.
+    main.flushPlaceIdsForTest(0);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Once the interval has passed, what is on screen is what is written down.
+    main.flushPlaceIdsForTest(3600);
+    if (main.keptPlaceSeenLenForTest(0) != 2) {
+        std.debug.print("the room was never written down: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.RoomNotFlushed;
+    }
+
+    // And it does not rewrite when nothing changed.
+    main.setKeptPlaceSeenLenForTest(0, 0);
+    main.flushPlaceIdsForTest(7200);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+}

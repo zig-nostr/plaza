@@ -23472,6 +23472,13 @@ pub fn savePlacesForTest() void {
     savePlaces();
 }
 
+pub fn flushPlaceIdsForTest(now_s: i64) void {
+    flushPlaceIds(now_s);
+}
+pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
+    g_places[i].seen_len = n;
+}
+
 pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
     seedPlaceFeed(ids);
 }
@@ -23489,6 +23496,10 @@ pub fn seedFromKeptPlaceForTest(i: usize) void {
 }
 
 pub fn resetPlacesForTest() void {
+    // The feed ids too, or one test's room leaks into the next one's.
+    clearPlaceFeed();
+    g_place_flushed_at = 0;
+    g_place_flushed_rev = 0;
     g_place = null;
     g_place_kept = false;
     g_places = @splat(.{});
@@ -23740,6 +23751,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 var link_buf: [2048]u8 = undefined;
                 if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
                 refreshPlaceFetch();
+                flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
@@ -28879,6 +28891,28 @@ const places_file = "places";
 
 /// Copies what the live place has seen back onto its entry in the list, so the
 /// file records the room as it was left.
+/// How often the room being read is written down. This is a convenience for
+/// the next launch, not a transaction, so it is coarse on purpose.
+const place_flush_s: i64 = 5;
+var g_place_flushed_at: i64 = 0;
+var g_place_flushed_rev: u32 = 0;
+
+/// Writes the ids down while the reader is still in the place.
+///
+/// Without this the file only ever held what existed at the moment Enter was
+/// pressed, which is nothing: the notes arrive afterwards. So the place was
+/// remembered and its contents never were, and the next launch opened an empty
+/// room having saved the ids of nothing.
+fn flushPlaceIds(now_s: i64) void {
+    if (g_place == null or !g_place_kept) return;
+    const rev = g_place_rev.load(.monotonic);
+    if (rev == g_place_flushed_rev) return;
+    if (now_s - g_place_flushed_at < place_flush_s) return;
+    g_place_flushed_at = now_s;
+    g_place_flushed_rev = rev;
+    savePlaces();
+}
+
 fn rememberPlaceIds() void {
     const m = g_place orelse return;
     const i = placeIndexOf(m.author, m.ident()) orelse return;
