@@ -1,18 +1,14 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.12.0
+### What's new in v0.12.1
 
-**Places.** A place is somebody's corner of nostr: their relays, their people. Open one with a link and you are reading that place, not your own feed with a banner on top. Walk in, look around, and leave, and nothing has changed about your account.
+**Logging out takes your places with you.** The list of places you have entered is a file on your own disk, which is what keeps it private, and it is also why it outlived the account: a list kept on a relay goes when your key does, and a file sits there until something deletes it. So logging out left the rail exactly as it was, and the next person to sign in on that Mac opened straight into whichever place the last one had been reading. Logout already cleared the follows, the mutes, the drafts and everything else that belongs to an account rather than to a machine. Places are newer than that and were never added to it.
 
-Following a `plaza://place/...` link opens the place it names, from anywhere, including from a browser and from a cold start. You arrive as a visitor, which means you can already read and post, and closing the app forgets you were ever there. If you want to keep it, Enter puts it on a rail down the side of the window, and from then on it is one press away. Leaving takes it off again, and the link still works if you change your mind.
+**Nothing you paste disappears without being told.** Paste a note longer than the composer holds and the overflow was simply gone, cut mid-word, with the counter reading "0 left" as though you had filled it exactly. On a six thousand character paste that is nearly two thousand characters of your own writing, thrown away in silence. It now says how much did not fit.
 
-Entering gates nothing at all, posting included. Whether a post lands is between you and that place's relays: if they turn it away, that is theirs to say, not a wall this app invents. And the list of places you have entered is a file on your own disk, not something published anywhere, because which communities somebody belongs to is nobody else's business.
+**The starter pack names the right people.** Three of the nine accounts a new install follows were labelled with somebody else's name. The keys were always right, so nobody has been following anyone they should not have been, but the app was telling newcomers the wrong thing about who they were reading, and saying it about real people. Every one of the nine is now checked against its owner's own domain.
 
-Switching between them is the point, so there are keys for it: `Cmd+Option+S` shows the rail, `Cmd+Option+Up` and `Down` walk your places, and `Cmd+Option+Right` steps out of a place and back into it.
-
-The format is fiatjaf's, exactly. Anyone who has deployed a site with Hallway has already written one of these, and the same document means the same thing in both.
-
-**Text sits where it should now.** Every mention, every bold name, every timestamp in the app was drawing two points below the line it belonged to. It is the sort of thing you feel before you can point at it, and it turned out to be the four bundled fonts disagreeing about where their own baselines are.
+**The feed stops giving up on history.** Scrolling to the bottom asks the relays for older notes, and if that attempt came back empty the feed decided there was nothing older and never asked again. It could not tell "every relay says that is all of it" from "nothing answered", so one attempt made offline ended your feed until you restarted the app. It now waits to be told.
 
 ### Install
 
