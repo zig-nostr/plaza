@@ -12311,7 +12311,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
     const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
     // A place's name and its feed's name, at the capacity of the buffers that
-    // receive them (`mode_name_cap`, `mode_feed_name_cap`). Both are a
+    // receive them (`place_name_cap`, `place_feed_name_cap`). Both are a
     // stranger's, and both land in fixed-width chrome.
     const long_place = "P" ** 64;
     const long_feed = "F" ** 48;
@@ -18316,24 +18316,24 @@ test "building a reply queues the note it answers, so the line can fill in" {
     }
 }
 
-test "a mode is read out of a stranger's event, using Hallway's own field names" {
+test "a place is read out of a stranger's event, using Hallway's own field names" {
     // The names are fiatjaf's, not mine: `window.hallway.universe` is a flat
     // object of 41 camelCase keys embedded in every site his deployer ships. A
-    // mode published once should mean the same thing in both clients.
+    // place published once should mean the same thing in both clients.
     const gpa = testing.allocator;
 
     const good =
         \\{"appName":"nOasis","homeMarkdown":"# Rules\n\n- be interesting",
         \\ "hardcodedFeeds":[{"name":"Spatia-Arcana","relays":["wss://spatia-arcana.com"]}]}
     ;
-    const m = main.parseMode(gpa, good) orelse return error.NoMode;
+    const m = main.parsePlace(gpa, good) orelse return error.NoPlace;
     try testing.expectEqualStrings("nOasis", m.name());
     try testing.expectEqualStrings("# Rules\n\n- be interesting", m.home());
     try testing.expectEqual(@as(u8, 1), m.feeds_len);
     try testing.expectEqualStrings("Spatia-Arcana", m.feeds[0].name());
     try testing.expectEqualStrings("wss://spatia-arcana.com", m.feeds[0].relay());
 
-    // The other 38 keys are ignored rather than refused, so a mode carrying the
+    // The other 38 keys are ignored rather than refused, so a place carrying the
     // whole object still applies the three this version reads.
     const full =
         \\{"appName":"Later","defaultPrimaryColor":"CYAN","feedKinds":[1,6,20],
@@ -18341,21 +18341,21 @@ test "a mode is read out of a stranger's event, using Hallway's own field names"
         \\ "indexerUrls":["wss://purplepag.es"],"dearrowYoutube":true,
         \\ "hardcodedFeeds":[{"relays":["wss://a.example"],"pubkeys":["abcd"]}]}
     ;
-    const n = main.parseMode(gpa, full) orelse return error.NoMode;
+    const n = main.parsePlace(gpa, full) orelse return error.NoPlace;
     try testing.expectEqualStrings("Later", n.name());
     try testing.expectEqual(@as(u8, 1), n.feeds_len);
     // A feed with no name of its own is labelled by its host: Hallway's own
     // data has one like this, so it is a real case and not a hypothetical.
     try testing.expectEqualStrings("a.example", n.feeds[0].name());
 
-    // Not a mode at all. kind:30078 is shared by every app that stores
+    // Not a place at all. kind:30078 is shared by every app that stores
     // settings, so an empty document must not be applied as one.
-    try testing.expect(main.parseMode(gpa, "{}") == null);
-    try testing.expect(main.parseMode(gpa, "{\"unrelated\":true}") == null);
-    try testing.expect(main.parseMode(gpa, "not json") == null);
+    try testing.expect(main.parsePlace(gpa, "{}") == null);
+    try testing.expect(main.parsePlace(gpa, "{\"unrelated\":true}") == null);
+    try testing.expect(main.parsePlace(gpa, "not json") == null);
 }
 
-test "a mode cannot point Plaza at a relay it should not dial" {
+test "a place cannot point Plaza at a relay it should not dial" {
     // The relay URL is the one field that reaches the network, so it is checked
     // rather than trusted.
     const gpa = testing.allocator;
@@ -18383,12 +18383,12 @@ test "a mode cannot point Plaza at a relay it should not dial" {
         \\ {"name":"ok","relays":["ws://plain.example","wss://good.example"]},
         \\ {"name":"none","relays":["http://nope.example"]}]}
     ;
-    const m = main.parseMode(gpa, mixed) orelse return error.NoMode;
+    const m = main.parsePlace(gpa, mixed) orelse return error.NoPlace;
     try testing.expectEqual(@as(u8, 1), m.feeds_len);
     try testing.expectEqualStrings("wss://good.example", m.feeds[0].relay());
 }
 
-test "an overlong mode field is cut on a character boundary" {
+test "an overlong place field is cut on a character boundary" {
     // A name or home text longer than the buffer is a stranger's choice, not an
     // error, so it is cut. Cut mid-character it would draw a replacement glyph.
     const gpa = testing.allocator;
@@ -18400,7 +18400,7 @@ test "an overlong mode field is cut on a character boundary" {
     while (i < 40) : (i += 1) try buf.appendSlice(gpa, "\u{1F600}"); // 4 bytes each, 160 total
     try buf.appendSlice(gpa, "\"}");
 
-    const m = main.parseMode(gpa, buf.items) orelse return error.NoMode;
+    const m = main.parsePlace(gpa, buf.items) orelse return error.NoPlace;
     try testing.expect(m.name_len > 0);
     try testing.expect(m.name_len <= 64);
     if (!std.unicode.utf8ValidateSlice(m.name())) {
@@ -18411,27 +18411,32 @@ test "an overlong mode field is cut on a character boundary" {
 
 test "a plaza:// link names what to fetch and nothing else" {
     // A link can arrive from a note, a DM, anywhere. It carries an address, not
-    // a mode, so the worst a hostile one can do is point Plaza at an event that
-    // is not a mode (refused by the parser) or one that is (shown before it
+    // a place, so the worst a hostile one can do is point Plaza at an event that
+    // is not a place (refused by the parser) or one that is (shown before it
     // applies).
-    const ok = main.parsePlazaLink("plaza://mode/naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n") orelse
+    const ok = main.parsePlazaLink("plaza://place/naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n") orelse
         return error.NoLink;
     try testing.expectEqualStrings("naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n", ok);
 
     // A trailing slash, query or fragment is a link shortener's, not the address.
-    const trimmed = main.parsePlazaLink("plaza://mode/naddr1abc?utm_source=x") orelse
+    const trimmed = main.parsePlazaLink("plaza://place/naddr1abc?utm_source=x") orelse
         return error.NoLink;
     try testing.expectEqualStrings("naddr1abc", trimmed);
 
     const refused = [_][]const u8{
-        "plaza://mode/", // nothing to fetch
-        "plaza://mode/nevent1abc", // not an address
-        "plaza://mode/NADDR1ABC", // bech32 is lowercase
-        "plaza://mode/naddr1 abc", // a space is not bech32
+        "plaza://place/", // nothing to fetch
+        "plaza://place/nevent1abc", // not an address
+        "plaza://place/NADDR1ABC", // bech32 is lowercase
+        "plaza://place/naddr1 abc", // a space is not bech32
         "plaza://something/naddr1abc", // an action this version does not know
+        // The old spelling. It was `plaza://mode/` while the feature was named
+        // after fiatjaf's proposal, and nothing outside this machine ever held
+        // one, so it is refused rather than carried: two spellings for one verb
+        // is the drift the vocabulary rules exist to stop.
+        "plaza://mode/naddr1abc",
         "plaza://naddr1abc", // no action at all
         "https://evil.example/naddr1abc", // not our scheme
-        "plaza://mode/naddr1abc/../../etc", // path games
+        "plaza://place/naddr1abc/../../etc", // path games
     };
     for (refused) |link| {
         if (main.parsePlazaLink(link) != null) {
@@ -18451,7 +18456,7 @@ test "entering a place keeps it, and nothing else is gated on it" {
     defer main.resetPlacesForTest();
 
     const host = [_]u8{0x77} ** 32;
-    main.visitPlaceForTest(host, "plaza-mode-test", "Bass Pistol");
+    main.visitPlaceForTest(host, "plaza-place-test", "Bass Pistol");
 
     // Visiting: you are in it, and it is not kept.
     try testing.expect(main.activePlace() != null);

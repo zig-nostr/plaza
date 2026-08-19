@@ -2609,104 +2609,104 @@ const engagement_request_limit = 500;
 // What an engagement query asks for: replies, reposts, likes, zap receipts.
 const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
 
-// ------------------------------------------------------------------- modes
+// ------------------------------------------------------------------- places
 //
-// A mode is somebody else's Plaza, published as an event.
+// A place is somebody else's Plaza, published as an event.
 //
 // fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
 // static site on your own domain. That works, and it costs a deploy per variant,
 // so you only get variants worth a deploy. His own suggestion for a native app
-// was the other shape: one binary, several modes, each instantiated from a URL
-// or an event shared by whoever runs the community. Then a mode costs nothing to
+// was the other shape: one binary, several rooms, each instantiated from a URL
+// or an event shared by whoever runs the community. Then a place costs nothing to
 // make, and you get the ones nobody would have deployed a site for: one
 // conference weekend, a reading group of nine people.
 //
-// This is the first slice of that. A mode carries an app name, a home text, and
+// This is the first slice of that. A place carries an app name, a home text, and
 // the relays its feeds read from. v1 reads the first two and one feed; the rest
 // of Hallway's surface (colours, kinds, publish targets, densities) arrives in
 // later versions against the same document.
 //
-// EVERYTHING HERE COMES FROM A STRANGER. A mode is an event by definition
+// EVERYTHING HERE COMES FROM A STRANGER. A place is an event by definition
 // somebody else signed, so every field is bounded, copied into fixed storage,
 // and never trusted for its length. The relay URL is the sharp one: it decides
 // where the app connects.
 
-/// How much of each field a mode may carry. Small on purpose: this is chrome,
-/// not content, and a mode that wants to say more than this wants to be a note.
-const mode_name_cap = 64;
-const mode_home_cap = 2048;
-const mode_feed_name_cap = 48;
-const mode_relay_cap = 96;
+/// How much of each field a place may carry. Small on purpose: this is chrome,
+/// not content, and a place that wants to say more than this wants to be a note.
+const place_name_cap = 64;
+const place_home_cap = 2048;
+const place_feed_name_cap = 48;
+const place_relay_cap = 96;
 /// v1 reads one feed. The array is here so the parser does not have to change
 /// shape when v3 reads several.
-const mode_feeds_cap = 1;
+const place_feeds_cap = 1;
 /// How many ids are remembered per place. A screenful and then some; the point
 /// is that the room is not empty on arrival, not that it is complete.
 const place_seed_cap = 60;
 
-const ModeFeed = struct {
-    name_buf: [mode_feed_name_cap]u8 = @splat(0),
+const PlaceFeed = struct {
+    name_buf: [place_feed_name_cap]u8 = @splat(0),
     name_len: u8 = 0,
-    relay_buf: [mode_relay_cap]u8 = @splat(0),
+    relay_buf: [place_relay_cap]u8 = @splat(0),
     relay_len: u8 = 0,
 
-    pub fn name(self: *const ModeFeed) []const u8 {
+    pub fn name(self: *const PlaceFeed) []const u8 {
         return self.name_buf[0..self.name_len];
     }
-    pub fn relay(self: *const ModeFeed) []const u8 {
+    pub fn relay(self: *const PlaceFeed) []const u8 {
         return self.relay_buf[0..self.relay_len];
     }
 };
 
-pub const Mode = struct {
-    name_buf: [mode_name_cap]u8 = @splat(0),
+pub const Place = struct {
+    name_buf: [place_name_cap]u8 = @splat(0),
     name_len: u8 = 0,
-    home_buf: [mode_home_cap]u8 = @splat(0),
+    home_buf: [place_home_cap]u8 = @splat(0),
     home_len: u16 = 0,
-    feeds: [mode_feeds_cap]ModeFeed = @splat(.{}),
+    feeds: [place_feeds_cap]PlaceFeed = @splat(.{}),
     feeds_len: u8 = 0,
     /// The last notes seen here, so returning shows the room rather than an
     /// empty screen while a stranger's relay is dialled. Bounded and cheap:
     /// these are ids, and the notes themselves are already in the store.
     seen: [place_seed_cap][32]u8 = undefined,
     seen_len: u16 = 0,
-    /// Who published it and under what `d`, so the applied mode can be named,
-    /// re-fetched, and told apart from another mode with the same title.
+    /// Who published it and under what `d`, so the applied place can be named,
+    /// re-fetched, and told apart from another place with the same title.
     author: [32]u8 = @splat(0),
     ident_buf: [64]u8 = @splat(0),
     ident_len: u8 = 0,
 
-    pub fn name(self: *const Mode) []const u8 {
+    pub fn name(self: *const Place) []const u8 {
         return self.name_buf[0..self.name_len];
     }
-    pub fn home(self: *const Mode) []const u8 {
+    pub fn home(self: *const Place) []const u8 {
         return self.home_buf[0..self.home_len];
     }
-    pub fn ident(self: *const Mode) []const u8 {
+    pub fn ident(self: *const Place) []const u8 {
         return self.ident_buf[0..self.ident_len];
     }
 };
 
-/// The kind a mode is published under. NIP-78 is application-specific data
+/// The kind a place is published under. NIP-78 is application-specific data
 /// keyed by a `d` tag, which is exactly what this is: one publisher can keep
-/// several modes apart, and editing one replaces it rather than adding a
+/// several places apart, and editing one replaces it rather than adding a
 /// second.
-const mode_kind: u16 = 30078;
+const place_kind: u16 = 30078;
 
-/// Reads a mode out of an event's content. Null when it is not one.
+/// Reads a place out of an event's content. Null when it is not one.
 ///
 /// THE FIELD NAMES ARE HALLWAY'S, EXACTLY. fiatjaf's deployer ships its whole
 /// configuration as one flat JSON object, `window.hallway.universe`, embedded in
-/// every site it deploys: 41 keys, camelCase. Matching it means a mode published
+/// every site it deploys: 41 keys, camelCase. Matching it means a place published
 /// once means the same thing in both clients, which is worth more than a format
 /// of our own. I guessed at `name`/`home`/`feeds` first and every one was wrong.
 ///
 /// v1 reads three of the 41: `appName`, `homeMarkdown`, and the first entry of
 /// `hardcodedFeeds`. The other 38 are ignored HERE and not forgotten: unknown
-/// fields are skipped rather than refused, so a mode carrying the full object
+/// fields are skipped rather than refused, so a place carrying the full object
 /// already applies the parts this version understands and picks up the rest as
 /// later versions learn them.
-pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
+pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
     @setRuntimeSafety(true); // A stranger's JSON, sized into fixed buffers.
     const Wire = struct {
         appName: []const u8 = "",
@@ -2727,13 +2727,13 @@ pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
     defer parsed.deinit();
     const w = parsed.value;
 
-    var m = Mode{};
+    var m = Place{};
     m.name_len = @intCast(copyBounded(&m.name_buf, w.appName));
     m.home_len = @intCast(copyBounded(&m.home_buf, w.homeMarkdown));
     for (w.hardcodedFeeds) |f| {
         if (m.feeds_len == m.feeds.len) break;
         // The first relay of this feed that is safe to dial. A feed whose relays
-        // are all refused is skipped, and the rest of the mode still applies.
+        // are all refused is skipped, and the rest of the place still applies.
         var chosen: []const u8 = "";
         for (f.relays) |r| {
             if (isSafeRelayUrl(r)) {
@@ -2743,7 +2743,7 @@ pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
         }
         if (chosen.len == 0) continue;
 
-        var out = ModeFeed{};
+        var out = PlaceFeed{};
         out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
         const label = if (f.name.len > 0) f.name else relayHost(chosen);
         out.name_len = @intCast(copyBounded(&out.name_buf, label));
@@ -2751,7 +2751,7 @@ pub fn parseMode(gpa: std.mem.Allocator, content: []const u8) ?Mode {
         m.feeds_len += 1;
     }
 
-    // A mode with nothing to say is not a mode. This is what stops any random
+    // A place with nothing to say is not a place. This is what stops any random
     // kind:30078 (the kind is shared by every app that stores settings) from
     // being applied as one.
     if (m.name_len == 0 and m.home_len == 0 and m.feeds_len == 0) return null;
@@ -2778,15 +2778,15 @@ fn copyBounded(dst: []u8, src: []const u8) usize {
     return n;
 }
 
-/// Whether a relay URL from a mode is one this app will dial.
+/// Whether a relay URL from a place is one this app will dial.
 ///
 /// The sharpest field in the document: it decides where the app connects. Plain
-/// `wss://` only, no control bytes, no spaces, and short enough to hold. A mode
+/// `wss://` only, no control bytes, no spaces, and short enough to hold. A place
 /// cannot point Plaza at `ws://` in the clear, and cannot smuggle a newline into
 /// a frame.
 pub fn isSafeRelayUrl(url: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "wss://")) return false;
-    if (url.len <= "wss://".len or url.len > mode_relay_cap) return false;
+    if (url.len <= "wss://".len or url.len > place_relay_cap) return false;
     for (url) |c| {
         if (c <= 0x20 or c == 0x7f) return false;
     }
@@ -20432,7 +20432,7 @@ fn railSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
 /// 512x512 slot hold sixty-four tiles at 64x64; it exists on the internal widget
 /// and is not exposed on the app-facing options, which is filed upstream as
 /// vercel-labs/native#387. Until that lands, letters.
-fn placeRow(ui: *AppUi, m: *const Mode, press: ?Msg, selected: bool) AppUi.Node {
+fn placeRow(ui: *AppUi, m: *const Place, press: ?Msg, selected: bool) AppUi.Node {
     const p = theme.palette;
     const name = if (m.name_len > 0) m.name() else "A place";
     // The first BYTE, uppercased when it is a lowercase ASCII letter. A name
@@ -20783,15 +20783,19 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 ///
 /// The line is the name, the connection state, the feed's name, About and the
 /// verb, all inside the 620pt column with 16pt insets. The app's own strings
-/// and the two buttons are the budget; the two names arrive from a mode a
+/// and the two buttons are the budget; the two names arrive from a place a
 /// stranger published, at 64 and 48 bytes, and both of them at full length
 /// overflowed the window by 240pt at its floor.
 ///
-/// These came down when About joined the row: the overflow sweep measures the
+/// These came down when Info joined the row: the overflow sweep measures the
 /// worst case (longest name, longest feed name, "cannot reach this place",
-/// About and Leave together) and it was 20pt over at the floor.
-const place_title_cap = 20;
-const place_feed_name_cap = 14;
+/// Info and Enter together) and it was 20pt over at the floor.
+///
+/// Named for the LINE, not for the place: `place_name_cap` and
+/// `place_feed_name_cap` are what the buffers hold (64 and 48), and these are
+/// what one header line can show of them.
+const header_name_cap = 20;
+const header_feed_cap = 14;
 
 /// The width of the Info card. Wide enough for a paragraph of somebody's
 /// markdown without becoming a page.
@@ -20804,7 +20808,7 @@ const place_info_card_width: f32 = 440;
 /// destructive verb in a place and it was sitting a few pixels from Enter, and
 /// a reader who is about to leave is exactly the reader who should be looking
 /// at what this place is.
-fn placeInfoCard(ui: *AppUi, m: *const Mode) AppUi.Node {
+fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
     const p = theme.palette;
     const leaving = g_place_info == .leaving;
     var npub_buf: [96]u8 = undefined;
@@ -20881,7 +20885,7 @@ fn placeInfoRow(ui: *AppUi, label: []const u8, value: []const u8) AppUi.Node {
 /// button. The host's own text and the note about privacy are shown only while
 /// VISITING: they are the pitch, and a pitch that stays on screen after the
 /// answer is a banner in the way of the thing it was selling.
-fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
+fn placeHeader(ui: *AppUi, m: *const Place) AppUi.Node {
     const p = theme.palette;
     const visiting = !g_place_kept;
     const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
@@ -20891,7 +20895,7 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
             hgap(ui, chrome_inset),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = elide(ui, if (m.name_len > 0) m.name() else "A place", place_title_cap), .weight = .bold, .scale = scope_title_scale }},
+                &.{.{ .text = elide(ui, if (m.name_len > 0) m.name() else "A place", header_name_cap), .weight = .bold, .scale = scope_title_scale }},
             ),
             hgap(ui, 8),
             // What THIS place's socket is doing, which the status bar cannot
@@ -20912,7 +20916,7 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
             ui.spacer(1),
             if (feed_name.len > 0) ui.paragraph(
                 .{ .style = .{ .foreground = p.text_faint_alt } },
-                &.{.{ .text = elide(ui, feed_name, place_feed_name_cap), .monospace = true, .scale = mono_meta_scale }},
+                &.{.{ .text = elide(ui, feed_name, header_feed_cap), .monospace = true, .scale = mono_meta_scale }},
             ) else ui.spacer(0),
             if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
             // One control, whatever state you are in: what this place is, who
@@ -23777,16 +23781,16 @@ fn takePendingLink(buf: []u8) ?[]const u8 {
 
 /// What a `plaza://` link asks for.
 ///
-/// One shape in v1: `plaza://mode/<naddr>`, which applies somebody's published
-/// mode. The path segment is there so a later version can add others without
+/// One shape in v1: `plaza://place/<naddr>`, which applies somebody's published
+/// place. The path segment is there so a later version can add others without
 /// the first form becoming ambiguous.
 ///
 /// Untrusted: a link can come from a note, a DM, or anywhere else. It names
-/// what to fetch and never carries the mode itself, so the worst a hostile link
-/// can do is point Plaza at an event that is not a mode, which the parser
+/// what to fetch and never carries the place itself, so the worst a hostile link
+/// can do is point Plaza at an event that is not a place, which the parser
 /// refuses, or one that is, which is then shown before it applies.
 pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
-    const prefix = "plaza://mode/";
+    const prefix = "plaza://place/";
     if (!std.mem.startsWith(u8, link, prefix)) return null;
     var rest = link[prefix.len..];
     // A query or fragment is ordinary link decoration (a tracker, an anchor)
@@ -23796,7 +23800,7 @@ pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, rest, "naddr1")) return null;
     // bech32 is lowercase alphanumeric. Checked here so nothing downstream has
     // to wonder what a stranger put in the path, and it is also what refuses an
-    // extra path segment: `plaza://mode/<naddr>` has exactly one, and a `/`
+    // extra path segment: `plaza://place/<naddr>` has exactly one, and a `/`
     // is not a bech32 character. I wrote a separate check for that first and no
     // probe could fail it, because this one already covered it.
     for (rest) |c| {
@@ -23817,7 +23821,7 @@ pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
 /// Nothing is gated on entering. Whether a post lands is between the reader and
 /// the place's relays: if they refuse the write, that is theirs to say, not a
 /// wall this app invents.
-var g_place: ?Mode = null;
+var g_place: ?Place = null;
 var g_place_kept: bool = false;
 
 /// What the place's relay has told us about, newest first.
@@ -23907,7 +23911,7 @@ pub fn placeFeedCount() usize {
 /// reader one of their own relays, and this connection never publishes and is
 /// never written into their kind:10002, which is the same discipline the
 /// indexer set and the discovered pool already follow.
-fn startPlaceFeed(m: *const Mode) void {
+fn startPlaceFeed(m: *const Place) void {
     clearPlaceFeed();
     // What was here last time, on screen before anything is dialled, and BEFORE
     // the check below: the ids are already known whether or not there is a
@@ -23916,13 +23920,13 @@ fn startPlaceFeed(m: *const Mode) void {
     if (m.seen_len > 0) seedPlaceFeed(m.seen[0..m.seen_len]);
     if (m.feeds_len == 0) return;
     const gen = g_place_gen.load(.monotonic);
-    var url_buf: [mode_relay_cap]u8 = undefined;
+    var url_buf: [place_relay_cap]u8 = undefined;
     const len = copyBounded(&url_buf, m.feeds[0].relay());
     const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, gen }) catch return;
     t.detach();
 }
 
-fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
+fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, gen: u32) void {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -24041,10 +24045,10 @@ pub fn setRailForTest(open: bool) void {
 
 /// The places kept across restarts. Small on purpose for v1.
 const max_places = 8;
-var g_places: [max_places]Mode = @splat(.{});
+var g_places: [max_places]Place = @splat(.{});
 var g_places_len: usize = 0;
 /// What we are fetching, while we fetch it.
-var g_mode_want: ?struct {
+var g_place_want: ?struct {
     pubkey: [32]u8,
     ident_buf: [64]u8,
     ident_len: u8,
@@ -24118,7 +24122,7 @@ pub fn resetPlacesForTest() void {
 
 /// Arrives in a place the way a link does: in it, kept only if it already was.
 pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
-    var m = Mode{};
+    var m = Place{};
     m.author = author;
     m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
     m.name_len = @intCast(copyBounded(&m.name_buf, name));
@@ -24131,7 +24135,7 @@ pub fn clearActivePlaceForTest() void {
     g_place_kept = false;
 }
 
-pub fn activePlace() ?*const Mode {
+pub fn activePlace() ?*const Place {
     return if (g_place) |*m| m else null;
 }
 pub fn placeIsKept() bool {
@@ -24189,11 +24193,11 @@ fn openKeptPlace(i: usize) void {
 /// on the rail to get back to it because a visit is deliberately not in the
 /// list. This is the seat it keeps until the app quits, which is exactly as
 /// long as a visit was ever promised to last.
-var g_visited: ?Mode = null;
+var g_visited: ?Place = null;
 
 /// What the rail's "Visiting" row stands for: the place open right now if it is
 /// a visit, otherwise the last one visited this session.
-fn visitingPlace() ?*const Mode {
+fn visitingPlace() ?*const Place {
     if (g_place) |*m| {
         if (!g_place_kept) return m;
     }
@@ -24333,7 +24337,7 @@ pub fn bootPlaceIndexForTest() ?usize {
 pub fn applyActivePlaceLineForTest(value: []const u8) void {
     applyActivePlaceLine(value);
 }
-pub fn visitingPlaceForTest() ?*const Mode {
+pub fn visitingPlaceForTest() ?*const Place {
     return visitingPlace();
 }
 pub fn resumeVisitForTest() void {
@@ -24346,30 +24350,30 @@ fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
     const gpa = std.heap.page_allocator;
     var ptr = nostr.nip19.decodeNaddr(gpa, naddr) catch return;
     defer ptr.deinit(gpa);
-    // Only ever a mode. The link says `mode`, so an address pointing at some
+    // Only ever a place. The link says `place`, so an address pointing at some
     // other kind is a link that lies, not a kind to go and fetch.
-    if (ptr.kind != mode_kind) return;
+    if (ptr.kind != place_kind) return;
 
-    var want: @TypeOf(g_mode_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    var want: @TypeOf(g_place_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
     want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
-    g_mode_want = want;
-    askMode(fx, ptr.relays);
+    g_place_want = want;
+    askPlace(fx, ptr.relays);
 }
 
-/// Asks for a mode event: the pool, plus the relays the address itself named.
+/// Asks for a place event: the pool, plus the relays the address itself named.
 ///
-/// The hints matter more here than anywhere else in the app. A mode is
+/// The hints matter more here than anywhere else in the app. A place is
 /// published by whoever runs a community, on that community's relay, and the
 /// reader has by definition not joined it yet: that is the thing the link is
 /// for. Asking only the reader's own relays would fail for exactly the case
 /// this feature exists to serve.
-fn askMode(fx: *Effects, hints: []const []const u8) void {
+fn askPlace(fx: *Effects, hints: []const []const u8) void {
     _ = fx;
-    const want = g_mode_want orelse return;
+    const want = g_place_want orelse return;
     const ident = want.ident_buf[0..want.ident_len];
 
     const authors = [_][32]u8{want.pubkey};
-    const kinds = [_]u16{mode_kind};
+    const kinds = [_]u16{place_kind};
     const values = [_][]const u8{ident};
     const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
     const filters = [_]nostr.filter.Filter{.{
@@ -24378,7 +24382,7 @@ fn askMode(fx: *Effects, hints: []const []const u8) void {
         .tags = &tags,
         .limit = 1,
     }};
-    _ = askPool(one_shot_sub_prefix ++ "mode", &filters);
+    _ = askPool(one_shot_sub_prefix ++ "place", &filters);
 
     // And the hinted relays, which the pool does not hold. One throwaway socket
     // each, bounded, the same shape every other one-shot in this app uses.
@@ -24386,15 +24390,15 @@ fn askMode(fx: *Effects, hints: []const []const u8) void {
     for (hints) |h| {
         if (n >= 3) break;
         if (!isSafeRelayUrl(h)) continue;
-        var url_buf: [mode_relay_cap]u8 = undefined;
+        var url_buf: [place_relay_cap]u8 = undefined;
         const len = copyBounded(&url_buf, h);
-        const t = std.Thread.spawn(.{}, askModeAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
+        const t = std.Thread.spawn(.{}, askPlaceAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
         t.detach();
         n += 1;
     }
 }
 
-fn askModeAt(url_buf: [mode_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
+fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -24408,11 +24412,11 @@ fn askModeAt(url_buf: [mode_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_
     defer releaseOneShot(watched);
 
     const authors = [_][32]u8{pubkey};
-    const kinds = [_]u16{mode_kind};
+    const kinds = [_]u16{place_kind};
     const values = [_][]const u8{ident_buf[0..ident_len]};
     const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
     const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }};
-    relay.subscribe(one_shot_sub_prefix ++ "mode", &filters) catch return;
+    relay.subscribe(one_shot_sub_prefix ++ "place", &filters) catch return;
     while (true) {
         var msg = (relay.receive() catch break) orelse break;
         defer msg.deinit();
@@ -24424,17 +24428,17 @@ fn askModeAt(url_buf: [mode_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_
     }
 }
 
-/// Looks for the mode being waited on, once the store has grown. Called from
+/// Looks for the place being waited on, once the store has grown. Called from
 /// the tick, which is where every other "did it arrive yet" check in this app
 /// lives.
 fn refreshPlaceFetch() void {
-    const want = g_mode_want orelse return;
+    const want = g_place_want orelse return;
     if (g_place != null) return;
     const store = g_store orelse return;
     const gpa = std.heap.page_allocator;
 
     const authors = [_][32]u8{want.pubkey};
-    const kinds = [_]u16{mode_kind};
+    const kinds = [_]u16{place_kind};
     const values = [_][]const u8{want.ident_buf[0..want.ident_len]};
     const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
     var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return;
@@ -24442,14 +24446,14 @@ fn refreshPlaceFetch() void {
 
     if (result.events.len == 0) {
         // Give up eventually rather than spinning on a store read forever. A
-        // mode nobody can find is a fact worth showing, not a spinner.
-        g_mode_want.?.waited +|= 1;
-        if (g_mode_want.?.waited > mode_fetch_ticks) g_mode_want = null;
+        // place nobody can find is a fact worth showing, not a spinner.
+        g_place_want.?.waited +|= 1;
+        if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
         return;
     }
-    var m = parseMode(gpa, result.events[0].content) orelse {
-        // It exists and is not a mode. Stop asking.
-        g_mode_want = null;
+    var m = parsePlace(gpa, result.events[0].content) orelse {
+        // It exists and is not a place. Stop asking.
+        g_place_want = null;
         return;
     };
     m.author = want.pubkey;
@@ -24459,7 +24463,7 @@ fn refreshPlaceFetch() void {
     // the place, not a question about it.
     g_place = m;
     g_place_kept = placeIndexOf(m.author, m.ident()) != null;
-    g_mode_want = null;
+    g_place_want = null;
     startPlaceFeed(&g_place.?);
     // The feed is about to mean something entirely different, and the
     // incremental path cannot express that: it merges arrivals into the list
@@ -24468,9 +24472,9 @@ fn refreshPlaceFetch() void {
     g_feed_rebuild_all.store(true, .release);
 }
 
-/// How many ticks a mode fetch may go unanswered. The tick is a second, and a
+/// How many ticks a place fetch may go unanswered. The tick is a second, and a
 /// relay that has not answered in fifteen is one that does not have it.
-const mode_fetch_ticks = 15;
+const place_fetch_ticks = 15;
 
 pub fn boot(model: *Model, fx: *Effects) void {
     // FIRST, before anything slow. On a cold launch macOS sends the Apple Event
@@ -29794,14 +29798,14 @@ fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((mode_home_cap + place_seed_cap * 70 + 1024) * max_places)) catch return;
+    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((place_home_cap + place_seed_cap * 70 + 1024) * max_places)) catch return;
     defer gpa.free(raw);
 
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         if (g_places_len == g_places.len) break;
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-        var m = parseMode(gpa, line) orelse continue;
+        var m = parsePlace(gpa, line) orelse continue;
         // `host` and `d` are ours, not Hallway's, so they are read here rather
         // than in the shared parser: they are how a place is told apart from
         // another with the same title, and how it is re-fetched later.
