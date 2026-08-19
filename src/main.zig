@@ -2539,16 +2539,33 @@ fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
 // feed is scoped to these authors (plus the user's own notes); follow
 // management and NIP-51 lists come later. Pubkeys are hex, decoded to bytes at
 // comptime.
+//
+// EVERY NAME HERE IS A CLAIM ABOUT A REAL PERSON, and three of them were wrong
+// for months: this list said Vitor, hodlbod and Lyn Alden, and the keys beside
+// those names belong to PABLOF7z, Lyn Alden and Vitor Pamplona. hodlbod was
+// never in the pack at all. The keys were always fine, so nobody followed
+// anybody they should not have; the app simply told them the wrong thing about
+// who they were reading, on the one screen a newcomer has no way to check.
+//
+// So the bar for editing this list: resolve the key's own NIP-05 at the domain
+// it names and paste what THAT says. Not a kind:0, which anybody can write
+// about themselves, and not memory, which is how this happened. Verified that
+// way on 2026-08-19, every one of the nine.
+//
+// Nothing here can be tested locally. A comment and a hex string have no
+// mechanical link, and no assertion in this repo can tell you whose key that
+// is. The check is a person doing the lookup above, which is why the method is
+// written down instead of a guard that would only look like one.
 const starter_pack_hex = [_][]const u8{
-    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d", // fiatjaf
-    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2", // jack
-    "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55
-    "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // ODELL
-    "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93", // gigi
-    "84dee6e676e5bb67b4ad4e042cf70cbd8681155db535942fcc6a0533858a7240", // Snowden
-    "fa984bd7dbb282f07e16e7ae87b26a2a7b9b90b7246a44771f0cf5ae58018f52", // Vitor (Amethyst)
-    "eab0e756d32b80bcd464f3d844b8040303075a13eabc3599a762c9ac7ab91f4f", // hodlbod
-    "460c25e682fda7832b52d1f22d3d22b3176d972f60dcdc3212ed8c92ef85065c", // Lyn Alden
+    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d", // fiatjaf, _@fiatjaf.com
+    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2", // jack, jack@primal.net
+    "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55, _@jb55.com
+    "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // ODELL, odell@primal.net
+    "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93", // Gigi, dergigi.com
+    "84dee6e676e5bb67b4ad4e042cf70cbd8681155db535942fcc6a0533858a7240", // Edward Snowden, Snowden@Nostr-Check.com
+    "fa984bd7dbb282f07e16e7ae87b26a2a7b9b90b7246a44771f0cf5ae58018f52", // PABLOF7z, _@f7z.io
+    "eab0e756d32b80bcd464f3d844b8040303075a13eabc3599a762c9ac7ab91f4f", // Lyn Alden, lyn@primal.net
+    "460c25e682fda7832b52d1f22d3d22b3176d972f60dcdc3212ed8c92ef85065c", // Vitor Pamplona, _@vitorpamplona.com
 };
 const starter_pack = blk: {
     var pks: [starter_pack_hex.len][32]u8 = undefined;
