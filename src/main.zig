@@ -13354,8 +13354,12 @@ pub const Msg = union(enum) {
     place_leave,
     /// The Places icon: the switcher rail out, or folded away.
     toggle_places_rail,
-    /// Show or fold this place's own description.
-    toggle_place_about,
+    /// The place's Info card: what this place is, and the way out of it.
+    open_place_info,
+    close_place_info,
+    /// Ask to leave, and back out of asking.
+    place_leave_request,
+    place_leave_cancel,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
     /// Back into the visit Home closed.
@@ -14588,6 +14592,11 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     }
     if (model.notifications_open) {
         return ui.stack(.{ .grow = 1 }, .{ base, notificationsSheet(ui, model) });
+    }
+    // Over the room it describes, so closing it puts the reader back exactly
+    // where they were rather than at the top of a rebuilt feed.
+    if (g_place_info != .closed) {
+        if (activePlace()) |m| return ui.stack(.{ .grow = 1 }, .{ base, placeInfoCard(ui, m) });
     }
     if (model.stage == .settings) {
         // Both sheets, in order, when a profile is being edited: dropping the
@@ -20784,6 +20793,87 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 const place_title_cap = 20;
 const place_feed_name_cap = 14;
 
+/// The width of the Info card. Wide enough for a paragraph of somebody's
+/// markdown without becoming a page.
+const place_info_card_width: f32 = 440;
+
+/// What a place is, who hosts it, where it reads from, and the way out.
+///
+/// Everything the old inline banner said, in a card nobody has to scroll past.
+/// Leave lives here rather than in the header for two reasons: it is the one
+/// destructive verb in a place and it was sitting a few pixels from Enter, and
+/// a reader who is about to leave is exactly the reader who should be looking
+/// at what this place is.
+fn placeInfoCard(ui: *AppUi, m: *const Mode) AppUi.Node {
+    const p = theme.palette;
+    const leaving = g_place_info == .leaving;
+    var npub_buf: [96]u8 = undefined;
+    const host = abbreviateNpub(&npub_buf, m.author);
+    const relay = if (m.feeds_len > 0) m.feeds[0].relay() else "";
+    return modalScrim(ui, "About this place", .close_place_info, ui.el(.dialog, .{
+        .width = place_info_card_width,
+        .on_dismiss = .close_place_info,
+        .semantics = .{ .label = "About this place" },
+    }, .{
+        modalCard(ui, place_info_card_width, ui.column(.{ .grow = 1, .gap = 0, .padding = 20 }, .{
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = join_title_scale }},
+            ),
+            vgap(ui, 10),
+            placeInfoRow(ui, "Host", ui.fmt("@{s}", .{host})),
+            if (relay.len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (relay.len > 0) placeInfoRow(ui, "Reads", relay) else ui.spacer(0),
+            // The host's own words, in the one place that is theirs to fill.
+            if (m.home_len > 0) vgap(ui, 12) else ui.spacer(0),
+            if (m.home_len > 0) ui.separator(.{ .style = .{ .foreground = p.divider_card, .background = p.divider_card } }) else ui.spacer(0),
+            if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (m.home_len > 0) ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
+                canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
+            }) else ui.spacer(0),
+            vgap(ui, 14),
+            // Asking, then the answer. The warning is the whole footer while it
+            // is up: a confirmation sharing a row with other controls is a
+            // confirmation nobody reads.
+            if (leaving) ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Leave this place? It comes off your rail and the notes it was holding are forgotten. The link still works, so you can walk back in.", .scale = join_sub_scale }},
+            ) else ui.spacer(0),
+            if (leaving) vgap(ui, 12) else ui.spacer(0),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave_cancel }, "Cancel")
+                else
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_place_info }, "Close"),
+                ui.spacer(1),
+                // Nothing to leave while visiting: a visit is not kept, so there
+                // is no list to come off. Home closes the room either way.
+                if (!g_place_kept)
+                    ui.spacer(0)
+                else if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave }, "Leave")
+                else
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave_request }, "Leave"),
+            }),
+        })),
+    }));
+}
+
+/// One labelled fact about a place: a quiet name, then the value in mono.
+fn placeInfoRow(ui: *AppUi, label: []const u8, value: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.paragraph(
+            .{ .width = 54, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = label, .scale = mono_meta_scale }},
+        ),
+        ui.paragraph(
+            .{ .width = place_info_card_width - 40 - 54, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = value, .monospace = true, .scale = mono_meta_scale }},
+        ),
+    });
+}
+
 /// The header of a room, which is the scope line while you are in one.
 ///
 /// The place's name is the title, the feed it is reading is the meta on the
@@ -20795,8 +20885,6 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
     const p = theme.palette;
     const visiting = !g_place_kept;
     const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
-    // On a visit it shows by itself; once entered it is behind the control.
-    const about_shown = m.home_len > 0 and (visiting or g_place_about_open);
     return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
         vgap(ui, 11),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
@@ -20827,18 +20915,17 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
                 &.{.{ .text = elide(ui, feed_name, place_feed_name_cap), .monospace = true, .scale = mono_meta_scale }},
             ) else ui.spacer(0),
             if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
-            // Only once entered: while visiting the description is already open
-            // above the feed, and a control to show what is showing is noise.
-            if (m.home_len > 0 and !visiting) ui.button(.{
-                .size = .sm,
-                .variant = .ghost,
-                .on_press = Msg.toggle_place_about,
-            }, if (g_place_about_open) "Hide" else "About") else ui.spacer(0),
-            if (m.home_len > 0 and !visiting) hgap(ui, 4) else ui.spacer(0),
+            // One control, whatever state you are in: what this place is, who
+            // hosts it, where it reads from, and the way out. Leave used to sit
+            // right here, a few pixels from Enter, and one press did it.
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.open_place_info }, "Info"),
+            // Entering is the only verb the header keeps, because it is the one
+            // the reader came for and it should cost one press.
+            if (visiting) hgap(ui, 4) else ui.spacer(0),
             if (visiting)
                 ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter")
             else
-                ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave }, "Leave"),
+                ui.spacer(0),
             hgap(ui, chrome_inset),
         }),
         if (visiting) vgap(ui, 6) else ui.spacer(0),
@@ -20848,14 +20935,6 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
                 .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
                 &.{.{ .text = "Just visiting. Entering keeps this place on your rail, and nobody else can see which places you have entered.", .scale = mono_hint_scale }},
             ),
-            hgap(ui, chrome_inset),
-        }) else ui.spacer(0),
-        if (about_shown) vgap(ui, 4) else ui.spacer(0),
-        if (about_shown) ui.row(.{ .cross = .start, .gap = 0 }, .{
-            hgap(ui, chrome_inset),
-            ui.column(.{ .width = picture_column_width, .gap = 0 }, .{
-                canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
-            }),
             hgap(ui, chrome_inset),
         }) else ui.spacer(0),
         vgap(ui, 9),
@@ -23914,20 +23993,25 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
 /// only says it is empty. Entering a place turns it on, and it stays on.
 var g_rail_open: bool = false;
 
-/// Whether the place's own description is showing.
+/// What the place's Info card is doing.
 ///
-/// It shows by itself on a VISIT, because that is the moment somebody needs to
-/// know what this place is. Once entered it folds away: a pitch that stays on
-/// screen after the answer is a banner in the way of the thing it was selling.
-/// This is the way back to it, because "entered and can no longer read what
-/// this place says about itself" is the wrong end of that trade.
-var g_place_about_open: bool = false;
+/// A card and not a banner. The host's own text used to sit inline above the
+/// feed on every visit, which is a wall of somebody else's markdown in front of
+/// the thing it is selling. So the whole of what a place says about itself
+/// lives behind one control, and the first-visit presentation is its own
+/// design problem rather than "the banner, again".
+///
+/// Leave lives in here too. It is the one destructive verb in a place, it was
+/// sitting in the header a few pixels from Enter, and one press did it. Now it
+/// takes two, and the second one is behind a card that says what leaving does.
+pub const PlaceInfo = enum(u8) { closed, open, leaving };
+var g_place_info: PlaceInfo = .closed;
 
-pub fn placeAboutOpen() bool {
-    return g_place_about_open;
+pub fn placeInfo() PlaceInfo {
+    return g_place_info;
 }
-pub fn togglePlaceAboutForTest() void {
-    g_place_about_open = !g_place_about_open;
+pub fn setPlaceInfoForTest(state: PlaceInfo) void {
+    g_place_info = state;
 }
 
 pub fn railOpen() bool {
@@ -24021,6 +24105,7 @@ pub fn resetPlacesForTest() void {
     // The feed ids too, or one test's room leaks into the next one's.
     clearPlaceFeed();
     g_rail_open = false;
+    g_place_info = .closed;
     g_place_flushed_at = 0;
     g_place_flushed_rev = 0;
     g_place = null;
@@ -24084,7 +24169,7 @@ var g_place_last: usize = 0;
 /// and the next `startPlaceFeed` clears it.
 fn openKeptPlace(i: usize) void {
     if (i >= g_places_len) return;
-    g_place_about_open = false;
+    g_place_info = .closed;
     if (g_place != null and g_place_kept) savePlaces();
     g_place_last = i;
     g_place = g_places[i];
@@ -24134,6 +24219,7 @@ fn resumeVisit() void {
 /// list with its ids intact, one press away.
 fn goToOwnPlaza() void {
     if (g_place == null) return;
+    g_place_info = .closed;
     if (g_place_kept) savePlaces() else g_visited = g_place;
     g_place = null;
     g_place_kept = false;
@@ -24850,6 +24936,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             g_place = null;
             g_place_kept = false;
+            g_place_info = .closed;
             // The visiting seat is deliberately NOT cleared here, and it took a
             // probe to see why: entering already clears it, and the seat only
             // ever holds a place that is not in the list, so a place being left
@@ -24860,7 +24947,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             saveSettings();
         },
         .toggle_places_rail => togglePlacesRail(),
-        .toggle_place_about => g_place_about_open = !g_place_about_open,
+        .open_place_info => g_place_info = .open,
+        .close_place_info => g_place_info = .closed,
+        .place_leave_request => g_place_info = .leaving,
+        .place_leave_cancel => g_place_info = .open,
         .place_resume => resumeVisit(),
         // No `showPlacesRail` here: the press came FROM the rail, so it is
         // already out, and forcing it would undo a fold the reader just did.

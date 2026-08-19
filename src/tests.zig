@@ -12289,7 +12289,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -12450,9 +12450,19 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 main.visitPlaceWithFeedForTest([_]u8{0x75} ** 32, "five", long_place, long_feed);
                 main.setPlaceHomeForTest(long_about);
                 main.update(model, .place_enter, &fx);
-                main.togglePlaceAboutForTest();
                 main.setPlaceLinkForTest(.unreachable_relay);
                 main.setRailForTest(true);
+                main.setPlaceInfoForTest(.open);
+            },
+            // The same card with the leave warning up, which is the taller of
+            // the two states and carries a sentence of its own.
+            .place_leaving => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x76} ** 32, "six", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.setRailForTest(true);
+                main.setPlaceInfoForTest(.leaving);
             },
             .place_visiting => {
                 main.visitPlaceWithFeedForTest([_]u8{0x74} ** 32, "four", long_place, long_feed);
@@ -12505,7 +12515,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .places_rail, .place_visiting, .place_about, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .place_about, .place_leaving, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -19206,12 +19216,11 @@ test "a reply snippet stops saying npub once the name lands" {
     try testing.expect(std.mem.indexOf(u8, after, "@Rabble") != null);
 }
 
-test "an entered place can still be asked what it is" {
-    // The description shows by itself on a visit, because that is the moment
-    // somebody needs to know what this place is, and folds away once entered so
-    // it is not a banner over the feed it was selling. This is the way back to
-    // it: "entered, and can no longer read what this place says about itself"
-    // is the wrong end of that trade.
+test "a place says what it is behind one control, and leaving takes two presses" {
+    // The host's markdown used to sit inline above the feed on every visit,
+    // which is a wall of somebody else's words in front of the thing it is
+    // selling. And Leave sat in the header a few pixels from Enter, where one
+    // press did it.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var fx: main.EffectsForTest = undefined;
@@ -19225,28 +19234,40 @@ test "an entered place can still be asked what it is" {
     const about = "House rules: be interesting, or be quiet.";
     main.visitPlaceWithFeedForTest([_]u8{0x81} ** 32, "bass", "Bass Pistol", "The relay");
     main.setPlaceHomeForTest(about);
-
-    // Visiting: the description is open and there is no control, because a
-    // control to show what is already showing is noise.
-    const visiting = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
-    try testing.expect(paintsText(visiting, about));
-    if (paintsText(visiting, "About")) return error.AControlToShowWhatIsAlreadyShowing;
-
-    // Entered: folded away, and the control is there.
     main.update(&model, .place_enter, &fx);
-    const entered = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
-    if (paintsText(entered, about)) return error.TheDescriptionStayedOverTheFeed;
-    if (!paintsText(entered, "About")) return error.NoWayBackToTheDescription;
 
-    // And pressing it brings the description back.
-    main.update(&model, .toggle_place_about, &fx);
-    const shown = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
-    if (!paintsText(shown, about)) return error.AboutDidNotShowTheDescription;
-    try testing.expect(paintsText(shown, "Hide"));
+    // Nothing of the host's text over the feed, and no Leave within reach.
+    const closed = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (paintsText(closed, about)) return error.TheDescriptionIsBackOverTheFeed;
+    if (paintsText(closed, "Leave")) return error.LeaveIsOnePressAway;
+    try testing.expect(paintsText(closed, "Info"));
 
-    main.update(&model, .toggle_place_about, &fx);
-    const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
-    if (paintsText(folded, about)) return error.TheDescriptionWouldNotFoldAgain;
+    // Info says what this place is, who hosts it and where it reads from.
+    main.update(&model, .open_place_info, &fx);
+    const open = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(open, about)) return error.InfoDidNotShowTheDescription;
+    try testing.expect(paintsText(open, "Host"));
+    try testing.expect(paintsText(open, "The relay"));
+    try testing.expect(paintsText(open, "Leave"));
+
+    // The first Leave asks. It must not have left yet.
+    main.update(&model, .place_leave_request, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    const asking = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(asking, "Leave this place?")) return error.LeavingNeverAsked;
+    try testing.expect(paintsText(asking, "Cancel"));
+
+    // Backing out changes nothing.
+    main.update(&model, .place_leave_cancel, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    try testing.expectEqual(main.PlaceInfo.open, main.placeInfo());
+
+    // The second one does it, and takes the card down with it.
+    main.update(&model, .place_leave_request, &fx);
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
 }
 
 /// Whether any text node on the page carries this string.
