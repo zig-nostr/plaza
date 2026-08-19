@@ -19282,3 +19282,50 @@ fn paintsText(p: painted.Painted, needle: []const u8) bool {
     }
     return false;
 }
+
+test "logging out takes your places with you" {
+    // Which communities somebody belongs to is sensitive, which is the whole
+    // reason the list is a file on their own disk rather than an event on a
+    // relay. That is also what made it outlive a logout: a relay-backed list
+    // goes when the key does, and a file does not go until something deletes
+    // it. The next account to sign in on this Mac inherited the last one's
+    // rail, fully populated, opened straight into whichever place they had been
+    // reading.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+
+    main.visitPlaceForTest([_]u8{0x92} ** 32, "one", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    main.visitPlaceForTest([_]u8{0x93} ** 32, "two", "The Pleb Table");
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 2), main.keptPlaceCount());
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(main.railOpen());
+
+    // A visit in the seat too, so the session-only half is covered.
+    main.goToOwnPlazaForTest();
+    main.visitPlaceForTest([_]u8{0x94} ** 32, "three", "Somewhere");
+    main.goToOwnPlazaForTest();
+    try testing.expect(main.visitingPlaceForTest() != null);
+
+    main.performLogoutForTest(&model, &fx);
+
+    if (main.keptPlaceCount() != 0) {
+        std.debug.print("the next account inherits {d} places\n", .{main.keptPlaceCount()});
+        return error.ThePlacesOutlivedTheAccount;
+    }
+    if (main.activePlace() != null) return error.StillInsideTheLastAccountsPlace;
+    if (main.visitingPlaceForTest() != null) return error.TheVisitOutlivedTheAccount;
+    // And nothing on disk points the next launch back into one.
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("", main.activePlaceLine(&buf));
+    try testing.expect(main.bootPlaceIndexForTest() == null);
+    // The rail folds, because an empty rail that is still out is a column
+    // saying the previous reader had none.
+    try testing.expect(!main.railOpen());
+}
