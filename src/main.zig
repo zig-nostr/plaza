@@ -6044,6 +6044,17 @@ const QuoteEntry = struct {
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
+    /// The names generation `text_buf` was rendered at.
+    ///
+    /// The snippet has mentions in it, and a mention is baked into text as
+    /// `@Name` (or as an abbreviated npub when no name is known yet). The feed's
+    /// note bodies re-parse when a display name lands, because the generation
+    /// moving invalidates every card; this cache had no such stamp, so a snippet
+    /// rendered before its mentioned author's kind:0 arrived kept the npub for
+    /// as long as the entry lived. That is the raw `@npub1sg6plzp…uf63m` in a
+    /// reply context line while the same person's name shows correctly two rows
+    /// down.
+    names_generation: u64 = 0,
     /// The HOST of the picture the quoted note carries, when it carries one.
     ///
     /// The URL itself is deliberately cut out of `text_buf` (a raw image URL is
@@ -6598,7 +6609,11 @@ fn refreshQuotes(store: *nostr.store.Store) void {
     var nested: [quote_cache_cap][32]u8 = undefined;
     var nested_count: usize = 0;
     for (&g_quotes) |*q| {
-        if (!q.used or q.state == .loaded or q.state == .missing) continue;
+        if (!q.used or q.state == .missing) continue;
+        // A loaded entry is re-rendered ONLY when a name has landed since it was
+        // baked, which is the one thing that can change what its text should
+        // say. Otherwise this stays what it was: a pass over the unresolved.
+        if (q.state == .loaded and q.names_generation == g_names_generation) continue;
         var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
             // `.missing` is what the ROW says, not a decision to stop looking:
             // the card reads "not on your relays yet", which is true, and the
@@ -6641,6 +6656,7 @@ fn refreshQuotes(store: *nostr.store.Store) void {
             }
         }
         q.state = .loaded;
+        q.names_generation = g_names_generation;
         wantProfile(q.pubkey);
     }
     for (nested[0..nested_count]) |id| wantQuote(id);
@@ -13338,6 +13354,8 @@ pub const Msg = union(enum) {
     place_leave,
     /// The Places icon: the switcher rail out, or folded away.
     toggle_places_rail,
+    /// Show or fold this place's own description.
+    toggle_place_about,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
     /// Back into the visit Home closed.
@@ -20754,13 +20772,17 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 /// learn that where the decision is, not afterwards.
 /// How much of a stranger's naming fits on the room's one header line.
 ///
-/// The line is the name, the connection state, the feed's name and the verb,
-/// all inside the 620pt column with 16pt insets. The connection state and the
-/// button are the app's own strings and are therefore the budget; the two names
-/// arrive from a mode a stranger published, at 64 and 48 bytes, and both of
-/// them at full length overflowed the window by 240pt at its floor.
-const place_title_cap = 24;
-const place_feed_name_cap = 18;
+/// The line is the name, the connection state, the feed's name, About and the
+/// verb, all inside the 620pt column with 16pt insets. The app's own strings
+/// and the two buttons are the budget; the two names arrive from a mode a
+/// stranger published, at 64 and 48 bytes, and both of them at full length
+/// overflowed the window by 240pt at its floor.
+///
+/// These came down when About joined the row: the overflow sweep measures the
+/// worst case (longest name, longest feed name, "cannot reach this place",
+/// About and Leave together) and it was 20pt over at the floor.
+const place_title_cap = 20;
+const place_feed_name_cap = 14;
 
 /// The header of a room, which is the scope line while you are in one.
 ///
@@ -20773,6 +20795,8 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
     const p = theme.palette;
     const visiting = !g_place_kept;
     const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
+    // On a visit it shows by itself; once entered it is behind the control.
+    const about_shown = m.home_len > 0 and (visiting or g_place_about_open);
     return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
         vgap(ui, 11),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
@@ -20803,6 +20827,14 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
                 &.{.{ .text = elide(ui, feed_name, place_feed_name_cap), .monospace = true, .scale = mono_meta_scale }},
             ) else ui.spacer(0),
             if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
+            // Only once entered: while visiting the description is already open
+            // above the feed, and a control to show what is showing is noise.
+            if (m.home_len > 0 and !visiting) ui.button(.{
+                .size = .sm,
+                .variant = .ghost,
+                .on_press = Msg.toggle_place_about,
+            }, if (g_place_about_open) "Hide" else "About") else ui.spacer(0),
+            if (m.home_len > 0 and !visiting) hgap(ui, 4) else ui.spacer(0),
             if (visiting)
                 ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter")
             else
@@ -20818,8 +20850,8 @@ fn placeHeader(ui: *AppUi, m: *const Mode) AppUi.Node {
             ),
             hgap(ui, chrome_inset),
         }) else ui.spacer(0),
-        if (visiting and m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
-        if (visiting and m.home_len > 0) ui.row(.{ .cross = .start, .gap = 0 }, .{
+        if (about_shown) vgap(ui, 4) else ui.spacer(0),
+        if (about_shown) ui.row(.{ .cross = .start, .gap = 0 }, .{
             hgap(ui, chrome_inset),
             ui.column(.{ .width = picture_column_width, .gap = 0 }, .{
                 canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
@@ -22629,6 +22661,14 @@ pub fn wantQuoteForTest(id: [32]u8) void {
 
 /// The real fill path, over a real store: what a quote card knows about the
 /// note it draws comes from here and nowhere else.
+pub fn refreshProfilesForTest(store: *nostr.store.Store) void {
+    refreshProfiles(store);
+}
+pub fn quoteTextForTest(id: [32]u8) ?[]const u8 {
+    const q = quoteFor(id) orelse return null;
+    if (q.state != .loaded) return null;
+    return q.text_buf[0..q.text_len];
+}
 pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
     refreshQuotes(store);
 }
@@ -23874,6 +23914,22 @@ fn placeFeedWorker(url_buf: [mode_relay_cap]u8, url_len: usize, gen: u32) void {
 /// only says it is empty. Entering a place turns it on, and it stays on.
 var g_rail_open: bool = false;
 
+/// Whether the place's own description is showing.
+///
+/// It shows by itself on a VISIT, because that is the moment somebody needs to
+/// know what this place is. Once entered it folds away: a pitch that stays on
+/// screen after the answer is a banner in the way of the thing it was selling.
+/// This is the way back to it, because "entered and can no longer read what
+/// this place says about itself" is the wrong end of that trade.
+var g_place_about_open: bool = false;
+
+pub fn placeAboutOpen() bool {
+    return g_place_about_open;
+}
+pub fn togglePlaceAboutForTest() void {
+    g_place_about_open = !g_place_about_open;
+}
+
 pub fn railOpen() bool {
     return g_rail_open;
 }
@@ -23937,6 +23993,9 @@ pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []cons
 
 pub fn flushPlaceIdsForTest(now_s: i64) void {
     flushPlaceIds(now_s);
+}
+pub fn setPlaceHomeForTest(text: []const u8) void {
+    if (g_place) |*m| m.home_len = @intCast(copyBounded(&m.home_buf, text));
 }
 pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
     g_places[i].seen_len = n;
@@ -24025,6 +24084,7 @@ var g_place_last: usize = 0;
 /// and the next `startPlaceFeed` clears it.
 fn openKeptPlace(i: usize) void {
     if (i >= g_places_len) return;
+    g_place_about_open = false;
     if (g_place != null and g_place_kept) savePlaces();
     g_place_last = i;
     g_place = g_places[i];
@@ -24800,6 +24860,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             saveSettings();
         },
         .toggle_places_rail => togglePlacesRail(),
+        .toggle_place_about => g_place_about_open = !g_place_about_open,
         .place_resume => resumeVisit(),
         // No `showPlacesRail` here: the press came FROM the rail, so it is
         // already out, and forcing it would undo a fold the reader just did.

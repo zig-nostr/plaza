@@ -12289,7 +12289,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -12315,6 +12315,8 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // stranger's, and both land in fixed-width chrome.
     const long_place = "P" ** 64;
     const long_feed = "F" ** 48;
+    // A host's markdown, with a heading and a list, wide enough to wrap.
+    const long_about = "# " ++ ("A" ** 60) ++ "\n\nA description a stranger wrote, long enough to wrap more than once in the column it is given.\n\n- " ++ ("b" ** 70) ++ "\n- and another\n";
     // Exactly the 128 bytes `lud16_buf` holds. A single byte over and the
     // parser drops the field without a word, which is correct of it and made
     // the first version of this measure an empty line.
@@ -12440,6 +12442,18 @@ test "no view paints past the right edge at the narrowest the window can be" {
             },
             // Inside a place, which replaces the scope line with a header of a
             // stranger's name, their feed's name, and their markdown.
+            // Entered, with the description open behind its control: the
+            // widest the header can be, because that row then carries the
+            // About toggle as well as Leave.
+            .place_about => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x75} ** 32, "five", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.togglePlaceAboutForTest();
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(true);
+            },
             .place_visiting => {
                 main.visitPlaceWithFeedForTest([_]u8{0x74} ** 32, "four", long_place, long_feed);
                 // The longest thing the header can say about the connection,
@@ -12491,7 +12505,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .places_rail, .place_visiting, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .place_about, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -19057,4 +19071,188 @@ test "a smaller line is asked for by its size, not by scaling every span" {
         else => {},
     };
     try testing.expect(body_y != null);
+}
+
+test "every bundled face agrees about where the baseline is" {
+    // The macOS host draws a run with `drawAtPoint:(x, baseline - size)` into a
+    // flipped context, and AppKit then puts the baseline `round(ascender)`
+    // below that point. Subtracting the point SIZE asserts "ascent == size",
+    // which is a per-FACE number, so two faces on one line diverge by the
+    // difference in their ascents.
+    //
+    // Ours did: Geist-Regular ships 920/-220/100 and the other three shipped
+    // 1005/-295/0, which at a 14.5pt body put every medium, bold and mono run
+    // exactly 2pt BELOW the regular text beside it. Mentions, the reply
+    // context label, bold names next to regular meta: all of them sat low, and
+    // nothing on the Zig side could see it, because the display list carries
+    // one baseline for the whole line and is correct.
+    //
+    // scripts/harmonize-font-metrics.py made the four agree. This is what
+    // notices if a font update ever pulls them apart again.
+    const faces = [_]struct { name: []const u8, ttf: []const u8 }{
+        .{ .name = "Geist-Regular", .ttf = theme.geist_ttf },
+        .{ .name = "Geist-Medium", .ttf = theme.geist_medium_ttf },
+        .{ .name = "Geist-Bold", .ttf = theme.geist_bold_ttf },
+        .{ .name = "GeistMono-Regular", .ttf = theme.geist_mono_ttf },
+    };
+
+    var want: ?[6]i16 = null;
+    for (faces) |face| {
+        const m = try verticalMetrics(face.ttf);
+        if (want) |w| {
+            if (!std.mem.eql(i16, &w, &m)) {
+                std.debug.print(
+                    "\n{s} has vertical metrics {any}, and Geist-Regular has {any}.\n" ++
+                        "Two faces that disagree draw on two different baselines. Run\n" ++
+                        "  python3 scripts/harmonize-font-metrics.py\n",
+                    .{ face.name, m, w },
+                );
+                return error.FacesDisagreeAboutTheBaseline;
+            }
+        } else want = m;
+    }
+    // And they agree on numbers that are actually there, not on all zeroes.
+    try testing.expect(want.?[0] > 0);
+}
+
+/// hhea ascender/descender/lineGap and OS/2 sTypoAscender/Descender/LineGap,
+/// read straight out of the sfnt. Six numbers, because macOS picks the typo set
+/// when USE_TYPO_METRICS is on and the hhea set when it is not, and a face is
+/// only safe if both agree with everyone else's.
+fn verticalMetrics(ttf: []const u8) ![6]i16 {
+    if (ttf.len < 12) return error.NotAFont;
+    const count = std.mem.readInt(u16, ttf[4..6], .big);
+    var hhea: ?usize = null;
+    var os2: ?usize = null;
+    for (0..count) |i| {
+        const entry = 12 + i * 16;
+        if (entry + 16 > ttf.len) return error.NotAFont;
+        const tag = ttf[entry..][0..4];
+        const off = std.mem.readInt(u32, ttf[entry + 8 ..][0..4], .big);
+        if (std.mem.eql(u8, tag, "hhea")) hhea = off;
+        if (std.mem.eql(u8, tag, "OS/2")) os2 = off;
+    }
+    const h = hhea orelse return error.NoHhea;
+    const o = os2 orelse return error.NoOs2;
+    if (h + 10 > ttf.len or o + 74 > ttf.len) return error.NotAFont;
+    return .{
+        std.mem.readInt(i16, ttf[h + 4 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 6 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 8 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 68 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 70 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 72 ..][0..2], .big),
+    };
+}
+
+test "a reply snippet stops saying npub once the name lands" {
+    // The snippet is baked into text the same way a note body is: a mention
+    // becomes "@Name", or an abbreviated npub when no name is known yet. A body
+    // re-parses when a display name arrives, because the names generation
+    // moving invalidates every card. The quote cache had no such stamp, so a
+    // snippet rendered before its mentioned author's kind:0 landed kept the
+    // npub for as long as the entry lived, which is the raw "@npub1..." showing
+    // in a reply context line while the same person's name reads correctly two
+    // rows down.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6d} ** 32);
+    const mentioned = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quote-names.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetProfilesForTest();
+    main.resetQuotesForTest();
+    defer main.resetProfilesForTest();
+    defer main.resetQuotesForTest();
+
+    // A note that mentions somebody nobody has a name for yet.
+    const npub = try nostr.nip19.encodeNpub(arena, mentioned.public_key);
+    const body = try std.fmt.allocPrint(arena, "hello nostr:{s} how are you", .{npub});
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, body, null);
+    _ = try store.ingest(arena, ev, .{});
+
+    main.wantQuoteForTest(ev.id);
+    main.refreshQuotesForTest(&store);
+    const before = main.quoteTextForTest(ev.id) orelse return error.TheQuoteNeverLoaded;
+    if (std.mem.indexOf(u8, before, "npub1") == null) {
+        std.debug.print("expected an npub while the name is unknown, got \"{s}\"\n", .{before});
+        return error.NoNpubToBeginWith;
+    }
+
+    // The name lands, exactly as it does live: a kind:0 into the store, then
+    // the profile pass that reads it and moves the names generation.
+    var meta_buf: [128]u8 = undefined;
+    const meta = try std.fmt.bufPrint(&meta_buf, "{{\"name\":\"Rabble\"}}", .{});
+    const kind0 = try nostr.event.create(arena, signer, mentioned, 1_800_000_060, 0, &.{}, meta, null);
+    _ = try store.ingest(arena, kind0, .{});
+    main.refreshProfilesForTest(&store);
+    main.refreshQuotesForTest(&store);
+
+    const after = main.quoteTextForTest(ev.id) orelse return error.TheQuoteWentAway;
+    if (std.mem.indexOf(u8, after, "npub1") != null) {
+        std.debug.print("the snippet still says npub after the name landed: \"{s}\"\n", .{after});
+        return error.TheSnippetKeptTheNpub;
+    }
+    try testing.expect(std.mem.indexOf(u8, after, "@Rabble") != null);
+}
+
+test "an entered place can still be asked what it is" {
+    // The description shows by itself on a visit, because that is the moment
+    // somebody needs to know what this place is, and folds away once entered so
+    // it is not a banner over the feed it was selling. This is the way back to
+    // it: "entered, and can no longer read what this place says about itself"
+    // is the wrong end of that trade.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    const about = "House rules: be interesting, or be quiet.";
+    main.visitPlaceWithFeedForTest([_]u8{0x81} ** 32, "bass", "Bass Pistol", "The relay");
+    main.setPlaceHomeForTest(about);
+
+    // Visiting: the description is open and there is no control, because a
+    // control to show what is already showing is noise.
+    const visiting = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    try testing.expect(paintsText(visiting, about));
+    if (paintsText(visiting, "About")) return error.AControlToShowWhatIsAlreadyShowing;
+
+    // Entered: folded away, and the control is there.
+    main.update(&model, .place_enter, &fx);
+    const entered = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (paintsText(entered, about)) return error.TheDescriptionStayedOverTheFeed;
+    if (!paintsText(entered, "About")) return error.NoWayBackToTheDescription;
+
+    // And pressing it brings the description back.
+    main.update(&model, .toggle_place_about, &fx);
+    const shown = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(shown, about)) return error.AboutDidNotShowTheDescription;
+    try testing.expect(paintsText(shown, "Hide"));
+
+    main.update(&model, .toggle_place_about, &fx);
+    const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (paintsText(folded, about)) return error.TheDescriptionWouldNotFoldAgain;
+}
+
+/// Whether any text node on the page carries this string.
+fn paintsText(p: painted.Painted, needle: []const u8) bool {
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, needle) != null) return true;
+    }
+    return false;
 }
