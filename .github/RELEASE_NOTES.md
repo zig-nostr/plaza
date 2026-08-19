@@ -1,14 +1,18 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.11.0
+### What's new in v0.12.0
 
-**Some of the people you follow were invisible, and now they are not.** Plaza works out where each person you follow publishes, and connects there, so you see them even when they are nowhere near your own relays. That has been true since v0.4.0 with one gap nobody could see: to find out where somebody publishes, Plaza has to read a small note they signed saying so, and it only ever looked for that note on relays it was already connected to.
+**Places.** A place is somebody's corner of nostr: their relays, their people. Open one with a link and you are reading that place, not your own feed with a banner on top. Walk in, look around, and leave, and nothing has changed about your account.
 
-If yours were not among them, that person stayed missing. Not with an error, not with an empty space, just absent, exactly the thing the whole feature exists to prevent.
+Following a `plaza://place/...` link opens the place it names, from anywhere, including from a browser and from a cold start. You arrive as a visitor, which means you can already read and post, and closing the app forgets you were ever there. If you want to keep it, Enter puts it on a rail down the side of the window, and from then on it is one press away. Leaving takes it off again, and the link still works if you change your mind.
 
-Plaza now asks four well-known relays that one question, and only about the people it has no answer for. They are asked and nothing more: never joined, never published as yours, and never counted among your relays.
+Entering gates nothing at all, posting included. Whether a post lands is between you and that place's relays: if they turn it away, that is theirs to say, not a wall this app invents. And the list of places you have entered is a file on your own disk, not something published anywhere, because which communities somebody belongs to is nobody else's business.
 
-Whether you notice depends on who you follow. On an account whose relays already cover its follows there is nothing to fix and you will see no difference. On a fresh install it found relay lists for every single account it could not previously place.
+Switching between them is the point, so there are keys for it: `Cmd+Option+S` shows the rail, `Cmd+Option+Up` and `Down` walk your places, and `Cmd+Option+Right` steps out of a place and back into it.
+
+The format is fiatjaf's, exactly. Anyone who has deployed a site with Hallway has already written one of these, and the same document means the same thing in both.
+
+**Text sits where it should now.** Every mention, every bold name, every timestamp in the app was drawing two points below the line it belonged to. It is the sort of thing you feel before you can point at it, and it turned out to be the four bundled fonts disagreeing about where their own baselines are.
 
 ### Install
 
