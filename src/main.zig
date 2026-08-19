@@ -2609,6 +2609,190 @@ const engagement_request_limit = 500;
 // What an engagement query asks for: replies, reposts, likes, zap receipts.
 const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
 
+// ------------------------------------------------------------------- places
+//
+// A place is somebody else's Plaza, published as an event.
+//
+// fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
+// static site on your own domain. That works, and it costs a deploy per variant,
+// so you only get variants worth a deploy. His own suggestion for a native app
+// was the other shape: one binary, several rooms, each instantiated from a URL
+// or an event shared by whoever runs the community. Then a place costs nothing to
+// make, and you get the ones nobody would have deployed a site for: one
+// conference weekend, a reading group of nine people.
+//
+// This is the first slice of that. A place carries an app name, a home text, and
+// the relays its feeds read from. v1 reads the first two and one feed; the rest
+// of Hallway's surface (colours, kinds, publish targets, densities) arrives in
+// later versions against the same document.
+//
+// EVERYTHING HERE COMES FROM A STRANGER. A place is an event by definition
+// somebody else signed, so every field is bounded, copied into fixed storage,
+// and never trusted for its length. The relay URL is the sharp one: it decides
+// where the app connects.
+
+/// How much of each field a place may carry. Small on purpose: this is chrome,
+/// not content, and a place that wants to say more than this wants to be a note.
+const place_name_cap = 64;
+const place_home_cap = 2048;
+const place_feed_name_cap = 48;
+const place_relay_cap = 96;
+/// v1 reads one feed. The array is here so the parser does not have to change
+/// shape when v3 reads several.
+const place_feeds_cap = 1;
+/// How many ids are remembered per place. A screenful and then some; the point
+/// is that the room is not empty on arrival, not that it is complete.
+const place_seed_cap = 60;
+
+const PlaceFeed = struct {
+    name_buf: [place_feed_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    relay_buf: [place_relay_cap]u8 = @splat(0),
+    relay_len: u8 = 0,
+
+    pub fn name(self: *const PlaceFeed) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn relay(self: *const PlaceFeed) []const u8 {
+        return self.relay_buf[0..self.relay_len];
+    }
+};
+
+pub const Place = struct {
+    name_buf: [place_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    home_buf: [place_home_cap]u8 = @splat(0),
+    home_len: u16 = 0,
+    feeds: [place_feeds_cap]PlaceFeed = @splat(.{}),
+    feeds_len: u8 = 0,
+    /// The last notes seen here, so returning shows the room rather than an
+    /// empty screen while a stranger's relay is dialled. Bounded and cheap:
+    /// these are ids, and the notes themselves are already in the store.
+    seen: [place_seed_cap][32]u8 = undefined,
+    seen_len: u16 = 0,
+    /// Who published it and under what `d`, so the applied place can be named,
+    /// re-fetched, and told apart from another place with the same title.
+    author: [32]u8 = @splat(0),
+    ident_buf: [64]u8 = @splat(0),
+    ident_len: u8 = 0,
+
+    pub fn name(self: *const Place) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn home(self: *const Place) []const u8 {
+        return self.home_buf[0..self.home_len];
+    }
+    pub fn ident(self: *const Place) []const u8 {
+        return self.ident_buf[0..self.ident_len];
+    }
+};
+
+/// The kind a place is published under. NIP-78 is application-specific data
+/// keyed by a `d` tag, which is exactly what this is: one publisher can keep
+/// several places apart, and editing one replaces it rather than adding a
+/// second.
+const place_kind: u16 = 30078;
+
+/// Reads a place out of an event's content. Null when it is not one.
+///
+/// THE FIELD NAMES ARE HALLWAY'S, EXACTLY. fiatjaf's deployer ships its whole
+/// configuration as one flat JSON object, `window.hallway.universe`, embedded in
+/// every site it deploys: 41 keys, camelCase. Matching it means a place published
+/// once means the same thing in both clients, which is worth more than a format
+/// of our own. I guessed at `name`/`home`/`feeds` first and every one was wrong.
+///
+/// v1 reads three of the 41: `appName`, `homeMarkdown`, and the first entry of
+/// `hardcodedFeeds`. The other 38 are ignored HERE and not forgotten: unknown
+/// fields are skipped rather than refused, so a place carrying the full object
+/// already applies the parts this version understands and picks up the rest as
+/// later versions learn them.
+pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
+    @setRuntimeSafety(true); // A stranger's JSON, sized into fixed buffers.
+    const Wire = struct {
+        appName: []const u8 = "",
+        homeMarkdown: []const u8 = "",
+        hardcodedFeeds: []const struct {
+            /// Optional in Hallway's own data: one feed on the site I read
+            /// carries only `relays`, so a feed with no name falls back to its
+            /// relay's host rather than drawing blank.
+            name: []const u8 = "",
+            icon: []const u8 = "",
+            /// An ARRAY, and a feed can name several. v1 reads the first one it
+            /// will dial and says so; reading all of them is v3's job.
+            relays: []const []const u8 = &.{},
+            pubkeys: []const []const u8 = &.{},
+        } = &.{},
+    };
+    var parsed = std.json.parseFromSlice(Wire, gpa, content, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const w = parsed.value;
+
+    var m = Place{};
+    m.name_len = @intCast(copyBounded(&m.name_buf, w.appName));
+    m.home_len = @intCast(copyBounded(&m.home_buf, w.homeMarkdown));
+    for (w.hardcodedFeeds) |f| {
+        if (m.feeds_len == m.feeds.len) break;
+        // The first relay of this feed that is safe to dial. A feed whose relays
+        // are all refused is skipped, and the rest of the place still applies.
+        var chosen: []const u8 = "";
+        for (f.relays) |r| {
+            if (isSafeRelayUrl(r)) {
+                chosen = r;
+                break;
+            }
+        }
+        if (chosen.len == 0) continue;
+
+        var out = PlaceFeed{};
+        out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
+        const label = if (f.name.len > 0) f.name else relayHost(chosen);
+        out.name_len = @intCast(copyBounded(&out.name_buf, label));
+        m.feeds[m.feeds_len] = out;
+        m.feeds_len += 1;
+    }
+
+    // A place with nothing to say is not a place. This is what stops any random
+    // kind:30078 (the kind is shared by every app that stores settings) from
+    // being applied as one.
+    if (m.name_len == 0 and m.home_len == 0 and m.feeds_len == 0) return null;
+    return m;
+}
+
+/// A relay URL without its scheme or trailing slash, for naming a feed that did
+/// not name itself.
+fn relayHost(url: []const u8) []const u8 {
+    var h = url;
+    if (std.mem.startsWith(u8, h, "wss://")) h = h["wss://".len..];
+    return std.mem.trimEnd(u8, h, "/");
+}
+
+/// Copies as much of `src` as fits, on a UTF-8 boundary, and returns the length.
+fn copyBounded(dst: []u8, src: []const u8) usize {
+    var n = @min(src.len, dst.len);
+    // Same boundary rule as the reply snippet: a field cut mid-character draws
+    // a replacement glyph, which is worse than a shorter field.
+    if (n < src.len) {
+        while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
+    }
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+/// Whether a relay URL from a place is one this app will dial.
+///
+/// The sharpest field in the document: it decides where the app connects. Plain
+/// `wss://` only, no control bytes, no spaces, and short enough to hold. A place
+/// cannot point Plaza at `ws://` in the clear, and cannot smuggle a newline into
+/// a frame.
+pub fn isSafeRelayUrl(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "wss://")) return false;
+    if (url.len <= "wss://".len or url.len > place_relay_cap) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
 // -------------------------------------------------- things you can take away
 //
 // A client you can make quiet.
@@ -3168,11 +3352,20 @@ const quote_aside_chrome: f32 = 62.125;
 /// states draw a bar or a single line where the identity would be.
 const quote_quiet_chrome: f32 = 5 + 4 + 2 + 2;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
-/// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
-/// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
-/// DOWN still gets `14.5 * 1.25`. Scale shrinks glyphs, never the line box, and
-/// every term here that priced a scaled run at its own size was short.
-const ancestor_line_height: f32 = body_line_height;
+/// A nested line, at the height it now actually draws.
+///
+/// This used to be `body_line_height`, with a comment explaining that a body
+/// line is a body line whatever register it is set in: `textSpansMaxScale`
+/// starts at 1 and only takes the max, so a paragraph whose spans were all
+/// scaled DOWN still got a full `14.5 * 1.25` box. That was a true description
+/// of the engine and a workaround for a defect, and pricing around it kept the
+/// defect: the glyphs shrank and the line box did not, so every nested line sat
+/// a point low with a point and a quarter of air above it.
+///
+/// The nested register is asked for by its SIZE now (`.sm`, which is
+/// `body_size - 1`), so the box is the one the text needs and the estimate is
+/// the height it draws.
+const ancestor_line_height: f32 = nested_line_height;
 const ancestor_row_chrome: f32 = avatar_size + ancestor_identity_gap + ancestor_bottom_pad;
 /// A ghost row: its two quiet lines set the height, not the dashed disc. Both are
 /// scaled down and both still take a full body line box (see
@@ -3189,6 +3382,9 @@ const focal_leading_pad: f32 = 16;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
+/// The same for the nested register, which is `.sm` (`body_size - 1`) and so
+/// lays out at `13.5 * 1.25`.
+pub const nested_line_height: f32 = 16.875;
 /// The redesign's metadata register: 12px for handles, timestamps and counts.
 /// `.size = .sm` cannot say it (the size enum steps by exactly one from the 14.5
 /// body, giving 13.5), so these runs are scaled spans, which take an exact
@@ -5848,6 +6044,17 @@ const QuoteEntry = struct {
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
+    /// The names generation `text_buf` was rendered at.
+    ///
+    /// The snippet has mentions in it, and a mention is baked into text as
+    /// `@Name` (or as an abbreviated npub when no name is known yet). The feed's
+    /// note bodies re-parse when a display name lands, because the generation
+    /// moving invalidates every card; this cache had no such stamp, so a snippet
+    /// rendered before its mentioned author's kind:0 arrived kept the npub for
+    /// as long as the entry lived. That is the raw `@npub1sg6plzp…uf63m` in a
+    /// reply context line while the same person's name shows correctly two rows
+    /// down.
+    names_generation: u64 = 0,
     /// The HOST of the picture the quoted note carries, when it carries one.
     ///
     /// The URL itself is deliberately cut out of `text_buf` (a raw image URL is
@@ -6402,7 +6609,11 @@ fn refreshQuotes(store: *nostr.store.Store) void {
     var nested: [quote_cache_cap][32]u8 = undefined;
     var nested_count: usize = 0;
     for (&g_quotes) |*q| {
-        if (!q.used or q.state == .loaded or q.state == .missing) continue;
+        if (!q.used or q.state == .missing) continue;
+        // A loaded entry is re-rendered ONLY when a name has landed since it was
+        // baked, which is the one thing that can change what its text should
+        // say. Otherwise this stays what it was: a pass over the unresolved.
+        if (q.state == .loaded and q.names_generation == g_names_generation) continue;
         var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
             // `.missing` is what the ROW says, not a decision to stop looking:
             // the card reads "not on your relays yet", which is true, and the
@@ -6445,6 +6656,7 @@ fn refreshQuotes(store: *nostr.store.Store) void {
             }
         }
         q.state = .loaded;
+        q.names_generation = g_names_generation;
         wantProfile(q.pubkey);
     }
     for (nested[0..nested_count]) |id| wantQuote(id);
@@ -9502,6 +9714,16 @@ pub const Model = struct {
         return "Connecting…";
     }
     pub fn empty_text(self: *const Model) []const u8 {
+        // In a place, the pool is not what the reader is waiting on. Its relay
+        // is deliberately outside the eight, so "Connecting to the relay pool"
+        // under a place header describes a connection that has nothing to do
+        // with the empty screen it is explaining, and says "connecting" about a
+        // socket that may have failed a minute ago.
+        if (g_place != null) return switch (placeLink()) {
+            .idle, .connecting => "Connecting to this place…",
+            .unreachable_relay => "Can't reach this place. Retrying…",
+            .connected => "Nothing here yet.",
+        };
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
         return "Connecting to the relay pool…";
     }
@@ -9549,6 +9771,13 @@ pub const Model = struct {
     /// statements too.
     pub fn scope_name(self: *const Model) []const u8 {
         _ = self;
+        // Inside a place the feed is the place's, so saying "Following" is
+        // simply false: those are not the reader's follows. It names the
+        // place's own feed instead.
+        if (g_place) |*m| {
+            if (m.feeds_len > 0 and m.feeds[0].name_len > 0) return m.feeds[0].name();
+            return "This place";
+        }
         return if (followsAreOwned()) "Following" else "Starter pack";
     }
 
@@ -9778,9 +10007,21 @@ pub const Model = struct {
         // either can be true on a tick where the count has not moved (a
         // deletion cancels an insert, or nothing was stored at all and the
         // reader simply changed who they follow).
+        // A place's notes arrive on its own socket and go into the store like
+        // anything else, so for a place the reader has never seen this fires on
+        // the count alone. For one they HAVE seen it does not: every note is
+        // already stored, the ingest is a duplicate, the count does not move,
+        // and nothing below ever runs. That is a room that sits on "Connecting"
+        // forever while its relay is connected and answering.
+        //
+        // `rebuildNotes` already treats this counter as a reason to rebuild.
+        // The bug was one level up: it never got the chance, because deciding
+        // whether to call it at all did not know about places.
+        const place_rev = g_place_rev.load(.monotonic);
         const stale = count != g_last_count or
             g_arrival_pending.load(.acquire) or
             g_feed_rebuild_all.load(.acquire) or
+            place_rev != g_notes_place_rev or
             self.feed_limit != g_notes_feed_limit;
         if (stale) {
             g_last_count = count;
@@ -9842,7 +10083,16 @@ pub const Model = struct {
         //   !reuse_ok      a name moved, so every card's baked text is stale
         //   limit moved    the reader paged down, so notes below the old window
         //                  belong now and no arrival describes them
+        // A place's notes arrive on its own socket, not through the ingest
+        // buffer the splice path drains, so nothing in `arrived` ever describes
+        // them. Its revision counter is what says there is something new, and
+        // `refresh` consults the same counter before it gets here.
+        const place_rev = g_place_rev.load(.monotonic);
+        const place_moved = place_rev != g_notes_place_rev;
+        g_notes_place_rev = place_rev;
+
         const full = g_feed_rebuild_all.swap(false, .acq_rel) or
+            place_moved or
             arrived.lost or
             !reuse_ok or
             limit != g_notes_limit or
@@ -9851,7 +10101,14 @@ pub const Model = struct {
         g_notes_feed_limit = self.feed_limit;
 
         if (full) {
-            self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
+            // In a place, the feed IS the place. Not your follows with a
+            // header on top, which is what a lens would be and is exactly the
+            // thing the room decision rejected.
+            if (g_place != null) {
+                self.rebuildNotesFromPlace(store, now_s, limit, reuse_ok);
+            } else {
+                self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
+            }
             return;
         }
         if (arrived.n == 0) return;
@@ -9861,6 +10118,58 @@ pub const Model = struct {
     /// Reads the whole window back from the store: a cursor per followed author
     /// and a linear pick across all of them, per note returned. The expensive
     /// one, and the reason for everything above it.
+    /// The same rebuild, reading the ids the place's relay sent rather than a
+    /// set of authors. Shares `noteFrom`, the reuse index and the mute filter,
+    /// because a note in a place is a note.
+    fn rebuildNotesFromPlace(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        limit: usize,
+        reuse_ok: bool,
+    ) void {
+        var ids: [place_feed_cap][32]u8 = undefined;
+        var ids_len: usize = 0;
+        {
+            lockPlaceIds();
+            defer unlockPlaceIds();
+            ids_len = g_place_ids_len;
+            @memcpy(ids[0..ids_len], g_place_ids[0..ids_len]);
+        }
+        if (ids_len == 0) {
+            self.notes_len = 0;
+            return;
+        }
+
+        var result = store.query(std.heap.page_allocator, .{
+            .ids = ids[0..ids_len],
+            .limit = @intCast(limit),
+        }) catch return;
+        defer result.deinit();
+        g_feed_work.full_reads += 1;
+
+        const old = g_feed_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+        const slots = if (reuse_ok) buildReuseIndex(old[0..old_len]) else &.{};
+
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= limit) break;
+            // The reader's own mutes still apply inside a place. So what they
+            // see is not exactly what the host published, and that is the right
+            // way round: a host cannot un-mute somebody for you.
+            if (isMuted(ev.pubkey)) continue;
+            self.notes[n] = blk: {
+                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                g_feed_work.parses += 1;
+                break :blk noteFrom(ev, now_s);
+            };
+            n += 1;
+        }
+        self.notes_len = n;
+    }
+
     fn rebuildNotesFromStore(
         self: *Model,
         store: *nostr.store.Store,
@@ -10052,6 +10361,19 @@ pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) vo
     model.rebuildNotes(store, now_s);
 }
 
+/// A tick as the app actually takes one, including the gate that decides
+/// whether the feed is rebuilt AT ALL.
+///
+/// `reconcileForTest` goes straight to `rebuildNotes` and invalidates on the
+/// way in, so every test using it rebuilds unconditionally. That is the right
+/// tool for asking what a rebuild produces, and it is why a place could sit on
+/// "Connecting" forever with nothing red: the decision NOT to rebuild is the
+/// part it skips.
+pub fn refreshForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    setStoreForTest(store);
+    model.refresh(now_s);
+}
+
 /// How the feed has been brought up to date, counted. Asserted on instead of
 /// timed: a stopwatch in a Debug test binary on a shared machine says nothing,
 /// and the whole point of this path is which of the two ran.
@@ -10176,6 +10498,8 @@ var g_splice_keep: [feed_arrival_cap]u32 = undefined;
 /// skip the rebuild entirely.
 var g_notes_limit: usize = 0;
 var g_notes_feed_limit: usize = 0;
+/// The place revision the notes on screen were built from.
+var g_notes_place_rev: u32 = 0;
 
 fn reuseHash(id: i64, mask: usize) usize {
     // Fibonacci mixing: note ids are the first eight bytes of a hash, so the low
@@ -13026,6 +13350,24 @@ pub const Msg = union(enum) {
     open_join,
     /// Dismiss the join sheet; a remembered intent is forgotten with it.
     close_join,
+    place_enter,
+    place_leave,
+    /// The Places icon: the switcher rail out, or folded away.
+    toggle_places_rail,
+    /// The place's Info card: what this place is, and the way out of it.
+    open_place_info,
+    close_place_info,
+    /// Ask to leave, and back out of asking.
+    place_leave_request,
+    place_leave_cancel,
+    /// Open one of the places you have entered, by its index in the list.
+    place_open: u8,
+    /// Back into the visit Home closed.
+    place_resume,
+    /// The keyboard's places grammar: out of the room and back into it, and
+    /// walking the list either way.
+    place_bounce,
+    place_step: i8,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
     /// The sheet's import path: open the Notary window (a separate process),
@@ -14250,6 +14592,11 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     }
     if (model.notifications_open) {
         return ui.stack(.{ .grow = 1 }, .{ base, notificationsSheet(ui, model) });
+    }
+    // Over the room it describes, so closing it puts the reader back exactly
+    // where they were rather than at the top of a rebuilt feed.
+    if (g_place_info != .closed) {
+        if (activePlace()) |m| return ui.stack(.{ .grow = 1 }, .{ base, placeInfoCard(ui, m) });
     }
     if (model.stage == .settings) {
         // Both sheets, in order, when a profile is being edited: dropping the
@@ -19431,8 +19778,8 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
                 if (about.len > 0)
                     ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = p.text_body_soft } },
-                        &.{.{ .text = about, .scale = nested_body_scale }},
+                        .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_body_soft } },
+                        &.{.{ .text = about }},
                     )
                 else
                     ui.spacer(0),
@@ -19795,12 +20142,21 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
     // the feed owns the full width below the OS titlebar.
+    const second_rail = g_rail_open;
     return ui.row(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         railView(ui, model),
         // A 1px vertical rule between the rail and the content. No `grow`: in a
         // row that would stretch it along the WIDTH and eat the feed's space; it
         // fills the height on its own via the row's cross-axis stretch.
         ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        // The second rail, and its own rule. Contents are a pure function of
+        // which primary section is selected, so there is nothing to consult here
+        // beyond that: Home has no second rail, Places is a list of yours.
+        if (second_rail) placesRail(ui) else ui.spacer(0),
+        if (second_rail)
+            ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } })
+        else
+            ui.spacer(0),
         // The bar sits BESIDE the rail and BELOW everything else, which is the
         // only place it is always visible. It used to be the last row of the
         // feed's own column, so every level layered over the feed (a thread, a
@@ -19885,7 +20241,12 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
-        scopeHeader(ui, model),
+        // ONE header, not two. A place stacked its own banner on top of the
+        // scope line, so the top of the room was the place's name over the
+        // place's feed name over a rule, in two different rhythms. In a place
+        // the place header IS the scope line, and it keeps the same 11/9 insets
+        // so nothing jumps on the way in or out.
+        if (activePlace()) |m| placeHeader(ui, m) else scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
@@ -19899,13 +20260,22 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The 56px navigation rail: Home (the mark) up top, then the compose verb, the
+/// The 56px primary rail: the destinations up top, then the compose verb, the
 /// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
 /// titlebar of buttons: destinations on the edge, the feed owns the width. A
-/// guest's gated tiles (compose, settings, you) route to the join sheet. Search
-/// is not shown until the feature exists.
+/// guest's gated tiles (compose, settings, you) route to the join sheet.
+///
+/// Three of the five destinations the design names. Search and Messages are not
+/// built and are therefore not here: a rail item that goes nowhere is worse than
+/// one fewer, which is the same rule that keeps Groups off until NIP-29 ships.
+///
+/// Our split is inverted from the strongest prior art and that is a choice.
+/// Flotilla and Discord put the COMMUNITIES on the primary rail with three or
+/// four fixed destinations pinned under them; we put destinations primary and
+/// places secondary, which is Slack's shape. The deciding factor is how many
+/// top-level things the app ends up with: Discord has essentially one, so
+/// servers earn the outer rail, and Plaza is heading for five or six.
 fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
     const guest = model.is_guest();
     const compose_press: Msg = if (guest) .open_join else .open_compose;
     const settings_press: Msg = if (guest) .open_join else .open_settings;
@@ -19913,33 +20283,222 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
     // one uniform padding cannot state. The 10 on each side is exactly what
     // centring a 36px tile in the 56px rail leaves, so it stays as padding.
     return ui.column(.{ .width = 56, .cross = .center, .gap = 0, .padding = 10, .style_tokens = .{ .background = .background } }, .{
-        // Home: the mark on a raised plate, and the way back to the feed from
-        // wherever the reader has got to. It looked like the app's own button
-        // for a long time and did nothing when pressed, which is the one thing
-        // a mark in that position should never be.
-        ui.row(.{
-            .on_press = Msg.go_home,
-            .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "Home", .focusable = true },
-        }, .{
-            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark")),
-        }),
+        // Home: the mark, and the way back to your own feed from wherever the
+        // reader has got to, INCLUDING out of a place. It looked like the app's
+        // own button for a long time and did nothing when pressed, which is the
+        // one thing a mark in that position should never be.
+        railDest(ui, "mark", 21, Msg.go_home, "Home", g_place == null),
+        vgap(ui, rail_gap),
+        // The bell, with what is waiting on it. Signed out there is no inbox to
+        // have, so there is no bell: a tile that could only ever say zero is a
+        // tile that says nothing.
+        //
+        // It takes no selected plate, and that is not an oversight: it opens a
+        // SHEET over whatever is underneath rather than being a section of its
+        // own, so a plate would claim a selection the app does not have.
+        if (guest) ui.spacer(0) else railBell(ui),
+        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
+        // Places: the switcher rail, out or folded away. Shown even with an
+        // empty list, because the rail's empty state is how somebody learns
+        // what a place is and that a link opens one, which in v1 is the only
+        // way in. The plate says you are IN a place, which is the fact worth
+        // showing; whether the rail happens to be out is visible on its own.
+        railDest(ui, "places", 17, Msg.toggle_places_rail, "Places", g_place != null),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
         railTile(ui, "edit", 15, compose_press, "New note", true),
         vgap(ui, rail_gap),
-        // The bell, with what is waiting on it. Signed out there is no inbox to
-        // have, so there is no bell: a tile that could only ever say zero is a
-        // tile that says nothing.
-        if (guest) ui.spacer(0) else railBell(ui),
-        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
         // Settings.
         railTile(ui, "settings", 16, settings_press, "Settings", false),
         vgap(ui, rail_gap),
         // The account seat: a dashed "you" as a guest, the account once signed in.
         railYou(ui, guest),
         vgap(ui, 2),
+    });
+}
+
+/// A primary-rail destination: the same 36px tile as a verb, plus the one thing
+/// a destination has that a verb does not, which is being where you are.
+///
+/// The plate says where you are, and the two that have one are exclusive by
+/// construction: Home is plated out of a place, the pin is plated in one, and
+/// there is no third state. Discord's left-edge indicator bar reads better but
+/// has nowhere to live here: the 56px rail is a 36px tile between two 10px
+/// insets, and a bar inside the tile's own box paints on top of the plate
+/// instead of beside it.
+fn railDest(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label: []const u8, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const tint = if (selected) p.text_primary else p.text_muted;
+    const glyph = ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon);
+    return ui.row(.{
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = true },
+    }, .{
+        if (selected)
+            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", glyph)
+        else
+            ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{glyph}),
+    });
+}
+
+/// The width of the second rail. Every point of it is added to the window's
+/// floor in `app.zon`, because a floor cannot be conditional and the narrowest
+/// window has to hold the widest arrangement.
+const places_rail_width: f32 = 180;
+/// Everything to the left of the reading area when both rails are out: the two
+/// rails and the 1pt rule after each. The window's default size is stated in
+/// terms of this, so a rail that changes width takes the window with it.
+pub const rails_width: f32 = 56 + 1 + places_rail_width + 1;
+const place_row_height: f32 = 34;
+const place_tile_size: f32 = 24;
+const places_rail_inset: f32 = 12;
+/// What is left for a name once the inset, the tile and the gap are spent. A
+/// DEFINITE width, so a long one ellipsizes instead of pushing the rail wide.
+const place_name_width: f32 = places_rail_width - places_rail_inset * 2 - place_tile_size - 8;
+
+/// The second rail: the places you have entered, and the one you are visiting.
+///
+/// Contents are a pure function of which primary section is selected, which is
+/// why this takes nothing but the arena: Places is the only section with a
+/// second rail, so being drawn at all is the whole of the condition.
+///
+/// It does not scroll and needs no overflow rule. Flotilla computes an item
+/// limit from the window height and moves the rest into a popover, which is the
+/// right answer at its scale; eight places at 34 points fit inside the 680pt
+/// window floor with room to spare, and a rule for a case that cannot happen is
+/// a rule nobody can check.
+fn placesRail(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const visiting = visitingPlace();
+    const rows = ui.arena.alloc(AppUi.Node, g_places_len) catch {
+        ui.failed = true;
+        return ui.column(.{ .width = places_rail_width }, .{});
+    };
+    for (rows, 0..) |*row, i| {
+        const open = if (activePlaceIndex()) |c| c == i else false;
+        row.* = placeRow(ui, &g_places[i], Msg{ .place_open = @intCast(i) }, open);
+    }
+    return ui.column(.{ .width = places_rail_width, .gap = 0, .style = .{ .background = p.surface_subbar } }, .{
+        vgap(ui, 14),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Places", .weight = .bold, .scale = scope_title_scale }},
+            ),
+        }),
+        vgap(ui, 10),
+        // The visit sits above the list and outside it, because that is exactly
+        // what a visit is: you are in this place, and it is not one of yours.
+        if (visiting != null) railSectionLabel(ui, "Visiting") else ui.spacer(0),
+        if (visiting) |m| placeRow(
+            ui,
+            m,
+            // Nothing to press while you are already in it.
+            if (g_place != null and !g_place_kept) null else Msg.place_resume,
+            g_place != null and !g_place_kept,
+        ) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) vgap(ui, 10) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) railSectionLabel(ui, "Entered") else ui.spacer(0),
+        ui.column(.{ .gap = 0 }, .{rows}),
+        if (g_places_len == 0 and visiting == null) placesRailEmpty(ui) else ui.spacer(0),
+        ui.spacer(1),
+    });
+}
+
+/// A small quiet label over a group of rail rows.
+fn railSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = text, .monospace = true, .scale = mono_meta_scale }},
+            ),
+        }),
+        vgap(ui, 4),
+    });
+}
+
+/// One place on the second rail: a letter tile and a name.
+///
+/// A LETTER tile, not the host's picture, and that is a budget decision rather
+/// than a taste one. The canvas registers sixteen images at a time, and a rail
+/// of eight would spend half of them on chrome that is always on screen, taken
+/// from the faces in the feed. `image_src` (a source-crop rect) would let one
+/// 512x512 slot hold sixty-four tiles at 64x64; it exists on the internal widget
+/// and is not exposed on the app-facing options, which is filed upstream as
+/// vercel-labs/native#387. Until that lands, letters.
+fn placeRow(ui: *AppUi, m: *const Place, press: ?Msg, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const name = if (m.name_len > 0) m.name() else "A place";
+    // The first BYTE, uppercased when it is a lowercase ASCII letter. A name
+    // starting with a multi-byte character would be cut mid-codepoint by a
+    // one-byte slice, so anything that is not printable ASCII falls back to a
+    // dot rather than to half a character.
+    const head = name[0];
+    const initial: []const u8 = if (head >= 'a' and head <= 'z')
+        ui.fmt("{c}", .{head - 32})
+    else if (head > 0x20 and head < 0x7f)
+        ui.fmt("{c}", .{head})
+    else
+        "\u{2022}";
+    return ui.el(.data_row, .{
+        .width = places_rail_width,
+        .height = place_row_height,
+        .cross = .center,
+        .padding = 0,
+        .on_press = press,
+        .style = if (selected)
+            .{ .background = p.surface_menu_selected }
+        else
+            .{ .quiet_hover = true },
+        .semantics = .{
+            .role = if (press == null) .none else .button,
+            .label = if (press == null) name else ui.fmt("Open {s}", .{name}),
+            .focusable = press != null,
+        },
+    }, .{
+        ui.row(.{ .cross = .center, .gap = 0, .height = place_row_height }, .{
+            hgap(ui, places_rail_inset),
+            ui.el(.panel, .{
+                .width = place_tile_size,
+                .height = place_tile_size,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_link_tile, .radius = 6, .stroke_width = 0 },
+            }, .{
+                ui.column(.{ .width = place_tile_size, .height = place_tile_size, .main = .center, .cross = .center }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = initial, .monospace = true, .weight = .medium, .scale = mono_meta_scale }},
+                    ),
+                }),
+            }),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .width = place_name_width, .style = .{ .foreground = if (selected) p.text_primary else p.text_muted } },
+                &.{.{ .text = name, .scale = meta_scale }},
+            ),
+        }),
+    });
+}
+
+/// What the rail says before there is anything in it.
+///
+/// It names the one way in that v1 has. A link is the only door, so a rail that
+/// simply looked empty would be the feature failing to explain itself on the
+/// only screen where it could.
+fn placesRailEmpty(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .start, .gap = 0 }, .{
+        hgap(ui, places_rail_inset),
+        ui.paragraph(
+            .{ .wrap = true, .width = places_rail_width - places_rail_inset * 2, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "No places yet. A plaza:// link opens one, and entering it keeps it here. Only you can see this list.", .scale = mono_hint_scale }},
+        ),
     });
 }
 
@@ -20210,6 +20769,183 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The feed's scope line: which feed this is (the starter pack) and how wide it
 /// reaches. A property of the feed, not a destination to choose between.
+/// The header of the place you are in: who it belongs to, what they wrote, and
+/// the way out.
+///
+/// While VISITING it also carries the one affordance that matters, and it is a
+/// quiet line rather than a wall: entering keeps the place, and nothing else in
+/// the app is gated on it. You can already read here and post here.
+///
+/// It says entering is private on the spot rather than in settings, because a
+/// list of the communities somebody belongs to is sensitive and they should
+/// learn that where the decision is, not afterwards.
+/// How much of a stranger's naming fits on the room's one header line.
+///
+/// The line is the name, the connection state, the feed's name, About and the
+/// verb, all inside the 620pt column with 16pt insets. The app's own strings
+/// and the two buttons are the budget; the two names arrive from a place a
+/// stranger published, at 64 and 48 bytes, and both of them at full length
+/// overflowed the window by 240pt at its floor.
+///
+/// These came down when Info joined the row: the overflow sweep measures the
+/// worst case (longest name, longest feed name, "cannot reach this place",
+/// Info and Enter together) and it was 20pt over at the floor.
+///
+/// Named for the LINE, not for the place: `place_name_cap` and
+/// `place_feed_name_cap` are what the buffers hold (64 and 48), and these are
+/// what one header line can show of them.
+const header_name_cap = 20;
+const header_feed_cap = 14;
+
+/// The width of the Info card. Wide enough for a paragraph of somebody's
+/// markdown without becoming a page.
+const place_info_card_width: f32 = 440;
+
+/// What a place is, who hosts it, where it reads from, and the way out.
+///
+/// Everything the old inline banner said, in a card nobody has to scroll past.
+/// Leave lives here rather than in the header for two reasons: it is the one
+/// destructive verb in a place and it was sitting a few pixels from Enter, and
+/// a reader who is about to leave is exactly the reader who should be looking
+/// at what this place is.
+fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
+    const p = theme.palette;
+    const leaving = g_place_info == .leaving;
+    var npub_buf: [96]u8 = undefined;
+    const host = abbreviateNpub(&npub_buf, m.author);
+    const relay = if (m.feeds_len > 0) m.feeds[0].relay() else "";
+    return modalScrim(ui, "About this place", .close_place_info, ui.el(.dialog, .{
+        .width = place_info_card_width,
+        .on_dismiss = .close_place_info,
+        .semantics = .{ .label = "About this place" },
+    }, .{
+        modalCard(ui, place_info_card_width, ui.column(.{ .grow = 1, .gap = 0, .padding = 20 }, .{
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = join_title_scale }},
+            ),
+            vgap(ui, 10),
+            placeInfoRow(ui, "Host", ui.fmt("@{s}", .{host})),
+            if (relay.len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (relay.len > 0) placeInfoRow(ui, "Reads", relay) else ui.spacer(0),
+            // The host's own words, in the one place that is theirs to fill.
+            if (m.home_len > 0) vgap(ui, 12) else ui.spacer(0),
+            if (m.home_len > 0) ui.separator(.{ .style = .{ .foreground = p.divider_card, .background = p.divider_card } }) else ui.spacer(0),
+            if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (m.home_len > 0) ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
+                canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
+            }) else ui.spacer(0),
+            vgap(ui, 14),
+            // Asking, then the answer. The warning is the whole footer while it
+            // is up: a confirmation sharing a row with other controls is a
+            // confirmation nobody reads.
+            if (leaving) ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Leave this place? It comes off your rail and the notes it was holding are forgotten. The link still works, so you can walk back in.", .scale = join_sub_scale }},
+            ) else ui.spacer(0),
+            if (leaving) vgap(ui, 12) else ui.spacer(0),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave_cancel }, "Cancel")
+                else
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_place_info }, "Close"),
+                ui.spacer(1),
+                // Nothing to leave while visiting: a visit is not kept, so there
+                // is no list to come off. Home closes the room either way.
+                if (!g_place_kept)
+                    ui.spacer(0)
+                else if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave }, "Leave")
+                else
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave_request }, "Leave"),
+            }),
+        })),
+    }));
+}
+
+/// One labelled fact about a place: a quiet name, then the value in mono.
+fn placeInfoRow(ui: *AppUi, label: []const u8, value: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.paragraph(
+            .{ .width = 54, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = label, .scale = mono_meta_scale }},
+        ),
+        ui.paragraph(
+            .{ .width = place_info_card_width - 40 - 54, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = value, .monospace = true, .scale = mono_meta_scale }},
+        ),
+    });
+}
+
+/// The header of a room, which is the scope line while you are in one.
+///
+/// The place's name is the title, the feed it is reading is the meta on the
+/// right where the follow feed puts its count of voices, and the verb is one
+/// button. The host's own text and the note about privacy are shown only while
+/// VISITING: they are the pitch, and a pitch that stays on screen after the
+/// answer is a banner in the way of the thing it was selling.
+fn placeHeader(ui: *AppUi, m: *const Place) AppUi.Node {
+    const p = theme.palette;
+    const visiting = !g_place_kept;
+    const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
+    return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
+        vgap(ui, 11),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = elide(ui, if (m.name_len > 0) m.name() else "A place", header_name_cap), .weight = .bold, .scale = scope_title_scale }},
+            ),
+            hgap(ui, 8),
+            // What THIS place's socket is doing, which the status bar cannot
+            // say: it counts the pool, and this relay is deliberately not in
+            // it. Silent once connected, because a working connection is not
+            // news.
+            switch (placeLink()) {
+                .connecting => ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint } },
+                    &.{.{ .text = "connecting", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                .unreachable_relay => ui.paragraph(
+                    .{ .style = .{ .foreground = p.status_warning } },
+                    &.{.{ .text = "cannot reach this place", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                else => ui.spacer(0),
+            },
+            ui.spacer(1),
+            if (feed_name.len > 0) ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint_alt } },
+                &.{.{ .text = elide(ui, feed_name, header_feed_cap), .monospace = true, .scale = mono_meta_scale }},
+            ) else ui.spacer(0),
+            if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
+            // One control, whatever state you are in: what this place is, who
+            // hosts it, where it reads from, and the way out. Leave used to sit
+            // right here, a few pixels from Enter, and one press did it.
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.open_place_info }, "Info"),
+            // Entering is the only verb the header keeps, because it is the one
+            // the reader came for and it should cost one press.
+            if (visiting) hgap(ui, 4) else ui.spacer(0),
+            if (visiting)
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter")
+            else
+                ui.spacer(0),
+            hgap(ui, chrome_inset),
+        }),
+        if (visiting) vgap(ui, 6) else ui.spacer(0),
+        if (visiting) ui.row(.{ .cross = .start, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Just visiting. Entering keeps this place on your rail, and nobody else can see which places you have entered.", .scale = mono_hint_scale }},
+            ),
+            hgap(ui, chrome_inset),
+        }) else ui.spacer(0),
+        vgap(ui, 9),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    })});
+}
+
 fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // The scope name and the pack's size, on one line with the redesign's 11/16/9
@@ -20294,9 +21030,21 @@ fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
 }
 
 /// A scope name as it reads mid-sentence.
+///
+/// Only the app's OWN two names are lowered. It used to return "starter pack"
+/// for anything that was not "Following", which was safe while those were the
+/// only two scopes there were, and became a plain lie the moment a place could
+/// be one: the status bar said "caught up, starter pack" under a header naming
+/// somebody else's room. A place's feed name is a stranger's proper noun and is
+/// left exactly as they wrote it.
 fn lowerScope(scope: []const u8) []const u8 {
     if (std.mem.eql(u8, scope, "Following")) return "following";
-    return "starter pack";
+    if (std.mem.eql(u8, scope, "Starter pack")) return "starter pack";
+    return scope;
+}
+
+pub fn lowerScopeForTest(scope: []const u8) []const u8 {
+    return lowerScope(scope);
 }
 
 /// What a note offers beyond its verbs: where it is, what it says, and what to
@@ -21476,6 +22224,30 @@ fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
 /// The same paragraph at a stated register and ink: the thread's focal note reads
 /// one step up from a feed row, and a shade brighter.
 fn textParaAt(ui: *AppUi, spans: []const canvas.TextSpan, scale: f32, ink: canvas.Color) AppUi.Node {
+    // A paragraph one step DOWN is asked for by its SIZE, never by scaling
+    // every span in it, and the difference is a point of vertical position.
+    //
+    // The line box and the baseline come from `size * max(1, largest span
+    // scale)`. That floor of 1 is the whole problem: a paragraph whose spans
+    // are all scaled DOWN is still boxed and baselined as though it were full
+    // size, so the nested register drew 13.5pt text on a 14.5pt baseline inside
+    // an 18.125pt box instead of a 13.5pt baseline in a 16.875pt one. A point
+    // lower than the text around it, with a point and a quarter of extra air
+    // above, which is what a reply's context line looked like next to the note
+    // it belongs to.
+    //
+    // `.sm` is `body_size - 1`, which is exactly the 13.5 the ratio was
+    // approximating, and the spans then sit at scale 1 of a genuinely smaller
+    // paragraph. Scaling UP is unaffected and stays a scale: the floor only
+    // bites below 1.
+    if (scale == nested_body_scale) {
+        return ui.paragraph(.{
+            .size = .sm,
+            .wrap = true,
+            .on_link = AppUi.linkMsg(.open_url),
+            .style = .{ .foreground = ink },
+        }, spans);
+    }
     const sized = if (scale == 1) spans else blk: {
         const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch break :blk spans;
         for (spans, out) |src, *dst| {
@@ -21587,7 +22359,7 @@ fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.No
     var n: usize = 0;
     // The name carries the weight and the snippet does not, so the two read
     // apart on one line without needing a second colour.
-    spans[n] = .{ .text = label, .scale = nested_body_scale, .weight = .medium };
+    spans[n] = .{ .text = label, .weight = .medium };
     n += 1;
     if (snippet.len > 0) {
         // One line's worth. The cache already clamps to `quote_text_cap`, and a
@@ -21595,12 +22367,25 @@ fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.No
         // ellipsis before running out of box.
         const cut = firstLineOf(snippet, reply_context_snippet_chars);
         if (cut.len > 0) {
-            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = nested_body_scale };
+            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = 0 };
             n += 1;
         }
     }
+    // `.sm`, not spans scaled to 13.5/14.5, and the difference is a point of
+    // vertical position rather than a nicety.
+    //
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 is what matters: a paragraph whose spans are ALL
+    // scaled DOWN is still boxed and baselined as though it were full size, so
+    // this line drew its 13.5pt text on a 14.5pt baseline inside an 18.125pt box
+    // instead of a 13.5pt baseline in a 16.875pt one. A point lower than the
+    // text beside it, with a point and a quarter of extra air above.
+    //
+    // The size TOKEN says the same thing without the floor applying: `.sm` is
+    // `body_size - 1`, which is exactly the 13.5 the ratio was approximating,
+    // and the spans then sit at scale 1 of a genuinely smaller paragraph.
     return ui.paragraph(
-        .{ .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
+        .{ .size = .sm, .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
         spans[0..n],
     );
 }
@@ -21669,8 +22454,8 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // sentence the ancestor row above a thread has always used for the same
         // situation, which is the other reason to use it.
         return quoteAside(ui, null, ui.paragraph(
-            .{ .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = "Not on your relays yet", .scale = nested_body_scale }},
+            .{ .size = .sm, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = "Not on your relays yet" }},
         ));
     }
 
@@ -21959,6 +22744,14 @@ pub fn wantQuoteForTest(id: [32]u8) void {
 
 /// The real fill path, over a real store: what a quote card knows about the
 /// note it draws comes from here and nowhere else.
+pub fn refreshProfilesForTest(store: *nostr.store.Store) void {
+    refreshProfiles(store);
+}
+pub fn quoteTextForTest(id: [32]u8) ?[]const u8 {
+    const q = quoteFor(id) orelse return null;
+    if (q.state != .loaded) return null;
+    return q.text_buf[0..q.text_len];
+}
 pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
     refreshQuotes(store);
 }
@@ -22949,7 +23742,17 @@ const PlazaApp = native_sdk.UiApp(Model, Msg);
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "new-note")) return .open_compose;
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    // The same message the rail's own tile sends, so the key and the tile
+    // cannot drift into two behaviours.
+    if (std.mem.eql(u8, name, "places-rail")) return .toggle_places_rail;
+    if (std.mem.eql(u8, name, "place-bounce")) return .place_bounce;
+    if (std.mem.eql(u8, name, "place-prev")) return Msg{ .place_step = -1 };
+    if (std.mem.eql(u8, name, "place-next")) return Msg{ .place_step = 1 };
     return null;
+}
+
+pub fn onCommandForTest(name: []const u8) ?Msg {
+    return onCommand(name);
 }
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
@@ -22957,7 +23760,733 @@ pub const EffectsForTest = Effects;
 
 /// Boot: seed the feed once, register whatever images are already cached, then
 /// arm the repeating timers.
+/// Receiving a `plaza://` link. See `src/urlscheme.m`: the SDK registers the
+/// scheme but hands the app nothing, so Plaza installs its own Apple Event
+/// handler. macOS-only; elsewhere these are stubs and a link does nothing,
+/// which is honest because no other platform routes one here either.
+/// Not in test builds: the suite does not link AppKit (nothing in it receives
+/// an Apple Event, and linking it would make the tests need a window server),
+/// so referencing the symbols there would fail to link.
+const has_url_scheme = builtin.os.tag == .macos and !builtin.is_test;
+extern fn plaza_url_scheme_install() void;
+extern fn plaza_url_scheme_take(out: [*]u8, cap: usize) usize;
+
+/// The link macOS handed us since the last tick, if any.
+fn takePendingLink(buf: []u8) ?[]const u8 {
+    if (!has_url_scheme) return null;
+    const n = plaza_url_scheme_take(buf.ptr, buf.len);
+    if (n == 0) return null;
+    return buf[0..n];
+}
+
+/// What a `plaza://` link asks for.
+///
+/// One shape in v1: `plaza://place/<naddr>`, which applies somebody's published
+/// place. The path segment is there so a later version can add others without
+/// the first form becoming ambiguous.
+///
+/// Untrusted: a link can come from a note, a DM, or anywhere else. It names
+/// what to fetch and never carries the place itself, so the worst a hostile link
+/// can do is point Plaza at an event that is not a place, which the parser
+/// refuses, or one that is, which is then shown before it applies.
+pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
+    const prefix = "plaza://place/";
+    if (!std.mem.startsWith(u8, link, prefix)) return null;
+    var rest = link[prefix.len..];
+    // A query or fragment is ordinary link decoration (a tracker, an anchor)
+    // and is cut off.
+    if (std.mem.indexOfAny(u8, rest, "?#")) |cut| rest = rest[0..cut];
+    if (rest.len == 0 or rest.len > 1024) return null;
+    if (!std.mem.startsWith(u8, rest, "naddr1")) return null;
+    // bech32 is lowercase alphanumeric. Checked here so nothing downstream has
+    // to wonder what a stranger put in the path, and it is also what refuses an
+    // extra path segment: `plaza://place/<naddr>` has exactly one, and a `/`
+    // is not a bech32 character. I wrote a separate check for that first and no
+    // probe could fail it, because this one already covered it.
+    for (rest) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
+        if (!ok) return null;
+    }
+    return rest;
+}
+
+/// The place you are in right now. Null is your own Plaza.
+///
+/// Three states, and only two of them are stored. VISITING is this being set
+/// while `g_place_kept` is false: you followed a link, you are in the place,
+/// you can read it and post to it, and closing the app forgets it. ENTERED is
+/// the same thing with the place also in the list below, which is the only
+/// thing entering does. LEFT is out of the list; the link still works.
+///
+/// Nothing is gated on entering. Whether a post lands is between the reader and
+/// the place's relays: if they refuse the write, that is theirs to say, not a
+/// wall this app invents.
+var g_place: ?Place = null;
+var g_place_kept: bool = false;
+
+/// What the place's relay has told us about, newest first.
+///
+/// A ROOM, per the decision: while you are in a place you see IT, not your own
+/// feed with a header on top. Nothing in the store records which relay an event
+/// arrived on, so the connection keeps its own list of ids and the rebuild reads
+/// exactly those. That also makes leaving instant: drop the list.
+const place_feed_cap = 200;
+var g_place_ids: [place_feed_cap][32]u8 = undefined;
+var g_place_ids_len: usize = 0;
+var g_place_ids_lock = std.atomic.Value(bool).init(false);
+/// Bumped by the relay thread so the UI knows there is something new to read,
+/// the same shape the arrival buffer uses.
+var g_place_rev = std.atomic.Value(u32).init(0);
+/// Which place the live connection belongs to, so a thread whose place has been
+/// left stops writing into the list the next one is filling.
+var g_place_gen = std.atomic.Value(u32).init(0);
+
+fn lockPlaceIds() void {
+    while (g_place_ids_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockPlaceIds() void {
+    g_place_ids_lock.store(false, .release);
+}
+
+/// Seeds the place's list from what was remembered last time.
+///
+/// The rest of this app is local-first and a place was not: entering one showed
+/// "Connecting to the relay pool" and nothing else until a stranger's relay
+/// answered, which on a slow one is a long time to look at an empty room. The
+/// notes are already in the store from last visit; the only thing missing was
+/// knowing WHICH of them belong to this place, since nothing records the relay
+/// an event arrived on. So the ids are remembered with the place.
+fn seedPlaceFeed(ids: []const [32]u8) void {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = @min(ids.len, g_place_ids.len);
+    @memcpy(g_place_ids[0..g_place_ids_len], ids[0..g_place_ids_len]);
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+/// A snapshot of the current place's ids, for writing down.
+fn placeIdsSnapshot(out: [][32]u8) usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    const n = @min(g_place_ids_len, out.len);
+    @memcpy(out[0..n], g_place_ids[0..n]);
+    return n;
+}
+
+/// What the place's own socket is doing.
+///
+/// Its own state, because the status bar counts the POOL and a place's relay is
+/// deliberately not in it. So a place that is slow, or refusing, or simply not
+/// there looked exactly like a connected one while the bar cheerfully reported
+/// 5/5 relays. That is the reader being told the wrong thing about the only
+/// connection they are actually waiting on.
+pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay };
+var g_place_link = std.atomic.Value(u8).init(@intFromEnum(PlaceLink.idle));
+
+pub fn placeLink() PlaceLink {
+    return @enumFromInt(g_place_link.load(.monotonic));
+}
+fn setPlaceLink(state: PlaceLink) void {
+    g_place_link.store(@intFromEnum(state), .monotonic);
+}
+
+fn clearPlaceFeed() void {
+    _ = g_place_gen.fetchAdd(1, .monotonic);
+    setPlaceLink(.idle);
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = 0;
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+pub fn placeFeedCount() usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    return g_place_ids_len;
+}
+
+/// Opens the place's relay and keeps reading it.
+///
+/// Its own socket, outside the eight. Entering a place must never cost the
+/// reader one of their own relays, and this connection never publishes and is
+/// never written into their kind:10002, which is the same discipline the
+/// indexer set and the discovered pool already follow.
+fn startPlaceFeed(m: *const Place) void {
+    clearPlaceFeed();
+    // What was here last time, on screen before anything is dialled, and BEFORE
+    // the check below: the ids are already known whether or not there is a
+    // relay to go and ask. Seeding after that early return meant a place whose
+    // feed could not be dialled showed nothing, having remembered everything.
+    if (m.seen_len > 0) seedPlaceFeed(m.seen[0..m.seen_len]);
+    if (m.feeds_len == 0) return;
+    const gen = g_place_gen.load(.monotonic);
+    var url_buf: [place_relay_cap]u8 = undefined;
+    const len = copyBounded(&url_buf, m.feeds[0].relay());
+    const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, gen }) catch return;
+    t.detach();
+}
+
+fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, gen: u32) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    setPlaceLink(.connecting);
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch {
+        // Only if this thread still owns the place. A dial that fails after the
+        // reader has already walked out must not paint the next room's header.
+        if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+        return;
+    };
+    defer relay.deinit();
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.connected);
+
+    const kinds = [_]u16{1};
+    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = place_feed_cap }};
+    relay.subscribe("plaza-place", &filters) catch return;
+
+    while (g_place_gen.load(.monotonic) == gen) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                // The reader left, or moved: this thread's list is not the one
+                // being shown any more, so it stops rather than writing into it.
+                if (g_place_gen.load(.monotonic) != gen) break;
+                wantProfile(e.event.pubkey);
+                lockPlaceIds();
+                defer unlockPlaceIds();
+                if (g_place_ids_len < g_place_ids.len) {
+                    g_place_ids[g_place_ids_len] = e.event.id;
+                    g_place_ids_len += 1;
+                    _ = g_place_rev.fetchAdd(1, .monotonic);
+                }
+            },
+            // NOT closed at EOSE: a place is somewhere you sit, so the socket
+            // stays open and new notes arrive while the reader is looking.
+            else => {},
+        }
+    }
+    // The loop only ends when the socket died or the reader left. The first is
+    // worth saying out loud; the second already reset this.
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+}
+
+/// Whether the places rail is out. One boolean, persisted, and that is the
+/// whole of the second rail's state.
+///
+/// The design called for a SECTION here, one of Home / Search / Notifications /
+/// Messages / Places, with the second rail's contents a pure function of it.
+/// Driving the built version is what argued against it: with only Places
+/// carrying a second rail, making Home a section that has none meant pressing
+/// Home hid the list of places, so coming back from your own feed to a room
+/// cost two presses. That is the opposite of switching between them with ease,
+/// which is the whole point of the rail.
+///
+/// So the Places icon is a toggle for the switcher, exactly as it was asked
+/// for, and Home is a content destination that leaves the rail alone. The
+/// section comes back when a second one actually needs a second rail (Messages
+/// and its conversations, most likely), and it can be designed then against two
+/// real cases instead of one imagined one.
+///
+/// Off by default: a reader with no places should never be given a column that
+/// only says it is empty. Entering a place turns it on, and it stays on.
+var g_rail_open: bool = false;
+
+/// What the place's Info card is doing.
+///
+/// A card and not a banner. The host's own text used to sit inline above the
+/// feed on every visit, which is a wall of somebody else's markdown in front of
+/// the thing it is selling. So the whole of what a place says about itself
+/// lives behind one control, and the first-visit presentation is its own
+/// design problem rather than "the banner, again".
+///
+/// Leave lives in here too. It is the one destructive verb in a place, it was
+/// sitting in the header a few pixels from Enter, and one press did it. Now it
+/// takes two, and the second one is behind a card that says what leaving does.
+pub const PlaceInfo = enum(u8) { closed, open, leaving };
+var g_place_info: PlaceInfo = .closed;
+
+pub fn placeInfo() PlaceInfo {
+    return g_place_info;
+}
+pub fn setPlaceInfoForTest(state: PlaceInfo) void {
+    g_place_info = state;
+}
+
+pub fn railOpen() bool {
+    return g_rail_open;
+}
+
+/// The Places icon, and `Cmd+Option+S`.
+fn togglePlacesRail() void {
+    g_rail_open = !g_rail_open;
+    saveSettings();
+}
+
+/// Navigation reveals the switcher: entering a place, walking the list, or
+/// bouncing back into a room all put the rail where the eye is going to look.
+/// Opening one FROM the rail does not go through this, so folding it and then
+/// pressing a seat cannot make it spring back open.
+fn showPlacesRail() void {
+    g_rail_open = true;
+}
+
+pub fn togglePlacesRailForTest() void {
+    togglePlacesRail();
+}
+pub fn setRailForTest(open: bool) void {
+    g_rail_open = open;
+}
+
+/// The places kept across restarts. Small on purpose for v1.
+const max_places = 8;
+var g_places: [max_places]Place = @splat(.{});
+var g_places_len: usize = 0;
+/// What we are fetching, while we fetch it.
+var g_place_want: ?struct {
+    pubkey: [32]u8,
+    ident_buf: [64]u8,
+    ident_len: u8,
+    /// Ticks the fetch has been outstanding, so it can give up and say so.
+    waited: u16 = 0,
+} = null;
+
+/// Drives the REAL entry path. It spawns a worker that dials and fails without
+/// a relay, which is harmless: the seeding this asserts happens before it.
+pub fn startPlaceFeedForTest(i: usize) void {
+    startPlaceFeed(&g_places[i]);
+}
+pub fn savePlacesForTest() void {
+    savePlaces();
+}
+
+pub fn setPlaceLinkForTest(state: PlaceLink) void {
+    setPlaceLink(state);
+}
+
+/// Arrives in a place that has a named feed, which is the ordinary case.
+pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []const u8, feed: []const u8) void {
+    visitPlaceForTest(author, ident, name);
+    if (g_place) |*m| {
+        m.feeds[0].name_len = @intCast(copyBounded(&m.feeds[0].name_buf, feed));
+        m.feeds[0].relay_len = @intCast(copyBounded(&m.feeds[0].relay_buf, "wss://example.test"));
+        m.feeds_len = 1;
+    }
+}
+
+pub fn flushPlaceIdsForTest(now_s: i64) void {
+    flushPlaceIds(now_s);
+}
+pub fn setPlaceHomeForTest(text: []const u8) void {
+    if (g_place) |*m| m.home_len = @intCast(copyBounded(&m.home_buf, text));
+}
+pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
+    g_places[i].seen_len = n;
+}
+
+pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
+    seedPlaceFeed(ids);
+}
+pub fn clearPlaceFeedForTest() void {
+    clearPlaceFeed();
+}
+pub fn rememberPlaceIdsForTest() void {
+    rememberPlaceIds();
+}
+pub fn keptPlaceSeenLenForTest(i: usize) u16 {
+    return g_places[i].seen_len;
+}
+pub fn seedFromKeptPlaceForTest(i: usize) void {
+    seedPlaceFeed(g_places[i].seen[0..g_places[i].seen_len]);
+}
+
+pub fn resetPlacesForTest() void {
+    // The feed ids too, or one test's room leaks into the next one's.
+    clearPlaceFeed();
+    g_rail_open = false;
+    g_place_info = .closed;
+    g_place_flushed_at = 0;
+    g_place_flushed_rev = 0;
+    g_place = null;
+    g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
+    g_places = @splat(.{});
+    g_places_len = 0;
+}
+
+/// Arrives in a place the way a link does: in it, kept only if it already was.
+pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
+    var m = Place{};
+    m.author = author;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    m.name_len = @intCast(copyBounded(&m.name_buf, name));
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+}
+
+pub fn clearActivePlaceForTest() void {
+    g_place = null;
+    g_place_kept = false;
+}
+
+pub fn activePlace() ?*const Place {
+    return if (g_place) |*m| m else null;
+}
+pub fn placeIsKept() bool {
+    return g_place_kept;
+}
+pub fn keptPlaceCount() usize {
+    return g_places_len;
+}
+
+/// Whether a place with this author and identifier is already in the list.
+fn placeIndexOf(author: [32]u8, ident: []const u8) ?usize {
+    for (g_places[0..g_places_len], 0..) |*p, i| {
+        if (std.mem.eql(u8, &p.author, &author) and std.mem.eql(u8, p.ident(), ident)) return i;
+    }
+    return null;
+}
+
+/// Which entry of the list is open, when the open place is one of them. Null
+/// while visiting, because a visit is deliberately not in the list.
+fn activePlaceIndex() ?usize {
+    const m = g_place orelse return null;
+    return placeIndexOf(m.author, m.ident());
+}
+
+/// The last place opened from the rail, so `Cmd+Option+Right` has somewhere to
+/// bounce back to. An index rather than an address because it is a convenience:
+/// leaving a place shifts the ones after it, and the read below clamps, so the
+/// worst a stale value does is bounce into a neighbour.
+var g_place_last: usize = 0;
+
+/// Opens a place already in the list.
+///
+/// The room being left is written down FIRST. Switching places is precisely
+/// when its ids stop being reachable: `rememberPlaceIds` reads the live list,
+/// and the next `startPlaceFeed` clears it.
+fn openKeptPlace(i: usize) void {
+    if (i >= g_places_len) return;
+    g_place_info = .closed;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place_last = i;
+    g_place = g_places[i];
+    g_place_kept = true;
+    startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen.
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// The place being visited, held for this session only.
+///
+/// A visit is transient by design, and Home closing the room turned that into a
+/// trap: peek at your own feed for a second and the room is gone, with nothing
+/// on the rail to get back to it because a visit is deliberately not in the
+/// list. This is the seat it keeps until the app quits, which is exactly as
+/// long as a visit was ever promised to last.
+var g_visited: ?Place = null;
+
+/// What the rail's "Visiting" row stands for: the place open right now if it is
+/// a visit, otherwise the last one visited this session.
+fn visitingPlace() ?*const Place {
+    if (g_place) |*m| {
+        if (!g_place_kept) return m;
+    }
+    return if (g_visited) |*m| m else null;
+}
+
+/// Back into the visit that Home closed.
+fn resumeVisit() void {
+    if (g_visited == null) return;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place = g_visited;
+    g_place_kept = false;
+    showPlacesRail();
+    startPlaceFeed(&g_place.?);
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// Back to your own feed, without leaving the place.
+///
+/// Home and Leave were the same button for as long as there was no rail, and
+/// they are not the same verb: this closes the room, and the place stays in the
+/// list with its ids intact, one press away.
+fn goToOwnPlaza() void {
+    if (g_place == null) return;
+    g_place_info = .closed;
+    if (g_place_kept) savePlaces() else g_visited = g_place;
+    g_place = null;
+    g_place_kept = false;
+    clearPlaceFeed();
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// `Cmd+Option+Right`: out of the room, and back into the one you were in.
+///
+/// This one earns a key more here than it does in the clients it is borrowed
+/// from. A place is a ROOM, so being in one hides your own feed entirely, and
+/// the way out has to be as cheap as the way in.
+fn bouncePlace() void {
+    if (g_place != null) {
+        goToOwnPlaza();
+        return;
+    }
+    if (g_places_len == 0) return;
+    showPlacesRail();
+    openKeptPlace(@min(g_place_last, g_places_len - 1));
+}
+
+/// `Cmd+Option+Up` / `Down`: the place before or after the open one, wrapping.
+///
+/// Discord and Slack both spend this pair on walking the community list, which
+/// is what our places are even though they sit on the second rail rather than
+/// the first. Matching the muscle memory is worth more than matching the rail.
+fn stepPlace(delta: i8) void {
+    if (g_places_len == 0) return;
+    const n: isize = @intCast(g_places_len);
+    const next: usize = if (activePlaceIndex()) |c|
+        @intCast(@mod(@as(isize, @intCast(c)) + delta, n))
+    else if (delta > 0) 0 else g_places_len - 1;
+    showPlacesRail();
+    openKeptPlace(next);
+}
+
+pub fn openKeptPlaceForTest(i: usize) void {
+    openKeptPlace(i);
+}
+pub fn goToOwnPlazaForTest() void {
+    goToOwnPlaza();
+}
+pub fn bouncePlaceForTest() void {
+    bouncePlace();
+}
+pub fn stepPlaceForTest(delta: i8) void {
+    stepPlace(delta);
+}
+pub fn activePlaceIndexForTest() ?usize {
+    return activePlaceIndex();
+}
+
+/// The place that was open when the app last quit.
+///
+/// Reopening used to land in the most recently ENTERED place no matter what,
+/// because entering was the only way to be in one. With a rail there is a way
+/// out that is not leaving, so "the last one entered" and "the one I was
+/// looking at" came apart, and restoring the wrong one reads as the app
+/// ignoring you.
+var g_boot_place_author: [32]u8 = @splat(0);
+var g_boot_place_ident_buf: [64]u8 = @splat(0);
+var g_boot_place_ident_len: u8 = 0;
+var g_boot_place_set: bool = false;
+
+/// `<64 hex>:<d>`, or empty for your own Plaza. Written by author and `d`
+/// rather than by position, so leaving a place cannot silently reopen whichever
+/// one slid into its index.
+pub fn activePlaceLine(buf: []u8) []const u8 {
+    const m = g_place orelse return "";
+    if (!g_place_kept) return "";
+    const hex = std.fmt.bytesToHex(m.author, .lower);
+    return std.fmt.bufPrint(buf, "{s}:{s}", .{ &hex, m.ident() }) catch "";
+}
+
+pub fn applyActivePlaceLine(value: []const u8) void {
+    g_boot_place_set = false;
+    if (value.len < 65 or value[64] != ':') return;
+    _ = std.fmt.hexToBytes(&g_boot_place_author, value[0..64]) catch return;
+    g_boot_place_ident_len = @intCast(copyBounded(&g_boot_place_ident_buf, value[65..]));
+    g_boot_place_set = true;
+}
+
+/// Land back where you were: the place that was open at quit, or your own
+/// Plaza if that is what was open.
+///
+/// Its own function so a test can drive the decision boot makes rather than a
+/// helper beside it. Restoring the most recently ENTERED place unconditionally
+/// was right while entering was the only way to be in one, and became wrong the
+/// moment Home stopped meaning "leave"; a probe that put that line back left
+/// the suite green, because nothing exercised this.
+fn restoreOpenPlace() void {
+    const i = bootPlaceIndex() orelse return;
+    openKeptPlace(i);
+}
+
+pub fn restoreOpenPlaceForTest() void {
+    restoreOpenPlace();
+}
+
+/// Where boot should land, when what was open is still in the list.
+fn bootPlaceIndex() ?usize {
+    if (!g_boot_place_set) return null;
+    return placeIndexOf(g_boot_place_author, g_boot_place_ident_buf[0..g_boot_place_ident_len]);
+}
+
+pub fn bootPlaceIndexForTest() ?usize {
+    return bootPlaceIndex();
+}
+pub fn applyActivePlaceLineForTest(value: []const u8) void {
+    applyActivePlaceLine(value);
+}
+pub fn visitingPlaceForTest() ?*const Place {
+    return visitingPlace();
+}
+pub fn resumeVisitForTest() void {
+    resumeVisit();
+}
+
+fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
+    _ = model;
+    const naddr = parsePlazaLink(link) orelse return;
+    const gpa = std.heap.page_allocator;
+    var ptr = nostr.nip19.decodeNaddr(gpa, naddr) catch return;
+    defer ptr.deinit(gpa);
+    // Only ever a place. The link says `place`, so an address pointing at some
+    // other kind is a link that lies, not a kind to go and fetch.
+    if (ptr.kind != place_kind) return;
+
+    var want: @TypeOf(g_place_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
+    g_place_want = want;
+    askPlace(fx, ptr.relays);
+}
+
+/// Asks for a place event: the pool, plus the relays the address itself named.
+///
+/// The hints matter more here than anywhere else in the app. A place is
+/// published by whoever runs a community, on that community's relay, and the
+/// reader has by definition not joined it yet: that is the thing the link is
+/// for. Asking only the reader's own relays would fail for exactly the case
+/// this feature exists to serve.
+fn askPlace(fx: *Effects, hints: []const []const u8) void {
+    _ = fx;
+    const want = g_place_want orelse return;
+    const ident = want.ident_buf[0..want.ident_len];
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{ident};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{
+        .authors = &authors,
+        .kinds = &kinds,
+        .tags = &tags,
+        .limit = 1,
+    }};
+    _ = askPool(one_shot_sub_prefix ++ "place", &filters);
+
+    // And the hinted relays, which the pool does not hold. One throwaway socket
+    // each, bounded, the same shape every other one-shot in this app uses.
+    var n: usize = 0;
+    for (hints) |h| {
+        if (n >= 3) break;
+        if (!isSafeRelayUrl(h)) continue;
+        var url_buf: [place_relay_cap]u8 = undefined;
+        const len = copyBounded(&url_buf, h);
+        const t = std.Thread.spawn(.{}, askPlaceAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
+        t.detach();
+        n += 1;
+    }
+}
+
+fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
+
+    const authors = [_][32]u8{pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{ident_buf[0..ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }};
+    relay.subscribe(one_shot_sub_prefix ++ "place", &filters) catch return;
+    while (true) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .eose => break,
+            else => {},
+        }
+    }
+}
+
+/// Looks for the place being waited on, once the store has grown. Called from
+/// the tick, which is where every other "did it arrive yet" check in this app
+/// lives.
+fn refreshPlaceFetch() void {
+    const want = g_place_want orelse return;
+    if (g_place != null) return;
+    const store = g_store orelse return;
+    const gpa = std.heap.page_allocator;
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{want.ident_buf[0..want.ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return;
+    defer result.deinit();
+
+    if (result.events.len == 0) {
+        // Give up eventually rather than spinning on a store read forever. A
+        // place nobody can find is a fact worth showing, not a spinner.
+        g_place_want.?.waited +|= 1;
+        if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
+        return;
+    }
+    var m = parsePlace(gpa, result.events[0].content) orelse {
+        // It exists and is not a place. Stop asking.
+        g_place_want = null;
+        return;
+    };
+    m.author = want.pubkey;
+    m.ident_len = want.ident_len;
+    m.ident_buf = want.ident_buf;
+    // Straight in, visiting. No sheet: the destination of following a link is
+    // the place, not a question about it.
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+    g_place_want = null;
+    startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen. Without this the reader enters a place and keeps
+    // looking at their own follows, which is exactly what was reported.
+    g_feed_rebuild_all.store(true, .release);
+}
+
+/// How many ticks a place fetch may go unanswered. The tick is a second, and a
+/// relay that has not answered in fifteen is one that does not have it.
+const place_fetch_ticks = 15;
+
 pub fn boot(model: *Model, fx: *Effects) void {
+    // FIRST, before anything slow. On a cold launch macOS sends the Apple Event
+    // moments after the app starts, so a handler installed after the store is
+    // opened misses the very link that launched Plaza.
+    if (has_url_scheme) plaza_url_scheme_install();
+    if (g_io) |io| {
+        if (g_environ) |environ| {
+            loadPlaces(io, environ);
+            restoreOpenPlace();
+        }
+    }
     model.refresh(nowSeconds());
     // What was written but not sent when the app last closed, back in the
     // composer where it was left.
@@ -23010,6 +24539,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome == .fired) {
                 const now = nowSeconds();
+                // A `plaza://` link somebody clicked, drained once per tick.
+                // Polling rather than an effect because the Apple Event lands
+                // on the main thread outside the SDK's event loop entirely,
+                // so there is nothing to subscribe to.
+                var link_buf: [2048]u8 = undefined;
+                if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+                refreshPlaceFetch();
+                flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
@@ -23371,6 +24908,59 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             saveDraft(model.draft());
         },
         .open_join => model.joining = true,
+        // Enter: keep this place. That is all it does, and it is private.
+        .place_enter => {
+            if (g_place) |m| {
+                if (g_places_len < g_places.len and placeIndexOf(m.author, m.ident()) == null) {
+                    g_places[g_places_len] = m;
+                    g_places_len += 1;
+                    g_place_kept = true;
+                    g_place_last = g_places_len - 1;
+                    // In the list now, so it is no longer the visit the rail
+                    // holds a seat for.
+                    g_visited = null;
+                    savePlaces();
+                    // Entering is the moment the rail has something to show,
+                    // so it shows it: the place the reader just kept, now with
+                    // a seat of its own. It is off until then, because a column
+                    // that can only say it is empty is worse than no column.
+                    showPlacesRail();
+                    saveSettings();
+                }
+            }
+        },
+        // Leave: out of the list, and out of the place. The link still works.
+        .place_leave => {
+            if (g_place) |m| {
+                if (placeIndexOf(m.author, m.ident())) |i| {
+                    for (i..g_places_len - 1) |j| g_places[j] = g_places[j + 1];
+                    g_places_len -= 1;
+                    savePlaces();
+                }
+            }
+            g_place = null;
+            g_place_kept = false;
+            g_place_info = .closed;
+            // The visiting seat is deliberately NOT cleared here, and it took a
+            // probe to see why: entering already clears it, and the seat only
+            // ever holds a place that is not in the list, so a place being left
+            // cannot be the one sitting in it. A second clear for a case that
+            // cannot happen is a line no test can ever fail on.
+            clearPlaceFeed();
+            g_feed_rebuild_all.store(true, .release);
+            saveSettings();
+        },
+        .toggle_places_rail => togglePlacesRail(),
+        .open_place_info => g_place_info = .open,
+        .close_place_info => g_place_info = .closed,
+        .place_leave_request => g_place_info = .leaving,
+        .place_leave_cancel => g_place_info = .open,
+        .place_resume => resumeVisit(),
+        // No `showPlacesRail` here: the press came FROM the rail, so it is
+        // already out, and forcing it would undo a fold the reader just did.
+        .place_open => |i| openKeptPlace(i),
+        .place_bounce => bouncePlace(),
+        .place_step => |delta| stepPlace(delta),
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
@@ -26749,6 +28339,11 @@ fn goHome(model: *Model) void {
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
+    // Home is YOUR feed, so the mark closes the room. Not the same verb as
+    // Leave: the place stays in the list with its ids intact, one press away on
+    // the rail, which is deliberately left exactly as it was. Hiding it here is
+    // what made coming back cost two presses.
+    goToOwnPlaza();
 }
 
 pub fn goHomeForTest(model: *Model) void {
@@ -28088,10 +29683,12 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     g_hidden = @splat(false);
+    g_rail_open = false;
+    g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(1024)) catch return;
+    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(2048)) catch return;
     defer gpa.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
@@ -28105,6 +29702,131 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // Written by id rather than by position, so adding an element to the
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
+        if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // An empty value is meaningful here too: it is your own Plaza.
+        if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
+    }
+}
+
+/// Where the places you have entered are written.
+///
+/// A local file for v1, and that is a privacy decision as much as a simplicity
+/// one: a list of the communities somebody belongs to is sensitive, and a file
+/// on their own disk exposes nothing at all. The encrypted `kind:30078` version
+/// that syncs across devices is v2, and it has two hazards already written down
+/// in the notes: it is replaceable, so it must be read back before it is
+/// written, and NIP-44 decrypt is a signer capability a remote bunker may not
+/// offer.
+///
+/// Written in Hallway's own shape, one document per line, so the file is the
+/// documents and not a private encoding of them.
+const places_file = "places";
+
+/// Copies what the live place has seen back onto its entry in the list, so the
+/// file records the room as it was left.
+/// How often the room being read is written down. This is a convenience for
+/// the next launch, not a transaction, so it is coarse on purpose.
+const place_flush_s: i64 = 5;
+var g_place_flushed_at: i64 = 0;
+var g_place_flushed_rev: u32 = 0;
+
+/// Writes the ids down while the reader is still in the place.
+///
+/// Without this the file only ever held what existed at the moment Enter was
+/// pressed, which is nothing: the notes arrive afterwards. So the place was
+/// remembered and its contents never were, and the next launch opened an empty
+/// room having saved the ids of nothing.
+fn flushPlaceIds(now_s: i64) void {
+    if (g_place == null or !g_place_kept) return;
+    const rev = g_place_rev.load(.monotonic);
+    if (rev == g_place_flushed_rev) return;
+    if (now_s - g_place_flushed_at < place_flush_s) return;
+    g_place_flushed_at = now_s;
+    g_place_flushed_rev = rev;
+    savePlaces();
+}
+
+fn rememberPlaceIds() void {
+    const m = g_place orelse return;
+    const i = placeIndexOf(m.author, m.ident()) orelse return;
+    g_places[i].seen_len = @intCast(placeIdsSnapshot(&g_places[i].seen));
+}
+
+fn savePlaces() void {
+    rememberPlaceIds();
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    if (g_places_len == 0) {
+        dir.deleteFile(io, places_file) catch {};
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (g_places[0..g_places_len]) |*m| {
+        out.print(gpa,
+            \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}],"host":{f},"d":{f}
+        , .{
+            std.json.fmt(m.name(), .{}),
+            std.json.fmt(m.home(), .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].name() else "", .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].relay() else "", .{}),
+            std.json.fmt(&std.fmt.bytesToHex(m.author, .lower), .{}),
+            std.json.fmt(m.ident(), .{}),
+        }) catch return;
+        // The ids, so returning here is instant. Written last and by hand
+        // rather than through the struct formatter, because they are ours and
+        // not part of Hallway's document.
+        out.appendSlice(gpa, ",\"seen\":[") catch return;
+        for (m.seen[0..m.seen_len], 0..) |id, i| {
+            if (i > 0) out.append(gpa, ',') catch return;
+            out.print(gpa, "\"{s}\"", .{&std.fmt.bytesToHex(id, .lower)}) catch return;
+        }
+        out.appendSlice(gpa, "]}") catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    dir.writeFile(io, .{
+        .sub_path = places_file,
+        .data = out.items,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((place_home_cap + place_seed_cap * 70 + 1024) * max_places)) catch return;
+    defer gpa.free(raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (g_places_len == g_places.len) break;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        var m = parsePlace(gpa, line) orelse continue;
+        // `host` and `d` are ours, not Hallway's, so they are read here rather
+        // than in the shared parser: they are how a place is told apart from
+        // another with the same title, and how it is re-fetched later.
+        const Extra = struct { host: []const u8 = "", d: []const u8 = "", seen: []const []const u8 = &.{} };
+        if (std.json.parseFromSlice(Extra, gpa, line, .{ .ignore_unknown_fields = true })) |ex| {
+            defer ex.deinit();
+            if (ex.value.host.len == 64) {
+                _ = std.fmt.hexToBytes(&m.author, ex.value.host) catch {};
+            }
+            m.ident_len = @intCast(copyBounded(&m.ident_buf, ex.value.d));
+            for (ex.value.seen) |hex| {
+                if (m.seen_len == m.seen.len) break;
+                if (hex.len != 64) continue;
+                var id: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&id, hex) catch continue;
+                m.seen[m.seen_len] = id;
+                m.seen_len += 1;
+            }
+        } else |_| {}
+        g_places[g_places_len] = m;
+        g_places_len += 1;
     }
 }
 
@@ -28116,14 +29838,18 @@ fn saveSettings() void {
     defer dir.close(io);
     var hidden_buf: [256]u8 = undefined;
     const hidden_ids = hiddenLine(&hidden_buf);
-    var buf: [768]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\n", .{
+    var place_buf: [160]u8 = undefined;
+    const place = activePlaceLine(&place_buf);
+    var buf: [1024]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
         hidden_ids,
         if (g_media_proxy_on) "on" else "off",
         if (g_media_direct_fallback) "on" else "off",
+        if (g_rail_open) "on" else "off",
+        place,
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",

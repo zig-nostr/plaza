@@ -3515,8 +3515,11 @@ test "an ancestor row is priced at what it draws, one line and two" {
         One.a = .{ .note = note, .lines = @intFromFloat(main.ancestorBodyLinesForTest(&note)) };
 
         const measured = try measuredHeight(arena, &model, One.row);
+        // The NESTED unit: an ancestor's body is set one register down, and
+        // that register is now boxed at the height it draws rather than at a
+        // full body line.
         const priced = main.ancestor_top_pad + main.ancestor_row_chrome_for_test +
-            @as(f32, @floatFromInt(One.a.lines)) * main.body_line_height;
+            @as(f32, @floatFromInt(One.a.lines)) * main.nested_line_height;
         if (@abs(measured - priced) > 0.5) {
             std.debug.print("\nancestor ({d} chars): draws {d}, priced {d}, lines {d}\n", .{ body.len, measured, priced, main.ancestorBodyLinesForTest(&One.a.note) });
             return error.EstimateDisagreesWithLayout;
@@ -10071,10 +10074,15 @@ test "the pool the app is born with holds no retired relay" {
     try testing.expect(main.relayCount() >= 3);
 }
 
-test "the window is square" {
+test "the window is square where the reading happens" {
     // A feed is a column of rows. The wide-and-short default spent its extra
     // width on margin while showing four notes at a time.
-    try testing.expectEqual(main.window_width, main.window_height);
+    //
+    // The square is the READING AREA, not the window. It was the same thing
+    // until the second rail existed; now the window carries 238pt of chrome
+    // down its left side, and asserting the window itself would either shrink
+    // the room by that much or quietly stop meaning anything.
+    try testing.expectEqual(main.window_width - main.rails_width, main.window_height);
 }
 
 test "there is always something under a name" {
@@ -12281,7 +12289,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -12302,6 +12310,13 @@ test "no view paints past the right edge at the narrowest the window can be" {
     const long_site = "https://" ++ ("a" ** 112) ++ ".example";
     const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
     const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
+    // A place's name and its feed's name, at the capacity of the buffers that
+    // receive them (`place_name_cap`, `place_feed_name_cap`). Both are a
+    // stranger's, and both land in fixed-width chrome.
+    const long_place = "P" ** 64;
+    const long_feed = "F" ** 48;
+    // A host's markdown, with a heading and a list, wide enough to wrap.
+    const long_about = "# " ++ ("A" ** 60) ++ "\n\nA description a stranger wrote, long enough to wrap more than once in the column it is given.\n\n- " ++ ("b" ** 70) ++ "\n- and another\n";
     // Exactly the 128 bytes `lud16_buf` holds. A single byte over and the
     // parser drops the field without a word, which is correct of it and made
     // the first version of this measure an empty line.
@@ -12382,6 +12397,9 @@ test "no view paints past the right edge at the narrowest the window can be" {
         _ = main.addRelayForTest(long_relay, true, true);
         _ = main.addRelayForTest("wss://relay.example.org", true, true);
         main.seedInboxUnreadForTest(3);
+        // Every state starts out of every place, or one state's room and one
+        // state's rail leak into the next one's measurement.
+        main.resetPlacesForTest();
         switch (st) {
             .feed, .feed_with_link => {},
             .thread => {
@@ -12407,6 +12425,51 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 _ = main.enqueueOutboxForTest(model.notes[0].pubkey, model.notes[0].pubkey, 1_800_000_000);
                 model.outbox_pending = 1;
                 model.menu = .outbox;
+            },
+            // The second rail, full, with a visit above the list: every string
+            // on it is a stranger's, and the rail is a fixed 180pt column that
+            // cannot grow to fit one.
+            .places_rail => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceForTest([_]u8{0x71} ** 32, "one", long_place);
+                main.update(model, .place_enter, &fx);
+                main.visitPlaceForTest([_]u8{0x72} ** 32, "two", "Bass Pistol");
+                main.update(model, .place_enter, &fx);
+                main.goToOwnPlazaForTest();
+                main.visitPlaceForTest([_]u8{0x73} ** 32, "three", long_place);
+                main.goToOwnPlazaForTest();
+                main.setRailForTest(true);
+            },
+            // Inside a place, which replaces the scope line with a header of a
+            // stranger's name, their feed's name, and their markdown.
+            // Entered, with the description open behind its control: the
+            // widest the header can be, because that row then carries the
+            // About toggle as well as Leave.
+            .place_about => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x75} ** 32, "five", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(true);
+                main.setPlaceInfoForTest(.open);
+            },
+            // The same card with the leave warning up, which is the taller of
+            // the two states and carries a sentence of its own.
+            .place_leaving => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x76} ** 32, "six", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.setRailForTest(true);
+                main.setPlaceInfoForTest(.leaving);
+            },
+            .place_visiting => {
+                main.visitPlaceWithFeedForTest([_]u8{0x74} ** 32, "four", long_place, long_feed);
+                // The longest thing the header can say about the connection,
+                // measured with the longest name and feed name beside it.
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(true);
             },
             .menu_note => model.note_menu = model.notes[0].id,
         }
@@ -12452,7 +12515,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .place_about, .place_leaving, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -18251,4 +18314,971 @@ test "building a reply queues the note it answers, so the line can fill in" {
         std.debug.print("the answered note was never queued, so the line stays generic forever\n", .{});
         return error.ParentNeverRequested;
     }
+}
+
+test "a place is read out of a stranger's event, using Hallway's own field names" {
+    // The names are fiatjaf's, not mine: `window.hallway.universe` is a flat
+    // object of 41 camelCase keys embedded in every site his deployer ships. A
+    // place published once should mean the same thing in both clients.
+    const gpa = testing.allocator;
+
+    const good =
+        \\{"appName":"nOasis","homeMarkdown":"# Rules\n\n- be interesting",
+        \\ "hardcodedFeeds":[{"name":"Spatia-Arcana","relays":["wss://spatia-arcana.com"]}]}
+    ;
+    const m = main.parsePlace(gpa, good) orelse return error.NoPlace;
+    try testing.expectEqualStrings("nOasis", m.name());
+    try testing.expectEqualStrings("# Rules\n\n- be interesting", m.home());
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("Spatia-Arcana", m.feeds[0].name());
+    try testing.expectEqualStrings("wss://spatia-arcana.com", m.feeds[0].relay());
+
+    // The other 38 keys are ignored rather than refused, so a place carrying the
+    // whole object still applies the three this version reads.
+    const full =
+        \\{"appName":"Later","defaultPrimaryColor":"CYAN","feedKinds":[1,6,20],
+        \\ "kindGroups":[{"kinds":[1,6],"label":"Notes"}],
+        \\ "indexerUrls":["wss://purplepag.es"],"dearrowYoutube":true,
+        \\ "hardcodedFeeds":[{"relays":["wss://a.example"],"pubkeys":["abcd"]}]}
+    ;
+    const n = main.parsePlace(gpa, full) orelse return error.NoPlace;
+    try testing.expectEqualStrings("Later", n.name());
+    try testing.expectEqual(@as(u8, 1), n.feeds_len);
+    // A feed with no name of its own is labelled by its host: Hallway's own
+    // data has one like this, so it is a real case and not a hypothetical.
+    try testing.expectEqualStrings("a.example", n.feeds[0].name());
+
+    // Not a place at all. kind:30078 is shared by every app that stores
+    // settings, so an empty document must not be applied as one.
+    try testing.expect(main.parsePlace(gpa, "{}") == null);
+    try testing.expect(main.parsePlace(gpa, "{\"unrelated\":true}") == null);
+    try testing.expect(main.parsePlace(gpa, "not json") == null);
+}
+
+test "a place cannot point Plaza at a relay it should not dial" {
+    // The relay URL is the one field that reaches the network, so it is checked
+    // rather than trusted.
+    const gpa = testing.allocator;
+
+    const refused = [_][]const u8{
+        "ws://plain.example", // cleartext
+        "http://not.a.relay",
+        "wss://", // nothing after the scheme
+        "wss://has space.example",
+        "wss://has\nnewline.example", // would smuggle a line into a frame
+        "wss://has\ttab.example",
+    };
+    for (refused) |url| {
+        if (main.isSafeRelayUrl(url)) {
+            std.debug.print("accepted a relay it should refuse: {s}\n", .{url});
+            return error.UnsafeRelayAccepted;
+        }
+    }
+    try testing.expect(main.isSafeRelayUrl("wss://basspistol.org"));
+
+    // A feed picks the first relay it WILL dial, rather than the first listed:
+    // one bad entry must not cost the whole feed.
+    const mixed =
+        \\{"appName":"Mixed","hardcodedFeeds":[
+        \\ {"name":"ok","relays":["ws://plain.example","wss://good.example"]},
+        \\ {"name":"none","relays":["http://nope.example"]}]}
+    ;
+    const m = main.parsePlace(gpa, mixed) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("wss://good.example", m.feeds[0].relay());
+}
+
+test "an overlong place field is cut on a character boundary" {
+    // A name or home text longer than the buffer is a stranger's choice, not an
+    // error, so it is cut. Cut mid-character it would draw a replacement glyph.
+    const gpa = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"appName\":\"");
+    var i: usize = 0;
+    while (i < 40) : (i += 1) try buf.appendSlice(gpa, "\u{1F600}"); // 4 bytes each, 160 total
+    try buf.appendSlice(gpa, "\"}");
+
+    const m = main.parsePlace(gpa, buf.items) orelse return error.NoPlace;
+    try testing.expect(m.name_len > 0);
+    try testing.expect(m.name_len <= 64);
+    if (!std.unicode.utf8ValidateSlice(m.name())) {
+        std.debug.print("the cut name is not valid UTF-8: {any}\n", .{m.name()});
+        return error.CutMidCharacter;
+    }
+}
+
+test "a plaza:// link names what to fetch and nothing else" {
+    // A link can arrive from a note, a DM, anywhere. It carries an address, not
+    // a place, so the worst a hostile one can do is point Plaza at an event that
+    // is not a place (refused by the parser) or one that is (shown before it
+    // applies).
+    const ok = main.parsePlazaLink("plaza://place/naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n", ok);
+
+    // A trailing slash, query or fragment is a link shortener's, not the address.
+    const trimmed = main.parsePlazaLink("plaza://place/naddr1abc?utm_source=x") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1abc", trimmed);
+
+    const refused = [_][]const u8{
+        "plaza://place/", // nothing to fetch
+        "plaza://place/nevent1abc", // not an address
+        "plaza://place/NADDR1ABC", // bech32 is lowercase
+        "plaza://place/naddr1 abc", // a space is not bech32
+        "plaza://something/naddr1abc", // an action this version does not know
+        // The old spelling. It was `plaza://mode/` while the feature was named
+        // after fiatjaf's proposal, and nothing outside this machine ever held
+        // one, so it is refused rather than carried: two spellings for one verb
+        // is the drift the vocabulary rules exist to stop.
+        "plaza://mode/naddr1abc",
+        "plaza://naddr1abc", // no action at all
+        "https://evil.example/naddr1abc", // not our scheme
+        "plaza://place/naddr1abc/../../etc", // path games
+    };
+    for (refused) |link| {
+        if (main.parsePlazaLink(link) != null) {
+            std.debug.print("accepted a link it should refuse: {s}\n", .{link});
+            return error.BadLinkAccepted;
+        }
+    }
+}
+
+test "entering a place keeps it, and nothing else is gated on it" {
+    // The correction that reshaped this feature: entering is about KEEPING a
+    // place, not about permission. Somebody may enter, stay across restarts,
+    // and never post; somebody else may read and post while only visiting.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x77} ** 32;
+    main.visitPlaceForTest(host, "plaza-place-test", "Bass Pistol");
+
+    // Visiting: you are in it, and it is not kept.
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Entering twice is not two places. A link followed again while already
+    // entered must not duplicate the row.
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Leaving takes it out of the list AND out of the place.
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expect(!main.placeIsKept());
+}
+
+test "returning to a place already entered arrives kept, not visiting" {
+    // The link works whether or not the place is in the list. Following it for
+    // one already entered must not offer to enter it again.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x33} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+
+    // Walk out without leaving, then follow the link again.
+    main.clearActivePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    if (!main.placeIsKept()) {
+        std.debug.print("a place already entered came back as visiting\n", .{});
+        return error.KeptPlaceForgotten;
+    }
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+}
+
+test "a place remembers what was in it, so returning is not an empty room" {
+    // Reported: entering a place showed "Connecting to the relay pool" and
+    // nothing else until a stranger's relay answered, which on a slow one is a
+    // long time to stare at nothing. The rest of this app is local-first and a
+    // place was not.
+    //
+    // The notes are already in the store from last visit. The only missing
+    // piece was knowing WHICH of them belong to this place, because nothing
+    // records the relay an event arrived on, so the ids ride with the place.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x5a} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+
+    // Notes arrive from the place's relay.
+    var ids: [3][32]u8 = .{ @splat(1), @splat(2), @splat(3) };
+    main.seedPlaceFeedForTest(&ids);
+    try testing.expectEqual(@as(usize, 3), main.placeFeedCount());
+
+    // The REAL save path has to carry them onto the kept entry, not a helper
+    // called only by this test.
+    main.savePlacesForTest();
+    if (main.keptPlaceSeenLenForTest(0) != 3) {
+        std.debug.print("saving did not remember the room: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.NotRemembered;
+    }
+
+    // And the REAL entry path has to put them back before any socket answers.
+    main.clearPlaceFeedForTest();
+    try testing.expectEqual(@as(usize, 0), main.placeFeedCount());
+    main.startPlaceFeedForTest(0);
+    if (main.placeFeedCount() != 3) {
+        std.debug.print("returned to an empty room: {d} ids\n", .{main.placeFeedCount()});
+        return error.EmptyOnReturn;
+    }
+}
+
+test "the room is written down while it is being read, not only when entered" {
+    // The bug behind an empty room on relaunch: the file was written on Enter
+    // and never again, and at that moment the place has no notes yet. So the
+    // place was remembered and its contents never were.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0x6b} ** 32, "later", "Later");
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Notes arrive after entering, which is always.
+    var ids: [2][32]u8 = .{ @splat(9), @splat(8) };
+    main.seedPlaceFeedForTest(&ids);
+
+    // Too soon: a flush every tick would rewrite the file constantly.
+    main.flushPlaceIdsForTest(0);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Once the interval has passed, what is on screen is what is written down.
+    main.flushPlaceIdsForTest(3600);
+    if (main.keptPlaceSeenLenForTest(0) != 2) {
+        std.debug.print("the room was never written down: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.RoomNotFlushed;
+    }
+
+    // And it does not rewrite when nothing changed.
+    main.setKeptPlaceSeenLenForTest(0, 0);
+    main.flushPlaceIdsForTest(7200);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+}
+
+test "inside a place the feed is not called Following" {
+    // It said "Following" under a place header, which is simply false: those
+    // are not the reader's follows, which is the whole point of a room.
+    const model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const own = model.scope_name();
+    try testing.expect(std.mem.eql(u8, own, "Following") or std.mem.eql(u8, own, "Starter pack"));
+
+    main.visitPlaceWithFeedForTest([_]u8{0x4d} ** 32, "somewhere", "Somewhere", "The relay");
+    const inside = model.scope_name();
+    if (std.mem.eql(u8, inside, "Following") or std.mem.eql(u8, inside, "Starter pack")) {
+        std.debug.print("a place still calls its feed \"{s}\"\n", .{inside});
+        return error.PlaceCalledFollowing;
+    }
+    try testing.expectEqualStrings("The relay", inside);
+
+    // A place whose feed has no name of its own still must not borrow yours.
+    main.visitPlaceForTest([_]u8{0x4e} ** 32, "nameless", "Nameless");
+    try testing.expectEqualStrings("This place", model.scope_name());
+}
+
+test "a place says what its own connection is doing" {
+    // The status bar counts the pool, and a place's relay is deliberately not
+    // in it, so a place that is slow or unreachable looked exactly like a
+    // connected one while the bar reported 5/5.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqual(main.PlaceLink.idle, main.placeLink());
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqual(main.PlaceLink.connecting, main.placeLink());
+
+    // Walking out resets it, so the next place never inherits the last one's
+    // failure.
+    main.setPlaceLinkForTest(.unreachable_relay);
+    main.clearPlaceFeedForTest();
+    if (main.placeLink() != .idle) {
+        std.debug.print("a new place inherited the last one's state: {t}\n", .{main.placeLink()});
+        return error.StaleLinkState;
+    }
+}
+
+/// Three places in the list, entered in order, and out of all of them.
+fn seedPlacesForRail(model: *main.Model, fx: *main.EffectsForTest) void {
+    main.visitPlaceForTest([_]u8{0xa1} ** 32, "one", "Bass Pistol");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "two", "Coldcard Hack");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa3} ** 32, "three", "Sparc Noasis");
+    main.update(model, .place_enter, fx);
+    main.goToOwnPlazaForTest();
+}
+
+test "the places rail folds and comes back, and Home leaves it alone" {
+    // Home hiding the switcher is what the first version did, and it made
+    // coming back from your own feed to a room cost two presses. The rail is
+    // the Places icon's to open and close, and nothing else touches it.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Off until there is something to put in it.
+    try testing.expect(!main.railOpen());
+
+    main.togglePlacesRailForTest();
+    try testing.expect(main.railOpen());
+    main.togglePlacesRailForTest();
+    try testing.expect(!main.railOpen());
+
+    // Entering a place turns it on, because that is the moment it has a seat
+    // to show.
+    main.visitPlaceForTest([_]u8{0xe1} ** 32, "one", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.railOpen());
+
+    // And Home does not take it away again.
+    main.goHomeForTest(&model);
+    if (!main.railOpen()) return error.HomeFoldedTheSwitcher;
+    try testing.expect(main.activePlace() == null);
+}
+
+test "Home closes the room without leaving the place" {
+    // Two different verbs that were one button for as long as there was no rail
+    // to put the place back on. Home means your own feed; the place stays.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xb1} ** 32, "bass", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.activePlace() != null);
+
+    main.goHomeForTest(&model);
+    if (main.activePlace() != null) return error.HomeStayedInTheRoom;
+    if (main.keptPlaceCount() != 1) {
+        std.debug.print("Home dropped the place from the list: {d} left\n", .{main.keptPlaceCount()});
+        return error.HomeLeftThePlace;
+    }
+
+    // And the rail puts you straight back.
+    main.openKeptPlaceForTest(0);
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(main.placeIsKept());
+}
+
+test "a visit is not thrown away by pressing Home" {
+    // A visit is deliberately not in the list, so once Home could close a room
+    // there was nothing on the rail to get back to one. Peeking at your own
+    // feed for a second destroyed the room you were reading.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xc1} ** 32, "guest", "Somewhere");
+    try testing.expect(!main.placeIsKept());
+
+    var model = main.initialModel();
+    main.goHomeForTest(&model);
+    try testing.expect(main.activePlace() == null);
+    if (main.visitingPlaceForTest() == null) return error.TheVisitWasLost;
+
+    main.resumeVisitForTest();
+    const back = main.activePlace() orelse return error.CouldNotGoBackToTheVisit;
+    try testing.expectEqualStrings("Somewhere", back.name());
+    // Still a visit. Going back into it is not the same as entering it.
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+}
+
+test "entering a place takes it out of the visiting seat" {
+    // The seat is for a visit in progress. Once the place is in the list it has
+    // a row of its own, and leaving the seat set would draw it twice: once
+    // under Visiting and once under Entered.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xd1} ** 32, "one", "Bass Pistol");
+    main.goHomeForTest(&model);
+    try testing.expect(main.visitingPlaceForTest() != null);
+
+    main.resumeVisitForTest();
+    main.update(&model, .place_enter, &fx);
+    main.goHomeForTest(&model);
+    if (main.visitingPlaceForTest() != null) return error.AnEnteredPlaceIsStillAVisit;
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+}
+
+test "reopening lands on the place that was open, not the last one entered" {
+    // Restoring `g_places_len - 1` was right while entering was the only way
+    // to be in a place. With a way out that is not leaving, "the last one
+    // entered" and "the one I was looking at" came apart.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    try testing.expectEqual(@as(usize, 3), main.keptPlaceCount());
+
+    // Open the FIRST, which is not the last one entered.
+    main.openKeptPlaceForTest(0);
+    var buf: [160]u8 = undefined;
+    const line = main.activePlaceLine(&buf);
+    try testing.expect(line.len > 65);
+
+    // The restart, as boot actually does it: the list is read back, the line
+    // says which one, and the app opens it. Asserting on the index alone left
+    // the decision itself untested, which a probe that put "the last one
+    // entered" back walked straight through.
+    main.applyActivePlaceLineForTest(line);
+    main.goToOwnPlazaForTest();
+    main.restoreOpenPlaceForTest();
+    const landing = main.activePlaceIndexForTest() orelse return error.BootOpenedNoPlace;
+    if (landing != 0) {
+        std.debug.print("boot opened place {d}, not the one that was open (0)\n", .{landing});
+        return error.BootOpenedTheWrongPlace;
+    }
+
+    // Home at quit means home at launch.
+    main.goToOwnPlazaForTest();
+    try testing.expectEqualStrings("", main.activePlaceLine(&buf));
+    main.applyActivePlaceLineForTest("");
+    main.restoreOpenPlaceForTest();
+    if (main.activePlace() != null) return error.BootOpenedAPlaceNobodyWasIn;
+
+    // Written by author and `d`, so a place leaving the list cannot hand its
+    // index to whichever one slid into it.
+    main.openKeptPlaceForTest(2);
+    const third = main.activePlaceLine(&buf);
+    var addr: [160]u8 = undefined;
+    const third_len = third.len;
+    @memcpy(addr[0..third_len], third);
+    main.openKeptPlaceForTest(0);
+    main.update(&model, .place_leave, &fx);
+    main.applyActivePlaceLineForTest(addr[0..third_len]);
+    const shifted = main.bootPlaceIndexForTest() orelse return error.BootLostThePlaceAfterALeave;
+    try testing.expectEqual(@as(usize, 1), shifted);
+}
+
+test "walking the places goes both ways and wraps" {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+
+    // From your own feed, forward is the first and back is the last.
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 1), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(-1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+
+    // And it puts the rail where the eye is going to look.
+    try testing.expect(main.railOpen());
+}
+
+test "the bounce goes out of the room and back into the same one" {
+    // The key exists because a place is a ROOM: being in one hides your own
+    // feed entirely, so the way out has to be as cheap as the way in, and the
+    // way back must not land somewhere else.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    main.openKeptPlaceForTest(1);
+
+    main.bouncePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+
+    main.bouncePlaceForTest();
+    const landed = main.activePlaceIndexForTest() orelse return error.BounceLandedNowhere;
+    if (landed != 1) {
+        std.debug.print("the bounce came back into place {d}, not the one it left (1)\n", .{landed});
+        return error.BounceLandedInTheWrongRoom;
+    }
+}
+
+test "a shortcut sends the message its tile sends" {
+    // A key that reimplements what a control does is a second implementation to
+    // keep in step, and this app has one already declared for compose and
+    // settings. The places keys go through the same messages.
+    try testing.expectEqual(main.Msg.toggle_places_rail, main.onCommandForTest("places-rail").?);
+    try testing.expectEqual(main.Msg.place_bounce, main.onCommandForTest("place-bounce").?);
+    try testing.expectEqual(main.Msg{ .place_step = -1 }, main.onCommandForTest("place-prev").?);
+    try testing.expectEqual(main.Msg{ .place_step = 1 }, main.onCommandForTest("place-next").?);
+    try testing.expect(main.onCommandForTest("no-such-key") == null);
+}
+
+test "every place you have entered has a seat on the rail" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Empty first: the rail has to explain itself, because a link is the only
+    // door v1 has and a blank column teaches nobody where to find one.
+    main.setRailForTest(true);
+    {
+        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+        var said_how = false;
+        for (p.layout.nodes) |n| {
+            if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) said_how = true;
+        }
+        if (!said_how) return error.TheEmptyRailSaysNothing;
+    }
+
+    seedPlacesForRail(&model, &fx);
+    main.setRailForTest(true);
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    // Three DISTINCT names, not three matching nodes. Counting matches let a
+    // probe that drew place 0 three times pass: the same seat repeated is
+    // exactly the failure this is here to catch.
+    const wanted = [_][]const u8{ "Bass Pistol", "Coldcard Hack", "Sparc Noasis" };
+    var seen = [_]bool{false} ** wanted.len;
+    var still_empty = false;
+    for (p.layout.nodes) |n| {
+        for (wanted, 0..) |w, i| {
+            if (std.mem.eql(u8, n.widget.text, w)) seen[i] = true;
+        }
+        if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) still_empty = true;
+    }
+    for (wanted, seen) |w, ok| {
+        if (!ok) {
+            std.debug.print("the rail drew no seat for \"{s}\"\n", .{w});
+            return error.APlaceHasNoSeat;
+        }
+    }
+    if (still_empty) return error.TheRailStillSaysItIsEmpty;
+
+    // Folded away, it draws nothing at all: contents follow the selection, and
+    // the one boolean beside it decides whether they are on screen.
+    main.setRailForTest(false);
+    const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    for (folded.layout.nodes) |n| {
+        if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) return error.TheFoldedRailIsStillDrawn;
+    }
+}
+
+test "the status bar does not call a place the starter pack" {
+    // It lowered "Following" and returned "starter pack" for everything else,
+    // which was safe while those were the only two scopes and became a lie the
+    // moment a place could be one: the bar said "caught up, starter pack" under
+    // a header naming somebody else's room.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqualStrings("following", main.lowerScopeForTest("Following"));
+    try testing.expectEqualStrings("starter pack", main.lowerScopeForTest("Starter pack"));
+    try testing.expectEqualStrings("The relay", main.lowerScopeForTest("The relay"));
+
+    var model = main.initialModel();
+    model.notes_len = 3;
+    main.visitPlaceWithFeedForTest([_]u8{0xf1} ** 32, "bass", "Bass Pistol", "The relay");
+    const line = model.caught_up(arena_state.allocator());
+    if (std.mem.indexOf(u8, line, "starter pack") != null) {
+        std.debug.print("the status bar says \"{s}\" inside a place\n", .{line});
+        return error.ThePlaceIsCalledTheStarterPack;
+    }
+    try testing.expectEqualStrings("Caught up · The relay · 3 notes", line);
+}
+
+test "a place whose notes are already stored still fills" {
+    // The report: open the app with no places entered, follow a link to one you
+    // have been in before, and it sits on "Connecting" forever while its relay
+    // is connected and answering. Enter it and restart, and it works.
+    //
+    // The cause was one level above the rebuild. A place's notes arrive on its
+    // own socket and are ingested like anything else, so a room the reader has
+    // never seen fires the store-count check and fills. A room they HAVE seen
+    // does not: every note is a duplicate, the count never moves, and the tick
+    // decides there is nothing to do without ever asking the place. Restarting
+    // hid it, because boot's first tick is stale for other reasons anyway.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5b} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/place-stale.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+    defer main.setStoreForTest(null);
+
+    // Everything the place will send is ALREADY in the store, which is the
+    // whole point: this is a room the reader has been in before.
+    var ids: [3][32]u8 = undefined;
+    for (0..3) |i| {
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), "a note from the room");
+        _ = try store.ingest(arena, ev, .{});
+        ids[i] = ev.id;
+    }
+
+    // A tick with no place, so the store count is settled and the next one
+    // cannot ride in on it.
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.refreshForTest(&model, &store, 1_800_000_100);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    // Now visit, and let the place's socket deliver. Nothing new reaches the
+    // store, so the revision counter is the only thing that says so.
+    main.visitPlaceWithFeedForTest([_]u8{0x5c} ** 32, "room", "Bass Pistol", "The relay");
+    main.seedPlaceFeedForTest(&ids);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    if (model.notes_len == 0) {
+        std.debug.print("the place stayed empty: \"{s}\"\n", .{model.empty_text()});
+        return error.ThePlaceNeverFilled;
+    }
+    try testing.expectEqual(@as(usize, 3), model.notes_len);
+}
+
+test "an empty place says what its own relay is doing, not the pool's" {
+    // A place's relay is deliberately outside the eight, so "Connecting to the
+    // relay pool" under a place header describes a connection that has nothing
+    // to do with the empty screen it is explaining.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    var model = main.initialModel();
+    try testing.expectEqualStrings("Connecting to the relay pool…", model.empty_text());
+
+    main.visitPlaceWithFeedForTest([_]u8{0x5d} ** 32, "room", "Bass Pistol", "The relay");
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqualStrings("Connecting to this place…", model.empty_text());
+
+    main.setPlaceLinkForTest(.unreachable_relay);
+    const failed = model.empty_text();
+    if (std.mem.indexOf(u8, failed, "pool") != null) {
+        std.debug.print("an unreachable place blames the pool: \"{s}\"\n", .{failed});
+        return error.ThePlaceBlamedThePool;
+    }
+
+    main.setPlaceLinkForTest(.connected);
+    try testing.expectEqualStrings("Nothing here yet.", model.empty_text());
+}
+
+test "a smaller line is asked for by its size, not by scaling every span" {
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 means a paragraph whose spans are ALL scaled DOWN
+    // keeps a full-size baseline in a full-size box: 13.5pt text drawn on a
+    // 14.5pt baseline inside an 18.125pt box. A point lower than the text
+    // around it, with a point and a quarter of extra air above, which is what
+    // the reply-context line looked like next to the note it belongs to.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest("");
+    const body = "hop on @primal august workout challenge.";
+    const b = @min(body.len, model.notes[0].content_buf.len);
+    @memcpy(model.notes[0].content_buf[0..b], body[0..b]);
+    model.notes[0].content_len = @intCast(b);
+    model.notes[0].reply_parent = [_]u8{0x42} ** 32;
+    model.notes[0].has_reply_parent = true;
+    model.notes_len = 1;
+    main.seedQuoteForTest([_]u8{0x42} ** 32, [_]u8{0x31} ** 32, 1_800_000_000, "the note being answered");
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    // Every run of the context line, by the size it actually draws at.
+    var line_y: ?f32 = null;
+    var runs: usize = 0;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.indexOf(u8, t.text, "reply to") != null or
+                std.mem.indexOf(u8, t.text, "being answered") != null;
+            if (!mine) continue;
+            runs += 1;
+            // 13.5, the `.sm` token, NOT 14.5 scaled down to look like it.
+            try testing.expectApproxEqAbs(@as(f32, 13.5), t.size, 0.001);
+            // Both runs of the line share one baseline, whatever their weight.
+            if (line_y) |y| {
+                if (@abs(y - t.origin.y) > 0.001) {
+                    std.debug.print("the context line draws runs at y={d:.3} and y={d:.3}\n", .{ y, t.origin.y });
+                    return error.RunsOffTheirSharedBaseline;
+                }
+            } else line_y = t.origin.y;
+        },
+        else => {},
+    };
+    if (runs < 2) return error.TheContextLineNeverDrewBothRuns;
+
+    // And the box is the height that size needs: 13.5 * 1.25, not 14.5 * 1.25.
+    var boxed = false;
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, "reply to") == null) continue;
+        boxed = true;
+        if (@abs(n.widget.frame.height - 16.875) > 0.01) {
+            std.debug.print(
+                "the context line reserves {d:.3}pt for 13.5pt text (16.875 is its own height)\n",
+                .{n.widget.frame.height},
+            );
+            return error.TheLineIsBoxedForATextItDoesNotDraw;
+        }
+    }
+    try testing.expect(boxed);
+
+    // The body around it is untouched: full size, one baseline across the
+    // plain text and the mention that sits in the middle of it.
+    var body_y: ?f32 = null;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.eql(u8, t.text, "hop on ") or
+                std.mem.eql(u8, t.text, "@primal") or
+                std.mem.eql(u8, t.text, " august workout challenge.");
+            if (!mine) continue;
+            try testing.expectApproxEqAbs(@as(f32, 14.5), t.size, 0.001);
+            if (body_y) |y| try testing.expectApproxEqAbs(y, t.origin.y, 0.001) else body_y = t.origin.y;
+        },
+        else => {},
+    };
+    try testing.expect(body_y != null);
+}
+
+test "every bundled face agrees about where the baseline is" {
+    // The macOS host draws a run with `drawAtPoint:(x, baseline - size)` into a
+    // flipped context, and AppKit then puts the baseline `round(ascender)`
+    // below that point. Subtracting the point SIZE asserts "ascent == size",
+    // which is a per-FACE number, so two faces on one line diverge by the
+    // difference in their ascents.
+    //
+    // Ours did: Geist-Regular ships 920/-220/100 and the other three shipped
+    // 1005/-295/0, which at a 14.5pt body put every medium, bold and mono run
+    // exactly 2pt BELOW the regular text beside it. Mentions, the reply
+    // context label, bold names next to regular meta: all of them sat low, and
+    // nothing on the Zig side could see it, because the display list carries
+    // one baseline for the whole line and is correct.
+    //
+    // scripts/harmonize-font-metrics.py made the four agree. This is what
+    // notices if a font update ever pulls them apart again.
+    const faces = [_]struct { name: []const u8, ttf: []const u8 }{
+        .{ .name = "Geist-Regular", .ttf = theme.geist_ttf },
+        .{ .name = "Geist-Medium", .ttf = theme.geist_medium_ttf },
+        .{ .name = "Geist-Bold", .ttf = theme.geist_bold_ttf },
+        .{ .name = "GeistMono-Regular", .ttf = theme.geist_mono_ttf },
+    };
+
+    var want: ?[6]i16 = null;
+    for (faces) |face| {
+        const m = try verticalMetrics(face.ttf);
+        if (want) |w| {
+            if (!std.mem.eql(i16, &w, &m)) {
+                std.debug.print(
+                    "\n{s} has vertical metrics {any}, and Geist-Regular has {any}.\n" ++
+                        "Two faces that disagree draw on two different baselines. Run\n" ++
+                        "  python3 scripts/harmonize-font-metrics.py\n",
+                    .{ face.name, m, w },
+                );
+                return error.FacesDisagreeAboutTheBaseline;
+            }
+        } else want = m;
+    }
+    // And they agree on numbers that are actually there, not on all zeroes.
+    try testing.expect(want.?[0] > 0);
+}
+
+/// hhea ascender/descender/lineGap and OS/2 sTypoAscender/Descender/LineGap,
+/// read straight out of the sfnt. Six numbers, because macOS picks the typo set
+/// when USE_TYPO_METRICS is on and the hhea set when it is not, and a face is
+/// only safe if both agree with everyone else's.
+fn verticalMetrics(ttf: []const u8) ![6]i16 {
+    if (ttf.len < 12) return error.NotAFont;
+    const count = std.mem.readInt(u16, ttf[4..6], .big);
+    var hhea: ?usize = null;
+    var os2: ?usize = null;
+    for (0..count) |i| {
+        const entry = 12 + i * 16;
+        if (entry + 16 > ttf.len) return error.NotAFont;
+        const tag = ttf[entry..][0..4];
+        const off = std.mem.readInt(u32, ttf[entry + 8 ..][0..4], .big);
+        if (std.mem.eql(u8, tag, "hhea")) hhea = off;
+        if (std.mem.eql(u8, tag, "OS/2")) os2 = off;
+    }
+    const h = hhea orelse return error.NoHhea;
+    const o = os2 orelse return error.NoOs2;
+    if (h + 10 > ttf.len or o + 74 > ttf.len) return error.NotAFont;
+    return .{
+        std.mem.readInt(i16, ttf[h + 4 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 6 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 8 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 68 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 70 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 72 ..][0..2], .big),
+    };
+}
+
+test "a reply snippet stops saying npub once the name lands" {
+    // The snippet is baked into text the same way a note body is: a mention
+    // becomes "@Name", or an abbreviated npub when no name is known yet. A body
+    // re-parses when a display name arrives, because the names generation
+    // moving invalidates every card. The quote cache had no such stamp, so a
+    // snippet rendered before its mentioned author's kind:0 landed kept the
+    // npub for as long as the entry lived, which is the raw "@npub1..." showing
+    // in a reply context line while the same person's name reads correctly two
+    // rows down.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6d} ** 32);
+    const mentioned = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quote-names.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetProfilesForTest();
+    main.resetQuotesForTest();
+    defer main.resetProfilesForTest();
+    defer main.resetQuotesForTest();
+
+    // A note that mentions somebody nobody has a name for yet.
+    const npub = try nostr.nip19.encodeNpub(arena, mentioned.public_key);
+    const body = try std.fmt.allocPrint(arena, "hello nostr:{s} how are you", .{npub});
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, body, null);
+    _ = try store.ingest(arena, ev, .{});
+
+    main.wantQuoteForTest(ev.id);
+    main.refreshQuotesForTest(&store);
+    const before = main.quoteTextForTest(ev.id) orelse return error.TheQuoteNeverLoaded;
+    if (std.mem.indexOf(u8, before, "npub1") == null) {
+        std.debug.print("expected an npub while the name is unknown, got \"{s}\"\n", .{before});
+        return error.NoNpubToBeginWith;
+    }
+
+    // The name lands, exactly as it does live: a kind:0 into the store, then
+    // the profile pass that reads it and moves the names generation.
+    var meta_buf: [128]u8 = undefined;
+    const meta = try std.fmt.bufPrint(&meta_buf, "{{\"name\":\"Rabble\"}}", .{});
+    const kind0 = try nostr.event.create(arena, signer, mentioned, 1_800_000_060, 0, &.{}, meta, null);
+    _ = try store.ingest(arena, kind0, .{});
+    main.refreshProfilesForTest(&store);
+    main.refreshQuotesForTest(&store);
+
+    const after = main.quoteTextForTest(ev.id) orelse return error.TheQuoteWentAway;
+    if (std.mem.indexOf(u8, after, "npub1") != null) {
+        std.debug.print("the snippet still says npub after the name landed: \"{s}\"\n", .{after});
+        return error.TheSnippetKeptTheNpub;
+    }
+    try testing.expect(std.mem.indexOf(u8, after, "@Rabble") != null);
+}
+
+test "a place says what it is behind one control, and leaving takes two presses" {
+    // The host's markdown used to sit inline above the feed on every visit,
+    // which is a wall of somebody else's words in front of the thing it is
+    // selling. And Leave sat in the header a few pixels from Enter, where one
+    // press did it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    const about = "House rules: be interesting, or be quiet.";
+    main.visitPlaceWithFeedForTest([_]u8{0x81} ** 32, "bass", "Bass Pistol", "The relay");
+    main.setPlaceHomeForTest(about);
+    main.update(&model, .place_enter, &fx);
+
+    // Nothing of the host's text over the feed, and no Leave within reach.
+    const closed = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (paintsText(closed, about)) return error.TheDescriptionIsBackOverTheFeed;
+    if (paintsText(closed, "Leave")) return error.LeaveIsOnePressAway;
+    try testing.expect(paintsText(closed, "Info"));
+
+    // Info says what this place is, who hosts it and where it reads from.
+    main.update(&model, .open_place_info, &fx);
+    const open = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(open, about)) return error.InfoDidNotShowTheDescription;
+    try testing.expect(paintsText(open, "Host"));
+    try testing.expect(paintsText(open, "The relay"));
+    try testing.expect(paintsText(open, "Leave"));
+
+    // The first Leave asks. It must not have left yet.
+    main.update(&model, .place_leave_request, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    const asking = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(asking, "Leave this place?")) return error.LeavingNeverAsked;
+    try testing.expect(paintsText(asking, "Cancel"));
+
+    // Backing out changes nothing.
+    main.update(&model, .place_leave_cancel, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    try testing.expectEqual(main.PlaceInfo.open, main.placeInfo());
+
+    // The second one does it, and takes the card down with it.
+    main.update(&model, .place_leave_request, &fx);
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
+}
+
+/// Whether any text node on the page carries this string.
+fn paintsText(p: painted.Painted, needle: []const u8) bool {
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, needle) != null) return true;
+    }
+    return false;
 }

@@ -8,21 +8,40 @@
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "clipboard" },
     .capabilities = .{ "native_views", "gpu_surfaces" },
+    // `plaza://` links, so a mode can be shared in a note and opened from
+    // anywhere. This writes CFBundleURLTypes into the packaged Info.plist;
+    // receiving the URL is src/urlscheme.m, because the SDK does not.
+    .url_schemes = .{
+        .{ .scheme = "plaza" },
+    },
     .shell = .{
         .windows = .{
             .{
                 .label = "main",
                 .title = "Plaza",
-                .width = 760,
+                // 998 x 760, which is the old 760 square plus exactly the
+                // chrome either side of it: the 56pt primary rail, the 180pt
+                // places rail, and their two 1pt rules. With both rails out the
+                // reading area is the square it always was. `zig build test`
+                // asserts that relationship rather than the two numbers, so
+                // moving a rail moves the window with it.
+                .width = 998,
                 .height = 760,
                 // The floor the window itself enforces (macOS contentMinSize).
-                // 687 is what the layout measures: the 56pt rail, the 620pt
-                // reading column, and the 11pt scrollbar gutter the virtualList
-                // reserves. This is 700 for a little slack. `zig build test`
-                // sweeps every screen from exactly this number and fails if the
-                // content outgrows it, which is what stopped being true when the
-                // feed became a virtualList and nothing moved the floor.
-                .min_width = 700,
+                // 869 is what the layout measures with both rails out: the 56pt
+                // primary rail, the 180pt places rail, their two 1pt rules, the
+                // 620pt reading column, and the 11pt scrollbar gutter the
+                // virtualList reserves. This is 880 for a little slack. `zig
+                // build test` sweeps every screen from exactly this number and
+                // fails if the content outgrows it, which is what stopped being
+                // true when the feed became a virtualList and nothing moved the
+                // floor.
+                //
+                // The places rail is what raised this from 700. It is only out
+                // while Places is the selected section, but a floor cannot be
+                // conditional, so the narrowest window has to hold the widest
+                // arrangement or the rail overflows the one it cannot fit in.
+                .min_width = 880,
                 .min_height = 680,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
@@ -40,7 +59,8 @@
     },
     .web_engine = "system",
     .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
-    // Only the two with no in-canvas equivalent.
+    // Only what has no in-canvas equivalent, or what is worth reaching
+    // without moving the hand.
     //
     // Cmd+Enter and Escape are NOT declared, deliberately: a declared shortcut
     // is swallowed by the shell's key monitor before the responder chain, so
@@ -52,5 +72,14 @@
     .shortcuts = .{
         .{ .id = "new-note", .key = "n", .modifiers = .{"primary"} },
         .{ .id = "settings", .key = ",", .modifiers = .{"primary"} },
+        // The places grammar. Cmd+Option is the safe corner of the keyboard for
+        // these: a declared shortcut is swallowed by the shell's key monitor
+        // before the responder chain, and bare Option+Up/Down (which is what
+        // Discord and Slack use to walk a list) is a real text-field binding
+        // that every multi-line field here would lose.
+        .{ .id = "places-rail", .key = "s", .modifiers = .{ "primary", "option" } },
+        .{ .id = "place-bounce", .key = "arrowright", .modifiers = .{ "primary", "option" } },
+        .{ .id = "place-prev", .key = "arrowup", .modifiers = .{ "primary", "option" } },
+        .{ .id = "place-next", .key = "arrowdown", .modifiers = .{ "primary", "option" } },
     },
 }

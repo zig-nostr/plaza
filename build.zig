@@ -62,6 +62,24 @@ pub fn build(b: *std.Build) void {
     app.exe.root_module.linkLibrary(stb);
     app.tests.root_module.linkLibrary(stb);
 
+    // Receiving a `plaza://` link. The SDK registers the scheme (app.zon's
+    // `.url_schemes` becomes CFBundleURLTypes) but delivers nothing: the macOS
+    // host implements no inbound URL path at all, so Plaza installs its own
+    // Apple Event handler. macOS-only, like the Keychain shim, and for the same
+    // reason: there is no AppKit anywhere else.
+    //
+    // The EXE only. The test binary never receives an Apple Event and linking
+    // AppKit into it would make the suite depend on a window server.
+    if (app.exe.root_module.resolved_target.?.result.os.tag == .macos) {
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/urlscheme.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
+        // AppKit reaches Security.framework's headers, and those include
+        // `libDER/DERItem.h`, which lives in the SDK's usr/include rather than
+        // inside any framework. The signer build hit this first; same fix.
+        const sdk_path = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
+        app.exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
+        app.exe.root_module.linkFramework("AppKit", .{});
+    }
+
     // plaza-signer: the isolated keyholder daemon. A SEPARATE binary from the
     // SDK app, built from the nostr library ALONE (no SDK), so the process that
     // holds the key links none of the UI's image or JSON parsers. Plaza spawns
