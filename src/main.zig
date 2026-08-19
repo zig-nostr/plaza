@@ -3054,11 +3054,20 @@ const engagement_widen_ms: i64 = 5_000;
 //
 // It was 512, which is not "comfortably longer than a typical note": it is
 // shorter than an ordinary announcement. Past it the buffer silently dropped
-// what would not fit, while the footer said "no length limit", so a paste came
-// back cut mid-sentence with nothing on screen admitting it. The editor widget
-// keeps its own copy of the text, so the two then disagreed about the content
-// and re-wrapped it differently on the same frame, which is what made the
-// composer look scrambled and feel slow.
+// what would not fit while the footer said "no length limit", so a paste came
+// back cut mid-sentence with nothing on screen admitting it.
+//
+// This comment used to go on to blame that for the scrambled composer in #165,
+// on the theory that the editor's own copy and this one disagreed and re-wrapped
+// differently on the same frame. That is not established. #165 was filed the
+// same day and says plainly that raising the cap left the scrambling exactly as
+// it was, and the scramble has not been reproduced since, under the harness or
+// in use. Two bugs that looked like one, and the guess is removed rather than
+// left here to be read as a finding.
+//
+// The silent-dropping half is real and is NOT solved by a bigger number: it
+// moved the wall from 512 to 4096. What fixes it is saying so, which is what
+// `draft_dropped` is for.
 const compose_capacity = 4096;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
@@ -9146,6 +9155,9 @@ pub const Model = struct {
     // text through `draft()`, never the buffer itself, and every edit event is
     // mirrored here in `update`.
     draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
+    /// Bytes of the last paste that did not fit, so the composer can say so.
+    /// Zero once something that fits is typed or pasted over it.
+    draft_dropped: usize = 0,
     // Which screen shows. A returning user (session on disk) starts at `.ready`;
     // a newcomer starts at `.onboarding` and moves to `.ready` when they sign in.
     // `.settings` is reached from the feed and returns to it.
@@ -15653,7 +15665,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                         hgap(ui, 2),
                         ui.paragraph(
                             .{ .style = .{ .foreground = p.text_dim } },
-                            &.{.{ .text = composeReach(ui, model.draft().len), .monospace = true, .scale = mono_meta_scale }},
+                            &.{.{ .text = composeReach(ui, model.draft().len, model.draft_dropped), .monospace = true, .scale = mono_meta_scale }},
                         ),
                         ui.spacer(1),
                         ui.paragraph(
@@ -15962,7 +15974,20 @@ fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.No
     return ui.column(.{ .gap = 6 }, rows);
 }
 
-fn composeReach(ui: *AppUi, written: usize) []const u8 {
+pub const compose_capacity_for_test = compose_capacity;
+
+pub fn composeReachForTest(arena: std.mem.Allocator, written: usize, dropped: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return composeReach(&ui, written, dropped);
+}
+
+fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
+    // The overflow first, because it is the only thing here the writer has to
+    // act on: some of what they pasted is not in the box and they cannot see
+    // which part.
+    if (dropped > 0) {
+        return ui.fmt("{d} characters did not fit and were not kept", .{dropped});
+    }
     // The room left, once there is little enough of it to matter. A composer
     // that silently stops accepting characters is the bug this replaces, and a
     // counter that is always on screen is a nag for the ninety-nine notes that
@@ -24787,7 +24812,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .media_warmed => |response| handleMediaWarmed(response),
         .banner_fetched => |response| handleBannerFetched(fx, response),
         .draft_edit => |edit| {
+            // What this edit meant to add, before it is clamped. Only an insert
+            // can overflow; every other edit is rejected whole.
+            const wanted: usize = switch (edit) {
+                .insert_text => |t| t.len,
+                else => 0,
+            };
+            const before = model.draft_buffer.len;
             model.draft_buffer.apply(edit);
+            // The buffer's own words for this flag are "loud seam for paste:
+            // check after applying a clipboard insert", and nothing here ever
+            // did. A paste past the cap lost the overflow in silence: the
+            // counter read "0 left", which says the composer is exactly full,
+            // not that a third of what you just pasted is gone.
+            if (model.draft_buffer.truncated and wanted > 0) {
+                model.draft_dropped = wanted -| (model.draft_buffer.len -| before);
+            } else if (wanted > 0) {
+                // A later paste that DID fit answers the earlier warning.
+                model.draft_dropped = 0;
+            }
             // A new query is a new question, so a dismissal only covers the one
             // the reader dismissed. Without this, putting the picker away once
             // would put it away for the rest of the note.
@@ -24975,6 +25018,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
             model.composing = false;
+            model.draft_dropped = 0;
             // Closing the sheet stashes what is in it. The words survived a
             // closed sheet already; this is what carries them past a quit.
             saveDraft(model.draft());
@@ -26309,6 +26353,7 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     // restorable to the composer if a remote signer never answers.
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true);
     model.draft_buffer.clear();
+    model.draft_dropped = 0;
     return true;
 }
 
@@ -30116,6 +30161,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
+    model.draft_dropped = 0;
     // Every other thing the previous reader typed, for the same reason the draft
     // is cleared: it is their private thinking, and it is one press from being
     // published under the NEXT account's key.
