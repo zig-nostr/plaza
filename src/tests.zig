@@ -19374,3 +19374,47 @@ test "changing who the feed asks about un-ends it" {
     _ = main.addRelayForTest("wss://relay.example.test", true, false);
     if (main.feedEndReached()) return error.TheFeedStayedEndedAfterANewRelay;
 }
+
+test "a paste that does not fit says so instead of vanishing" {
+    // The composer caps the draft at 4096 and the retained editor caps at half
+    // a megabyte, so a longer paste is clamped on the way in. Nothing read the
+    // buffer's `truncated` flag, whose own documentation calls it a "loud seam
+    // for paste", so the overflow disappeared without a word: the counter read
+    // "0 left", which says the box is exactly full, not that a third of what
+    // was just pasted is gone. Measured live at 6064 bytes pasted, 4096 kept,
+    // 1968 lost, cut mid-word.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    // Something that fits: nothing to report.
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "a short note" } }, &fx);
+    try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+
+    // And something that does not.
+    const cap = main.compose_capacity_for_test;
+    const big = try arena_state.allocator().alloc(u8, cap + 500);
+    @memset(big, 'x');
+    main.update(&model, .{ .draft_edit = .{ .insert_text = big } }, &fx);
+    if (model.draft_dropped == 0) {
+        std.debug.print("{d} bytes went in over a {d} cap and nothing was reported\n", .{ big.len, cap });
+        return error.TheOverflowVanishedInSilence;
+    }
+    // The draft is full, and what did not fit is exactly what was refused.
+    try testing.expectEqual(cap, model.draft().len);
+    try testing.expectEqual(big.len - (cap - "a short note".len), model.draft_dropped);
+
+    // The composer says it, rather than "0 left".
+    const line = main.composeReachForTest(arena_state.allocator(), model.draft().len, model.draft_dropped);
+    if (std.mem.indexOf(u8, line, "did not fit") == null) {
+        std.debug.print("the composer says \"{s}\"\n", .{line});
+        return error.TheComposerNeverSaidSo;
+    }
+
+    // Clearing the box clears the warning with it.
+    main.update(&model, .close_compose, &fx);
+    try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+}
