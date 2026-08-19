@@ -162,11 +162,38 @@ Plaza is a [Native SDK](https://github.com/vercel-labs/native) app: plain Zig
 for the logic and the feed (`src/main.zig`), declarative `.native` markup for
 the static screens, rendered natively, no browser, no Electron.
 
-Linux builds and tests in CI on every change. Windows is not in the matrix:
-the relay transport resolves hostnames through libc `getaddrinfo`, which Zig's
-standard library does not declare for Windows, so nothing depending on the
-library links there (`zig-nostr/nostr#59`). Packaged releases for either come
-later regardless.
+### Building on Linux
+
+There is no Linux release to install, but it builds and runs the full suite in
+CI on every change, so you can build it yourself. Zig and two system libraries,
+nothing else:
+
+```sh
+sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+zig build
+zig build test
+```
+
+Zig **0.16.0** exactly, which is what `.zigversion` pins and what CI installs.
+Everything else comes from the build: the dependencies are fetched on the first
+run, and the C pieces (secp256k1, LMDB, the stb image codecs) are compiled from
+source by the Zig toolchain, so there is no separate C compiler, no cmake and
+nothing to install from npm. The `native` commands above are the packaging CLI
+and are only needed to produce a macOS bundle.
+
+Those two packages are what CI adds on top of the `ubuntu-latest` runner image,
+which already carries a good deal. A minimal or non-Debian system may want more,
+and I have not built it on one.
+
+Worth knowing before you judge it by that build: off macOS the toolkit renders
+through a software rasteriser and there is no platform text provider, so it is
+slower than the packaged app and emoji come out as tofu. That is why there is no
+Linux release yet rather than a rough one.
+
+Windows is not in the matrix at all: the relay transport resolves hostnames
+through libc `getaddrinfo`, which Zig's standard library does not declare for
+Windows, so nothing depending on the library links there
+(`zig-nostr/nostr#59`).
 
 ## License
 
