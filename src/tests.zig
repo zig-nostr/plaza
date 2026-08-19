@@ -19329,3 +19329,48 @@ test "logging out takes your places with you" {
     // saying the previous reader had none.
     try testing.expect(!main.railOpen());
 }
+
+test "the end of the feed is something relays say, not something silence says" {
+    // `added == 0` was the whole test, and every failure in the paging worker
+    // is a `catch continue`: a dial that could not connect, a subscribe that
+    // was refused. So an offline round and a round where every relay answered
+    // "nothing older" produced the same zero. The latch is write-once for the
+    // life of the process, so one paging attempt made on a train dead-ended the
+    // feed until the app restarted.
+    main.resetFeedEndForTest();
+    defer main.resetFeedEndForTest();
+    try testing.expect(!main.feedEndReached());
+
+    // Nobody reached: not an end.
+    try testing.expect(!main.feedEndLatchesForTest(0, 0, 0));
+    // Reached, but nobody finished answering: still not an end.
+    try testing.expect(!main.feedEndLatchesForTest(3, 0, 0));
+    // Asked and answered, and there was nothing older. That is an end.
+    try testing.expect(main.feedEndLatchesForTest(3, 3, 0));
+    // Answered and there WAS something older, so plainly not the end.
+    try testing.expect(!main.feedEndLatchesForTest(3, 3, 7));
+    // One relay answering is enough to know, even if others never dialled.
+    try testing.expect(main.feedEndLatchesForTest(3, 1, 0));
+}
+
+test "changing who the feed asks about un-ends it" {
+    // The end of history is an answer about a question. Change the question and
+    // the answer stops being about anything. The reset existed only as a test
+    // helper with no callers, so the latch outlived every change to the author
+    // set and to the relays.
+    main.resetFeedEndForTest();
+    defer main.resetFeedEndForTest();
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+
+    main.setFeedEndForTest();
+    try testing.expect(main.feedEndReached());
+    main.forgetFollowsForTest();
+    if (main.feedEndReached()) return error.TheFeedStayedEndedAfterTheFollowsChanged;
+
+    // And a relay nobody has asked yet may hold what the feed decided was not
+    // there.
+    main.setFeedEndForTest();
+    _ = main.addRelayForTest("wss://relay.example.test", true, false);
+    if (main.feedEndReached()) return error.TheFeedStayedEndedAfterANewRelay;
+}

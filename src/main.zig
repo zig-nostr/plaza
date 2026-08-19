@@ -2516,6 +2516,9 @@ fn seedBootstrapRelays() void {
 /// Claims a slot for `url`, or returns the slot it already occupies. Returns
 /// null when the pool is full, which the caller surfaces rather than hides.
 fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
+    // A relay nobody has asked yet may hold a decade of history the feed has
+    // already decided does not exist.
+    resetFeedEnd();
     if (url.len == 0 or url.len > 96) return null;
     for (0..relaySlots()) |i| {
         if (g_relays[i].used and relayUrlEql(g_relays[i].url(), url)) return i;
@@ -2948,6 +2951,9 @@ pub fn setHidden(what: Hideable, off: bool) void {
     // relay still sending them, which is the cosmetic version of this feature
     // and the one it exists not to be.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
     invalidateFeed();
 }
 
@@ -17780,6 +17786,9 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     // relay filters, the names being fetched, and which relays are worth
     // suggesting (the ranking is a count of THESE people).
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
     invalidateFeed();
     g_relay_ranks_dirty.store(true, .release);
     return true;
@@ -17802,6 +17811,9 @@ fn forgetFollows() void {
     // records requested on an already-open socket, and following stays disabled
     // for the whole session.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
     // And this is the one thing the inbox DOES depend on: whose notifications
     // these are. It is the only place that bumps it, which is the point.
     bumpIdentityGeneration();
@@ -28233,8 +28245,33 @@ pub fn feedEndReached() bool {
     return g_feed_end_reached.load(.monotonic);
 }
 
-pub fn resetFeedEndForTest() void {
+/// The end of history is an answer about a QUESTION: is there anything older
+/// than this, from these authors, on these relays. Change the question and the
+/// answer stops being about anything.
+///
+/// This existed only as a test helper with no callers anywhere, so the latch
+/// was write-once for the life of the process: sign in as somebody else, follow
+/// three hundred new people, add a relay that holds a decade of history, and
+/// the feed still refused to ask.
+fn resetFeedEnd() void {
     g_feed_end_reached.store(false, .monotonic);
+}
+
+/// The latch's condition, lifted out so it can be asserted without standing up
+/// a relay. The worker calls this with what its round actually saw.
+fn feedEndLatches(asked: usize, answered: usize, added: usize) bool {
+    return asked > 0 and answered > 0 and added == 0;
+}
+
+pub fn feedEndLatchesForTest(asked: usize, answered: usize, added: usize) bool {
+    return feedEndLatches(asked, answered, added);
+}
+pub fn setFeedEndForTest() void {
+    g_feed_end_reached.store(true, .monotonic);
+}
+
+pub fn resetFeedEndForTest() void {
+    resetFeedEnd();
     g_older_busy.store(false, .monotonic);
 }
 
@@ -28289,6 +28326,11 @@ fn fetchOlderWorker(until: i64) void {
     const flen = built.len;
 
     var added: usize = 0;
+    // How many relays took the subscription and answered it. Both, because an
+    // end of history is a thing relays TELL you and the two ways of not being
+    // told look identical from `added` alone.
+    var asked: usize = 0;
+    var answered: usize = 0;
     for (0..relaySlots()) |ri| {
         var url_buf: [96]u8 = undefined;
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
@@ -28300,6 +28342,7 @@ fn fetchOlderWorker(until: i64) void {
         const watched = watchOneShot(io, relay, one_shot_budget_ms);
         defer releaseOneShot(watched);
         relay.subscribe("plaza-older", filters[0..flen]) catch continue;
+        asked += 1;
         var seen: usize = 0;
         // Bounded: `receive` has no deadline, and a relay that takes the
         // subscription and then goes quiet would hold this thread forever.
@@ -28311,7 +28354,12 @@ fn fetchOlderWorker(until: i64) void {
                     const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
                     if (result == .added) added += 1;
                 },
-                .eose => break,
+                .eose => {
+                    // "I have looked and that is all of it." The only message
+                    // that licenses the latch below.
+                    answered += 1;
+                    break;
+                },
                 .closed => break,
                 else => {},
             }
@@ -28319,9 +28367,19 @@ fn fetchOlderWorker(until: i64) void {
         relay.unsubscribe("plaza-older") catch {};
     }
 
-    // Nothing anywhere had anything older. That is an end, and saying so is
-    // better than a spinner that never resolves.
-    if (added == 0) g_feed_end_reached.store(true, .monotonic);
+    // Nothing anywhere had anything older, AND somebody was actually there to
+    // say so. Both halves matter, and only the first was checked.
+    //
+    // `added` counts events that were new to the store, and every failure in
+    // the loop above is a `catch continue`: a dial that could not connect, a
+    // subscribe that was refused. So an offline round and a round where every
+    // relay answered "nothing older" produced the same zero, and this latched
+    // on the first paging attempt made on a train. It is write-once for the
+    // life of the process, so the feed then dead-ended until the app restarted.
+    //
+    // A round that reached nobody now says nothing at all, and the next attempt
+    // asks again.
+    if (feedEndLatches(asked, answered, added)) g_feed_end_reached.store(true, .monotonic);
 }
 
 /// Opens a person as a level of their own.
