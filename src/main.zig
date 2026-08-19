@@ -24043,6 +24043,49 @@ pub fn setRailForTest(open: bool) void {
     g_rail_open = open;
 }
 
+/// Everything about where the leaving account had been.
+///
+/// Which communities somebody belongs to is sensitive, which is the whole
+/// reason this list is a file on their own disk rather than an event on a
+/// relay. That is also what made it outlive a logout: a relay-backed list goes
+/// when the key does, and a file does not go until something deletes it. So the
+/// next account to sign in on this Mac inherited the last one's rail, fully
+/// populated, opened straight into whichever place they had been reading, with
+/// the notes each one had been holding.
+///
+/// The file AND the memory AND the pointer in settings, because all three
+/// outlive the account in different ways: the file across launches, the memory
+/// across this session, and `place=` would send the next launch back into a
+/// room that is no longer in any list.
+fn forgetPlaces() void {
+    // Stops the place's socket first: its worker writes into the id list, and
+    // the generation bump is what tells it to stop.
+    clearPlaceFeed();
+    g_place = null;
+    g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
+    g_places = @splat(.{});
+    g_places_len = 0;
+    g_place_info = .closed;
+    g_rail_open = false;
+    g_boot_place_set = false;
+    if (g_io) |io| if (g_environ) |environ| {
+        if (plazaDir(io, environ)) |dir_const| {
+            var dir = dir_const;
+            defer dir.close(io);
+            dir.deleteFile(io, places_file) catch {};
+        } else |_| {}
+    };
+    saveSettings();
+    // The feed was the place's a moment ago and is the next reader's now.
+    invalidateFeed();
+}
+
+pub fn forgetPlacesForTest() void {
+    forgetPlaces();
+}
+
 /// The places kept across restarts. Small on purpose for v1.
 const max_places = 8;
 var g_places: [max_places]Place = @splat(.{});
@@ -29983,6 +30026,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     forgetFollows();
     forgetMutes();
     resetInbox();
+    forgetPlaces();
     model.notifications_open = false;
     model.editing_profile = false;
     model.profile_seeded = false;
