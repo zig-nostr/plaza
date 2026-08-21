@@ -10,7 +10,7 @@
 # not notarized on purpose: it signs notes with your key, so the trust anchor is
 # a build you can reproduce rather than an Apple signature you cannot inspect.
 # Read this script, and build from source
-# (https://github.com/zig-nostr/plaza#build) if you would rather.
+# (https://github.com/zig-nostr/plaza#install) if you would rather.
 #
 set -euo pipefail
 
@@ -27,7 +27,7 @@ main() {
 
   # --- platform checks -----------------------------------------------------
   [ "$(uname -s)" = "Darwin" ] || die "Plaza is a macOS app; this installer is macOS-only."
-  [ "$(uname -m)" = "arm64" ] || die "Plaza ships for Apple Silicon (arm64) only. On an Intel Mac, build from source: https://github.com/$repo#build"
+  [ "$(uname -m)" = "arm64" ] || die "Plaza ships for Apple Silicon (arm64) only. On an Intel Mac, build from source: https://github.com/$repo#install"
 
   local tool
   for tool in curl shasum ditto xattr; do
@@ -50,7 +50,7 @@ main() {
   json="$(printf '%s' "$resp" | sed '$d')"
   case "$status" in
     200) ;;
-    404) die "there is no published release yet. Build from source instead: https://github.com/$repo#build" ;;
+    404) die "there is no published release yet. Build from source instead: https://github.com/$repo#install" ;;
     403 | 429) die "GitHub rate-limited this request. Wait a few minutes, or download it from https://github.com/$repo/releases" ;;
     *) die "GitHub answered HTTP $status. Try https://github.com/$repo/releases" ;;
   esac

@@ -9,17 +9,24 @@ four clicks, and the feed renders from disk. It's built on the
 through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
-> **Status: early.** A first run opens straight into a feed, signed in as
-> nobody: a curated starter pack, already populated, with a strip along the top
-> offering a key when you want one. Create an identity, bring an existing key, or
-> connect an external signer (Notary) over NIP-46 so your key never touches the
-> app. The feed carries real names, avatars and pictures,
-> rendered straight from a local store that a pool of background threads keeps
-> filled, one process, no IPC. Composing signs a note (locally, or by a
-> round-trip to the signer) that is stored at once and published to the pool.
-> A `plaza://place/` link opens somebody else's corner of Nostr: their relay, and
-> whatever that relay serves, without disturbing your own. Private messages land in a milestone
-> ahead. macOS first.
+> **Status: active development (`v0.12.1`).** Plaza installs and runs today. It
+> opens straight into a feed, signed in as nobody: nine accounts to start from,
+> already populated, with a strip along the top offering a key when you want
+> one. Create an identity, bring an existing key, or connect an external signer
+> (Notary) over NIP-46. On a shipped build the key never enters Plaza on any of
+> the three: `plaza-signer` is a separate process that mints or adopts it, keeps
+> it in the login Keychain, and answers signing requests over loopback, so the
+> process decoding images and parsing relay JSON holds no secret. The feed
+> carries real names, avatars and pictures, rendered from a local store that a
+> pool of background threads keeps filled, no IPC on the read path, so it is on
+> screen before any relay answers. Composing signs a note (in the keyholder, or
+> by a round-trip to an external signer), stores it at once and publishes it to
+> the pool. A `plaza://place/` link opens somebody else's corner of Nostr: their
+> relay, and whatever it serves, without disturbing your own.
+>
+> Not there yet, and tracked in the open milestones: putting a picture in a
+> note, setting an avatar, sending a zap, search, and private messages. macOS
+> first.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
@@ -41,8 +48,9 @@ curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/instal
 
 macOS on Apple Silicon. The installer verifies the download's SHA-256, installs
 `Plaza.app`, clears the download-quarantine flag so it opens without a Gatekeeper
-detour, and launches it. It touches the bundle and nothing else: your key,
-session and local store live in `~/.plaza` and survive every upgrade.
+detour, and launches it. It touches the bundle and nothing else: your session
+and local store live in `~/.plaza`, your key in the login Keychain, and both
+survive every upgrade.
 
 Plaza is ad-hoc signed and not notarized on purpose. It signs notes with your
 key, so the trust anchor is a build you can reproduce rather than an Apple
@@ -96,7 +104,7 @@ behind a closed door.
 
 The feed is a windowed list: it builds only the rows near the viewport, so what
 it costs follows the window rather than the length of the feed. Measured on the
-build that ships (ReleaseFast), scrolling hard through a fixed feed of 246 notes
+build that ships (ReleaseFast), scrolling hard through a fixed feed of 240 notes
 that the harness seeds into a store of its own, so a run means the same thing
 twice:
 
