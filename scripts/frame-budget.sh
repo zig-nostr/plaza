@@ -6,9 +6,14 @@
 # these numbers should stay flat no matter how long the feed grows. That is the
 # claim this script exists to keep honest.
 #
-# Run it against the build that ships (ReleaseFast). A Debug build is roughly
-# thirty times slower per rebuild and will fail every budget here, which is
-# correct: nobody runs Debug.
+# Run it against the build that ships (ReleaseFast, the default here). A Debug
+# build is roughly thirty times slower per rebuild and will fail every budget,
+# which is correct: nobody runs Debug. `OPTIMIZE=ReleaseSafe` measures the whole
+# app with safety checks on, which is how the cost of doing that was priced:
+# rebuild 290us to 852us, layout 1377us to 2650us, three budgets blown. The
+# `nostr` library is built ReleaseSafe either way, see `libraryOptimize` in
+# build.zig, and that part costs nothing measurable here, which is the point of
+# splitting them.
 #
 #   scripts/frame-budget.sh
 #
@@ -16,48 +21,93 @@
 # is 8333 us; the sum of these leaves most of it unspent.
 set -euo pipefail
 
-# These are DRIFT ALARMS, and the number that matters about each one is its
-# headroom over what the app actually costs, not how small it looks.
+# Set from measurement against the FIXED corpus this harness seeds, with about
+# forty percent over the worst honest reading. They are only comparable to other
+# runs of this harness: the corpus carries no images and no link previews, on
+# purpose, so these numbers are lower than a real feed's and are not meant to
+# describe one.
 #
-# The first pair were set when a note card was an avatar, a name and a line of
-# text. It now carries a verified handle, images, quoted notes, link previews and
-# a context menu, and both were straddling their old limits: 315us to 435us
-# against 400, and 1700us to 1750us against 1500, best-of-three on a working
-# machine with a real account signed in. A budget that the healthy app trips
-# every third run teaches people to rerun it until it passes, which is worse
-# than having none.
+# Four consecutive runs on unchanged code, best-of-three rounds each, on battery
+# with Low Power Mode off:
 #
-# So they are set from measurement with roughly 40 percent headroom over the
-# worst honest reading. That is still a tight gate: the regression these exist to
-# catch, the feed asking the database who you follow once per card, measures
-# 24423us against a rebuild budget of 700.
-REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-700}
-LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-2400}
-PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-200}
-# The plan stage grows with the number of registered images the app draws
-# (upstream reprocesses them every frame); this bound catches the app suddenly
-# registering far more than it means to.
-PLAN_P90_BUDGET=${PLAN_P90_BUDGET:-3000}
+#   mounted nodes  462   462   462   462     (identical, which is the point)
+#   layout  p90   1388  1526  1594  1495     spread 1.15x
+#   rebuild p90    290   378   351   396
+#   plan    p90    936    ...
+#
+# Before the corpus was pinned the same readings spanned 2.4x and the node count
+# ranged 296 to 521, because the feed was whatever the relays had sent. That gate
+# could only catch order-of-magnitude regressions, and it produced two wrong
+# conclusions in one afternoon: a real 35% layout regression read as noise, then
+# a 300us saving read as confirmed. Neither was knowable from it.
+#
+# The remaining 1.15x is the machine, not the app. Compare readings only against
+# others taken in the same power state; the script prints it.
+#
+# The regression these exist to catch, the feed asking the database who you
+# follow once per card, measures 24423us against a rebuild budget of 600.
+REBUILD_P90_BUDGET=${REBUILD_P90_BUDGET:-600}
+LAYOUT_P90_BUDGET=${LAYOUT_P90_BUDGET:-2200}
+PATCH_P90_BUDGET=${PATCH_P90_BUDGET:-150}
+PLAN_P90_BUDGET=${PLAN_P90_BUDGET:-1400}
 
 cd "$(dirname "$0")/.."
 SNAPSHOT=".zig-cache/native-sdk-automation/snapshot.txt"
 
-echo "building (ReleaseFast, automation on)..."
-zig build -Doptimize=ReleaseFast -Dautomation=true
+OPTIMIZE="${OPTIMIZE:-ReleaseFast}"
+echo "building ($OPTIMIZE, automation on)..."
+zig build "-Doptimize=$OPTIMIZE" -Dautomation=true
+# Asked for by name, because a plain `zig build` no longer installs it: the
+# packager ships whatever build.zig installs, and a tool that fabricates a feed
+# has no business inside a signed app bundle. Built Debug, since it runs once
+# before a measurement and is not measured itself.
+zig build seed-feed
 
-./zig-out/bin/plaza >/tmp/plaza-frame-budget.log 2>&1 &
+# A FIXED FEED, and its own $HOME.
+#
+# This used to run against the real account and whatever the relays happened to
+# send, so two runs of one binary laid out different numbers of image rows,
+# quote cards and link previews. The layout reading swung 2.4x on unchanged
+# code: twenty-two readings in one afternoon spanned 1424us to 3376us, and
+# dividing by the mounted node count did not stabilise them (3.45 to 7.54us per
+# node). A gate that noisy can only catch order-of-magnitude regressions, and it
+# produced two wrong conclusions in a day, in both directions.
+#
+# So the app gets a $HOME of its own. Everything it keeps hangs off $HOME/.plaza
+# (the store, the identity, the session, the relay list), so one variable
+# isolates all of it, and the seeder leaves an EMPTY relay list, which is a
+# reader who removed every relay: the pool parks and nothing is dialled. No feed
+# arrives mid-measurement because no feed can arrive.
+#
+# It also stops the harness measuring, and depending on, whoever is signed in.
+BENCH_HOME="${FRAME_BUDGET_HOME:-/tmp/plaza-frame-budget-home}"
+rm -rf "$BENCH_HOME"
+mkdir -p "$BENCH_HOME"
+./zig-out/bin/seed-feed "$BENCH_HOME/.plaza" >/dev/null
+
+# What the machine was doing, recorded rather than assumed. Apple Silicon on
+# battery is not the same machine as on mains, and Low Power Mode is a third.
+# None of this was being checked while twenty-two readings were compared to each
+# other, which is its own answer to where some of that 2.4x came from.
+POWER="$(pmset -g batt 2>/dev/null | head -1 | sed -e "s/Now drawing from //" -e "s/'//g")"
+LOWPOWER="$(pmset -g 2>/dev/null | awk '/lowpowermode/ {print $2}')"
+echo "measuring on: ${POWER:-unknown} power, low power mode ${LOWPOWER:-unknown}"
+echo "compare readings only against others taken in the same state."
+
+HOME="$BENCH_HOME" ./zig-out/bin/plaza >/tmp/plaza-frame-budget.log 2>&1 &
 APP_PID=$!
 trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
 
 native automate wait --timeout 120 >/dev/null
-# Let the feed fill from the relays before measuring it.
-sleep 20
+# The feed comes from the store, so it is up as soon as the app is. This is only
+# for the first frames to settle.
+sleep 3
 native automate snapshot >/dev/null
 
 LIST=$(grep -oE 'main-canvas#[0-9]+ role=(group|list)[^|]*scroll=\[offset=' "$SNAPSHOT" \
   | grep -oE '#[0-9]+' | tr -d '#' | head -1)
 if [ -z "$LIST" ]; then
-  echo "no scrollable feed found: is the app signed in with notes loaded?" >&2
+  echo "no scrollable feed found: did seed-feed populate $BENCH_HOME/.plaza?" >&2
   exit 1
 fi
 

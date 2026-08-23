@@ -32,6 +32,31 @@ const plaza_icons = @import("plaza_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
+// ------------------------------------------------- bytes that are not ours
+//
+// `@setRuntimeSafety(true)` appears at the top of every function below that
+// walks bytes somebody else chose. It is one rule, stated here once:
+//
+// Plaza ships ReleaseFast, and ReleaseFast compiles out the bounds check, the
+// overflow check and the cast check. That is the right trade for the render
+// thread, which walks this app's own data at 120 Hz, and the wrong one for a
+// parser, where an index comes off a length a stranger wrote. The `nostr`
+// library is already built one notch safer for exactly that reason (see
+// `libraryOptimize` in build.zig). The same argument covers the parsing this
+// file does for itself, which that setting does not reach.
+//
+// The question is not "does this touch a string". It is: does an INDEX, a
+// LENGTH or a CAST in here come from the input? A note's content, an `imeta`
+// tag, a blurhash, a kind:0 body, a fetched page's `<head>`, an image's
+// declared dimensions. Anything read start to end is left alone.
+//
+// It goes at the TOP of the function rather than around the interesting line,
+// so a check added inside it later is covered without anybody remembering to.
+//
+// It does not reach the vendored stb decoders. They are C, they are the largest
+// stranger-facing surface in the app, and no Zig setting changes what they do.
+// What stands in front of them is the size check in `decodeAndRegister`.
+
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
@@ -111,6 +136,42 @@ const bootstrap_relays = [_][]const u8{
     "wss://relay.snort.social",
 };
 
+/// Relays asked one question only: where does this person publish?
+///
+/// The outbox bootstrap. To route to somebody's write relays you must first
+/// hold their kind:10002, and you cannot ask their write relays for it, because
+/// finding them is the thing you are trying to do. Plaza only ever learned a
+/// relay list from a relay it was already reading, so a followed account whose
+/// list lives anywhere else was never routed to and simply never appeared. No
+/// error, no empty state, which is the exact failure the outbox model exists to
+/// fix and the easiest one to leave behind while fixing it.
+///
+/// The set is READ FROM FOUR SHIPPING CLIENTS rather than picked. nos.lol is in
+/// three of them (Jumble, Amethyst desktop, NDK), purplepag.es in two (Amethyst
+/// mobile, NDK), primal in two (Jumble, Amethyst desktop). kindpag.es is
+/// Amethyst mobile alone and is here because it is the only one of the four
+/// built for indexing rather than a general relay that happens to keep
+/// replaceables; Amethyst's own desktop source carries a comment saying its
+/// purpose-built list is the better one and adopting it is a separate ticket.
+///
+/// These are NOT pool relays. They are never published in the reader's
+/// kind:10002, never routed to for notes, and never counted in the eight, which
+/// is Jumble's `filterOutBigRelays` discipline rather than Notedeck's, where
+/// the bootstrap set gets spliced into the user's own advertised relays the
+/// first time they edit their list.
+const indexer_relays = [_][]const u8{
+    "wss://purplepag.es",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://user.kindpag.es",
+};
+/// Authors per REQ. Amethyst desktop chunks at exactly this and sets its limit
+/// to the chunk size; Amethyst ANDROID puts the whole follow list in one filter
+/// and a 2000-entry `authors` array is past what most relays accept, so they
+/// truncate or CLOSE without saying which. Chunked at the wire, because in this
+/// codebase the frame writer IS the wire and nothing merges behind it.
+const indexer_chunk = 100;
+
 var g_relays = [_]RelayEntry{.{}} ** max_relays;
 /// How many slots have ever been claimed. It never shrinks, because a slot's
 /// index is a promise to everything that recorded one.
@@ -139,6 +200,1091 @@ fn lockRelayTable() void {
 }
 fn unlockRelayTable() void {
     g_suggested_lock.store(false, .release);
+}
+
+// -- Where the people you follow actually write ------------------------------
+//
+// The suggestions used to be first come, first kept: the first six write relays
+// seen in anyone's kind:10002 filled the table and everything after was
+// dropped. Which six that is depends on whose relay list happened to arrive
+// first, so a relay one person uses could sit above one two hundred people use,
+// and the reader was being asked to add relays in arrival order.
+//
+// What the answer should be is the inversion every outbox implementation
+// starts with: turn "person -> relays they write to" into "relay -> people who
+// write there", and rank by how many. Jumble does exactly this, and takes each
+// author's top few write relays rather than all of them, on the reasoning
+// written into their source: most people do not understand relays and a list
+// of nine cannot be trusted to mean anything.
+//
+// Computed from the STORE rather than accumulated on ingest. The store already
+// holds one kind:10002 per author, which is the whole input, and counting on
+// arrival would need per-relay author sets to avoid counting one person twice
+// when their list is re-sent. Reading it back is both simpler and correct by
+// construction.
+
+/// How many of one author's write relays count toward the ranking.
+///
+/// Jumble's number. An author advertising a dozen relays is not telling you
+/// about a dozen places their notes reliably are; taking the first few keeps
+/// one enthusiastic list from outvoting everyone else's.
+const outbox_relays_per_author = 4;
+/// How many relays the ranking considers before it stops.
+///
+/// 128 was a guess and it was too small: on a real account of 257 follows the
+/// count hit it exactly and dropped 63 further relay references, silently,
+/// which is how it was found. Coverage cannot choose a relay it never saw.
+///
+/// 384 clears the measured need with room. The cost is the author bitsets, one
+/// bit per follow per candidate, so 384 x 2048 bits is 98 KB of static, and
+/// `RouteCoverage.candidates_dropped` says out loud when even this is not
+/// enough rather than quietly answering with less.
+const relay_rank_candidates = 384;
+
+/// A relay some of the reader's follows write to, and how many of them.
+const RelayRank = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    len: u8 = 0,
+    writers: u16 = 0,
+
+    fn urlSlice(self: *const RelayRank) []const u8 {
+        return self.url[0..self.len];
+    }
+};
+
+/// True when `a` should be offered before `b`: more of the reader's follows
+/// write there, ties broken by URL so the list does not shuffle between runs
+/// for no reason a reader could see.
+fn rankBefore(a: RelayRank, b: RelayRank) bool {
+    if (a.writers != b.writers) return a.writers > b.writers;
+    return std.mem.order(u8, a.urlSlice(), b.urlSlice()) == .lt;
+}
+
+/// Folds one author's write relays into `table`, counting each relay once for
+/// that author however many times they list it. Returns the new length.
+/// The write relays of one relay list that count toward routing: the first few
+/// DISTINCT ones, trimmed and sanity-checked. Returns how many landed in `out`.
+///
+/// One function, because the ranking and the routing have to agree exactly.
+/// They did not: the ranking skipped a repeat before counting it against the
+/// cap and the routing counted raw tags, so an author listing `[A, A, B, C, D]`
+/// had D counted in the ranking and dropped in the routing, and D then got a
+/// connection with nobody on it. Found by removing the empty-relay guard and
+/// noticing that no test cared.
+fn selectWriteRelays(urls: []const []const u8, out: *[outbox_relays_per_author][]const u8) usize {
+    var n: usize = 0;
+    for (urls) |raw| {
+        if (n >= out.len) break;
+        const url = std.mem.trim(u8, raw, " \t\r\n");
+        if (url.len == 0 or url.len > 96) continue;
+        if (!isRelayUrl(url)) continue;
+        // A relay list naming the same relay twice is one person's opinion
+        // twice, and it would quietly promote whatever a duplicate-happy list
+        // mentions most.
+        var dup = false;
+        for (out[0..n]) |v| {
+            if (relayUrlEql(v, url)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        out[n] = url;
+        n += 1;
+    }
+    return n;
+}
+
+/// The `r` tags of a relay list, as raw values. Only where they WRITE: a relay
+/// somebody merely reads from will never hold their notes, so it is not a route
+/// to them.
+fn writeTagUrls(ev: nostr.event.Event, out: [][]const u8) usize {
+    var n: usize = 0;
+    for (ev.tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "r")) continue;
+        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
+        out[n] = tag[1];
+        n += 1;
+    }
+    return n;
+}
+
+fn foldWriteRelays(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    var len = len_in;
+    var selected: [outbox_relays_per_author][]const u8 = undefined;
+    const chosen = selectWriteRelays(urls, &selected);
+    for (selected[0..chosen]) |url| {
+        var seated = false;
+        for (table[0..len]) |*e| {
+            if (!relayUrlEql(e.urlSlice(), url)) continue;
+            e.writers +|= 1;
+            seated = true;
+            break;
+        }
+        if (seated) continue;
+        if (len >= table.len) continue;
+        table[len] = .{ .len = @intCast(url.len), .writers = 1 };
+        @memcpy(table[len].url[0..url.len], url);
+        len += 1;
+    }
+    return len;
+}
+
+// -- Choosing which relays to connect to -------------------------------------
+//
+// Ranking by popularity answers "which relay should this reader consider
+// adding", which is a question for a human. It does not answer "which four
+// relays reach the most people", and taking the top four of a popularity list
+// is not the same thing: the top four all carry the same crowd, and the person
+// who publishes to one quiet relay is never reached however many popular ones
+// are dialled.
+//
+// Measured on a real account: 215 of 257 follows have a relay list, naming more
+// than 128 distinct relays between them. That is a long tail of relays with one
+// or two writers each, and no top-N of it can cover everybody.
+//
+// So the two questions get two algorithms. Suggestions stay ranked by how many
+// follows write there. Connections are chosen by marginal coverage: repeatedly
+// take the relay that reaches the most people not yet reached enough times.
+//
+// Amethyst wrote this algorithm and never called it
+// (RelayListRecommendationProcessor.kt:63, zero callers). Jumble approximates
+// it with a greedy PRUNE instead, dropping a relay only when every pubkey on it
+// is covered at least twice elsewhere, which is the same coverage-of-two idea
+// from the other end. Neither of them has to fit a budget, because a browser
+// tab can open sockets freely; Plaza holds one thread per socket, so the budget
+// is the reason it has to choose at all.
+
+/// How many chosen relays should carry each author, where possible. One is
+/// enough to see somebody; two is what keeps one relay being down from hiding
+/// them. Jumble's prune uses the same number for the same reason.
+const route_coverage_target: u8 = 2;
+
+const route_bitset_words = (max_follows + 63) / 64;
+/// Which authors each candidate relay carries, one bit per author, indexed the
+/// same as the caller's author slice.
+var g_route_bits: [relay_rank_candidates][route_bitset_words]u64 = undefined;
+/// How many chosen relays carry each author.
+var g_route_cover: [max_follows]u8 = @splat(0);
+
+fn bitSet(row: *[route_bitset_words]u64, i: usize) void {
+    row[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+}
+fn bitGet(row: *const [route_bitset_words]u64, i: usize) bool {
+    return row[i >> 6] & (@as(u64, 1) << @intCast(i & 63)) != 0;
+}
+
+/// What the routing achieved, for tests and for saying so out loud.
+pub const RouteCoverage = struct {
+    /// Follows carried by at least one chosen relay.
+    reached: usize = 0,
+    /// Follows carried by at least `route_coverage_target` of them.
+    doubly_reached: usize = 0,
+    /// Follows no chosen relay carries. These ride the pool.
+    residual: usize = 0,
+    /// Candidate relays the table could not hold. Counted rather than dropped
+    /// in silence: the cap was hit exactly on a real account, which is how it
+    /// was found.
+    candidates_dropped: usize = 0,
+};
+var g_route_coverage: RouteCoverage = .{};
+
+pub fn routeCoverageForTest() RouteCoverage {
+    return g_route_coverage;
+}
+pub const routeCoverageTargetForTest = route_coverage_target;
+
+// -- Relays that will not have us ---------------------------------------------
+//
+// Coverage says which relays carry the people you follow. It does not say which
+// of them will talk to you, and those are not the same set. A paid relay refuses
+// the WEBSOCKET HANDSHAKE, before a single Nostr message is exchanged, so there
+// is no protocol answer to give it: no NIP-42 challenge arrives, and nothing to
+// authenticate with would help, because what it wants is a subscription.
+//
+// Found on my own account: `wss://nostr.wine` is the single best relay by
+// coverage, 50 of 257 follows write there, and it had a routed slot to itself
+// dialling and failing on a widening ladder forever. The coverage counter could
+// not see it. It reported those 50 people as reached.
+//
+// So a routed relay that will not have us gives up its slot and the greedy
+// spends it on the next relay down, which is a real one. This applies ONLY to
+// relays Plaza chose. A relay the reader added themselves keeps its seat and
+// keeps retrying however badly it behaves, because dropping somebody's own relay
+// quietly is the opposite of what they asked for.
+
+/// Failed connections in a row before a routed relay is set aside. Three,
+/// because a handshake also fails for a blip: the free relay in my own pool
+/// failed one in the same run and was fine on the retry.
+const routed_refusal_strikes: u6 = 3;
+/// How long a set-aside relay stays set aside. It is a subscription, a block or
+/// an outage, and all three end; none of them ends in a minute.
+const routed_refusal_ms: i64 = 6 * 60 * 60 * 1000;
+/// How many at once. Small on purpose: this is a list of relays that would
+/// otherwise hold a routed slot, and there are only eight of those.
+const routed_refusal_slots = 16;
+
+const RefusedRelay = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    strikes: u6 = 0,
+    /// When the last strike landed, monotonic ms, or -1 for never.
+    at_ms: i64 = -1,
+};
+var g_refused: [routed_refusal_slots]RefusedRelay = @splat(.{});
+var g_refused_lock = std.atomic.Value(bool).init(false);
+
+fn lockRefused() void {
+    while (g_refused_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockRefused() void {
+    g_refused_lock.store(false, .release);
+}
+
+/// Whether a relay with this record should be passed over right now.
+///
+/// A pure function so the two clocks it has to survive are testable: no clock at
+/// all (before `main` wires one, when nothing has been dialled either), and a
+/// record older than the window.
+fn relayIsRefused(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
+    if (strikes < routed_refusal_strikes) return false;
+    if (at_ms < 0) return false;
+    const now = now_ms orelse return true;
+    return now -| at_ms < routed_refusal_ms;
+}
+
+pub fn relayIsRefusedForTest(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
+    return relayIsRefused(strikes, at_ms, now_ms);
+}
+pub const routedRefusalStrikesForTest = routed_refusal_strikes;
+pub const routedRefusalMsForTest = routed_refusal_ms;
+
+/// Records one failed connection to a routed relay. Returns true when this is
+/// the strike that sets it aside, so the caller can ask for a rethink.
+fn noteRelayRefusal(url: []const u8) bool {
+    return noteRelayRefusalAt(url, nowMillis() orelse return false);
+}
+
+fn noteRelayRefusalAt(url: []const u8, now: i64) bool {
+    if (url.len == 0 or url.len > 96) return false;
+    lockRefused();
+    defer unlockRefused();
+
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayUrlEql(e.url[0..e.url_len], url)) continue;
+        const was = relayIsRefused(e.strikes, e.at_ms, now);
+        // A record that has aged out starts its count again rather than
+        // tripping on the first failure of the next attempt.
+        if (e.at_ms >= 0 and now -| e.at_ms >= routed_refusal_ms) e.strikes = 0;
+        e.strikes +|= 1;
+        e.at_ms = now;
+        return !was and relayIsRefused(e.strikes, e.at_ms, now);
+    }
+
+    // A free slot, or the stalest one. Evicting the stalest can only mean a
+    // relay is retried sooner than the window says, never that one is set aside
+    // for longer, so the failure mode is a wasted dial rather than a hidden
+    // person.
+    var pick: usize = 0;
+    for (&g_refused, 0..) |*e, i| {
+        if (e.url_len == 0) {
+            pick = i;
+            break;
+        }
+        if (e.at_ms < g_refused[pick].at_ms) pick = i;
+    }
+    const e = &g_refused[pick];
+    @memcpy(e.url[0..url.len], url);
+    e.url_len = @intCast(url.len);
+    e.strikes = 1;
+    e.at_ms = now;
+    return relayIsRefused(e.strikes, e.at_ms, now);
+}
+
+/// Forgets a relay's failures, because it just held a connection open.
+fn clearRelayRefusal(url: []const u8) void {
+    lockRefused();
+    defer unlockRefused();
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayUrlEql(e.url[0..e.url_len], url)) continue;
+        e.strikes = 0;
+        e.at_ms = -1;
+        return;
+    }
+}
+
+/// Copies out the relays currently set aside, so the choice can skip them
+/// without holding this lock while it runs.
+fn refusedRelays(urls: *[routed_refusal_slots][96]u8, lens: *[routed_refusal_slots]u8) usize {
+    const now = nowMillis();
+    lockRefused();
+    defer unlockRefused();
+    var n: usize = 0;
+    for (&g_refused) |*e| {
+        if (e.url_len == 0) continue;
+        if (!relayIsRefused(e.strikes, e.at_ms, now)) continue;
+        @memcpy(urls[n][0..e.url_len], e.url[0..e.url_len]);
+        lens[n] = e.url_len;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn refusedRelayCountForTest() usize {
+    var urls: [routed_refusal_slots][96]u8 = undefined;
+    var lens: [routed_refusal_slots]u8 = @splat(0);
+    return refusedRelays(&urls, &lens);
+}
+pub fn noteRelayRefusalAtForTest(url: []const u8, now: i64) bool {
+    return noteRelayRefusalAt(url, now);
+}
+pub fn clearRelayRefusalForTest(url: []const u8) void {
+    clearRelayRefusal(url);
+}
+pub fn forgetRefusedRelaysForTest() void {
+    lockRefused();
+    defer unlockRefused();
+    for (&g_refused) |*e| {
+        e.url_len = 0;
+        e.strikes = 0;
+        e.at_ms = -1;
+    }
+}
+
+/// How much better a challenger has to be before a relay already connected is
+/// dropped for it, as a percentage of what the incumbent still reaches.
+///
+/// Coverage is computed from relay lists that arrive one at a time, so the
+/// margin between two candidates moves all day. Without this the set flaps: one
+/// person's kind:10002 lands, relay B passes relay A by a single author, and a
+/// live socket is torn down and a new one handshaked to gain one. Twenty-five
+/// per cent is the smallest margin that a single author cannot cross once a
+/// relay carries more than four.
+const route_evict_gain_percent: usize = 125;
+
+/// Whether a challenger reaches enough more people to be worth taking a live
+/// connection away for.
+fn worthEvicting(challenger_gain: usize, incumbent_gain: usize) bool {
+    // An incumbent that reaches nobody new is not defending anything.
+    if (incumbent_gain == 0) return true;
+    return challenger_gain * 100 >= incumbent_gain * route_evict_gain_percent;
+}
+
+pub fn worthEvictingForTest(challenger_gain: usize, incumbent_gain: usize) bool {
+    return worthEvicting(challenger_gain, incumbent_gain);
+}
+
+/// The relays currently holding a routed connection, copied out so the choice
+/// can prefer them without holding the discovered lock while it runs.
+fn incumbentRoutes(urls: *[max_discovered_relays][96]u8, lens: *[max_discovered_relays]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    for (&g_discovered) |*d| {
+        if (d.url_len == 0) continue;
+        @memcpy(urls[n][0..d.url_len], d.url[0..d.url_len]);
+        lens[n] = d.url_len;
+        n += 1;
+    }
+    return n;
+}
+
+/// Picks up to `budget` relays by marginal coverage, skipping any the reader is
+/// already connected to and counting their coverage as already paid for.
+///
+/// Returns how many were chosen, into `out` as indices into `table`.
+fn chooseRoutedRelays(
+    table: []const RelayRank,
+    author_count: usize,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+    incumbent_urls: *const [max_discovered_relays][96]u8,
+    incumbent_lens: *const [max_discovered_relays]u8,
+    incumbent_n: usize,
+    refused_urls: *const [routed_refusal_slots][96]u8,
+    refused_lens: *const [routed_refusal_slots]u8,
+    refused_n: usize,
+    budget: usize,
+    out: []usize,
+) usize {
+    @memset(g_route_cover[0..author_count], 0);
+
+    // The reader's own relays are already connected, so what they carry is
+    // covered before anything is chosen. Without this the greedy spends its
+    // whole budget re-reaching the crowd already on nos.lol.
+    for (table, 0..) |e, ti| {
+        var in_pool = false;
+        for (0..pool_n) |pi| {
+            if (pool_lens[pi] == 0) continue;
+            if (relayUrlEql(pool_urls[pi][0..pool_lens[pi]], e.urlSlice())) {
+                in_pool = true;
+                break;
+            }
+        }
+        if (!in_pool) continue;
+        for (0..author_count) |ai| {
+            if (bitGet(&g_route_bits[ti], ai)) g_route_cover[ai] +|= 1;
+        }
+    }
+
+    var chosen: usize = 0;
+    var taken: [relay_rank_candidates]bool = @splat(false);
+    while (chosen < budget and chosen < out.len) {
+        var best: ?usize = null;
+        var best_gain: usize = 0;
+        // The best of the relays already holding a connection, tracked
+        // alongside so a live socket is not dropped for a marginal gain.
+        var held: ?usize = null;
+        var held_gain: usize = 0;
+        for (table, 0..) |e, ti| {
+            if (taken[ti]) continue;
+            var in_pool = false;
+            for (0..pool_n) |pi| {
+                if (pool_lens[pi] == 0) continue;
+                if (relayUrlEql(pool_urls[pi][0..pool_lens[pi]], e.urlSlice())) {
+                    in_pool = true;
+                    break;
+                }
+            }
+            if (in_pool) continue;
+            // Before the gain is even computed, and before the incumbent check
+            // below, so a relay that will not talk to us can neither win a slot
+            // nor defend one it already holds.
+            var refused = false;
+            for (0..refused_n) |ri| {
+                if (refused_lens[ri] == 0) continue;
+                if (relayUrlEql(refused_urls[ri][0..refused_lens[ri]], e.urlSlice())) {
+                    refused = true;
+                    break;
+                }
+            }
+            if (refused) continue;
+            var gain: usize = 0;
+            for (0..author_count) |ai| {
+                if (g_route_cover[ai] >= route_coverage_target) continue;
+                if (bitGet(&g_route_bits[ti], ai)) gain += 1;
+            }
+            // Ties go to the relay more follows write to, then to the URL, so
+            // the set does not reshuffle between runs for no visible reason.
+            if (gain > best_gain or (gain == best_gain and gain > 0 and best != null and rankBefore(e, table[best.?]))) {
+                best = ti;
+                best_gain = gain;
+            }
+            var is_held = false;
+            for (0..incumbent_n) |ii| {
+                if (incumbent_lens[ii] == 0) continue;
+                if (relayUrlEql(incumbent_urls[ii][0..incumbent_lens[ii]], e.urlSlice())) {
+                    is_held = true;
+                    break;
+                }
+            }
+            if (!is_held) continue;
+            if (gain > held_gain or (gain == held_gain and gain > 0 and held != null and rankBefore(e, table[held.?]))) {
+                held = ti;
+                held_gain = gain;
+            }
+        }
+        // Keep the socket unless the challenger is clearly worth the handshake.
+        if (held) |h| {
+            if (held_gain > 0 and !worthEvicting(best_gain, held_gain)) {
+                best = h;
+                best_gain = held_gain;
+            }
+        }
+        // Nothing left to reach. Stopping here rather than spending the budget
+        // is the point: a fifth relay carrying only people already covered
+        // twice is a thread and a socket for nothing.
+        if (best == null or best_gain == 0) break;
+        taken[best.?] = true;
+        out[chosen] = best.?;
+        chosen += 1;
+        for (0..author_count) |ai| {
+            if (bitGet(&g_route_bits[best.?], ai)) g_route_cover[ai] +|= 1;
+        }
+    }
+
+    var cov: RouteCoverage = .{};
+    for (0..author_count) |ai| {
+        if (g_route_cover[ai] >= 1) cov.reached += 1;
+        if (g_route_cover[ai] >= route_coverage_target) cov.doubly_reached += 1;
+        if (g_route_cover[ai] == 0) cov.residual += 1;
+    }
+    cov.candidates_dropped = g_route_coverage.candidates_dropped;
+    g_route_coverage = cov;
+    return chosen;
+}
+
+/// Rebuilds the suggestions from every relay list the store holds for the
+/// people this reader follows, ordered by how many of them write there.
+///
+/// One pass over one query. The relays already in the pool are dropped, because
+/// a relay the reader is on is not a suggestion, and the top few of what is left
+/// are what gets offered.
+fn rankRelaySuggestions(store: *nostr.store.Store) void {
+    var authors: [max_follows][32]u8 = undefined;
+    var authors_len: usize = 0;
+    for (followSet()) |pk| {
+        if (authors_len >= authors.len) break;
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    if (authors_len == 0) return;
+
+    const kinds = [_]u16{relay_list_kind};
+    var result = store.query(std.heap.page_allocator, .{
+        .authors = authors[0..authors_len],
+        .kinds = &kinds,
+        .limit = @intCast(authors_len),
+    }) catch return;
+    defer result.deinit();
+
+    var table: [relay_rank_candidates]RelayRank = undefined;
+    var len: usize = 0;
+    var urls: [32][]const u8 = undefined;
+    for (&g_route_bits) |*row| @memset(row, 0);
+    g_route_coverage.candidates_dropped = 0;
+    for (result.events) |ev| {
+        // The reader's own list says where THEY write. It is not a suggestion
+        // about anyone else, and counting it would have the reader voting for
+        // their own relays in a ranking meant to tell them about others'.
+        if (activePubkey()) |pk| {
+            if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+        }
+        const before = len;
+        len = foldWriteRelays(&table, len, urls[0..writeTagUrls(ev, &urls)]);
+
+        // Which author this event is, so the bitsets can be indexed the same
+        // way the caller's author slice is.
+        const ai = blk: {
+            for (authors[0..authors_len], 0..) |a, i| {
+                if (std.mem.eql(u8, &a, &ev.pubkey)) break :blk i;
+            }
+            break :blk null;
+        };
+        if (ai) |author_index| {
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(urls[0..writeTagUrls(ev, &urls)], &selected);
+            for (selected[0..chosen]) |url| {
+                var found = false;
+                for (table[0..len], 0..) |e, ti| {
+                    if (!relayUrlEql(e.urlSlice(), url)) continue;
+                    bitSet(&g_route_bits[ti], author_index);
+                    found = true;
+                    break;
+                }
+                // The table was full, so this relay is not a candidate at all.
+                // Counted, because a cap that drops work in silence reads as a
+                // complete answer, and this one was hit exactly on a real
+                // account before anybody noticed it existed.
+                if (!found and len == table.len) g_route_coverage.candidates_dropped += 1;
+            }
+        }
+        _ = before;
+    }
+    if (len == 0) return;
+
+    // Sort an ORDER, not the table.
+    //
+    // `g_route_bits` is indexed by table position, so sorting the table itself
+    // silently re-points every bitset at a different relay: the routing then
+    // reads one relay's authors and dials another. That is what this did on the
+    // first attempt, and the symptom was the routed set choosing the relay with
+    // two writers over the one with four.
+    var order: [relay_rank_candidates]usize = undefined;
+    for (0..len) |i| order[i] = i;
+    const Ctx = struct {
+        t: []const RelayRank,
+        fn lt(self: @This(), a: usize, b: usize) bool {
+            return rankBefore(self.t[a], self.t[b]);
+        }
+    };
+    std.mem.sort(usize, order[0..len], Ctx{ .t = table[0..len] }, Ctx.lt);
+
+    // The pool, copied out BEFORE the table lock is taken. `relaySnapshot` takes
+    // that same lock and it is a plain spinlock with no owner tracking, so
+    // reaching for it from inside is not a slow path, it is a hang: the thread
+    // waits for a lock only it could release. Found by running the tests.
+    var pool: [max_relays][96]u8 = undefined;
+    var pool_len: [max_relays]u8 = @splat(0);
+    var pool_n: usize = 0;
+    for (0..relaySlots()) |i| {
+        var pool_buf: [96]u8 = undefined;
+        const pe = relaySnapshot(i, &pool_buf) orelse continue;
+        if (pool_n >= pool.len) break;
+        @memcpy(pool[pool_n][0..pe.url.len], pe.url);
+        pool_len[pool_n] = @intCast(pe.url.len);
+        pool_n += 1;
+    }
+
+    // Which relays already hold a routed connection, read before the table lock
+    // for the same reason the pool is: `incumbentRoutes` takes the discovered
+    // lock, and the rule here is table first, discovered second, never both at
+    // once from a place that could be entered the other way round.
+    var held_urls: [max_discovered_relays][96]u8 = undefined;
+    var held_lens: [max_discovered_relays]u8 = @splat(0);
+    const held_n = incumbentRoutes(&held_urls, &held_lens);
+
+    // And the ones that would not have us, read here for the same reason.
+    var refused_urls: [routed_refusal_slots][96]u8 = undefined;
+    var refused_lens: [routed_refusal_slots]u8 = @splat(0);
+    const refused_n = refusedRelays(&refused_urls, &refused_lens);
+
+    lockRelayTable();
+    defer unlockRelayTable();
+    var kept: u8 = 0;
+    for (order[0..len]) |oi| {
+        const e = table[oi];
+        if (kept >= max_relay_suggestions) break;
+        // A relay the reader is already on is not news.
+        var in_pool = false;
+        for (0..pool_n) |i| {
+            if (relayUrlEql(pool[i][0..pool_len[i]], e.urlSlice())) {
+                in_pool = true;
+                break;
+            }
+        }
+        if (in_pool) continue;
+        @memcpy(g_suggested[kept][0..e.len], e.urlSlice());
+        g_suggested_len[kept] = e.len;
+        kept += 1;
+    }
+    // Published last, so a reader cannot see a half-rewritten table: the count
+    // is what bounds every read of it.
+    g_suggested_count.store(kept, .release);
+
+    // The same relays, the first few of them, are the ones worth connecting to.
+    // Filled from the same query, because it is the same question: who writes
+    // where. This runs while the table lock is held, and takes the discovered
+    // lock inside it, which is safe only because nothing on the discovered side
+    // ever reaches back for the table lock. Nested locks are exactly how the
+    // hang above happened, so the order is fixed here and stated: table first,
+    // discovered second, never the reverse.
+    // The routed set is chosen by COVERAGE, not by the popularity order above.
+    // The suggestions answer "what should this reader consider adding", which
+    // is a human question; connections answer "which relays reach the most
+    // people I cannot otherwise see", and the top of a popularity list is the
+    // wrong answer to that because the popular relays all carry the same crowd.
+    var picked: [max_discovered_relays]usize = undefined;
+    const picked_n = chooseRoutedRelays(
+        table[0..len],
+        authors_len,
+        &pool,
+        &pool_len,
+        pool_n,
+        &held_urls,
+        &held_lens,
+        held_n,
+        &refused_urls,
+        &refused_lens,
+        refused_n,
+        max_discovered_relays,
+        &picked,
+    );
+    var routed_urls: [max_discovered_relays][96]u8 = undefined;
+    var routed_lens: [max_discovered_relays]u8 = @splat(0);
+    for (picked[0..picked_n], 0..) |ti, i| {
+        const u = table[ti].urlSlice();
+        @memcpy(routed_urls[i][0..u.len], u);
+        routed_lens[i] = @intCast(u.len);
+    }
+    fillDiscovered(result.events, routed_urls[0..picked_n], routed_lens[0..picked_n], authors[0..authors_len], &pool, &pool_len, pool_n);
+}
+
+/// Gives each discovered slot a relay and the people who write there.
+///
+/// `urls` are already ranked and already known not to be in the reader's pool,
+/// so this only has to find, for each of them, which authors named it.
+/// Built here, compared with what is live, and only then swapped in. Static
+/// rather than a local: four slots of five hundred pubkeys is sixty-odd
+/// kilobytes and this runs on the render thread.
+var g_discovered_next: [max_discovered_relays]DiscoveredRelay = @splat(.{});
+
+/// Whether two slots ask the same question of the same relay.
+///
+/// Every author, not the first one. Amethyst shipped this comparison as a
+/// `forEachIndexed` with a return inside it, which in Kotlin returns from the
+/// lambda, so only `filters[0]` was ever compared and a change further down the
+/// list was silently treated as no change at all.
+fn sameRoute(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
+    if (authors_a.len != authors_b.len) return false;
+    if (!std.mem.eql(u8, url_a, url_b)) return false;
+    for (authors_a, authors_b) |x, y| {
+        if (!std.mem.eql(u8, &x, &y)) return false;
+    }
+    return true;
+}
+
+pub fn sameRouteForTest(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
+    return sameRoute(url_a, authors_a, url_b, authors_b);
+}
+
+fn sameRoutes(a: *const DiscoveredRelay, b: *const DiscoveredRelay) bool {
+    return sameRoute(
+        a.url[0..a.url_len],
+        a.authors[0..a.authors_len],
+        b.url[0..b.url_len],
+        b.authors[0..b.authors_len],
+    );
+}
+
+fn fillDiscovered(
+    events: []const nostr.event.Event,
+    urls: []const [96]u8,
+    lens: []const u8,
+    authors: []const [32]u8,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+) void {
+    lockDiscovered();
+    defer unlockDiscovered();
+
+    for (&g_discovered_next) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+
+    const take = @min(@min(urls.len, g_discovered_next.len), lens.len);
+
+    // Where each chosen relay goes: the seat it is already sitting in.
+    //
+    // The choice comes back in coverage order, and that order moves whenever
+    // anybody's relay list does. Filling the slots in that order hands relay A's
+    // socket to relay B and B's to A for no reason other than that they swapped
+    // places in a ranking, and both connections are dropped and redialled to do
+    // it. Keeping a relay in its own slot means a table that still contains it
+    // costs nothing at all.
+    var slot_of: [max_discovered_relays]?usize = @splat(null);
+    var slot_taken: [max_discovered_relays]bool = @splat(false);
+    for (0..take) |i| {
+        const url = urls[i][0..lens[i]];
+        for (0..g_discovered.len) |s| {
+            if (slot_taken[s]) continue;
+            const live = &g_discovered[s];
+            if (live.url_len == 0) continue;
+            if (!relayUrlEql(live.url[0..live.url_len], url)) continue;
+            slot_of[i] = s;
+            slot_taken[s] = true;
+            break;
+        }
+    }
+    for (0..take) |i| {
+        if (slot_of[i] != null) continue;
+        for (0..g_discovered.len) |s| {
+            if (slot_taken[s]) continue;
+            slot_of[i] = s;
+            slot_taken[s] = true;
+            break;
+        }
+    }
+
+    for (0..take) |i| {
+        const url = urls[i][0..lens[i]];
+        const d = &g_discovered_next[slot_of[i] orelse continue];
+        @memcpy(d.url[0..url.len], url);
+        d.url_len = @intCast(url.len);
+
+        for (events) |ev| {
+            if (d.authors_len >= discovered_authors_cap) break;
+            if (activePubkey()) |pk| {
+                if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+            }
+            // The SAME selection the ranking used, from the same function.
+            // Two copies of this rule drifted once already.
+            var raw: [32][]const u8 = undefined;
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(raw[0..writeTagUrls(ev, &raw)], &selected);
+            var writes_here = false;
+            for (selected[0..chosen]) |candidate| {
+                if (relayUrlEql(candidate, url)) {
+                    writes_here = true;
+                    break;
+                }
+            }
+            if (!writes_here) continue;
+            d.authors[d.authors_len] = ev.pubkey;
+            d.authors_len += 1;
+        }
+        // A backstop. Both loops now select through `selectWriteRelays` over
+        // the same query result, so a relay in the ranking should always have
+        // at least one writer here. If that ever stops being true the symptom
+        // is a connection asking about nobody, and this turns it into a missing
+        // connection instead, which is the quieter of the two failures.
+        if (d.authors_len == 0) d.url_len = 0;
+    }
+
+    // The pool's own slots and the residual, from the same events, while the
+    // lock is held and `g_discovered_next` is final. Order matters: the residual
+    // is "not covered by a ROUTED relay", so it has to be computed after they
+    // are chosen.
+    fillPoolRoutes(events, authors, pool_urls, pool_lens, pool_n);
+
+    // Only the slots whose answer actually moved.
+    //
+    // The ranking reruns every time a relay list lands, and during a cold start
+    // hundreds of them land. Bumping the generation each time would drop and
+    // redial every discovered connection each time, so the pool would spend the
+    // whole startup reconnecting and never finish asking anything. Seen exactly
+    // that in a live run before this check: three connections, each redialled
+    // inside two minutes, for a route table that had not changed.
+    for (0..g_discovered.len) |i| {
+        const src = &g_discovered_next[i];
+        const dst = &g_discovered[i];
+        if (sameRoutes(dst, src)) continue;
+        dst.url_len = src.url_len;
+        @memcpy(dst.url[0..src.url_len], src.url[0..src.url_len]);
+        dst.authors_len = src.authors_len;
+        @memcpy(dst.authors[0..src.authors_len], src.authors[0..src.authors_len]);
+        // Last for this slot, so a thread reading the counter sees a slot that
+        // is finished.
+        _ = g_discovered_gen[i].fetchAdd(1, .monotonic);
+    }
+}
+
+/// Set when a relay list that is not the reader's own reaches the store, so the
+/// ranking is redone once rather than on every tick.
+var g_relay_ranks_dirty = std.atomic.Value(bool).init(true);
+
+// -- When the routing is allowed to be recomputed -----------------------------
+//
+// A cold start lands hundreds of relay lists in a few seconds, and each one is
+// a reason to redo the ranking. Redoing it on each one is work thrown away by
+// the next one, and every intermediate answer is a route table nobody should
+// act on: the fifth list in changes the coverage that the tenth settles.
+//
+// Neither Jumble nor Amethyst needs this. Both recompute per event and pay a
+// socket for the churn; Plaza pays a thread, and the render thread does the
+// computing, so it waits for the flurry to stop first.
+
+/// Quiet time after the last relay list before the routing is recomputed.
+const route_settle_ms: i64 = 5_000;
+/// Floor between two recomputes, however much arrives in between.
+const route_recompute_min_ms: i64 = 10_000;
+/// How long the settle window may hold a wanted recompute back. A steady
+/// trickle of relay lists must not postpone the answer forever.
+const route_settle_max_ms: i64 = 30_000;
+
+/// Whether a wanted recompute may run now. All three arguments are ages in
+/// milliseconds, and null means "has not happened yet".
+fn routeRecomputeDue(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
+    const pending = pending_ms orelse return false;
+    if (pending >= route_settle_max_ms) return true;
+    if (since_run_ms) |t| {
+        if (t < route_recompute_min_ms) return false;
+    }
+    if (since_list_ms) |t| {
+        if (t < route_settle_ms) return false;
+    }
+    return true;
+}
+
+pub fn routeRecomputeDueForTest(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
+    return routeRecomputeDue(pending_ms, since_list_ms, since_run_ms);
+}
+pub const routeSettleMsForTest = route_settle_ms;
+pub const routeRecomputeMinMsForTest = route_recompute_min_ms;
+pub const routeSettleMaxMsForTest = route_settle_max_ms;
+
+/// Monotonic milliseconds since the app woke, or null before `main` wires the
+/// clock. Null and not zero: zero is a real reading, and a rate limit that
+/// stops working at a particular clock value is not a rate limit.
+fn nowMillis() ?i64 {
+    const io = g_io orelse return null;
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
+}
+
+/// When the last relay list landed, when the routing last ran, and when it was
+/// first wanted since then. All monotonic milliseconds, all -1 for "never".
+var g_route_list_at = std.atomic.Value(i64).init(-1);
+var g_route_ran_at: i64 = -1;
+var g_route_wanted_at: i64 = -1;
+
+fn ageMs(now_ms: i64, stamp: i64) ?i64 {
+    if (stamp < 0) return null;
+    return now_ms -| stamp;
+}
+
+/// Runs the ranking if one is wanted and the flurry has stopped. Called once a
+/// tick from the render thread.
+fn maybeRankRelaySuggestions(store: *nostr.store.Store) void {
+    if (!g_relay_ranks_dirty.load(.acquire)) return;
+    // No clock yet means no window to wait out. Better an early answer than a
+    // routing that never runs.
+    const now_ms = nowMillis() orelse {
+        if (g_relay_ranks_dirty.swap(false, .acq_rel)) rankRelaySuggestions(store);
+        return;
+    };
+    if (g_route_wanted_at < 0) g_route_wanted_at = now_ms;
+    if (!routeRecomputeDue(
+        ageMs(now_ms, g_route_wanted_at),
+        ageMs(now_ms, g_route_list_at.load(.acquire)),
+        ageMs(now_ms, g_route_ran_at),
+    )) return;
+    // Cleared BEFORE the query, so a list landing while this runs asks for
+    // another pass rather than being folded in and forgotten.
+    if (!g_relay_ranks_dirty.swap(false, .acq_rel)) return;
+    g_route_wanted_at = -1;
+    g_route_ran_at = now_ms;
+    rankRelaySuggestions(store);
+    // Right after the routing is rebuilt, because that is the moment the set of
+    // people nobody can be asked about is known and correct. Off the render
+    // thread and one at a time; the sweep marks who it asked, so this settling
+    // to a no-op is what the marking is for.
+    sweepRelayLists();
+}
+
+pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
+    rankRelaySuggestions(store);
+}
+pub fn foldWriteRelaysForTest(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    return foldWriteRelays(table, len_in, urls);
+}
+pub const RelayRankForTest = RelayRank;
+pub fn relayRankWritersForTest(e: RelayRank) u16 {
+    return e.writers;
+}
+pub fn relayRankUrlForTest(e: *const RelayRank) []const u8 {
+    return e.urlSlice();
+}
+pub const outboxRelaysPerAuthorForTest = outbox_relays_per_author;
+pub const maxDiscoveredRelaysForTest = max_discovered_relays;
+pub const discoveredAuthorsCapForTest = discovered_authors_cap;
+pub const discoveredWatchBaseForTest = discovered_watch_base;
+pub const relayWatchSlotsForTest = relay_watch_slots;
+pub fn discoveredGenerationForTest(index: usize) u32 {
+    if (index >= g_discovered_gen.len) return 0;
+    return g_discovered_gen[index].load(.acquire);
+}
+
+// -- Reading where your follows actually write -------------------------------
+//
+// The pool asks every relay in it about every person the reader follows. A
+// follow who writes only to relays the reader is not on is therefore invisible:
+// their notes never arrive, and nothing says so. No error, no empty state, no
+// loading spinner. They simply are not there.
+//
+// The ranking above already works out where the follows write. This dials the
+// top few of those that the reader is NOT already on, and asks each one only
+// about the people who write there, which is the whole point: a small relay
+// gets asked about its dozen writers rather than about two thousand strangers.
+//
+// A SEPARATE pool, and not a wider `g_relays`. `max_relays` is eight because
+// the outbox records deliveries in a `u8` bitmap, one bit per slot; a ninth
+// slot would silently stop being counted and notes would look undelivered
+// forever. These connections never publish, so they need no bit and no slot.
+//
+// Notedeck, the closest architectural match to this app, does not route by
+// author at all: it parses kind:10002 for the logged-in account only. So this
+// is not a prerequisite for being a credible client, and it stays bounded: the
+// reader's own pool remains the feed, and these are what it cannot see.
+//
+// Eight, matching the pool, for sixteen sockets in all. Four was the number
+// picked before there was anything to measure it against. Measured since, on a
+// real account of 257 follows: four routed connections reach 193 of them and
+// leave 64 riding the pool, and eight reach 202 and leave 55, with 156 covered
+// by two relays rather than 134. The eighth connection is still earning its
+// thread, and the greedy stops on its own when one would not: it takes a relay
+// only while one reaches somebody not yet covered twice, so a quiet account
+// with a tidy follow list opens fewer than this and nothing is wasted.
+const max_discovered_relays = 8;
+/// How many authors one discovered relay is asked about. Beyond this the
+/// question stops being "who writes here" and starts being another firehose.
+const discovered_authors_cap = 512;
+
+const DiscoveredRelay = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    authors: [discovered_authors_cap][32]u8 = undefined,
+    authors_len: u16 = 0,
+};
+
+var g_discovered: [max_discovered_relays]DiscoveredRelay = @splat(.{});
+var g_discovered_lock = std.atomic.Value(bool).init(false);
+/// Bumped whenever a slot is rewritten, ONE COUNTER PER SLOT. A thread compares
+/// its own slot's counter to the value it dialled under, which is how a slot
+/// changing hands takes effect now rather than at the next reconnect.
+///
+/// Per slot and not one counter for the table, because a single counter makes
+/// every routed connection the hostage of every other: one follow publishing a
+/// new relay list moves one slot and drops all four sockets, and during a cold
+/// start that happens over and over. The three other connections had nothing to
+/// re-ask.
+var g_discovered_gen: [max_discovered_relays]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(0));
+
+/// What one routed socket is connected to and asking about, so a thread that is
+/// not blocked reading it can replace its question.
+///
+/// The owner of a socket cannot re-ask on its own. It spends its life inside
+/// `receive`, which blocks until the relay says something, and a relay with
+/// nothing new to say says nothing: driving a route change through the owner
+/// means the change lands whenever the next note happens to arrive, which on a
+/// quiet relay is never. Measured, by moving a route under a live connection
+/// and watching it not notice for forty seconds.
+///
+/// So the keeper does it. It already holds a pointer to every live connection
+/// and a clock, and `sendFrame` is write-locked, which is what makes a second
+/// thread writing to a live socket safe at all.
+const RoutedLive = struct {
+    url: [96]u8 = [_]u8{0} ** 96,
+    url_len: u8 = 0,
+    /// The generation this socket's standing REQ was built from.
+    gen: u32 = 0,
+};
+/// Guarded by the live-relay lock of `discovered_watch_base + i`, the same lock
+/// that guards the pointer it describes.
+var g_routed_live: [max_discovered_relays]RoutedLive = @splat(.{});
+
+fn lockDiscovered() void {
+    while (g_discovered_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockDiscovered() void {
+    g_discovered_lock.store(false, .release);
+}
+
+pub fn discoveredCount() usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    for (&g_discovered) |*d| {
+        if (d.url_len > 0) n += 1;
+    }
+    return n;
+}
+
+pub fn discoveredUrlCopy(index: usize, buf: *[96]u8) ?[]const u8 {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return null;
+    const d = &g_discovered[index];
+    if (d.url_len == 0) return null;
+    @memcpy(buf[0..d.url_len], d.url[0..d.url_len]);
+    return buf[0..d.url_len];
+}
+
+pub fn discoveredAuthorCount(index: usize) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return 0;
+    return g_discovered[index].authors_len;
+}
+
+/// Copies one slot's question for the thread about to ask it. Returns null when
+/// the slot emptied or the table was rewritten under it.
+fn discoveredSnapshot(index: usize, gen: u32, url: *[96]u8, authors: *[discovered_authors_cap][32]u8) ?struct { url_len: usize, authors_len: usize } {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return null;
+    if (g_discovered_gen[index].load(.acquire) != gen) return null;
+    const d = &g_discovered[index];
+    if (d.url_len == 0 or d.authors_len == 0) return null;
+    @memcpy(url[0..d.url_len], d.url[0..d.url_len]);
+    @memcpy(authors[0..d.authors_len], d.authors[0..d.authors_len]);
+    return .{ .url_len = d.url_len, .authors_len = d.authors_len };
 }
 
 /// Records a relay a follow writes to, unless it is already in the pool or
@@ -395,14 +1541,18 @@ fn ingestRelayList(ev: nostr.event.Event) void {
             return;
         }
     }
-    for (ev.tags) |tag| {
-        if (tag.len < 2) continue;
-        if (!std.mem.eql(u8, tag[0], "r")) continue;
-        // Only where they WRITE: a relay a follow merely reads from will never
-        // hold their notes, so adding it would buy nothing.
-        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
-        noteRelaySuggestion(std.mem.trim(u8, tag[1], " \t\r\n"));
-    }
+    // Somebody else's list. The suggestions are ranked from every list the
+    // store holds rather than from this one in isolation, so all this has to do
+    // is say that the answer has moved.
+    //
+    // It used to walk the tags here and keep the first six write relays ever
+    // seen. That made the offer depend on whose list arrived first: one
+    // person's relay could sit above one two hundred people use.
+    //
+    // Stamped as well as flagged, because a cold start lands hundreds of these
+    // in a few seconds and the ranking is worth doing once they have stopped.
+    if (nowMillis()) |ms| g_route_list_at.store(ms, .release);
+    g_relay_ranks_dirty.store(true, .release);
 }
 
 /// An edit is waiting to be published, and when it was made. Walking a badge
@@ -549,15 +1699,26 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // one the app was born with. An edit grants this to itself, which is why it
     // is not the whole gate.
     if (!relayListIsOwned()) return false;
-    if (!canWriteRelayList()) return false;
     // A refusal here keeps the edit pending, so the tick brings it back the
     // moment the signer is free. This is the half of the same-tick collision the
     // relay list was on the losing end of.
     if (!signerReady()) return false;
     const gpa = std.heap.page_allocator;
 
+    // Read ONCE, and gate on the read that is actually spliced from.
+    //
+    // This used to ask `canWriteRelayList()` first, which does its own store
+    // read, and then read again for the base. Two reads can disagree: if the
+    // second returns nothing, the gate has already said yes, the splice loop is
+    // skipped, and the event is built from the pool alone. A thirteen-relay list
+    // is then replaced by the eight relays this process happens to hold, which
+    // is the exact deletion the splice below exists to prevent. `writeFollow`
+    // documents this hazard and decides its gate from the one read it uses.
     var previous: ?OwnProfile = null;
     if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
+    // Somebody else's list may not be overwritten sight unseen. Minting the
+    // identity here is the one case where there is legitimately nothing to read.
+    if (previous == null and !g_identity_minted_here) return false;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
@@ -679,7 +1840,7 @@ fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
 /// short: a backup for a kind nothing writes is a guess about the future, and
 /// this app writes exactly these.
 fn isOwnList(kind: u16) bool {
-    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind;
+    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind or kind == mute_list_kind;
 }
 
 /// The one door into the store.
@@ -718,6 +1879,19 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
                 noteOwnContactListStored(pk);
             }
         }
+    }
+    // What the feed needs to know about this, and the only place that can say
+    // it: the store's own event count moves for every kind, so it cannot tell a
+    // note from a reaction, and the feed used to re-read everything on either.
+    switch (ev.kind) {
+        1 => if (result == .added) noteFeedArrival(ev.id),
+        // A deletion takes a note OUT, and no arrival describes a removal, so
+        // the list in hand has to be read again. Amethyst hit the mirror image
+        // of this: one kind:5 folded into an ordinary batch quietly emptied rows
+        // that had nothing to do with it, because their splice could only add.
+        5 => if (result != .invalid) invalidateFeed(),
+        mute_list_kind => if (result != .invalid) ingestMuteList(ev),
+        else => {},
     }
     return result;
 }
@@ -782,6 +1956,7 @@ fn keepReplaced(gpa: std.mem.Allocator, store: *nostr.store.Store, kind: u16, js
 /// Points the app's store at a test's own, so the funnel can be driven for real.
 pub fn setStoreForTest(store: ?*nostr.store.Store) void {
     g_store = store;
+    if (store) |st| seedFeedNewest(st);
 }
 
 pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
@@ -1120,6 +2295,8 @@ pub fn resetRelaysForTest() void {
     forgetRelayRemovals();
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
+    forgetDiscovered();
+    forgetRefusedRelaysForTest();
     seedBootstrapRelays();
 }
 
@@ -1147,6 +2324,8 @@ pub fn clearRelaysForTest() void {
     forgetRelayRemovals();
     g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
+    forgetDiscovered();
+    forgetRefusedRelaysForTest();
 }
 
 pub fn relayListStampForTest() i64 {
@@ -1210,8 +2389,57 @@ pub fn setRelayStatusForTest(i: usize, connected: bool) void {
 }
 
 pub fn relayStatusConnectedForTest(i: usize) bool {
-    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .connected;
+    return connHolds(@enumFromInt(g_relay_status[i].load(.monotonic)));
 }
+
+/// What the keeper would do for a connection this idle, last pinged this long
+/// ago. Null for either means "no measurement".
+pub fn keeperActionForTest(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
+    return keeperAction(idle_ms, since_ping_ms);
+}
+pub const KeeperActionForTest = KeeperAction;
+
+pub fn setRelayQuietForTest(i: usize) void {
+    setRelayStatus(i, .quiet);
+}
+pub fn outboxWokeForTest() bool {
+    return g_outbox_woke_ever.load(.monotonic);
+}
+pub fn resetOutboxWokeForTest() void {
+    g_outbox_woke_ever.store(false, .monotonic);
+    g_outbox_woke_at.store(0, .monotonic);
+}
+pub fn relayStatusQuietForTest(i: usize) bool {
+    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .quiet;
+}
+/// Seats a deadline in the one-shot table without a socket, so what the keeper
+/// decides about it can be driven directly.
+pub fn seatOneShotForTest(slot: usize, deadline_ms: i64) void {
+    g_oneshot_deadline[slot] = deadline_ms;
+}
+pub fn clearOneShotsForTest() void {
+    for (0..one_shot_slots) |i| {
+        g_oneshot[i] = null;
+        g_oneshot_deadline[i] = 0;
+    }
+}
+pub fn expiredOneShotsForTest(now_ms: i64, out: []usize) usize {
+    var buf: [one_shot_slots]usize = undefined;
+    const n = expiredOneShots(now_ms, &buf);
+    const take = @min(n, out.len);
+    @memcpy(out[0..take], buf[0..take]);
+    return take;
+}
+pub fn markOneShotCutForTest(slot: usize) void {
+    g_oneshot_deadline[slot] = one_shot_already_cut;
+}
+pub const oneShotSlotsForTest = one_shot_slots;
+pub const oneShotBudgetMsForTest = one_shot_budget_ms;
+pub const bunkerWatchSlotForTest = bunker_watch_slot;
+pub const maxRelaysForTest = max_relays;
+
+pub const relayPingAfterMsForTest = relay_ping_after_ms;
+pub const relayDeadAfterMsForTest = relay_dead_after_ms;
 
 pub fn isReaderNoteForTest(kind: u16) bool {
     return isReaderNote(kind);
@@ -1288,6 +2516,9 @@ fn seedBootstrapRelays() void {
 /// Claims a slot for `url`, or returns the slot it already occupies. Returns
 /// null when the pool is full, which the caller surfaces rather than hides.
 fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
+    // A relay nobody has asked yet may hold a decade of history the feed has
+    // already decided does not exist.
+    resetFeedEnd();
     if (url.len == 0 or url.len > 96) return null;
     for (0..relaySlots()) |i| {
         if (g_relays[i].used and relayUrlEql(g_relays[i].url(), url)) return i;
@@ -1311,16 +2542,33 @@ fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
 // feed is scoped to these authors (plus the user's own notes); follow
 // management and NIP-51 lists come later. Pubkeys are hex, decoded to bytes at
 // comptime.
+//
+// EVERY NAME HERE IS A CLAIM ABOUT A REAL PERSON, and three of them were wrong
+// for months: this list said Vitor, hodlbod and Lyn Alden, and the keys beside
+// those names belong to PABLOF7z, Lyn Alden and Vitor Pamplona. hodlbod was
+// never in the pack at all. The keys were always fine, so nobody followed
+// anybody they should not have; the app simply told them the wrong thing about
+// who they were reading, on the one screen a newcomer has no way to check.
+//
+// So the bar for editing this list: resolve the key's own NIP-05 at the domain
+// it names and paste what THAT says. Not a kind:0, which anybody can write
+// about themselves, and not memory, which is how this happened. Verified that
+// way on 2026-08-19, every one of the nine.
+//
+// Nothing here can be tested locally. A comment and a hex string have no
+// mechanical link, and no assertion in this repo can tell you whose key that
+// is. The check is a person doing the lookup above, which is why the method is
+// written down instead of a guard that would only look like one.
 const starter_pack_hex = [_][]const u8{
-    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d", // fiatjaf
-    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2", // jack
-    "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55
-    "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // ODELL
-    "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93", // gigi
-    "84dee6e676e5bb67b4ad4e042cf70cbd8681155db535942fcc6a0533858a7240", // Snowden
-    "fa984bd7dbb282f07e16e7ae87b26a2a7b9b90b7246a44771f0cf5ae58018f52", // Vitor (Amethyst)
-    "eab0e756d32b80bcd464f3d844b8040303075a13eabc3599a762c9ac7ab91f4f", // hodlbod
-    "460c25e682fda7832b52d1f22d3d22b3176d972f60dcdc3212ed8c92ef85065c", // Lyn Alden
+    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d", // fiatjaf, _@fiatjaf.com
+    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2", // jack, jack@primal.net
+    "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55, _@jb55.com
+    "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // ODELL, odell@primal.net
+    "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93", // Gigi, dergigi.com
+    "84dee6e676e5bb67b4ad4e042cf70cbd8681155db535942fcc6a0533858a7240", // Edward Snowden, Snowden@Nostr-Check.com
+    "fa984bd7dbb282f07e16e7ae87b26a2a7b9b90b7246a44771f0cf5ae58018f52", // PABLOF7z, _@f7z.io
+    "eab0e756d32b80bcd464f3d844b8040303075a13eabc3599a762c9ac7ab91f4f", // Lyn Alden, lyn@primal.net
+    "460c25e682fda7832b52d1f22d3d22b3176d972f60dcdc3212ed8c92ef85065c", // Vitor Pamplona, _@vitorpamplona.com
 };
 const starter_pack = blk: {
     var pks: [starter_pack_hex.len][32]u8 = undefined;
@@ -1361,22 +2609,465 @@ const thread_loading_grace_s = 6;
 // How much of a note's text is stored. A long note is collapsed in the feed to
 // `note_collapse_chars` with a "Show more" that reveals the rest, up to this cap
 // (a kind:1 past it is truncated: long-form is kind:30023, not a note).
-const note_content_cap = 1024;
+//
+// This was 1024, which is under an ordinary long note: a release announcement
+// with a feature list runs 1500 to 2500 bytes, and "Show more" opened onto a
+// note that stopped mid-sentence anyway. The cap was invisible in the UI because
+// the text simply ended, so it read as a rendering bug rather than a limit.
+//
+// 4096 rather than more because `Note` carries its text inline and lives 100
+// deep in a thread. Anything past a few kilobytes is long-form (kind:30023),
+// which is a different surface, not a bigger note.
+const note_content_cap = 4096;
 const note_collapse_chars = 300;
 // How many loaded notes each relay watches for engagement. Bounded so the
 // `#e` filter stays a size relays accept; covers the feed's first screens.
 const engagement_watch_cap = 128;
+// The cap on that filter's answer. Without one the relay picks, and 128 note
+// ids across four kinds is a very large thing to leave a busy relay to pick.
+const engagement_request_limit = 500;
+// What an engagement query asks for: replies, reposts, likes, zap receipts.
+const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
+
+// ------------------------------------------------------------------- places
+//
+// A place is somebody else's Plaza, published as an event.
+//
+// fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
+// static site on your own domain. That works, and it costs a deploy per variant,
+// so you only get variants worth a deploy. His own suggestion for a native app
+// was the other shape: one binary, several rooms, each instantiated from a URL
+// or an event shared by whoever runs the community. Then a place costs nothing to
+// make, and you get the ones nobody would have deployed a site for: one
+// conference weekend, a reading group of nine people.
+//
+// This is the first slice of that. A place carries an app name, a home text, and
+// the relays its feeds read from. v1 reads the first two and one feed; the rest
+// of Hallway's surface (colours, kinds, publish targets, densities) arrives in
+// later versions against the same document.
+//
+// EVERYTHING HERE COMES FROM A STRANGER. A place is an event by definition
+// somebody else signed, so every field is bounded, copied into fixed storage,
+// and never trusted for its length. The relay URL is the sharp one: it decides
+// where the app connects.
+
+/// How much of each field a place may carry. Small on purpose: this is chrome,
+/// not content, and a place that wants to say more than this wants to be a note.
+const place_name_cap = 64;
+const place_home_cap = 2048;
+const place_feed_name_cap = 48;
+const place_relay_cap = 96;
+/// v1 reads one feed. The array is here so the parser does not have to change
+/// shape when v3 reads several.
+const place_feeds_cap = 1;
+/// How many ids are remembered per place. A screenful and then some; the point
+/// is that the room is not empty on arrival, not that it is complete.
+const place_seed_cap = 60;
+
+const PlaceFeed = struct {
+    name_buf: [place_feed_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    relay_buf: [place_relay_cap]u8 = @splat(0),
+    relay_len: u8 = 0,
+
+    pub fn name(self: *const PlaceFeed) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn relay(self: *const PlaceFeed) []const u8 {
+        return self.relay_buf[0..self.relay_len];
+    }
+};
+
+pub const Place = struct {
+    name_buf: [place_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    home_buf: [place_home_cap]u8 = @splat(0),
+    home_len: u16 = 0,
+    feeds: [place_feeds_cap]PlaceFeed = @splat(.{}),
+    feeds_len: u8 = 0,
+    /// The last notes seen here, so returning shows the room rather than an
+    /// empty screen while a stranger's relay is dialled. Bounded and cheap:
+    /// these are ids, and the notes themselves are already in the store.
+    seen: [place_seed_cap][32]u8 = undefined,
+    seen_len: u16 = 0,
+    /// Who published it and under what `d`, so the applied place can be named,
+    /// re-fetched, and told apart from another place with the same title.
+    author: [32]u8 = @splat(0),
+    ident_buf: [64]u8 = @splat(0),
+    ident_len: u8 = 0,
+
+    pub fn name(self: *const Place) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn home(self: *const Place) []const u8 {
+        return self.home_buf[0..self.home_len];
+    }
+    pub fn ident(self: *const Place) []const u8 {
+        return self.ident_buf[0..self.ident_len];
+    }
+};
+
+/// The kind a place is published under. NIP-78 is application-specific data
+/// keyed by a `d` tag, which is exactly what this is: one publisher can keep
+/// several places apart, and editing one replaces it rather than adding a
+/// second.
+const place_kind: u16 = 30078;
+
+/// Reads a place out of an event's content. Null when it is not one.
+///
+/// THE FIELD NAMES ARE HALLWAY'S, EXACTLY. fiatjaf's deployer ships its whole
+/// configuration as one flat JSON object, `window.hallway.universe`, embedded in
+/// every site it deploys: 41 keys, camelCase. Matching it means a place published
+/// once means the same thing in both clients, which is worth more than a format
+/// of our own. I guessed at `name`/`home`/`feeds` first and every one was wrong.
+///
+/// v1 reads three of the 41: `appName`, `homeMarkdown`, and the first entry of
+/// `hardcodedFeeds`. The other 38 are ignored HERE and not forgotten: unknown
+/// fields are skipped rather than refused, so a place carrying the full object
+/// already applies the parts this version understands and picks up the rest as
+/// later versions learn them.
+pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
+    @setRuntimeSafety(true); // A stranger's JSON, sized into fixed buffers.
+    const Wire = struct {
+        appName: []const u8 = "",
+        homeMarkdown: []const u8 = "",
+        hardcodedFeeds: []const struct {
+            /// Optional in Hallway's own data: one feed on the site I read
+            /// carries only `relays`, so a feed with no name falls back to its
+            /// relay's host rather than drawing blank.
+            name: []const u8 = "",
+            icon: []const u8 = "",
+            /// An ARRAY, and a feed can name several. v1 reads the first one it
+            /// will dial and says so; reading all of them is v3's job.
+            relays: []const []const u8 = &.{},
+            pubkeys: []const []const u8 = &.{},
+        } = &.{},
+    };
+    var parsed = std.json.parseFromSlice(Wire, gpa, content, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const w = parsed.value;
+
+    var m = Place{};
+    m.name_len = @intCast(copyBounded(&m.name_buf, w.appName));
+    m.home_len = @intCast(copyBounded(&m.home_buf, w.homeMarkdown));
+    for (w.hardcodedFeeds) |f| {
+        if (m.feeds_len == m.feeds.len) break;
+        // The first relay of this feed that is safe to dial. A feed whose relays
+        // are all refused is skipped, and the rest of the place still applies.
+        var chosen: []const u8 = "";
+        for (f.relays) |r| {
+            if (isSafeRelayUrl(r)) {
+                chosen = r;
+                break;
+            }
+        }
+        if (chosen.len == 0) continue;
+
+        var out = PlaceFeed{};
+        out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
+        const label = if (f.name.len > 0) f.name else relayHost(chosen);
+        out.name_len = @intCast(copyBounded(&out.name_buf, label));
+        m.feeds[m.feeds_len] = out;
+        m.feeds_len += 1;
+    }
+
+    // A place with nothing to say is not a place. This is what stops any random
+    // kind:30078 (the kind is shared by every app that stores settings) from
+    // being applied as one.
+    if (m.name_len == 0 and m.home_len == 0 and m.feeds_len == 0) return null;
+    return m;
+}
+
+/// A relay URL without its scheme or trailing slash, for naming a feed that did
+/// not name itself.
+fn relayHost(url: []const u8) []const u8 {
+    var h = url;
+    if (std.mem.startsWith(u8, h, "wss://")) h = h["wss://".len..];
+    return std.mem.trimEnd(u8, h, "/");
+}
+
+/// Copies as much of `src` as fits, on a UTF-8 boundary, and returns the length.
+fn copyBounded(dst: []u8, src: []const u8) usize {
+    var n = @min(src.len, dst.len);
+    // Same boundary rule as the reply snippet: a field cut mid-character draws
+    // a replacement glyph, which is worse than a shorter field.
+    if (n < src.len) {
+        while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
+    }
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+/// Whether a relay URL from a place is one this app will dial.
+///
+/// The sharpest field in the document: it decides where the app connects. Plain
+/// `wss://` only, no control bytes, no spaces, and short enough to hold. A place
+/// cannot point Plaza at `ws://` in the clear, and cannot smuggle a newline into
+/// a frame.
+pub fn isSafeRelayUrl(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "wss://")) return false;
+    if (url.len <= "wss://".len or url.len > place_relay_cap) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+// -------------------------------------------------- things you can take away
+//
+// A client you can make quiet.
+//
+// Every element here is one the reader can remove, and the point of the whole
+// thing is the second column: a hidden thing should not be FETCHED. Hide
+// reaction counts and the subscription stops asking relays for kind:7, so the
+// preference is less bandwidth, less parsing and a smaller store rather than a
+// number painted over. It is also what makes the claim honest. "The data is
+// absent" and "the data is covered up" are different promises, and only one of
+// them can be made about a thing that is still being downloaded.
+//
+// A registry rather than a handful of booleans on the Model, because the ids are
+// written to a file and will eventually be a NIP-78 `kind:30078` record, and
+// because the same table drives the settings list. That list is not decoration:
+// hide something, forget, and there is nothing left to right click. One screen
+// naming everything that can be hidden is how this avoids the way hide-based
+// customisation usually fails.
+//
+// Subtractive on purpose. Taking things away cannot make the app ugly or slow;
+// rearranging can, and it would mean making the feed's layout data-driven, which
+// is an architectural change rather than a preference.
+
+/// What can be hidden. The enum is the index into the registry below, so a call
+/// site is checked at compile time while the table stays data.
+/// What can be taken away. Each verb has two, and they are a hierarchy rather
+/// than two independent switches: hiding the VERB hides its count with it,
+/// because an icon that is not drawn has nowhere to put a number.
+pub const Hideable = enum {
+    replies,
+    reply_counts,
+    reposts,
+    repost_counts,
+    reactions,
+    reaction_counts,
+    zaps,
+    zap_totals,
+};
+
+pub const HideableInfo = struct {
+    /// Stable across releases: it is written to the settings file, so renaming
+    /// one silently un-hides whatever somebody had already hidden.
+    id: []const u8,
+    label: []const u8,
+    /// What hiding it says, in the one place a reader will look for it.
+    detail: []const u8,
+    /// The kinds the app stops asking for. Empty means hiding this one changes
+    /// what is drawn and nothing else, which has to be stated rather than
+    /// implied.
+    drops: []const u16 = &.{},
+};
+
+pub const hideables = [_]HideableInfo{
+    .{
+        .id = "replies",
+        .label = "Replying",
+        .detail = "The reply verb itself. Hiding it takes the count with it, and stops the feed asking relays for replies to the notes on screen. You can still open a note and answer it there.",
+        .drops = &.{1},
+    },
+    .{
+        .id = "reply_counts",
+        .label = "Reply counts",
+        .detail = "How many people answered a note, with the verb left in place. The number alone is enough to stop the feed asking for them.",
+        .drops = &.{1},
+    },
+    .{
+        // No `drops` on either repost row, and this is the honest half of the
+        // feature rather than an oversight. Whether YOU reposted something is
+        // read out of the same kind:6 stream as everybody else's reposts, so
+        // dropping it would leave the repost verb unable to say it had already
+        // been pressed. Hiding it is worth having; claiming the data is gone
+        // would not be true.
+        .id = "reposts",
+        .label = "Reposting",
+        .detail = "The repost verb itself. Still fetched either way: it is the same stream that tells Plaza whether you reposted something.",
+    },
+    .{
+        .id = "repost_counts",
+        .label = "Repost counts",
+        .detail = "How many people passed a note on. Still fetched, for the same reason as the row above.",
+    },
+    .{
+        .id = "reactions",
+        .label = "Reacting",
+        .detail = "The like verb itself. Hiding it takes the count with it and stops the feed asking relays for reactions. Your own likes are still remembered here.",
+        .drops = &.{7},
+    },
+    .{
+        .id = "reaction_counts",
+        .label = "Reaction counts",
+        .detail = "How many people liked a note. Hiding it stops the FEED asking relays for reactions. Your notifications are a separate subscription and keep theirs, so you still hear when somebody reacts to you. You can still like things; your own heart is remembered here.",
+        .drops = &.{7},
+    },
+    .{
+        .id = "zaps",
+        .label = "Zapping",
+        .detail = "The zap verb itself. Hiding it takes the total with it and stops the feed asking relays for zap receipts.",
+        .drops = &.{9735},
+    },
+    .{
+        .id = "zap_totals",
+        .label = "Zap totals",
+        .detail = "How many sats a note was sent. Hiding it stops the FEED asking relays for zap receipts. You still hear when somebody zaps you.",
+        .drops = &.{9735},
+    },
+};
+
+// The registry is indexed by `Hideable`, so the two have to stay in step. They
+// are checked here rather than trusted: a row inserted in the wrong place would
+// hide the wrong thing, and nothing about that failure looks like a mistake.
+// Making the id the tag's own name is what lets this be a compile error.
+comptime {
+    if (hideables.len != @typeInfo(Hideable).@"enum".fields.len) {
+        @compileError("every Hideable needs exactly one registry row");
+    }
+    for (@typeInfo(Hideable).@"enum".fields) |field| {
+        const row = hideables[field.value];
+        if (!std.mem.eql(u8, row.id, field.name)) {
+            @compileError("Hideable." ++ field.name ++ " does not line up with registry id \"" ++ row.id ++ "\"");
+        }
+    }
+}
+
+var g_hidden: [hideables.len]bool = @splat(false);
+
+/// Whether the reader has taken `what` away.
+pub fn isTakenAway(what: Hideable) bool {
+    return g_hidden[@intFromEnum(what)];
+}
+
+pub fn setHidden(what: Hideable, off: bool) void {
+    if (g_hidden[@intFromEnum(what)] == off) return;
+    g_hidden[@intFromEnum(what)] = off;
+    // The open subscriptions are asking a question that has changed. Without
+    // this, turning reactions off stops the counts being drawn and leaves every
+    // relay still sending them, which is the cosmetic version of this feature
+    // and the one it exists not to be.
+    _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
+    invalidateFeed();
+}
+
+/// How many things are hidden right now, for the settings screen to say so.
+pub fn hiddenCount() usize {
+    var n: usize = 0;
+    for (g_hidden) |h| {
+        if (h) n += 1;
+    }
+    return n;
+}
+
+/// Backing store for the engagement filter's kinds. A `Filter` borrows its
+/// `kinds` slice, so it cannot be built on the caller's stack.
+var g_engagement_kinds: [engagement_kinds.len]u16 = undefined;
+
+/// The kinds an engagement subscription asks for, with the hidden ones left out.
+///
+/// This is the function that makes the preference real. Kind 1 is always in it
+/// (a reply count is not hideable, and replies are the notes themselves), and so
+/// are 6 and 16, for the reason in the registry.
+///
+/// THE FEED'S subscription, and only that one. `inbox_kinds` asks the same
+/// relays for the same kinds and is deliberately left alone: hiding how many
+/// people liked a note is not asking to stop being told when somebody likes
+/// YOURS. Those are different questions and they get different answers, which
+/// is why the settings rows say "the feed" rather than "Plaza". Claiming a kind
+/// is no longer requested while another subscription still requests it is the
+/// exact shape of overclaim this feature exists not to make.
+fn engagementKinds() []const u16 {
+    var n: usize = 0;
+    for (engagement_kinds) |k| {
+        const drop = switch (k) {
+            1 => countHidden(.replies, .reply_counts),
+            7 => countHidden(.reactions, .reaction_counts),
+            9735 => countHidden(.zaps, .zap_totals),
+            // 6 and 16 stay whatever is hidden, for the reason in the registry.
+            else => false,
+        };
+        if (drop) continue;
+        g_engagement_kinds[n] = k;
+        n += 1;
+    }
+    return g_engagement_kinds[0..n];
+}
+
+/// Whether a verb's number is gone, either because the number was hidden or
+/// because the whole verb was.
+///
+/// The hierarchy, in one place. Hiding a verb hides its count with it: an icon
+/// that is not drawn has nowhere to put a number, so treating the two as
+/// independent would leave a count that could never be seen still being fetched.
+pub fn countHidden(verb: Hideable, count: Hideable) bool {
+    return isTakenAway(verb) or isTakenAway(count);
+}
+
+/// The settings file's `hidden=` value: the ids of what is hidden, comma
+/// separated.
+///
+/// By ID, never by position. A list of booleans in registry order would mean
+/// that adding an element, or reordering one, silently moves everybody's
+/// preferences onto different things. These ids are also the shape a NIP-78
+/// record will use when this syncs, so they are already the durable name.
+pub fn hiddenLine(buf: []u8) []const u8 {
+    var len: usize = 0;
+    for (hideables, 0..) |h, i| {
+        if (!g_hidden[i]) continue;
+        const sep = if (len == 0) "" else ",";
+        const wrote = std.fmt.bufPrint(buf[len..], "{s}{s}", .{ sep, h.id }) catch break;
+        len += wrote.len;
+    }
+    return buf[0..len];
+}
+
+/// The other half. An id this build does not know is skipped rather than
+/// refused: a settings file written by a newer Plaza should still open here with
+/// everything it does understand intact.
+pub fn applyHiddenLine(value: []const u8) void {
+    var ids = std.mem.splitScalar(u8, value, ',');
+    while (ids.next()) |id| {
+        for (hideables, 0..) |h, i| {
+            if (std.mem.eql(u8, h.id, id)) g_hidden[i] = true;
+        }
+    }
+}
+
+pub fn engagementKindsForTest() []const u16 {
+    return engagementKinds();
+}
+// How often the feed's engagement subscription may be widened as more notes
+// load. A REQ under an existing id replaces it, so widening is one message, but
+// a busy feed adds ids continuously and re-asking on each one would be its own
+// flood.
+const engagement_widen_ms: i64 = 5_000;
 // The composer's fixed text capacity. The display buffer
 // (`Note.content_buf`) truncates for rendering, but the published event carries
 // the full draft.
 //
 // It was 512, which is not "comfortably longer than a typical note": it is
 // shorter than an ordinary announcement. Past it the buffer silently dropped
-// what would not fit, while the footer said "no length limit", so a paste came
-// back cut mid-sentence with nothing on screen admitting it. The editor widget
-// keeps its own copy of the text, so the two then disagreed about the content
-// and re-wrapped it differently on the same frame, which is what made the
-// composer look scrambled and feel slow.
+// what would not fit while the footer said "no length limit", so a paste came
+// back cut mid-sentence with nothing on screen admitting it.
+//
+// This comment used to go on to blame that for the scrambled composer in #165,
+// on the theory that the editor's own copy and this one disagreed and re-wrapped
+// differently on the same frame. That is not established. #165 was filed the
+// same day and says plainly that raising the cap left the scrambling exactly as
+// it was, and the scramble has not been reproduced since, under the harness or
+// in use. Two bugs that looked like one, and the guess is removed rather than
+// left here to be read as a finding.
+//
+// The silent-dropping half is real and is NOT solved by a bigger number: it
+// moved the wall from 512 to 4096. What fixes it is saying so, which is what
+// `draft_dropped` is for.
 const compose_capacity = 4096;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
@@ -1403,6 +3094,7 @@ else
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
 const copy_nevent_key: u64 = 103;
+const copy_bunker_key: u64 = 104;
 const copy_note_text_key: u64 = 104;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
@@ -1422,7 +3114,29 @@ const open_url_key: u64 = 102;
 // (a full thread: the active user + the root + up to `thread_reply_cap` replies)
 // with headroom for recently-seen authors, so the mark pass never has to evict
 // an author it just marked. Names are cheap; only avatars are slot-bound.
-const profile_cap = thread_reply_cap + 60;
+// 4096, and it costs nothing. Measured at the 2048-follow ceiling with the
+// follow-list walk removed: 3714us at 256, 3743us at 1024, 3627us at 4096,
+// which is one number three times inside noise.
+//
+// It used to cost a great deal (6018us at 160 rising to 26258us at 4096) and
+// the reason was not the cache. `refreshProfiles` derived its LMDB query limit
+// from this constant, so growing the cache grew a database read that ran on
+// every feed rebuild. Two unrelated quantities sharing one name.
+//
+// The index is twice the capacity, because an open-addressed table at full load
+// degrades to a linear scan.
+//
+// The research said to raise this to 4096, citing Jumble's 5000. That is wrong
+// FOR THIS CODEBASE and the measurement says so: several paths walk the whole
+// array once per feed rebuild, so the cost is linear in this number. At the
+// 2048-follow ceiling the rebuild measured 6018us at 160, 9499us at 256,
+// 12213us at 512 and 16259us at 2048, against a 16000us frame. Jumble can hold
+// 5000 because its cache is a hash map, not an array anything scans.
+//
+// 256 buys real headroom over a screenful of notifications for 3.5ms, and stops
+// there. The right way to earn more is to stop upserting every follow into an
+// LRU sized for on-screen authors, which is its own piece of work.
+const profile_cap = 4096;
 
 comptime {
     // The avatar pass marks the whole on-screen author set (active user + a
@@ -1549,6 +3263,8 @@ const reply_row_extent: f32 = 62;
 const nested_avatar_size: f32 = 28;
 const nested_name_scale: f32 = 13.0 / 14.5;
 const nested_body_scale: f32 = 13.5 / 14.5;
+/// How much of the answered note the reply line shows before it elides.
+const reply_context_snippet_chars: usize = 80;
 const nested_meta_scale: f32 = 11.5 / 14.5;
 const op_chip_scale: f32 = 9.0 / 14.5;
 /// A nested reply minus its body, the branch line, and the show-more line, all
@@ -1569,6 +3285,8 @@ const ancestor_identity_gap: f32 = 4;
 /// before they are laid out. The column is the estimator's own 70 characters per
 /// line at the 14.5 body, held to the 13.5 register.
 const ancestor_body_lines: usize = 2;
+/// A notification's preview, for the same reason and by the same rule.
+const notification_body_lines: usize = 2;
 /// A quote is an aside, so it shows four lines of the note it quotes and stops
 /// (11f). Its height is then known where the row around it is priced.
 const quote_body_lines: usize = 4;
@@ -1604,6 +3322,11 @@ const compose_sheet_width: f32 = 560;
 /// around a single input reads as a form.
 const join_sheet_width: f32 = 372;
 const name_card_width: f32 = 340;
+/// The two other modal card widths, named because a `.dialog` now needs its
+/// width stated: the SDK centres a modal at its preferred size and falls back to
+/// a 420pt default, which silently clamped the profile card's 400 + 16 padding.
+const profile_edit_card_width: f32 = 400;
+const join_card_width: f32 = 420;
 const join_title_scale: f32 = 17.0 / 14.5;
 const join_sub_scale: f32 = 11.5 / 14.5;
 const join_label_scale: f32 = 9.0 / 14.5;
@@ -1661,11 +3384,20 @@ const quote_aside_chrome: f32 = 62.125;
 /// states draw a bar or a single line where the identity would be.
 const quote_quiet_chrome: f32 = 5 + 4 + 2 + 2;
 const ancestor_chars_per_line: usize = @intFromFloat(70 / nested_body_scale);
-/// A body line is a BODY line whatever register it is set in: `textSpansMaxScale`
-/// starts at 1 and only takes the max, so a paragraph whose spans are all scaled
-/// DOWN still gets `14.5 * 1.25`. Scale shrinks glyphs, never the line box, and
-/// every term here that priced a scaled run at its own size was short.
-const ancestor_line_height: f32 = body_line_height;
+/// A nested line, at the height it now actually draws.
+///
+/// This used to be `body_line_height`, with a comment explaining that a body
+/// line is a body line whatever register it is set in: `textSpansMaxScale`
+/// starts at 1 and only takes the max, so a paragraph whose spans were all
+/// scaled DOWN still got a full `14.5 * 1.25` box. That was a true description
+/// of the engine and a workaround for a defect, and pricing around it kept the
+/// defect: the glyphs shrank and the line box did not, so every nested line sat
+/// a point low with a point and a quarter of air above it.
+///
+/// The nested register is asked for by its SIZE now (`.sm`, which is
+/// `body_size - 1`), so the box is the one the text needs and the estimate is
+/// the height it draws.
+const ancestor_line_height: f32 = nested_line_height;
 const ancestor_row_chrome: f32 = avatar_size + ancestor_identity_gap + ancestor_bottom_pad;
 /// A ghost row: its two quiet lines set the height, not the dashed disc. Both are
 /// scaled down and both still take a full body line box (see
@@ -1682,6 +3414,9 @@ const focal_leading_pad: f32 = 16;
 /// One wrapped body line, as the engine actually lays it out (`size * 1.25` at a
 /// 14.5 body). Measured live, and the estimator's unit.
 pub const body_line_height: f32 = 18.125;
+/// The same for the nested register, which is `.sm` (`body_size - 1`) and so
+/// lays out at `13.5 * 1.25`.
+pub const nested_line_height: f32 = 16.875;
 /// The redesign's metadata register: 12px for handles, timestamps and counts.
 /// `.size = .sm` cannot say it (the size enum steps by exactly one from the 14.5
 /// body, giving 13.5), so these runs are scaled spans, which take an exact
@@ -1708,8 +3443,14 @@ pub const engagement_row_height: f32 = verb_slot_height;
 /// redesign's own number, so the estimate cannot drift from the layout.
 pub const feed_row_chrome: f32 = row_pad_top + avatar_size + 5 + 10 + engagement_row_height + row_pad_bottom + 1;
 
-pub const max_avatar_images = 9;
-const max_media_images = 6;
+/// How many pictures the app can be showing at once.
+///
+/// A POLICY cap inside the shared pool, not a reserved share of it: a screen of
+/// two four-picture notes plus a three-picture one is what a Nostr feed
+/// actually looks like, and the old six was a reservation that made the fourth
+/// picture of the second note impossible however idle the rest of the registry
+/// was. The registry still decides how many of these hold pixels at once.
+const max_media_images = 12;
 
 /// A span of feed rows, inclusive at both ends. Named rather than anonymous so
 /// the visible span and the warmed span are the same type and one can be built
@@ -1723,6 +3464,15 @@ pub const RowRange = struct { first: usize, last: usize };
 /// is about a screen either way at the feed's row height, which is the distance
 /// a flick covers before the next tick can react.
 const feed_prefetch_rows: usize = 16;
+/// SUPERSEDED, kept for the argument it lost.
+///
+/// The banner had a reserved id, on the reasoning that one non-scrolling
+/// consumer does not exercise an allocator. That was true, and it stopped being
+/// the point: pictures did cross the pools, so the allocator exists now, and a
+/// reserved id would be the one slot it could not reach.
+///
+/// The old note:
+///
 /// The profile banner's own id, taken out of the avatar pool rather than
 /// borrowed from either LRU.
 ///
@@ -1740,16 +3490,11 @@ const feed_prefetch_rows: usize = 16;
 /// visible window, and a window this size holds a handful of rows, so the tenth id
 /// only ever lengthened the LRU tail. A reclaimed avatar returns from the disk
 /// cache, not the network.
-const banner_image_id: u64 = max_avatar_images + 1;
-comptime {
-    // The split may never promise more ids than the registry owns: overshooting
-    // shows up as a silent `error.ImageRegistryFull` at the 17th registration,
-    // which reads as "this author has no avatar" rather than as a budget bug.
-    if (max_avatar_images + 1 + max_media_images > image_registry_slots) {
-        @compileError("the image budget oversubscribes the canvas registry");
-    }
-}
-const media_image_id_base: u64 = banner_image_id + 1;
+/// Which registry id the banner is holding, or 0 for none. A variable now,
+/// because the banner takes its slot from the same pool as everything else.
+var g_banner_image_id: u64 = 0;
+/// The tick the banner was last on screen.
+var g_banner_seen: u64 = 0;
 /// What a banner is asked for and bounded to.
 ///
 /// 512 and not a pixel more: `decodeAndRegister` scales the LONG edge to this,
@@ -1766,9 +3511,21 @@ const banner_target_px: u32 = 512;
 // blows it. 480x480 leaves honest headroom under the cap.
 const avatar_target_px: u32 = 128;
 const media_target_px: u32 = 480;
-// The largest body we accept from a fetch. The effect caps at 256 KiB anyway;
+// The largest body we accept from ONE fetch. The effect caps at 256 KiB anyway;
 // stopping a little short keeps the decode budget for images that will fit.
 const max_image_bytes = 240 * 1024;
+// The largest picture we will assemble out of several of those.
+//
+// A response body is capped at `max_image_bytes`, and an ordinary phone photo
+// is several times that: every picture in a Nostr feed shot on a phone is
+// 300 KB to 2 MB, so "one body" was never a size a photo fits in. A picture
+// over it is asked for in slices (HTTP Range) and reassembled here.
+//
+// The ceiling is a real refusal, not a formality: bytes arriving from a
+// stranger's host are held whole in memory before they decode, so something
+// has to say when to stop. Four MiB covers a full-frame camera JPEG and
+// refuses a file that is not a feed picture at all.
+const max_image_download_bytes = 4 * 1024 * 1024;
 // The registry's own ceiling on one decoded image.
 const max_registered_image_bytes = 1024 * 1024;
 // Animated GIFs decode every frame up front, so they are bounded twice over: by
@@ -1816,12 +3573,30 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // write lock one at a time) and hands readers an MVCC snapshot, and every
 // `nostr.store` call is a self-contained transaction on its calling thread.
 
-const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2 };
+/// A relay slot's connection state.
+///
+/// `quiet` is the state this app used to be unable to express, and the reason a
+/// green dot could be a lie: the socket is open, nothing has come down it for a
+/// while, and a ping is out with no answer yet. It is not offline, because
+/// nothing has failed; it is not plainly connected either, because the last
+/// evidence of that is a minute old. Every shipping client the pool was
+/// compared against has exactly two states here and shows the same green dot
+/// over a half-open socket, so this is not a bug being fixed so much as a lie
+/// being stopped.
+const Conn = enum(u8) { connecting = 0, connected = 1, offline = 2, quiet = 3 };
 
 var g_store: ?*nostr.store.Store = null;
 // One connection state per relay in the pool, flipped by that relay's ingest
 // thread and read by the UI thread to summarise the pool.
 var g_relay_status = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(Conn.connecting))} ** max_relays;
+
+/// Whether a slot holds a socket, whatever the socket is doing. A relay that has
+/// gone quiet has not dropped: nothing has failed, and counting it as offline
+/// would put the whole app behind an "offline, reconnecting" banner because the
+/// night was slow.
+fn connHolds(state: Conn) bool {
+    return state == .connected or state == .quiet;
+}
 
 /// Arrival order inside a thread level: the build a reply first appeared in, so a
 /// late arrival lands after what has already been read instead of jumping into the
@@ -1936,21 +3711,382 @@ fn claimArrival(table: *ArrivalTable, id: [32]u8, live: []const Note) u32 {
 /// A thread level's reading order: the batch a reply arrived in, then when it was
 /// written. ONE comparator, called by the open thread and by every level under
 /// it, so a level reads the same both ways round.
+/// Orders a thread's replies: arrival first, then chronological within a batch,
+/// so a reply that showed up later sits after the ones already read even when it
+/// was written earlier.
+///
+/// Sorts an array of INDICES and permutes once, rather than sorting the notes
+/// themselves. Two reasons, and the second one is a hard constraint rather than
+/// a preference.
+///
+/// A `Note` is kilobytes, because it carries the note's text inline. Sorting
+/// them directly means the sort swaps whole notes around: ~100 log 100 moves of
+/// a multi-kilobyte struct to order a list whose keys are two integers. Indices
+/// are four bytes and the permutation touches each note once.
+///
+/// The constraint: `std.mem.sort` is a stable block sort, and its rotate step
+/// calls `std.mem.reverse`, which asks `std.simd.suggestVectorLength` for a
+/// vector width. That computes `ceilPowerOfTwo(u16, @bitSizeOf(T))`, so ANY
+/// element type over 4096 bytes overflows a u16 and fails to compile, inside
+/// the standard library, with no mention of the caller. That put a hard ceiling
+/// of 4096 bytes on `Note` and therefore on how much of a note Plaza could hold,
+/// which is not a limit anybody chose. Sorting `u32` keeps the stdlib on a small
+/// type and the ceiling disappears.
 pub fn sortThreadNotes(notes: []Note) void {
-    std.mem.sort(Note, notes, {}, struct {
-        fn lt(_: void, a: Note, b: Note) bool {
-            // Arrival first, then chronological within a batch: a reply that
-            // showed up later sits after the ones already read, even when it was
-            // written earlier.
-            if (a.arrival != b.arrival) return a.arrival < b.arrival;
-            return a.created_at < b.created_at;
+    if (notes.len < 2) return;
+    var order: [thread_reply_cap]u32 = undefined;
+    if (notes.len > order.len) return;
+    for (0..notes.len) |i| order[i] = @intCast(i);
+
+    const Ctx = struct {
+        notes: []const Note,
+        fn lt(self: @This(), a: u32, b: u32) bool {
+            const x = &self.notes[a];
+            const y = &self.notes[b];
+            if (x.arrival != y.arrival) return x.arrival < y.arrival;
+            return x.created_at < y.created_at;
         }
-    }.lt);
+    };
+    // The STABLE sort, so a batch that arrived together keeps the order it
+    // arrived in. A thread loaded in one go stamps every reply with the same
+    // arrival, and relays answer in whatever order they please, so without this
+    // the conversation could reshuffle between rebuilds under the reader.
+    //
+    // Stability comes from the algorithm and not from a tiebreak in the
+    // comparator. I wrote the tiebreak version first and could not make any
+    // probe fail: the unstable sort preserves equal elements anyway at these
+    // sizes, so the tiebreak was a second mechanism for a property already held,
+    // and one that no test could show was doing anything.
+    //
+    // Sorting `u32` rather than `Note` is what makes this legal at all: see the
+    // ceiling described above.
+    std.mem.sort(u32, order[0..notes.len], Ctx{ .notes = notes }, Ctx.lt);
+
+    // Permute in place by following each cycle, so this costs one move per note
+    // and needs no second array of notes.
+    var scratch: Note = undefined;
+    var done = [_]bool{false} ** thread_reply_cap;
+    for (0..notes.len) |start| {
+        if (done[start] or order[start] == start) {
+            done[start] = true;
+            continue;
+        }
+        scratch = notes[start];
+        var at = start;
+        while (true) {
+            const from = order[at];
+            done[at] = true;
+            if (from == start) {
+                notes[at] = scratch;
+                break;
+            }
+            notes[at] = notes[from];
+            at = from;
+        }
+    }
 }
 
 /// Sets relay `index`'s live connection state.
 fn setRelayStatus(index: usize, state: Conn) void {
+    const was: Conn = @enumFromInt(g_relay_status[index].load(.monotonic));
     g_relay_status[index].store(@intFromEnum(state), .monotonic);
+    // A relay coming back is the event a queued note has been waiting for. The
+    // backoff was only ever reset by editing the relay list, so a note that had
+    // widened out to an hourly retry stayed on that schedule even when the
+    // network returned a second later.
+    //
+    // Coming back from QUIET does not count. A relay answering the keepalive it
+    // was sent is not news about the network, it is news about that one socket,
+    // and treating it as a recovery would let a quiet pool reset the queue's
+    // ladder every minute forever.
+    if (state == .connected and was != .connected and was != .quiet) wakeOutboxBackoff();
+}
+
+// -- Knowing a socket is still there -----------------------------------------
+//
+// A relay's ingest thread blocks in `receive` until the relay says something.
+// If the peer goes away without closing, that thread waits forever and the chip
+// stays green: no error, no timeout, no reconnect. Nothing in this app could
+// tell that apart from a quiet night.
+//
+// Nothing can tell it apart from inside that thread either, which is the whole
+// difficulty. A thread waiting on a dead peer cannot notice anything. So a
+// separate one watches the pool: it sends the ping, and it is the one that can
+// still act when no answer comes.
+//
+// The numbers are Amethyst's, who surveyed 122 relays and found idle timeouts
+// clustered at roughly 60, 120, 240, 300 and 600 seconds, and who report that a
+// ping only reliably holds a connection open when its interval is at most about
+// half the timeout. Thirty seconds sits under half of the shortest tier. Ninety
+// is three missed answers, which is the point at which a socket that has not
+// said a word to three pings is not coming back.
+const relay_ping_after_ms: i64 = 30_000;
+const relay_dead_after_ms: i64 = 90_000;
+/// How often the keeper looks. Short enough that ninety seconds means ninety,
+/// long enough to cost nothing.
+const relay_keeper_tick_ms: u64 = 5_000;
+
+/// The live connection for each slot, for the keeper and nothing else.
+///
+/// Published by the thread that dialled it and cleared by that same thread
+/// before the connection is freed, both under the slot's lock, and the keeper
+/// holds that lock for as long as it touches the pointer. Without it the keeper
+/// can be inside `ping` on a `Relay` whose owner has already returned and run
+/// its `deinit`.
+/// One per pool slot, plus one for the bunker listener.
+///
+/// The listener is not a pool relay (it is not in the reader's list, it is not
+/// published to, it has no badge) but it is the same kind of thing: a socket
+/// held open indefinitely by a thread blocked in `receive`. When it half-opens,
+/// remote signing stops working with no error anywhere, which is the worst way
+/// for a signer to fail.
+const relay_watch_slots = max_relays + 1 + max_discovered_relays;
+const bunker_watch_slot = max_relays;
+/// The discovered connections sit past the pool and the bunker. They are
+/// watched the same way and deliberately have no entry in the pool's status
+/// table: they are not the reader's relays, they are where the reader's follows
+/// turned out to be, and a chip claiming otherwise would be a lie about whose
+/// list this is.
+const discovered_watch_base = max_relays + 1;
+
+var g_relay_live: [relay_watch_slots]?*nostr.relay.Relay = @splat(null);
+var g_relay_live_lock: [relay_watch_slots]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+/// When each slot was last pinged, so a socket that stops answering is pinged
+/// once per interval rather than once per keeper tick.
+var g_relay_pinged_ms: [relay_watch_slots]i64 = @splat(0);
+
+fn lockLiveRelay(index: usize) void {
+    while (g_relay_live_lock[index].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockLiveRelay(index: usize) void {
+    g_relay_live_lock[index].store(false, .release);
+}
+
+/// Offers this slot's connection to the keeper, or withdraws it. The owning
+/// thread calls this with the connection on the way in and with null on the way
+/// out, BEFORE the connection is freed.
+///
+/// Named "offer", not "publish". It hands over a POINTER; nothing here sends
+/// anything to a relay, and a name that reads as publishing an event on a code
+/// path near a signing key is the kind of thing that gets misread once and then
+/// trusted.
+fn offerLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
+    lockLiveRelay(index);
+    defer unlockLiveRelay(index);
+    g_relay_live[index] = relay;
+    g_relay_pinged_ms[index] = 0;
+}
+
+/// What the keeper decides for one slot, given how long that connection has
+/// been silent and when it was last pinged. Pulled out so it can be asserted
+/// without a socket, a thread or a clock.
+const KeeperAction = enum { leave_it, ping, give_up };
+
+fn keeperAction(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
+    // Nothing has ever arrived on this connection. That is the window between
+    // the handshake and the relay's first word, not a stall, and treating a
+    // missing measurement as an infinite one would cut off every relay that
+    // took a moment to answer.
+    const idle = idle_ms orelse return .leave_it;
+    if (idle >= relay_dead_after_ms) return .give_up;
+    if (idle < relay_ping_after_ms) return .leave_it;
+    // Silent past the interval. Ping, but only once per interval: at a five
+    // second tick a socket that has stopped answering would otherwise be pinged
+    // twelve more times on its way to being declared dead.
+    const since = since_ping_ms orelse return .ping;
+    return if (since >= relay_ping_after_ms) .ping else .leave_it;
+}
+
+// -- A question that cannot be asked forever ---------------------------------
+//
+// Every fetch that is not the feed dials its own socket, asks one question and
+// reads until EOSE. `receive` has no deadline, so a relay that accepts the REQ
+// and then goes quiet holds that thread for the life of the process. Several of
+// these loops are bounded by a message COUNT, which does not help at all: a
+// relay that sends nothing never reaches the count either.
+//
+// The keeper already watches the pool's sockets and already knows how to
+// half-close one. A one-shot registers with it under a deadline and gets the
+// same treatment for the same reason: the thread that would notice is the
+// thread that is blocked.
+//
+// The deadline is ABSOLUTE, not idle. A fetch is a question with an answer, not
+// a conversation, so what needs bounding is how long the whole exchange may
+// take. A relay dribbling one event every few seconds forever is exactly as
+// stuck as one sending nothing, and an idle deadline would never fire on it.
+//
+// This does NOT stop a one-shot dialling its own socket, which is the other
+// half of the finding and a larger change: the eight pool threads already hold
+// connections these questions could go down, and no answer needs routing back
+// because every event reaches the render thread through the store either way.
+// Worth doing, and not this.
+const one_shot_slots = 16;
+/// Per relay, not per fetch. A fetch walks the pool one relay at a time, so a
+/// whole sweep can still take several of these; what it can no longer do is
+/// take forever.
+///
+/// Eight seconds sits among what the reference clients allow one request:
+/// welshman 3s, Amethyst 8s, NDK and Jumble 10s.
+const one_shot_budget_ms: i64 = 8_000;
+/// Written into a cut slot's deadline so the keeper does not cut the same
+/// socket again on every tick until its owner notices. The owner clears it.
+const one_shot_already_cut: i64 = std.math.maxInt(i64);
+
+var g_oneshot_lock = std.atomic.Value(bool).init(false);
+var g_oneshot: [one_shot_slots]?*nostr.relay.Relay = @splat(null);
+var g_oneshot_deadline: [one_shot_slots]i64 = @splat(0);
+
+fn lockOneShot() void {
+    while (g_oneshot_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockOneShot() void {
+    g_oneshot_lock.store(false, .release);
+}
+
+/// Puts `relay` under the keeper's deadline until `releaseOneShot`.
+///
+/// Returns null when the table is full, and the caller then runs unwatched
+/// rather than not at all. Sixteen concurrent one-shots is more than this app
+/// starts, and an unbounded read is bad where refusing to read is worse: it
+/// would turn a busy moment into a blank profile.
+fn watchOneShot(io: std.Io, relay: *nostr.relay.Relay, budget_ms: i64) ?usize {
+    const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    lockOneShot();
+    defer unlockOneShot();
+    for (0..one_shot_slots) |i| {
+        if (g_oneshot[i] != null) continue;
+        g_oneshot[i] = relay;
+        g_oneshot_deadline[i] = now + budget_ms;
+        return i;
+    }
+    return null;
+}
+
+/// Takes the connection back out of the keeper's reach. MUST run before the
+/// connection is freed. The keeper only ever holds the pointer under the lock,
+/// and this takes the same lock, which is the whole reason it can never be
+/// inside `shutdown` on a `Relay` that has already been deinit'd.
+fn releaseOneShot(slot: ?usize) void {
+    const i = slot orelse return;
+    lockOneShot();
+    defer unlockOneShot();
+    g_oneshot[i] = null;
+    g_oneshot_deadline[i] = 0;
+}
+
+/// Which one-shot slots have run out of time. Pure over the deadline table, so
+/// what the keeper decides here can be asserted without a socket or a thread.
+///
+/// A slot already cut carries `one_shot_already_cut` and is not returned again:
+/// its owner is on its way out, and shutting the same socket on every tick
+/// until then is noise rather than safety.
+fn expiredOneShots(now_ms: i64, out: *[one_shot_slots]usize) usize {
+    var n: usize = 0;
+    for (0..one_shot_slots) |i| {
+        if (g_oneshot_deadline[i] == 0) continue;
+        if (g_oneshot_deadline[i] == one_shot_already_cut) continue;
+        if (now_ms < g_oneshot_deadline[i]) continue;
+        out[n] = i;
+        n += 1;
+    }
+    return n;
+}
+
+/// Watches every slot's connection for silence: pings one that has gone quiet,
+/// and cuts off one that will not answer. Also holds the deadline on every
+/// one-shot fetch, for the same reason and by the same means.
+fn relayKeeper(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    while (true) {
+        io.sleep(std.Io.Duration.fromMilliseconds(relay_keeper_tick_ms), .awake) catch {};
+        const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        for (0..relay_watch_slots) |i| {
+            lockLiveRelay(i);
+            defer unlockLiveRelay(i);
+            const relay = g_relay_live[i] orelse continue;
+            const idle = relay.idleMs(io);
+            const since_ping: ?i64 = if (g_relay_pinged_ms[i] == 0) null else now - g_relay_pinged_ms[i];
+            switch (keeperAction(idle, since_ping)) {
+                .leave_it => {},
+                .ping => {
+                    // A failed write is not a verdict on its own; the silence
+                    // deadline is. Letting a write error tear the socket down
+                    // here would race the owning thread's own error handling.
+                    relay.ping(io) catch {};
+                    g_relay_pinged_ms[i] = now;
+                    // The bunker listener has no chip and no slot in the pool's
+                    // status table; it is watched, not displayed.
+                    if (i < max_relays) setRelayStatus(i, .quiet);
+                },
+                .give_up => {
+                    // Half-close, so the owner's blocked `receive` returns and
+                    // it reconnects through its own path. NOT deinit: the owner
+                    // still holds this and has to unwind.
+                    relay.shutdown(io);
+                    g_relay_live[i] = null;
+                    g_relay_pinged_ms[i] = 0;
+                    if (i < max_relays) setRelayStatus(i, .offline);
+                },
+            }
+        }
+
+        // Routed sockets whose slot moved while they were blocked reading.
+        followRouteChanges(io);
+
+        // And the one-shots. Same means, different clock: those above are idle
+        // deadlines on a standing connection, these are absolute deadlines on
+        // an exchange that is supposed to end.
+        {
+            lockOneShot();
+            defer unlockOneShot();
+            var expired: [one_shot_slots]usize = undefined;
+            const n = expiredOneShots(now, &expired);
+            for (expired[0..n]) |i| {
+                const relay = g_oneshot[i] orelse continue;
+                relay.shutdown(io);
+                // Left in the table on purpose. Clearing it here would let the
+                // slot be handed to another fetch while this one's owner still
+                // holds the pointer; the owner clears it on the way out.
+                g_oneshot_deadline[i] = one_shot_already_cut;
+            }
+        }
+    }
+}
+
+/// How often a returning relay may pull the queue's backoff back to zero.
+///
+/// A relay that accepts the handshake and drops the socket reconnects every
+/// three seconds, and without this each of those would reset every note to an
+/// immediate retry: the widening delay would never widen and a dead relay would
+/// be dialled continuously. Amethyst has the same guard for the same reason.
+const outbox_wake_min_s: i64 = 60;
+var g_outbox_woke_at: std.atomic.Value(i64) = .init(0);
+/// Whether a wake has happened at all. A separate flag rather than a zero
+/// sentinel, because zero is a real timestamp: `nowSeconds` returns it whenever
+/// there is no io, and a rate limit that stops working at a particular clock
+/// value is not a rate limit.
+var g_outbox_woke_ever = std.atomic.Value(bool).init(false);
+
+/// Puts every unacked note back at the front of the retry ladder.
+fn wakeOutboxBackoff() void {
+    const now = nowSeconds();
+    if (g_outbox_woke_ever.load(.monotonic) and
+        now -| g_outbox_woke_at.load(.monotonic) < outbox_wake_min_s) return;
+    g_outbox_woke_ever.store(true, .monotonic);
+    g_outbox_woke_at.store(now, .monotonic);
+
+    outboxLock();
+    defer outboxUnlock();
+    var changed = false;
+    for (&g_outbox) |*e| {
+        if (!e.used or e.acked != 0 or e.rounds == 0) continue;
+        e.rounds = 0;
+        changed = true;
+    }
+    if (changed) _ = g_outbox_rev.fetchAdd(1, .monotonic);
 }
 
 /// Whether the reader has paused the pool. Read by every relay thread between
@@ -1970,10 +4106,33 @@ pub fn relaysPaused() bool {
 /// small ring so the bar can show a median rather than the last spike. Zero means
 /// no sample yet.
 const rtt_samples = 8;
-/// The latency probe: a one-event query whose round trip is the number the status
-/// bar shows, and how often each relay is asked for it.
+/// The latency probe: a query whose round trip is the number the status bar
+/// shows, and how often each relay is asked for it.
 const probe_sub = "plaza-ping";
 const probe_interval_ms: i64 = 20_000;
+
+/// What the probe asks for: one event id that cannot exist.
+///
+/// The relay does an index lookup, finds nothing, and answers EOSE. That round
+/// trip is the number the bar wants, and it costs one lookup and zero events.
+///
+/// It used to ask `{"kinds":[1],"limit":1}`: no authors, no since, no until, and
+/// nothing ever closed it. A REQ stays live past EOSE, so every relay then
+/// pushed Plaza every kind:1 it received, from anyone, for the life of the
+/// connection. Each one was parsed, allocated and put through a full Schnorr
+/// verify before being dropped for not being a note this reader is watching. It
+/// also held a subscription slot on every relay permanently, and an unauthored
+/// global request for all text notes is not a thing an ordinary client sends.
+///
+/// An all-zero id is a value no event can have: the id IS the hash, so having
+/// one would mean holding a SHA-256 preimage of thirty-two zero bytes.
+const probe_ids = [_][32]u8{[_]u8{0} ** 32};
+
+/// The probe's REQ. One filter, naming only that id, capped at one event so even
+/// a relay that answered it somehow could not turn the probe into a stream.
+pub fn probeFilters() [1]nostr.filter.Filter {
+    return .{.{ .ids = &probe_ids, .limit = 1 }};
+}
 var g_relay_rtt = [_][rtt_samples]std.atomic.Value(u16){[_]std.atomic.Value(u16){std.atomic.Value(u16).init(0)} ** rtt_samples} ** max_relays;
 var g_relay_rtt_at = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** max_relays;
 
@@ -2038,6 +4197,104 @@ var g_environ: ?*const std.process.Environ.Map = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
 var g_last_count: usize = std.math.maxInt(usize);
+/// The same, for whichever level is open. Separate from `g_last_count` because
+/// the feed consumes that one, and a level opened after a feed rebuild would
+/// otherwise see an unchanged count and never fill.
+var g_last_level_count: usize = std.math.maxInt(usize);
+
+// -- What just arrived -------------------------------------------------------
+//
+// The feed used to answer "has anything changed" by asking the store for the
+// whole thing again, once a second, on the render thread: a cursor per followed
+// author and a linear pick across all of them per note returned. Measured in the
+// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
+// screenful and 10.8 ms once the reader has paged twenty pages down, against a
+// 16.7 ms frame. The cost is set by how many people the reader follows, not by
+// how much actually changed, and almost nothing changes between two ticks.
+//
+// So the ingest threads say what landed instead. No reference client re-reads
+// its store on arrival: Notedeck polls note keys ingested since the last poll
+// and merges them, Jumble splices the arriving event into a sorted array, and
+// Amethyst hands its filter only the new items. This is that, with the ids
+// carried across the thread boundary and the events read back by id, which is a
+// direct read each rather than a walk of the follow list.
+
+/// Ids of kind:1 events an ingest thread has just added to the store.
+///
+/// Sized well past a busy second so the common case never overflows. A backfill
+/// does overflow it, and that is not a loss: overflow means the list in hand
+/// cannot be brought up to date by splicing, so the next rebuild reads the store
+/// in full, which is exactly what a backfill wants anyway.
+const feed_arrival_cap = 1024;
+var g_arrival_lock = std.atomic.Value(bool).init(false);
+var g_arrival_ids: [feed_arrival_cap][32]u8 = undefined;
+var g_arrival_len: usize = 0;
+var g_arrival_overflowed: bool = false;
+/// Read on every tick without taking the lock, so a tick with nothing waiting
+/// costs one atomic load.
+var g_arrival_pending = std.atomic.Value(bool).init(false);
+/// The render thread's private copy, drained under the lock.
+var g_arrival_taken: [feed_arrival_cap][32]u8 = undefined;
+
+/// The list in hand is no longer a valid starting point: read the store in full
+/// on the next rebuild. Safe from any thread.
+///
+/// Set by everything that changes what the feed is a view OF (the author set,
+/// the identity, how deep the reader has paged) and by a deletion, which is the
+/// one arrival a splice cannot express: splicing only ever adds.
+var g_feed_rebuild_all = std.atomic.Value(bool).init(true);
+
+fn invalidateFeed() void {
+    g_feed_rebuild_all.store(true, .release);
+}
+
+fn lockArrivals() void {
+    while (g_arrival_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockArrivals() void {
+    g_arrival_lock.store(false, .release);
+}
+
+fn noteFeedArrival(id: [32]u8) void {
+    lockArrivals();
+    defer unlockArrivals();
+    if (g_arrival_len >= g_arrival_ids.len) {
+        g_arrival_overflowed = true;
+    } else {
+        g_arrival_ids[g_arrival_len] = id;
+        g_arrival_len += 1;
+    }
+    g_arrival_pending.store(true, .release);
+}
+
+/// Empties the buffer into the render thread's copy and reports whether anything
+/// was dropped on the way in.
+///
+/// Everything, in one locked step, at the top of the rebuild. That is what makes
+/// it safe: an event landing while the rebuild is running goes into the emptied
+/// buffer and is spliced on the next tick, rather than falling between the query
+/// and the clear. Taking the count first and clearing after the query would lose
+/// exactly those.
+fn takeFeedArrivals() struct { n: usize, lost: bool } {
+    lockArrivals();
+    defer unlockArrivals();
+    const n = g_arrival_len;
+    @memcpy(g_arrival_taken[0..n], g_arrival_ids[0..n]);
+    const lost = g_arrival_overflowed;
+    g_arrival_len = 0;
+    g_arrival_overflowed = false;
+    g_arrival_pending.store(false, .release);
+    return .{ .n = n, .lost = lost };
+}
+
+/// Forgets what is waiting. For a reset that is about to rebuild from nothing.
+fn clearFeedArrivals() void {
+    lockArrivals();
+    defer unlockArrivals();
+    g_arrival_len = 0;
+    g_arrival_overflowed = false;
+    g_arrival_pending.store(false, .release);
+}
 
 // Plaza's local identity: the keypair that signs composed notes. Loaded in
 // `main` (returning user) or created by the onboarding action, both on the UI
@@ -2071,8 +4328,6 @@ var g_remote_secret_buf: [128]u8 = undefined;
 var g_remote_secret_len: usize = 0;
 // 0 idle, 1 connecting, 2 connected, 3 failed. Drives the onboarding status line.
 var g_remote_status = std.atomic.Value(u8).init(0);
-// Monotonic source of unique NIP-46 request ids.
-var g_req_counter = std.atomic.Value(u64).init(0);
 
 // ------------------------------------------------- the isolated signer helper
 //
@@ -2309,6 +4564,27 @@ pub fn ceremonyCanTakeKeyForTest() bool {
 }
 
 /// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
+/// Pretends this session connected to `pubkey`'s bunker.
+pub fn setRemotePubkeyForTest(pubkey: [32]u8) void {
+    g_remote_pubkey = pubkey;
+}
+
+/// Hands one NIP-46 response event to the listener's handler, as a relay would.
+/// The generation is the live one, so only the checks under test can reject it.
+pub fn deliverNip46ResponseForTest(
+    signer: nostr.keys.Signer,
+    client_kp: nostr.keys.KeyPair,
+    ev: nostr.event.Event,
+) void {
+    handleNip46Response(
+        std.heap.page_allocator,
+        signer,
+        client_kp,
+        ev,
+        g_remote_generation.load(.acquire),
+    );
+}
+
 pub fn setSignerKindForTest(kind: []const u8) void {
     g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
         .helper
@@ -2761,6 +5037,37 @@ pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
 /// The tags a body of text implies, for tests. Deliberately takes the finished
 /// string: that is exactly what the publish path passes, which is why a pasted
 /// note and a typed one cannot diverge.
+pub fn resetWantedProfilesForTest() void {
+    g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+}
+
+pub fn wantProfileForTest(pubkey: [32]u8) void {
+    wantProfile(pubkey);
+}
+
+pub fn wantProfilesAheadForTest(model: *const Model) void {
+    wantProfilesAhead(model);
+}
+
+pub fn isProfileWantedForTest(pubkey: [32]u8) bool {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
+    }
+    return false;
+}
+
+pub fn wantedProfileCountForTest() usize {
+    var n: usize = 0;
+    for (&g_wanted) |*w| {
+        if (w.used) n += 1;
+    }
+    return n;
+}
+
+pub fn dupeTagsForTest(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
+    return dupeTags(gpa, tags);
+}
+
 pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
     return contentTags(gpa, content, &.{}, &.{});
 }
@@ -2909,7 +5216,7 @@ fn adoptHelperIdentity(pk: [32]u8) void {
     g_signer_kind = .helper;
     const npub = abbreviateNpub(&g_identity_npub_buf, pk);
     g_identity_npub_len = npub.len;
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
 }
 
 /// Restores a helper identity from a persisted session pubkey. Synchronous: the
@@ -3041,7 +5348,13 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
     // empty would leave the published id not matching its content, so relays
     // would reject it. Deep-copied because `parsed` is freed on return.
-    out.tags = dupeTags(gpa, parsed.value.tags);
+    // Whole, or the note is handed back rather than published. Without the
+    // signed tags the id no longer matches the event, so a relay rejects it and
+    // the reader is told nothing; failing here keeps the note recoverable.
+    out.tags = dupeTags(gpa, parsed.value.tags) orelse {
+        failHelperSign();
+        return;
+    };
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -3285,6 +5598,44 @@ pub fn mediaProxy() []const u8 {
 }
 
 /// Sets the proxy base URL (trimmed; empty disables proxying).
+/// Whether image URLs are routed through the proxy at all.
+///
+/// ON by default, and not only for privacy: the proxy RESIZES. The registry
+/// decodes at most 512x512, so a 2040x1536 photograph is 611 KB direct and a
+/// fraction of that proxied, and the difference is downloaded and thrown away.
+/// One note with three pictures measured 825 KB direct.
+var g_media_proxy_on: bool = true;
+
+/// Whether a picture the proxy REFUSES is then fetched from its own host.
+///
+/// ON by default, because the alternative is a broken picture, and a broken
+/// picture reads as a broken app. The public proxy blocks whole TLDs by policy
+/// (code 400, "Domain or TLD blocked by policy") for Blossom hosts that serve
+/// the same file directly without complaint, and that is not something this app
+/// can fix from here.
+///
+/// The cost is stated rather than hidden: a fallback fetch is a request to that
+/// host, so it sees the reader's address. Turning it off means those pictures do
+/// not load at all, which is a legitimate thing to want and is why this is a
+/// switch rather than a silent behaviour.
+var g_media_direct_fallback: bool = true;
+
+pub fn mediaProxyOn() bool {
+    return g_media_proxy_on;
+}
+
+pub fn setMediaProxyOn(on: bool) void {
+    g_media_proxy_on = on;
+}
+
+pub fn mediaDirectFallback() bool {
+    return g_media_direct_fallback;
+}
+
+pub fn setMediaDirectFallback(on: bool) void {
+    g_media_direct_fallback = on;
+}
+
 pub fn setMediaProxy(url: []const u8) void {
     const trimmed = std.mem.trim(u8, url, " \t\r\n");
     const n = @min(trimmed.len, g_media_proxy_buf.len);
@@ -3328,7 +5679,7 @@ pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u
         return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
     }
     const proxy = mediaProxy();
-    if (proxy.len == 0) return src;
+    if (!g_media_proxy_on or proxy.len == 0) return src;
 
     var encoded_buf: [768]u8 = undefined;
     const encoded = percentEncode(&encoded_buf, src) orelse return src;
@@ -3365,6 +5716,96 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
     return out[0..n];
 }
 
+// -- Asking on a socket that is already open ---------------------------------
+//
+// A one-shot fetch used to dial its own connection to every relay, serially,
+// and read until EOSE. Eight relays meant eight TLS handshakes for one question
+// about one profile, a thread parked for the duration, and a connect bounded
+// only by the operating system.
+//
+// The pool already holds those sockets. No client dials for a one-shot:
+// NDK, Jumble and welshman all bottom out in a pool lookup, every one of them.
+//
+// What makes a shared socket safe here is that there is no reply to deliver.
+// Every event a relay sends is ingested into the store by the thread that owns
+// that socket, whoever asked for it, and the render thread reads the store.
+// That is welshman's ingest policy, and it means a subscription id only has to
+// name a question, never a caller waiting on an answer.
+//
+// So this WRITES the REQ from the asking thread. Writes on a connection are
+// serialized inside the library (nostr v0.8.0), which is what makes it sound
+// while the owning thread is blocked reading the same socket.
+
+/// Prefix for a one-shot's subscription id, so the relay threads can recognise
+/// one and close it at EOSE. Anything not the feed, the inbox or a one-shot is
+/// the engagement subscription, and that dispatch is by prefix rather than by a
+/// list of names precisely so a new question cannot land in the engagement
+/// branch and be counted as somebody liking something.
+const one_shot_sub_prefix = "plaza-ask-";
+
+fn isOneShotSub(sub_id: []const u8) bool {
+    return std.mem.startsWith(u8, sub_id, one_shot_sub_prefix);
+}
+
+/// Asks every READ relay in the pool one question, on the socket it already
+/// holds. Returns how many were asked.
+///
+/// Does not wait, and has nothing to wait for: the answers arrive in the store.
+/// A caller that needs to know when they have arrived watches the store, the
+/// way the profile cache and the feed already do.
+///
+/// A REQ under an existing id REPLACES it (NIP-01), so re-asking the same
+/// question costs one message and no CLOSE, and two batches of the same kind
+/// cannot pile up subscriptions on a relay.
+/// Which pool slots a one-shot question goes to: the ones that take reads.
+///
+/// Split out from the asking so it can be asserted. Inside `askPool` the choice
+/// is invisible to a test: with no live socket every slot is skipped anyway, so
+/// a test of "how many were asked" passes whether or not the read marker is
+/// honoured, which is the assertion looking right for the wrong reason.
+fn askableSlots(out: []usize) usize {
+    var n: usize = 0;
+    for (0..relaySlots()) |i| {
+        if (n >= out.len) break;
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(i, &url_buf) orelse continue;
+        // Asking a write-only relay to answer a filter is asking it the wrong
+        // question. It keeps its socket, for publishing.
+        if (!entry.read) continue;
+        out[n] = i;
+        n += 1;
+    }
+    return n;
+}
+
+fn askPool(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
+    std.debug.assert(isOneShotSub(sub_id));
+    var slots: [max_relays]usize = undefined;
+    const n = askableSlots(&slots);
+    var asked: usize = 0;
+    for (slots[0..n]) |i| {
+        // The lock is what stops the owning thread freeing this connection
+        // while the REQ is being written onto it.
+        lockLiveRelay(i);
+        defer unlockLiveRelay(i);
+        const relay = g_relay_live[i] orelse continue;
+        relay.subscribe(sub_id, filters) catch continue;
+        asked += 1;
+    }
+    return asked;
+}
+
+pub fn askPoolForTest(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
+    return askPool(sub_id, filters);
+}
+pub fn askableSlotsForTest(out: []usize) usize {
+    return askableSlots(out);
+}
+pub fn isOneShotSubForTest(sub_id: []const u8) bool {
+    return isOneShotSub(sub_id);
+}
+pub const oneShotSubPrefixForTest = one_shot_sub_prefix;
+
 // ------------------------------------------------------------------ profiles
 //
 // Kind:0 metadata gives each author a display name and an avatar. The pool
@@ -3380,18 +5821,43 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 // to the follow set's metadata, so a mention of anyone else would render as a
 // bare npub forever; these are fetched separately, once each, and then resolve
 // like any other name.
-const wanted_profiles_cap = 48;
+// Sized to the real ceiling rather than to a guess: a full inbox, a full
+// thread, and headroom. The old table held 48 and, once full, SILENTLY DROPPED
+// every further request: the loop looked for a slot already asked the maximum
+// number of times, found none, and fell off the end having queued nothing. With
+// 144 notifications that is what it did all day, which is why a name only ever
+// arrived after visiting that person's profile, because visiting asks for one.
+//
+// No shipping client has an author cap here. NDK merges `authors` with no limit
+// at all; Amethyst rebuilds one REQ from every name currently on screen.
+const wanted_profiles_cap = inbox_cap + thread_reply_cap + 64;
 const WantedProfile = struct {
     used: bool = false,
-    requested: bool = false,
-    /// How many times this one has been asked for. Some pubkeys simply have no
-    /// metadata published anywhere, so the asking is bounded.
+    /// When this pubkey was last actually asked for, and how many times running
+    /// it has come back with nothing. Together they gate a retry: wait
+    /// `2^attempts` seconds, clamped, before asking again.
+    ///
+    /// There is no strike limit. The old code wrote a pubkey off permanently
+    /// after three rounds and incremented the counter BEFORE checking whether
+    /// the network was even allowed, so an app launched offline burned all three
+    /// inside forty seconds and showed a raw npub for the rest of the process.
+    /// welshman's loader is the shape copied here: a timestamp, exponential
+    /// backoff, and nothing ever marked dead.
+    last_tried: i64 = 0,
     attempts: u8 = 0,
     pubkey: [32]u8 = [_]u8{0} ** 32,
 };
-/// How many rounds to ask for a mentioned profile before letting it be.
-const max_profile_attempts = 3;
+/// The longest a repeatedly silent pubkey waits between asks.
+const profile_retry_cap_s: i64 = 300;
 var g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+
+/// Whether `w` is due another ask.
+fn profileRetryDue(w: *const WantedProfile, now: i64) bool {
+    if (w.attempts == 0) return true;
+    const shift: u6 = @intCast(@min(w.attempts, 8));
+    const wait = @min(@as(i64, 1) << shift, profile_retry_cap_s);
+    return now - w.last_tried >= wait;
+}
 
 /// Notes that `pubkey` was mentioned but has no known name yet.
 fn wantProfile(pubkey: [32]u8) void {
@@ -3407,16 +5873,15 @@ fn wantProfile(pubkey: [32]u8) void {
             return;
         }
     }
-    // The set is full. Reclaim a slot from someone we have already asked for the
-    // maximum times (no metadata anywhere), so a fresh thread's authors are never
-    // starved by a backlog of dead entries. Without this the table fills up once
-    // and every later reply author renders as a bare npub forever.
+    // Genuinely full, which the size above is chosen to make impossible in
+    // normal use. Take the slot that has gone longest without an answer rather
+    // than dropping the request, because dropping it is what the old 48-slot
+    // table did and it is the whole reason names never loaded.
+    var oldest: ?*WantedProfile = null;
     for (&g_wanted) |*w| {
-        if (w.attempts >= max_profile_attempts) {
-            w.* = .{ .used = true, .pubkey = pubkey };
-            return;
-        }
+        if (oldest == null or w.last_tried < oldest.?.last_tried) oldest = w;
     }
+    if (oldest) |w| w.* = .{ .used = true, .pubkey = pubkey };
 }
 
 /// Whether `pubkey`'s profile is still being fetched: no profile in hand yet, and
@@ -3426,85 +5891,145 @@ fn wantProfile(pubkey: [32]u8) void {
 fn profileLoading(pubkey: [32]u8) bool {
     if (lookupProfile(pubkey) != null) return false;
     for (&g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.attempts < max_profile_attempts;
+        // Still being asked for, because nothing is ever written off now.
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
     }
     return false;
 }
 
-/// Profile-timer rounds between re-asking for metadata that has not arrived
-/// (about 20s at the profile interval).
-const profile_rearm_rounds: u64 = 10;
 var g_profile_round: u64 = 0;
-
-/// Lets the still-unnamed be asked for again on the next pass.
-fn rearmWantedProfiles() void {
-    for (&g_wanted) |*w| {
-        if (w.used and w.attempts < max_profile_attempts) w.requested = false;
-    }
-}
+/// Quote re-ask rounds. Quotes still use a round counter; profiles moved to a
+/// per-pubkey backoff, and the two shared this number only by accident.
+const quote_rearm_rounds: u64 = 10;
 
 /// Asks the relays for the metadata of everyone mentioned but still unnamed, in
 /// one batch on a throwaway connection.
 fn requestWantedProfiles() void {
+    const now = nowSeconds();
     var batch: [wanted_profiles_cap][32]u8 = undefined;
     var n: usize = 0;
     for (&g_wanted) |*w| {
         if (!w.used) continue;
-        // Resolved: free the slot so later mentions can use it. Without this the
-        // table fills with names we already have and new mentions are dropped.
+        // Resolved: free the slot so later mentions can use it.
         if (lookupProfile(w.pubkey)) |p| {
             if (p.name_len > 0) {
                 w.* = .{};
                 continue;
             }
         }
-        if (w.attempts >= max_profile_attempts) continue;
-        if (w.requested) continue;
+        if (!profileRetryDue(w, now)) continue;
         batch[n] = w.pubkey;
         n += 1;
-        w.requested = true;
-        w.attempts += 1;
         if (n == batch.len) break;
     }
     if (n == 0) return;
+
+    // THE DISK FIRST, always. A notification's author is very often somebody
+    // whose kind:0 is already in the store from the feed, a thread, or a
+    // previous session, and this path never once looked. Every reference client
+    // reads its cache before it opens a socket: NDK's `fetchProfile` returns
+    // from the cache adapter before creating a subscription, and Jumble reads
+    // IndexedDB and only refreshes past a three day staleness.
+    //
+    // Exact and cheap here, because the store has a composite author+kind index
+    // and keeps at most one kind:0 per pubkey.
+    var still_missing: [wanted_profiles_cap][32]u8 = undefined;
+    var missing: usize = 0;
+    if (g_store) |store| {
+        const kinds = [_]u16{0};
+        if (store.query(std.heap.page_allocator, .{ .authors = batch[0..n], .kinds = &kinds, .limit = @intCast(n) })) |res| {
+            var result = res;
+            defer result.deinit();
+            for (result.events) |ev| {
+                const prof = upsertProfile(ev.pubkey) orelse continue;
+                if (std.mem.eql(u8, &prof.meta_id, &ev.id)) continue;
+                parseMetadataInto(prof, ev.content);
+                prof.meta_id = ev.id;
+                g_names_generation +%= 1;
+            }
+        } else |_| {}
+        for (batch[0..n]) |pk| {
+            const known = if (lookupProfile(pk)) |prof| prof.name_len > 0 else false;
+            if (known) {
+                // Answered from disk. Retire the want rather than asking a relay
+                // for something already held.
+                for (&g_wanted) |*w| {
+                    if (w.used and std.mem.eql(u8, &w.pubkey, &pk)) w.* = .{};
+                }
+                continue;
+            }
+            still_missing[missing] = pk;
+            missing += 1;
+        }
+    } else {
+        @memcpy(still_missing[0..n], batch[0..n]);
+        missing = n;
+    }
+    if (missing == 0) return;
+
+    // Only now, and only for what disk could not answer. The attempt is counted
+    // HERE, after the network is known to be allowed, never before: counting it
+    // first is what wrote names off during the seconds before the first relay
+    // had finished its handshake.
     if (!networkAllowed()) return;
-    const thread = std.Thread.spawn(.{}, fetchProfilesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
-    thread.detach();
+    for (still_missing[0..missing]) |pk| {
+        for (&g_wanted) |*w| {
+            if (!w.used or !std.mem.eql(u8, &w.pubkey, &pk)) continue;
+            w.last_tried = now;
+            w.attempts +|= 1;
+        }
+    }
+    askProfiles(still_missing, missing);
 }
 
-/// Fetches kind:0 for `batch` and ingests it, then closes. Its own io backend
-/// and signer, like every other background worker.
-fn fetchProfilesOnce(gpa: std.mem.Allocator, batch: [wanted_profiles_cap][32]u8, len: usize) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
+/// The filters for a relay the reader is not on, asked about the people who
+/// write there.
+///
+/// NO `since`, which is the whole point of this function existing separately.
+///
+/// `feedSince` is "the newest note I hold, minus an hour", and on the pool's own
+/// relays that is right: they have been answering this same question all along,
+/// so anything older is already in the store. A routed relay has answered
+/// nothing. It was dialled precisely because it holds notes from people whose
+/// posts the reader has never had, and every one of those is older than the
+/// newest note the reader holds from anybody else. Stamping `since` on that
+/// subscription asks a relay full of missing history for the last hour of it.
+///
+/// Amethyst hit the same thing from the other side and wrote it down: a `since`
+/// floor "silently emptied the tab" on a cold start.
+///
+/// No `self` either: the reader's own notes come from the reader's own relays,
+/// and asking a stranger's relay about them is asking the wrong place.
+fn buildRoutedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    return buildFeedFilters(authors, null, null, out);
+}
 
+pub fn buildRoutedFiltersForTest(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    return buildRoutedFilters(authors, out);
+}
+
+/// Stamps the newest note the feed has seen, so a test can put `feedSince` in
+/// the state that matters. Without this it returns null for want of any note at
+/// all, and a test asserting "no since" passes whether or not the code asks for
+/// one.
+pub fn setFeedNewestForTest(created_at: i64) void {
+    g_feed_newest.store(created_at, .monotonic);
+}
+pub fn feedSinceForTest() ?i64 {
+    return feedSince();
+}
+
+/// Asks the pool for these authors' metadata, on the sockets it already holds.
+///
+/// Was a thread that dialled every relay in turn and read each to EOSE: eight
+/// TLS handshakes and a parked thread to learn one display name. The answers
+/// land in the store either way, and the profile cache already reads them from
+/// there on the next tick, so there was never anything for that thread to wait
+/// for.
+fn askProfiles(batch: [wanted_profiles_cap][32]u8, len: usize) void {
     const kinds = [_]u16{0};
     const filters = [_]nostr.filter.Filter{.{ .authors = batch[0..len], .kinds = &kinds, .limit = @intCast(len) }};
-    for (0..relaySlots()) |ri| {
-        var url_buf: [96]u8 = undefined;
-        const entry = relaySnapshot(ri, &url_buf) orelse continue;
-        // A read-only or read-write relay. Asking a write-only relay to answer
-        // a filter is asking the wrong question of it.
-        if (!entry.read) continue;
-        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
-        defer relay.deinit();
-        relay.subscribe("plaza-mentions", &filters) catch continue;
-        while (true) {
-            var msg = (relay.receive() catch break) orelse break;
-            defer msg.deinit();
-            switch (msg.value) {
-                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
-                // Everything stored has been sent; no need to hold the socket.
-                .eose => break,
-                else => {},
-            }
-        }
-        // Keep going: no single relay holds everyone's metadata, and the store
-        // keeps only the newest copy of each anyway.
-    }
+    _ = askPool(one_shot_sub_prefix ++ "profiles", &filters);
 }
 
 // ------------------------------------------------------------------ quotes
@@ -3551,6 +6076,17 @@ const QuoteEntry = struct {
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
+    /// The names generation `text_buf` was rendered at.
+    ///
+    /// The snippet has mentions in it, and a mention is baked into text as
+    /// `@Name` (or as an abbreviated npub when no name is known yet). The feed's
+    /// note bodies re-parse when a display name lands, because the generation
+    /// moving invalidates every card; this cache had no such stamp, so a snippet
+    /// rendered before its mentioned author's kind:0 arrived kept the npub for
+    /// as long as the entry lived. That is the raw `@npub1sg6plzp…uf63m` in a
+    /// reply context line while the same person's name shows correctly two rows
+    /// down.
+    names_generation: u64 = 0,
     /// The HOST of the picture the quoted note carries, when it carries one.
     ///
     /// The URL itself is deliberately cut out of `text_buf` (a raw image URL is
@@ -3727,6 +6263,7 @@ fn isPrivateAddress(host: []const u8) bool {
 /// URL is not one (it is drawn as the picture), and neither is anything inside a
 /// `nostr:` token.
 pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Scans a stranger's content for a URL run.
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
         if (!std.mem.startsWith(u8, content[i..], "https://") and !std.mem.startsWith(u8, content[i..], "http://")) continue;
@@ -3990,6 +6527,7 @@ pub const PageMeta = struct {
 /// lives, and anything it cannot make sense of simply leaves the card without
 /// that line rather than guessing.
 pub fn parsePageMeta(html: []const u8) PageMeta {
+    @setRuntimeSafety(true); // A fetched page's head, up to 256 KiB of it, and every offset below is read out of it.
     var out: PageMeta = .{};
     var i: usize = 0;
     while (i < html.len) : (i += 1) {
@@ -4035,6 +6573,7 @@ pub fn parsePageMeta(html: []const u8) PageMeta {
 
 /// One attribute's value out of a tag, single or double quoted.
 fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Quote positions inside a tag the page wrote.
     var i: usize = 0;
     while (std.ascii.indexOfIgnoreCasePos(tag, i, name)) |at| {
         i = at + name.len;
@@ -4102,7 +6641,11 @@ fn refreshQuotes(store: *nostr.store.Store) void {
     var nested: [quote_cache_cap][32]u8 = undefined;
     var nested_count: usize = 0;
     for (&g_quotes) |*q| {
-        if (!q.used or q.state == .loaded or q.state == .missing) continue;
+        if (!q.used or q.state == .missing) continue;
+        // A loaded entry is re-rendered ONLY when a name has landed since it was
+        // baked, which is the one thing that can change what its text should
+        // say. Otherwise this stays what it was: a pass over the unresolved.
+        if (q.state == .loaded and q.names_generation == g_names_generation) continue;
         var se = (store.getEvent(std.heap.page_allocator, q.id) catch continue) orelse {
             // `.missing` is what the ROW says, not a decision to stop looking:
             // the card reads "not on your relays yet", which is true, and the
@@ -4145,6 +6688,7 @@ fn refreshQuotes(store: *nostr.store.Store) void {
             }
         }
         q.state = .loaded;
+        q.names_generation = g_names_generation;
         wantProfile(q.pubkey);
     }
     for (nested[0..nested_count]) |id| wantQuote(id);
@@ -4166,11 +6710,12 @@ fn quoteBackoffRounds(attempts: u8) u64 {
     return @min(@as(u64, 1) << shift, quote_backoff_max_rounds);
 }
 
-/// Every unresolved quote may be asked for again, now.
-///
-/// The pool changed, so the answer may have too: a relay the reader just added,
-/// or one that just finished dialling, can hold exactly the note that was
-/// written off while nothing was connected.
+/// Clears the quote cache. For tests, which share the process globals.
+pub fn resetQuotesForTest() void {
+    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
+    g_quote_clock = 0;
+}
+
 /// Whether this build may open a socket of its own accord.
 ///
 /// False under `zig build test`, and not as tidiness. The feed's background
@@ -4217,45 +6762,19 @@ fn requestWantedQuotes() void {
     }
     if (n == 0) return;
     if (!networkAllowed()) return;
-    const thread = std.Thread.spawn(.{}, fetchQuotesOnce, .{ std.heap.page_allocator, batch, n }) catch return;
-    thread.detach();
+    askQuotes(batch, n);
 }
 
 /// Fetches the quoted events in `batch` by id and ingests them, then closes.
 /// The next store-growth tick flips them to `.loaded` via `refreshQuotes`.
-fn fetchQuotesOnce(gpa: std.mem.Allocator, batch: [quote_fetch_batch][32]u8, len: usize) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-
+/// Asks the pool for these quoted events, on the sockets it already holds.
+///
+/// Same shape as `askProfiles`, and for the same reason: the quote cache is
+/// filled from the store, so a thread holding a socket open until EOSE was
+/// waiting for something it did not read.
+fn askQuotes(batch: [quote_fetch_batch][32]u8, len: usize) void {
     const filters = [_]nostr.filter.Filter{.{ .ids = batch[0..len], .limit = @intCast(len) }};
-    for (0..relaySlots()) |ri| {
-        var url_buf: [96]u8 = undefined;
-        const entry = relaySnapshot(ri, &url_buf) orelse continue;
-        // A read-only or read-write relay. Asking a write-only relay to answer
-        // a filter is asking the wrong question of it.
-        if (!entry.read) continue;
-        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
-        defer relay.deinit();
-        relay.subscribe("plaza-quotes", &filters) catch continue;
-        while (true) {
-            var msg = (relay.receive() catch break) orelse break;
-            defer msg.deinit();
-            switch (msg.value) {
-                .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
-                .eose => break,
-                else => {},
-            }
-        }
-    }
-}
-
-/// Clears the quote cache. For tests, which share the process globals.
-pub fn resetQuotesForTest() void {
-    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
-    g_quote_clock = 0;
+    _ = askPool(one_shot_sub_prefix ++ "quotes", &filters);
 }
 
 /// Builds a Note over `content` and runs the quote-reference scan, so a test can
@@ -4307,6 +6826,15 @@ const Profile = struct {
     // The avatar's lifecycle: not yet fetched, in flight, registered, or given
     // up on (initials fallback).
     avatar_state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Fetches of this face that came back unusable for a reason worth retrying.
+    /// Cleared on a successful load, on a changed picture URL, and by the
+    /// Settings retry.
+    avatar_attempts: u8 = 0,
+    /// A face too big for one response body. Same problem as a feed picture and
+    /// the same answer: a profile picture straight from its own host is often a
+    /// full-size photo, and one that drew initials was never undecodable, only
+    /// too long to arrive in one piece.
+    down: Download = .{},
     /// Whether this face's BYTES have been pulled into the disk cache ahead of
     /// being needed. Separate from `avatar_state` because that one is about a
     /// registry id and there are only nine of those: warming is what a row just
@@ -4349,7 +6877,14 @@ var g_profiles = [_]Profile{.{}} ** profile_cap;
 
 // The avatar-id LRU clock (see `assignAvatarSlots`): bumped once per avatar
 // pass; a profile's `avatar_clock` records the last pass it was on screen.
-var g_avatar_clock: u64 = 0;
+/// The tick that the avatar pass, the picture pass and the banner all mark
+/// against.
+///
+/// ONE clock, because the slots are one pool: an avatar marked at tick N and a
+/// picture marked at tick N+1 are not comparable, and eviction is nothing but
+/// that comparison. Two clocks would have made whichever pass ticked second
+/// look permanently newer, so the other kind would always be the one evicted.
+var g_image_clock: u64 = 0;
 
 // Bumped whenever a profile gains or changes a display name. Mention labels are
 // baked into note text at parse time, so the feed re-parses (rather than
@@ -4359,9 +6894,10 @@ var g_names_generation: u64 = 0;
 /// Clears the profile cache. For tests, which share the process globals.
 pub fn resetProfilesForTest() void {
     g_profiles = [_]Profile{.{}} ** profile_cap;
+    @memset(&g_profile_index, 0);
     g_names_generation = 0;
     g_notes_names_generation = 0;
-    g_avatar_clock = 0;
+    g_image_clock = 0;
 }
 
 /// Drops a cached avatar. `parseMetadataInto` only ever REPLACES a picture URL,
@@ -4406,6 +6942,8 @@ pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
 
 /// Runs one avatar-id assignment pass, for tests.
 pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
+    wantProfilesAhead(model);
+    beginImagePass();
     assignAvatarSlots(fx, model);
 }
 
@@ -4514,6 +7052,15 @@ const Counts = struct {
     reposts: u32 = 0,
     likes: u32 = 0,
     zap_msat: u64 = 0,
+    /// Whether one of those reposts is ours.
+    ///
+    /// Read out of the crowd rather than kept in a table of our own, which is
+    /// what a like needs: an un-like has to name the exact reaction it deletes,
+    /// so that id is remembered locally. A repost has no undo (see `repost`), so
+    /// the only question is whether ours is in there, and the subscription that
+    /// counts them already carries the answer. It also means the filled icon
+    /// survives a relaunch, and is true for a repost sent from another client.
+    reposted_by_me: bool = false,
 };
 const Engagement = struct {
     used: bool = false,
@@ -4603,11 +7150,74 @@ pub const InboxItem = struct {
     verb: InboxVerb = .mention,
     /// Millisats, for a zap.
     msat: u64 = 0,
+    /// The words this row shows, copied in when the item is admitted.
+    ///
+    /// Never read from the store while drawing. The feed already paid for that
+    /// lesson: asking the database who you follow once per card cost 24423us to
+    /// rebuild, three whole frames to draw one, and two hundred notification
+    /// rows querying per frame would be the same bug wearing a different hat.
+    ///
+    /// WHICH note this holds depends on the verb, and that is the whole design.
+    /// For a reply or a mention it is THEIR note, because the question is what
+    /// did they say. For a reaction, a repost or a zap it is YOUR note, because
+    /// the question is which of mine did this happen to.
+    body_buf: [180]u8 = [_]u8{0} ** 180,
+    body_len: u8 = 0,
+    /// A reaction's own content: `+`, `-`, an emoji, or a `:shortcode:`. The
+    /// gutter draws this instead of a generic heart, which is the difference
+    /// between "somebody reacted" and seeing what they actually sent.
+    glyph_buf: [16]u8 = [_]u8{0} ** 16,
+    glyph_len: u8 = 0,
 
     pub fn hasTarget(self: InboxItem) bool {
         return !std.mem.allEqual(u8, &self.target_id, 0);
     }
+
+    pub fn body(self: *const InboxItem) []const u8 {
+        return self.body_buf[0..self.body_len];
+    }
+
+    pub fn reactionGlyph(self: *const InboxItem) []const u8 {
+        return self.glyph_buf[0..self.glyph_len];
+    }
 };
+
+/// Copies `src` into `dst`, clipped to whole codepoints, and returns the length.
+fn fillClipped(dst: []u8, src: []const u8) u8 {
+    // Whitespace runs collapse to one space, newlines included. A preview is one
+    // block: kept as-is, a note with a blank line between paragraphs drew as two
+    // separated blocks inside a row, so four notifications filled the screen and
+    // the list read as a stack of documents rather than a list of events.
+    var flat_buf: [512]u8 = undefined;
+    var flat_len: usize = 0;
+    var in_space = false;
+    for (src) |c| {
+        const is_space = c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        if (is_space) {
+            in_space = true;
+            continue;
+        }
+        if (in_space and flat_len > 0 and flat_len < flat_buf.len) {
+            flat_buf[flat_len] = ' ';
+            flat_len += 1;
+        }
+        in_space = false;
+        if (flat_len == flat_buf.len) break;
+        flat_buf[flat_len] = c;
+        flat_len += 1;
+    }
+    const trimmed = flat_buf[0..flat_len];
+    const ellipsis = "\u{2026}";
+    // Room kept for the ellipsis before clipping, not after: appending it to a
+    // full buffer would either overflow or cut a codepoint in half.
+    const room = if (trimmed.len > dst.len) dst.len - ellipsis.len else dst.len;
+    const take = clipToChars(trimmed, room, room);
+    @memcpy(dst[0..take.len], take);
+    if (take.len == trimmed.len) return @intCast(take.len);
+    // Cut. Say so, or a sentence that stops mid-word reads as the whole note.
+    @memcpy(dst[take.len..][0..ellipsis.len], ellipsis);
+    return @intCast(take.len + ellipsis.len);
+}
 
 var g_inbox = [_]InboxItem{.{}} ** inbox_cap;
 var g_inbox_len: usize = 0;
@@ -4647,10 +7257,15 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     var names_me = false;
     var hex: [64]u8 = undefined;
     hexLower(&hex, me);
+    var last_p_is_me = false;
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
         p_tags += 1;
-        if (std.ascii.eqlIgnoreCase(tag[1], &hex)) names_me = true;
+        const mine = std.ascii.eqlIgnoreCase(tag[1], &hex);
+        if (mine) names_me = true;
+        // Tracked separately: for a reaction or a repost the LAST p tag is the
+        // one that means "this is about you".
+        last_p_is_me = mine;
     }
     if (!names_me) return null;
     // A note addressed to a crowd is a broadcast. Being one of twenty names on
@@ -4658,12 +7273,93 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     if (p_tags > inbox_hellthread_max) return null;
 
     return switch (ev.kind) {
-        1 => if (inboxTargetsMyNote(ev, me)) .reply else .mention,
-        6, 16 => .repost,
-        7 => if (isLikeReaction(ev.content)) .like else null,
+        1 => noteVerbFor(ev, me, last_p_is_me),
+        // A repost or a reaction copies the p tags of what it is about, and
+        // NIP-10 has a reply carry every p tag of its parent plus the parent's
+        // author. So the reader's key propagates down every thread they ever
+        // touched, and ANY-tag matching then filed somebody reacting to a
+        // stranger's reply, three levels below a note of the reader's, as a
+        // notification about the reader.
+        //
+        // NIP-25: "If a client decides to include other `p` tags, which not
+        // recommended, the target event `pubkey` should be last the `p` tags."
+        // So the last one is the target's author. Jumble enforces exactly this.
+        // Where the reacted event is on disk, its author is checked directly,
+        // which is better evidence than tag order.
+        6, 16 => if (reactionTargetsMe(ev, me, last_p_is_me)) .repost else null,
+        // Every reaction except the one that is not good news. The content
+        // picks the GLYPH; it does not decide admission. Requiring "+" or empty
+        // meant a heart, a fire or any custom shortcode produced no row, no
+        // badge and no glyph, so a reader was told nobody had reacted when
+        // people had, and the emoji the row is built to show could never reach
+        // it. NIP-25 has exactly one negative, and a downvote is still not
+        // something to celebrate in a bell.
+        7 => if (!isDownvoteReaction(ev.content) and reactionTargetsMe(ev, me, last_p_is_me)) .like else null,
         9735 => .zap,
         else => null,
     };
+}
+
+/// NIP-25's one negative reaction: content of exactly "-".
+///
+/// Everything else, "+" and empty and every emoji and shortcode, is somebody
+/// reacting well enough to be told about.
+fn isDownvoteReaction(content: []const u8) bool {
+    return std.mem.eql(u8, content, "-");
+}
+
+/// What a kind:1 naming the reader actually is, or null when it is not about
+/// them at all.
+///
+/// The distinction that matters is whether the note is a REPLY. NIP-10 has a
+/// reply carry every `p` tag of its parent plus the parent's author, so once
+/// the reader posts a single word into a thread, their key travels down every
+/// branch of it forever. Reading any `p` tag as a mention therefore filed every
+/// later exchange between two other people, in any conversation the reader once
+/// touched, as "X mentioned you in a note". In a busy thread that becomes the
+/// commonest row in the inbox: it pushes real notifications out through the
+/// item cap and inflates the unread badge on the rail.
+///
+/// A note that is NOT a reply inherited nothing, so a `p` tag on it is a
+/// decision somebody made, and it still counts.
+fn noteVerbFor(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) ?InboxVerb {
+    // Answering a note this app holds and can see is the reader's.
+    if (inboxTargetsMyNote(ev, me)) return .reply;
+    // Named in the text. A mention is something the writer typed, so a quote of
+    // the reader's note counts here too.
+    if (contentNames(ev.content, me)) return .mention;
+    if (nip10Parent(ev.tags) != null) {
+        // A reply whose parent this app does not hold, which is the normal case
+        // for a reader who has been away. NIP-25's ordering rule is the same
+        // fallback the reaction path leans on: the last `p` tag is the one the
+        // event is about. It is what keeps a genuine reply from being dropped
+        // along with the thread noise.
+        return if (last_p_is_me) .reply else null;
+    }
+    return .mention;
+}
+
+/// Whether a reaction or repost is about a note of the reader's.
+///
+/// The store is the authority when it holds the target: an author is a fact,
+/// where tag order is a convention the sender may not have followed. Falls back
+/// to NIP-25's rule that the target's author is the last `p` tag.
+fn reactionTargetsMe(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) bool {
+    if (engagementTarget(ev)) |t| {
+        if (t.len == 64) {
+            var id: [32]u8 = undefined;
+            if (std.fmt.hexToBytes(&id, t)) |_| {
+                if (g_store) |store| {
+                    if (store.getEvent(std.heap.page_allocator, id) catch null) |found| {
+                        var se = found;
+                        defer se.deinit();
+                        return std.mem.eql(u8, &se.event.pubkey, &me);
+                    }
+                }
+            } else |_| {}
+        }
+    }
+    return last_p_is_me;
 }
 
 /// Whether this note replies to something the reader wrote, as opposed to merely
@@ -4707,6 +7403,11 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     const claim: ?ZapClaim = if (ev.kind == 9735) (zapClaim(ev, me) orelse return false) else null;
     const author = if (claim) |c| c.payer else ev.pubkey;
     const identity = if (claim) |c| c.id else ev.id;
+    // Muted, so no row. Checked against the AUTHOR established above rather
+    // than the event's own pubkey, which for a zap is a payment server: muting
+    // somebody has to stop their zaps too, and their key is only in the request
+    // inside the receipt.
+    if (isMuted(author)) return false;
 
     // Deduped on that identity, which is why this runs here rather than on the
     // way in: twenty receipts wrapping one request have twenty ids of their own,
@@ -4729,7 +7430,7 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
         }
     }
 
-    const item = InboxItem{
+    var item = InboxItem{
         .used = true,
         .id = identity,
         .author = author,
@@ -4749,12 +7450,115 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
     // for exactly the people it is about, which is the one screen where a name
     // is the entire content of the row.
     wantProfile(author);
+    bakeInboxText(&item, ev, verb, target);
     // Fetch what it is about, if this is the first we have heard of it. The row
     // is pressable, so the note behind it should be on its way before the reader
     // ever gets there.
     if (item.hasTarget() and !haveEvent(item.target_id)) wantQuote(item.target_id);
     g_inbox_dirty = true;
     return true;
+}
+
+/// Fills the row's words once, when the item is admitted.
+///
+/// A reply and a mention carry their own text, so those are free. A reaction, a
+/// repost and a zap are about a note of the reader's own, which means one store
+/// read here. Once per item, never per frame: a row that resolved itself while
+/// drawing would put a database query in the scroll path of a two hundred row
+/// list.
+///
+/// A miss is not an error. The note may not have arrived yet, `wantQuote` just
+/// asked for it, and a row with a name and no body still says who did what.
+fn bakeInboxText(item: *InboxItem, ev: nostr.event.Event, verb: InboxVerb, target: [32]u8) void {
+    switch (verb) {
+        // Their words, already in hand.
+        .reply, .mention => item.body_len = fillClipped(&item.body_buf, ev.content),
+        .like => {
+            // The reaction as sent. NIP-25 allows `+`, `-`, an empty string and
+            // a `:shortcode:`; `+` and empty both mean a like, and the row draws
+            // its usual heart for those rather than printing a plus sign.
+            const content = std.mem.trim(u8, ev.content, " \t\r\n");
+            if (content.len > 0 and !std.mem.eql(u8, content, "+")) {
+                item.glyph_len = fillClipped(&item.glyph_buf, content);
+            }
+            bakeTargetBody(item, target);
+        },
+        .repost, .zap => bakeTargetBody(item, target),
+    }
+}
+
+/// The reader's own note, for the rows that are about one.
+///
+/// Usually a miss, and that is expected. What a notification points at is almost
+/// always an older note of the reader's own, which the follow-scoped feed window
+/// does not hold, so the line after this one asks the relays for it. That is why
+/// the resolve below exists: baking once here and never looking again left every
+/// reaction, repost and zap row with no note under it for good.
+fn bakeTargetBody(item: *InboxItem, target: [32]u8) void {
+    if (std.mem.allEqual(u8, &target, 0)) return;
+    const store = g_store orelse return;
+    var se = (store.getEvent(std.heap.page_allocator, target) catch return) orelse return;
+    defer se.deinit();
+    item.body_len = fillClipped(&item.body_buf, se.event.content);
+}
+
+/// The rows the notifications window last put on screen. Written by the view,
+/// read by the pass that lends avatar ids on the next tick.
+var g_inbox_visible: struct { first: usize = 0, last: usize = 0, len: usize = 0 } = .{};
+
+/// The store generation the inbox last tried to fill its missing bodies at.
+var g_inbox_body_stamp: usize = std.math.maxInt(usize);
+
+/// Fills in the note behind every row that is still missing one.
+///
+/// Guarded on the store's event count, so this is one pass per arrival rather
+/// than a query per row per frame. The feed already paid for the other version:
+/// asking the database once per card cost 24423us to rebuild, three whole frames
+/// to draw one.
+///
+/// A row whose note never arrives keeps an empty body and still says who did
+/// what, which is what it did before any of this.
+fn resolveInboxBodies() void {
+    const store = g_store orelse return;
+    const stamp = store.eventCount() catch return;
+    if (stamp == g_inbox_body_stamp) return;
+    g_inbox_body_stamp = stamp;
+    lockInbox();
+    defer unlockInbox();
+    for (g_inbox[0..g_inbox_len]) |*item| {
+        if (!item.used or item.body_len > 0) continue;
+        // A reply or a mention IS the event, so its own id holds their words.
+        // Skipping these was wrong: `inboxAdd` copies the content as the event
+        // arrives, but `loadInbox` rebuilds the inbox from the store at launch
+        // and never goes near that path, so every reply restored from a previous
+        // session drew a name, a time, and nothing in between.
+        const from: [32]u8 = if (item.verb == .reply or item.verb == .mention) item.id else item.target_id;
+        bakeTargetBody(item, from);
+    }
+}
+
+/// Asks for the metadata of everyone the inbox names.
+///
+/// `inboxAdd` already does this for an event as it arrives, and that is not
+/// enough: `loadInbox` rebuilds the whole inbox from the store on launch without
+/// going near that path, so every notification from a previous session had
+/// nobody asking for its author's name. Those rows showed a raw npub and an
+/// initial for as long as the app ran, which is exactly the screen where a name
+/// IS the content.
+///
+/// Cheap to repeat. `wantProfile` returns immediately for anyone already named
+/// and never queues a duplicate.
+fn wantInboxProfiles(shown: []const InboxItem) void {
+    // Only the rows on screen, and this is the third time the same rule has had
+    // to be learned on this page. The wanted table holds 48 and evicts to make
+    // room, so asking on behalf of 143 notifications thrashed it: the names that
+    // actually arrived were whichever ones happened to survive the churn, which
+    // is why opening somebody's profile and coming back was what finally loaded
+    // them. Visiting the profile asked for one person instead of a hundred.
+    const first = @min(g_inbox_visible.first, shown.len);
+    const last = @min(g_inbox_visible.last + 1, shown.len);
+    if (last <= first) return;
+    for (shown[first..last]) |item| wantProfile(item.author);
 }
 
 /// Whether the store already holds this event.
@@ -5064,6 +7868,55 @@ fn inboxMeHex(me: [32]u8) [64]u8 {
 const inbox_backfill_cap: u32 = 200;
 const inbox_since_overlap_s: i64 = 60 * 60;
 
+/// The newest kind:1 this app holds, for the feed's `since`.
+///
+/// Updated by the ingest threads, seeded once from the store at startup so a
+/// relaunch does not re-download everything it already has.
+var g_feed_newest = std.atomic.Value(i64).init(0);
+
+/// How far back of the newest held note the feed re-asks from.
+///
+/// The same one hour `inboxSince` uses, and for the same reason: relays differ
+/// on whether `since` is inclusive, clocks differ, and an event can be stored
+/// with a `created_at` behind the one that arrived before it. An hour of
+/// overlap costs a few duplicate events, which the store rejects, and buys not
+/// silently missing the notes either side of a reconnect.
+const feed_since_overlap_s: i64 = 3600;
+
+fn noteFeedNewest(created_at: i64) void {
+    var seen = g_feed_newest.load(.monotonic);
+    while (created_at > seen) {
+        seen = g_feed_newest.cmpxchgWeak(seen, created_at, .monotonic, .monotonic) orelse break;
+    }
+}
+
+/// Reads the newest stored kind:1 once, so the first subscription after a
+/// launch is bounded too. One cursor on the kind index, not a merge.
+fn seedFeedNewest(store: *nostr.store.Store) void {
+    if (g_feed_newest.load(.monotonic) != 0) return;
+    const kinds = [_]u16{1};
+    var result = store.query(std.heap.page_allocator, .{ .kinds = &kinds, .limit = 1 }) catch return;
+    defer result.deinit();
+    if (result.events.len > 0) noteFeedNewest(result.events[0].created_at);
+}
+
+/// What the feed asks relays to start from, or null on a cold store.
+///
+/// Every reconnect re-asked for the full three hundred per chunk, from every
+/// relay, because no feed filter ever carried a `since`. A flapping relay was
+/// therefore handed a fifteen-hundred-event question every few seconds, and
+/// every one of those events cost a Schnorr verify before the store recognised
+/// it as a duplicate. The app already knew the shape: `subscribeInbox` has done
+/// exactly this since it was written.
+///
+/// Null when nothing is held, which is Notedeck's rule: a cold store needs the
+/// whole backfill, and bounding it would leave a new install with an empty feed.
+fn feedSince() ?i64 {
+    const newest = g_feed_newest.load(.monotonic);
+    if (newest == 0) return null;
+    return @max(0, newest - feed_since_overlap_s);
+}
+
 fn inboxSince() i64 {
     const newest = inboxNewest();
     if (newest == 0) return 0;
@@ -5117,22 +7970,13 @@ fn saveInbox() void {
         unlockInbox();
         return;
     };
-    for (g_inbox[0..g_inbox_len]) |item| {
-        var hex: [64]u8 = undefined;
-        hexLower(&hex, item.id);
-        var ahex: [64]u8 = undefined;
-        hexLower(&ahex, item.author);
-        var thex: [64]u8 = undefined;
-        hexLower(&thex, item.target_id);
-        out.print(gpa, "{s} {s} {d} {s} {s} {d}\n", .{
-            hex[0..],
-            ahex[0..],
-            item.created_at,
-            thex[0..],
-            @tagName(item.verb),
-            item.msat,
-        }) catch break;
-    }
+    // Only the read marker. The items themselves are NOT serialised here any
+    // more: the events are already in the store, indexed by their `p` tag, and
+    // writing a second parallel copy of them was both duplication and a bug.
+    // The blob carried the id, author, stamp, target, verb and msat, and nothing
+    // else, so a restored row had no words and no reaction glyph, which is
+    // exactly the "some rows have no content" report. Rebuilding from the store
+    // replays the real events through the real gate and cannot drift from it.
     g_inbox_dirty = false;
     unlockInbox();
     // Outside the lock: an LMDB write must never be held under a spinlock that
@@ -5144,62 +7988,49 @@ fn saveInbox() void {
 fn loadInbox() void {
     const store = g_store orelse return;
     const me = activePubkey() orelse return;
-    var key_buf: [96]u8 = undefined;
-    const key = inboxKey(&key_buf, me);
-    if (key.len == 0) return;
     const gpa = std.heap.page_allocator;
-    const raw = (store.get(gpa, key) catch null) orelse return;
-    defer gpa.free(raw);
 
     lockInbox();
-    defer unlockInbox();
     resetInboxLocked(me);
-    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        var parts = std.mem.tokenizeScalar(u8, line, ' ');
-        const first = parts.next() orelse continue;
-        if (std.mem.eql(u8, first, "read")) {
-            const v = parts.next() orelse continue;
-            g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
-            continue;
+    unlockInbox();
+
+    // AFTER the reset, which clears it. Reading the marker first and resetting
+    // second put the whole inbox back at unread on every launch.
+    var key_buf: [96]u8 = undefined;
+    const key = inboxKey(&key_buf, me);
+    if (key.len > 0) {
+        if (store.get(gpa, key) catch null) |raw| {
+            defer gpa.free(raw);
+            var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+            while (lines.next()) |line| {
+                var parts = std.mem.tokenizeScalar(u8, line, ' ');
+                const first = parts.next() orelse continue;
+                if (!std.mem.eql(u8, first, "read")) continue;
+                const v = parts.next() orelse continue;
+                g_inbox_read_through = std.fmt.parseInt(i64, v, 10) catch 0;
+            }
         }
-        if (g_inbox_len >= g_inbox.len) break;
-        if (first.len != 64) continue;
-        var item = InboxItem{ .used = true };
-        _ = std.fmt.hexToBytes(&item.id, first) catch continue;
-        const ahex = parts.next() orelse continue;
-        if (ahex.len != 64) continue;
-        _ = std.fmt.hexToBytes(&item.author, ahex) catch continue;
-        item.created_at = std.fmt.parseInt(i64, parts.next() orelse continue, 10) catch continue;
-        // A field that is not a whole id leaves the item with no target rather
-        // than discarding the item: a notification the reader cannot follow
-        // through to is still a notification they should be told about.
-        const thex = parts.next() orelse continue;
-        if (thex.len == 64) {
-            var scratch: [32]u8 = undefined;
-            if (std.fmt.hexToBytes(&scratch, thex)) |_| {
-                item.target_id = scratch;
-            } else |_| {}
-        }
-        const verb = parts.next() orelse continue;
-        item.verb = if (std.mem.eql(u8, verb, "reply"))
-            .reply
-        else if (std.mem.eql(u8, verb, "mention"))
-            .mention
-        else if (std.mem.eql(u8, verb, "like"))
-            .like
-        else if (std.mem.eql(u8, verb, "repost"))
-            .repost
-        else if (std.mem.eql(u8, verb, "zap"))
-            .zap
-        else
-            continue;
-        item.msat = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
-        g_inbox[g_inbox_len] = item;
-        g_inbox_len += 1;
     }
-    sortInboxLocked();
-    g_inbox_dirty = false;
+
+    // The same filter the relay is asked, answered from disk. Jumble does
+    // exactly this: it paints the notification list from IndexedDB using the
+    // identical filter it is about to send, before opening a socket.
+    //
+    // Replayed through `inboxAdd`, so restored rows pass the same gate, the same
+    // dedup and the same text baking as live ones. The hand-rolled blob this
+    // replaces could not: it held six scalar fields and no content, so every row
+    // restored from a previous session came back with a name, a time, and
+    // nothing in between.
+    const hex = inboxMeHex(me);
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &.{&hex} }};
+    var result = store.query(gpa, .{
+        .kinds = &inbox_kinds,
+        .tags = &tags,
+        .limit = inbox_backfill_cap,
+    }) catch return;
+    defer result.deinit();
+    const now = nowSeconds();
+    for (result.events) |ev| _ = inboxAdd(ev, now);
 }
 
 pub fn saveInboxForTest() void {
@@ -5439,11 +8270,80 @@ pub fn bolt11Msat(invoice: []const u8) u64 {
 }
 
 /// The sats a kind:9735 zap receipt is worth, from its bolt11 tag.
+/// The most a single receipt may add to a note's total.
+///
+/// Not a judgement about generosity: it is a bound on how wrong one forged
+/// receipt can make the number. A hundred thousand sats is already an unusual
+/// zap, and a card claiming millions is the whole payoff for forging one.
+const zap_msat_ceiling: u64 = 100_000_000; // 100k sats
+pub const zap_msat_ceiling_for_test = zap_msat_ceiling;
+
+/// What a zap receipt is worth to a note's total, after checking it is real.
+///
+/// The counting path used to read the receipt's own `bolt11` tag and add it,
+/// with nothing checked. A kind:9735 is an ordinary public event that anybody
+/// can publish, so a note could be given any total at all by writing a receipt
+/// with a large invoice string in it and no payment behind it. `zapClaim`
+/// already did this properly for the inbox and this path never called it.
+///
+/// What is checked here, without a network round trip:
+///
+///   - the `description` holds a real kind:9734 zap request whose signature
+///     verifies, so the receipt carries something the payer actually signed;
+///   - that request asks about THIS event, so a genuine receipt for a different
+///     note cannot be replayed onto this one;
+///   - the amount is the smaller of what the request asked for and what the
+///     invoice says, so neither number alone can inflate the total;
+///   - the result is clamped.
+///
+/// Not checked: that the receipt is signed by the recipient's LNURL server
+/// (`nostrPubkey`), which the reference clients do verify. That needs the
+/// recipient's LNURL, which is a fetch this path cannot make. Its absence means
+/// a receipt can still be minted by someone willing to sign a zap request for
+/// the reader's note, which is a far higher bar than editing a string.
 fn zapMsat(ev: nostr.event.Event) u64 {
+    const target = engagementTarget(ev) orelse return 0;
+
+    var invoice_msat: u64 = 0;
+    var description: ?[]const u8 = null;
     for (ev.tags) |tag| {
-        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "bolt11")) return bolt11Msat(tag[1]);
+        if (tag.len < 2) continue;
+        if (std.mem.eql(u8, tag[0], "bolt11")) invoice_msat = bolt11Msat(tag[1]);
+        if (std.mem.eql(u8, tag[0], "description")) description = tag[1];
     }
-    return 0;
+    const desc = description orelse return 0;
+
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.event.fromJson(gpa, desc) catch return 0;
+    defer parsed.deinit();
+    const req = parsed.value;
+    if (req.kind != 9734) return 0;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    if (!(nostr.event.verify(gpa, signer, req) catch false)) return 0;
+
+    // The request has to be about the note being credited. Without this a real
+    // receipt for a popular note could be re-published against any other note.
+    var about_this_note = false;
+    var requested_msat: u64 = 0;
+    for (req.tags) |t| {
+        if (t.len < 2) continue;
+        if (t[0].len == 1 and t[0][0] == 'e' and std.ascii.eqlIgnoreCase(t[1], target))
+            about_this_note = true;
+        if (std.mem.eql(u8, t[0], "amount"))
+            requested_msat = std.fmt.parseInt(u64, t[1], 10) catch 0;
+    }
+    if (!about_this_note) return 0;
+
+    // Both numbers, when both are present: the smaller one. An invoice for a
+    // fortune attached to a request for a sat is not worth a fortune, and the
+    // reverse is equally untrue.
+    const msat = if (requested_msat > 0 and invoice_msat > 0)
+        @min(requested_msat, invoice_msat)
+    else if (invoice_msat > 0) invoice_msat else requested_msat;
+
+    return @min(msat, zap_msat_ceiling);
 }
 
 /// The single note an engagement event is about: its `reply`-marked e tag if it
@@ -5488,7 +8388,12 @@ fn countEngagement(ev: nostr.event.Event, feed_ids: []const i64) void {
     if (!markSeen(idPrefix(ev.id))) return;
     switch (ev.kind) {
         1 => row.counts.replies += 1,
-        6, 16 => row.counts.reposts += 1,
+        6, 16 => {
+            row.counts.reposts += 1;
+            if (activePubkey()) |me| {
+                if (std.mem.eql(u8, &ev.pubkey, &me)) row.counts.reposted_by_me = true;
+            }
+        },
         7 => row.counts.likes += 1,
         9735 => row.counts.zap_msat +|= zapMsat(ev),
         else => {},
@@ -5506,6 +8411,16 @@ fn noteIdFromHex(hex: []const u8) ?i64 {
 }
 
 /// Clears the engagement table and dedup set. For tests.
+/// Sets a note's zap total directly, for tests about what the RENDER does with
+/// a large number. Ingestion cannot produce one in a single step any more, and
+/// the two properties are worth testing apart: what is admitted, and what is
+/// survivable once admitted.
+pub fn setZapMsatForTest(id: i64, msat: u64) void {
+    engagementLock();
+    defer engagementUnlock();
+    if (ensureEngagement(id)) |row| row.counts.zap_msat = msat;
+}
+
 pub fn resetEngagementForTest() void {
     g_engagement = [_]Engagement{.{}} ** engagement_cap;
     g_seen = [_]u64{0} ** seen_engagement_cap;
@@ -5518,9 +8433,57 @@ pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void
 }
 
 /// Finds the cached profile for `pubkey`, or null.
+/// An open-addressed index over `g_profiles`, so a lookup is a probe rather
+/// than a walk.
+///
+/// The cache was 160 slots and a linear scan was fine. Sizing it to the real
+/// author set (200 notifications plus up to 2048 follows) made that scan 12x
+/// longer, and it runs per note per feed rebuild: the 2048-follow rebuild went
+/// from inside the frame budget to 17155us against 16000us, a visible stutter
+/// every second. The cap and this index are one change, not two.
+///
+/// Slot values are index+1 so that zero means empty. Rebuilt wholesale on
+/// eviction, which is rare and bounded.
+const profile_index_slots = 8192;
+var g_profile_index = [_]u16{0} ** profile_index_slots;
+var g_profile_index_stale: usize = 0;
+
+fn profileSlotFor(pubkey: [32]u8) usize {
+    // The pubkey is already a hash, so its low bits are as good as any.
+    const h = std.mem.readInt(u64, pubkey[0..8], .little);
+    return @intCast(h % profile_index_slots);
+}
+
+fn profileIndexInsert(idx: usize) void {
+    var slot = profileSlotFor(g_profiles[idx].pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        if (g_profile_index[slot] == 0) {
+            g_profile_index[slot] = @intCast(idx + 1);
+            return;
+        }
+        slot = (slot + 1) % profile_index_slots;
+    }
+}
+
+fn profileIndexRebuild() void {
+    @memset(&g_profile_index, 0);
+    g_profile_index_stale = 0;
+    for (&g_profiles, 0..) |*p, i| {
+        if (p.used) profileIndexInsert(i);
+    }
+}
+
 fn lookupProfile(pubkey: [32]u8) ?*Profile {
-    for (&g_profiles) |*p| {
+    var slot = profileSlotFor(pubkey);
+    var probes: usize = 0;
+    while (probes < profile_index_slots) : (probes += 1) {
+        const entry = g_profile_index[slot];
+        // An empty slot ends the probe: nothing past it can belong to this key.
+        if (entry == 0) return null;
+        const p = &g_profiles[entry - 1];
         if (p.used and std.mem.eql(u8, &p.pubkey, &pubkey)) return p;
+        slot = (slot + 1) % profile_index_slots;
     }
     return null;
 }
@@ -5531,9 +8494,10 @@ fn lookupProfile(pubkey: [32]u8) ?*Profile {
 /// one only while on screen.
 pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     if (lookupProfile(pubkey)) |p| return p;
-    for (&g_profiles) |*p| {
+    for (&g_profiles, 0..) |*p, i| {
         if (!p.used) {
             p.* = .{ .used = true, .pubkey = pubkey };
+            profileIndexInsert(i);
             return p;
         }
     }
@@ -5547,12 +8511,27 @@ pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
     var victim: ?*Profile = null;
     for (&g_profiles) |*p| {
         if (p.avatar_state == .fetching or p.nip05_state == .fetching) continue;
-        if (p.avatar_clock == g_avatar_clock) continue;
+        if (p.avatar_clock == g_image_clock) continue;
         if (victim == null or p.avatar_clock < victim.?.avatar_clock) victim = p;
     }
     const v = victim orelse return null;
     v.* = .{ .used = true, .pubkey = pubkey };
+    // The evicted key's entry is left pointing at a slot that no longer holds
+    // it. That is SAFE, because a lookup compares the pubkey and keeps probing
+    // on a mismatch, and it is what keeps eviction O(1). Rebuilding the whole
+    // table here instead cost 10ms per feed rebuild at 2048 follows, where the
+    // cache is permanently full and every new author evicts.
+    profileIndexInsert(idxOf(v));
+    g_profile_index_stale += 1;
+    // Stale entries lengthen probe chains, so the table is rebuilt occasionally
+    // rather than never. Amortised to nothing across 512 evictions.
+    if (g_profile_index_stale >= 512) profileIndexRebuild();
     return v;
+}
+
+/// The slot number of a profile pointer, for the index.
+fn idxOf(p: *const Profile) usize {
+    return (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
 }
 
 /// Parses a kind:0 metadata JSON content into `profile`'s name and picture.
@@ -5560,6 +8539,7 @@ pub fn upsertProfile(pubkey: [32]u8) ?*Profile {
 /// unchanged (it just keeps rendering from its npub). Prefers `display_name`
 /// (or the legacy `displayName`) over `name`.
 pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
+    @setRuntimeSafety(true); // A kind:0 body, which is whatever its author put there.
     const Metadata = struct {
         name: ?[]const u8 = null,
         display_name: ?[]const u8 = null,
@@ -5605,6 +8585,9 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
                 @memcpy(profile.picture_buf[0..trimmed.len], trimmed);
                 profile.picture_len = @intCast(trimmed.len);
                 if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
+                // A different picture is a different resource, so whatever the
+                // last one failed at says nothing about this one.
+                profile.avatar_attempts = 0;
             }
         }
     }
@@ -5671,6 +8654,90 @@ fn activePubkey() ?[32]u8 {
 /// fetch, open, and cache key) and the byte span of its raw token within the
 /// note's `content_buf`, so the body can be split around it at render time
 /// without ever mutating the stored text.
+/// Stood in for a picture past the end, so `imageAt` can answer without the
+/// caller checking first: a zero-length URL is what every path already reads as
+/// "no image".
+const empty_note_image = NoteImage{};
+
+/// What a picture's chip says: its dimensions and its weight, as the note claims
+/// them, in the shot's own form (`1600x900 · 240 KB`). Either half may be
+/// missing, and it is empty when both are. Never taken from the decoded bytes,
+/// which are the proxy's box and would be a lie about the file, and never from
+/// the response, which carries no headers.
+fn imageChipLabelFor(img: *const NoteImage, arena: std.mem.Allocator) []const u8 {
+    const has_dims = img.w > 0 and img.h > 0;
+    if (has_dims and img.bytes > 0) {
+        return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ img.w, img.h, byteSize(arena, img.bytes) }) catch "";
+    }
+    if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ img.w, img.h }) catch "";
+    if (img.bytes > 0) return byteSize(arena, img.bytes);
+    return "";
+}
+
+/// How many pictures one note draws.
+///
+/// Four, which is what the clients that draw galleries settle on, and what a
+/// phone's share sheet produces. Past it the extra URLs stay in the body as
+/// links, which is the old behaviour for everything after the first and is the
+/// right fallback for a note carrying a dozen.
+pub const max_note_images = 4;
+
+/// One picture in a note: where it is, and what the note's own `imeta` claims
+/// about it before a single byte has been fetched.
+pub const NoteImage = struct {
+    /// 192 and not the 300 a single image used to get, because there are four of
+    /// these in every Note now and the feed copies whole Notes on every rebuild
+    /// and every splice. At 300 the rebuild went from 272us to 400us and the
+    /// layout from 1303 to 1907, with the node count and the planning stage
+    /// unmoved: that is bytes being copied, not work being done.
+    ///
+    /// It fits what image hosts actually emit. A Blossom URL is its 64-character
+    /// hash plus a host and an extension, about 90; nostr.build and primal sit
+    /// in the same range. A longer one is left in the body as a link, which is
+    /// the same fallback a note past the picture cap gets.
+    url_buf: [192]u8 = [_]u8{0} ** 192,
+    url_len: u16 = 0,
+    /// Height divided by width, from the note's NIP-92 `imeta dim`. Knowing the
+    /// shape BEFORE the picture downloads is what lets the card reserve exactly
+    /// the right space, so nothing shifts when it arrives (or is evicted and
+    /// comes back).
+    aspect: f32 = 0,
+    /// The author's claim about the file: pixel dimensions and byte size, from
+    /// the same `imeta` tag, drawn as chips at rest.
+    w: u16 = 0,
+    h: u16 = 0,
+    bytes: u32 = 0,
+    /// Its colour before its bytes. Fixed buffer, because the tag's memory is
+    /// the event's.
+    blur_buf: [40]u8 = [_]u8{0} ** 40,
+    blur_len: u8 = 0,
+    /// Whether the note described it. The chip is one word; the description
+    /// itself would need a hover expand, which is not expressible.
+    has_alt: bool = false,
+
+    pub fn url(self: *const NoteImage) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+
+    pub fn blurhash(self: *const NoteImage) []const u8 {
+        return self.blur_buf[0..self.blur_len];
+    }
+
+    fn set(self: *NoteImage, link: []const u8, meta: Imeta) void {
+        const n = @min(link.len, self.url_buf.len);
+        @memcpy(self.url_buf[0..n], link[0..n]);
+        self.url_len = @intCast(n);
+        self.aspect = meta.aspect();
+        self.w = meta.width;
+        self.h = meta.height;
+        self.bytes = meta.size;
+        const b = @min(meta.blurhash.len, self.blur_buf.len);
+        @memcpy(self.blur_buf[0..b], meta.blurhash[0..b]);
+        self.blur_len = @intCast(b);
+        self.has_alt = meta.alt.len > 0;
+    }
+};
+
 const QuoteRef = struct {
     kind: enum(u8) { none, event } = .none,
     id: [32]u8 = [_]u8{0} ** 32,
@@ -5678,11 +8745,102 @@ const QuoteRef = struct {
     len: u16 = 0,
 };
 
+/// How many mentions in one note can be pressed. Past this they still render as
+/// `@name`, they just do not open anything, which is the mild end of a note
+/// tagging a crowd.
+const note_max_mentions = 8;
+
+/// The cap, for a test that has to build a note carrying more than it.
+pub const noteMaxMentionsForTest = note_max_mentions;
+
+/// The link payload a mention span carries: `mention_link_tag` followed by the
+/// raw 32-byte pubkey.
+///
+/// Not a URL, and not meant to be read as one. A paragraph has exactly one link
+/// handler, so a mention and an ordinary `https://` link arrive at the same
+/// place and have to be told apart once they are there. The tag's second byte is
+/// zero, which no URL contains, so nothing a stranger can write in a note will
+/// be mistaken for a mention.
+///
+/// Carrying the pubkey rather than spelling it back out as `nostr:npub1…` is
+/// what keeps this cheap: the text form is 69 bytes per mention in every note
+/// the feed holds, and would then have to be decoded again on the press.
+const mention_link_tag = "p\x00";
+const mention_link_len = mention_link_tag.len + 32;
+
+/// One rendered NIP-27 mention: where its `@name` landed, and who it names.
+pub const MentionRef = struct {
+    /// Byte range of the label inside the note's `content_buf`.
+    off: u16 = 0,
+    len: u16 = 0,
+    link_buf: [mention_link_len]u8 = [_]u8{0} ** mention_link_len,
+
+    /// The payload for this mention's span. Borrowed from the note, which
+    /// outlives the frame that built the span, for the same reason the link
+    /// card's URL is: the press message holds the slice, and the opener reads it
+    /// after the arena that drew the frame is gone.
+    pub fn link(self: *const MentionRef) []const u8 {
+        return &self.link_buf;
+    }
+};
+
+/// The mentions of one note, filled in as its content is rendered.
+pub const MentionList = struct {
+    refs: [note_max_mentions]MentionRef = [_]MentionRef{.{}} ** note_max_mentions,
+    len: u8 = 0,
+
+    pub fn all(self: *const MentionList) []const MentionRef {
+        return self.refs[0..self.len];
+    }
+
+    fn record(self: *MentionList, off: usize, len: usize, pubkey: [32]u8) void {
+        if (self.len == self.refs.len) return;
+        const ref = &self.refs[self.len];
+        ref.off = std.math.cast(u16, off) orelse return;
+        ref.len = std.math.cast(u16, len) orelse return;
+        @memcpy(ref.link_buf[0..mention_link_tag.len], mention_link_tag);
+        @memcpy(ref.link_buf[mention_link_tag.len..], &pubkey);
+        self.len += 1;
+    }
+
+    /// Moves every offset back by the leading whitespace a trim removed, and
+    /// drops anything the trim cut into.
+    ///
+    /// The trim runs after the whole note is rendered, and it can shift the
+    /// buffer left, so offsets recorded during the walk describe the buffer as
+    /// it was rather than as it ends up. A note that is nothing but a mention
+    /// and some spaces is the ordinary case here, not a contrived one: lifting
+    /// an image URL out of the text is exactly what strands that whitespace.
+    fn rebase(self: *MentionList, lead: usize, len: usize) void {
+        var kept: u8 = 0;
+        for (self.refs[0..self.len]) |ref| {
+            if (ref.off < lead) continue;
+            const off = ref.off - lead;
+            if (off + ref.len > len) continue;
+            self.refs[kept] = ref;
+            self.refs[kept].off = @intCast(off);
+            kept += 1;
+        }
+        self.len = kept;
+    }
+};
+
+/// The pubkey behind a mention's link payload, or null if this is an ordinary
+/// link that should go to the browser instead.
+pub fn mentionLinkPubkey(link: []const u8) ?[32]u8 {
+    if (link.len != mention_link_len) return null;
+    if (!std.mem.startsWith(u8, link, mention_link_tag)) return null;
+    var pubkey: [32]u8 = undefined;
+    @memcpy(&pubkey, link[mention_link_tag.len..]);
+    return pubkey;
+}
+
 /// The verb a guest reached for, held until they have a key.
 pub const Intent = union(enum) {
     none,
     post,
     like: i64,
+    repost: i64,
     reply: i64,
     follow: [32]u8,
 
@@ -5715,27 +8873,15 @@ pub const Note = struct {
     time_len: u8 = 0,
     content_buf: [note_content_cap]u8 = [_]u8{0} ** note_content_cap,
     content_len: u16 = 0,
-    // The first image URL in the note, lifted out of the text and rendered as a
-    // picture instead (see `renderContent`'s `omit`).
-    image_url_buf: [300]u8 = [_]u8{0} ** 300,
-    image_url_len: u16 = 0,
-    // Height divided by width, taken from the note's own NIP-92 `imeta dim`
-    // when it carries one. Knowing the shape BEFORE the picture downloads is
-    // what lets the card reserve exactly the right space, so nothing shifts
-    // when the image arrives (or is evicted and comes back).
-    image_aspect: f32 = 0,
-    /// What the picture's own chrome says: its pixel dimensions, from the same
-    /// `imeta` tag the aspect comes from, and its alt text. Both are the note
-    /// author's claim about the file, which is the only thing available before
-    /// the bytes are, and the chips read at rest rather than on hover (the
-    /// design's hover-expand is not expressible).
-    image_w: u16 = 0,
-    image_h: u16 = 0,
-    image_bytes: u32 = 0,
-    /// The picture's blurhash, when the note carries one: its colour before its
-    /// bytes. Fixed buffer, because the tag's memory is the event's.
-    image_blur_buf: [40]u8 = [_]u8{0} ** 40,
-    image_blur_len: u8 = 0,
+    /// Every picture the note carries, up to `max_note_images`, lifted out of
+    /// the text and drawn as pictures instead (see `renderContent`'s `omit`).
+    ///
+    /// A note with several images is ordinary, not exotic: a phone's share sheet
+    /// posts three at once and every other client draws them as a gallery. This
+    /// held exactly one, so the first was drawn and the rest were left in the
+    /// body as raw URLs, which is the worst of both.
+    images: [max_note_images]NoteImage = [_]NoteImage{.{}} ** max_note_images,
+    images_len: u8 = 0,
     /// The first plain link in the note, previewed as a card under the body. One
     /// per note, which is what 11o draws; the URL stays in the text as well.
     link_url_buf: [300]u8 = [_]u8{0} ** 300,
@@ -5749,6 +8895,12 @@ pub const Note = struct {
     // `content_buf` so the body can split around it and render an embedded quote
     // card. `.none` when the note quotes nothing.
     quote: QuoteRef = .{},
+    // Where each `@name` in the rendered content sits, and whom it names, so a
+    // press on one can open that profile. The pubkey is gone from the text by
+    // the time it is drawn: rewriting `nostr:npub1…` into a readable name is
+    // what makes the note legible, and it is also what threw away the only
+    // thing a press could have acted on.
+    mentions: MentionList = .{},
     // The NIP-10 parent this note answers (the `e` tag marked `reply`, or the
     // thread root for a direct reply), extracted once at parse time so a thread
     // can seat each reply under the note it answers. Zero when it answers
@@ -5777,9 +8929,29 @@ pub const Note = struct {
     pub fn initials(self: *const Note) []const u8 {
         return &self.initials_buf;
     }
-    /// The picture's blurhash, empty when the note carries none.
+    /// The first picture's blurhash, empty when the note carries none.
     pub fn imageBlurhash(self: *const Note) []const u8 {
-        return self.image_blur_buf[0..self.image_blur_len];
+        return self.imageAt(0).blurhash();
+    }
+    /// Picture `i`, or an empty one past the end so callers can read it without
+    /// checking first. An empty picture has a zero-length URL, which every
+    /// caller already treats as "no image".
+    pub fn imageAt(self: *const Note, i: usize) *const NoteImage {
+        if (i >= self.images_len) return &empty_note_image;
+        return &self.images[i];
+    }
+    /// How many pictures this note draws.
+    pub fn imageCount(self: *const Note) usize {
+        return self.images_len;
+    }
+    /// Gives a hand-built note a picture and hands it back so the test can state
+    /// its shape. For tests, which used to poke the Note's image fields directly.
+    pub fn setImageForTest(self: *Note, i: usize, link: []const u8) *NoteImage {
+        const n = @min(link.len, self.images[i].url_buf.len);
+        @memcpy(self.images[i].url_buf[0..n], link[0..n]);
+        self.images[i].url_len = @intCast(n);
+        if (self.images_len <= i) self.images_len = @intCast(i + 1);
+        return &self.images[i];
     }
     /// The link this note previews, empty when it has none.
     pub fn linkUrl(self: *const Note) []const u8 {
@@ -5790,7 +8962,7 @@ pub const Note = struct {
     }
     /// Whether this note carries an image to render.
     pub fn hasImage(self: *const Note) bool {
-        return self.image_url_len > 0;
+        return self.images_len > 0;
     }
     /// What the picture's chip says: its dimensions and its weight, as the note
     /// claims them, in the shot's own form (`1600x900 · 240 KB`). Either half may
@@ -5798,22 +8970,20 @@ pub const Note = struct {
     /// decoded bytes, which are the proxy's 480px box and would be a lie about
     /// the file, and never from the response, which carries no headers.
     pub fn imageChipLabel(self: *const Note, arena: std.mem.Allocator) []const u8 {
-        const has_dims = self.image_w > 0 and self.image_h > 0;
-        if (has_dims and self.image_bytes > 0) {
-            return std.fmt.allocPrint(arena, "{d}\u{00d7}{d} · {s}", .{ self.image_w, self.image_h, byteSize(arena, self.image_bytes) }) catch "";
-        }
-        if (has_dims) return std.fmt.allocPrint(arena, "{d}\u{00d7}{d}", .{ self.image_w, self.image_h }) catch "";
-        if (self.image_bytes > 0) return byteSize(arena, self.image_bytes);
-        return "";
+        return imageChipLabelFor(self.imageAt(0), arena);
     }
-    /// The note's image URL (empty when it has none).
+    /// The note's first image URL (empty when it has none).
     pub fn imageUrl(self: *const Note) []const u8 {
-        return self.image_url_buf[0..self.image_url_len];
+        return self.imageAt(0).url();
     }
-    /// The registered image id for this note's picture, or 0 while it is
+    /// The registered image id for this note's first picture, or 0 while it is
     /// loading, unavailable, or absent.
     pub fn media_id(self: *const Note) u64 {
-        if (mediaSlotFor(self.id)) |m| {
+        return self.mediaIdAt(0);
+    }
+    /// The same for picture `i`.
+    pub fn mediaIdAt(self: *const Note, i: usize) u64 {
+        if (mediaSlotFor(mediaKey(self.id, i))) |m| {
             if (m.state == .loaded) return m.image_id;
         }
         return 0;
@@ -5985,6 +9155,9 @@ pub const Model = struct {
     // text through `draft()`, never the buffer itself, and every edit event is
     // mirrored here in `update`.
     draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
+    /// Bytes of the last paste that did not fit, so the composer can say so.
+    /// Zero once something that fits is typed or pasted over it.
+    draft_dropped: usize = 0,
     // Which screen shows. A returning user (session on disk) starts at `.ready`;
     // a newcomer starts at `.onboarding` and moves to `.ready` when they sign in.
     // `.settings` is reached from the feed and returns to it.
@@ -6024,6 +9197,9 @@ pub const Model = struct {
     relay_full: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
+    /// Which of that note's pictures the viewer is showing. Zero for a note with
+    /// one, which is every note the viewer could open before galleries existed.
+    expanded_image: u8 = 0,
     /// Whether the mention picker has been dismissed for the query now in the
     /// draft. It has no open flag of its own: it shows whenever the draft ends
     /// in a `@word`, so Escape and a press outside had nothing to clear and it
@@ -6053,7 +9229,6 @@ pub const Model = struct {
     // and an unbounded one would refuse the whole view.
     /// Which page of the sheet is showing, counted from zero. Pages REPLACE each
     /// other rather than accumulating, so this is an index, not a depth.
-    notifications_page: usize = 0,
     // Whether the compose sheet is open. Compose is on demand from the "New
     // note" button in the titlebar, not a permanent bar, so the feed fills the
     // window.
@@ -6124,6 +9299,11 @@ pub const Model = struct {
     // never consulted again.
     mentions_off: [max_mention_tags][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_mention_tags,
     mentions_off_len: usize = 0,
+    /// Whether the level on screen was opened FROM notifications, so closing it
+    /// goes back there rather than to the feed. Pressing a row used to drop the
+    /// page entirely, and Back then landed on a feed the reader had not been
+    /// looking at, with their place in the notifications list gone.
+    notifications_return: bool = false,
     // The name beat: after creating an identity, one optional, skippable ask
     // so the account is not blank. Never for imported keys or signers.
     naming: bool = false,
@@ -6496,6 +9676,24 @@ pub const Model = struct {
         return "Pictures, faces, link previews and NIP-05 checks are fetched from the hosts a note names. " ++
             "Off, none of that is asked for until you press a picture, and only your relays learn you are reading.";
     }
+    pub fn proxy_on(self: *const Model) bool {
+        _ = self;
+        return g_media_proxy_on;
+    }
+    pub fn proxy_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return "On, a picture's host never sees you, and it arrives already resized: a 2040x1536 photograph is 611 KB from the source and a fraction of that through the proxy. " ++
+            "Off, pictures come straight from whoever hosts them, who then learn your address and how much you scroll.";
+    }
+    pub fn direct_fallback_on(self: *const Model) bool {
+        _ = self;
+        return g_media_direct_fallback;
+    }
+    pub fn direct_fallback_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return "Public proxies refuse whole domains by policy, and those pictures simply never appear. " ++
+            "On, Plaza asks that one host itself, which lets that host see you. Off, the picture stays blank and nobody new learns anything.";
+    }
     pub fn previews_state(self: *const Model) []const u8 {
         _ = self;
         return if (g_media_previews) "On" else "Off. Press a picture to load that one.";
@@ -6551,6 +9749,16 @@ pub const Model = struct {
         return "Connecting…";
     }
     pub fn empty_text(self: *const Model) []const u8 {
+        // In a place, the pool is not what the reader is waiting on. Its relay
+        // is deliberately outside the eight, so "Connecting to the relay pool"
+        // under a place header describes a connection that has nothing to do
+        // with the empty screen it is explaining, and says "connecting" about a
+        // socket that may have failed a minute ago.
+        if (g_place != null) return switch (placeLink()) {
+            .idle, .connecting => "Connecting to this place…",
+            .unreachable_relay => "Can't reach this place. Retrying…",
+            .connected => "Nothing here yet.",
+        };
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
         return "Connecting to the relay pool…";
     }
@@ -6598,6 +9806,13 @@ pub const Model = struct {
     /// statements too.
     pub fn scope_name(self: *const Model) []const u8 {
         _ = self;
+        // Inside a place the feed is the place's, so saying "Following" is
+        // simply false: those are not the reader's follows. It names the
+        // place's own feed instead.
+        if (g_place) |*m| {
+            if (m.feeds_len > 0 and m.feeds[0].name_len > 0) return m.feeds[0].name();
+            return "This place";
+        }
         return if (followsAreOwned()) "Following" else "Starter pack";
     }
 
@@ -6709,6 +9924,11 @@ pub const Model = struct {
             if (n >= self.thread_notes.len) break;
             var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
             defer se.deinit();
+            // A muted person's reply is hidden the same way their note is. The
+            // thread's ROOT is not checked: opening a thread is asking to read
+            // that note, and answering with an empty screen would be the app
+            // refusing a question the reader just asked.
+            if (isMuted(se.event.pubkey)) continue;
             self.thread_notes[n] = noteFrom(se.event, now_s);
             // Queue the replier's profile so a name, avatar, and handle resolve
             // for a reply from someone outside the follow set.
@@ -6789,7 +10009,10 @@ pub const Model = struct {
         for (0..relaySlots()) |i| {
             if (relayAt(i) == null) continue;
             switch (@as(Conn, @enumFromInt(g_relay_status[i].load(.acquire)))) {
-                .connected => live += 1,
+                // A quiet relay still holds its socket and nothing has failed,
+                // so it counts as live here. Saying otherwise would put the app
+                // behind an "offline, reconnecting" banner on a slow night.
+                .connected, .quiet => live += 1,
                 .offline => offline += 1,
                 .connecting => {},
             }
@@ -6814,7 +10037,28 @@ pub const Model = struct {
         const store = g_store orelse return;
 
         const count = store.eventCount() catch return;
-        if (count != g_last_count) {
+        // Three ways the view can be behind the store. The count catches
+        // anything landing by any route; the other two are the feed's own, and
+        // either can be true on a tick where the count has not moved (a
+        // deletion cancels an insert, or nothing was stored at all and the
+        // reader simply changed who they follow).
+        // A place's notes arrive on its own socket and go into the store like
+        // anything else, so for a place the reader has never seen this fires on
+        // the count alone. For one they HAVE seen it does not: every note is
+        // already stored, the ingest is a duplicate, the count does not move,
+        // and nothing below ever runs. That is a room that sits on "Connecting"
+        // forever while its relay is connected and answering.
+        //
+        // `rebuildNotes` already treats this counter as a reason to rebuild.
+        // The bug was one level up: it never got the chance, because deciding
+        // whether to call it at all did not know about places.
+        const place_rev = g_place_rev.load(.monotonic);
+        const stale = count != g_last_count or
+            g_arrival_pending.load(.acquire) or
+            g_feed_rebuild_all.load(.acquire) or
+            place_rev != g_notes_place_rev or
+            self.feed_limit != g_notes_feed_limit;
+        if (stale) {
             g_last_count = count;
             // Profiles first, so a note's mentions resolve to names as it builds.
             refreshProfiles(store);
@@ -6822,6 +10066,11 @@ pub const Model = struct {
             // A grown store may hold quoted events the feed references now.
             refreshQuotes(store);
         }
+        // Off the store-changed guard, on its own flag: a relay list is rare
+        // and the ranking reads every one of them, so it runs when one lands
+        // and not once a second because a reaction did. And not on the tick the
+        // list lands either, because they land in flurries.
+        maybeRankRelaySuggestions(store);
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
     }
 
@@ -6849,30 +10098,129 @@ pub const Model = struct {
         const limit = @min(self.feed_limit, ensureFeedCapacity(self.feed_limit));
         // After a growth the old slice is freed, so re-point before using it.
         self.notes = g_feed_notes;
-        var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(limit) }) catch return;
-        defer result.deinit();
 
-        // The store's count moves on every kind of ingest (profiles included),
-        // and the pool streams all day, so this runs about once a second. The
-        // notes themselves rarely change: reuse the already-parsed card whenever
-        // the event is one we hold, and parse only what is genuinely new.
         // Mention labels are baked into content at parse time, so a new display
         // name (the generation) forces one full parse pass to refresh them.
         const reuse_ok = g_names_generation == g_notes_names_generation;
         g_notes_names_generation = g_names_generation;
 
-        // Nothing new at all: the usual tick, when the count moved for some
-        // other kind of event. Keep every card exactly as it is.
-        if (reuse_ok and result.events.len == self.notes_len) {
-            var same = true;
-            for (result.events, 0..) |ev, i| {
-                if (noteIdOf(ev) != self.notes[i].id) {
-                    same = false;
-                    break;
-                }
+        // Always, and before deciding anything: whatever is waiting is either
+        // spliced now or covered by the full read below, and leaving it in the
+        // buffer would splice it a second time on the next tick.
+        const arrived = takeFeedArrivals();
+
+        // What the list in hand cannot be brought up to date FROM. Everything
+        // else is an addition, and an addition is a merge.
+        //
+        //   the flag       the author set changed, the reader signed in or out,
+        //                  or a deletion landed
+        //   lost           more arrived between two ticks than the buffer holds
+        //   !reuse_ok      a name moved, so every card's baked text is stale
+        //   limit moved    the reader paged down, so notes below the old window
+        //                  belong now and no arrival describes them
+        // A place's notes arrive on its own socket, not through the ingest
+        // buffer the splice path drains, so nothing in `arrived` ever describes
+        // them. Its revision counter is what says there is something new, and
+        // `refresh` consults the same counter before it gets here.
+        const place_rev = g_place_rev.load(.monotonic);
+        const place_moved = place_rev != g_notes_place_rev;
+        g_notes_place_rev = place_rev;
+
+        const full = g_feed_rebuild_all.swap(false, .acq_rel) or
+            place_moved or
+            arrived.lost or
+            !reuse_ok or
+            limit != g_notes_limit or
+            self.feed_limit != g_notes_feed_limit;
+        g_notes_limit = limit;
+        g_notes_feed_limit = self.feed_limit;
+
+        if (full) {
+            // In a place, the feed IS the place. Not your follows with a
+            // header on top, which is what a lens would be and is exactly the
+            // thing the room decision rejected.
+            if (g_place != null) {
+                self.rebuildNotesFromPlace(store, now_s, limit, reuse_ok);
+            } else {
+                self.rebuildNotesFromStore(store, now_s, authors[0..authors_len], &kinds, limit, reuse_ok);
             }
-            if (same) return;
+            return;
         }
+        if (arrived.n == 0) return;
+        self.spliceArrivals(store, now_s, authors[0..authors_len], &kinds, limit, arrived.n);
+    }
+
+    /// Reads the whole window back from the store: a cursor per followed author
+    /// and a linear pick across all of them, per note returned. The expensive
+    /// one, and the reason for everything above it.
+    /// The same rebuild, reading the ids the place's relay sent rather than a
+    /// set of authors. Shares `noteFrom`, the reuse index and the mute filter,
+    /// because a note in a place is a note.
+    fn rebuildNotesFromPlace(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        limit: usize,
+        reuse_ok: bool,
+    ) void {
+        var ids: [place_feed_cap][32]u8 = undefined;
+        var ids_len: usize = 0;
+        {
+            lockPlaceIds();
+            defer unlockPlaceIds();
+            ids_len = g_place_ids_len;
+            @memcpy(ids[0..ids_len], g_place_ids[0..ids_len]);
+        }
+        if (ids_len == 0) {
+            self.notes_len = 0;
+            return;
+        }
+
+        var result = store.query(std.heap.page_allocator, .{
+            .ids = ids[0..ids_len],
+            .limit = @intCast(limit),
+        }) catch return;
+        defer result.deinit();
+        g_feed_work.full_reads += 1;
+
+        const old = g_feed_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+        const slots = if (reuse_ok) buildReuseIndex(old[0..old_len]) else &.{};
+
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= limit) break;
+            // The reader's own mutes still apply inside a place. So what they
+            // see is not exactly what the host published, and that is the right
+            // way round: a host cannot un-mute somebody for you.
+            if (isMuted(ev.pubkey)) continue;
+            self.notes[n] = blk: {
+                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                g_feed_work.parses += 1;
+                break :blk noteFrom(ev, now_s);
+            };
+            n += 1;
+        }
+        self.notes_len = n;
+    }
+
+    fn rebuildNotesFromStore(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        authors: []const [32]u8,
+        kinds: []const u16,
+        limit: usize,
+        reuse_ok: bool,
+    ) void {
+        var result = store.query(std.heap.page_allocator, .{
+            .authors = authors,
+            .kinds = kinds,
+            .limit = @intCast(limit),
+        }) catch return;
+        defer result.deinit();
+        g_feed_work.full_reads += 1;
 
         // The old cards, so new positions can take them over by id.
         const old = g_feed_scratch;
@@ -6883,16 +10231,123 @@ pub const Model = struct {
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= limit) break;
-            const id = noteIdOf(ev);
+            // A muted author never becomes a card. Filtered here rather than in
+            // the query because the store has no idea who this reader muted, and
+            // rather than at render time because a hidden row would still hold a
+            // slot in a window that pages by count.
+            if (isMuted(ev.pubkey)) continue;
             self.notes[n] = blk: {
-                if (findReused(slots, old[0..old_len], id)) |prev| break :blk prev;
+                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                g_feed_work.parses += 1;
                 break :blk noteFrom(ev, now_s);
             };
             n += 1;
         }
         self.notes_len = n;
     }
+
+    /// Merges the notes that just landed into the list already on screen.
+    ///
+    /// The ids come from the ingest threads, so the store is asked for exactly
+    /// those and nothing else: a direct read per id, no cursor per follow and no
+    /// pick across two thousand streams. Everything already held is carried over
+    /// as it is, so no card is re-parsed and no picture is re-fetched.
+    fn spliceArrivals(
+        self: *Model,
+        store: *nostr.store.Store,
+        now_s: i64,
+        authors: []const [32]u8,
+        kinds: []const u16,
+        limit: usize,
+        arrived: usize,
+    ) void {
+        var result = store.query(std.heap.page_allocator, .{
+            .ids = g_arrival_taken[0..arrived],
+            .kinds = kinds,
+        }) catch {
+            // The ids are gone with the buffer, so the only honest recovery is
+            // to read the window back next tick.
+            invalidateFeed();
+            return;
+        };
+        defer result.deinit();
+        g_feed_work.splices += 1;
+        if (result.events.len == 0) return;
+
+        // Which of them this feed is actually about. The store was asked by id,
+        // not by author, on purpose: an author list is checked one name at a
+        // time, and asking about a handful of arrivals should not walk two
+        // thousand follows per arrival. Only the ones that are NOT already held
+        // pay that walk, and those are few.
+        const held = buildReuseIndex(self.notes[0..self.notes_len]);
+        var keep: usize = 0;
+        for (result.events, 0..) |ev, i| {
+            if (keep >= g_splice_keep.len) break;
+            if (ev.kind != 1) continue;
+            if (heldIndex(held, self.notes[0..self.notes_len], ev.id) != null) continue;
+            if (!authorInSet(authors, ev.pubkey)) continue;
+            if (isMuted(ev.pubkey)) continue;
+            // The window is full and this is older than everything in it, so it
+            // would be dropped by the truncation below. Not worth parsing.
+            if (self.notes_len >= limit and self.notes_len > 0 and
+                !eventNewerThanNote(ev, self.notes[self.notes_len - 1])) continue;
+            g_splice_keep[keep] = @intCast(i);
+            keep += 1;
+        }
+        if (keep == 0) return;
+
+        // Two sorted runs into one. `result.events` is newest-first (the store
+        // sorts it) and so is the list on screen, so this is one pass with no
+        // sort and no search. Through the scratch copy rather than in place: an
+        // in-place merge is only safe in one direction, and which direction
+        // depends on whether the window is growing or already full.
+        const old = g_feed_scratch;
+        const old_len = self.notes_len;
+        @memcpy(old[0..old_len], self.notes[0..old_len]);
+
+        const total = @min(old_len + keep, limit);
+        var oi: usize = 0;
+        var fi: usize = 0;
+        for (0..total) |n| {
+            const take_new = blk: {
+                if (fi >= keep) break :blk false;
+                if (oi >= old_len) break :blk true;
+                break :blk eventNewerThanNote(result.events[g_splice_keep[fi]], old[oi]);
+            };
+            if (take_new) {
+                self.notes[n] = noteFrom(result.events[g_splice_keep[fi]], now_s);
+                g_feed_work.parses += 1;
+                fi += 1;
+            } else {
+                self.notes[n] = old[oi];
+                oi += 1;
+            }
+        }
+        self.notes_len = total;
+    }
 };
+
+/// Whether `pubkey` is one of the feed's authors. A walk, because the set is a
+/// plain array; only arrivals that are not already on screen reach it.
+fn authorInSet(authors: []const [32]u8, pubkey: [32]u8) bool {
+    for (authors) |a| {
+        if (std.mem.eql(u8, &a, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Whether `ev` sorts ahead of `note` in the feed: newer, or the same second and
+/// a higher id.
+///
+/// The tie-break is not decoration. It is the store's own ordering
+/// (`created_at` descending, then id descending), and a merge that broke ties
+/// differently would put two same-second notes in one order while a full read
+/// put them in the other, so the pair would swap places the next time anything
+/// forced a full read.
+fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
+    if (ev.created_at != note.created_at) return ev.created_at > note.created_at;
+    return std.mem.order(u8, &ev.id, &note.event_id) == .gt;
+}
 
 /// Adopts `secret` as the active local identity. For tests: the feed scopes
 /// its queries to the follow set plus the signed-in user, so a test that
@@ -6916,23 +10371,104 @@ pub fn clearIdentityForTest() void {
     g_signer_kind = .local;
 }
 
-/// Reconciles profiles and notes against `store` directly, bypassing the
-/// count guard. For tests, which drive the store themselves.
 /// Forces the next reconcile to do the full work rather than take the
 /// unchanged-store fast path, so a benchmark measures a rebuild.
 pub fn invalidateFeedForTest() void {
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
+}
+
+/// Reconciles profiles and notes against `store` directly, bypassing change
+/// detection entirely. For tests that drive the store themselves rather than
+/// through `plazaIngest`, which is where an arrival announces itself: without
+/// the announcement there is nothing to splice, so this asks for the full read.
+///
+/// Tests of the change-detection layer itself go through `plazaIngestForTest`
+/// and `Model.refresh`, which is what the app runs.
+/// Rebuilds the open thread's replies from the store. The real one runs off the
+/// tick, which a test has no way to turn.
+pub fn refreshThreadNotesForTest(model: *Model, now_s: i64) void {
+    model.refreshThreadNotes(now_s);
 }
 
 pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    invalidateFeed();
     refreshProfiles(store);
     model.rebuildNotes(store, now_s);
+}
+
+/// A tick as the app actually takes one, including the gate that decides
+/// whether the feed is rebuilt AT ALL.
+///
+/// `reconcileForTest` goes straight to `rebuildNotes` and invalidates on the
+/// way in, so every test using it rebuilds unconditionally. That is the right
+/// tool for asking what a rebuild produces, and it is why a place could sit on
+/// "Connecting" forever with nothing red: the decision NOT to rebuild is the
+/// part it skips.
+pub fn refreshForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    setStoreForTest(store);
+    model.refresh(now_s);
+}
+
+/// How the feed has been brought up to date, counted. Asserted on instead of
+/// timed: a stopwatch in a Debug test binary on a shared machine says nothing,
+/// and the whole point of this path is which of the two ran.
+pub const FeedWork = struct {
+    /// Windows read back from the store in full: a cursor per followed author.
+    full_reads: usize = 0,
+    /// Merges of what the ingest threads announced: a direct read per id.
+    splices: usize = 0,
+    /// Notes parsed from an event. A reused card costs nothing and is not here.
+    parses: usize = 0,
+};
+var g_feed_work: FeedWork = .{};
+
+pub fn feedWork() FeedWork {
+    return g_feed_work;
+}
+pub fn resetFeedWork() void {
+    g_feed_work = .{};
+}
+
+/// One tick, exactly as the app's timer runs it: change detection and all. The
+/// entry point for tests of how the feed decides what to do, as opposed to what
+/// a rebuild produces.
+pub fn tickForTest(model: *Model, now_s: i64) void {
+    model.refresh(now_s);
+}
+
+/// Empties the arrival buffer and asks for a full read next time, so a test
+/// starts from a known place rather than from whatever the last one left.
+pub fn resetFeedChangeDetectionForTest() void {
+    clearFeedArrivals();
+    invalidateFeed();
+    g_notes_limit = 0;
+    g_notes_feed_limit = 0;
+    g_last_count = std.math.maxInt(usize);
+}
+
+/// Announces an id as newly arrived without storing anything. For the case the
+/// app is not supposed to produce and the splice guards against anyway.
+pub fn noteFeedArrivalForTest(id: [32]u8) void {
+    noteFeedArrival(id);
+}
+
+/// Fills the arrival buffer past its capacity, the way a backfill does.
+pub fn overflowFeedArrivalsForTest() void {
+    for (0..feed_arrival_cap + 1) |i| {
+        var id = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, id[0..8], i, .big);
+        noteFeedArrival(id);
+    }
 }
 
 /// The feed key derived from an event id: the first eight bytes, sign bit
 /// masked so the markup engine's i64 key round-trip never overflows.
 pub fn noteIdOf(ev: nostr.event.Event) i64 {
-    return @intCast(std.mem.readInt(u64, ev.id[0..8], .big) & std.math.maxInt(i64));
+    return feedKeyOf(ev.id);
+}
+
+fn feedKeyOf(id: [32]u8) i64 {
+    return @intCast(std.mem.readInt(u64, id[0..8], .big) & std.math.maxInt(i64));
 }
 
 // The previous feed, kept across one rebuild so unchanged notes carry over
@@ -6980,6 +10516,26 @@ fn ensureFeedCapacity(want: usize) usize {
 var g_reuse_slots: []u32 = &.{};
 const reuse_empty: u32 = std.math.maxInt(u32);
 
+/// Which of a splice's arrivals belong in the feed, as indices into the query
+/// result. Indices rather than parsed cards: a thousand `Note`s is over a
+/// megabyte of buffers, and the merge can parse each one straight into its final
+/// position instead.
+var g_splice_keep: [feed_arrival_cap]u32 = undefined;
+
+/// The window depth the list in hand was built for, as asked for and as it came
+/// out after clamping to the storage. A change in either means notes below the
+/// old bottom belong now, and no arrival says so.
+///
+/// Both, because they move for different reasons: the reader raises the ask by
+/// paging down, and the clamp lifts on its own when a growth that failed earlier
+/// succeeds. The ask is also what the tick's own staleness check reads, so that
+/// paging down wakes a tick that would otherwise see an unchanged store and
+/// skip the rebuild entirely.
+var g_notes_limit: usize = 0;
+var g_notes_feed_limit: usize = 0;
+/// The place revision the notes on screen were built from.
+var g_notes_place_rev: u32 = 0;
+
 fn reuseHash(id: i64, mask: usize) usize {
     // Fibonacci mixing: note ids are the first eight bytes of a hash, so the low
     // bits are already well spread, but the multiply costs nothing and protects
@@ -7010,14 +10566,20 @@ fn buildReuseIndex(old: []const Note) []u32 {
     return table;
 }
 
-/// The previous card for `id`, when there is one.
-fn findReused(table: []const u32, old: []const Note, id: i64) ?Note {
+/// Where `event_id` sits in `old`, when it is there at all.
+///
+/// Compares the full 32 bytes, not the eight-byte feed key the table is hashed
+/// on. The key is a render handle and two ids could in principle share one; the
+/// splice uses this answer to decide whether an arriving note is already on
+/// screen, and getting that wrong would show the same note twice or hide a real
+/// one behind a stranger's card.
+fn heldIndex(table: []const u32, old: []const Note, event_id: [32]u8) ?usize {
     if (table.len == 0) return null;
     const mask = table.len - 1;
-    var at = reuseHash(id, mask);
+    var at = reuseHash(feedKeyOf(event_id), mask);
     while (table[at] != reuse_empty) : (at = (at + 1) & mask) {
-        const prev = old[table[at]];
-        if (prev.id == id) return prev;
+        const i = table[at];
+        if (std.mem.eql(u8, &old[i].event_id, &event_id)) return i;
     }
     return null;
 }
@@ -7057,13 +10619,24 @@ fn refreshProfiles(store: *nostr.store.Store) void {
     // comptime pack with no checks, so the first runtime follow list longer than
     // nine would have written past it: silent stack corruption in a release
     // build, from a feature that has nothing to do with profiles.
-    var authors: [max_follows + 1 + wanted_profiles_cap][32]u8 = undefined;
+    // NOT the follow list. This used to walk every follow, up to 2048 of them,
+    // on the feed reconcile path, and ask LMDB for all of their metadata on
+    // every rebuild. That is the single reason a bigger profile cache made
+    // scrolling slower rather than faster: the query limit was derived from the
+    // cache size, so growing the cache grew the query.
+    //
+    // No reference client does this. Notedeck collects pubkeys from notes that
+    // were actually ingested and only on a database MISS, then asks in a
+    // debounced batch, with no follow-list pass anywhere. Amethyst has no path
+    // at all that requests kind:0 for a whole contact list: each name on screen
+    // registers itself. Jumble does walk the follow list, but off the render
+    // path entirely, twenty at a time with a one second sleep between batches.
+    //
+    // What replaces it is already here: a displayed author with no name calls
+    // `wantProfile`, so the wanted set IS the on-screen set, which is exactly
+    // the input Notedeck uses.
+    var authors: [wanted_profiles_cap + 1][32]u8 = undefined;
     var authors_len: usize = 0;
-    for (followSet()) |pk| {
-        if (authors_len >= authors.len) break;
-        authors[authors_len] = pk;
-        authors_len += 1;
-    }
     if (activePubkey()) |pk| {
         if (authors_len < authors.len) {
             authors[authors_len] = pk;
@@ -7077,7 +10650,10 @@ fn refreshProfiles(store: *nostr.store.Store) void {
         authors[authors_len] = w.pubkey;
         authors_len += 1;
     }
-    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = profile_cap + wanted_profiles_cap }) catch return;
+    if (authors_len == 0) return;
+    // The limit is how many records the query can match, which is one kind:0
+    // per author. It is not a cache size, and tying it to one was the bug.
+    var result = store.query(std.heap.page_allocator, .{ .authors = authors[0..authors_len], .kinds = &kinds, .limit = @intCast(authors_len) }) catch return;
     defer result.deinit();
     for (result.events) |ev| {
         const p = upsertProfile(ev.pubkey) orelse continue;
@@ -7096,7 +10672,7 @@ fn refreshProfiles(store: *nostr.store.Store) void {
 /// Marks `pubkey`'s profile as on screen this pass (creating the slot if new),
 /// so the id LRU keeps its avatar and evicts someone off screen instead.
 fn markAvatarWanted(pubkey: [32]u8) void {
-    if (upsertProfile(pubkey)) |p| p.avatar_clock = g_avatar_clock;
+    if (upsertProfile(pubkey)) |p| p.avatar_clock = g_image_clock;
 }
 
 /// Lends the `max_avatar_images` registry ids to the authors on screen right
@@ -7106,8 +10682,58 @@ fn markAvatarWanted(pubkey: [32]u8) void {
 /// thread of strangers showed initials for everyone. Runs each tick before
 /// `scanAvatarFetches`, which then fetches the faces for whoever just gained an
 /// id. `fx` is needed to free a reclaimed id's registered image.
+/// Asks for the kind:0 of everybody the reader is about to read.
+///
+/// The wanted set is the app's queue of "whose name do we still need", and it
+/// was populated by exactly two callers: the inbox, and quoted notes. The FEED
+/// never registered anybody. That was fine only for as long as `refreshProfiles`
+/// walked the whole follow list, and when that walk was removed from the render
+/// path the feed lost its only source of names: the comment left behind claimed
+/// "a displayed author with no name calls `wantProfile`", which was true of the
+/// notifications page it was written for and of nothing else.
+///
+/// What that looked like: real accounts, with profiles sitting on the relays,
+/// drawn as a raw npub and a two-character avatar for the whole session. The
+/// dial-time subscription asks for kind:0 alongside the notes, so most authors
+/// resolve and the gap looks like an occasional glitch rather than a missing
+/// mechanism. Anybody that one bounded backfill did not cover was never asked
+/// about again.
+///
+/// Over the PREFETCH band, not just the visible rows, so a name is being fetched
+/// while the row is still below the fold. This is the same window the image
+/// warmer uses, and it has to be: `warmAvatar` needs `picture_len`, which comes
+/// from the kind:0, so a face cannot be warmed ahead for somebody nobody asked
+/// about. One missing registration was starving both.
+///
+/// Cheap to call every tick: `wantProfile` returns at once for anybody already
+/// named, which after the first pass is nearly everybody.
+fn wantProfilesAhead(model: *const Model) void {
+    if (activePubkey()) |pk| wantProfile(pk);
+    // The notifications page registers its own authors as rows are admitted,
+    // which catches likers and zappers who are in no other set.
+    if (model.notifications_open) return;
+    if (model.viewing_profile != null or model.viewing_thread != 0) {
+        const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
+        for (set.authors[0..set.author_count]) |pk| wantProfile(pk);
+        return;
+    }
+    const w = model.prefetchRange();
+    var i = w.first;
+    while (i <= w.last and i < model.notes_len) : (i += 1) wantProfile(model.notes[i].pubkey);
+}
+
+/// Opens one pass of the image passes: everything they mark as on screen is
+/// marked against this tick.
+///
+/// Its own step, called by the tick rather than hidden inside whichever pass
+/// happens to run first. Burying it in the avatar pass would have made the
+/// picture pass silently depend on running second, and a later reordering would
+/// have shown up as pictures thrashing rather than as anything named.
+fn beginImagePass() void {
+    g_image_clock += 1;
+}
+
 fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
-    g_avatar_clock += 1;
 
     // Collect the on-screen authors in READING ORDER (the active user, then the
     // thread's root and replies top-down, or the feed's visible window). Order
@@ -7125,7 +10751,25 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         }
     }.f;
     if (activePubkey()) |pk| push(&onscreen, &n, pk);
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.notifications_open) {
+        // The notifications page occludes everything, and its rows are the only
+        // faces on screen. Without this branch its authors were never in the
+        // set that lends registry slots, so every row drew initials no matter
+        // how long the page stayed open: the ids were all out on loan to a feed
+        // nobody could see.
+        // Only the rows ON SCREEN, which is the same rule the thread branch
+        // below spells out and the same mistake it is warning about. Pushing
+        // all of them marked every author wanted, and the claim pass never
+        // evicts anything wanted this pass, so nine ids were locked by rows the
+        // reader could not see and every visible row kept its initials.
+        var buf: [inbox_cap]InboxItem = undefined;
+        const shown = inboxItems(&buf, !model.notifications_everyone);
+        const first = @min(g_inbox_visible.first, shown.len);
+        const last = @min(g_inbox_visible.last + 1, shown.len);
+        if (last > first) {
+            for (shown[first..last]) |item| push(&onscreen, &n, item.author);
+        }
+    } else if (model.viewing_profile != null or model.viewing_thread != 0) {
         // A level occludes the feed, so its authors own the ids while it is up,
         // and only the ones ON SCREEN in it. Walking every note in the level
         // instead meant the first nine authors of a long thread took every id
@@ -7150,35 +10794,126 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
     }
 }
 
-/// Assigns `p` a free registry id, or the id of the author least-recently on
-/// screen (never one mid-fetch, never one on screen this pass, so a just-lent id
-/// is safe). A no-op when every id is held by an on-screen author (that author
-/// keeps initials this frame). A reclaimed id's old image is unregistered and its
-/// former owner reset to reload from cache when it returns.
-fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
-    var held = [_]bool{false} ** (max_avatar_images + 1);
-    for (&g_profiles) |*q| {
-        if (q.used and q.image_id >= 1 and q.image_id <= max_avatar_images) held[@intCast(q.image_id)] = true;
+// ------------------------------------------------- the whole-app image pool
+//
+// ONE allocator over all `image_registry_slots`, serving avatars, pictures and
+// the profile banner alike. The block at the top of this file argues for it;
+// this is it. Consumers differ only in what they downscale to, never in a
+// reserved share, because a reserved share is capacity that sits idle on the
+// screen that needs it: a profile page wants a banner and many faces and no
+// feed pictures at all, and a feed of four-picture notes wants the opposite.
+
+/// Who is holding each id. Derived from the consumers on every pass rather than
+/// stored beside them: they already record which id they hold, and a second
+/// table saying the same thing is a second thing that can be wrong.
+const IdOwner = union(enum) {
+    free,
+    avatar: *Profile,
+    banner,
+    media: *MediaSlot,
+};
+
+/// One pass over the consumers, rather than a scan per id: the profile cache is
+/// thousands of entries and this runs whenever a face or a picture appears.
+fn imageIdOwners() [image_registry_slots + 1]IdOwner {
+    var owners = [_]IdOwner{.free} ** (image_registry_slots + 1);
+    if (g_banner_image_id >= 1 and g_banner_image_id <= image_registry_slots) {
+        owners[@intCast(g_banner_image_id)] = .banner;
     }
-    var id: usize = 1;
-    while (id <= max_avatar_images) : (id += 1) {
-        if (!held[id]) {
-            p.image_id = @intCast(id);
-            return;
+    for (&g_profiles) |*p| {
+        if (p.used and p.image_id >= 1 and p.image_id <= image_registry_slots) {
+            owners[@intCast(p.image_id)] = .{ .avatar = p };
         }
     }
-    var victim: ?*Profile = null;
-    for (&g_profiles) |*q| {
-        if (!q.used or q.image_id == 0) continue;
-        if (q.avatar_clock == g_avatar_clock or q.avatar_state == .fetching) continue;
-        if (victim == null or q.avatar_clock < victim.?.avatar_clock) victim = q;
+    for (&g_media) |*m| {
+        if (m.used and m.image_id >= 1 and m.image_id <= image_registry_slots) {
+            owners[@intCast(m.image_id)] = .{ .media = m };
+        }
     }
-    const v = victim orelse return;
-    const reclaimed = v.image_id;
-    _ = fx.unregisterImage(reclaimed);
-    v.image_id = 0;
-    v.avatar_state = .idle;
-    p.image_id = reclaimed;
+    return owners;
+}
+
+/// When a held id was last on screen, or null if it may not be taken at all.
+///
+/// Two things make an id untouchable, and they are the same two for every kind
+/// of consumer: it is on screen THIS pass (taking it would evict something the
+/// reader is looking at, and with the marking done first, that means a sibling
+/// that has not been served yet), or a fetch is in flight for it (taking it
+/// would hand the arriving bytes to whoever holds the id next).
+fn imageIdSeen(owner: IdOwner) ?u64 {
+    return switch (owner) {
+        .free => null,
+        .avatar => |p| if (p.avatar_clock == g_image_clock or p.avatar_state == .fetching) null else p.avatar_clock,
+        .media => |m| if (m.last_used == g_image_clock or m.state == .fetching) null else m.last_used,
+        .banner => if (g_banner_seen == g_image_clock) null else g_banner_seen,
+    };
+}
+
+/// Takes an id back from whoever holds it: the registered pixels go, and the
+/// former owner is reset so it reloads (from the disk cache, usually) if the
+/// reader comes back to it.
+fn releaseImageId(fx: *Effects, owner: IdOwner, id: u64) void {
+    _ = fx.unregisterImage(id);
+    switch (owner) {
+        .free => {},
+        .avatar => |p| {
+            p.image_id = 0;
+            p.avatar_state = .idle;
+        },
+        .media => |m| {
+            m.releaseFrames();
+            m.image_id = 0;
+            m.state = .idle;
+        },
+        .banner => {
+            g_banner_image_id = 0;
+            g_banner_state = .idle;
+        },
+    }
+}
+
+const IdPick = struct { id: u64, owner: IdOwner };
+
+/// WHICH id the next image should get: a free one, or the one whose holder has
+/// been off screen longest. Null when every id is held by something on screen
+/// or mid-fetch, which is the honest answer: the caller shows initials, or a
+/// blurhash, for this frame and asks again next pass.
+///
+/// Separate from taking it because this is the whole rule, and taking it needs
+/// the effects channel to drop the old pixels. The decision is what a test can
+/// ask about.
+fn chooseImageId(owners: *const [image_registry_slots + 1]IdOwner) ?IdPick {
+    var id: u64 = 1;
+    while (id <= image_registry_slots) : (id += 1) {
+        if (owners[@intCast(id)] == .free) return .{ .id = id, .owner = .free };
+    }
+
+    var pick: ?IdPick = null;
+    var oldest: u64 = std.math.maxInt(u64);
+    id = 1;
+    while (id <= image_registry_slots) : (id += 1) {
+        const owner = owners[@intCast(id)];
+        const seen = imageIdSeen(owner) orelse continue;
+        if (seen < oldest) {
+            oldest = seen;
+            pick = .{ .id = id, .owner = owner };
+        }
+    }
+    return pick;
+}
+
+/// Takes the id `chooseImageId` picked, dropping whatever was in it.
+fn acquireImageId(fx: *Effects) ?u64 {
+    const owners = imageIdOwners();
+    const pick = chooseImageId(&owners) orelse return null;
+    if (pick.owner != .free) releaseImageId(fx, pick.owner, pick.id);
+    return pick.id;
+}
+
+/// Assigns `p` an id from the shared pool. A no-op when everything is spoken
+/// for, and that author keeps initials this frame.
+fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
+    p.image_id = acquireImageId(fx) orelse return;
 }
 
 /// Pulls the bytes for rows NEAR the viewport into the disk cache, without
@@ -7357,6 +11092,12 @@ fn handleMediaWarmed(response: native_sdk.EffectResponse) void {
     const slot = response.key - media_warm_key_base;
     if (slot >= g_warm_ring.len) return;
     if (response.outcome != .ok or response.status != 200 or response.truncated) return;
+    // Warming stays one request, so a picture bigger than one body is not warmed
+    // at all: it is fetched in slices when its row reaches the screen, and
+    // cached then. The cost is that a big picture arrives a moment late the
+    // first time and instantly ever after, which is worth more than holding a
+    // prefetch slot open across several round trips for a row nobody has
+    // reached yet.
     if (response.body.len == 0 or response.body.len > max_image_bytes) return;
     // The ring is what remembers the address: a response carries a key and a
     // body, and the cache is keyed by the URL. A slot reused by a later warm
@@ -7392,11 +11133,8 @@ fn scanAvatarFetches(fx: *Effects) void {
         }
         if (fired >= per_tick) continue;
         p.avatar_state = .fetching;
-        fx.fetch(.{
-            .key = avatar_fetch_key_base + @as(u64, @intCast(i)),
-            .url = p.url(),
-            .on_response = Effects.responseMsg(.avatar_fetched),
-        });
+        p.down.release();
+        fetchSlice(fx, avatar_fetch_key_base + @as(u64, @intCast(i)), p.url(), 0, Effects.responseMsg(.avatar_fetched));
         fired += 1;
     }
 }
@@ -7412,21 +11150,56 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
 
     // A rejection means every effect slot was busy: try again next tick.
     if (response.outcome == .rejected) {
+        p.down.release();
         p.avatar_state = .idle;
         return;
     }
-    // Anything but a clean, whole, OK image body falls back to initials.
-    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
-        p.avatar_state = .failed;
+    // A slice of a face bigger than one body: take it, and ask for the next
+    // unless the host just said there is no next.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = p.down.append(response.body) orelse {
+            p.down.release();
+            p.avatar_state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchSlice(fx, response.key, p.url(), p.down.len, Effects.responseMsg(.avatar_fetched));
+            return;
+        }
+        const whole = p.down.bytes() orelse response.body;
+        finishAvatar(fx, p, whole);
+        p.down.release();
         return;
     }
-    // Decode into this profile's fixed image id, downscaling if the platform
-    // decoder will not take it as-is. Only a genuinely undecodable body falls
-    // back to initials now.
-    if (decodeAndRegister(fx, p.image_id, response.body, avatar_target_px)) |_| {
+    // Anything but a clean, whole, OK image body. Which of those is worth asking
+    // again is the same question the feed's pictures ask, so it is the same
+    // answer: a face used to be given up on for the rest of the session over one
+    // 503, one rate limit, or one dropped connection.
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
+        p.down.release();
+        p.avatar_state = switch (classifyImageFailure(response.outcome, response.status)) {
+            .give_up => .failed,
+            .retry => blk: {
+                p.avatar_attempts +|= 1;
+                break :blk if (p.avatar_attempts >= max_image_attempts) .failed else .idle;
+            },
+        };
+        return;
+    }
+    p.down.release();
+    finishAvatar(fx, p, response.body);
+}
+
+/// Decodes a complete face into `p`'s registry id and remembers it.
+fn finishAvatar(fx: *Effects, p: *Profile, bytes: []const u8) void {
+    // Downscaling if the platform decoder will not take it as-is. Only a
+    // genuinely undecodable body falls back to initials now.
+    if (decodeAndRegister(fx, p.image_id, bytes, avatar_target_px)) |_| {
         p.avatar_state = .loaded;
-        storeCachedImage(p.url(), response.body);
+        p.avatar_attempts = 0;
+        storeCachedImage(p.url(), bytes);
     } else {
+        // Undecodable bytes are a fact about the picture, not about the network.
         p.avatar_state = .failed;
     }
 }
@@ -7540,6 +11313,18 @@ fn handleNip05Fetched(response: native_sdk.EffectResponse) void {
 // them itself: the platform decoder is tried first (it knows every format the
 // OS does, WebP and HEIC included), and stb takes over when it refuses.
 
+/// Whether the vendored decoder can read `bytes` at all. Test seam: what makes
+/// the platform fallback in `decodeAndRegister` load-bearing is precisely which
+/// formats stb was NOT built for.
+pub fn stbCanDecodeForTest(bytes: []const u8) bool {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
+    stbi_image_free(px);
+    return true;
+}
+
 extern fn stbi_load_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) ?[*]u8;
 extern fn stbi_load_gif_from_memory(buffer: [*]const u8, len: c_int, delays: *?[*]c_int, x: *c_int, y: *c_int, z: *c_int, comp: ?*c_int, req_comp: c_int) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
@@ -7587,7 +11372,7 @@ fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?Decode
     var name_buf: [64]u8 = undefined;
     const name = cacheName(&name_buf, url);
     const gpa = std.heap.page_allocator;
-    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return null;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_download_bytes)) catch return null;
     defer gpa.free(bytes);
     return decodeAndRegister(fx, id, bytes, max_dim);
 }
@@ -7603,6 +11388,16 @@ fn loadCachedImage(fx: *Effects, id: u64, url: []const u8, max_dim: u32) ?Decode
 /// test could compare two spellings; sharing the function means there are not
 /// two to compare.
 fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
+    return feedImageUrlDirect(buf, src, false);
+}
+
+/// The same, with `direct` skipping the proxy and asking the host itself.
+///
+/// The picture is still resized afterwards, by us: `decodeAndRegister` scales
+/// anything over the registry's budget. What a direct fetch costs is the bytes
+/// on the way in, since the proxy would have shrunk them first.
+fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    if (direct) return src;
     return if (isGifUrl(src))
         mediaUrl(buf, src, gif_target_px, .animation)
     else
@@ -7662,24 +11457,88 @@ fn storeCachedImage(url: []const u8, bytes: []const u8) void {
 /// at its real aspect instead of stretching it into whatever box it is given.
 const DecodedSize = struct { width: usize, height: usize };
 
+/// The largest single dimension worth decoding. Its only real job is to make the
+/// area check below safe to compute: squared it is 2^28, nowhere near overflowing
+/// a usize, so `w * h` cannot wrap before anybody looks at it.
+const image_max_dim = 16384;
+
+/// And the area, which is the number that actually costs memory: four bytes a
+/// pixel, so this is a 160 MB decode at the limit. A photograph does not reach
+/// it; a file built to make an app allocate does.
+const image_max_pixels = 40 * 1024 * 1024;
+
+/// Whether a decoded image's own declared size is one to go on with.
+pub fn imageSizeUsable(width: usize, height: usize) bool {
+    if (width == 0 or height == 0) return false;
+    // Both dimensions FIRST, so the multiply that follows cannot wrap. Checking
+    // the area alone would be the check computing the very number it exists to
+    // decide is safe.
+    if (width > image_max_dim or height > image_max_dim) return false;
+    return width * height <= image_max_pixels;
+}
+
 /// Decodes `bytes` and registers the pixels under `id`, downscaling so the long
 /// edge is at most `max_dim`. Returns the registered size, or null on failure.
 fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32) ?DecodedSize {
-    // Fast path: let the platform decode and register directly. This succeeds
-    // whenever the image already fits the registry's budget.
-    if (fx.registerImageBytes(id, bytes)) |registered| {
-        return .{ .width = registered.width, .height = registered.height };
-    } else |_| {}
+    @setRuntimeSafety(true); // Pixel dimensions a stranger's file declares, multiplied into a buffer size.
+    // Fast path: let the platform decode and register directly, but only when
+    // what it produces is close to what this caller asked for.
+    //
+    // SDK 0.9.2 taught the platform decoder to downsample (thumbnail-at-index
+    // against a pixel budget), so this stopped failing on real photos and
+    // started succeeding on nearly all of them. That is the fix I asked for and
+    // it is worth taking. The catch is that it fits the REGISTRY BUDGET, not
+    // `max_dim`: it hands back roughly 512x512 whatever the caller wanted. For
+    // feed media (480) and a banner (512) that is the right answer. For an
+    // avatar drawn at 40pt and asked for at 128 it is four times the pixels on
+    // each edge, so sixteen times the texture bytes, for every face on screen.
+    //
+    // So the small consumers TRY the vendored decoder first, which honours
+    // `max_dim` exactly. They do not skip the platform: that broke every face in
+    // the app. stb is compiled for JPEG, PNG and GIF only, and the image proxy
+    // hands back WEBP, which is 327 of the 400 files in my own media cache. A
+    // gate that sent avatars straight to stb sent them to a decoder that cannot
+    // read the format they arrive in, so they all fell back to initials.
+    //
+    // Hence: platform first when the size it picks is the size we want, stb in
+    // the middle because it honours `max_dim`, and platform LAST as the format
+    // fallback. Every image gets a decoder that can read it, and only the ones
+    // stb can read pay for the smaller texture.
+    if (max_dim >= media_target_px) {
+        if (fx.registerImageBytes(id, bytes)) |registered| {
+            return .{ .width = registered.width, .height = registered.height };
+        } else |_| {}
+    }
 
     var w: c_int = 0;
     var h: c_int = 0;
     var comp: c_int = 0;
-    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return null;
+    const pixels = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse {
+        // A format stb was not built for, which in practice means WEBP. The
+        // platform decoder reads it, so ask even though it will come back
+        // larger than `max_dim`: a face at the wrong size beats no face.
+        if (max_dim < media_target_px) {
+            if (fx.registerImageBytes(id, bytes)) |registered| {
+                return .{ .width = registered.width, .height = registered.height };
+            } else |_| {}
+        }
+        return null;
+    };
     defer stbi_image_free(pixels);
     if (w <= 0 or h <= 0) return null;
 
     const src_w: usize = @intCast(w);
     const src_h: usize = @intCast(h);
+    // What the C decoder handed back, checked before anything multiplies it.
+    //
+    // Every line below turns these two numbers into a buffer size, and they came
+    // out of a file somebody linked in a note. stb caps a single dimension at
+    // 2^24, which is a product of 2^48 pixels, so "it decoded" is not the same as
+    // "this is a size to allocate". The safety check above would catch the
+    // overflow itself, but catching it means the app stops; refusing the picture
+    // means the app carries on without it, which is the right answer for one
+    // oversized image in a feed.
+    if (!imageSizeUsable(src_w, src_h)) return null;
     const longest = @max(src_w, src_h);
     if (longest <= max_dim) {
         // The platform refused it for some other reason; the decoded pixels
@@ -7712,6 +11571,10 @@ const MediaSlot = struct {
     note_id: i64 = 0,
     image_id: u64 = 0,
     state: enum { idle, fetching, loaded, failed } = .idle,
+    /// Fetches for this slot's URL that came back unusable for a reason worth
+    /// retrying. Reset when the slot is handed to a different note, because
+    /// `claimMediaSlot` rebuilds the whole struct.
+    attempts: u8 = 0,
     /// Tick counter at the last time this note was still wanted, for eviction.
     last_used: u64 = 0,
     /// The registered pixel size, so the card can lay the picture out at its
@@ -7721,6 +11584,20 @@ const MediaSlot = struct {
     /// The resolved URL this image is fetched from, which is also its cache key.
     url_buf: [1024]u8 = [_]u8{0} ** 1024,
     url_len: u16 = 0,
+    /// Ask this picture's own host next time, skipping the proxy.
+    ///
+    /// Set when a proxied fetch came back unusable, so the retry goes to the
+    /// source. The public proxy refuses whole TLDs by policy and answers 400 for
+    /// hosts that serve the same file directly without complaint, and from here
+    /// that is indistinguishable from any other refusal: what is observable is
+    /// that the proxy would not produce the picture.
+    ///
+    /// One flag rather than a counter, because it is one alternative: proxy,
+    /// then source, then give up. Reset with the rest of the slot when it is
+    /// handed to a different note.
+    direct: bool = false,
+    /// A picture too big for one response body, assembled out of Range slices.
+    down: Download = .{},
     /// Every frame of an animated GIF, decoded once and owned by stb (freed on
     /// eviction). Null for a still picture.
     frames: ?[*]u8 = null,
@@ -7746,7 +11623,6 @@ const MediaSlot = struct {
 };
 
 var g_media = [_]MediaSlot{.{}} ** max_media_images;
-var g_media_clock: u64 = 0;
 
 // The rows the windowed list last put on screen. Written by the view (which is
 // where the runtime resolves the window) and read by the fetch pass in
@@ -7793,7 +11669,7 @@ fn recalledAspect(note_id: i64) ?f32 {
 /// has to ask about.
 pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
     const m = mediaSlotFor(note_id) orelse return null;
-    return m.last_used == g_media_clock;
+    return m.last_used == g_image_clock;
 }
 
 pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
@@ -7824,11 +11700,43 @@ pub fn maxMediaImagesForTest() usize {
 }
 
 pub fn resetMediaForTest() void {
+    for (&g_media) |*m| m.down.release();
     g_media = [_]MediaSlot{.{}} ** max_media_images;
-    g_media_clock = 0;
+    g_image_clock = 0;
+}
+
+/// How many slots are holding a half-assembled picture. Zero at rest: a slice
+/// buffer belongs to one fetch and dies with it.
+pub fn mediaPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_media) |*m| {
+        if (m.down.buf != null) n += 1;
+    }
+    return n;
 }
 
 /// The slot holding `note_id`'s image, if any.
+/// The media-slot key for one picture of a note.
+///
+/// Picture ZERO keeps the note's own id, deliberately: every slot already on
+/// disk was cached under it, and every path that still speaks in note ids keeps
+/// working unchanged. Only the second and later pictures need a key of their
+/// own.
+///
+/// A derived key colliding with some other note's id would show that note's
+/// picture here. Note ids are already 63 bits taken from an event id, so this is
+/// the same order of unlikely as two notes colliding outright, which the feed
+/// has always lived with.
+fn mediaKey(note_id: i64, index: usize) i64 {
+    if (index == 0) return note_id;
+    const mixed = @as(u64, @bitCast(note_id)) ^ (0x9E37_79B9_7F4A_7C15 *% @as(u64, index));
+    return @bitCast(mixed & 0x7FFF_FFFF_FFFF_FFFF);
+}
+
+pub fn mediaKeyForTest(note_id: i64, index: usize) i64 {
+    return mediaKey(note_id, index);
+}
+
 fn mediaSlotFor(note_id: i64) ?*MediaSlot {
     for (&g_media) |*m| {
         if (m.used and m.note_id == note_id) return m;
@@ -7852,8 +11760,88 @@ pub fn markMediaFailedForTest(slot: *MediaSlot) void {
     slot.state = .failed;
 }
 
-pub fn mediaFailureIsFinalForTest(status: u16) bool {
-    return mediaFailureIsFinal(status);
+pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.attempts;
+}
+
+pub fn mediaIdleForTest(note_id: i64) bool {
+    const m = mediaSlotFor(note_id) orelse return false;
+    return m.state == .idle;
+}
+
+/// Delivers one picture-fetch response for `note_id` the way the runtime would,
+/// so a test can drive the failure paths rather than the classifier alone.
+/// How many faces are holding a half-assembled picture. Zero at rest.
+pub fn avatarPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_profiles) |*p| {
+        if (p.used and p.down.buf != null) n += 1;
+    }
+    return n;
+}
+
+/// Feeds one delivered slice to a profile's face, exactly as a 206 does.
+pub fn appendAvatarSliceForTest(pubkey: [32]u8, body: []const u8) ?SliceOutcome {
+    const p = lookupProfile(pubkey) orelse return null;
+    return p.down.append(body);
+}
+
+pub fn deliverAvatarResponseForTest(
+    fx: *Effects,
+    pubkey: [32]u8,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const p = lookupProfile(pubkey) orelse return;
+    const index = (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
+    handleAvatarFetched(fx, .{
+        .key = avatar_fetch_key_base + index,
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
+}
+
+pub fn maxImageBytesForTest() usize {
+    return max_image_bytes;
+}
+
+pub fn maxImageDownloadBytesForTest() usize {
+    return max_image_download_bytes;
+}
+
+pub fn rangeHeaderForTest(buf: []u8, offset: usize) ?[]const u8 {
+    return rangeHeader(buf, offset);
+}
+
+/// Feeds one delivered slice to a note's slot, exactly as a 206 response does.
+pub fn appendMediaSliceForTest(note_id: i64, body: []const u8) ?SliceOutcome {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.down.append(body);
+}
+
+/// What a note's slot has assembled so far, or null if it is holding nothing.
+pub fn mediaPartialForTest(note_id: i64) ?[]const u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.down.bytes();
+}
+
+pub fn deliverMediaResponseForTest(
+    fx: *Effects,
+    note_id: i64,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    handleMediaFetched(fx, .{
+        .key = media_fetch_key_base + mediaSlotIndex(m),
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
 }
 
 pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
@@ -7861,29 +11849,72 @@ pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
 }
 
 pub fn touchMediaClockForTest() u64 {
-    g_media_clock += 1;
-    return g_media_clock;
+    beginImagePass();
+    return g_image_clock;
+}
+
+pub fn acquireImageIdForTest(fx: *Effects) ?u64 {
+    return acquireImageId(fx);
+}
+
+/// The id the pool would hand out next, without taking it. Lets a test ask what
+/// the rule decides without an effects channel to drop pixels through.
+pub fn chooseImageIdForTest() ?u64 {
+    const owners = imageIdOwners();
+    const pick = chooseImageId(&owners) orelse return null;
+    return pick.id;
+}
+
+pub fn imageClockForTest() u64 {
+    return g_image_clock;
+}
+
+pub fn markAvatarWantedForTest(pubkey: [32]u8) void {
+    markAvatarWanted(pubkey);
+}
+
+pub fn beginImagePassForTest() void {
+    beginImagePass();
+}
+
+/// The slot's position in `g_media`, which is its identity for everything
+/// outside the registry: its fetch key is derived from it, so an arriving
+/// response finds the slot that asked even after the registry id it holds has
+/// been lent to somebody else.
+fn mediaSlotIndex(m: *const MediaSlot) usize {
+    return (@intFromPtr(m) - @intFromPtr(&g_media[0])) / @sizeOf(MediaSlot);
 }
 
 fn claimMediaSlot(fx: *Effects, note_id: i64) ?*MediaSlot {
     if (mediaSlotFor(note_id)) |m| return m;
-    for (&g_media, 0..) |*m, i| {
+    for (&g_media) |*m| {
         if (!m.used) {
-            m.* = .{ .used = true, .note_id = note_id, .image_id = media_image_id_base + i };
+            // A slot with no registry id yet. It gets one when there is a
+            // picture to put in it, from the same pool as everything else.
+            m.* = .{ .used = true, .note_id = note_id };
             return m;
         }
     }
     var victim: ?*MediaSlot = null;
     for (&g_media) |*m| {
         if (m.state == .fetching) continue;
-        if (m.last_used == g_media_clock) continue; // still wanted on screen
+        if (m.last_used == g_image_clock) continue; // still wanted on screen
         if (victim == null or m.last_used < victim.?.last_used) victim = m;
     }
     const v = victim orelse return null;
     const id = v.image_id;
-    // Free the registry slot and any decoded frames before reusing the id.
-    _ = fx.unregisterImage(id);
+    // Free the registry slot and any decoded frames before reusing the slot.
+    if (id != 0) _ = fx.unregisterImage(id);
     v.releaseFrames();
+    // Not a second cleanup: every way a fetch can end already drops its slices,
+    // and a slot still assembling one is `.fetching`, which is never a victim.
+    // This says so out loud, so a terminal path that forgets fails here in a
+    // test rather than quietly handing the next note half of somebody else's
+    // picture.
+    std.debug.assert(v.down.buf == null);
+    // The id it was holding comes with it: the picture that was in it has just
+    // been unregistered, so the slot is empty and nobody else can be lent it
+    // between here and the next registration.
     v.* = .{ .used = true, .note_id = note_id, .image_id = id };
     return v;
 }
@@ -7948,7 +11979,7 @@ fn loadCachedMedia(fx: *Effects, slot: *MediaSlot, gif: bool) bool {
     var name_buf: [64]u8 = undefined;
     const name = cacheName(&name_buf, slot.url());
     const gpa = std.heap.page_allocator;
-    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_bytes)) catch return false;
+    const bytes = dir.readFileAlloc(io, name, gpa, std.Io.Limit.limited(max_image_download_bytes)) catch return false;
     defer gpa.free(bytes);
 
     if (gif and loadAnimatedGif(fx, slot, bytes)) return true;
@@ -8004,7 +12035,10 @@ fn advanceAnimations(fx: *Effects, model: *const Model) void {
 fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     const per_tick = 6;
     var fired: usize = 0;
-    g_media_clock += 1;
+    // No tick of its own: `beginImagePass` advances the one clock every image
+    // pass marks against. A second bump here would put every picture a tick
+    // ahead of every face, so the allocator would read faces as permanently
+    // older and evict them first, forever.
 
     if (model.viewing_profile != null or model.viewing_thread != 0) {
         // A level occludes the feed, so the picture budget goes to the level,
@@ -8045,25 +12079,50 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
 /// Marks the picture slot for `note_id` wanted this pass (if it has one), so the
 /// claim pass does not evict a picture still on screen.
 fn markMediaWanted(note_id: i64) void {
-    if (mediaSlotFor(note_id)) |m| m.last_used = g_media_clock;
+    // Every picture of the note, not just the first: a gallery's later cells are
+    // as much on screen as its first, and leaving them unmarked let the claim
+    // pass evict one to feed another in the same row.
+    var i: usize = 0;
+    while (i < max_note_images) : (i += 1) {
+        if (mediaSlotFor(mediaKey(note_id, i))) |m| m.last_used = g_image_clock;
+    }
 }
 
 /// Loads one note's picture: claims a slot, serves it from the disk cache, or
 /// fetches it over the network (up to `per_tick` fetches a pass). A note with no
 /// picture, or one whose slot is already loading or done, is a no-op.
 fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) void {
-    if (!note.hasImage()) return;
+    // Every picture the note carries, in reading order, so the first one is the
+    // first to get a slot when there are not enough to go round. The ones that
+    // miss out draw their blurhash, which costs no slot at all.
+    var i: usize = 0;
+    while (i < note.imageCount()) : (i += 1) fireMediaAt(fx, note, i, fired, per_tick);
+}
+
+fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per_tick: usize) void {
+    const link = note.imageAt(index).url();
+    if (link.len == 0) return;
     // With previews off, nothing leaves the machine until the reader asks for
-    // this one picture. That is the point of the setting: not bandwidth, but
+    // this note's pictures. That is the point of the setting: not bandwidth, but
     // that reading a feed should not tell every host in it that you did.
     if (!g_media_previews and !isMediaAsked(note.id)) return;
-    const slot = claimMediaSlot(fx, note.id) orelse return;
-    slot.last_used = g_media_clock;
+    const slot = claimMediaSlot(fx, mediaKey(note.id, index)) orelse return;
+    slot.last_used = g_image_clock;
     if (slot.state != .idle) return;
+    // A slot is a place to put a picture; an id is the registry capacity to
+    // hold one, and there are fewer of those. Take one now, marked on screen
+    // first so this cannot evict a sibling picture in the same note. Nothing
+    // free means the reader sees this cell as a blurhash for a frame and the
+    // next pass tries again, which is what the shared pool is for: the id it
+    // needs is whichever face or picture has been off screen longest, not one
+    // reserved for pictures and idle.
+    if (slot.image_id == 0) {
+        slot.image_id = acquireImageId(fx) orelse return;
+    }
 
     var url_buf: [1024]u8 = undefined;
-    const gif = isGifUrl(note.imageUrl());
-    const url = feedImageUrl(&url_buf, note.imageUrl());
+    const gif = isGifUrl(link);
+    const url = feedImageUrlDirect(&url_buf, link, slot.direct);
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
@@ -8073,24 +12132,168 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
     if (loadCachedMedia(fx, slot, gif)) return;
     if (fired.* >= per_tick) return;
     slot.state = .fetching;
-    fx.fetch(.{
-        .key = media_fetch_key_base + (slot.image_id - media_image_id_base),
-        .url = slot.url(),
-        .on_response = Effects.responseMsg(.media_fetched),
-    });
+    slot.down.release();
+    fetchMediaSlice(fx, slot, 0);
     fired.* += 1;
 }
 
-/// Whether a failed picture fetch is worth another try later.
+/// Asks `slot`'s host for the `max_image_bytes` of the picture that start at
+/// `offset`.
 ///
-/// A 4xx other than "slow down" is the host answering: the picture is not there,
-/// or not for us, and asking again just makes the same round trip. Everything
-/// else (no status at all, a rate limit, a 5xx) is the network or the host
-/// having a moment, and those recover.
-fn mediaFailureIsFinal(status: u16) bool {
-    if (status == 408 or status == 429) return false;
-    return status >= 400 and status < 500;
+/// Every request is a Range request, including the first, so one code path
+/// covers a thumbnail and a full-frame photo alike: a picture smaller than one
+/// slice comes back whole on the first answer and costs no extra round trip.
+/// A host that does not do ranges answers 200 with the whole body instead of
+/// 206 with a slice, which is a difference the caller can see, so ignoring the
+/// header can never be mistaken for a complete picture.
+fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
+    fetchSlice(fx, media_fetch_key_base + mediaSlotIndex(slot), slot.url(), offset, Effects.responseMsg(.media_fetched));
 }
+
+/// One slice of one image, whoever wants it.
+fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_response: anytype) void {
+    var range_buf: [64]u8 = undefined;
+    const range = rangeHeader(&range_buf, offset) orelse return;
+    fx.fetch(.{
+        .key = key,
+        .url = url,
+        // `identity` is not politeness, it is what makes the arithmetic true.
+        // The HTTP client asks for gzip by default, and a range together with a
+        // content encoding means the slice boundaries are in ENCODED bytes
+        // while what arrives is decoded ones: "a short slice is the last slice"
+        // would then be measuring the wrong thing, and the picture would
+        // assemble out of the wrong pieces and still decode. Pictures are
+        // already compressed, so asking for none costs nothing.
+        .headers = &.{
+            .{ .name = "range", .value = range },
+            .{ .name = "accept-encoding", .value = "identity" },
+        },
+        .on_response = on_response,
+    });
+}
+
+/// The value of a `Range` header asking for the slice that starts at `offset`.
+///
+/// Inclusive at both ends, which is what the header means: the window is
+/// `max_image_bytes` wide, so the last byte asked for is one before the next
+/// offset. An off-by-one here would either drop a byte between slices (a
+/// corrupt picture that still decodes, which is the worst outcome) or overlap
+/// them (a picture longer than the file).
+fn rangeHeader(buf: []u8, offset: usize) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ offset, offset + max_image_bytes - 1 }) catch null;
+}
+
+/// A slice that came back SHORT is the last one: the host had nothing more to
+/// give from that offset. A full slice means there is probably more, so the
+/// caller asks again from the new end.
+pub const SliceOutcome = enum { complete, want_more };
+
+/// One picture arriving in Range slices.
+///
+/// Every image Plaza draws goes through this: a face, a feed picture and a
+/// profile banner are the same problem, because a response body carries at most
+/// `max_image_bytes` and none of the three is reliably under it. It was written
+/// for feed pictures first and the other two were left on one request, which
+/// meant a full-size profile picture fetched from its own host drew initials
+/// for exactly the same reason a photo drew a blank cell.
+const Download = struct {
+    buf: ?[]u8 = null,
+    len: usize = 0,
+
+    /// Appends one delivered slice. `null` means this picture cannot be
+    /// assembled (no memory, or past the ceiling) and the fetch is over.
+    fn append(self: *Download, body: []const u8) ?SliceOutcome {
+        if (self.buf == null) {
+            // The first slice arrives before there is anywhere to put it, and
+            // it is the only one that can be the whole picture: a short first
+            // slice decodes straight from the response with nothing allocated.
+            if (body.len < max_image_bytes) return .complete;
+            self.buf = std.heap.page_allocator.alloc(u8, max_image_download_bytes) catch return null;
+        }
+        const buf = self.buf.?;
+        const filled = self.len + body.len;
+        // The buffer IS the ceiling, and there is deliberately no second check
+        // saying the same thing: a host that answers a full slice every time
+        // has to run out of room, and one bound that the append cannot cross is
+        // easier to trust than two that can drift apart.
+        if (filled > buf.len) return null;
+        @memcpy(buf[self.len..filled], body);
+        self.len = filled;
+        return if (body.len < max_image_bytes) .complete else .want_more;
+    }
+
+    /// What has been assembled, or null when nothing was: a picture that fit in
+    /// one slice decodes from the response body instead.
+    fn bytes(self: *const Download) ?[]const u8 {
+        const buf = self.buf orelse return null;
+        return buf[0..self.len];
+    }
+
+    /// Drops a half-assembled picture. Called wherever a fetch ends, however it
+    /// ends: bytes that outlive their fetch are bytes nobody will ever decode.
+    fn release(self: *Download) void {
+        if (self.buf) |buf| std.heap.page_allocator.free(buf);
+        self.buf = null;
+        self.len = 0;
+    }
+};
+
+/// What a fetch that produced no usable image says about trying again.
+pub const ImageFailure = enum { retry, give_up };
+
+/// Classifies a picture or avatar fetch that did not produce an image.
+///
+/// The question is not what the status code was, it is WHAT FAILED. A body that
+/// arrived whole, with a 200, and is simply too large for the decoder, or was
+/// truncated, or is empty, is a fact about that picture: it will be exactly as
+/// large the next time, and every time after that. A timeout, a 5xx or a rate
+/// limit is the network or the host having a moment, and those recover.
+///
+/// Reading only the status conflated the two, in opposite directions on the two
+/// paths. The feed asked whether the STATUS was final, and an oversized picture
+/// comes back 200, so the slot went back to idle and the same picture was
+/// downloaded again on the next tick and again on every scroll event, for as
+/// long as the note stayed on screen. The avatar path asked nothing at all, so a
+/// single 503 or one dropped connection blanked that face for the rest of the
+/// session, on every screen.
+pub fn classifyImageFailure(outcome: native_sdk.EffectFetchOutcome, status: u16) ImageFailure {
+    // Never reached a host, or the request was cut short on the way.
+    if (outcome != .ok) return .retry;
+    // The host answered, and the answer was not an image and will not become
+    // one: too large to decode, cut off, or empty.
+    if (status == 200) return .give_up;
+    // The two 4xx that are about timing rather than about the resource.
+    if (status == 408 or status == 429) return .retry;
+    // Any other 4xx is the host saying no, and it will say no again.
+    if (status >= 400 and status < 500) return .give_up;
+    // 5xx, and anything unexpected: the host is having a moment.
+    return .retry;
+}
+
+/// Whether this answer is the proxy refusing the HOST, rather than telling us
+/// something about the picture.
+///
+/// The three statuses a proxy uses to decline on policy. wsrv.nl answers 400
+/// with `{"message":"Domain or TLD blocked by policy"}` for Blossom hosts that
+/// serve the same file directly; 403 is the same refusal by another name, and
+/// 451 is one made for it by somebody else.
+///
+/// Deliberately NOT 404, which is the source missing and will be missing
+/// directly too, and not a 200 that produced no usable image, which is our own
+/// size limit and is only worse without the proxy shrinking it first.
+pub fn proxyRefusedHost(outcome: native_sdk.EffectFetchOutcome, status: u16) bool {
+    if (outcome != .ok) return false;
+    return status == 400 or status == 403 or status == 451;
+}
+
+/// How many times a picture or avatar may come back unusable for a reason worth
+/// retrying before Plaza stops asking.
+///
+/// A backstop, not the mechanism. `classifyImageFailure` is what should decide,
+/// and this is here so that no future mistake in it can produce an unbounded
+/// download loop again: getting that wrong cost 240 KiB a second, per picture,
+/// for as long as the reader looked at it.
+const max_image_attempts = 4;
 
 /// Handles a feed-image fetch response, mirroring the avatar path.
 fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
@@ -8101,31 +12304,94 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (!slot.used) return;
 
     if (response.outcome == .rejected) {
+        slot.down.release();
         slot.state = .idle;
         return;
     }
-    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
-        // A host that said NO is different from a host that did not answer. A
-        // 404 or a 410 is an answer, and the box says so; a timeout, a 5xx or a
-        // rate limit is the network having a moment, and marking the picture
-        // permanently broken over one of those is the same mistake the quote
-        // fetch used to make, in a place the reader can see.
-        slot.state = if (mediaFailureIsFinal(response.status)) .failed else .idle;
+    // A 206 is a slice of a picture that does not fit in one body. Take it, and
+    // ask for the next unless the host just told us there is no next.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = slot.down.append(response.body) orelse {
+            // Too big to assemble, or no memory to assemble it in. Both are
+            // facts about this picture rather than about the network, so this
+            // is finished rather than retried.
+            slot.down.release();
+            slot.state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchMediaSlice(fx, slot, slot.down.len);
+            return;
+        }
+        // Whole. The bytes are in the slice buffer unless this was a single
+        // short first slice, which never allocated one.
+        const whole = slot.down.bytes() orelse response.body;
+        finishMedia(fx, slot, whole);
+        slot.down.release();
         return;
     }
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
+        // Whatever was assembled so far is bytes nobody will decode now.
+        slot.down.release();
+        // A host that said NO is different from a host that did not answer, and
+        // a picture that is simply too big is different again: it will be the
+        // same size next time, so asking again is a download with a known
+        // answer. Only something that can change goes back to idle.
+        // One more try, at the source, before this is a failure at all.
+        //
+        // Only for the answers that are about the PROXY rather than about the
+        // picture. The public one refuses whole TLDs by policy and answers 400
+        // for Blossom hosts that hand over the same file without complaint, so
+        // those say "not through here" and the host has not been asked yet.
+        //
+        // Narrow on purpose. A 404 through the proxy is the SOURCE missing,
+        // and a body too large to decode is our own limit on the response,
+        // which a direct fetch only makes worse because the proxy was the thing
+        // shrinking it. Falling back on either is a second download with a known
+        // answer, and two tests said so before this comment existed.
+        //
+        // Once per slot, and only while the proxy is what was used, so it can
+        // never loop and never fires for a fetch that was already direct. The
+        // attempt counter is untouched: this is a different question, not
+        // another go at the same one.
+        if (g_media_direct_fallback and g_media_proxy_on and !slot.direct and
+            proxyRefusedHost(response.outcome, response.status))
+        {
+            slot.direct = true;
+            slot.state = .idle;
+            return;
+        }
+        slot.state = switch (classifyImageFailure(response.outcome, response.status)) {
+            .give_up => .failed,
+            .retry => blk: {
+                slot.attempts +|= 1;
+                break :blk if (slot.attempts >= max_image_attempts) .failed else .idle;
+            },
+        };
+        return;
+    }
+    slot.down.release();
+    finishMedia(fx, slot, response.body);
+}
+
+/// Decodes a complete picture into `slot` and remembers it.
+fn finishMedia(fx: *Effects, slot: *MediaSlot, bytes: []const u8) void {
+    // Whatever it took to get here, this URL answers, so the count of tries
+    // worth making starts again.
+    slot.attempts = 0;
     // An animated GIF keeps all its frames; anything else (including a GIF with
     // only one frame) takes the still path.
-    if (loadAnimatedGif(fx, slot, response.body)) {
-        storeCachedImage(slot.url(), response.body);
+    if (loadAnimatedGif(fx, slot, bytes)) {
+        storeCachedImage(slot.url(), bytes);
         return;
     }
-    if (decodeAndRegister(fx, slot.image_id, response.body, media_target_px)) |size| {
+    if (decodeAndRegister(fx, slot.image_id, bytes, media_target_px)) |size| {
         slot.state = .loaded;
         slot.width = size.width;
         slot.height = size.height;
         rememberAspect(slot.note_id, size.width, size.height);
         // Keep it for next launch: the feed should come back with its pictures.
-        storeCachedImage(slot.url(), response.body);
+        storeCachedImage(slot.url(), bytes);
     } else {
         slot.state = .failed;
     }
@@ -8160,10 +12426,16 @@ fn openExternally(fx: *Effects, url: []const u8) void {
 /// Lets everything that failed to load try again, after the media proxy changed.
 fn retryFailedImages() void {
     for (&g_profiles) |*p| {
-        if (p.used and p.avatar_state == .failed) p.avatar_state = .idle;
+        if (p.used and p.avatar_state == .failed) {
+            p.avatar_state = .idle;
+            p.avatar_attempts = 0;
+        }
     }
     for (&g_media) |*m| {
-        if (m.used and m.state == .failed) m.state = .idle;
+        if (m.used and m.state == .failed) {
+            m.state = .idle;
+            m.attempts = 0;
+        }
     }
 }
 
@@ -8189,33 +12461,32 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         note.client_len = @intCast(n);
     }
 
-    // An image link becomes a picture, so lift it out of the text and omit it
-    // from the rendered content rather than showing a bare URL beside it.
-    var image_url: []const u8 = "";
-    if (firstImageUrl(ev.content)) |url| {
-        if (url.len <= note.image_url_buf.len) {
-            @memcpy(note.image_url_buf[0..url.len], url);
-            note.image_url_len = @intCast(url.len);
-            image_url = note.imageUrl();
-            const meta = imetaFor(ev.tags, url);
-            note.image_aspect = meta.aspect();
-            note.image_w = meta.width;
-            note.image_h = meta.height;
-            note.image_bytes = meta.size;
-            const blur_len = @min(meta.blurhash.len, note.image_blur_buf.len);
-            @memcpy(note.image_blur_buf[0..blur_len], meta.blurhash[0..blur_len]);
-            note.image_blur_len = @intCast(blur_len);
-            note.image_has_alt = meta.alt.len > 0;
-        }
+    // Image links become pictures, so lift them out of the text and omit them
+    // from the rendered content rather than showing bare URLs beside a gallery.
+    //
+    // The URLs are borrowed from the EVENT while it is still in hand, and the
+    // omit list below borrows them again; the note keeps its own copies. A URL
+    // too long for the buffer is left in the text, which is the honest fallback:
+    // it is still a link the reader can open.
+    var found: [max_note_images][]const u8 = undefined;
+    const found_len = collectImageUrls(ev.content, &found);
+    var omit: [max_note_images][]const u8 = undefined;
+    var omit_len: usize = 0;
+    for (found[0..found_len]) |url| {
+        if (url.len > note.images[0].url_buf.len) continue;
+        note.images[note.images_len].set(url, imetaFor(ev.tags, url));
+        omit[omit_len] = url;
+        omit_len += 1;
+        note.images_len += 1;
     }
 
     // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
     // whole-codepoint so a split multi-byte sequence never reaches the shaper.
-    note.content_len = @intCast(renderContent(&note.content_buf, ev.content, image_url));
+    note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, omit[0..omit_len], &note.mentions));
 
     // The first plain link, for the preview card. Read from the ORIGINAL content:
     // the rendered copy has mentions rewritten and may be capped.
-    if (firstLinkUrl(ev.content, image_url)) |link| {
+    if (firstLinkUrl(ev.content, note.imageUrl())) |link| {
         if (link.len <= note.link_url_buf.len) {
             @memcpy(note.link_url_buf[0..link.len], link);
             note.link_url_len = @intCast(link.len);
@@ -8227,10 +12498,15 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     findQuoteRef(&note);
     if (note.quote.kind == .event) wantQuote(note.quote.id);
 
-    // Which note this one answers, for thread nesting.
+    // Which note this one answers, for thread nesting AND for the line the feed
+    // draws above a reply. Queued into the same cache a quote uses: a reply
+    // parent is the same problem, an event referenced by id that may or may not
+    // be on the reader's relays, and it already has the fetching, the backoff
+    // and the eviction.
     if (nip10Parent(ev.tags)) |parent_id| {
         note.reply_parent = parent_id;
         note.has_reply_parent = true;
+        wantQuote(parent_id);
     }
 
     note.setTime(now_s);
@@ -8378,6 +12654,23 @@ pub fn nip10Root(tags: []const nostr.event.Tag) ?[32]u8 {
         if (first_plain == null) first_plain = id;
     }
     return first_plain;
+}
+
+/// The event ids a thread subscription should name: the note the reader
+/// pressed, and the root of the conversation it belongs to when that is a
+/// different note. Fills `out` and returns how many are in it.
+///
+/// Both, not just the root, and not just the note. The root is what the rest of
+/// the conversation actually tags, and the pressed note is what keeps this
+/// working when a root tag is missing, wrong, or points at something else: its
+/// own direct children still match.
+pub fn threadQueryIds(focal: [32]u8, tags: []const nostr.event.Tag, out: *[2][32]u8) usize {
+    out[0] = focal;
+    const root = nip10Root(tags) orelse return 1;
+    // A note that names itself as its own root is one id, not two.
+    if (std.mem.eql(u8, &root, &focal)) return 1;
+    out[1] = root;
+    return 2;
 }
 
 /// Whether the tags carry a NON-mention `e` reference to `id`: a root, reply,
@@ -8650,6 +12943,7 @@ pub const Ancestor = struct {
 /// body can split around it and draw an embedded quote card. A second reference,
 /// an `naddr`, or an undecodable token is left as plain text (`.none`).
 fn findQuoteRef(note: *Note) void {
+    @setRuntimeSafety(true); // Byte spans of a token inside the note's own content.
     const text = note.content();
     var scratch: [16 * 1024]u8 = undefined;
     var i: usize = 0;
@@ -8719,6 +13013,7 @@ pub const Imeta = struct {
 };
 
 pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
+    @setRuntimeSafety(true); // Reads fields out of a tag the note's author wrote.
     for (tags) |tag| {
         if (tag.len == 0 or !std.mem.eql(u8, tag[0], "imeta")) continue;
         var matches_url = false;
@@ -8802,6 +13097,7 @@ pub fn urlHost(url: []const u8) []const u8 {
 }
 
 pub fn firstImageUrl(content: []const u8) ?[]const u8 {
+    @setRuntimeSafety(true); // Same walk as firstLinkUrl, matching an extension at the end of a run.
     const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
@@ -8822,12 +13118,57 @@ pub fn firstImageUrl(content: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Every image URL in `content`, in the order written, up to `out.len`.
+///
+/// The same walk as `firstImageUrl`, which it now backs: a note carrying three
+/// pictures is ordinary, and taking only the first left the other two sitting in
+/// the body as raw links beside a gallery that had room for them.
+pub fn collectImageUrls(content: []const u8, out: [][]const u8) usize {
+    @setRuntimeSafety(true); // Walks a stranger's content and indexes `out` as it goes.
+    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i < content.len and found < out.len) : (i += 1) {
+        if (content[i] != 'h') continue;
+        if (!std.mem.startsWith(u8, content[i..], "http://") and !std.mem.startsWith(u8, content[i..], "https://")) continue;
+        var j = i;
+        while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
+        const url = content[i..j];
+        const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+        const path = url[0..path_end];
+        for (exts) |ext| {
+            if (std.ascii.endsWithIgnoreCase(path, ext)) {
+                out[found] = url;
+                found += 1;
+                break;
+            }
+        }
+        i = j;
+    }
+    return found;
+}
+
 /// Copies note content into `dst`, rewriting NIP-27 `nostr:npub…`/`nostr:nprofile…`
 /// mentions into a readable `@name` (from the profile cache) or a short `@npub`,
-/// and dropping `omit` (the URL rendered as a picture) wherever it appears.
+/// and dropping every URL in `omit` (the ones drawn as pictures) wherever they
+/// appear.
 /// Plain text is copied one whole codepoint at a time and stops at `dst`'s
 /// capacity, so the buffer never ends mid-sequence. Returns the byte length.
 pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
+    const one = [_][]const u8{omit};
+    return renderContentInto(dst, src, if (omit.len == 0) &.{} else &one, null);
+}
+
+/// The same, recording where each mention's label landed into `mentions` when
+/// one is given. A note wants that table so the label can be pressed; a profile's
+/// "about" text is rendered the same way and has nowhere to put one.
+pub const note_content_cap_for_test = note_content_cap;
+pub fn noteContentCapForTest() usize {
+    return note_content_cap;
+}
+
+pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, mentions: ?*MentionList) usize {
+    @setRuntimeSafety(true); // Copies a stranger's content into a fixed buffer, offset by offset.
     // Mention decoding needs an allocator for bech32 scratch; a stack buffer
     // covers it without touching the heap for every note parsed. A pathological
     // mention that will not fit simply stays as its raw token.
@@ -8838,14 +13179,25 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;
     while (i < src.len) {
-        if (omit.len > 0 and std.mem.startsWith(u8, src[i..], omit)) {
-            i += omit.len;
+        // Every picture's URL comes out, not just the first. Longest match wins,
+        // so one URL that is a prefix of another cannot leave the tail of the
+        // longer one stranded in the text.
+        var skipped: usize = 0;
+        for (omit) |gone| {
+            if (gone.len > skipped and std.mem.startsWith(u8, src[i..], gone)) skipped = gone.len;
+        }
+        if (skipped > 0) {
+            i += skipped;
             continue;
         }
         if (parseMentionAt(arena, src, i)) |m| {
             var label_buf: [80]u8 = undefined;
             const label = mentionLabel(m.pubkey, &label_buf);
+            // Before the copy, so a label that does not fit is not recorded as
+            // one that did: the break below leaves the buffer ending where the
+            // last whole thing ended.
             if (out + label.len > dst.len) break;
+            if (mentions) |list| list.record(out, label.len, m.pubkey);
             @memcpy(dst[out..][0..label.len], label);
             out += label.len;
             i = m.end;
@@ -8861,6 +13213,7 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
     // Lifting a URL out can leave whitespace stranded at either edge.
     const trimmed = std.mem.trim(u8, dst[0..out], " \t\r\n");
     if (trimmed.len != out) {
+        if (mentions) |list| list.rebase(@intFromPtr(trimmed.ptr) - @intFromPtr(dst.ptr), trimmed.len);
         std.mem.copyForwards(u8, dst[0..trimmed.len], trimmed);
         return trimmed.len;
     }
@@ -8870,6 +13223,7 @@ pub fn renderContent(dst: []u8, src: []const u8, omit: []const u8) usize {
 /// A parsed `nostr:` mention at `src[i]`: the byte just past its token, and the
 /// referenced pubkey. Null when `src[i]` is not the start of one.
 fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct { end: usize, pubkey: [32]u8 } {
+    @setRuntimeSafety(true); // Walks a bech32 run whose length the note chose.
     const prefix = "nostr:";
     var body_start = i;
     if (std.mem.startsWith(u8, src[i..], prefix)) {
@@ -8909,6 +13263,7 @@ fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct {
 /// Writes `@` + the cached display name (or a short npub) for `pubkey` into
 /// `buf`, returning the written slice. `buf` should be at least 80 bytes.
 fn mentionLabel(pubkey: [32]u8, buf: []u8) []const u8 {
+    @setRuntimeSafety(true); // Writes a display name of somebody else's choosing into a fixed buffer.
     buf[0] = '@';
     if (lookupProfile(pubkey)) |p| {
         if (p.name_len > 0) {
@@ -9030,6 +13385,24 @@ pub const Msg = union(enum) {
     open_join,
     /// Dismiss the join sheet; a remembered intent is forgotten with it.
     close_join,
+    place_enter,
+    place_leave,
+    /// The Places icon: the switcher rail out, or folded away.
+    toggle_places_rail,
+    /// The place's Info card: what this place is, and the way out of it.
+    open_place_info,
+    close_place_info,
+    /// Ask to leave, and back out of asking.
+    place_leave_request,
+    place_leave_cancel,
+    /// Open one of the places you have entered, by its index in the list.
+    place_open: u8,
+    /// Back into the visit Home closed.
+    place_resume,
+    /// The keyboard's places grammar: out of the room and back into it, and
+    /// walking the list either way.
+    place_bounce,
+    place_step: i8,
     /// The sheet's primary: mint a local identity and replay the intent.
     join_create,
     /// The sheet's import path: open the Notary window (a separate process),
@@ -9050,8 +13423,6 @@ pub const Msg = union(enum) {
     toggle_notifications,
     close_notifications,
     notifications_tab: u8,
-    notifications_older,
-    notifications_newer,
     notifications_read_all,
     /// The note overflow menu.
     toggle_note_menu: i64,
@@ -9060,9 +13431,12 @@ pub const Msg = union(enum) {
     /// a guest reached for it, 1 follow, 2 unfollow.
     follow_author: u8,
     /// Opens a person as a level of their own.
+    repost: i64,
     open_person: [32]u8,
     /// Follow or unfollow the person whose profile is open: 1 follow, 2 unfollow.
     follow_person: u8,
+    /// 1 mutes the open profile, 2 unmutes.
+    mute_person: u8,
     /// Which of a profile's two tabs: 0 notes, 1 replies.
     profile_tab: u8,
     /// Opens the Edit profile sheet, and the three fields in it.
@@ -9139,6 +13513,12 @@ pub const Msg = union(enum) {
     notary_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
+    /// The daemon's answer to the bunker poll, and the reader's three actions.
+    bunker_state: native_sdk.EffectResponse,
+    bunker_toggle,
+    bunker_decide: struct { id: u64, allow: bool, remember: BunkerRemember = .once },
+    bunker_revoke: u8,
+    copy_bunker_url,
     /// A /setup (create) answered: adopt the new helper identity.
     helper_setup: native_sdk.EffectResponse,
     /// A /sign answered: ingest and publish the signed event.
@@ -9160,6 +13540,10 @@ pub const Msg = union(enum) {
     proxy_save,
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
+    proxy_toggle,
+    direct_fallback_toggle,
+    /// Index into `hideables`.
+    hide_toggle: u8,
     client_tag_toggle,
     /// The feed scrolled: remember where, so images load around the viewport.
     feed_scrolled: canvas.ScrollState,
@@ -9172,6 +13556,9 @@ pub const Msg = union(enum) {
     profiles: native_sdk.EffectTimer,
     /// Expand a note's picture to fill the window.
     expand_image: i64,
+    /// Which picture of a gallery to open. A single picture still uses
+    /// `expand_image`, which is the same thing with an implied zero.
+    expand_image_at: struct { note: i64, index: u8 },
     /// One picture, asked for by the reader while previews are off.
     load_image: i64,
     /// Dismiss the expanded picture.
@@ -9213,7 +13600,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "load_image", "close_image", "like", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "copy_bunker_url", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -9240,7 +13627,9 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 /// the scroll is bounded by it rather than the other way round.
 fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    var sections: [6]AppUi.Node = undefined;
+    // Exactly the number of `sections[n] =` lines below. It was full when this
+    // screen grew a section, and the bounds check is what said so.
+    var sections: [8]AppUi.Node = undefined;
     var n: usize = 0;
 
     sections[n] = identitySection(ui, model);
@@ -9255,6 +13644,10 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     sections[n] = settingsSection(ui, "APPEARANCE", "", appearanceCard(ui));
     n += 1;
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
+    n += 1;
+    sections[n] = settingsSection(ui, "NOTES", "what each one shows · what the feed stops asking for", notesCard(ui, model));
+    n += 1;
+    sections[n] = settingsSection(ui, "SIGNING", "let other apps sign with your key · NIP-46", signingCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;
@@ -9535,6 +13928,187 @@ fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
     });
 }
 
+/// Signing for other apps: the switch, the link, whoever is waiting, and
+/// whoever is already connected.
+///
+/// Four things in one card because they are one decision. A switch with the
+/// consequences on another screen is a switch people flip without reading, and
+/// the whole argument for this over a browser extension is that you can see what
+/// it is doing.
+fn signingCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    var kids: [10]AppUi.Node = undefined;
+    var n: usize = 0;
+
+    kids[n] = ui.el(.checkbox, .{
+        .size = .sm,
+        .checked = bunkerOn(),
+        .text = "Sign for other apps",
+        .on_toggle = Msg.bunker_toggle,
+        .style = .{
+            .accent = p.surface_control_solid,
+            .accent_foreground = p.on_accent,
+            .border = p.border_radio,
+            .radius = 4,
+            .stroke_width = 1.5,
+        },
+        .semantics = .{ .label = "Sign for other apps", .focusable = true },
+    }, .{});
+    n += 1;
+    kids[n] = vgap(ui, 7);
+    n += 1;
+    kids[n] = ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+        &.{.{ .text = "Off unless you turn it on. While it is on, Plaza connects to relays and other apps can ask it to sign as you. Each one has to be approved here first, and approving it approves everything it will ever ask for.", .scale = mono_hint_scale }},
+    );
+    n += 1;
+
+    if (bunkerOn()) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerLinkRow(ui);
+        n += 1;
+    }
+
+    if (bunkerPendingClient().len > 0) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerAskRow(ui);
+        n += 1;
+    }
+
+    if (bunkerClientCount() > 0) {
+        kids[n] = cardDivider(ui);
+        n += 1;
+        kids[n] = bunkerClientRows(ui);
+        n += 1;
+    }
+
+    return settingsCard(ui, .{kids[0..n]});
+}
+
+/// The link, and the one button that matters: copy.
+///
+/// Shown in full rather than truncated. It carries a secret, and a reader who
+/// cannot see the whole thing cannot tell whether what they pasted is what this
+/// screen is showing.
+fn bunkerLinkRow(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+            &.{.{ .text = bunkerUrl(), .monospace = true, .scale = mono_meta_scale }},
+        ),
+        vgap(ui, 7),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker_url }, "Copy link"),
+            ui.paragraph(
+                // `grow` as well as `wrap`: a wrapping paragraph with no width to
+                // wrap INTO lays out at its natural width and runs off the card,
+                // which is what this did.
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.", .scale = mono_hint_scale }},
+            ),
+        }),
+    });
+}
+
+/// Somebody is waiting. Named by pubkey, because that is the only thing about a
+/// client this app actually knows: a name in a connection token is a string a
+/// stranger chose.
+fn bunkerAskRow(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
+            &.{.{ .text = "An app wants to sign as you", .scale = meta_scale }},
+        ),
+        vgap(ui, 5),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
+        ),
+        vgap(ui, 7),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Approve"),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
+        }),
+    });
+}
+
+/// Who is connected, and the button that ends it.
+fn bunkerClientRows(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    var kids: [8 * 2]AppUi.Node = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < bunkerClientCount()) : (i += 1) {
+        if (n > 0) {
+            kids[n] = vgap(ui, 7);
+            n += 1;
+        }
+        kids[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = bunkerClientAt(i), .monospace = true, .scale = mono_hint_scale }},
+            ),
+            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_revoke = @intCast(i) } }, "Disconnect"),
+        });
+        n += 1;
+    }
+    return ui.column(.{ .gap = 0 }, .{kids[0..n]});
+}
+
+/// What the reader can take away, and what is gone right now.
+///
+/// The WHOLE registry is listed, not only what is hidden, and that is the point
+/// of the screen rather than a detail of it. Hide something in the feed and
+/// there is nothing left there to press to get it back; a list that showed only
+/// what was hidden would be empty exactly when somebody came looking for it.
+///
+/// Each row says what hiding it does to the fetching, in its own words, because
+/// two of these stop the app asking relays for anything and one does not, and a
+/// screen that let you assume they were the same would be making a promise the
+/// app does not keep.
+fn notesCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    _ = model;
+    const p = theme.palette;
+    var kids: [hideables.len * 3]AppUi.Node = undefined;
+    var n: usize = 0;
+    for (hideables, 0..) |h, i| {
+        if (n > 0) {
+            kids[n] = vgap(ui, 10);
+            n += 1;
+        }
+        kids[n] = ui.el(.checkbox, .{
+            .size = .sm,
+            // Checked means SHOWN. The registry stores what is hidden, which is
+            // the right way round for a file and the wrong way round for a
+            // person: a box you tick to make something disappear reads as a
+            // switch that does the opposite of what it says.
+            .checked = !g_hidden[i],
+            .text = h.label,
+            .on_toggle = Msg{ .hide_toggle = @intCast(i) },
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = h.label, .focusable = true },
+        }, .{});
+        n += 1;
+        kids[n] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = h.detail, .scale = mono_hint_scale }},
+        );
+        n += 1;
+    }
+    return settingsCard(ui, .{kids[0..n]});
+}
+
 /// The feed section: what the app is allowed to fetch on the reader's behalf,
 /// and where pictures are resized. Both are privacy settings before they are
 /// anything else, which is why each keeps its sentence.
@@ -9583,11 +14157,51 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
             &.{.{ .text = model.client_tag_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.proxy_on(),
+            .text = "Load pictures through a proxy",
+            .on_toggle = Msg.proxy_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Load pictures through a proxy", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.proxy_explainer(), .scale = mono_hint_scale }},
+        ),
+        vgap(ui, 9),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.direct_fallback_on(),
+            .text = "Ask the host when the proxy refuses",
+            .on_toggle = Msg.direct_fallback_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Ask the host when the proxy refuses", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.direct_fallback_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
         ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, &.{.{ .text = "Media proxy", .scale = menu_scale }}),
         vgap(ui, 7),
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-            &.{.{ .text = "Pictures are resized through this service so they load fast and small. Point it at your own instance, or clear it to load originals straight from their host.", .scale = mono_hint_scale }},
+            &.{.{ .text = "Which service does the resizing. Point it at your own instance if you would rather not use a public one.", .scale = mono_hint_scale }},
         ),
         vgap(ui, 9),
         ui.inputGroup(
@@ -9751,6 +14365,10 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
     const p = theme.palette;
     const dot: canvas.Color = switch (state) {
         .connected => p.status_success,
+        // Amber, not green. The socket is open and nothing has failed, but the
+        // last word from this relay is a minute old and a keepalive is out with
+        // no answer. Green here is the lie this state exists to stop telling.
+        .quiet => p.status_warning_text,
         .connecting => p.status_warning_text,
         .offline => p.status_offline,
     };
@@ -9765,6 +14383,8 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
             // rather than as the app already doing something about it.
             if (state == .connecting)
                 ui.paragraph(.{ .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = "reconnecting", .monospace = true, .scale = mono_chip_scale }})
+            else if (state == .quiet)
+                ui.paragraph(.{ .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = "quiet", .monospace = true, .scale = mono_chip_scale }})
             else if (relayRttMs(index)) |ms|
                 ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = ui.fmt("{d} ms", .{ms}), .monospace = true, .scale = mono_chip_scale }})
             else
@@ -9964,6 +14584,24 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The root view: one screen at a time, chosen by the stage, with an expanded
 /// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const view = appViewLayers(ui, model);
+    // An app asking to sign as you goes on TOP of whatever was built, rather
+    // than instead of it.
+    //
+    // Not because it outranks reading, but because it is the only thing here
+    // with somebody waiting on the other end: a relay thread is parked on the
+    // answer and the client gives up long before Plaza's own two-minute window
+    // closes. A question buried under whatever screen happens to be open is a
+    // question that times out, which is exactly how this failed the first time
+    // it met a real client. An earlier version of this returned early and threw
+    // away the screen underneath, which is why it is a layer and not a branch.
+    if (bunkerPendingClient().len > 0) {
+        return ui.stack(.{ .grow = 1 }, .{ view, bunkerAskSheet(ui) });
+    }
+    return view;
+}
+
+fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     const base = switch (model.stage) {
         .onboarding => OnboardingView.build(ui, model),
         // Settings layers OVER the feed rather than replacing it, like every
@@ -9989,6 +14627,11 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     }
     if (model.notifications_open) {
         return ui.stack(.{ .grow = 1 }, .{ base, notificationsSheet(ui, model) });
+    }
+    // Over the room it describes, so closing it puts the reader back exactly
+    // where they were rather than at the top of a rebuilt feed.
+    if (g_place_info != .closed) {
+        if (activePlace()) |m| return ui.stack(.{ .grow = 1 }, .{ base, placeInfoCard(ui, m) });
     }
     if (model.stage == .settings) {
         // Both sheets, in order, when a profile is being edited: dropping the
@@ -10020,77 +14663,72 @@ pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// is not blank. Fully skippable; the remembered intent replays either way.
 fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
+    return modalScrim(ui, "Name", .name_skip, ui.el(.dialog, .{
+        .width = name_card_width,
         .on_dismiss = .name_skip,
-        .on_press = .name_skip,
-        .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Name" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
-                ),
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                    &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
-                ),
-                ui.el(.textarea, .{
-                    .text = model.name_draft(),
-                    .placeholder = "A name people will see",
-                    .on_input = AppUi.inputMsg(.name_edit),
-                    .autofocus = true,
-                    .on_submit = .name_save,
-                    .height = 38,
-                    .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
-                }, .{}),
-                ui.row(.{ .gap = 0, .cross = .center }, .{
-                    // Never disabled. Blank is a valid answer to "want a name on
-                    // it?", and it means the same thing as Skip, so Done takes it
-                    // and moves on rather than sitting there greyed out while the
-                    // reader wonders what is wrong with an empty field.
-                    // Painted by a `.panel`, pressed by the row around it. A
-                    // `.list_item` given a background draws none, so the first
-                    // version of this button was white text on the card's own
-                    // dark surface: present, pressable, and unreadable.
-                    ui.row(.{
+        modalCard(ui, name_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 16 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Want a name on it?", .weight = .bold, .scale = name_title_scale }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = "Shown with your notes. Change it any time.", .scale = join_sub_scale }},
+            ),
+            ui.el(.textarea, .{
+                .text = model.name_draft(),
+                .placeholder = "A name people will see",
+                .on_input = AppUi.inputMsg(.name_edit),
+                .autofocus = true,
+                .on_submit = .name_save,
+                .height = 38,
+                .style = .{ .background = p.surface_input, .border = p.border_focus, .radius = 9, .stroke_width = 1.5 },
+            }, .{}),
+            ui.row(.{ .gap = 0, .cross = .center }, .{
+                // Never disabled. Blank is a valid answer to "want a name on
+                // it?", and it means the same thing as Skip, so Done takes it
+                // and moves on rather than sitting there greyed out while the
+                // reader wonders what is wrong with an empty field.
+                // Painted by a `.panel`, pressed by the row around it. A
+                // `.list_item` given a background draws none, so the first
+                // version of this button was white text on the card's own
+                // dark surface: present, pressable, and unreadable.
+                ui.row(.{
+                    .grow = 1,
+                    .gap = 0,
+                    .on_press = Msg.name_save,
+                    .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                }, .{
+                    ui.el(.panel, .{
                         .grow = 1,
-                        .gap = 0,
-                        .on_press = Msg.name_save,
-                        .semantics = .{ .role = .button, .label = "Done", .focusable = true },
+                        .padding = 0.01,
+                        .style = .{ .background = p.accent, .radius = 8 },
                     }, .{
-                        ui.el(.panel, .{
-                            .grow = 1,
-                            .padding = 0.01,
-                            .style = .{ .background = p.accent, .radius = 8 },
-                        }, .{
-                            ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
-                                ui.paragraph(
-                                    .{ .style = .{ .foreground = p.on_accent } },
-                                    &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
-                                ),
-                            }),
+                        ui.row(.{ .height = 32, .cross = .center, .main = .center, .gap = 0 }, .{
+                            ui.paragraph(
+                                .{ .style = .{ .foreground = p.on_accent } },
+                                &.{.{ .text = "Done", .weight = .medium, .scale = menu_scale }},
+                            ),
                         }),
                     }),
-                    hgap(ui, 12),
-                    ui.el(.list_item, .{
-                        .padding = 0.01,
-                        .on_press = Msg.name_skip,
-                        .style = .{ .quiet_hover = true },
-                        .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
-                    }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_muted } },
-                            &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
-                        ),
-                    }),
                 }),
-            })),
-        }),
-    });
+                hgap(ui, 12),
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .on_press = Msg.name_skip,
+                    .style = .{ .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
+                }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = "Skip", .underline = true, .scale = menu_scale }},
+                    ),
+                }),
+            }),
+        })),
+    }));
 }
 
 /// The Edit profile sheet. No mock draws it, so it is the modal-card recipe with
@@ -10102,52 +14740,47 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const status = model.profile_status();
-    return ui.el(.dialog, .{
-        .grow = 1,
-        .padding = 16,
+    return modalScrim(ui, "Edit profile", Msg.close_profile_edit, ui.el(.dialog, .{
+        .width = profile_edit_card_width,
         .on_dismiss = Msg.close_profile_edit,
-        .on_press = Msg.close_profile_edit,
-        .style_tokens = .{ .background = .scrim },
         .semantics = .{ .label = "Edit profile" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            modalCard(ui, 400, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
+            ),
+            profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
+            profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
+            profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
+            if (status.len > 0)
                 ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
-                ),
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                    &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
-                ),
-                profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
-                profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
-                profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
-                if (status.len > 0)
-                    ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
-                        &.{.{ .text = status, .scale = mono_hint_scale }},
-                    )
+                    .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
+                    &.{.{ .text = status, .scale = mono_hint_scale }},
+                )
+            else
+                ui.spacer(0),
+            ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
+                ui.spacer(1),
+                if (model.profile_stage == .unread)
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
                 else
                     ui.spacer(0),
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
-                    ui.spacer(1),
-                    if (model.profile_stage == .unread)
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
-                    else
-                        ui.spacer(0),
-                    if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
-                    ui.button(.{
-                        .size = .sm,
-                        .variant = .primary,
-                        .disabled = !model.profile_can_save(),
-                        .on_press = Msg.profile_save,
-                    }, "Save"),
-                }),
-            })),
-        }),
-    });
+                if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .primary,
+                    .disabled = !model.profile_can_save(),
+                    .on_press = Msg.profile_save,
+                }, "Save"),
+            }),
+        })),
+    }));
 }
 
 /// One labelled field in the sheet.
@@ -10179,44 +14812,99 @@ fn profileField(ui: *AppUi, label: []const u8, value: []const u8, placeholder: [
 /// that vanishes. A page is capped and replaced rather than appended, which is
 /// the same answer the thread reached for the same reason.
 fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
     var buf: [inbox_cap]InboxItem = undefined;
+    resolveInboxBodies();
     const shown = inboxItems(&buf, !model.notifications_everyone);
-    const pages = if (shown.len == 0) 1 else (shown.len + inbox_page - 1) / inbox_page;
-    const page = @min(model.notifications_page, pages - 1);
-    const first = page * inbox_page;
-    const last = @min(first + inbox_page, shown.len);
-    const rows = ui.arena.alloc(AppUi.Node, last - first) catch return ui.spacer(0);
-    for (rows, first..) |*row, i| row.* = notificationRow(ui, &shown[i]);
 
-    return ui.el(.dialog, .{
+    // A windowed list, not pages. Paging existed because every row was mounted
+    // at once and the whole view is priced against a 1024-node ceiling that
+    // refuses a frame WHOLE when crossed, so twenty rows was the arithmetic that
+    // fit. A window mounts only what is on screen, which removes the ceiling as
+    // a constraint and the pager with it: two hundred notifications are one
+    // scroll rather than ten presses of a Next button.
+    const options: AppUi.VirtualListOptions = .{
+        .id = "notifications",
+        .item_count = shown.len,
+        .item_extent = 0,
+        .extent_estimate = notificationExtentEstimate,
+        .extent_context = &shown_ctx,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 3,
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = Msg.close_notifications,
-        .on_press = Msg.close_notifications,
-        .style_tokens = .{ .background = .scrim },
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Notifications list" },
+    };
+    shown_ctx = .{ .items = shown };
+    const window = ui.virtualWindow(options);
+    g_inbox_visible = .{
+        .first = @intCast(window.first_visible_index),
+        .last = @intCast(window.last_visible_index),
+        .len = shown.len,
+    };
+    // After the window, because it asks on behalf of the rows the window chose.
+    wantInboxProfiles(shown);
+    const rows = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.spacer(0);
+    // Centred ONCE, around the list, never per row. A spacer-column-spacer
+    // wrapper on each row is four nodes apiece, and fourteen mounted rows of
+    // that is fifty-six nodes spent on horizontal alignment: enough on its own
+    // to push this view through the 1024 ceiling that refuses a frame whole.
+    for (rows, 0..) |*row, offset| {
+        const i = window.start_index + offset;
+        row.* = if (i < shown.len) notificationRow(ui, &shown[i]) else ui.spacer(0);
+    }
+
+    return ui.column(.{
+        .grow = 1,
+        .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Notifications" },
     }, .{
-        // No `cross` override. The default is `.stretch`, and the card needs it:
-        // `modalCard` sets a width and no height, so under `.start` the card took
-        // its INTRINSIC height, the `grow = 1` scroll inside it resolved to zero,
-        // and every row was laid out and PAINTED outside the card, down the bare
-        // window, with the footer drawn on top of the first row and nothing
-        // scrollable. The tree was correct the whole time, which is why a test
-        // that asserts on the tree said so.
-        ui.row(.{ .grow = 1, .main = .center }, .{
-            modalCard(ui, 480, ui.column(.{ .grow = 1, .gap = 0 }, .{
-                notificationsHeader(ui),
-                notificationsTabs(ui, model),
-                if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
-                ui.scroll(.{ .grow = 1 }, .{
-                    ui.column(.{ .gap = 0 }, .{rows}),
-                }),
-                notificationsPager(ui, page, pages),
-                notificationsFooter(ui, shown.len),
-            })),
+        notificationsHeader(ui),
+        ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
+        notificationsTabs(ui, model),
+        if (shown.len == 0) notificationsEmpty(ui, model) else ui.spacer(0),
+        ui.row(.{ .grow = 1, .gap = 0 }, .{
+            ui.spacer(1),
+            // Width only, never grow. In a row, grow claims the remaining
+            // horizontal space and beats the fixed width: 620 resolved to 853
+            // and ran 153px past the edge of the narrowest allowed window.
+            // The row's cross-axis stretch is what gives it its height.
+            ui.column(.{ .width = notifications_column_width }, .{
+                ui.virtualList(options, window, .{rows}),
+            }),
+            ui.spacer(1),
         }),
+        notificationsFooter(ui, shown.len),
     });
 }
+
+/// The rows the notifications window is measuring, so the extent callback can
+/// price one without the view handing it a closure.
+const NotificationCtx = struct { items: []const InboxItem = &.{} };
+var shown_ctx: NotificationCtx = .{};
+
+/// A cheap height for the notification at `index`, from the item alone: the
+/// row's chrome plus however many lines its body wraps to.
+fn notificationExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
+    const ctx: *const NotificationCtx = @ptrCast(@alignCast(context orelse return 64));
+    const i: usize = @intCast(index);
+    if (i >= ctx.items.len) return 64;
+    const item = &ctx.items[i];
+    // 12 padding top and bottom, the name line, the time line, and the body.
+    var extent: f32 = 12 * 2 + body_line_height + body_line_height + 6;
+    if (item.body_len > 0) {
+        const per_line: f32 = 58;
+        const lines = @max(1.0, @ceil(@as(f32, @floatFromInt(item.body_len)) / per_line));
+        extent += lines * body_line_height;
+    }
+    return extent;
+}
+
+/// The reading column for notifications, matching the feed's so a row is the
+/// same width whichever screen it is on.
+const notifications_column_width: f32 = feed_column_width;
+pub const notifications_column_width_for_test = notifications_column_width;
 
 /// How many rows the sheet draws at once.
 ///
@@ -10241,51 +14929,31 @@ fn notificationsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 /// ceiling and outside the tenth of it the suite insists stays free.
 pub const inbox_page = 16;
 
-/// Older and newer, when there is more than one page.
-fn notificationsPager(ui: *AppUi, page: usize, pages: usize) AppUi.Node {
-    const p = theme.palette;
-    if (pages <= 1) return ui.spacer(0);
-    return ui.row(.{ .cross = .center, .padding = 10, .gap = 8, .style = .{ .background = p.surface_modal } }, .{
-        if (page > 0)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_newer,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Newer", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Newer", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-        ui.spacer(1),
-        ui.paragraph(
-            .{ .style = .{ .foreground = p.text_faint_alt } },
-            &.{.{ .text = ui.fmt("{d} of {d}", .{ page + 1, pages }), .scale = menu_scale }},
-        ),
-        ui.spacer(1),
-        if (page + 1 < pages)
-            ui.el(.list_item, .{
-                .padding = 0.01,
-                .height = 20,
-                .cross = .center,
-                .on_press = Msg.notifications_older,
-                .style = .{ .quiet_hover = true },
-                .semantics = .{ .role = .button, .label = "Older", .focusable = true },
-            }, .{
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = "Older", .scale = menu_scale }}),
-            })
-        else
-            ui.spacer(0),
-    });
-}
-
 fn notificationsHeader(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         ui.row(.{ .cross = .center, .gap = 10, .height = 38, .padding = 0.01 }, .{
-            hgap(ui, 14),
+            hgap(ui, 10),
+            // A page needs a way out. As a sheet this had the scrim to press and
+            // Escape to dismiss; an opaque level has neither, so closing it was
+            // the bell in a rail the page was covering.
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .cross = .center,
+                .on_press = Msg.close_notifications,
+                .style = .{ .radius = 6, .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = "Back", .focusable = true },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 6),
+                    ui.icon(.{ .width = 14, .height = 14, .style = .{ .foreground = p.text_muted } }, "chevron-left"),
+                    hgap(ui, 4),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = "Back", .scale = stat_scale }}),
+                    hgap(ui, 8),
+                    vgap(ui, 26),
+                }),
+            }),
+            hgap(ui, 4),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Notifications", .weight = .bold, .scale = settings_title_scale }},
@@ -10365,8 +15033,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     const p = theme.palette;
     const read = item.created_at <= inboxReadThrough();
     const glyph: []const u8 = switch (item.verb) {
-        .reply => "reply",
-        .mention => "reply",
+        .reply, .mention => "reply",
         .like => "like",
         .repost => "repeat",
         .zap => "zap",
@@ -10377,22 +15044,81 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         .like => p.status_like,
         else => p.text_muted_alt,
     };
+    // A reply says only the name. "replied to you" above a row that already
+    // shows their reply is the same fact twice.
     const verb_text: []const u8 = switch (item.verb) {
-        .reply => "replied to you",
-        .mention => "mentioned you",
-        .like => "liked your note",
-        .repost => "reposted you",
-        .zap => "zapped you",
+        .reply => "",
+        .mention => "mentioned you in a note",
+        .like => "reacted to your note",
+        .repost => "reposted your note",
+        .zap => "zapped your note",
     };
-    // Flattened deliberately: the four spacer nodes this used to hold, plus the
-    // inner column and its two vertical gaps, cost seven nodes A ROW for spacing
-    // that `padding` and `gap` already express. Twenty rows of that is a seventh
-    // of the whole view budget spent on whitespace.
+    const body = item.body();
+    const emoji = item.reactionGlyph();
+
+    // Name, verb and amount are SPANS of one paragraph, not three paragraphs.
+    // The row is priced in widget nodes against a per-view ceiling that refuses
+    // the whole screen when crossed, and the first cut of this row spent five
+    // extra nodes apiece on things that are only text: twenty rows of that put
+    // the notifications view at 924 against a ceiling of 1024 with 102 that has
+    // to stay free. Spans cost nothing.
+    var head: [3]canvas.TextSpan = undefined;
+    var head_len: usize = 0;
+    head[head_len] = .{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale };
+    head_len += 1;
+    if (verb_text.len > 0) {
+        head[head_len] = .{ .text = ui.fmt(" {s}", .{verb_text}), .scale = nested_meta_scale };
+        head_len += 1;
+    }
+    if (item.verb == .zap and item.msat > 0) {
+        head[head_len] = .{ .text = ui.fmt("  {d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale };
+        head_len += 1;
+    }
+
+    // Built by hand rather than with an `else ui.spacer(0)` per optional child,
+    // because an empty spacer is still a node and this row has three of them.
+    var kids: [3]AppUi.Node = undefined;
+    var kids_len: usize = 0;
+    kids[kids_len] = ui.el(.list_item, .{
+        .padding = 0.01,
+        .on_press = Msg{ .open_person = item.author },
+        .style = .{ .radius = 4, .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+    }, .{
+        ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, head[0..head_len]),
+    });
+    kids_len += 1;
+    if (body.len > 0) {
+        // Theirs for a reply, yours for everything else, and dimmer when it is
+        // yours: you wrote it, so the new fact is who did what to it.
+        const own = item.verb != .reply and item.verb != .mention;
+        // Two lines and stop, cut in the spans before layout because the SDK
+        // has no multi-line clamp. The same rule an ancestor's body follows, so
+        // a long note cannot turn one notification into half a screen.
+        // Through the same renderer the feed uses, so a `nostr:npub…` reads as a
+        // name and a `nostr:nevent…` does not dump sixty characters of bech32
+        // into the preview. It was raw before, which is the one thing a preview
+        // must not be.
+        const spans = clampSpansToLines(ui, contentSpans(ui, body), notification_body_lines);
+        kids[kids_len] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
+            spans,
+        );
+        kids_len += 1;
+    }
+    kids[kids_len] = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_faint_alt } },
+        &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
+    );
+    kids_len += 1;
+
     return ui.column(.{ .gap = 0 }, .{
         ui.el(.data_row, .{
             .padding = 12,
             .gap = 10,
-            .cross = .center,
+            // Top aligned: the row is several lines now, and a gutter glyph
+            // floating beside the middle of a paragraph belongs to nothing.
+            .cross = .start,
             // `open_event`, never `open_thread`. The thread route resolves an id
             // against the LOADED FEED, which is scoped to follows and holds at
             // most a few hundred notes; what a notification points at is almost
@@ -10401,7 +15127,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
             // a silent no-op. This one asks the store by name.
             .on_press = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author },
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = verb_text, .focusable = true },
+            .semantics = .{ .role = .button, .label = if (verb_text.len > 0) verb_text else "replied to you", .focusable = true },
         }, .{
             // The unread dot holds its width either way, so a row does not shift
             // sideways the moment it is read.
@@ -10416,26 +15142,34 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
                     .stroke_width = 0,
                 },
             }, .{}),
-            ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
-            ui.row(.{ .cross = .center, .gap = 5, .grow = 1 }, .{
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_body_soft } },
-                    &.{.{ .text = personName(ui, item.author), .weight = .medium, .scale = nested_meta_scale }},
-                ),
-                ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = verb_text, .scale = nested_meta_scale }}),
-                if (item.verb == .zap and item.msat > 0)
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.status_warning } },
-                        &.{.{ .text = ui.fmt("{d} sats", .{item.msat / 1000}), .weight = .medium, .scale = nested_meta_scale }},
-                    )
+            // Glyph and face together, centred against EACH OTHER, and that pair
+            // top-aligned against the text. The row's own `.cross = .start` is
+            // right for the avatar, which should hang beside the name and the
+            // first line of the body, and wrong for a 14pt glyph, which then
+            // floated at the very top with nothing beside it.
+            ui.row(.{ .cross = .center, .gap = 10 }, .{
+                // The reaction they actually sent, where a generic heart used to
+                // be. A shortcode with no image would print as `:shakingeyes:`,
+                // so only something short enough to read as a glyph is drawn.
+                if (item.verb == .like and emoji.len > 0 and emoji.len <= 8)
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_body } }, &.{.{ .text = emoji, .scale = nested_meta_scale }})
                 else
-                    ui.spacer(0),
-                ui.spacer(1),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_faint_alt } },
-                    &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
-                ),
+                    ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = tint } }, glyph),
+                // The face and the name go to the person, everything else goes
+                // to the note. That is what the feed does and what Jumble does,
+                // and without it the one thing a notification is most likely to
+                // make you want (who IS this) was the one thing you could not
+                // press.
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .on_press = Msg{ .open_person = item.author },
+                    .style = .{ .radius = 999, .quiet_hover = true },
+                    .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
+                }, .{
+                    personAvatar(ui, item.author, nested_avatar_size),
+                }),
             }),
+            ui.column(.{ .gap = 3, .grow = 1 }, kids[0..kids_len]),
         }),
         ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
     });
@@ -10454,24 +15188,75 @@ fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The first-intent sheet: the join ladder over the dimmed feed. Three ways in,
 /// most confident first, and always the way back to reading. When the guest
 /// reached for the composer, the sheet says the note is waiting.
-fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
-    return ui.el(.dialog, .{
+/// An app asking to sign as you, over whatever the reader was doing.
+///
+/// No dismiss and no press-to-close, unlike every other sheet here. The two
+/// buttons ARE the answer, and a scrim that closes on a stray click would leave
+/// a client hanging on a question the reader thinks they dealt with. Denying is
+/// one press away and costs nothing: the app can ask again.
+fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    // No dismiss and no backdrop press, deliberately: an app is asking to sign as
+    // this person and the only ways out are the four answers on the card. The
+    // scrim is still here to dim what is behind it and to swallow presses that
+    // would otherwise land on the feed.
+    return ui.el(.panel, .{
         .grow = 1,
-        .padding = 16,
-        .on_dismiss = .close_join,
-        .on_press = .close_join,
+        .on_press = Msg.absorb_press,
         .style_tokens = .{ .background = .scrim },
-        .semantics = .{ .label = "Join" },
+        .semantics = .{ .label = "An app wants to sign as you" },
     }, .{
-        ui.row(.{ .grow = 1, .main = .center, .cross = .start }, .{
-            // 40px down from the window, which is the design's offset: 16 of it is
-            // the dialog's own padding, so this is the rest.
-            ui.column(.{ .gap = 0 }, .{
-                vgap(ui, 24),
-                if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+        ui.el(.dialog, .{
+            .width = settings_column_width,
+            .semantics = .{ .label = "An app wants to sign as you" },
+        }, .{
+            settingsCard(ui, .{
+                ui.column(.{ .gap = 0, .grow = 1 }, .{
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
+                        &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
+                    ),
+                    vgap(ui, 7),
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                        &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
+                    ),
+                    vgap(ui, 7),
+                    ui.paragraph(
+                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                        &.{.{
+                            .text = if (bunkerAskIsConnect())
+                                "Letting it in does not let it sign yet: it is asked again the first time it wants to. If it already gave up waiting, approve anyway and connect again from the app, because this is remembered."
+                            else
+                                "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
+                            .scale = mono_hint_scale,
+                        }},
+                    ),
+                    vgap(ui, 12),
+                    // Four answers rather than two. Amber's shape: "not now",
+                    // "for a while" and "stop asking" all reachable in one
+                    // press, because a prompt with only yes and no is one
+                    // people learn to hit yes on.
+                    ui.row(.{ .gap = 8, .cross = .center }, .{
+                        ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
+                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
+                    }),
+                }),
             }),
         }),
     });
+}
+
+fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    return modalScrim(ui, "Join", .close_join, ui.el(.dialog, .{
+        .width = join_card_width,
+        .on_dismiss = .close_join,
+        .semantics = .{ .label = "Join" },
+    }, .{
+        if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+    }));
 }
 
 /// Why the sheet appeared, in the reader's own terms: the thing they reached for
@@ -10495,6 +15280,10 @@ fn pendingText(ui: *AppUi, model: *const Model) []const u8 {
             std.fmt.allocPrint(ui.arena, "Your like on {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your like is waiting."
         else
             "Your like is waiting.",
+        .repost => |id| if (model.noteById(id)) |note|
+            std.fmt.allocPrint(ui.arena, "Your repost of {s}'s note is waiting.", .{personLabel(ui, note.author())}) catch "Your repost is waiting."
+        else
+            "Your repost is waiting.",
         .follow => |pk| std.fmt.allocPrint(ui.arena, "Following {s} is waiting.", .{personLabel(ui, personName(ui, pk))}) catch "Your follow is waiting.",
     };
 }
@@ -10526,6 +15315,7 @@ fn pendingGlyph(ui: *AppUi, model: *const Model) AppUi.Node {
         .none, .post => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "edit"),
         .reply => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "reply"),
         .like => ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_like } }, "like"),
+        .repost => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.status_success } }, "repeat"),
         .follow => ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = p.text_muted } }, "plus"),
     };
 }
@@ -10648,6 +15438,34 @@ fn joinLabel(ui: *AppUi, text: []const u8) AppUi.Node {
 /// a full-window dialog that closes when pressed, and a `.card` claims no press
 /// of its own, so without this a click on the sheet's own background walks past
 /// the card to the dialog and closes the sheet mid-use. See `Msg.absorb_press`.
+/// The full-window dim behind a modal, and the press target that closes it.
+///
+/// The SDK owns where a `.dialog` sits: since 0.9.2 a dialog, drawer or sheet is
+/// placed against the ROOT surface and centred there, its proposed frame
+/// discarded, so `.grow = 1` on one does nothing at all. Plaza used to be the
+/// dialog AND the backdrop in one element, which meant the upgrade quietly
+/// shrank every scrim to a 420pt box: the dim stopped covering the window and a
+/// press outside that box stopped closing anything.
+///
+/// So the two jobs are two elements now. This is the backdrop: a plain panel
+/// that fills the window, carries the dim, and closes on a press. The `.dialog`
+/// goes inside it and is nothing but the card, which is the shape the SDK's own
+/// examples use.
+///
+/// `.grow = 1` here is belt and braces and I checked: removing it keeps every
+/// test green, because the layer stack these sheets are mounted in stretches its
+/// children anyway. It stays because a backdrop that only fills the window when
+/// its parent happens to stretch it is one reparenting away from the bug this
+/// function exists to fix. The dismiss press is the part a probe does catch.
+fn modalScrim(ui: *AppUi, label: []const u8, dismiss: Msg, child: AppUi.Node) AppUi.Node {
+    return ui.el(.panel, .{
+        .grow = 1,
+        .on_press = dismiss,
+        .style_tokens = .{ .background = .scrim },
+        .semantics = .{ .label = label },
+    }, .{child});
+}
+
 fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
     const p = theme.palette;
     return ui.el(.card, .{
@@ -10847,7 +15665,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                         hgap(ui, 2),
                         ui.paragraph(
                             .{ .style = .{ .foreground = p.text_dim } },
-                            &.{.{ .text = composeReach(ui, model.draft().len), .monospace = true, .scale = mono_meta_scale }},
+                            &.{.{ .text = composeReach(ui, model.draft().len, model.draft_dropped), .monospace = true, .scale = mono_meta_scale }},
                         ),
                         ui.spacer(1),
                         ui.paragraph(
@@ -11156,7 +15974,20 @@ fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.No
     return ui.column(.{ .gap = 6 }, rows);
 }
 
-fn composeReach(ui: *AppUi, written: usize) []const u8 {
+pub const compose_capacity_for_test = compose_capacity;
+
+pub fn composeReachForTest(arena: std.mem.Allocator, written: usize, dropped: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return composeReach(&ui, written, dropped);
+}
+
+fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
+    // The overflow first, because it is the only thing here the writer has to
+    // act on: some of what they pasted is not in the box and they cannot see
+    // which part.
+    if (dropped > 0) {
+        return ui.fmt("{d} characters did not fit and were not kept", .{dropped});
+    }
     // The room left, once there is little enough of it to matter. A composer
     // that silently stops accepting characters is the bug this replaces, and a
     // counter that is always on screen is a nag for the ninety-nine notes that
@@ -11183,10 +16014,15 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
     // surface and always claim their own input, so the feed underneath neither
     // shows through nor scrolls, and Escape or a click outside closes it.
     // Stacking kinds layer their children, so the contents go in a column.
-    return ui.el(.dialog, .{
+    // A PANEL rather than a dialog, and it is the one modal here that is not a
+    // card. A picture wants the whole window; a `.dialog` since 0.9.2 is centred
+    // at its preferred size inside a 24pt margin, which would frame the viewer
+    // with a border of feed showing around it. The cost is Escape: dismissal is
+    // a modal-surface event, so it goes with the dialog. A press anywhere still
+    // closes, which is how the viewer was mostly used anyway.
+    return ui.el(.panel, .{
         .grow = 1,
         .padding = 16,
-        .on_dismiss = .close_image,
         .on_press = .close_image,
         .style_tokens = .{ .background = .background },
         .semantics = .{ .label = "Expanded image" },
@@ -11285,6 +16121,11 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
     var extent = chrome + lines * line_height;
     if (collapsed) extent += line_height;
+    // The reply line and its gap, priced whatever state it is in: it occupies
+    // one line while it says "reply to a note" and one line once it names
+    // somebody, so the row does not resize under the reader when the parent
+    // resolves a moment later.
+    if (note.has_reply_parent) extent += line_height + 4;
     if (!media) return extent;
     // A link card, once the page has answered; nothing before that.
     if (note.hasLink()) {
@@ -12134,7 +16975,7 @@ fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) A
             ui.column(.{ .grow = 1, .gap = 0 }, .{
                 focalBody(ui, note),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
@@ -12194,13 +17035,13 @@ fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, thread_inset + 2),
             vgap(ui, 33),
-            statCount(ui, c.replies, "reply", "replies"),
+            statCount(ui, if (countHidden(.replies, .reply_counts)) 0 else c.replies, "reply", "replies"),
             hgap(ui, 18),
-            statCount(ui, c.reposts, "repost", "reposts"),
+            statCount(ui, if (countHidden(.reposts, .repost_counts)) 0 else c.reposts, "repost", "reposts"),
             hgap(ui, 18),
-            statCount(ui, c.likes, "like", "likes"),
+            statCount(ui, if (countHidden(.reactions, .reaction_counts)) 0 else c.likes, "like", "likes"),
             hgap(ui, 18),
-            statCount(ui, c.zap_msat / 1000, "sat", "sats"),
+            statCount(ui, if (countHidden(.zaps, .zap_totals)) 0 else c.zap_msat / 1000, "sat", "sats"),
             ui.spacer(1),
         }),
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
@@ -12332,6 +17173,14 @@ fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) G
 /// this reader follows, everywhere, at once.
 const contact_list_kind: u16 = 3;
 
+/// NIP-51's mute list. Public entries are `p` tags; private ones live in the
+/// content, encrypted to yourself, and are read separately (see `privateMutes`).
+const mute_list_kind: u16 = 10000;
+
+/// How many muted accounts are held. Far past any real list: muting is a thing
+/// people do a handful of times, not two thousand.
+const max_mutes = 512;
+
 /// How many follows are TRACKED, which is not how many the feed reads.
 ///
 /// These are two different numbers and conflating them was a real bug: the feed
@@ -12372,15 +17221,38 @@ const follow_chunk = 500;
 /// a compile-time question rather than a truncated subscription.
 const max_follows_divided = (max_follows + 1 + follow_chunk - 1) / follow_chunk;
 
-/// How many filters the feed subscription can need: two per chunk.
-pub const max_feed_filters = 2 * (max_follows_divided + 1);
+/// How many filters the feed subscription can need: two per chunk, plus one for
+/// the reader's own records.
+pub const max_feed_filters = 2 * (max_follows_divided + 1) + 1;
 
 /// The feed's notes.
 const feed_filter_kinds = [_]u16{1};
-/// kind:0 is who they are, 10002 is where they are, and 3 is who the reader
-/// follows: their own contact list, which nothing may be written over until it
-/// has been read.
-const profile_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
+/// What the feed needs about the people in it: kind:0 is who they are, 10002 is
+/// where they are.
+///
+/// NOT kind:3. Somebody else's contact list is asked for in exactly one place,
+/// the profile card's follow counts, and the worker that opens a profile
+/// already fetches that person's kind:0 and kind:3 on its own. Asking for it
+/// here asked every relay for the contact list of all two thousand follows at
+/// dial: a list of two thousand `p` tags is well over a hundred kilobytes, so
+/// this was megabytes per relay, per connection, to answer a question nobody
+/// had asked, about people whose profile the reader may never open.
+const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
+
+/// What the feed needs about the READER, which is the above plus their own
+/// contact list.
+///
+/// Their own kind:3 is not optional and not a nicety: nothing may write over a
+/// replaceable record that has not been read back first, and the follow list is
+/// the one where getting that wrong empties somebody's account. It is one
+/// author and three records, so it costs nothing to ask for separately, which
+/// is the entire reason the bulk filter above can stop asking for it.
+const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind };
+
+/// Backing store for the reader's own author filter. A `Filter` borrows its
+/// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
+/// only there, and only from the relay threads that build a subscription.
+var g_self_filter_author: [1][32]u8 = undefined;
 
 /// Splits `authors` across filters small enough for a relay to accept, two per
 /// chunk, and returns the slice of `out` that was filled.
@@ -12390,15 +17262,45 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind };
 /// envelope that arrives. The per-chunk limit is NOT divided: each chunk names
 /// different people, and splitting the limit would starve whoever landed in the
 /// last one.
-pub fn buildFeedFilters(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, since: ?i64, out: []nostr.filter.Filter) []nostr.filter.Filter {
     var len: usize = 0;
     var start: usize = 0;
     while (start < authors.len) : (start += follow_chunk) {
         if (len + 2 > out.len) break;
         const chunk = authors[start..@min(start + follow_chunk, authors.len)];
-        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .limit = feed_request_limit };
-        out[len + 1] = .{ .authors = chunk, .kinds = &profile_filter_kinds, .limit = profile_cap };
+        // The notes carry `since`; the metadata filter deliberately does not.
+        // A profile or relay list edited while the app was closed has an older
+        // `created_at` than the newest note held, so bounding that filter would
+        // hide exactly the update the app most needs.
+        out[len] = .{ .authors = chunk, .kinds = &feed_filter_kinds, .since = since, .limit = feed_request_limit };
+        // One record per author per kind, which is what the filter can actually
+        // return: these are all replaceable, so a relay holds at most one of
+        // each. The old limit was `profile_cap`, a UI cache size, which for a
+        // 500-author chunk across three kinds asked for 1500 records and
+        // permitted 160. A relay obeying the limit answered a third of a chunk
+        // and the rest of those authors stayed nameless until something else
+        // happened to ask for them.
+        out[len + 1] = .{
+            .authors = chunk,
+            .kinds = &profile_filter_kinds,
+            .limit = @intCast(chunk.len * profile_filter_kinds.len),
+        };
         len += 2;
+    }
+    // The reader's own three records, asked for once rather than folded into a
+    // five-hundred-author filter. `self_storage` outlives the returned slice
+    // because it is a module-level buffer: a filter borrows its authors, and a
+    // local array here would dangle the moment this function returned.
+    if (self) |pk| {
+        if (len < out.len) {
+            g_self_filter_author[0] = pk;
+            out[len] = .{
+                .authors = g_self_filter_author[0..1],
+                .kinds = &self_filter_kinds,
+                .limit = self_filter_kinds.len,
+            };
+            len += 1;
+        }
     }
     return out[0..len];
 }
@@ -12416,6 +17318,23 @@ var g_follow_created_at: i64 = 0;
 /// notes, and a sign-in asks for the new account's own records, without waiting
 /// for a socket to drop.
 var g_follow_gen = std.atomic.Value(u32).init(0);
+
+/// Bumped only when WHO IS SIGNED IN changes, never when the follow list moves.
+///
+/// The inbox REQ hung off the follow generation, so following one person
+/// re-issued `plaza-inbox` on every read relay with a 200-event backfill. At
+/// eight relays that is up to 1600 events re-delivered and re-verified for a
+/// change the inbox does not depend on: its filter names one pubkey, the
+/// reader's own. Amethyst keeps these on separate watchers for the same reason.
+var g_identity_gen = std.atomic.Value(u32).init(0);
+
+pub fn identityGeneration() u32 {
+    return g_identity_gen.load(.acquire);
+}
+
+pub fn bumpIdentityGeneration() void {
+    _ = g_identity_gen.fetchAdd(1, .monotonic);
+}
 /// Guards the table. The UI thread writes it; ingest threads read it to build
 /// their filters.
 var g_follow_lock = std.atomic.Value(bool).init(false);
@@ -12432,6 +17351,337 @@ fn followsAreOwned() bool {
     const pk = activePubkey() orelse return false;
     const owner = g_follow_owner orelse return false;
     return std.mem.eql(u8, &owner, &pk);
+}
+
+// ---------------------------------------------------------------- muting
+//
+// The reader's NIP-51 mute list, read and honoured. Not written: a mute list is
+// REPLACEABLE, and the rule this app already learned about contact lists holds
+// here too, that nothing may write over a record it has not read back first.
+// Jumble does the careful version of that write (it re-fetches immediately
+// before every change, and when the fetch comes back empty it ASKS rather than
+// assuming there is nothing there, because "not found" and "the fetch failed"
+// look identical). Doing that properly is its own change; honouring a list made
+// elsewhere costs nothing and is most of the value, because muting is something
+// people mostly did in whatever client they came from.
+
+var g_mutes: [max_mutes][32]u8 = undefined;
+var g_mute_count: usize = 0;
+var g_mute_owner: ?[32]u8 = null;
+var g_mute_created_at: i64 = 0;
+var g_mute_lock = std.atomic.Value(bool).init(false);
+
+fn lockMutes() void {
+    while (g_mute_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockMutes() void {
+    g_mute_lock.store(false, .release);
+}
+
+/// Whether the list in memory is THIS account's. Same question the follow set
+/// asks, and for the same reason: one account's mutes must never silently
+/// become another's.
+fn mutesAreOwned() bool {
+    const pk = activePubkey() orelse return false;
+    const owner = g_mute_owner orelse return false;
+    return std.mem.eql(u8, &owner, &pk);
+}
+
+/// Whether this reader has muted `pubkey`.
+///
+/// The one question the rest of the app asks. Answering false when no list is
+/// known is the right default in a way the follow set's is not: an unknown
+/// follow list falls back to a starter pack, but an unknown mute list has no
+/// stand-in, and inventing one would hide people nobody asked to hide.
+pub fn isMuted(pubkey: [32]u8) bool {
+    lockMutes();
+    defer unlockMutes();
+    if (!mutesAreOwned()) return false;
+    for (g_mutes[0..g_mute_count]) |m| {
+        if (std.mem.eql(u8, &m, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// How many accounts this reader has muted.
+pub fn muteCount() usize {
+    lockMutes();
+    defer unlockMutes();
+    if (!mutesAreOwned()) return 0;
+    return g_mute_count;
+}
+
+/// Installs a mute set as this account's. Returns whether anything changed.
+fn setMutes(list: []const [32]u8, created_at: i64) bool {
+    const pk = activePubkey() orelse return false;
+    lockMutes();
+    const same = blk: {
+        if (!mutesAreOwned()) break :blk false;
+        if (g_mute_count != @min(list.len, max_mutes)) break :blk false;
+        for (list[0..@min(list.len, max_mutes)], 0..) |m, i| {
+            if (!std.mem.eql(u8, &m, &g_mutes[i])) break :blk false;
+        }
+        break :blk true;
+    };
+    if (same) {
+        unlockMutes();
+        return false;
+    }
+    const n = @min(list.len, max_mutes);
+    @memcpy(g_mutes[0..n], list[0..n]);
+    g_mute_count = n;
+    g_mute_owner = pk;
+    g_mute_created_at = created_at;
+    unlockMutes();
+    // The feed in hand was built without this. Unlike a follow change, an empty
+    // list is a meaningful answer here (they unmuted everybody), so this runs on
+    // any change rather than only on a non-empty one.
+    invalidateFeed();
+    return true;
+}
+
+/// Forgets whose list this is, on any identity change.
+fn forgetMutes() void {
+    lockMutes();
+    g_mute_owner = null;
+    g_mute_count = 0;
+    g_mute_created_at = 0;
+    unlockMutes();
+}
+
+/// The pubkeys a kind:10000's public `p` tags name, deduped.
+///
+/// Only `p`. NIP-51 also allows `t` (hashtags), `word` and `e` (threads) here,
+/// and none of those is read yet: hiding a person is the whole of what the feed
+/// can act on today, and claiming to honour a word filter that does nothing
+/// would be worse than not claiming it.
+fn mutesFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
+    @setRuntimeSafety(true); // Tags off a relay, and `out` is indexed as they are walked.
+    var n: usize = 0;
+    for (tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "p")) continue;
+        if (tag[1].len != 64) continue;
+        var pk: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk, tag[1]) catch continue;
+        var seen = false;
+        for (out[0..n]) |had| {
+            if (std.mem.eql(u8, &had, &pk)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+pub const MuteWrite = enum {
+    published,
+    /// Already muted, or already not, or the reader themselves.
+    nothing_to_do,
+    /// A signature is already out. One key signs one thing at a time.
+    signer_busy,
+    /// This account's mute list has not been read back yet. Publishing one now
+    /// would replace whatever is really out there with a list of one name.
+    no_list_yet,
+    /// The list has a private half this app could not decrypt, so it cannot
+    /// carry it forward and will not write without it.
+    private_half_unreadable,
+    /// The write would have dropped more people than the press asked for.
+    would_shrink,
+    failed,
+};
+
+/// Mutes or unmutes `pubkey`, by splicing this reader's own kind:10000.
+///
+/// The same discipline the contact list learned, for the same reason: this is a
+/// REPLACEABLE record, so publishing one replaces what the reader has muted
+/// everywhere at once.
+///
+/// Jumble asks the user when it cannot find a list, because "you have no mute
+/// list" and "the fetch failed" are indistinguishable from here. This refuses
+/// instead, which is the answer this app already gives for a contact list, and
+/// the button says why rather than silently doing nothing. A key minted here is
+/// the one case where having no list is a fact rather than a failed read.
+fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
+    if (!signerReady()) return .signer_busy;
+    const me = activePubkey() orelse return .failed;
+    // Muting yourself would hide your own notes from your own feed.
+    if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, mute_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    const have_base = previous != null;
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+
+    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+
+    // The private half, carried forward VERBATIM and only when it is understood.
+    //
+    // This is the bug in Jumble worth not copying. Its `getPrivateTags` returns
+    // an empty list when the decrypt throws, and the write then sets `content`
+    // to `''`, publishing away every private mute the reader had. A bunker
+    // reader hits that path every time, because the decrypt needs a NIP-46 round
+    // trip this app does not make.
+    //
+    // So: content that is present and cannot be read means no write at all. The
+    // reader keeps their private mutes and is told the app cannot do this one.
+    if (base_content.len > 0) {
+        var probe: [max_mutes][32]u8 = undefined;
+        if (privateMutes(gpa, base_content, &probe) == 0 and !privateHalfIsReadable(gpa, base_content)) {
+            return .private_half_unreadable;
+        }
+    }
+
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    var found = false;
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, pubkey);
+
+    // Every tag is carried, `p` and otherwise. NIP-51 also puts hashtags,
+    // words and threads in here, and this app reads none of those: dropping
+    // what it does not understand would delete a filter the reader set in a
+    // client that does.
+    for (base_tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and hexEqlIgnoreCase(tag[1], &hex)) {
+            found = true;
+            if (!muting) continue;
+        }
+        const copy = gpa.alloc([]const u8, tag.len) catch return .failed;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    }
+
+    if (muting) {
+        if (found) return .nothing_to_do;
+        const copy = gpa.alloc([]const u8, 2) catch return .failed;
+        copy[0] = gpa.dupe(u8, "p") catch return .failed;
+        copy[1] = gpa.dupe(u8, &hex) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    } else if (!found) {
+        return .nothing_to_do;
+    }
+
+    // The same shrink guard the contact list has. A mute adds exactly one name
+    // and an unmute removes exactly one, so a write that drops more than that is
+    // a bug here or a stale base, and refusing beats publishing it.
+    if (have_base and !shrinkAllowed(countPeople(base_tags), countPeople(tags.items), muting)) return .would_shrink;
+
+    const owned_tags = tags.toOwnedSlice(gpa) catch return .failed;
+    handed_off = true;
+    const content = gpa.dupe(u8, base_content) catch return .failed;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(mute_list_kind) + 1), base_created_at + 1);
+
+    // The live set moves first, so the feed reflects the press immediately.
+    var next: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(owned_tags, &next);
+    n += privateMutes(gpa, content, next[n..]);
+    _ = setMutes(next[0..n], created);
+
+    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false);
+    return .published;
+}
+
+/// Whether an encrypted content opens at all.
+///
+/// `privateMutes` returns zero for two completely different situations: a half
+/// that decrypted fine and simply names nobody, and a half that could not be
+/// decrypted. Carrying the first one forward is ordinary; carrying the second is
+/// the only thing this write must never do. This is what tells them apart, and
+/// the name says "readable" rather than "empty" on purpose: a reader glancing at
+/// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
+/// opposite of what the guard is for.
+fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
+    const kp = g_identity_kp orelse return false;
+    const signer = g_identity_signer orelse return false;
+    const me = activePubkey() orelse return false;
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return false;
+    defer gpa.free(plain);
+    const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
+    defer parsed.deinit();
+    // It decrypted and parsed. Whatever is in it, this app understood the half it
+    // is about to carry forward, which is the whole question.
+    return true;
+}
+
+pub fn writeMuteForTest(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
+    return writeMute(fx, pubkey, muting);
+}
+
+/// Seeds the mute set from the local store, at boot and at sign-in, so a muted
+/// account is hidden from the first frame rather than after a round trip.
+fn loadMutesFromStore() void {
+    const gpa = std.heap.page_allocator;
+    const own = ownRecordJson(gpa, mute_list_kind) orelse return;
+    defer freeOwnProfile(gpa, own);
+    var list: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(own.tags, &list);
+    n += privateMutes(gpa, own.json, list[n..]);
+    // No `if (n == 0) return` here, deliberately, and this is the one place the
+    // mute list differs from the contact list. An empty contact list is a
+    // malformed event to be ignored, because a reader with no follows has no
+    // feed; an empty mute list is somebody who unmuted everybody, and refusing
+    // to adopt it would leave the last person they unmuted hidden.
+    _ = setMutes(list[0..n], own.created_at);
+}
+
+/// A mute list arriving from a relay. Newer wins; the reader's own only.
+fn ingestMuteList(ev: nostr.event.Event) void {
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    lockMutes();
+    const owned = mutesAreOwned();
+    const held_at = g_mute_created_at;
+    unlockMutes();
+    if (owned and ev.created_at <= held_at) return;
+    const gpa = std.heap.page_allocator;
+    var list: [max_mutes][32]u8 = undefined;
+    var n = mutesFromTags(ev.tags, &list);
+    n += privateMutes(gpa, ev.content, list[n..]);
+    _ = setMutes(list[0..n], ev.created_at);
+}
+
+/// The private half of a mute list: `content` is a JSON array of tags,
+/// encrypted to yourself, which NIP-51 says may be NIP-04 or NIP-44.
+///
+/// Only readable with a LOCAL key. A bunker holds the secret and would have to
+/// be asked to decrypt over NIP-46, which is a round trip this path does not
+/// have; those readers see their public mutes honoured and their private ones
+/// not, which is the honest failure, and it is why part two of this must refuse
+/// to write a list whose private half it could not read. Jumble has exactly that
+/// bug: a failed decrypt leaves it writing an empty content, which publishes
+/// away every private mute the reader had.
+fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
+    if (content.len == 0 or out.len == 0) return 0;
+    const kp = g_identity_kp orelse return 0;
+    const signer = g_identity_signer orelse return 0;
+    const me = activePubkey() orelse return 0;
+    // To yourself, so both sides of the conversation key are this account's.
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return 0;
+    defer gpa.free(plain);
+    const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
+    defer parsed.deinit();
+    var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
+    defer gpa.free(tags);
+    for (parsed.value, 0..) |tag, i| tags[i] = tag;
+    return mutesFromTags(tags, out);
 }
 
 /// Who the FEED reads: a bounded slice of the follow list, or the starter pack
@@ -12558,9 +17808,14 @@ fn setFollows(list: []const [32]u8, created_at: i64) bool {
     g_follow_created_at = created_at;
     unlockFollows();
     // Everything scoped to the follow set is now stale: the feed's query, the
-    // relay filters, the names being fetched.
+    // relay filters, the names being fetched, and which relays are worth
+    // suggesting (the ranking is a count of THESE people).
     _ = g_follow_gen.fetchAdd(1, .monotonic);
-    g_last_count = std.math.maxInt(usize);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
+    invalidateFeed();
+    g_relay_ranks_dirty.store(true, .release);
     return true;
 }
 
@@ -12581,6 +17836,12 @@ fn forgetFollows() void {
     // records requested on an already-open socket, and following stays disabled
     // for the whole session.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+    // The author set moved, so whatever was concluded about the end of their
+    // history was concluded about a different question.
+    resetFeedEnd();
+    // And this is the one thing the inbox DOES depend on: whose notifications
+    // these are. It is the only place that bumps it, which is the point.
+    bumpIdentityGeneration();
 }
 
 /// Seeds the follow set from the local store, at boot and at sign-in.
@@ -12637,6 +17898,25 @@ pub fn followBlockedReason() ?[]const u8 {
     if (activePubkey() == null) return null;
     if (canWriteFollows()) return null;
     return "Looking for your follow list…";
+}
+
+/// Why muting is unavailable right now, in the words the button shows under it.
+///
+/// The same rule as following, and for a worse consequence: a mute list is
+/// replaceable, so writing one this app has not read back would replace whatever
+/// the reader really has with a list of one name. A key minted here is the one
+/// case where having none is a fact rather than a read that has not landed.
+pub fn muteBlockedReason() ?[]const u8 {
+    if (activePubkey() == null) return null;
+    if (g_identity_minted_here) return null;
+    // Free, and the right question. `mutesAreOwned` is true exactly when this
+    // account's own kind:10000 has been read, which is what the gate in
+    // `writeMute` decides on. No store query per frame: the button asks this,
+    // and `writeMute` asks the read itself, which is the lesson the follow path
+    // paid for (deciding a write from a SECOND query let a transient failure
+    // answer "they have no list").
+    if (mutesAreOwned()) return null;
+    return "Looking for your mute list…";
 }
 
 /// Whether this account's own kind:3 is in the local store, REMEMBERED.
@@ -13007,10 +18287,10 @@ fn clearPendingFollowBase() void {
 fn setPendingFollowBase(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
     const gpa = std.heap.page_allocator;
     clearPendingFollowBase();
-    const tag_copy = dupeTags(gpa, tags);
-    // `dupeTags` degrades to an empty set rather than failing, and an empty base
-    // is worse than no base: it would publish a list with nobody in it.
-    if (tag_copy.len == 0 and tags.len != 0) return;
+    // No base beats a partial one: a partial one publishes a list with nobody
+    // in it. `dupeTags` reports the difference now rather than returning an
+    // empty set that reads as "this list was empty".
+    const tag_copy = dupeTags(gpa, tags) orelse return;
     g_pending_follow_tags = tag_copy;
     g_pending_follow_content = gpa.dupe(u8, content) catch {
         clearPendingFollowBase();
@@ -13131,6 +18411,22 @@ pub fn setFollowsForTest(list: []const [32]u8, created_at: i64) bool {
 
 pub fn forgetFollowsForTest() void {
     forgetFollows();
+}
+
+pub fn forgetMutesForTest() void {
+    forgetMutes();
+}
+
+pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
+    return setMutes(list, created_at);
+}
+
+pub fn loadMutesFromStoreForTest() void {
+    loadMutesFromStore();
+}
+
+pub fn ingestMuteListForTest(ev: nostr.event.Event) void {
+    ingestMuteList(ev);
 }
 
 pub fn loadFollowsFromStoreForTest() void {
@@ -13330,7 +18626,7 @@ fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_a
                 vgap(ui, 5),
                 noteBody(ui, note, true),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, model, note),
@@ -13426,7 +18722,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
 /// cut is made in the SPANS: building them from the whole text first keeps a
 /// mention reading as `@name` rather than as half of a bech32 token.
 fn ancestorBody(ui: *AppUi, note: *const Note) AppUi.Node {
-    const spans = clampSpansToLines(ui, contentSpans(ui, note.content()), ancestor_body_lines);
+    const spans = clampSpansToLines(ui, noteSpans(ui, note, note.content()), ancestor_body_lines);
     return textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
 }
 
@@ -13856,7 +19152,7 @@ fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node {
 /// the strip rather than letterboxing inside it.
 fn bannerImage(ui: *AppUi) AppUi.Node {
     var node = ui.image(.{
-        .image = banner_image_id,
+        .image = g_banner_image_id,
         .height = profile_banner_height,
         .grow = 1,
         .semantics = .{ .label = "Profile banner" },
@@ -13888,11 +19184,20 @@ fn bannerReady(pubkey: [32]u8) bool {
 /// Asks for the open profile's banner, once per person.
 fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     const pubkey = model.viewing_profile orelse {
-        // Left the screen: the next person starts clean.
+        // Left the screen: the next person starts clean, and the slot goes back
+        // to the pool rather than sitting on a picture nobody can see. The feed
+        // underneath is exactly what wants it.
+        if (g_banner_image_id != 0) {
+            _ = fx.unregisterImage(g_banner_image_id);
+            g_banner_image_id = 0;
+        }
         g_banner_for = null;
         g_banner_state = .idle;
         return;
     };
+    // On screen this pass, so the allocator will not take it out from under the
+    // reader while they are looking at it.
+    g_banner_seen = g_image_clock;
     if (!g_media_previews) return;
     const changed = if (g_banner_for) |who| !std.mem.eql(u8, &who, &pubkey) else true;
     if (changed) {
@@ -13910,18 +19215,25 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     @memcpy(g_banner_url_buf[0..n], url[0..n]);
     g_banner_url_len = @intCast(n);
 
-    if (loadCachedImage(fx, banner_image_id, bannerUrl(), banner_target_px)) |_| {
+    // A slot from the shared pool, the same one faces and pictures come from.
+    // The banner marks itself on screen every pass a profile is open, so the
+    // allocator will not take it back underneath the reader.
+    if (g_banner_image_id == 0) {
+        g_banner_image_id = acquireImageId(fx) orelse return;
+    }
+    if (loadCachedImage(fx, g_banner_image_id, bannerUrl(), banner_target_px)) |_| {
         g_banner_state = .loaded;
         return;
     }
     g_banner_state = .fetching;
     g_banner_asked_for = pubkey;
-    fx.fetch(.{
-        .key = banner_fetch_key,
-        .url = bannerUrl(),
-        .on_response = Effects.responseMsg(.banner_fetched),
-    });
+    g_banner_down.release();
+    fetchSlice(fx, banner_fetch_key, bannerUrl(), 0, Effects.responseMsg(.banner_fetched));
 }
+
+/// A banner too big for one response body. The widest of the three, drawn at
+/// 660x132, so the least likely of them to arrive in one piece.
+var g_banner_down: Download = .{};
 
 /// Deliberately not 4000: that is `link_fetch_key_base + 0`, and the runtime
 /// rejects a second fetch under a key already in flight, so a banner and the
@@ -13937,12 +19249,30 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     const asked_for = g_banner_asked_for orelse return;
     const showing = g_banner_for orelse return;
     if (!std.mem.eql(u8, &asked_for, &showing)) {
+        g_banner_down.release();
         g_banner_state = .idle;
         return;
     }
     // Every effect slot was busy: ask again next tick.
     if (response.outcome == .rejected) {
+        g_banner_down.release();
         g_banner_state = .idle;
+        return;
+    }
+    // A slice of a banner bigger than one body.
+    if (response.outcome == .ok and response.status == 206 and !response.truncated and response.body.len > 0) {
+        const outcome = g_banner_down.append(response.body) orelse {
+            g_banner_down.release();
+            g_banner_state = .failed;
+            return;
+        };
+        if (outcome == .want_more) {
+            fetchSlice(fx, banner_fetch_key, bannerUrl(), g_banner_down.len, Effects.responseMsg(.banner_fetched));
+            return;
+        }
+        const whole = g_banner_down.bytes() orelse response.body;
+        finishBanner(fx, whole);
+        g_banner_down.release();
         return;
     }
     // Anything but a clean, whole, OK image body leaves the flat band, which is
@@ -13950,12 +19280,19 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.outcome != .ok or response.status != 200 or response.truncated or
         response.body.len == 0 or response.body.len > max_image_bytes)
     {
+        g_banner_down.release();
         g_banner_state = .failed;
         return;
     }
-    if (decodeAndRegister(fx, banner_image_id, response.body, banner_target_px)) |_| {
+    g_banner_down.release();
+    finishBanner(fx, response.body);
+}
+
+/// Decodes a complete banner into the slot it holds.
+fn finishBanner(fx: *Effects, bytes: []const u8) void {
+    if (decodeAndRegister(fx, g_banner_image_id, bytes, banner_target_px)) |_| {
         g_banner_state = .loaded;
-        storeCachedImage(bannerUrl(), response.body);
+        storeCachedImage(bannerUrl(), bytes);
     } else {
         g_banner_state = .failed;
     }
@@ -14148,7 +19485,8 @@ fn readRecord(gpa: std.mem.Allocator, pubkey: [32]u8, kind: u16) ?OwnProfile {
     defer result.deinit();
     if (result.events.len == 0) return null;
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -14494,8 +19832,8 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 if (about.len > 0) vgap(ui, 9) else ui.spacer(0),
                 if (about.len > 0)
                     ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = p.text_body_soft } },
-                        &.{.{ .text = about, .scale = nested_body_scale }},
+                        .{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_body_soft } },
+                        &.{.{ .text = about }},
                     )
                 else
                     ui.spacer(0),
@@ -14530,7 +19868,17 @@ fn profileActions(ui: *AppUi, model: *const Model, pubkey: [32]u8, is_me: bool) 
         return ui.paragraph(.{ .style = .{ .foreground = p.text_faint } }, &.{.{ .text = "This is you", .scale = meta_scale }});
     }
     const following = isFollowedByMe(pubkey);
+    const muted = isMuted(pubkey);
     return ui.row(.{ .cross = .center, .gap = 8 }, .{
+        // Muting is quieter than following, in the layout as well as in what it
+        // does: a ghost button beside the primary one, and it says the state it
+        // is in rather than the verb it performs when that state is unusual.
+        if (muteBlockedReason() != null)
+            ui.button(.{ .size = .sm, .variant = .ghost, .disabled = true, .on_press = Msg{ .mute_person = 1 } }, "Mute")
+        else if (muted)
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .mute_person = 2 } }, "Muted")
+        else
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .mute_person = 1 } }, "Mute"),
         // Disabled rather than absent while the app is still reading the
         // reader's own list: a control that vanishes is a control they will
         // wonder about, and one that silently no-ops is worse. The sentence
@@ -14627,7 +19975,12 @@ fn profileTabFocused(ui: *AppUi, label: []const u8, active: bool, msg: Msg, focu
         hgap(ui, 11),
         ui.paragraph(
             .{ .style = .{ .foreground = if (active) p.text_primary else p.text_muted_alt } },
-            &.{.{ .text = label, .weight = if (active) .medium else .regular, .scale = menu_scale }},
+            // One weight for both. The active tab already has its own fill,
+            // border and text colour, and changing the weight as well moved the
+            // glyph metrics, so the two labels sat on different baselines inside
+            // boxes that were centred correctly. The tabs looked misaligned and
+            // the row was never the problem.
+            &.{.{ .text = label, .scale = menu_scale }},
         ),
         hgap(ui, 11),
     });
@@ -14843,12 +20196,21 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // The window is the rail plus the content. The old titlebar of buttons is
     // gone: home, compose, settings, and the account seat live on the rail, so
     // the feed owns the full width below the OS titlebar.
+    const second_rail = g_rail_open;
     return ui.row(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
         railView(ui, model),
         // A 1px vertical rule between the rail and the content. No `grow`: in a
         // row that would stretch it along the WIDTH and eat the feed's space; it
         // fills the height on its own via the row's cross-axis stretch.
         ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+        // The second rail, and its own rule. Contents are a pure function of
+        // which primary section is selected, so there is nothing to consult here
+        // beyond that: Home has no second rail, Places is a list of yours.
+        if (second_rail) placesRail(ui) else ui.spacer(0),
+        if (second_rail)
+            ui.separator(.{ .width = 1, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } })
+        else
+            ui.spacer(0),
         // The bar sits BESIDE the rail and BELOW everything else, which is the
         // only place it is always visible. It used to be the last row of the
         // feed's own column, so every level layered over the feed (a thread, a
@@ -14933,7 +20295,12 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
-        scopeHeader(ui, model),
+        // ONE header, not two. A place stacked its own banner on top of the
+        // scope line, so the top of the room was the place's name over the
+        // place's feed name over a rule, in two different rhythms. In a place
+        // the place header IS the scope line, and it keeps the same 11/9 insets
+        // so nothing jumps on the way in or out.
+        if (activePlace()) |m| placeHeader(ui, m) else scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
                 ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
@@ -14947,13 +20314,22 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The 56px navigation rail: Home (the mark) up top, then the compose verb, the
+/// The 56px primary rail: the destinations up top, then the compose verb, the
 /// Settings gear, and the "you" seat pinned to the bottom. This replaces the old
 /// titlebar of buttons: destinations on the edge, the feed owns the width. A
-/// guest's gated tiles (compose, settings, you) route to the join sheet. Search
-/// is not shown until the feature exists.
+/// guest's gated tiles (compose, settings, you) route to the join sheet.
+///
+/// Three of the five destinations the design names. Search and Messages are not
+/// built and are therefore not here: a rail item that goes nowhere is worse than
+/// one fewer, which is the same rule that keeps Groups off until NIP-29 ships.
+///
+/// Our split is inverted from the strongest prior art and that is a choice.
+/// Flotilla and Discord put the COMMUNITIES on the primary rail with three or
+/// four fixed destinations pinned under them; we put destinations primary and
+/// places secondary, which is Slack's shape. The deciding factor is how many
+/// top-level things the app ends up with: Discord has essentially one, so
+/// servers earn the outer rail, and Plaza is heading for five or six.
 fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
     const guest = model.is_guest();
     const compose_press: Msg = if (guest) .open_join else .open_compose;
     const settings_press: Msg = if (guest) .open_join else .open_settings;
@@ -14961,33 +20337,222 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
     // one uniform padding cannot state. The 10 on each side is exactly what
     // centring a 36px tile in the 56px rail leaves, so it stays as padding.
     return ui.column(.{ .width = 56, .cross = .center, .gap = 0, .padding = 10, .style_tokens = .{ .background = .background } }, .{
-        // Home: the mark on a raised plate, and the way back to the feed from
-        // wherever the reader has got to. It looked like the app's own button
-        // for a long time and did nothing when pressed, which is the one thing
-        // a mark in that position should never be.
-        ui.row(.{
-            .on_press = Msg.go_home,
-            .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "Home", .focusable = true },
-        }, .{
-            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", ui.appIcon(.{ .width = 21, .height = 21, .style = .{ .foreground = p.text_primary } }, "mark")),
-        }),
+        // Home: the mark, and the way back to your own feed from wherever the
+        // reader has got to, INCLUDING out of a place. It looked like the app's
+        // own button for a long time and did nothing when pressed, which is the
+        // one thing a mark in that position should never be.
+        railDest(ui, "mark", 21, Msg.go_home, "Home", g_place == null),
+        vgap(ui, rail_gap),
+        // The bell, with what is waiting on it. Signed out there is no inbox to
+        // have, so there is no bell: a tile that could only ever say zero is a
+        // tile that says nothing.
+        //
+        // It takes no selected plate, and that is not an oversight: it opens a
+        // SHEET over whatever is underneath rather than being a section of its
+        // own, so a plate would claim a selection the app does not have.
+        if (guest) ui.spacer(0) else railBell(ui),
+        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
+        // Places: the switcher rail, out or folded away. Shown even with an
+        // empty list, because the rail's empty state is how somebody learns
+        // what a place is and that a link opens one, which in v1 is the only
+        // way in. The plate says you are IN a place, which is the fact worth
+        // showing; whether the rail happens to be out is visible on its own.
+        railDest(ui, "places", 17, Msg.toggle_places_rail, "Places", g_place != null),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
         railTile(ui, "edit", 15, compose_press, "New note", true),
         vgap(ui, rail_gap),
-        // The bell, with what is waiting on it. Signed out there is no inbox to
-        // have, so there is no bell: a tile that could only ever say zero is a
-        // tile that says nothing.
-        if (guest) ui.spacer(0) else railBell(ui),
-        if (guest) ui.spacer(0) else vgap(ui, rail_gap),
         // Settings.
         railTile(ui, "settings", 16, settings_press, "Settings", false),
         vgap(ui, rail_gap),
         // The account seat: a dashed "you" as a guest, the account once signed in.
         railYou(ui, guest),
         vgap(ui, 2),
+    });
+}
+
+/// A primary-rail destination: the same 36px tile as a verb, plus the one thing
+/// a destination has that a verb does not, which is being where you are.
+///
+/// The plate says where you are, and the two that have one are exclusive by
+/// construction: Home is plated out of a place, the pin is plated in one, and
+/// there is no third state. Discord's left-edge indicator bar reads better but
+/// has nowhere to live here: the 56px rail is a 36px tile between two 10px
+/// insets, and a bar inside the tile's own box paints on top of the plate
+/// instead of beside it.
+fn railDest(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label: []const u8, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const tint = if (selected) p.text_primary else p.text_muted;
+    const glyph = ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon);
+    return ui.row(.{
+        .on_press = press,
+        .style = .{ .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = label, .focusable = true },
+    }, .{
+        if (selected)
+            tilePlate(ui, .{ .background = p.surface_rail_tile, .border = p.border_hairline, .radius = 9, .stroke_width = 1 }, "", glyph)
+        else
+            ui.column(.{ .width = 36, .height = 36, .main = .center, .cross = .center }, .{glyph}),
+    });
+}
+
+/// The width of the second rail. Every point of it is added to the window's
+/// floor in `app.zon`, because a floor cannot be conditional and the narrowest
+/// window has to hold the widest arrangement.
+const places_rail_width: f32 = 180;
+/// Everything to the left of the reading area when both rails are out: the two
+/// rails and the 1pt rule after each. The window's default size is stated in
+/// terms of this, so a rail that changes width takes the window with it.
+pub const rails_width: f32 = 56 + 1 + places_rail_width + 1;
+const place_row_height: f32 = 34;
+const place_tile_size: f32 = 24;
+const places_rail_inset: f32 = 12;
+/// What is left for a name once the inset, the tile and the gap are spent. A
+/// DEFINITE width, so a long one ellipsizes instead of pushing the rail wide.
+const place_name_width: f32 = places_rail_width - places_rail_inset * 2 - place_tile_size - 8;
+
+/// The second rail: the places you have entered, and the one you are visiting.
+///
+/// Contents are a pure function of which primary section is selected, which is
+/// why this takes nothing but the arena: Places is the only section with a
+/// second rail, so being drawn at all is the whole of the condition.
+///
+/// It does not scroll and needs no overflow rule. Flotilla computes an item
+/// limit from the window height and moves the rest into a popover, which is the
+/// right answer at its scale; eight places at 34 points fit inside the 680pt
+/// window floor with room to spare, and a rule for a case that cannot happen is
+/// a rule nobody can check.
+fn placesRail(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const visiting = visitingPlace();
+    const rows = ui.arena.alloc(AppUi.Node, g_places_len) catch {
+        ui.failed = true;
+        return ui.column(.{ .width = places_rail_width }, .{});
+    };
+    for (rows, 0..) |*row, i| {
+        const open = if (activePlaceIndex()) |c| c == i else false;
+        row.* = placeRow(ui, &g_places[i], Msg{ .place_open = @intCast(i) }, open);
+    }
+    return ui.column(.{ .width = places_rail_width, .gap = 0, .style = .{ .background = p.surface_subbar } }, .{
+        vgap(ui, 14),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Places", .weight = .bold, .scale = scope_title_scale }},
+            ),
+        }),
+        vgap(ui, 10),
+        // The visit sits above the list and outside it, because that is exactly
+        // what a visit is: you are in this place, and it is not one of yours.
+        if (visiting != null) railSectionLabel(ui, "Visiting") else ui.spacer(0),
+        if (visiting) |m| placeRow(
+            ui,
+            m,
+            // Nothing to press while you are already in it.
+            if (g_place != null and !g_place_kept) null else Msg.place_resume,
+            g_place != null and !g_place_kept,
+        ) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) vgap(ui, 10) else ui.spacer(0),
+        if (visiting != null and g_places_len > 0) railSectionLabel(ui, "Entered") else ui.spacer(0),
+        ui.column(.{ .gap = 0 }, .{rows}),
+        if (g_places_len == 0 and visiting == null) placesRailEmpty(ui) else ui.spacer(0),
+        ui.spacer(1),
+    });
+}
+
+/// A small quiet label over a group of rail rows.
+fn railSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, places_rail_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = text, .monospace = true, .scale = mono_meta_scale }},
+            ),
+        }),
+        vgap(ui, 4),
+    });
+}
+
+/// One place on the second rail: a letter tile and a name.
+///
+/// A LETTER tile, not the host's picture, and that is a budget decision rather
+/// than a taste one. The canvas registers sixteen images at a time, and a rail
+/// of eight would spend half of them on chrome that is always on screen, taken
+/// from the faces in the feed. `image_src` (a source-crop rect) would let one
+/// 512x512 slot hold sixty-four tiles at 64x64; it exists on the internal widget
+/// and is not exposed on the app-facing options, which is filed upstream as
+/// vercel-labs/native#387. Until that lands, letters.
+fn placeRow(ui: *AppUi, m: *const Place, press: ?Msg, selected: bool) AppUi.Node {
+    const p = theme.palette;
+    const name = if (m.name_len > 0) m.name() else "A place";
+    // The first BYTE, uppercased when it is a lowercase ASCII letter. A name
+    // starting with a multi-byte character would be cut mid-codepoint by a
+    // one-byte slice, so anything that is not printable ASCII falls back to a
+    // dot rather than to half a character.
+    const head = name[0];
+    const initial: []const u8 = if (head >= 'a' and head <= 'z')
+        ui.fmt("{c}", .{head - 32})
+    else if (head > 0x20 and head < 0x7f)
+        ui.fmt("{c}", .{head})
+    else
+        "\u{2022}";
+    return ui.el(.data_row, .{
+        .width = places_rail_width,
+        .height = place_row_height,
+        .cross = .center,
+        .padding = 0,
+        .on_press = press,
+        .style = if (selected)
+            .{ .background = p.surface_menu_selected }
+        else
+            .{ .quiet_hover = true },
+        .semantics = .{
+            .role = if (press == null) .none else .button,
+            .label = if (press == null) name else ui.fmt("Open {s}", .{name}),
+            .focusable = press != null,
+        },
+    }, .{
+        ui.row(.{ .cross = .center, .gap = 0, .height = place_row_height }, .{
+            hgap(ui, places_rail_inset),
+            ui.el(.panel, .{
+                .width = place_tile_size,
+                .height = place_tile_size,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_link_tile, .radius = 6, .stroke_width = 0 },
+            }, .{
+                ui.column(.{ .width = place_tile_size, .height = place_tile_size, .main = .center, .cross = .center }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = p.text_muted } },
+                        &.{.{ .text = initial, .monospace = true, .weight = .medium, .scale = mono_meta_scale }},
+                    ),
+                }),
+            }),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .width = place_name_width, .style = .{ .foreground = if (selected) p.text_primary else p.text_muted } },
+                &.{.{ .text = name, .scale = meta_scale }},
+            ),
+        }),
+    });
+}
+
+/// What the rail says before there is anything in it.
+///
+/// It names the one way in that v1 has. A link is the only door, so a rail that
+/// simply looked empty would be the feature failing to explain itself on the
+/// only screen where it could.
+fn placesRailEmpty(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .start, .gap = 0 }, .{
+        hgap(ui, places_rail_inset),
+        ui.paragraph(
+            .{ .wrap = true, .width = places_rail_width - places_rail_inset * 2, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "No places yet. A plaza:// link opens one, and entering it keeps it here. Only you can see this list.", .scale = mono_hint_scale }},
+        ),
     });
 }
 
@@ -15258,6 +20823,183 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The feed's scope line: which feed this is (the starter pack) and how wide it
 /// reaches. A property of the feed, not a destination to choose between.
+/// The header of the place you are in: who it belongs to, what they wrote, and
+/// the way out.
+///
+/// While VISITING it also carries the one affordance that matters, and it is a
+/// quiet line rather than a wall: entering keeps the place, and nothing else in
+/// the app is gated on it. You can already read here and post here.
+///
+/// It says entering is private on the spot rather than in settings, because a
+/// list of the communities somebody belongs to is sensitive and they should
+/// learn that where the decision is, not afterwards.
+/// How much of a stranger's naming fits on the room's one header line.
+///
+/// The line is the name, the connection state, the feed's name, About and the
+/// verb, all inside the 620pt column with 16pt insets. The app's own strings
+/// and the two buttons are the budget; the two names arrive from a place a
+/// stranger published, at 64 and 48 bytes, and both of them at full length
+/// overflowed the window by 240pt at its floor.
+///
+/// These came down when Info joined the row: the overflow sweep measures the
+/// worst case (longest name, longest feed name, "cannot reach this place",
+/// Info and Enter together) and it was 20pt over at the floor.
+///
+/// Named for the LINE, not for the place: `place_name_cap` and
+/// `place_feed_name_cap` are what the buffers hold (64 and 48), and these are
+/// what one header line can show of them.
+const header_name_cap = 20;
+const header_feed_cap = 14;
+
+/// The width of the Info card. Wide enough for a paragraph of somebody's
+/// markdown without becoming a page.
+const place_info_card_width: f32 = 440;
+
+/// What a place is, who hosts it, where it reads from, and the way out.
+///
+/// Everything the old inline banner said, in a card nobody has to scroll past.
+/// Leave lives here rather than in the header for two reasons: it is the one
+/// destructive verb in a place and it was sitting a few pixels from Enter, and
+/// a reader who is about to leave is exactly the reader who should be looking
+/// at what this place is.
+fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
+    const p = theme.palette;
+    const leaving = g_place_info == .leaving;
+    var npub_buf: [96]u8 = undefined;
+    const host = abbreviateNpub(&npub_buf, m.author);
+    const relay = if (m.feeds_len > 0) m.feeds[0].relay() else "";
+    return modalScrim(ui, "About this place", .close_place_info, ui.el(.dialog, .{
+        .width = place_info_card_width,
+        .on_dismiss = .close_place_info,
+        .semantics = .{ .label = "About this place" },
+    }, .{
+        modalCard(ui, place_info_card_width, ui.column(.{ .grow = 1, .gap = 0, .padding = 20 }, .{
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = join_title_scale }},
+            ),
+            vgap(ui, 10),
+            placeInfoRow(ui, "Host", ui.fmt("@{s}", .{host})),
+            if (relay.len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (relay.len > 0) placeInfoRow(ui, "Reads", relay) else ui.spacer(0),
+            // The host's own words, in the one place that is theirs to fill.
+            if (m.home_len > 0) vgap(ui, 12) else ui.spacer(0),
+            if (m.home_len > 0) ui.separator(.{ .style = .{ .foreground = p.divider_card, .background = p.divider_card } }) else ui.spacer(0),
+            if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
+            if (m.home_len > 0) ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
+                canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
+            }) else ui.spacer(0),
+            vgap(ui, 14),
+            // Asking, then the answer. The warning is the whole footer while it
+            // is up: a confirmation sharing a row with other controls is a
+            // confirmation nobody reads.
+            if (leaving) ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "Leave this place? It comes off your rail and the notes it was holding are forgotten. The link still works, so you can walk back in.", .scale = join_sub_scale }},
+            ) else ui.spacer(0),
+            if (leaving) vgap(ui, 12) else ui.spacer(0),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.place_leave_cancel }, "Cancel")
+                else
+                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.close_place_info }, "Close"),
+                ui.spacer(1),
+                // Nothing to leave while visiting: a visit is not kept, so there
+                // is no list to come off. Home closes the room either way.
+                if (!g_place_kept)
+                    ui.spacer(0)
+                else if (leaving)
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave }, "Leave")
+                else
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg.place_leave_request }, "Leave"),
+            }),
+        })),
+    }));
+}
+
+/// One labelled fact about a place: a quiet name, then the value in mono.
+fn placeInfoRow(ui: *AppUi, label: []const u8, value: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.paragraph(
+            .{ .width = 54, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = label, .scale = mono_meta_scale }},
+        ),
+        ui.paragraph(
+            .{ .width = place_info_card_width - 40 - 54, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = value, .monospace = true, .scale = mono_meta_scale }},
+        ),
+    });
+}
+
+/// The header of a room, which is the scope line while you are in one.
+///
+/// The place's name is the title, the feed it is reading is the meta on the
+/// right where the follow feed puts its count of voices, and the verb is one
+/// button. The host's own text and the note about privacy are shown only while
+/// VISITING: they are the pitch, and a pitch that stays on screen after the
+/// answer is a banner in the way of the thing it was selling.
+fn placeHeader(ui: *AppUi, m: *const Place) AppUi.Node {
+    const p = theme.palette;
+    const visiting = !g_place_kept;
+    const feed_name = if (m.feeds_len > 0 and m.feeds[0].name_len > 0) m.feeds[0].name() else "";
+    return ui.row(.{ .main = .center }, .{ui.column(.{ .width = feed_column_width, .gap = 0 }, .{
+        vgap(ui, 11),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = elide(ui, if (m.name_len > 0) m.name() else "A place", header_name_cap), .weight = .bold, .scale = scope_title_scale }},
+            ),
+            hgap(ui, 8),
+            // What THIS place's socket is doing, which the status bar cannot
+            // say: it counts the pool, and this relay is deliberately not in
+            // it. Silent once connected, because a working connection is not
+            // news.
+            switch (placeLink()) {
+                .connecting => ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint } },
+                    &.{.{ .text = "connecting", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                .unreachable_relay => ui.paragraph(
+                    .{ .style = .{ .foreground = p.status_warning } },
+                    &.{.{ .text = "cannot reach this place", .monospace = true, .scale = mono_meta_scale }},
+                ),
+                else => ui.spacer(0),
+            },
+            ui.spacer(1),
+            if (feed_name.len > 0) ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint_alt } },
+                &.{.{ .text = elide(ui, feed_name, header_feed_cap), .monospace = true, .scale = mono_meta_scale }},
+            ) else ui.spacer(0),
+            if (feed_name.len > 0) hgap(ui, 10) else ui.spacer(0),
+            // One control, whatever state you are in: what this place is, who
+            // hosts it, where it reads from, and the way out. Leave used to sit
+            // right here, a few pixels from Enter, and one press did it.
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.open_place_info }, "Info"),
+            // Entering is the only verb the header keeps, because it is the one
+            // the reader came for and it should cost one press.
+            if (visiting) hgap(ui, 4) else ui.spacer(0),
+            if (visiting)
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.place_enter }, "Enter")
+            else
+                ui.spacer(0),
+            hgap(ui, chrome_inset),
+        }),
+        if (visiting) vgap(ui, 6) else ui.spacer(0),
+        if (visiting) ui.row(.{ .cross = .start, .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
+                &.{.{ .text = "Just visiting. Entering keeps this place on your rail, and nobody else can see which places you have entered.", .scale = mono_hint_scale }},
+            ),
+            hgap(ui, chrome_inset),
+        }) else ui.spacer(0),
+        vgap(ui, 9),
+        ui.separator(.{ .width = feed_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    })});
+}
+
 fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // The scope name and the pack's size, on one line with the redesign's 11/16/9
@@ -15342,9 +21084,21 @@ fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
 }
 
 /// A scope name as it reads mid-sentence.
+///
+/// Only the app's OWN two names are lowered. It used to return "starter pack"
+/// for anything that was not "Following", which was safe while those were the
+/// only two scopes there were, and became a plain lie the moment a place could
+/// be one: the status bar said "caught up, starter pack" under a header naming
+/// somebody else's room. A place's feed name is a stranger's proper noun and is
+/// left exactly as they wrote it.
 fn lowerScope(scope: []const u8) []const u8 {
     if (std.mem.eql(u8, scope, "Following")) return "following";
-    return "starter pack";
+    if (std.mem.eql(u8, scope, "Starter pack")) return "starter pack";
+    return scope;
+}
+
+pub fn lowerScopeForTest(scope: []const u8) []const u8 {
+    return lowerScope(scope);
 }
 
 /// What a note offers beyond its verbs: where it is, what it says, and what to
@@ -15571,13 +21325,16 @@ fn relayRow(ui: *AppUi, url: []const u8, index: usize, badge: []const u8, model:
     // A relay leaves at its next message, so during a pause some rows are still
     // genuinely connected. Each row reports ITSELF: claiming the whole list is
     // paused while notes are still arriving on it is the dishonesty this is for.
-    const connected = state == .connected;
+    // Holding a socket, whichever way. The row still reads as a working relay
+    // (its round trip is real, its badge means something), and only the dot and
+    // the word say that the last evidence of life is a minute old.
+    const connected = connHolds(state);
     const paused = model.relays_paused and !connected;
     const dot = if (paused)
         p.text_faint_alt
-    else if (connected)
+    else if (state == .connected)
         p.status_success
-    else if (state == .connecting)
+    else if (state == .connecting or state == .quiet)
         p.status_warning
     else
         p.status_offline;
@@ -15602,6 +21359,8 @@ fn relayRow(ui: *AppUi, url: []const u8, index: usize, badge: []const u8, model:
             &.{.{
                 .text = if (paused)
                     "paused"
+                else if (state == .quiet)
+                    "quiet"
                 else if (connected)
                     (if (relayRttMs(index)) |ms| ui.fmt("{d}ms", .{ms}) else "…")
                 else if (state == .connecting)
@@ -16292,16 +22051,16 @@ fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: b
         // A plain pressable row, never a `.list_item`: that kind carries a 28px
         // intrinsic height floor and its padding walks the cluster off the rail
         // the disc, name and body share.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts) c.replies else 0, p.text_metric, .{
+        if (isTakenAway(.replies)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts and !countHidden(.replies, .reply_counts)) c.replies else 0, p.text_metric, .{
             .on_press = Msg{ .open_thread = note.id },
             .style = .{ .quiet_hover = true },
             .semantics = .{ .role = .button, .label = "Reply" },
         })),
-        verbSlot(ui, verbWithCount(ui, ui.icon(glyph, "repeat"), if (counts) c.reposts else 0, p.text_metric, .{})),
-        verbSlot(ui, likeAction(ui, note, counts)),
+        if (isTakenAway(.reposts)) ui.spacer(0) else verbSlot(ui, repostAction(ui, note, c, counts)),
+        if (isTakenAway(.reactions)) ui.spacer(0) else verbSlot(ui, likeAction(ui, note, counts)),
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
-        verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts) c.zap_msat / 1000 else 0, p.text_metric, .{})),
+        if (isTakenAway(.zaps)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !countHidden(.zaps, .zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
         verbSlot(ui, ui.appIcon(quiet, "bookmark")),
         // The one unfinished-looking glyph that is not unfinished: it opens the
         // note's menu, the same one the thread's header has always had, with the
@@ -16390,10 +22149,27 @@ fn likeAction(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     const liked = my_reaction != null;
     const count = likeCountFor(note.id, my_reaction);
     const tint = if (liked) theme.palette.status_like else theme.palette.text_metric;
-    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), if (counts) count else 0, tint, .{
+    // Hidden means the NUMBER goes, not the verb. You can still like a note
+    // with the count taken away; what you lose is being told how many others
+    // did, which is the part the preference is about.
+    const shown = if (counts and !countHidden(.reactions, .reaction_counts)) count else 0;
+    return verbWithCount(ui, ui.appIcon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "like"), shown, tint, .{
         .style = .{ .quiet_hover = true },
         .on_press = Msg{ .like = note.id },
         .semantics = .{ .role = .button, .label = if (liked) "Unlike" else "Like", .focusable = true },
+    });
+}
+
+/// The repost verb: pressable, and tinted once it is ours.
+///
+/// The tint is the same success green a repost notification uses, so the one
+/// colour means the same thing in both places.
+fn repostAction(ui: *AppUi, note: *const Note, c: Counts, counts: bool) AppUi.Node {
+    const tint = if (c.reposted_by_me) theme.palette.status_success else theme.palette.text_metric;
+    return verbWithCount(ui, ui.icon(.{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = tint } }, "repeat"), if (counts and !countHidden(.reposts, .repost_counts)) c.reposts else 0, tint, .{
+        .style = .{ .quiet_hover = true },
+        .on_press = Msg{ .repost = note.id },
+        .semantics = .{ .role = .button, .label = if (c.reposted_by_me) "Reposted" else "Repost", .focusable = true },
     });
 }
 
@@ -16502,6 +22278,30 @@ fn textPara(ui: *AppUi, spans: []const canvas.TextSpan) AppUi.Node {
 /// The same paragraph at a stated register and ink: the thread's focal note reads
 /// one step up from a feed row, and a shade brighter.
 fn textParaAt(ui: *AppUi, spans: []const canvas.TextSpan, scale: f32, ink: canvas.Color) AppUi.Node {
+    // A paragraph one step DOWN is asked for by its SIZE, never by scaling
+    // every span in it, and the difference is a point of vertical position.
+    //
+    // The line box and the baseline come from `size * max(1, largest span
+    // scale)`. That floor of 1 is the whole problem: a paragraph whose spans
+    // are all scaled DOWN is still boxed and baselined as though it were full
+    // size, so the nested register drew 13.5pt text on a 14.5pt baseline inside
+    // an 18.125pt box instead of a 13.5pt baseline in a 16.875pt one. A point
+    // lower than the text around it, with a point and a quarter of extra air
+    // above, which is what a reply's context line looked like next to the note
+    // it belongs to.
+    //
+    // `.sm` is `body_size - 1`, which is exactly the 13.5 the ratio was
+    // approximating, and the spans then sit at scale 1 of a genuinely smaller
+    // paragraph. Scaling UP is unaffected and stays a scale: the floor only
+    // bites below 1.
+    if (scale == nested_body_scale) {
+        return ui.paragraph(.{
+            .size = .sm,
+            .wrap = true,
+            .on_link = AppUi.linkMsg(.open_url),
+            .style = .{ .foreground = ink },
+        }, spans);
+    }
     const sized = if (scale == 1) spans else blk: {
         const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch break :blk spans;
         for (spans, out) |src, *dst| {
@@ -16537,25 +22337,25 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
     const has_card = q.kind == .event and card_end <= cut;
 
     // Fast path unchanged: a plain note with no fold is exactly one paragraph.
-    if (!has_card and !long) return textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
+    if (!has_card and !long) return textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
 
     var kids: [5]AppUi.Node = undefined;
     var n: usize = 0;
     if (has_card) {
         const head = std.mem.trim(u8, full[0..q.off], " \t\r\n");
         if (head.len > 0) {
-            kids[n] = textParaAt(ui, contentSpans(ui, head), scale, ink);
+            kids[n] = textParaAt(ui, noteSpans(ui, note, head), scale, ink);
             n += 1;
         }
         kids[n] = quoteRule(ui, q.id);
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
         if (tail.len > 0) {
-            kids[n] = textParaAt(ui, contentSpans(ui, tail), scale, ink);
+            kids[n] = textParaAt(ui, noteSpans(ui, note, tail), scale, ink);
             n += 1;
         }
     } else {
-        kids[n] = textParaAt(ui, contentSpans(ui, full[0..cut]), scale, ink);
+        kids[n] = textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
         n += 1;
     }
     if (long) {
@@ -16567,6 +22367,122 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
         n += 1;
     }
     return ui.column(.{ .gap = 8 }, .{kids[0..n]});
+}
+
+/// The line above a reply saying what it answers.
+///
+/// A feed that mixes replies in with root notes shows half a conversation: an
+/// answer with no question reads as a non sequitur, and worse, as though the
+/// person said it unprompted. Every other client puts the missing half back,
+/// and this is that line.
+///
+/// Deliberately ONE line and no avatar. The picture would want a registry slot,
+/// and there are sixteen for the whole app; a screenful of replies would spend
+/// them all on thumbnails of notes the reader is not reading. The name and the
+/// opening words are what identify a conversation anyway.
+fn replyContext(ui: *AppUi, note: *const Note) AppUi.Node {
+    const e = quoteFor(note.reply_parent);
+    if (e == null) {
+        // The parent's cache slot was reclaimed (it is one LRU shared with
+        // quotes). Ask again so the next tick fills it, and say the neutral
+        // thing meanwhile rather than flickering a wrong name.
+        wantQuote(note.reply_parent);
+        return replyContextLine(ui, "reply to a note", "");
+    }
+    const q = e.?;
+    if (q.state == .idle or q.state == .fetching) return replyContextLine(ui, "reply to a note", "");
+    if (q.state == .missing) {
+        // The same sentence the thread's ancestor row uses for the same fact,
+        // because it IS the same fact.
+        return replyContextLine(ui, "reply to a note not on your relays yet", "");
+    }
+
+    const name = quoteAuthorName(ui, q.pubkey);
+    const label = std.fmt.allocPrint(ui.arena, "reply to {s}", .{name}) catch "reply to a note";
+    return replyContextLine(ui, label, q.text_buf[0..q.text_len]);
+}
+
+/// One muted line: who was answered, then the opening of what they said.
+///
+/// The snippet is a SEPARATE span so it can carry its own dimmer colour, which
+/// is what keeps the name readable when the two run together. Both elide rather
+/// than wrap: this is a pointer at a conversation, not a second note.
+fn replyContextLine(ui: *AppUi, label: []const u8, snippet: []const u8) AppUi.Node {
+    const p = theme.palette;
+    var spans: [2]canvas.TextSpan = undefined;
+    var n: usize = 0;
+    // The name carries the weight and the snippet does not, so the two read
+    // apart on one line without needing a second colour.
+    spans[n] = .{ .text = label, .weight = .medium };
+    n += 1;
+    if (snippet.len > 0) {
+        // One line's worth. The cache already clamps to `quote_text_cap`, and a
+        // paragraph that elides needs less than that or it never reaches the
+        // ellipsis before running out of box.
+        const cut = firstLineOf(snippet, reply_context_snippet_chars);
+        if (cut.len > 0) {
+            spans[n] = .{ .text = std.fmt.allocPrint(ui.arena, "  {s}", .{cut}) catch "", .scale = 0 };
+            n += 1;
+        }
+    }
+    // `.sm`, not spans scaled to 13.5/14.5, and the difference is a point of
+    // vertical position rather than a nicety.
+    //
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 is what matters: a paragraph whose spans are ALL
+    // scaled DOWN is still boxed and baselined as though it were full size, so
+    // this line drew its 13.5pt text on a 14.5pt baseline inside an 18.125pt box
+    // instead of a 13.5pt baseline in a 16.875pt one. A point lower than the
+    // text beside it, with a point and a quarter of extra air above.
+    //
+    // The size TOKEN says the same thing without the floor applying: `.sm` is
+    // `body_size - 1`, which is exactly the 13.5 the ratio was approximating,
+    // and the spans then sit at scale 1 of a genuinely smaller paragraph.
+    return ui.paragraph(
+        .{ .size = .sm, .width = picture_column_width, .style = .{ .foreground = p.text_muted } },
+        spans[0..n],
+    );
+}
+
+/// The opening of `text`, stopping at the first newline and at `max` bytes, on a
+/// UTF-8 boundary. A snippet cut mid-codepoint draws a replacement glyph, which
+/// is a worse thing to show than a shorter snippet.
+fn firstLineOf(text: []const u8, max: usize) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    var end = @min(trimmed.len, max);
+    if (std.mem.indexOfScalar(u8, trimmed[0..end], '\n')) |nl| end = nl;
+    // Back off to a character boundary by looking at the byte AT the cut, not
+    // the one before it. Stripping trailing continuation bytes is not enough:
+    // it leaves the lead byte they belonged to, which is a broken sequence of
+    // its own. If the first EXCLUDED byte is a continuation, the cut landed
+    // mid-character, so walk back until it is not.
+    if (end < trimmed.len) {
+        while (end > 0 and (trimmed[end] & 0xc0) == 0x80) end -= 1;
+    }
+    return std.mem.trimEnd(u8, trimmed[0..end], " \t\r");
+}
+
+pub fn firstLineOfForTest(text: []const u8, max: usize) []const u8 {
+    return firstLineOf(text, max);
+}
+
+/// Renders just the reply line and returns its concatenated text, so a test can
+/// read what a reader would see without standing up a whole feed.
+pub fn buildReplyContextForTest(arena: std.mem.Allocator, note: *const Note) ![]const u8 {
+    var ui = AppUi.init(arena);
+    const node = replyContext(&ui, note);
+    const tree = try ui.finalize(node);
+    var out: std.ArrayList(u8) = .empty;
+    try collectText(tree.root, arena, &out);
+    return out.items;
+}
+
+fn collectText(w: canvas.Widget, arena: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    if (w.text.len > 0) {
+        try out.appendSlice(arena, w.text);
+        try out.append(arena, ' ');
+    }
+    for (w.children) |c| try collectText(c, arena, out);
 }
 
 /// An embedded quote card for a quoted event `id`: a bordered inset showing the
@@ -16592,8 +22508,8 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // sentence the ancestor row above a thread has always used for the same
         // situation, which is the other reason to use it.
         return quoteAside(ui, null, ui.paragraph(
-            .{ .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = "Not on your relays yet", .scale = nested_body_scale }},
+            .{ .size = .sm, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = "Not on your relays yet" }},
         ));
     }
 
@@ -16649,7 +22565,7 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
 /// of filling the column beside the rule, it wrapped at about half the width the
 /// shot gives it and read as a column of its own rather than an aside.
 fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
-    const spans = clampSpansToLines(ui, contentSpans(ui, note.content()), quote_body_lines);
+    const spans = clampSpansToLines(ui, noteSpans(ui, note, note.content()), quote_body_lines);
     var node = textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
     node.widget.semantics.label = "Quoted note body";
     return node;
@@ -16865,12 +22781,31 @@ pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []con
     e.state = .loaded;
 }
 
+/// Puts a resolved parent in the cache, as an answered fetch would.
+pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
+    wantQuote(id);
+    const q = quoteFor(id) orelse return;
+    q.state = .loaded;
+    q.pubkey = pubkey;
+    const n = @min(text.len, q.text_buf.len);
+    @memcpy(q.text_buf[0..n], text[0..n]);
+    q.text_len = @intCast(n);
+}
+
 pub fn wantQuoteForTest(id: [32]u8) void {
     wantQuote(id);
 }
 
 /// The real fill path, over a real store: what a quote card knows about the
 /// note it draws comes from here and nowhere else.
+pub fn refreshProfilesForTest(store: *nostr.store.Store) void {
+    refreshProfiles(store);
+}
+pub fn quoteTextForTest(id: [32]u8) ?[]const u8 {
+    const q = quoteFor(id) orelse return null;
+    if (q.state != .loaded) return null;
+    return q.text_buf[0..q.text_len];
+}
 pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
     refreshQuotes(store);
 }
@@ -17010,7 +22945,9 @@ fn liveRelayCount() usize {
         // A dormant seat is not a live relay whatever its last status said.
         if (relayAt(i) == null) continue;
         const state: Conn = @enumFromInt(g_relay_status[i].load(.monotonic));
-        if (state == .connected) n += 1;
+        // Quiet counts. It holds a socket, its subscriptions are still open on
+        // the relay, and a note published now goes out on it.
+        if (connHolds(state)) n += 1;
     }
     return n;
 }
@@ -17084,12 +23021,17 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                             ),
                         }),
                         vgap(ui, 5),
+                        // What this answers, above the answer. Feed only: in a
+                        // thread the parent is the row directly above, so the
+                        // line would restate what is already on screen.
+                        if (note.has_reply_parent) replyContext(ui, note) else ui.spacer(0),
+                        if (note.has_reply_parent) vgap(ui, 4) else ui.spacer(0),
                         noteBody(ui, note, true),
                         // The picture. The space is reserved at the picture's own
                         // shape whether or not it has loaded, so the feed never
                         // shifts as images arrive.
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                        if (note.hasImage()) notePicture(ui, note) else ui.spacer(0),
+                        if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                         if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                         vgap(ui, 10),
                         engagementRow(ui, model, note),
@@ -17120,6 +23062,23 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
 /// copied. A paragraph holds at most 32 runs, so a link-heavy note keeps its
 /// tail as one plain run rather than losing it.
 pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
+    return contentSpansIn(ui, text, &.{}, 0);
+}
+
+/// Spans for a piece of a note's rendered content, with its mentions pressable.
+///
+/// `mentions` are the note's, whose offsets are relative to the whole of
+/// `content_buf`; `base` is where `text` starts inside it. The body splits
+/// around a quote card and trims what is left, so what reaches one paragraph is
+/// usually a piece rather than the whole.
+///
+/// A recorded mention is authoritative and is checked before anything else. That
+/// is not only about the link: the `@` heuristic below reads a mention as ending
+/// at the first space, so `@Sepehr Safari` was styled as far as `@Sepehr` and the
+/// surname fell out of the run. A recorded range knows exactly how long the label
+/// is because it is what wrote it.
+pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef, base: usize) []const canvas.TextSpan {
+    @setRuntimeSafety(true); // Splits a stranger's text into runs, and does it on every rebuild.
     const max_spans = 32;
     if (text.len == 0) return &.{};
     const spans = ui.arena.alloc(canvas.TextSpan, max_spans) catch return &.{};
@@ -17127,7 +23086,35 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
     var n: usize = 0;
     var i: usize = 0;
     var plain_start: usize = 0;
+    // Mentions are recorded as the content is walked, so the table is in offset
+    // order, and this walk is in offset order too: one cursor covers it. Scanning
+    // the whole table at every byte would multiply the per-byte work in this loop
+    // by the number of mentions, and this loop runs over every note on screen.
+    // A piece of the body can start part-way in, so the cursor skips what is
+    // behind it rather than assuming it starts at the first.
+    var next: usize = 0;
     while (i < text.len) {
+        while (next < mentions.len and mentions[next].off < base + i) next += 1;
+        // A label straddling the end of this piece is passed over rather than
+        // clipped: the fold cuts the text at a character count, so the last
+        // mention before it can be half-present, and half a name is not
+        // something to make pressable.
+        if (next < mentions.len and mentions[next].off == base + i and mentions[next].len <= text.len - i) {
+            const ref = &mentions[next];
+            if (n + 2 > max_spans) break;
+            if (i > plain_start) {
+                spans[n] = .{ .text = text[plain_start..i] };
+                n += 1;
+            }
+            // The same colour and weight the heuristic gives a mention, plus the
+            // payload that makes it go somewhere. The renderer underlines every
+            // span carrying a link, so this reads as pressable without asking.
+            spans[n] = .{ .text = text[i..][0..ref.len], .color = .info, .weight = .medium, .link = ref.link() };
+            n += 1;
+            i += ref.len;
+            plain_start = i;
+            continue;
+        }
         const is_url = std.mem.startsWith(u8, text[i..], "https://") or std.mem.startsWith(u8, text[i..], "http://");
         const is_mention = text[i] == '@' and i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1]);
         // A hashtag is `#` + word characters at a word boundary, so `C#` and a
@@ -17161,11 +23148,12 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
         // token (a span names a token field, not a Color). A @mention
         // additionally sits one weight up, the way a name does.
         //
-        // The redesign draws an in-text URL colored and NOTHING more, but the
-        // renderer underlines every span that carries a link payload
-        // (`span.underline or is_link`), so a clickable URL is always underlined.
-        // Clickability wins over the hairline: `underline` stays unset here to
-        // say what we asked for, and the extra rule is the renderer's.
+        // Colour and nothing else, which the renderer now honours. It used to
+        // underline every span carrying a link payload whatever `underline`
+        // said, so a paragraph with three URLs came out striped; leaving
+        // `underline` unset stated the intent and got a hairline anyway. SDK
+        // 0.9.2 made the flag mean what it says, so the intent and the pixels
+        // finally agree. Mentions are marked by weight and colour, not a rule.
         spans[n] = if (is_url)
             .{ .text = run, .color = .info, .link = run }
         else if (is_mention)
@@ -17181,6 +23169,17 @@ pub fn contentSpans(ui: *AppUi, text: []const u8) []const canvas.TextSpan {
         n += 1;
     }
     return spans[0..n];
+}
+
+/// Spans for a sub-slice of `note`'s content, with the note's mentions mapped
+/// onto it. `text` must be a piece of `note.content()`; anything else falls back
+/// to the plain reading, since the offsets would mean nothing.
+fn noteSpans(ui: *AppUi, note: *const Note, text: []const u8) []const canvas.TextSpan {
+    const whole = note.content();
+    const start = @intFromPtr(text.ptr);
+    const first = @intFromPtr(whole.ptr);
+    if (start < first or start + text.len > first + whole.len) return contentSpans(ui, text);
+    return contentSpansIn(ui, text, note.mentions.all(), start - first);
 }
 
 /// The height a note's picture occupies, whether or not it has loaded. Taken
@@ -17204,7 +23203,7 @@ pub fn pictureHeight(note: *const Note) f32 {
 /// when it was last decoded (remembered past its slot, so an evicted picture does
 /// not shrink and shift the feed), else a landscape guess.
 fn pictureAspect(note: *const Note) f32 {
-    if (note.image_aspect > 0) return note.image_aspect;
+    if (note.imageAt(0).aspect > 0) return note.imageAt(0).aspect;
     return recalledAspect(note.id) orelse picture_default_aspect;
 }
 
@@ -17244,6 +23243,76 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // the native convention, where the hand marks a link and ordinary controls
     // keep the arrow, so this is the one role that advertises "clickable".
     return pictureBox(ui, note, height, picture);
+}
+
+/// Gap between gallery cells, and the height a multi-picture row draws at.
+///
+/// One height for every cell, because a row of pictures at their own aspects is
+/// a ragged edge, and the point of a gallery is that it reads as one object.
+/// Each picture is drawn `cover` inside its cell, which is the crop every other
+/// client uses here: `contain` would letterbox portrait shots into slivers.
+const gallery_gap: f32 = 4;
+const gallery_height: f32 = 190;
+
+/// A note's pictures. One fills the column at its own shape, as it always has;
+/// several become a row of equal cells.
+fn noteGallery(ui: *AppUi, note: *const Note) AppUi.Node {
+    const count = note.imageCount();
+    if (count <= 1) return notePicture(ui, note);
+
+    // Previews off: one chip for the whole set rather than one per picture,
+    // because the reader is deciding about the note, not about picture three.
+    if (!g_media_previews and !isMediaAsked(note.id)) return pictureAskChip(ui, note);
+
+    const cells = @min(count, max_note_images);
+    const width = (picture_column_width - gallery_gap * @as(f32, @floatFromInt(cells - 1))) / @as(f32, @floatFromInt(cells));
+
+    var kids: [max_note_images * 2 - 1]AppUi.Node = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < cells) : (i += 1) {
+        if (i > 0) {
+            kids[n] = hgap(ui, gallery_gap);
+            n += 1;
+        }
+        kids[n] = galleryCell(ui, note, i, width);
+        n += 1;
+    }
+    return ui.row(.{ .gap = 0, .cross = .start }, .{kids[0..n]});
+}
+
+/// One cell of a gallery: the picture once it has a slot, its blurhash while it
+/// does not, and a plain box when it will not come.
+///
+/// The blurhash matters more here than for a single picture. There are sixteen
+/// registration slots in the whole app and a gallery wants several at once, so
+/// the later cells of a busy screen routinely have none. A blurhash is drawn as
+/// flat colour cells rather than a registered image, so it costs nothing and the
+/// row still reads as photographs.
+fn galleryCell(ui: *AppUi, note: *const Note, index: usize, width: f32) AppUi.Node {
+    const p = theme.palette;
+    const image_id = note.mediaIdAt(index);
+    const failed = image_id == 0 and mediaFailed(mediaKey(note.id, index));
+
+    const inner: AppUi.Node = if (image_id != 0) blk: {
+        var picture = ui.image(.{ .image = image_id, .grow = 1 });
+        // `cover`, not `contain`: every cell is the same height, so a portrait
+        // shot letterboxed into one would be a sliver in a band of background.
+        picture.widget.image_fit = .cover;
+        break :blk picture;
+    } else if (failed)
+        ui.el(.panel, .{ .grow = 1, .style = .{ .background = p.surface_inset } }, .{})
+    else
+        blurGrid(ui, note.imageAt(index).blurhash(), gallery_height);
+
+    return ui.el(.list_item, .{
+        .width = width,
+        .height = gallery_height,
+        .padding = 0,
+        .on_press = Msg{ .expand_image_at = .{ .note = note.id, .index = @intCast(index) } },
+        .style = .{ .radius = 10, .background = p.surface_inset, .quiet_hover = true },
+        .semantics = .{ .role = .link, .label = "Attached image, press to enlarge", .focusable = true },
+    }, .{inner});
 }
 
 /// A quoted note on its way: the SHAPE of the card that will replace it.
@@ -17331,8 +23400,14 @@ fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) A
 /// and may be missing, in which case the chip does not invent one.
 fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
-    const label = if (note.image_bytes > 0)
-        ui.fmt("image · {s} · load", .{byteSize(ui.arena, note.image_bytes)})
+    const bytes = note.imageAt(0).bytes;
+    const many = note.imageCount() > 1;
+    const label = if (many and bytes > 0)
+        ui.fmt("{d} images · from {s} · load", .{ note.imageCount(), byteSize(ui.arena, bytes) })
+    else if (many)
+        ui.fmt("{d} images · load", .{note.imageCount()})
+    else if (bytes > 0)
+        ui.fmt("image · {s} · load", .{byteSize(ui.arena, bytes)})
     else
         "image · load";
     return ui.row(.{ .gap = 0 }, .{
@@ -17381,6 +23456,7 @@ fn base83(c: u8) ?f32 {
 }
 
 fn base83Value(hash: []const u8, from: usize, len: usize) ?f32 {
+    @setRuntimeSafety(true); // Slices the hash at offsets its own header implied.
     if (from + len > hash.len) return null;
     var value: f32 = 0;
     for (hash[from .. from + len]) |c| {
@@ -17405,6 +23481,7 @@ fn linearToSrgb(v: f32) f32 {
 /// reference decoder runs per pixel, at the resolution the eye gets from a
 /// placeholder anyway.
 pub fn decodeBlurhash(hash: []const u8) Blur {
+    @setRuntimeSafety(true); // Component counts decoded out of the hash index a fixed array.
     var out: Blur = .{};
     if (hash.len < 6) return out;
     const size_flag = base83Value(hash, 0, 1) orelse return out;
@@ -17474,7 +23551,12 @@ fn signPow(value: f32, exp: f32) f32 {
 /// What a picture that has not arrived looks like: its own colours when the note
 /// carries a blurhash, stripes when it does not.
 fn pictureBlur(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
-    const hash = note.imageBlurhash();
+    return blurGrid(ui, note.imageBlurhash(), height);
+}
+
+/// The same, for a picture that is not the note's first: a gallery cell knows
+/// its own hash and has no business asking the note for it.
+fn blurGrid(ui: *AppUi, hash: []const u8, height: f32) AppUi.Node {
     if (hash.len == 0) return pictureStripes(ui, height);
     const blur = decodeBlurhash(hash);
     if (!blur.ok) return pictureStripes(ui, height);
@@ -17714,7 +23796,17 @@ const PlazaApp = native_sdk.UiApp(Model, Msg);
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "new-note")) return .open_compose;
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    // The same message the rail's own tile sends, so the key and the tile
+    // cannot drift into two behaviours.
+    if (std.mem.eql(u8, name, "places-rail")) return .toggle_places_rail;
+    if (std.mem.eql(u8, name, "place-bounce")) return .place_bounce;
+    if (std.mem.eql(u8, name, "place-prev")) return Msg{ .place_step = -1 };
+    if (std.mem.eql(u8, name, "place-next")) return Msg{ .place_step = 1 };
     return null;
+}
+
+pub fn onCommandForTest(name: []const u8) ?Msg {
+    return onCommand(name);
 }
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
@@ -17722,7 +23814,776 @@ pub const EffectsForTest = Effects;
 
 /// Boot: seed the feed once, register whatever images are already cached, then
 /// arm the repeating timers.
+/// Receiving a `plaza://` link. See `src/urlscheme.m`: the SDK registers the
+/// scheme but hands the app nothing, so Plaza installs its own Apple Event
+/// handler. macOS-only; elsewhere these are stubs and a link does nothing,
+/// which is honest because no other platform routes one here either.
+/// Not in test builds: the suite does not link AppKit (nothing in it receives
+/// an Apple Event, and linking it would make the tests need a window server),
+/// so referencing the symbols there would fail to link.
+const has_url_scheme = builtin.os.tag == .macos and !builtin.is_test;
+extern fn plaza_url_scheme_install() void;
+extern fn plaza_url_scheme_take(out: [*]u8, cap: usize) usize;
+
+/// The link macOS handed us since the last tick, if any.
+fn takePendingLink(buf: []u8) ?[]const u8 {
+    if (!has_url_scheme) return null;
+    const n = plaza_url_scheme_take(buf.ptr, buf.len);
+    if (n == 0) return null;
+    return buf[0..n];
+}
+
+/// What a `plaza://` link asks for.
+///
+/// One shape in v1: `plaza://place/<naddr>`, which applies somebody's published
+/// place. The path segment is there so a later version can add others without
+/// the first form becoming ambiguous.
+///
+/// Untrusted: a link can come from a note, a DM, or anywhere else. It names
+/// what to fetch and never carries the place itself, so the worst a hostile link
+/// can do is point Plaza at an event that is not a place, which the parser
+/// refuses, or one that is, which is then shown before it applies.
+pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
+    const prefix = "plaza://place/";
+    if (!std.mem.startsWith(u8, link, prefix)) return null;
+    var rest = link[prefix.len..];
+    // A query or fragment is ordinary link decoration (a tracker, an anchor)
+    // and is cut off.
+    if (std.mem.indexOfAny(u8, rest, "?#")) |cut| rest = rest[0..cut];
+    if (rest.len == 0 or rest.len > 1024) return null;
+    if (!std.mem.startsWith(u8, rest, "naddr1")) return null;
+    // bech32 is lowercase alphanumeric. Checked here so nothing downstream has
+    // to wonder what a stranger put in the path, and it is also what refuses an
+    // extra path segment: `plaza://place/<naddr>` has exactly one, and a `/`
+    // is not a bech32 character. I wrote a separate check for that first and no
+    // probe could fail it, because this one already covered it.
+    for (rest) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
+        if (!ok) return null;
+    }
+    return rest;
+}
+
+/// The place you are in right now. Null is your own Plaza.
+///
+/// Three states, and only two of them are stored. VISITING is this being set
+/// while `g_place_kept` is false: you followed a link, you are in the place,
+/// you can read it and post to it, and closing the app forgets it. ENTERED is
+/// the same thing with the place also in the list below, which is the only
+/// thing entering does. LEFT is out of the list; the link still works.
+///
+/// Nothing is gated on entering. Whether a post lands is between the reader and
+/// the place's relays: if they refuse the write, that is theirs to say, not a
+/// wall this app invents.
+var g_place: ?Place = null;
+var g_place_kept: bool = false;
+
+/// What the place's relay has told us about, newest first.
+///
+/// A ROOM, per the decision: while you are in a place you see IT, not your own
+/// feed with a header on top. Nothing in the store records which relay an event
+/// arrived on, so the connection keeps its own list of ids and the rebuild reads
+/// exactly those. That also makes leaving instant: drop the list.
+const place_feed_cap = 200;
+var g_place_ids: [place_feed_cap][32]u8 = undefined;
+var g_place_ids_len: usize = 0;
+var g_place_ids_lock = std.atomic.Value(bool).init(false);
+/// Bumped by the relay thread so the UI knows there is something new to read,
+/// the same shape the arrival buffer uses.
+var g_place_rev = std.atomic.Value(u32).init(0);
+/// Which place the live connection belongs to, so a thread whose place has been
+/// left stops writing into the list the next one is filling.
+var g_place_gen = std.atomic.Value(u32).init(0);
+
+fn lockPlaceIds() void {
+    while (g_place_ids_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockPlaceIds() void {
+    g_place_ids_lock.store(false, .release);
+}
+
+/// Seeds the place's list from what was remembered last time.
+///
+/// The rest of this app is local-first and a place was not: entering one showed
+/// "Connecting to the relay pool" and nothing else until a stranger's relay
+/// answered, which on a slow one is a long time to look at an empty room. The
+/// notes are already in the store from last visit; the only thing missing was
+/// knowing WHICH of them belong to this place, since nothing records the relay
+/// an event arrived on. So the ids are remembered with the place.
+fn seedPlaceFeed(ids: []const [32]u8) void {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = @min(ids.len, g_place_ids.len);
+    @memcpy(g_place_ids[0..g_place_ids_len], ids[0..g_place_ids_len]);
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+/// A snapshot of the current place's ids, for writing down.
+fn placeIdsSnapshot(out: [][32]u8) usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    const n = @min(g_place_ids_len, out.len);
+    @memcpy(out[0..n], g_place_ids[0..n]);
+    return n;
+}
+
+/// What the place's own socket is doing.
+///
+/// Its own state, because the status bar counts the POOL and a place's relay is
+/// deliberately not in it. So a place that is slow, or refusing, or simply not
+/// there looked exactly like a connected one while the bar cheerfully reported
+/// 5/5 relays. That is the reader being told the wrong thing about the only
+/// connection they are actually waiting on.
+pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay };
+var g_place_link = std.atomic.Value(u8).init(@intFromEnum(PlaceLink.idle));
+
+pub fn placeLink() PlaceLink {
+    return @enumFromInt(g_place_link.load(.monotonic));
+}
+fn setPlaceLink(state: PlaceLink) void {
+    g_place_link.store(@intFromEnum(state), .monotonic);
+}
+
+fn clearPlaceFeed() void {
+    _ = g_place_gen.fetchAdd(1, .monotonic);
+    setPlaceLink(.idle);
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    g_place_ids_len = 0;
+    _ = g_place_rev.fetchAdd(1, .monotonic);
+}
+
+pub fn placeFeedCount() usize {
+    lockPlaceIds();
+    defer unlockPlaceIds();
+    return g_place_ids_len;
+}
+
+/// Opens the place's relay and keeps reading it.
+///
+/// Its own socket, outside the eight. Entering a place must never cost the
+/// reader one of their own relays, and this connection never publishes and is
+/// never written into their kind:10002, which is the same discipline the
+/// indexer set and the discovered pool already follow.
+fn startPlaceFeed(m: *const Place) void {
+    clearPlaceFeed();
+    // What was here last time, on screen before anything is dialled, and BEFORE
+    // the check below: the ids are already known whether or not there is a
+    // relay to go and ask. Seeding after that early return meant a place whose
+    // feed could not be dialled showed nothing, having remembered everything.
+    if (m.seen_len > 0) seedPlaceFeed(m.seen[0..m.seen_len]);
+    if (m.feeds_len == 0) return;
+    const gen = g_place_gen.load(.monotonic);
+    var url_buf: [place_relay_cap]u8 = undefined;
+    const len = copyBounded(&url_buf, m.feeds[0].relay());
+    const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, gen }) catch return;
+    t.detach();
+}
+
+fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, gen: u32) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    setPlaceLink(.connecting);
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch {
+        // Only if this thread still owns the place. A dial that fails after the
+        // reader has already walked out must not paint the next room's header.
+        if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+        return;
+    };
+    defer relay.deinit();
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.connected);
+
+    const kinds = [_]u16{1};
+    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .limit = place_feed_cap }};
+    relay.subscribe("plaza-place", &filters) catch return;
+
+    while (g_place_gen.load(.monotonic) == gen) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                // The reader left, or moved: this thread's list is not the one
+                // being shown any more, so it stops rather than writing into it.
+                if (g_place_gen.load(.monotonic) != gen) break;
+                wantProfile(e.event.pubkey);
+                lockPlaceIds();
+                defer unlockPlaceIds();
+                if (g_place_ids_len < g_place_ids.len) {
+                    g_place_ids[g_place_ids_len] = e.event.id;
+                    g_place_ids_len += 1;
+                    _ = g_place_rev.fetchAdd(1, .monotonic);
+                }
+            },
+            // NOT closed at EOSE: a place is somewhere you sit, so the socket
+            // stays open and new notes arrive while the reader is looking.
+            else => {},
+        }
+    }
+    // The loop only ends when the socket died or the reader left. The first is
+    // worth saying out loud; the second already reset this.
+    if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+}
+
+/// Whether the places rail is out. One boolean, persisted, and that is the
+/// whole of the second rail's state.
+///
+/// The design called for a SECTION here, one of Home / Search / Notifications /
+/// Messages / Places, with the second rail's contents a pure function of it.
+/// Driving the built version is what argued against it: with only Places
+/// carrying a second rail, making Home a section that has none meant pressing
+/// Home hid the list of places, so coming back from your own feed to a room
+/// cost two presses. That is the opposite of switching between them with ease,
+/// which is the whole point of the rail.
+///
+/// So the Places icon is a toggle for the switcher, exactly as it was asked
+/// for, and Home is a content destination that leaves the rail alone. The
+/// section comes back when a second one actually needs a second rail (Messages
+/// and its conversations, most likely), and it can be designed then against two
+/// real cases instead of one imagined one.
+///
+/// Off by default: a reader with no places should never be given a column that
+/// only says it is empty. Entering a place turns it on, and it stays on.
+var g_rail_open: bool = false;
+
+/// What the place's Info card is doing.
+///
+/// A card and not a banner. The host's own text used to sit inline above the
+/// feed on every visit, which is a wall of somebody else's markdown in front of
+/// the thing it is selling. So the whole of what a place says about itself
+/// lives behind one control, and the first-visit presentation is its own
+/// design problem rather than "the banner, again".
+///
+/// Leave lives in here too. It is the one destructive verb in a place, it was
+/// sitting in the header a few pixels from Enter, and one press did it. Now it
+/// takes two, and the second one is behind a card that says what leaving does.
+pub const PlaceInfo = enum(u8) { closed, open, leaving };
+var g_place_info: PlaceInfo = .closed;
+
+pub fn placeInfo() PlaceInfo {
+    return g_place_info;
+}
+pub fn setPlaceInfoForTest(state: PlaceInfo) void {
+    g_place_info = state;
+}
+
+pub fn railOpen() bool {
+    return g_rail_open;
+}
+
+/// The Places icon, and `Cmd+Option+S`.
+fn togglePlacesRail() void {
+    g_rail_open = !g_rail_open;
+    saveSettings();
+}
+
+/// Navigation reveals the switcher: entering a place, walking the list, or
+/// bouncing back into a room all put the rail where the eye is going to look.
+/// Opening one FROM the rail does not go through this, so folding it and then
+/// pressing a seat cannot make it spring back open.
+fn showPlacesRail() void {
+    g_rail_open = true;
+}
+
+pub fn togglePlacesRailForTest() void {
+    togglePlacesRail();
+}
+pub fn setRailForTest(open: bool) void {
+    g_rail_open = open;
+}
+
+/// Everything about where the leaving account had been.
+///
+/// Which communities somebody belongs to is sensitive, which is the whole
+/// reason this list is a file on their own disk rather than an event on a
+/// relay. That is also what made it outlive a logout: a relay-backed list goes
+/// when the key does, and a file does not go until something deletes it. So the
+/// next account to sign in on this Mac inherited the last one's rail, fully
+/// populated, opened straight into whichever place they had been reading, with
+/// the notes each one had been holding.
+///
+/// The file AND the memory AND the pointer in settings, because all three
+/// outlive the account in different ways: the file across launches, the memory
+/// across this session, and `place=` would send the next launch back into a
+/// room that is no longer in any list.
+fn forgetPlaces() void {
+    // Stops the place's socket first: its worker writes into the id list, and
+    // the generation bump is what tells it to stop.
+    clearPlaceFeed();
+    g_place = null;
+    g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
+    g_places = @splat(.{});
+    g_places_len = 0;
+    g_place_info = .closed;
+    g_rail_open = false;
+    g_boot_place_set = false;
+    if (g_io) |io| if (g_environ) |environ| {
+        if (plazaDir(io, environ)) |dir_const| {
+            var dir = dir_const;
+            defer dir.close(io);
+            dir.deleteFile(io, places_file) catch {};
+        } else |_| {}
+    };
+    saveSettings();
+    // The feed was the place's a moment ago and is the next reader's now.
+    invalidateFeed();
+}
+
+pub fn forgetPlacesForTest() void {
+    forgetPlaces();
+}
+
+/// The places kept across restarts. Small on purpose for v1.
+const max_places = 8;
+var g_places: [max_places]Place = @splat(.{});
+var g_places_len: usize = 0;
+/// What we are fetching, while we fetch it.
+var g_place_want: ?struct {
+    pubkey: [32]u8,
+    ident_buf: [64]u8,
+    ident_len: u8,
+    /// Ticks the fetch has been outstanding, so it can give up and say so.
+    waited: u16 = 0,
+} = null;
+
+/// Drives the REAL entry path. It spawns a worker that dials and fails without
+/// a relay, which is harmless: the seeding this asserts happens before it.
+pub fn startPlaceFeedForTest(i: usize) void {
+    startPlaceFeed(&g_places[i]);
+}
+pub fn savePlacesForTest() void {
+    savePlaces();
+}
+
+pub fn setPlaceLinkForTest(state: PlaceLink) void {
+    setPlaceLink(state);
+}
+
+/// Arrives in a place that has a named feed, which is the ordinary case.
+pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []const u8, feed: []const u8) void {
+    visitPlaceForTest(author, ident, name);
+    if (g_place) |*m| {
+        m.feeds[0].name_len = @intCast(copyBounded(&m.feeds[0].name_buf, feed));
+        m.feeds[0].relay_len = @intCast(copyBounded(&m.feeds[0].relay_buf, "wss://example.test"));
+        m.feeds_len = 1;
+    }
+}
+
+pub fn flushPlaceIdsForTest(now_s: i64) void {
+    flushPlaceIds(now_s);
+}
+pub fn setPlaceHomeForTest(text: []const u8) void {
+    if (g_place) |*m| m.home_len = @intCast(copyBounded(&m.home_buf, text));
+}
+pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
+    g_places[i].seen_len = n;
+}
+
+pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
+    seedPlaceFeed(ids);
+}
+pub fn clearPlaceFeedForTest() void {
+    clearPlaceFeed();
+}
+pub fn rememberPlaceIdsForTest() void {
+    rememberPlaceIds();
+}
+pub fn keptPlaceSeenLenForTest(i: usize) u16 {
+    return g_places[i].seen_len;
+}
+pub fn seedFromKeptPlaceForTest(i: usize) void {
+    seedPlaceFeed(g_places[i].seen[0..g_places[i].seen_len]);
+}
+
+pub fn resetPlacesForTest() void {
+    // The feed ids too, or one test's room leaks into the next one's.
+    clearPlaceFeed();
+    g_rail_open = false;
+    g_place_info = .closed;
+    g_place_flushed_at = 0;
+    g_place_flushed_rev = 0;
+    g_place = null;
+    g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
+    g_places = @splat(.{});
+    g_places_len = 0;
+}
+
+/// Arrives in a place the way a link does: in it, kept only if it already was.
+pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
+    var m = Place{};
+    m.author = author;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    m.name_len = @intCast(copyBounded(&m.name_buf, name));
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+}
+
+pub fn clearActivePlaceForTest() void {
+    g_place = null;
+    g_place_kept = false;
+}
+
+pub fn activePlace() ?*const Place {
+    return if (g_place) |*m| m else null;
+}
+pub fn placeIsKept() bool {
+    return g_place_kept;
+}
+pub fn keptPlaceCount() usize {
+    return g_places_len;
+}
+
+/// Whether a place with this author and identifier is already in the list.
+fn placeIndexOf(author: [32]u8, ident: []const u8) ?usize {
+    for (g_places[0..g_places_len], 0..) |*p, i| {
+        if (std.mem.eql(u8, &p.author, &author) and std.mem.eql(u8, p.ident(), ident)) return i;
+    }
+    return null;
+}
+
+/// Which entry of the list is open, when the open place is one of them. Null
+/// while visiting, because a visit is deliberately not in the list.
+fn activePlaceIndex() ?usize {
+    const m = g_place orelse return null;
+    return placeIndexOf(m.author, m.ident());
+}
+
+/// The last place opened from the rail, so `Cmd+Option+Right` has somewhere to
+/// bounce back to. An index rather than an address because it is a convenience:
+/// leaving a place shifts the ones after it, and the read below clamps, so the
+/// worst a stale value does is bounce into a neighbour.
+var g_place_last: usize = 0;
+
+/// Opens a place already in the list.
+///
+/// The room being left is written down FIRST. Switching places is precisely
+/// when its ids stop being reachable: `rememberPlaceIds` reads the live list,
+/// and the next `startPlaceFeed` clears it.
+fn openKeptPlace(i: usize) void {
+    if (i >= g_places_len) return;
+    g_place_info = .closed;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place_last = i;
+    g_place = g_places[i];
+    g_place_kept = true;
+    startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen.
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// The place being visited, held for this session only.
+///
+/// A visit is transient by design, and Home closing the room turned that into a
+/// trap: peek at your own feed for a second and the room is gone, with nothing
+/// on the rail to get back to it because a visit is deliberately not in the
+/// list. This is the seat it keeps until the app quits, which is exactly as
+/// long as a visit was ever promised to last.
+var g_visited: ?Place = null;
+
+/// What the rail's "Visiting" row stands for: the place open right now if it is
+/// a visit, otherwise the last one visited this session.
+fn visitingPlace() ?*const Place {
+    if (g_place) |*m| {
+        if (!g_place_kept) return m;
+    }
+    return if (g_visited) |*m| m else null;
+}
+
+/// Back into the visit that Home closed.
+fn resumeVisit() void {
+    if (g_visited == null) return;
+    if (g_place != null and g_place_kept) savePlaces();
+    g_place = g_visited;
+    g_place_kept = false;
+    showPlacesRail();
+    startPlaceFeed(&g_place.?);
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// Back to your own feed, without leaving the place.
+///
+/// Home and Leave were the same button for as long as there was no rail, and
+/// they are not the same verb: this closes the room, and the place stays in the
+/// list with its ids intact, one press away.
+fn goToOwnPlaza() void {
+    if (g_place == null) return;
+    g_place_info = .closed;
+    if (g_place_kept) savePlaces() else g_visited = g_place;
+    g_place = null;
+    g_place_kept = false;
+    clearPlaceFeed();
+    g_feed_rebuild_all.store(true, .release);
+    saveSettings();
+}
+
+/// `Cmd+Option+Right`: out of the room, and back into the one you were in.
+///
+/// This one earns a key more here than it does in the clients it is borrowed
+/// from. A place is a ROOM, so being in one hides your own feed entirely, and
+/// the way out has to be as cheap as the way in.
+fn bouncePlace() void {
+    if (g_place != null) {
+        goToOwnPlaza();
+        return;
+    }
+    if (g_places_len == 0) return;
+    showPlacesRail();
+    openKeptPlace(@min(g_place_last, g_places_len - 1));
+}
+
+/// `Cmd+Option+Up` / `Down`: the place before or after the open one, wrapping.
+///
+/// Discord and Slack both spend this pair on walking the community list, which
+/// is what our places are even though they sit on the second rail rather than
+/// the first. Matching the muscle memory is worth more than matching the rail.
+fn stepPlace(delta: i8) void {
+    if (g_places_len == 0) return;
+    const n: isize = @intCast(g_places_len);
+    const next: usize = if (activePlaceIndex()) |c|
+        @intCast(@mod(@as(isize, @intCast(c)) + delta, n))
+    else if (delta > 0) 0 else g_places_len - 1;
+    showPlacesRail();
+    openKeptPlace(next);
+}
+
+pub fn openKeptPlaceForTest(i: usize) void {
+    openKeptPlace(i);
+}
+pub fn goToOwnPlazaForTest() void {
+    goToOwnPlaza();
+}
+pub fn bouncePlaceForTest() void {
+    bouncePlace();
+}
+pub fn stepPlaceForTest(delta: i8) void {
+    stepPlace(delta);
+}
+pub fn activePlaceIndexForTest() ?usize {
+    return activePlaceIndex();
+}
+
+/// The place that was open when the app last quit.
+///
+/// Reopening used to land in the most recently ENTERED place no matter what,
+/// because entering was the only way to be in one. With a rail there is a way
+/// out that is not leaving, so "the last one entered" and "the one I was
+/// looking at" came apart, and restoring the wrong one reads as the app
+/// ignoring you.
+var g_boot_place_author: [32]u8 = @splat(0);
+var g_boot_place_ident_buf: [64]u8 = @splat(0);
+var g_boot_place_ident_len: u8 = 0;
+var g_boot_place_set: bool = false;
+
+/// `<64 hex>:<d>`, or empty for your own Plaza. Written by author and `d`
+/// rather than by position, so leaving a place cannot silently reopen whichever
+/// one slid into its index.
+pub fn activePlaceLine(buf: []u8) []const u8 {
+    const m = g_place orelse return "";
+    if (!g_place_kept) return "";
+    const hex = std.fmt.bytesToHex(m.author, .lower);
+    return std.fmt.bufPrint(buf, "{s}:{s}", .{ &hex, m.ident() }) catch "";
+}
+
+pub fn applyActivePlaceLine(value: []const u8) void {
+    g_boot_place_set = false;
+    if (value.len < 65 or value[64] != ':') return;
+    _ = std.fmt.hexToBytes(&g_boot_place_author, value[0..64]) catch return;
+    g_boot_place_ident_len = @intCast(copyBounded(&g_boot_place_ident_buf, value[65..]));
+    g_boot_place_set = true;
+}
+
+/// Land back where you were: the place that was open at quit, or your own
+/// Plaza if that is what was open.
+///
+/// Its own function so a test can drive the decision boot makes rather than a
+/// helper beside it. Restoring the most recently ENTERED place unconditionally
+/// was right while entering was the only way to be in one, and became wrong the
+/// moment Home stopped meaning "leave"; a probe that put that line back left
+/// the suite green, because nothing exercised this.
+fn restoreOpenPlace() void {
+    const i = bootPlaceIndex() orelse return;
+    openKeptPlace(i);
+}
+
+pub fn restoreOpenPlaceForTest() void {
+    restoreOpenPlace();
+}
+
+/// Where boot should land, when what was open is still in the list.
+fn bootPlaceIndex() ?usize {
+    if (!g_boot_place_set) return null;
+    return placeIndexOf(g_boot_place_author, g_boot_place_ident_buf[0..g_boot_place_ident_len]);
+}
+
+pub fn bootPlaceIndexForTest() ?usize {
+    return bootPlaceIndex();
+}
+pub fn applyActivePlaceLineForTest(value: []const u8) void {
+    applyActivePlaceLine(value);
+}
+pub fn visitingPlaceForTest() ?*const Place {
+    return visitingPlace();
+}
+pub fn resumeVisitForTest() void {
+    resumeVisit();
+}
+
+fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
+    _ = model;
+    const naddr = parsePlazaLink(link) orelse return;
+    const gpa = std.heap.page_allocator;
+    var ptr = nostr.nip19.decodeNaddr(gpa, naddr) catch return;
+    defer ptr.deinit(gpa);
+    // Only ever a place. The link says `place`, so an address pointing at some
+    // other kind is a link that lies, not a kind to go and fetch.
+    if (ptr.kind != place_kind) return;
+
+    var want: @TypeOf(g_place_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
+    g_place_want = want;
+    askPlace(fx, ptr.relays);
+}
+
+/// Asks for a place event: the pool, plus the relays the address itself named.
+///
+/// The hints matter more here than anywhere else in the app. A place is
+/// published by whoever runs a community, on that community's relay, and the
+/// reader has by definition not joined it yet: that is the thing the link is
+/// for. Asking only the reader's own relays would fail for exactly the case
+/// this feature exists to serve.
+fn askPlace(fx: *Effects, hints: []const []const u8) void {
+    _ = fx;
+    const want = g_place_want orelse return;
+    const ident = want.ident_buf[0..want.ident_len];
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{ident};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{
+        .authors = &authors,
+        .kinds = &kinds,
+        .tags = &tags,
+        .limit = 1,
+    }};
+    _ = askPool(one_shot_sub_prefix ++ "place", &filters);
+
+    // And the hinted relays, which the pool does not hold. One throwaway socket
+    // each, bounded, the same shape every other one-shot in this app uses.
+    var n: usize = 0;
+    for (hints) |h| {
+        if (n >= 3) break;
+        if (!isSafeRelayUrl(h)) continue;
+        var url_buf: [place_relay_cap]u8 = undefined;
+        const len = copyBounded(&url_buf, h);
+        const t = std.Thread.spawn(.{}, askPlaceAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
+        t.detach();
+        n += 1;
+    }
+}
+
+fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
+
+    const authors = [_][32]u8{pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{ident_buf[0..ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }};
+    relay.subscribe(one_shot_sub_prefix ++ "place", &filters) catch return;
+    while (true) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .eose => break,
+            else => {},
+        }
+    }
+}
+
+/// Looks for the place being waited on, once the store has grown. Called from
+/// the tick, which is where every other "did it arrive yet" check in this app
+/// lives.
+fn refreshPlaceFetch() void {
+    const want = g_place_want orelse return;
+    if (g_place != null) return;
+    const store = g_store orelse return;
+    const gpa = std.heap.page_allocator;
+
+    const authors = [_][32]u8{want.pubkey};
+    const kinds = [_]u16{place_kind};
+    const values = [_][]const u8{want.ident_buf[0..want.ident_len]};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return;
+    defer result.deinit();
+
+    if (result.events.len == 0) {
+        // Give up eventually rather than spinning on a store read forever. A
+        // place nobody can find is a fact worth showing, not a spinner.
+        g_place_want.?.waited +|= 1;
+        if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
+        return;
+    }
+    var m = parsePlace(gpa, result.events[0].content) orelse {
+        // It exists and is not a place. Stop asking.
+        g_place_want = null;
+        return;
+    };
+    m.author = want.pubkey;
+    m.ident_len = want.ident_len;
+    m.ident_buf = want.ident_buf;
+    // Straight in, visiting. No sheet: the destination of following a link is
+    // the place, not a question about it.
+    g_place = m;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+    g_place_want = null;
+    startPlaceFeed(&g_place.?);
+    // The feed is about to mean something entirely different, and the
+    // incremental path cannot express that: it merges arrivals into the list
+    // already on screen. Without this the reader enters a place and keeps
+    // looking at their own follows, which is exactly what was reported.
+    g_feed_rebuild_all.store(true, .release);
+}
+
+/// How many ticks a place fetch may go unanswered. The tick is a second, and a
+/// relay that has not answered in fifteen is one that does not have it.
+const place_fetch_ticks = 15;
+
 pub fn boot(model: *Model, fx: *Effects) void {
+    // FIRST, before anything slow. On a cold launch macOS sends the Apple Event
+    // moments after the app starts, so a handler installed after the store is
+    // opened misses the very link that launched Plaza.
+    if (has_url_scheme) plaza_url_scheme_install();
+    if (g_io) |io| {
+        if (g_environ) |environ| {
+            loadPlaces(io, environ);
+            restoreOpenPlace();
+        }
+    }
     model.refresh(nowSeconds());
     // What was written but not sent when the app last closed, back in the
     // composer where it was left.
@@ -17738,6 +24599,8 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // are registered here, so a returning user gets faces WITH the notes rather
     // than a tick later. Only what is on disk resolves now; the rest is fetched
     // from the first tick onward.
+    wantProfilesAhead(model);
+    beginImagePass();
     assignAvatarSlots(fx, model);
     scanAvatarFetches(fx);
     scanMediaFetches(fx, model);
@@ -17773,16 +24636,45 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome == .fired) {
                 const now = nowSeconds();
+                // A `plaza://` link somebody clicked, drained once per tick.
+                // Polling rather than an effect because the Apple Event lands
+                // on the main thread outside the SDK's event loop entirely,
+                // so there is nothing to subscribe to.
+                var link_buf: [2048]u8 = undefined;
+                if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+                refreshPlaceFetch();
+                flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
                 // relative times stay fresh, the same cadence as the feed.
-                model.refreshThreadNotes(now);
-                // And the open person's notes, for the same reason and with the
-                // same consequence if it is missed: without this the backfill
-                // this screen fires never appears, and the quiet line saying
-                // they have written nothing stays up over a store that has
-                // since filled with their notes.
-                model.refreshProfileNotes(now);
+                //
+                // Only when the store actually moved, which is the guard the
+                // feed rebuild ten lines up has always had and these two never
+                // did. Unconditional, they were a full `store.query`, a
+                // `collectThreadIds` closure walk that queries again per level,
+                // and a re-parse of every reply into a fresh `Note` — once a
+                // second, on the render thread, for as long as a thread or a
+                // profile stayed open, almost always to produce exactly the
+                // list that was already on screen.
+                //
+                // The open paths call these directly, so a thread still fills
+                // the moment it is opened; this only skips the repeat.
+                const level_count = if (g_store) |st| (st.eventCount() catch g_last_level_count) else g_last_level_count;
+                if (level_count != g_last_level_count) {
+                    g_last_level_count = level_count;
+                    model.refreshThreadNotes(now);
+                    // And the open person's notes, for the same reason and with
+                    // the same consequence if it is missed: without this the
+                    // backfill this screen fires never appears, and the quiet
+                    // line saying they have written nothing stays up over a
+                    // store that has since filled with their notes.
+                    model.refreshProfileNotes(now);
+                }
+                // Relative times were a side effect of the rebuild, so they have
+                // to be kept up now that the rebuild is conditional. "2m" going
+                // stale is exactly the sort of thing a guard like this breaks
+                // quietly.
+                for (model.thread_notes[0..model.thread_notes_len]) |*note| note.setTime(now);
                 if (model.viewing_profile != null) {
                     model.thread_loading = model.thread_notes_len == 0 and
                         g_thread_done_seq.load(.acquire) < model.thread_seq;
@@ -17855,6 +24747,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
                 // Start any pending image fetches (needs effects, so here, not
                 // in refresh). The feed reads loaded images at render time.
+                wantProfilesAhead(model);
+                beginImagePass();
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanBannerFetch(fx, model);
@@ -17862,6 +24756,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
+                // What the signer is doing as a bunker, while the screen showing
+                // it is open. A connect request waits two minutes for an answer,
+                // so this is what puts it in front of somebody in time.
+                pollBunker(fx, model, nowMillis() orelse 0);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
                 drivePendingIntent(model, fx);
@@ -17887,14 +24785,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .profiles => |t| {
             if (t.outcome == .fired) {
-                // Re-arm the still-unnamed every so often: a relay that had
-                // nothing a moment ago may have it now.
+                // Quotes still re-arm on a round counter. Profiles no longer
+                // need to: each pubkey carries its own last-tried stamp and
+                // backs off on its own, so asking every tick costs nothing for
+                // the ones that are waiting and retries the rest when due.
                 g_profile_round +%= 1;
                 g_quote_round +%= 1;
-                if (g_profile_round % profile_rearm_rounds == 0) {
-                    rearmWantedProfiles();
-                    rearmWantedQuotes();
-                }
+                if (g_quote_round % quote_rearm_rounds == 0) rearmWantedQuotes();
                 requestWantedProfiles();
                 requestWantedQuotes();
             }
@@ -17915,7 +24812,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .media_warmed => |response| handleMediaWarmed(response),
         .banner_fetched => |response| handleBannerFetched(fx, response),
         .draft_edit => |edit| {
+            // What this edit meant to add, before it is clamped. Only an insert
+            // can overflow; every other edit is rejected whole.
+            const wanted: usize = switch (edit) {
+                .insert_text => |t| t.len,
+                else => 0,
+            };
+            const before = model.draft_buffer.len;
             model.draft_buffer.apply(edit);
+            // The buffer's own words for this flag are "loud seam for paste:
+            // check after applying a clipboard insert", and nothing here ever
+            // did. A paste past the cap lost the overflow in silence: the
+            // counter read "0 left", which says the composer is exactly full,
+            // not that a third of what you just pasted is gone.
+            if (model.draft_buffer.truncated and wanted > 0) {
+                model.draft_dropped = wanted -| (model.draft_buffer.len -| before);
+            } else if (wanted > 0) {
+                // A later paste that DID fit answers the earlier warning.
+                model.draft_dropped = 0;
+            }
             // A new query is a new question, so a dismissal only covers the one
             // the reader dismissed. Without this, putting the picker away once
             // would put it away for the rest of the note.
@@ -17974,10 +24889,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.pending = .post;
             } else model.composing = true;
         },
-        .open_person => |pk| {
-            model.notifications_open = false;
-            enterProfile(model, pk);
-        },
+        .open_person => |pk| openPerson(model, pk),
         .follow_person => |direction| {
             if (model.is_guest()) {
                 // REMEMBERED, not merely gated. This press used to open the sheet
@@ -17991,10 +24903,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const who = model.viewing_profile orelse return;
             sayFollowWrite(model, writeFollow(fx, who, direction == 1), direction == 1);
         },
+        .mute_person => |direction| {
+            // A guest has nothing to mute FROM: there is no list to splice and
+            // no key to sign with. Unlike a follow, this is not worth
+            // remembering across a sign-in either, since muting is about a feed
+            // they do not have yet.
+            if (model.is_guest()) {
+                model.joining = true;
+                return;
+            }
+            const who = model.viewing_profile orelse return;
+            sayMuteWrite(model, writeMute(fx, who, direction == 1), direction == 1);
+        },
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
-            model.notifications_page = 0;
             // Opening IS reading: the reader is looking at them. The mark moves
             // to the newest item held, never to the wall clock, so a backfill
             // arriving later with older stamps is not born already read.
@@ -18008,19 +24931,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.notifications_everyone = which == 1;
             // The other tab holds a different set, so page four of this one is
             // not page four of that one.
-            model.notifications_page = 0;
-        },
-        .notifications_older => {
-            // Clamped in the MODEL, not only where it is drawn. The view clamps
-            // for its own safety, but leaving the model past the end means the
-            // reader presses Newer and watches nothing move, once for every page
-            // the set shrank by underneath them.
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page + 1, last);
-        },
-        .notifications_newer => {
-            const last = inboxPageCount(!model.notifications_everyone) - 1;
-            model.notifications_page = @min(model.notifications_page, last) -| 1;
         },
         .notifications_read_all => {
             inboxMarkAllRead();
@@ -18108,11 +25018,65 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
             model.composing = false;
+            model.draft_dropped = 0;
             // Closing the sheet stashes what is in it. The words survived a
             // closed sheet already; this is what carries them past a quit.
             saveDraft(model.draft());
         },
         .open_join => model.joining = true,
+        // Enter: keep this place. That is all it does, and it is private.
+        .place_enter => {
+            if (g_place) |m| {
+                if (g_places_len < g_places.len and placeIndexOf(m.author, m.ident()) == null) {
+                    g_places[g_places_len] = m;
+                    g_places_len += 1;
+                    g_place_kept = true;
+                    g_place_last = g_places_len - 1;
+                    // In the list now, so it is no longer the visit the rail
+                    // holds a seat for.
+                    g_visited = null;
+                    savePlaces();
+                    // Entering is the moment the rail has something to show,
+                    // so it shows it: the place the reader just kept, now with
+                    // a seat of its own. It is off until then, because a column
+                    // that can only say it is empty is worse than no column.
+                    showPlacesRail();
+                    saveSettings();
+                }
+            }
+        },
+        // Leave: out of the list, and out of the place. The link still works.
+        .place_leave => {
+            if (g_place) |m| {
+                if (placeIndexOf(m.author, m.ident())) |i| {
+                    for (i..g_places_len - 1) |j| g_places[j] = g_places[j + 1];
+                    g_places_len -= 1;
+                    savePlaces();
+                }
+            }
+            g_place = null;
+            g_place_kept = false;
+            g_place_info = .closed;
+            // The visiting seat is deliberately NOT cleared here, and it took a
+            // probe to see why: entering already clears it, and the seat only
+            // ever holds a place that is not in the list, so a place being left
+            // cannot be the one sitting in it. A second clear for a case that
+            // cannot happen is a line no test can ever fail on.
+            clearPlaceFeed();
+            g_feed_rebuild_all.store(true, .release);
+            saveSettings();
+        },
+        .toggle_places_rail => togglePlacesRail(),
+        .open_place_info => g_place_info = .open,
+        .close_place_info => g_place_info = .closed,
+        .place_leave_request => g_place_info = .leaving,
+        .place_leave_cancel => g_place_info = .open,
+        .place_resume => resumeVisit(),
+        // No `showPlacesRail` here: the press came FROM the rail, so it is
+        // already out, and forcing it would undo a fold the reader just did.
+        .place_open => |i| openKeptPlace(i),
+        .place_bounce => bouncePlace(),
+        .place_step => |delta| stepPlace(delta),
         .close_join => {
             model.joining = false;
             model.bunker_mode = false;
@@ -18201,7 +25165,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.thread_outside_open[level] = !model.thread_outside_open[level];
         },
         .jump_to_newest => {
-            g_last_count = std.math.maxInt(usize);
+            invalidateFeed();
             model.menu = .none;
         },
         .copy_nevent => |id| {
@@ -18365,6 +25329,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             setClientTag(!clientTag());
             saveSettings();
         },
+        .proxy_toggle => {
+            setMediaProxyOn(!mediaProxyOn());
+            saveSettings();
+            // Every picture's URL is built from this, so what is on screen was
+            // fetched under the old answer. Retrying the ones that failed is the
+            // point of the switch: turning the proxy off is how somebody fixes a
+            // blank picture, and it would be a strange switch that left it blank.
+            retryFailedImages();
+        },
+        .direct_fallback_toggle => {
+            setMediaDirectFallback(!mediaDirectFallback());
+            saveSettings();
+            if (mediaDirectFallback()) retryFailedImages();
+        },
+        .hide_toggle => |i| {
+            if (i < hideables.len) {
+                setHidden(@enumFromInt(i), !g_hidden[i]);
+                saveSettings();
+            }
+        },
         .previews_toggle => {
             setMediaPreviews(!mediaPreviews());
             saveSettings();
@@ -18380,8 +25364,50 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
         .link_fetched => |response| handleLinkFetched(response),
-        .open_url => |url| openExternally(fx, url),
-        .expand_image => |note_id| model.expanded_note = note_id,
+        // A paragraph carries one link handler, so a mention arrives here beside
+        // the ordinary links. Its payload is not a URL and never reaches the
+        // browser; see `mention_link_tag`.
+        .open_url => |url| {
+            if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
+        },
+        .bunker_state => |response| {
+            if (response.outcome == .ok and response.status == 200) applyBunkerState(response.body);
+        },
+        .bunker_toggle => {
+            // The reader's press goes to the daemon and the answer comes back as
+            // a fresh state, rather than being applied here and hoped for. The
+            // daemon owns whether the bunker is on; it holds the key and it is
+            // the thing relays talk to.
+            var body_buf: [32]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"on\":{s}}}", .{if (g_bunker_on) "false" else "true"}) catch return;
+            helperFetch(fx, bunker_toggle_key, "/bunker", body, Effects.responseMsg(.bunker_state));
+        },
+        .bunker_decide => |what| {
+            var body_buf: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s},\"remember\":\"{s}\"}}", .{ what.id, if (what.allow) "true" else "false", @tagName(what.remember) }) catch return;
+            helperFetch(fx, bunker_decide_key, "/bunker/decide", body, Effects.responseMsg(.bunker_state));
+        },
+        .copy_bunker_url => {
+            const url = bunkerUrl();
+            if (url.len == 0) return;
+            fx.writeClipboard(.{ .key = copy_bunker_key, .text = url });
+            setToast(model, "Link copied");
+        },
+        .bunker_revoke => |index| {
+            const pubkey = bunkerClientAt(index);
+            if (pubkey.len == 0) return;
+            var body_buf: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "{{\"pubkey\":\"{s}\"}}", .{pubkey}) catch return;
+            helperFetch(fx, bunker_revoke_key, "/bunker/revoke", body, Effects.responseMsg(.bunker_state));
+        },
+        .expand_image => |note_id| {
+            model.expanded_note = note_id;
+            model.expanded_image = 0;
+        },
+        .expand_image_at => |what| {
+            model.expanded_note = what.note;
+            model.expanded_image = what.index;
+        },
         .load_image => |note_id| {
             askForMedia(note_id);
             scanMediaFetches(fx, model);
@@ -18392,6 +25418,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},
         .like => |note_id| toggleLike(model, fx, note_id),
+        .repost => |note_id| repost(model, fx, note_id),
         .open_thread => |note_id| openThread(model, note_id),
         .open_event => |id| {
             // The sheet closes on the PRESS, before the navigation is attempted,
@@ -18401,6 +25428,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // anything that could close the sheet. Closing on arrival therefore
             // left it up in exactly the cases where the reader has least idea why
             // nothing moved.
+            model.notifications_return = model.notifications_open;
             model.notifications_open = false;
             openEvent(model, id);
         },
@@ -18429,6 +25457,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Load what just came into view without waiting for the next tick:
             // hand avatar ids to the newly-visible authors, then their faces and
             // pictures.
+            wantProfilesAhead(model);
             assignAvatarSlots(fx, model);
             scanAvatarFetches(fx);
             scanMediaFetches(fx, model);
@@ -18443,9 +25472,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // `notes_len` lands wherever that is; asking for more than exists
             // simply returns the same feed and the reader has reached the end
             // of what this app has been told about.
+            const held = model.notes_len;
             model.feed_limit += feed_page;
-            g_last_count = std.math.maxInt(usize);
+            invalidateFeed();
             model.refresh(nowSeconds());
+            // The store had no more to give, so ask the relays for what came
+            // before the oldest note in hand. Store first, network second.
+            if (model.notes_len == held and model.notes_len > 0 and !feedEndReached()) {
+                fetchOlderNotes(model.notes[model.notes_len - 1].created_at - 1);
+            }
         },
         .close_settings => {
             model.logout_pending = false;
@@ -18483,6 +25518,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// where it was and no reason at all. The most ordinary one is pressing Follow
 /// in the first seconds after opening the app, before this account's own list
 /// has come back from the relays.
+/// Open somebody's profile, remembering whether the notifications sheet was what
+/// we came from so closing it returns there rather than to the feed.
+fn openPerson(model: *Model, pubkey: [32]u8) void {
+    model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+    enterProfile(model, pubkey);
+}
+
 fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
     switch (outcome) {
         .published => if (following) setToast(model, "Following"),
@@ -18493,6 +25536,22 @@ fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
         // The guard fired, which means the list this app was about to publish
         // was not the list it meant to. Saying "try again" would be wrong: the
         // right move is to leave it alone until the real list is back.
+        .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .failed => setToast(model, "That did not save, and nothing was published."),
+    }
+}
+
+/// What a mute write did, in the reader's terms.
+fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
+    switch (outcome) {
+        .published => setToast(model, if (muting) "Muted" else "Unmuted"),
+        .nothing_to_do => {},
+        .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
+        .no_list_yet => setToast(model, "Still fetching your mute list. Try again in a moment."),
+        // The one message that is about a limit rather than a delay, so it does
+        // not say "try again": trying again will do the same thing. The reader's
+        // private mutes are safe precisely because nothing was published.
+        .private_half_unreadable => setToast(model, "Your mute list has private entries Plaza cannot read, so nothing was changed."),
         .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
@@ -18678,7 +25737,8 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     // Copied out before `result.deinit()`: the query owns its events through an
     // arena, and the write seam holds what it is given past this frame.
     const copy = gpa.dupe(u8, result.events[0].content) catch return null;
-    const tags = dupeTags(gpa, result.events[0].tags);
+    // Whole or not at all. A partial base is what turns a splice into a delete.
+    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 
@@ -18686,6 +25746,15 @@ fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
 /// string. For tests that need to see what a publish actually WROTE rather than
 /// whether it returned true: a splice that quietly drops half the list still
 /// publishes, so the return value proves nothing about what went out.
+/// This account's newest stored event of `kind`, its CONTENT. For the one
+/// property that tags cannot show: that an encrypted half nobody here reads was
+/// carried through a write rather than replaced with nothing.
+pub fn ownRecordContentForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const own = ownRecordJson(gpa, kind) orelse return null;
+    defer freeOwnProfile(gpa, own);
+    return gpa.dupe(u8, own.json) catch null;
+}
+
 pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
     const own = ownRecordJson(gpa, kind) orelse return null;
     defer freeOwnProfile(gpa, own);
@@ -18872,7 +25941,7 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // The TAGS come forward too. NIP-39 identity proofs (a GitHub account, a
     // Mastodon handle) live in kind:0's tags, and republishing with none would
     // delete them as silently as dropping a JSON key.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, created, 0, tags, merged, false);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
@@ -18884,17 +25953,43 @@ fn saveProfile(model: *Model, fx: *Effects) void {
 /// Parses `existing`, replaces the three keys this app models, and serialises the
 /// whole object back. Key order survives the round trip, so a profile this app
 /// did not change comes back byte-similar rather than reshuffled.
+/// The object a kind:0 edit merges into, or null when a record that IS there
+/// could not be read.
+///
+/// Falling back to an empty object on a parse failure is the merge failing
+/// open, and this object is the base every field is written into. A profile
+/// that did not parse would be republished as nothing but the fields the screen
+/// happened to hold, so the reader's lightning address, NIP-05, banner and
+/// website would be gone from every relay and from every other client. That is
+/// the same shape as writing a contact list over one that was never read, and
+/// the answer is the same: a record that cannot be read whole reads as "not
+/// read", which every caller already handles.
+///
+/// Not a hypothetical failure, either. Zig's JSON parser is stricter than the
+/// ones the rest of the ecosystem uses: it rejects an unpaired surrogate half
+/// in a `\u` escape, and it validates raw UTF-8. Profiles that came through
+/// bridges, or were written by clients that never checked, carry both, and
+/// those readers would be the ones who lost the most.
+///
+/// Only a caller saying there is nothing there may start from nothing, which is
+/// the literal `{}` passed when no record was found.
+fn profileMergeBase(a: std.mem.Allocator, existing: []const u8) ?std.json.ObjectMap {
+    const nothing_to_lose = existing.len == 0 or
+        std.mem.eql(u8, std.mem.trim(u8, existing, " \t\r\n"), "{}");
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    }) catch return if (nothing_to_lose) std.json.ObjectMap.empty else null;
+    if (root != .object) return if (nothing_to_lose) std.json.ObjectMap.empty else null;
+    return root.object;
+}
+
 fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_always,
-    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
-    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
-    var obj = root.object;
+    var obj = profileMergeBase(a, existing) orelse return null;
 
     // An emptied field REMOVES its key rather than writing "": a profile with
     // `"about": ""` reads to other clients as a bio the reader deliberately
@@ -19027,7 +26122,11 @@ fn ownProfileWorker(pk: [32]u8) void {
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-me", &filters) catch continue;
         var seen: usize = 0;
         while (seen < 32) : (seen += 1) {
@@ -19090,7 +26189,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     // proofs to lose, so this is not a bug being fixed: it is the one line that
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
-    const tags = dupeTags(gpa, prev_tags);
+    const tags = dupeTags(gpa, prev_tags) orelse return;
     signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
@@ -19105,12 +26204,7 @@ fn mergeNameJson(gpa: std.mem.Allocator, existing: []const u8, name: []const u8)
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_always,
-    }) catch std.json.Value{ .object = std.json.ObjectMap.empty };
-    if (root != .object) root = .{ .object = std.json.ObjectMap.empty };
-    var obj = root.object;
+    var obj = profileMergeBase(a, existing) orelse return null;
     setOrRemove(&obj, a, "name", name) catch return null;
     setOrRemove(&obj, a, "display_name", name) catch return null;
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
@@ -19195,7 +26289,7 @@ pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
 /// on the next tick by invalidating the change guard.
 fn enterFeed(model: *Model) void {
     model.stage = .ready;
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
     if (g_store == null) {
         if (g_io) |io| if (g_environ) |env| startFeed(io, env);
     }
@@ -19205,7 +26299,9 @@ fn enterFeed(model: *Model) void {
     // generation, which is what makes the open sockets re-ask for the records
     // of the account that is actually signed in.
     forgetFollows();
+    forgetMutes();
     loadFollowsFromStore();
+    loadMutesFromStore();
     // And what people sent this account while it was away.
     loadInbox();
 }
@@ -19257,6 +26353,7 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     // restorable to the composer if a remote signer never answers.
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true);
     model.draft_buffer.clear();
+    model.draft_dropped = 0;
     return true;
 }
 
@@ -19625,6 +26722,53 @@ fn notifiedBy(content: []const u8, out: *[max_mention_tags][32]u8) usize {
     return n;
 }
 
+/// Whether `content` names `who`: as a NIP-27 mention, or as the author of an
+/// event it quotes.
+///
+/// The reading half of what `notifiedBy` does for writing. Same scan, same
+/// tokens, one difference: this one is asked about a specific person and so
+/// cannot filter the reader out, which is the only thing it is ever asked
+/// about.
+pub fn contentNames(content: []const u8, who: [32]u8) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < content.len) {
+        // URLs whole, so a token inside one is never read as a reference.
+        if (std.mem.startsWith(u8, content[i..], "http://") or std.mem.startsWith(u8, content[i..], "https://")) {
+            while (i < content.len and !std.ascii.isWhitespace(content[i])) i += 1;
+            continue;
+        }
+        var fba = std.heap.FixedBufferAllocator.init(&scratch);
+        const arena = fba.allocator();
+        if (parseMentionAt(arena, content, i)) |m| {
+            if (std.mem.eql(u8, &m.pubkey, &who)) return true;
+            i = @max(m.end, i + 1);
+            continue;
+        }
+        if (refPrecededByBoundary(content, i)) {
+            var body_start = i;
+            if (std.mem.startsWith(u8, content[i..], "nostr:")) body_start = i + "nostr:".len;
+            const rest = content[body_start..];
+            if (std.mem.startsWith(u8, rest, "nevent1")) {
+                var j: usize = 0;
+                while (j < rest.len and isBech32Char(rest[j])) j += 1;
+                if (nostr.nip19.decodeNevent(arena, rest[0..j])) |ptr| {
+                    // Quoting somebody's note is telling them about it, so the
+                    // author the pointer carries counts. A `note1` carries none,
+                    // and nobody is named on a guess.
+                    if (ptr.author) |author| {
+                        if (std.mem.eql(u8, &author, &who)) return true;
+                    }
+                    i = @max(body_start + j, i + 1);
+                    continue;
+                } else |_| {}
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
 pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {
     return notifiedBy(content, out);
 }
@@ -19859,6 +27003,44 @@ fn buildLikeTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event
     return tags;
 }
 
+/// The NIP-18 tags on a repost: `["e", id, "", author]` and `["p", author]`.
+///
+/// Read off Jumble (`src/lib/draft-event.ts:126` `createRepostDraftEvent`, whose
+/// `buildETag(event.id, event.pubkey)` puts the author in the e-tag's fourth
+/// field) and NDK (`core/src/events/repost.ts`, which tags the event and then
+/// adds `k` only for a kind other than 1). Both send the e-tag and the p-tag and
+/// no `k` for a kind:1, which is every note Plaza's feed holds, so there is no
+/// `k` here and no kind:16.
+///
+/// The empty third field is the relay hint. It is empty rather than absent
+/// because the author sits in the fourth, and dropping the hint would move the
+/// pubkey into the hint's place and tell every reader to dial it as a relay.
+fn buildRepostTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, note.event_id) orelse return null;
+    const author_hex = hexAlloc(gpa, note.pubkey) orelse return null;
+    const e = gpa.dupe([]const u8, &.{ "e", id_hex, "", author_hex }) catch return null;
+    const p = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return null;
+    const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
+    tags[0] = e;
+    tags[1] = p;
+    return tags;
+}
+
+/// The reposted note itself, as JSON, which is what NIP-18 says the content
+/// should carry and what both clients above put there. A reader that has never
+/// seen the note can render it from this without going and asking for it.
+///
+/// Empty when the note is not in the store, which is legal and is what those
+/// clients fall back to as well. Plaza reads its own feed out of the store, so
+/// it is normally there; a note that has been evicted still reposts, it just
+/// costs the reader a fetch.
+pub fn repostContent(gpa: std.mem.Allocator, note: *const Note) []const u8 {
+    const store = g_store orelse return gpa.dupe(u8, "") catch "";
+    var se = (store.getEvent(gpa, note.event_id) catch null) orelse return gpa.dupe(u8, "") catch "";
+    defer se.deinit();
+    return nostr.event.toJson(gpa, se.event) catch gpa.dupe(u8, "") catch "";
+}
+
 /// The NIP-09 deletion tags to un-like: `["e", reaction_id]`, `["k", "7"]`.
 fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.event.Tag {
     const id_hex = hexAlloc(gpa, reaction_id) orelse return null;
@@ -19901,6 +27083,51 @@ fn like(model: *const Model, fx: *Effects, note_id: i64) void {
     signAndPublish(fx, gpa, created, 7, tags, content, false);
 }
 
+/// Publishes a kind:6 repost, and fills the icon at once.
+///
+/// One way, on purpose. Jumble disables its button once you have reposted
+/// (`RepostButton.tsx`, `canRepost = !hasReposted && …`) and NDK offers no undo
+/// at all; a like has one here only because an un-like has a reaction id to
+/// name in a kind:5, and every reader treats a deleted repost differently
+/// anyway. Pressing again is a no-op rather than a second repost.
+fn repost(model: *Model, fx: *Effects, note_id: i64) void {
+    if (model.is_guest()) {
+        model.pending = .{ .repost = note_id };
+        model.joining = true;
+        return;
+    }
+    if (!signerReady()) return;
+    if (engagementFor(note_id).reposted_by_me) return;
+    const note = model.noteById(note_id) orelse return;
+    const gpa = std.heap.page_allocator;
+    const tags = buildRepostTags(gpa, note) orelse return;
+    const content = repostContent(gpa, note);
+    // Filled before the signature comes back, the same way a like is. Our own
+    // kind:6 arrives through the engagement subscription a moment later and sets
+    // the same flag from the crowd, so this only covers the gap.
+    markRepostedByMe(note_id);
+    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false);
+}
+
+/// Sets the "ours" flag on a note's row before the crowd confirms it.
+///
+/// The FLAG only. Not the count, which is the part a like has to work at: a like
+/// shows an optimistic +1 and then has to retire it, which is why it remembers
+/// its reaction id and why `likeCountFor` subtracts. Adding one here would be
+/// added again a moment later, because our own kind:6 arrives through the same
+/// engagement subscription as everybody else's and `markSeen` is keyed by event
+/// id, so that fold is the first time that id has been seen and it counts.
+///
+/// So the icon fills at once and the number moves when the repost is really out.
+/// That is the honest pair: the icon is about what you did, the number is about
+/// what has been seen.
+fn markRepostedByMe(note_id: i64) void {
+    engagementLock();
+    defer engagementUnlock();
+    const row = ensureEngagement(note_id) orelse return;
+    row.counts.reposted_by_me = true;
+}
+
 /// Publishes a kind:5 deletion of our own reaction and empties the heart at once.
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
@@ -19932,6 +27159,11 @@ fn drivePendingIntent(model: *Model, fx: *Effects) void {
             like(model, fx, id);
             setToast(model, "Liked");
         },
+        .repost => |id| {
+            if (engagementFor(id).reposted_by_me) return;
+            repost(model, fx, id);
+            setToast(model, "Reposted");
+        },
         .follow => |pk| {
             // The follow-safety gate still applies: this publishes a replaceable
             // list, and nothing may be written over a contact list that has not
@@ -19960,13 +27192,24 @@ fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
 /// Deep-copies `tags` into process-lifetime memory so the detached publisher can
 /// read them after the parse arena is freed. Returns an empty set on OOM (posts
 /// are tagless, so nothing is lost there; a reaction that OOMs simply drops).
-fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) []const nostr.event.Tag {
+/// Copies a record's tags, or reports that it could not.
+///
+/// Null, never an empty slice. This is the splice base for every replaceable
+/// write (kind 0, 3 and 10002), and those writes decide how much to keep by
+/// counting what is in here. An empty slice says "this record had no tags",
+/// which is a true statement about a record with no tags and a catastrophic one
+/// about a copy that ran out of memory: the follow list's own shrink guard
+/// compares against this same slice, so 0 to 1 reads as growth and passes.
+///
+/// A base that could not be copied whole must read as "not read". Every caller
+/// already handles that safely, because it is the same path as a store miss.
+fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
     if (tags.len == 0) return &.{};
-    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return &.{};
+    const out = gpa.alloc(nostr.event.Tag, tags.len) catch return null;
     for (tags, 0..) |tag, i| {
-        const fields = gpa.alloc([]const u8, tag.len) catch return &.{};
+        const fields = gpa.alloc([]const u8, tag.len) catch return null;
         for (tag, 0..) |field, j| {
-            fields[j] = gpa.dupe(u8, field) catch return &.{};
+            fields[j] = gpa.dupe(u8, field) catch return null;
         }
         out[i] = fields;
     }
@@ -20085,7 +27328,10 @@ pub const OutboxEntry = struct {
     pub fn state(self: OutboxEntry) OutboxState {
         if (self.acked != 0) return .sent;
         if (self.sending) return .sending;
-        if (self.rounds >= max_outbox_rounds) return .stuck;
+        // A LABEL, not a verdict. The queue keeps offering this note; the word
+        // only tells the reader it has been a while. It used to mean the app
+        // had given up, which is the one thing a queue must not do silently.
+        if (self.rounds >= rounds_before_stuck) return .stuck;
         return .queued;
     }
 };
@@ -20100,7 +27346,11 @@ fn outboxRetryDelay(rounds: u8) i64 {
         1 => 5,
         2 => 20,
         3 => 60,
-        else => 300,
+        4 => 300,
+        5 => 900,
+        // Once an hour, forever. A relay that has been unreachable for an hour
+        // may well come back tomorrow, and asking it hourly costs one dial.
+        else => 3600,
     };
 }
 
@@ -20111,9 +27361,19 @@ var g_outbox_overflow = std.atomic.Value(bool).init(false);
 /// Room for a burst of posting without becoming a store of its own. A reader who
 /// writes more than this while offline is past what a status bar can explain.
 const outbox_cap = 16;
-/// How many times a note is offered to the relays before the queue stops asking.
-/// Every round is a full walk of the pool, so this is not a byte-level retry.
-const max_outbox_rounds = 6;
+/// After how many failed rounds the popover starts calling a note stuck.
+///
+/// This used to be the point at which the queue GAVE UP. Six rounds on the old
+/// ladder is about eleven and a half minutes, so closing a laptop lid for
+/// twelve, or spending that long on a captive portal where TCP connects and TLS
+/// does not, permanently abandoned every queued note. It was never offered
+/// again for the life of the install, the count survived a restart, and sixteen
+/// of them filled the queue so the account could never post from that install
+/// again. The only escape was editing the relay list, which nobody would guess.
+///
+/// Now it only changes the word on the row. The note keeps being offered, on a
+/// widening delay, for as long as the app is running.
+const rounds_before_stuck = 6;
 
 var g_outbox = [_]OutboxEntry{.{}} ** outbox_cap;
 /// Bumped whenever the queue changes, so the UI thread can tell that the
@@ -20312,6 +27572,22 @@ pub fn resetOutboxForTest() void {
     outboxLock();
     defer outboxUnlock();
     for (&g_outbox) |*e| e.* = .{};
+    g_outbox_woke_at.store(0, .monotonic);
+    g_outbox_woke_ever.store(false, .monotonic);
+}
+
+pub fn outboxStateForTest(id: [32]u8) ?OutboxState {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.state();
+}
+
+pub fn outboxRoundsForTest(id: [32]u8) ?u8 {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.rounds;
 }
 
 pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
@@ -20335,7 +27611,7 @@ pub fn outboxRetryDelayForTest(rounds: u8) i64 {
     return outboxRetryDelay(rounds);
 }
 
-pub const max_outbox_rounds_for_test = max_outbox_rounds;
+pub const rounds_before_stuck_for_test = rounds_before_stuck;
 pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
 
 /// A fingerprint of the pool, in slot order. The outbox records which relay took
@@ -20555,7 +27831,7 @@ fn collectOutboxDue(ids: *[outbox_cap][32]u8, now_s: i64) usize {
     outboxLock();
     defer outboxUnlock();
     for (&g_outbox) |*e| {
-        if (!e.used or e.sending or e.acked != 0 or e.rounds >= max_outbox_rounds) continue;
+        if (!e.used or e.sending or e.acked != 0) continue;
         // Somebody else's note. This is the line that stops the previous
         // account's unsent writing going out over the next account's relays,
         // and signed out it stops everything, because a queued note is a promise
@@ -20732,6 +28008,120 @@ fn publishOwnedWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
 /// keeps the ingest loops untouched; the note is already in the local store, so
 /// the feed shows it regardless of publish latency. Runs on a detached thread
 /// with its own io backend, never the UI thread's.
+/// At most this many of one recipient's read relays are added for a publish.
+///
+/// Jumble takes five, welshman's default scenario limit is three. Three is the
+/// smaller of the two and still means a person has to have lost three relays at
+/// once to miss a reply.
+const inbox_relays_per_recipient = 3;
+/// A ceiling on the whole extra set, so a note naming a dozen people does not
+/// turn one Post into thirty dials.
+const max_extra_inbox_relays = 8;
+
+/// Publishes `ev` to the relays the people it names actually READ from.
+///
+/// Plaza sent every note to the reader's own write relays and nowhere else. If
+/// the person being replied to does not read those relays, their client never
+/// sees the reply and never tells them: a thread started from Plaza reads
+/// one-sided to everybody else in it. Plaza's own inbox subscription is the
+/// mirror of this and is correct, so the app was receiving what others routed
+/// to it and not reciprocating.
+///
+/// Best effort, and deliberately not recorded in the outbox. An acknowledgement
+/// there is a bit in a per-slot bitmap and these relays hold no slot; more to
+/// the point, "did my note go out" is a question about the reader's own relays,
+/// and a stranger's inbox relay refusing an unknown pubkey is normal rather
+/// than a delivery failure worth alarming them about.
+fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event.Event) void {
+    const store = g_store orelse return;
+
+    // Who the note names. The author is skipped: a reply to yourself does not
+    // need routing, and the pool already carries it.
+    var recipients: [max_extra_inbox_relays * 2][32]u8 = undefined;
+    var n: usize = 0;
+    for (ev.tags) |tag| {
+        if (n == recipients.len) break;
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p") or tag[1].len != 64) continue;
+        var pk: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk, tag[1]) catch continue;
+        if (std.mem.eql(u8, &pk, &ev.pubkey)) continue;
+        var dupe = false;
+        for (recipients[0..n]) |seen| {
+            if (std.mem.eql(u8, &seen, &pk)) dupe = true;
+        }
+        if (dupe) continue;
+        recipients[n] = pk;
+        n += 1;
+    }
+    if (n == 0) return;
+
+    const kinds = [_]u16{relay_list_kind};
+    var result = store.query(gpa, .{ .authors = recipients[0..n], .kinds = &kinds, .limit = @intCast(n) }) catch return;
+    defer result.deinit();
+
+    var urls: [max_extra_inbox_relays][96]u8 = undefined;
+    var url_len: [max_extra_inbox_relays]usize = undefined;
+    var urls_n: usize = 0;
+
+    for (result.events) |list_ev| {
+        var parsed = nostr.nip65.parseRelayList(gpa, list_ev) catch continue;
+        defer parsed.deinit();
+        var taken: usize = 0;
+        for (parsed.list.entries) |entry| {
+            if (taken == inbox_relays_per_recipient or urls_n == urls.len) break;
+            // Where they READ. A relay they only write to will never show them
+            // anything, so a reply left there is a reply nobody receives.
+            if (!entry.read) continue;
+            const trimmed = std.mem.trim(u8, entry.url, " \t\r\n");
+            if (trimmed.len == 0 or trimmed.len > 96) continue;
+            // Already covered by the pool walk, so dialling it again would only
+            // publish the same note twice to the same host.
+            if (poolHasRelay(trimmed)) continue;
+            var already = false;
+            for (0..urls_n) |i| {
+                if (std.mem.eql(u8, urls[i][0..url_len[i]], trimmed)) already = true;
+            }
+            if (already) continue;
+            @memcpy(urls[urls_n][0..trimmed.len], trimmed);
+            url_len[urls_n] = trimmed.len;
+            urls_n += 1;
+            taken += 1;
+        }
+    }
+
+    for (0..urls_n) |i| {
+        const url = urls[i][0..url_len[i]];
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.publish(ev) catch continue;
+        // One read, to give the frame somewhere to flush to. The verdict is not
+        // recorded, so there is nothing to wait around for.
+        var msg = (relay.receive() catch continue) orelse continue;
+        msg.deinit();
+    }
+}
+
+/// Whether `url` is already one of the reader's own relays.
+pub fn poolHasRelayForTest(url: []const u8) bool {
+    return poolHasRelay(url);
+}
+
+fn poolHasRelay(url: []const u8) bool {
+    for (0..relaySlots()) |i| {
+        var buf: [96]u8 = undefined;
+        const entry = relaySnapshot(i, &buf) orelse continue;
+        // The pool's own comparison, which knows that a trailing slash and a
+        // difference of case are the same relay. Two spellings here would mean
+        // publishing the same note to the same host twice.
+        if (relayUrlEql(entry.url, url)) return true;
+    }
+    return false;
+}
+
 fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -20745,7 +28135,11 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
         // never reused for a different relay while the process lives.
         if (!entry.write) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.publish(ev) catch continue;
         // The relay's OK is the answer to "is my note out there", so it is READ
         // rather than merely waited for: which relay took it, and which refused,
@@ -20775,6 +28169,10 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
             }
         }
     }
+
+    // And where the people it names actually read, which the reader's own
+    // relays say nothing about.
+    publishToRecipientInboxes(gpa, io, ev);
 }
 
 /// How many frames to read from one relay while waiting for its verdict. A relay
@@ -20855,6 +28253,180 @@ fn pushCurrentScreen(model: *Model) void {
     }
 }
 
+/// The filters that ask for notes older than `until`.
+///
+/// Chunked exactly like the live subscription, and for the same reason: a relay
+/// refuses a filter whose field items exceed its size cap. Separate from
+/// `buildFeedFilters` because this asks for notes and nothing else: profiles
+/// and relay lists are replaceable, so there is no older copy to page back to.
+pub fn buildOlderFilters(
+    authors: []const [32]u8,
+    until: i64,
+    out: []nostr.filter.Filter,
+) []nostr.filter.Filter {
+    var len: usize = 0;
+    var start: usize = 0;
+    while (start < authors.len and len < out.len) : (start += follow_chunk) {
+        const chunk = authors[start..@min(start + follow_chunk, authors.len)];
+        out[len] = .{
+            .authors = chunk,
+            .kinds = &feed_filter_kinds,
+            .until = until,
+            .limit = feed_page,
+        };
+        len += 1;
+    }
+    return out[0..len];
+}
+
+/// Whether an older-notes fetch is already in flight, so a reader who keeps
+/// scrolling does not stack one request per frame.
+var g_older_busy = std.atomic.Value(bool).init(false);
+/// Set when a network round for older notes came back with nothing new, which
+/// is the only honest way to know the feed has an end.
+var g_feed_end_reached = std.atomic.Value(bool).init(false);
+
+pub fn feedEndReached() bool {
+    return g_feed_end_reached.load(.monotonic);
+}
+
+/// The end of history is an answer about a QUESTION: is there anything older
+/// than this, from these authors, on these relays. Change the question and the
+/// answer stops being about anything.
+///
+/// This existed only as a test helper with no callers anywhere, so the latch
+/// was write-once for the life of the process: sign in as somebody else, follow
+/// three hundred new people, add a relay that holds a decade of history, and
+/// the feed still refused to ask.
+fn resetFeedEnd() void {
+    g_feed_end_reached.store(false, .monotonic);
+}
+
+/// The latch's condition, lifted out so it can be asserted without standing up
+/// a relay. The worker calls this with what its round actually saw.
+fn feedEndLatches(asked: usize, answered: usize, added: usize) bool {
+    return asked > 0 and answered > 0 and added == 0;
+}
+
+pub fn feedEndLatchesForTest(asked: usize, answered: usize, added: usize) bool {
+    return feedEndLatches(asked, answered, added);
+}
+pub fn setFeedEndForTest() void {
+    g_feed_end_reached.store(true, .monotonic);
+}
+
+pub fn resetFeedEndForTest() void {
+    resetFeedEnd();
+    g_older_busy.store(false, .monotonic);
+}
+
+/// Asks the relays for notes older than `until`.
+///
+/// Reaching the end of the loaded feed used to raise the store's query limit
+/// and nothing else. The store answers with what it has, so once the initial
+/// backfill was exhausted the list simply stopped growing: no older history, no
+/// end-of-feed state, and no way to reach anything from before the app was
+/// opened. A reader coming back after a week saw the last few hundred notes and
+/// could not scroll past them. Grepping this file for `.until` returned nothing
+/// at all, which is the whole bug: no filter Plaza ever sent carried one.
+///
+/// Store first, network second, which is Jumble's ordering: `_loadMoreTimeline`
+/// serves from its cached list and only then asks with `{ ...filter, until }`.
+fn fetchOlderNotes(until: i64) void {
+    if (g_store == null) return;
+    // One at a time. Sitting at the bottom of the list fires this on every
+    // frame, and each round is a dial per relay.
+    if (g_older_busy.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, fetchOlderWorker, .{until}) catch {
+        g_older_busy.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchOlderWorker(until: i64) void {
+    const gpa = std.heap.page_allocator;
+    defer g_older_busy.store(false, .release);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var authors: [max_follows + 1][32]u8 = undefined;
+    var authors_len: usize = 0;
+    if (activePubkey()) |pk| {
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    for (followSet()) |pk| {
+        if (authors_len == authors.len) break;
+        authors[authors_len] = pk;
+        authors_len += 1;
+    }
+    if (authors_len == 0) return;
+
+    var filters: [max_feed_filters]nostr.filter.Filter = undefined;
+    const built = buildOlderFilters(authors[0..authors_len], until, &filters);
+    const flen = built.len;
+
+    var added: usize = 0;
+    // How many relays took the subscription and answered it. Both, because an
+    // end of history is a thing relays TELL you and the two ways of not being
+    // told look identical from `added` alone.
+    var asked: usize = 0;
+    var answered: usize = 0;
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.subscribe("plaza-older", filters[0..flen]) catch continue;
+        asked += 1;
+        var seen: usize = 0;
+        // Bounded: `receive` has no deadline, and a relay that takes the
+        // subscription and then goes quiet would hold this thread forever.
+        while (seen < profile_fetch_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .added) added += 1;
+                },
+                .eose => {
+                    // "I have looked and that is all of it." The only message
+                    // that licenses the latch below.
+                    answered += 1;
+                    break;
+                },
+                .closed => break,
+                else => {},
+            }
+        }
+        relay.unsubscribe("plaza-older") catch {};
+    }
+
+    // Nothing anywhere had anything older, AND somebody was actually there to
+    // say so. Both halves matter, and only the first was checked.
+    //
+    // `added` counts events that were new to the store, and every failure in
+    // the loop above is a `catch continue`: a dial that could not connect, a
+    // subscribe that was refused. So an offline round and a round where every
+    // relay answered "nothing older" produced the same zero, and this latched
+    // on the first paging attempt made on a train. It is write-once for the
+    // life of the process, so the feed then dead-ended until the app restarted.
+    //
+    // A round that reached nobody now says nothing at all, and the next attempt
+    // asks again.
+    if (feedEndLatches(asked, answered, added)) g_feed_end_reached.store(true, .monotonic);
+}
+
 /// Opens a person as a level of their own.
 fn enterProfile(model: *Model, pubkey: [32]u8) void {
     // Already here. Pressing a face on somebody's own page would otherwise push
@@ -20930,6 +28502,11 @@ fn goHome(model: *Model) void {
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
+    // Home is YOUR feed, so the mark closes the room. Not the same verb as
+    // Leave: the place stays in the list with its ids intact, one press away on
+    // the rail, which is deliberately left exactly as it was. Hiding it here is
+    // what made coming back cost two presses.
+    goToOwnPlaza();
 }
 
 pub fn goHomeForTest(model: *Model) void {
@@ -20973,6 +28550,13 @@ fn closeThread(model: *Model) void {
         model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
+        // Back to where the reader actually came from. The list is rebuilt from
+        // the same inbox and the window keeps its offset on the list's own id,
+        // so this lands on the row they pressed rather than at the top.
+        if (model.notifications_return) {
+            model.notifications_return = false;
+            model.notifications_open = true;
+        }
     }
 }
 
@@ -21026,7 +28610,11 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
         const entry = relaySnapshot(ri, &url_buf) orelse continue;
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
         relay.subscribe("plaza-person", &filters) catch continue;
 
         var ids: [engagement_watch_cap][64]u8 = undefined;
@@ -21066,9 +28654,8 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                     engagement_open = true;
                     var evals: [engagement_watch_cap][]const u8 = undefined;
                     for (0..id_count) |i| evals[i] = &ids[i];
-                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
                     const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..id_count] }};
-                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+                    const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
                     relay.subscribe("plaza-person-engagement", &eng_filters) catch break;
                 },
                 .closed => break,
@@ -21082,8 +28669,179 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
 /// thread moves on. See the comment in `fetchProfileWorker`.
 const profile_fetch_messages = 400;
 
+/// One engagement query over prepared `#e` values.
+///
+/// Three screens ask this same question, and each used to write it out again.
+/// They drifted: the thread and the profile capped the answer, and the feed's,
+/// which is the one re-issued on every reconnect, carried no cap at all, so a
+/// busy relay decided how much of four kinds across 128 note ids to send back.
+/// One function now, so there is nothing left to drift.
+pub fn engagementFilter(tags: []const nostr.filter.TagFilter) nostr.filter.Filter {
+    return .{ .kinds = engagementKinds(), .tags = tags, .limit = engagement_request_limit };
+}
+
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so
+// --------------------------------------------------------- the relay-list sweep
+//
+// Who to ask about the people nobody in the pool can answer for.
+//
+// Every author whose kind:10002 Plaza does not hold is asked of the indexers,
+// once per run. Eager over the whole follow list rather than lazily on a miss,
+// because the routing table has to be warm BEFORE the first feed REQ or the
+// feed goes to the wrong relays and the round trip is paid twice: three of the
+// four clients read do the eager sweep for exactly that reason, and welshman,
+// the one that does not, is also the one with no negative caching and an
+// unbounded retry.
+//
+// DEFERRED, and named rather than quietly skipped: the answer is not written
+// down across launches, so an author who has genuinely never published a
+// relay list is asked again next time Plaza starts. Within a run they are
+// asked once. Jumble is the only client of the five that persists a negative
+// result, and doing it properly means a `checked_at` per pubkey in the store
+// with a staleness rule, which is its own change.
+
+/// Pubkeys already put to the indexers this run, so a follow with no relay list
+/// anywhere is asked once rather than on every rebuild of the routing table.
+var g_indexed = std.atomic.Value(u32).init(0);
+var g_indexer_asked: [max_follows][32]u8 = undefined;
+var g_indexer_asked_len: usize = 0;
+var g_indexer_running = std.atomic.Value(bool).init(false);
+
+/// The follows Plaza holds no relay list for and has not yet asked about.
+///
+/// Reads the store rather than the routing table: "no relay list" is a fact
+/// about what is on disk, while a residual author may simply write somewhere
+/// that did not make the cut, and asking an indexer about them would be asking
+/// a question already answered.
+fn collectUnrouted(out: [][32]u8) usize {
+    const store = g_store orelse return 0;
+    var n: usize = 0;
+    for (followSet()) |pk| {
+        if (n >= out.len) break;
+        if (authorListed(g_indexer_asked[0..g_indexer_asked_len], pk)) continue;
+        const kinds = [_]u16{relay_list_kind};
+        var one: [1][32]u8 = .{pk};
+        var result = store.query(std.heap.page_allocator, .{
+            .authors = one[0..1],
+            .kinds = &kinds,
+            .limit = 1,
+        }) catch continue;
+        defer result.deinit();
+        if (result.events.len > 0) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+/// Asks the indexers about everyone the pool cannot place. One pass, off the
+/// UI thread, on its own sockets.
+fn sweepRelayLists() void {
+    if (g_store == null) return;
+    if (g_indexer_running.swap(true, .acq_rel)) return; // one sweep at a time
+    const t = std.Thread.spawn(.{}, sweepRelayListsWorker, .{}) catch {
+        g_indexer_running.store(false, .release);
+        return;
+    };
+    t.detach();
+}
+
+fn sweepRelayListsWorker() void {
+    defer g_indexer_running.store(false, .release);
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const wanted = gpa.alloc([32]u8, max_follows) catch return;
+    defer gpa.free(wanted);
+    const n = collectUnrouted(wanted);
+    if (n == 0) return;
+
+    // Marked as asked BEFORE the network, not after. A relay that never answers
+    // must not leave these authors queued for the next rebuild to ask again:
+    // the point of the set is one attempt per run, and an attempt that failed
+    // is still an attempt. Amethyst's equivalent is an LRU that fails OPEN when
+    // it evicts, resurrecting questions it had already given up on.
+    for (wanted[0..n]) |pk| {
+        if (g_indexer_asked_len >= g_indexer_asked.len) break;
+        g_indexer_asked[g_indexer_asked_len] = pk;
+        g_indexer_asked_len += 1;
+    }
+
+    for (indexer_relays) |url| {
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        defer relay.deinit();
+        // The clock starts once the socket is up, which is what NDK gets wrong:
+        // its budget races its own TCP handshake on a cold start and everything
+        // that misses is written off as "this person has no relay list".
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+
+        var start: usize = 0;
+        while (start < n) : (start += indexer_chunk) {
+            const chunk = wanted[start..@min(start + indexer_chunk, n)];
+            const kinds = [_]u16{relay_list_kind};
+            // No `since` and no `until`: all four clients agree, and a relay
+            // list edited while the app was closed is older than anything a
+            // `since` would admit. `limit` is the chunk size because these are
+            // replaceable, so a relay holds at most one per author.
+            const filters = [_]nostr.filter.Filter{.{
+                .authors = chunk,
+                .kinds = &kinds,
+                .limit = @intCast(chunk.len),
+            }};
+            relay.subscribe("plaza-ask-relaylists", &filters) catch break;
+            while (true) {
+                var msg = (relay.receive() catch break) orelse break;
+                defer msg.deinit();
+                switch (msg.value) {
+                    .event => |e| {
+                        _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                        _ = g_indexed.fetchAdd(1, .monotonic);
+                    },
+                    .eose => break,
+                    else => {},
+                }
+            }
+        }
+    }
+    // Whatever arrived changes who can be routed to, so the table is rebuilt
+    // rather than waiting for the next thing that happens to touch it.
+    // The same flag an arriving relay list sets. A rebuild is wanted, not
+    // forced: it runs on the render thread when the flurry has stopped, which
+    // is what stops a burst of lists redialling the discovered pool repeatedly.
+    if (g_indexed.load(.monotonic) > 0) g_relay_ranks_dirty.store(true, .release);
+}
+
+pub fn sweepRelayListsForTest() void {
+    sweepRelayLists();
+}
+pub fn collectUnroutedForTest(out: [][32]u8) usize {
+    return collectUnrouted(out);
+}
+pub fn indexerRelaysForTest() []const []const u8 {
+    return &indexer_relays;
+}
+pub fn indexerChunkForTest() usize {
+    return indexer_chunk;
+}
+pub fn resetIndexerAskedForTest() void {
+    g_indexer_asked_len = 0;
+    g_indexed.store(0, .monotonic);
+}
+pub fn markIndexerAskedForTest(pk: [32]u8) void {
+    if (g_indexer_asked_len >= g_indexer_asked.len) return;
+    g_indexer_asked[g_indexer_asked_len] = pk;
+    g_indexer_asked_len += 1;
+}
+pub fn indexerAskedLenForTest() usize {
+    return g_indexer_asked_len;
+}
+
 /// a throwaway connection keeps the ingest loops untouched, exactly like
 /// publishing. `seq` tags the fetch so its completion is attributable.
 fn fetchThreadReplies(root_id: [32]u8, seq: u64) void {
@@ -21109,8 +28867,39 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
-    var root_hex: [64]u8 = undefined;
-    hexLower(&root_hex, root_id);
+    // The note the reader pressed, and the ROOT of the conversation it sits in.
+    //
+    // Usually the same note, and when they are not, asking only about the note
+    // pressed asks a question almost nothing answers. NIP-10 says a reply
+    // carries an `e` tag for the ROOT and one for its immediate parent, so a
+    // grandchild of the note in the reader's hand names its own parent and the
+    // root, and never the note in between. Opening a reply from the feed
+    // therefore fetched that note's direct children and nothing else: no
+    // siblings, no parent, no root post, and nothing under those children. The
+    // ancestors then trickled in one hop at a time through the quote fetcher,
+    // which is why an old conversation took several seconds to assemble.
+    //
+    // Both ids go into ONE filter. Keeping the pressed note in it is what makes
+    // this safe when a root tag is missing, wrong, or points somewhere else:
+    // that note's own children still match.
+    var thread_ids: [2][32]u8 = undefined;
+    var thread_count: usize = 1;
+    thread_ids[0] = root_id;
+    if (g_store) |store| {
+        if (store.getEvent(gpa, root_id) catch null) |se| {
+            var owned = se;
+            defer owned.deinit();
+            thread_count = threadQueryIds(root_id, owned.event.tags, &thread_ids);
+        }
+    }
+    var thread_hex: [2][64]u8 = undefined;
+    var thread_evals: [2][]const u8 = undefined;
+    var thread_watch: [2]i64 = undefined;
+    for (0..thread_count) |i| {
+        hexLower(&thread_hex[i], thread_ids[i]);
+        thread_evals[i] = &thread_hex[i];
+        thread_watch[i] = @intCast(std.mem.readInt(u64, thread_ids[i][0..8], .big) & std.math.maxInt(i64));
+    }
 
     for (0..relaySlots()) |ri| {
         var url_buf: [96]u8 = undefined;
@@ -21119,20 +28908,25 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // a filter is asking the wrong question of it.
         if (!entry.read) continue;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
         defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
 
         // Phase 1: the replies themselves (kind:1 e-tagging the root). Collect
         // their ids as they arrive so phase 2 can watch their engagement too.
         var id_hex: [thread_reply_cap][64]u8 = undefined;
-        var watch_ids: [thread_reply_cap + 1]i64 = undefined;
+        var watch_ids: [thread_reply_cap + 2]i64 = undefined;
         var id_count: usize = 0;
-        // The root is watched from the start, so its own counts refresh.
-        watch_ids[0] = @intCast(std.mem.readInt(u64, root_id[0..8], .big) & std.math.maxInt(i64));
-        var watch_len: usize = 1;
+        // The note pressed, and the conversation's root when that is a
+        // different note, are both watched from the start so their own counts
+        // refresh alongside the replies'.
+        var watch_len: usize = 0;
+        while (watch_len < thread_count) : (watch_len += 1) watch_ids[watch_len] = thread_watch[watch_len];
 
         const reply_kinds = [_]u16{1};
-        const root_evals = [_][]const u8{&root_hex};
-        const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &root_evals }};
+        const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = thread_evals[0..thread_count] }};
         const reply_filters = [_]nostr.filter.Filter{.{ .kinds = &reply_kinds, .tags = &reply_tags, .limit = thread_reply_cap }};
         relay.subscribe("plaza-thread", &reply_filters) catch continue;
         while (true) {
@@ -21158,16 +28952,15 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // Phase 2: engagement on the root and every reply (replies, reposts,
         // likes, zaps), folded into the shared table so the thread shows real
         // metrics on each row, the same counts the feed shows.
-        var evals: [thread_reply_cap + 1][]const u8 = undefined;
-        evals[0] = &root_hex;
-        var eval_len: usize = 1;
+        var evals: [thread_reply_cap + 2][]const u8 = undefined;
+        var eval_len: usize = 0;
+        while (eval_len < thread_count) : (eval_len += 1) evals[eval_len] = thread_evals[eval_len];
         for (0..id_count) |i| {
             evals[eval_len] = &id_hex[i];
             eval_len += 1;
         }
-        const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
         const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..eval_len] }};
-        const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags, .limit = 500 }};
+        const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
         relay.subscribe("plaza-thread-eng", &eng_filters) catch continue;
         while (true) {
             var msg = (relay.receive() catch break) orelse break;
@@ -21260,12 +29053,30 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
     return true;
 }
 
+/// A request id nobody watching the relay can guess.
+///
+/// These were `req-0`, `req-1`, and so on, from a counter that starts at zero
+/// on every launch. Our client pubkey is not a secret: it is the `p` tag on
+/// every request we publish. Anyone reading the bunker's relay could therefore
+/// address an answer to us and guess which request was in flight. They still
+/// cannot read the request, and after the sender check above they cannot be
+/// heard at all, but a request id should not be a countdown either.
+///
+/// Sixteen hex characters from the system CSPRNG, the same source the ephemeral
+/// client key comes from.
+fn newRequestId(out: *[24]u8) ?[]const u8 {
+    const io = g_io orelse return null;
+    var raw: [8]u8 = undefined;
+    io.randomSecure(&raw) catch return null;
+    return std.fmt.bufPrint(out, "{x}", .{raw}) catch null;
+}
+
 /// Sends the NIP-46 `connect` request (remote pubkey + optional secret).
 fn sendConnect(gpa: std.mem.Allocator) void {
     var hexbuf: [64]u8 = undefined;
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
-    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch return;
+    const req_id = newRequestId(&idbuf) orelse return;
     if (!registerPending(req_id, .connect, null, false)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
@@ -21300,7 +29111,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     defer gpa.free(unsigned_json);
 
     var idbuf: [24]u8 = undefined;
-    const req_id = std.fmt.bufPrint(&idbuf, "req-{d}", .{g_req_counter.fetchAdd(1, .monotonic)}) catch {
+    const req_id = newRequestId(&idbuf) orelse {
         gpa.free(content_owned);
         return;
     };
@@ -21342,6 +29153,12 @@ fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
 
     var relay = nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]) catch return;
     defer relay.deinit();
+    // The read below waits for the relay's OK. Without a deadline a bunker
+    // relay that accepts the publish and says nothing holds this thread, and
+    // this is the signing path: one wedged request would be one thread gone for
+    // the life of the process, every time the reader signed anything.
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
     relay.publish(sealed.event) catch return;
     // Read the relay's OK so the frame flushes before we close; best-effort.
     var msg = (relay.receive() catch return) orelse return;
@@ -21374,14 +29191,32 @@ fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
 /// until the connection drops or this listener's `generation` is superseded.
 fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, generation: u64) !void {
     var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
+    // Withdrawn before the connection is freed: declared after `deinit`, so it
+    // runs before it.
     defer relay.deinit();
+    offerLiveRelay(bunker_watch_slot, relay);
+    defer offerLiveRelay(bunker_watch_slot, null);
 
     var client_hex: [64]u8 = undefined;
     hexLower(&client_hex, client_kp.public_key);
     const pvals = [_][]const u8{&client_hex};
     const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &pvals }};
     const kinds = [_]u16{nostr.nip46.kind};
-    const filters = [_]nostr.filter.Filter{.{ .kinds = &kinds, .tags = &tag_filters }};
+    // FROM THE SIGNER, addressed to us. The `p` tag alone is not a restriction:
+    // our client pubkey is on every request we publish, so anyone reading the
+    // relay can address an event to it. Naming the author is what makes this
+    // subscription about a conversation with one party.
+    //
+    // `limit = 0` asks for nothing stored. Kind 24133 is ephemeral and a relay
+    // should not be keeping it, but one that does would otherwise replay a
+    // previous session's answers into this one.
+    const authors = [_][32]u8{g_remote_pubkey};
+    const filters = [_]nostr.filter.Filter{.{
+        .authors = &authors,
+        .kinds = &kinds,
+        .tags = &tag_filters,
+        .limit = 0,
+    }};
     try relay.subscribe("plaza-nip46", &filters);
 
     while (generation == g_remote_generation.load(.acquire)) {
@@ -21402,6 +29237,16 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
 /// twice and a stale session's response never lands.
 fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event, generation: u64) void {
     if (generation != g_remote_generation.load(.acquire)) return;
+    // Only the signer this session connected to.
+    //
+    // A relay filter is a request, not a guarantee, and this one has to hold on
+    // its own because of how NIP-44 works: the conversation key is derived from
+    // the SENDER's key, so an event from anybody decrypts successfully as long
+    // as they encrypted it to our client key. That key is public. Without this
+    // line, a stranger who guesses the id of a request in flight can answer it,
+    // and the answer is either an event we then publish from the reader's
+    // machine to the reader's relays, or a failure that discards their note.
+    if (!std.mem.eql(u8, &ev.pubkey, &g_remote_pubkey)) return;
     const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
     defer gpa.free(plaintext);
     var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
@@ -21429,6 +29274,11 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
+            // Signed as the account we asked it to sign as. The verify further
+            // down the write path checks that an event's signature matches its
+            // OWN pubkey, which a stranger's event also satisfies, so this is
+            // the check that says the note is this reader's.
+            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return;
             // A process-lifetime copy of the content: `parsed` is freed on
             // return, but the detached publisher reads it afterwards. Our
             // composer produces tagless kind:1 notes, so an empty tag set still
@@ -21440,7 +29290,9 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             // Preserve the signed tags (a reaction carries e/p/k); forcing them
             // empty would make the id not match, and the verify below would drop
             // it. Deep-copied because `parsed` is freed on return.
-            out.tags = dupeTags(gpa, parsed.value.tags);
+            // Whole, or not published: the id is computed over these tags, so
+            // a partial copy is an event the verify below would drop anyway.
+            out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
             ingestAndPublish(gpa, out, signer);
         },
     }
@@ -21637,10 +29489,12 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
         return;
     };
     g_store = store;
+    seedFeedNewest(store);
     // The reader's own follow list is already on disk from last session. Read it
     // before the first frame, so a local-first app opens on THEIR feed rather
     // than on nine strangers while it waits for a relay.
     loadFollowsFromStore();
+    loadMutesFromStore();
     loadInbox();
 
     // The reader's own list, or the one the app was born with. Read before the
@@ -21660,6 +29514,32 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
             continue;
         };
         thread.detach();
+    }
+
+    // And one per discovered relay: where the reader's follows turned out to
+    // be, which the pool would never ask because it only knows the reader's own
+    // list. Spawned even before the table has anything in it, because these are
+    // slot threads like the pool's: they park until a slot is filled.
+    for (0..max_discovered_relays) |i| {
+        if (std.Thread.spawn(.{}, discoveredRelayThread, .{ gpa, i })) |t| {
+            t.detach();
+        } else |err| {
+            std.debug.print("plaza: discovered relay {d} did not start: {s}\n", .{ i, @errorName(err) });
+        }
+    }
+
+    // One more, watching all of them. It has to be a separate thread and not
+    // work folded into the eight: each of those is blocked inside `receive`
+    // exactly when there is something to notice, and a thread waiting on a dead
+    // peer is the last thing that can tell it has stopped answering.
+    if (std.Thread.spawn(.{}, relayKeeper, .{gpa})) |keeper| {
+        keeper.detach();
+    } else |err| {
+        // Not fatal. Without it the pool behaves the way it did before: a
+        // half-open socket sits there. Said out loud rather than swallowed,
+        // because "the feed silently stopped updating" is the symptom and it
+        // looks nothing like its cause.
+        std.debug.print("plaza: relay keepalive did not start ({s}); a dropped connection will not be noticed\n", .{@errorName(err)});
     }
 }
 
@@ -21963,10 +29843,15 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
     g_client_tag = false;
+    g_media_proxy_on = true;
+    g_media_direct_fallback = true;
+    g_hidden = @splat(false);
+    g_rail_open = false;
+    g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(1024)) catch return;
+    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(2048)) catch return;
     defer gpa.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
@@ -21975,6 +29860,136 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "media_direct_fallback")) g_media_direct_fallback = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // Written by id rather than by position, so adding an element to the
+        // registry, or reordering it, cannot silently un-hide something.
+        if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
+        if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // An empty value is meaningful here too: it is your own Plaza.
+        if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
+    }
+}
+
+/// Where the places you have entered are written.
+///
+/// A local file for v1, and that is a privacy decision as much as a simplicity
+/// one: a list of the communities somebody belongs to is sensitive, and a file
+/// on their own disk exposes nothing at all. The encrypted `kind:30078` version
+/// that syncs across devices is v2, and it has two hazards already written down
+/// in the notes: it is replaceable, so it must be read back before it is
+/// written, and NIP-44 decrypt is a signer capability a remote bunker may not
+/// offer.
+///
+/// Written in Hallway's own shape, one document per line, so the file is the
+/// documents and not a private encoding of them.
+const places_file = "places";
+
+/// Copies what the live place has seen back onto its entry in the list, so the
+/// file records the room as it was left.
+/// How often the room being read is written down. This is a convenience for
+/// the next launch, not a transaction, so it is coarse on purpose.
+const place_flush_s: i64 = 5;
+var g_place_flushed_at: i64 = 0;
+var g_place_flushed_rev: u32 = 0;
+
+/// Writes the ids down while the reader is still in the place.
+///
+/// Without this the file only ever held what existed at the moment Enter was
+/// pressed, which is nothing: the notes arrive afterwards. So the place was
+/// remembered and its contents never were, and the next launch opened an empty
+/// room having saved the ids of nothing.
+fn flushPlaceIds(now_s: i64) void {
+    if (g_place == null or !g_place_kept) return;
+    const rev = g_place_rev.load(.monotonic);
+    if (rev == g_place_flushed_rev) return;
+    if (now_s - g_place_flushed_at < place_flush_s) return;
+    g_place_flushed_at = now_s;
+    g_place_flushed_rev = rev;
+    savePlaces();
+}
+
+fn rememberPlaceIds() void {
+    const m = g_place orelse return;
+    const i = placeIndexOf(m.author, m.ident()) orelse return;
+    g_places[i].seen_len = @intCast(placeIdsSnapshot(&g_places[i].seen));
+}
+
+fn savePlaces() void {
+    rememberPlaceIds();
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    if (g_places_len == 0) {
+        dir.deleteFile(io, places_file) catch {};
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (g_places[0..g_places_len]) |*m| {
+        out.print(gpa,
+            \\{{"appName":{f},"homeMarkdown":{f},"hardcodedFeeds":[{{"name":{f},"relays":[{f}]}}],"host":{f},"d":{f}
+        , .{
+            std.json.fmt(m.name(), .{}),
+            std.json.fmt(m.home(), .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].name() else "", .{}),
+            std.json.fmt(if (m.feeds_len > 0) m.feeds[0].relay() else "", .{}),
+            std.json.fmt(&std.fmt.bytesToHex(m.author, .lower), .{}),
+            std.json.fmt(m.ident(), .{}),
+        }) catch return;
+        // The ids, so returning here is instant. Written last and by hand
+        // rather than through the struct formatter, because they are ours and
+        // not part of Hallway's document.
+        out.appendSlice(gpa, ",\"seen\":[") catch return;
+        for (m.seen[0..m.seen_len], 0..) |id, i| {
+            if (i > 0) out.append(gpa, ',') catch return;
+            out.print(gpa, "\"{s}\"", .{&std.fmt.bytesToHex(id, .lower)}) catch return;
+        }
+        out.appendSlice(gpa, "]}") catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    dir.writeFile(io, .{
+        .sub_path = places_file,
+        .data = out.items,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, places_file, gpa, std.Io.Limit.limited((place_home_cap + place_seed_cap * 70 + 1024) * max_places)) catch return;
+    defer gpa.free(raw);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (g_places_len == g_places.len) break;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        var m = parsePlace(gpa, line) orelse continue;
+        // `host` and `d` are ours, not Hallway's, so they are read here rather
+        // than in the shared parser: they are how a place is told apart from
+        // another with the same title, and how it is re-fetched later.
+        const Extra = struct { host: []const u8 = "", d: []const u8 = "", seen: []const []const u8 = &.{} };
+        if (std.json.parseFromSlice(Extra, gpa, line, .{ .ignore_unknown_fields = true })) |ex| {
+            defer ex.deinit();
+            if (ex.value.host.len == 64) {
+                _ = std.fmt.hexToBytes(&m.author, ex.value.host) catch {};
+            }
+            m.ident_len = @intCast(copyBounded(&m.ident_buf, ex.value.d));
+            for (ex.value.seen) |hex| {
+                if (m.seen_len == m.seen.len) break;
+                if (hex.len != 64) continue;
+                var id: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&id, hex) catch continue;
+                m.seen[m.seen_len] = id;
+                m.seen_len += 1;
+            }
+        } else |_| {}
+        g_places[g_places_len] = m;
+        g_places_len += 1;
     }
 }
 
@@ -21984,11 +29999,20 @@ fn saveSettings() void {
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-    var buf: [512]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\n", .{
+    var hidden_buf: [256]u8 = undefined;
+    const hidden_ids = hiddenLine(&hidden_buf);
+    var place_buf: [160]u8 = undefined;
+    const place = activePlaceLine(&place_buf);
+    var buf: [1024]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
+        hidden_ids,
+        if (g_media_proxy_on) "on" else "off",
+        if (g_media_direct_fallback) "on" else "off",
+        if (g_rail_open) "on" else "off",
+        place,
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
@@ -22105,7 +30129,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     g_remote_secret_len = 0;
     g_remote_status.store(0, .release);
     g_login_error.store(@intFromEnum(LoginError.none), .release);
-    g_last_count = std.math.maxInt(usize);
+    invalidateFeed();
 
     // The relay list belongs to the ACCOUNT, not the machine: it came from their
     // kind:10002 and it names where they read and write. Carrying it into the
@@ -22120,7 +30144,9 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // And who the leaving account followed, so the next reader is not shown a
     // feed built from a stranger's list.
     forgetFollows();
+    forgetMutes();
     resetInbox();
+    forgetPlaces();
     model.notifications_open = false;
     model.editing_profile = false;
     model.profile_seeded = false;
@@ -22135,6 +30161,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
+    model.draft_dropped = 0;
     // Every other thing the previous reader typed, for the same reason the draft
     // is cleared: it is their private thinking, and it is one press from being
     // published under the NEXT account's key.
@@ -22184,7 +30211,541 @@ fn performLogout(model: *Model, fx: *Effects) void {
 // subscribes for recent kind:1, verifies each event, and writes it into the
 // shared store; the UI thread reads it back through `Model.refresh`.
 
-/// One relay's ingest loop: dial, serve, and reconnect after a short delay,
+/// The first wait before redialling a relay whose connection ended, and the
+/// ceiling that wait grows to.
+///
+/// This used to be a flat three seconds, forever, with no counter. A relay that
+/// is down, that has stopped taking this reader, or that accepts the handshake
+/// and then drops the socket was dialled twelve hundred times an hour for as
+/// long as the app stayed open, from eight threads with no jitter between them,
+/// and every one of those dials re-asked for the whole backlog.
+const reconnect_base_ms: u64 = 3_000;
+const reconnect_max_ms: u64 = 300_000;
+
+/// How long a connection has to last before it counts as having worked.
+///
+/// The reason for the rule is not obvious: a successful handshake is NOT
+/// evidence that a relay is healthy. A relay that accepts the socket and
+/// immediately closes it would reset the ladder on every open, and the widening
+/// delay would never widen. Only a connection that stayed up clears the count.
+const stable_connection_ms: i64 = 60_000;
+
+/// The wait before redialling, after `attempts` connections in a row that did
+/// not last. Doubling, capped.
+pub fn reconnectDelayMs(attempts: u6) u64 {
+    const shift: u6 = @min(attempts, 7);
+    return @min(reconnect_base_ms << shift, reconnect_max_ms);
+}
+
+/// The attempt count after a connection that stayed up for `lasted_ms`.
+///
+/// Separate from the loop so the rule can be asserted rather than described: a
+/// connection only clears the ladder by LASTING, never by opening.
+pub fn nextReconnectAttempts(attempts: u6, lasted_ms: i64) u6 {
+    return if (lasted_ms >= stable_connection_ms) 0 else attempts +| 1;
+}
+
+/// Extra delay for slot `index`, so the pool does not redial in lockstep.
+///
+/// Spread rather than randomness, because the thing being avoided is specific:
+/// eight threads that dropped together on one network blip coming back together,
+/// and then staying in step for the rest of the session. Walking the offset by
+/// the attempt as well as the slot separates two relays that happened to start
+/// aligned. Never more than a quarter of the wait, and it is a function, so what
+/// it promises can be asserted.
+pub fn reconnectJitterMs(wait: u64, index: usize, attempts: u6) u64 {
+    const slice = wait / 64;
+    const step = (index *% 5 +% @as(usize, attempts) *% 3) % 16;
+    return slice * step;
+}
+
+/// Opens, or replaces, the engagement subscription over the first `count`
+/// watched notes.
+///
+/// A REQ under an existing id IS a replacement, so widening the watched set
+/// costs one message and no CLOSE.
+/// Records a feed note's id so its engagement can be watched, deduped and
+/// bounded.
+///
+/// Shared by the pool threads and the routed ones, because they had drifted:
+/// the pool watched engagement and the routed relays did not, and after the
+/// outbox landed the routed relays are the ones carrying most of the feed. One
+/// function is what stops that happening again.
+///
+/// The cap keeps the `#e` filter a size relays actually accept.
+pub const engagementWatchCapForTest = engagement_watch_cap;
+
+pub fn rememberFeedIdForTest(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: *usize,
+    ev: nostr.event.Event,
+) void {
+    rememberFeedId(ids, hex, len, ev);
+}
+
+fn rememberFeedId(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: *usize,
+    ev: nostr.event.Event,
+) void {
+    if (len.* >= engagement_watch_cap) return;
+    const nid = noteIdOf(ev);
+    for (ids[0..len.*]) |seen| {
+        if (seen == nid) return;
+    }
+    ids[len.*] = nid;
+    hexLower(&hex[len.*], ev.id);
+    len.* += 1;
+}
+
+fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_cap][64]u8, count: usize) void {
+    if (count == 0) return;
+    var evals: [engagement_watch_cap][]const u8 = undefined;
+    for (0..count) |i| evals[i] = &hex[i];
+    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..count] }};
+    const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
+    relay.subscribe("plaza-engagement", &eng_filters) catch {};
+}
+
+// -- Every socket asks only about the people it can answer for ---------------
+//
+// The pool used to ask all eight of its relays about every followed author, and
+// the routed relays asked about theirs. That is a hybrid: the routing bought
+// reach, and none of it bought the pool relays a smaller question. Jumble and
+// Amethyst both route the WHOLE feed, and this is that.
+//
+// Each pool relay is asked about the follows who write THERE, plus the
+// residual: everyone no relay in either set is going to be asked about. The
+// residual is what makes the change safe, and defining it correctly is the
+// whole risk. It is NOT "authors with no relay list". It is every author not
+// covered by any chosen relay, list or no list, because an author who publishes
+// only to a relay that did not make the cut is otherwise asked of nobody at all
+// and simply vanishes from the feed. No error, no empty state, which is the
+// exact failure the outbox model exists to fix and the easiest one to
+// reintroduce while fixing it.
+//
+// So the invariant, and there is a test for it by name: every followed author
+// appears in at least one relay's filters.
+
+/// Authors routed to each POOL slot: the follows who write to that relay.
+var g_pool_routed: [max_relays]DiscoveredRelay = @splat(.{});
+/// Everyone no chosen relay covers. Goes to every read-capable pool relay,
+/// which is where they were all being asked before this.
+var g_residual: [max_follows][32]u8 = undefined;
+var g_residual_len: usize = 0;
+
+/// Whether `pubkey` is in `list`.
+fn authorListed(list: []const [32]u8, pubkey: [32]u8) bool {
+    for (list) |a| {
+        if (std.mem.eql(u8, &a, &pubkey)) return true;
+    }
+    return false;
+}
+
+/// Fills the pool's per-slot author lists and the residual, from the same query
+/// result the routed table is built from. Called with the discovered lock held.
+/// `pool_urls`/`pool_lens` are the reader's own read relays, ALREADY SNAPSHOTTED
+/// by the caller. Not read from the relay table here, and that is not a style
+/// choice: the caller holds the relay-table lock, `relaySnapshot` takes the same
+/// one, and it is a plain spinlock with no owner tracking. Reaching for it from
+/// in here is not a slow path, it is a thread waiting on a lock only it could
+/// release. That exact mistake hung the test suite twice today, in this file,
+/// once already inside this very call chain.
+fn fillPoolRoutes(
+    events: []const nostr.event.Event,
+    authors: []const [32]u8,
+    pool_urls: *const [max_relays][96]u8,
+    pool_lens: *const [max_relays]u8,
+    pool_n: usize,
+) void {
+    for (&g_pool_routed) |*p| {
+        p.url_len = 0;
+        p.authors_len = 0;
+    }
+    g_residual_len = 0;
+
+    for (authors) |pubkey| {
+        var placed = false;
+
+        // Already going to a routed relay?
+        for (&g_discovered_next) |*d| {
+            if (d.url_len == 0) continue;
+            if (authorListed(d.authors[0..d.authors_len], pubkey)) {
+                placed = true;
+                break;
+            }
+        }
+
+        // Or writes to one of the reader's own relays. Checked even when a
+        // routed relay already has them: a second copy of the question is the
+        // redundancy that keeps one relay going down from hiding somebody.
+        const ev = eventFor(events, pubkey);
+        if (ev) |e| {
+            var raw: [32][]const u8 = undefined;
+            var selected: [outbox_relays_per_author][]const u8 = undefined;
+            const chosen = selectWriteRelays(raw[0..writeTagUrls(e, &raw)], &selected);
+            for (0..pool_n) |i| {
+                if (pool_lens[i] == 0) continue;
+                if (g_pool_routed[i].authors_len >= discovered_authors_cap) continue;
+                for (selected[0..chosen]) |url| {
+                    if (!relayUrlEql(url, pool_urls[i][0..pool_lens[i]])) continue;
+                    const p = &g_pool_routed[i];
+                    @memcpy(p.url[0..pool_lens[i]], pool_urls[i][0..pool_lens[i]]);
+                    p.url_len = pool_lens[i];
+                    p.authors[p.authors_len] = pubkey;
+                    p.authors_len += 1;
+                    placed = true;
+                    break;
+                }
+            }
+        }
+
+        if (placed) continue;
+        if (g_residual_len >= g_residual.len) continue;
+        g_residual[g_residual_len] = pubkey;
+        g_residual_len += 1;
+    }
+}
+
+/// The stored relay list for `pubkey`, if the query returned one.
+fn eventFor(events: []const nostr.event.Event, pubkey: [32]u8) ?nostr.event.Event {
+    for (events) |e| {
+        if (std.mem.eql(u8, &e.pubkey, &pubkey)) return e;
+    }
+    return null;
+}
+
+/// What pool slot `index` should ask about: the follows who write there, then
+/// everyone nobody else is being asked about. Returns how many went into `out`.
+fn poolAuthors(index: usize, out: *[max_follows + 1][32]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    var n: usize = 0;
+    if (index < g_pool_routed.len) {
+        const p = &g_pool_routed[index];
+        const take = @min(p.authors_len, out.len);
+        @memcpy(out[0..take], p.authors[0..take]);
+        n = take;
+    }
+    for (g_residual[0..g_residual_len]) |pk| {
+        if (n >= out.len) break;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+/// What pool slot `index` asks about, with the fallback the dial path uses.
+///
+/// Nothing routed yet (the first dial happens before any relay list has been
+/// read back) means ask about EVERYONE, which is what this did before routing
+/// existed and is the only answer that cannot hide somebody. Separate from
+/// `poolAuthors` so the fallback is a thing a test can reach; inside the relay
+/// loop it needs a socket.
+fn poolAuthorsOrAll(index: usize, out: *[max_follows + 1][32]u8) usize {
+    const n = poolAuthors(index, out);
+    if (n > 0) return n;
+    return followSnapshot(@ptrCast(out));
+}
+
+pub fn poolAuthorsForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthors(index, out);
+}
+pub fn poolAuthorsOrAllForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthorsOrAll(index, out);
+}
+pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return 0;
+    const d = &g_discovered[index];
+    @memcpy(out[0..d.authors_len], d.authors[0..d.authors_len]);
+    return d.authors_len;
+}
+pub fn clearRoutesForTest() void {
+    lockDiscovered();
+    defer unlockDiscovered();
+    for (&g_pool_routed) |*p| {
+        p.url_len = 0;
+        p.authors_len = 0;
+    }
+    g_residual_len = 0;
+}
+
+/// Forgets which relays hold a routed connection.
+///
+/// Called from the pool resets, because the choice now PREFERS a relay it is
+/// already connected to and a table left behind by the previous test is an
+/// incumbent that would quietly win. Tests that pass only in the order they
+/// happen to run are worse than no tests.
+fn forgetDiscovered() void {
+    lockDiscovered();
+    defer unlockDiscovered();
+    for (&g_discovered) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+    for (&g_discovered_next) |*d| {
+        d.url_len = 0;
+        d.authors_len = 0;
+    }
+}
+
+pub fn forgetDiscoveredForTest() void {
+    forgetDiscovered();
+}
+
+/// The subscription id every routed connection asks under. One id, because a
+/// REQ under an id the relay already holds is a REPLACEMENT rather than a
+/// second subscription (NIP-01), and that is the whole mechanism: the question
+/// changes without the socket closing.
+const outbox_sub_id = "plaza-outbox";
+pub const outboxSubIdForTest = outbox_sub_id;
+
+fn setRoutedLive(index: usize, url: []const u8, gen: u32) void {
+    if (index >= g_routed_live.len or url.len > 96) return;
+    lockLiveRelay(discovered_watch_base + index);
+    defer unlockLiveRelay(discovered_watch_base + index);
+    const r = &g_routed_live[index];
+    @memcpy(r.url[0..url.len], url);
+    r.url_len = @intCast(url.len);
+    r.gen = gen;
+}
+
+fn clearRoutedLive(index: usize) void {
+    if (index >= g_routed_live.len) return;
+    lockLiveRelay(discovered_watch_base + index);
+    defer unlockLiveRelay(discovered_watch_base + index);
+    g_routed_live[index].url_len = 0;
+}
+
+/// Whether routed slot `index` still names the relay this connection dialled.
+fn routedSlotStillNames(index: usize, url: []const u8) bool {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return false;
+    const d = &g_discovered[index];
+    if (d.url_len == 0) return false;
+    return relayUrlEql(d.url[0..d.url_len], url);
+}
+
+/// What the keeper should do about a routed socket whose slot has moved.
+pub const RouteFollowUp = enum {
+    /// The socket is already asking the current question.
+    leave_it,
+    /// Same relay, different people: replace the standing REQ in place.
+    re_ask,
+    /// The slot names another relay, or none. Close it and let the owner redial.
+    retire,
+};
+
+fn routeFollowUp(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
+    if (live_url.len == 0) return .leave_it;
+    if (live_gen == slot_gen) return .leave_it;
+    if (slot_url.len == 0) return .retire;
+    if (!relayUrlEql(live_url, slot_url)) return .retire;
+    return .re_ask;
+}
+
+pub fn routeFollowUpForTest(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
+    return routeFollowUp(live_url, live_gen, slot_url, slot_gen);
+}
+
+/// Brings every live routed socket up to date with its slot, from a thread that
+/// is not blocked reading it. Called once per keeper tick.
+fn followRouteChanges(io: std.Io) void {
+    for (0..max_discovered_relays) |i| {
+        const slot_gen = g_discovered_gen[i].load(.acquire);
+        var slot_url: [96]u8 = undefined;
+        var authors: [discovered_authors_cap][32]u8 = undefined;
+        // Read before the live lock is taken: `discoveredSnapshot` takes the
+        // discovered lock, and the keeper's other loop already holds a live
+        // lock while it works. Two locks held at once is how the last hang
+        // happened, so they are never held at once here.
+        const snap = discoveredSnapshot(i, slot_gen, &slot_url, &authors);
+        const slot_url_len = if (snap) |s| s.url_len else 0;
+
+        const watch = discovered_watch_base + i;
+        lockLiveRelay(watch);
+        defer unlockLiveRelay(watch);
+        const r = &g_routed_live[i];
+        switch (routeFollowUp(r.url[0..r.url_len], r.gen, slot_url[0..slot_url_len], slot_gen)) {
+            .leave_it => {},
+            .re_ask => {
+                const relay = g_relay_live[watch] orelse continue;
+                var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
+                const filters = buildRoutedFilters(authors[0..snap.?.authors_len], &filter_buf);
+                relay.subscribe(outbox_sub_id, filters) catch continue;
+                r.gen = slot_gen;
+            },
+            .retire => {
+                const relay = g_relay_live[watch] orelse continue;
+                // Half-close, so the owner's blocked `receive` returns and it
+                // redials through its own path. NOT deinit: the owner still
+                // holds this and has to unwind.
+                relay.shutdown(io);
+                g_relay_live[watch] = null;
+                r.url_len = 0;
+            },
+        }
+    }
+}
+pub fn residualCountForTest() usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    return g_residual_len;
+}
+
+/// One discovered relay's loop: dial, ask about the people who write there,
+/// ingest, and redial when the connection drops or the table moves under it.
+///
+/// Deliberately thinner than the pool's loop. No publish, no latency probe, no
+/// engagement subscription, no inbox: this connection exists to close one gap,
+/// which is that a follow writing somewhere the reader is not would otherwise
+/// never arrive at all.
+fn discoveredRelayThread(gpa: std.mem.Allocator, index: usize) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var attempts: u6 = 0;
+    var url_buf: [96]u8 = undefined;
+    var authors: [discovered_authors_cap][32]u8 = undefined;
+    while (true) {
+        const gen = g_discovered_gen[index].load(.acquire);
+        const snap = discoveredSnapshot(index, gen, &url_buf, &authors);
+        if (snap == null or relaysPaused()) {
+            attempts = 0;
+            io.sleep(std.Io.Duration.fromSeconds(2), .awake) catch {};
+            continue;
+        }
+        const opened_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        const url = url_buf[0..snap.?.url_len];
+        discoveredOnce(gpa, io, signer, index, url, authors[0..snap.?.authors_len], gen) catch {};
+        const lasted = std.Io.Timestamp.now(io, .awake).toMilliseconds() - opened_at;
+        // The pool's ladder, and its guard: a relay that accepts the handshake
+        // and drops the socket would otherwise reset the backoff on every
+        // connection and redial in a tight loop forever.
+        attempts = nextReconnectAttempts(attempts, lasted);
+        // Unlike the pool, this slot can be spent elsewhere. A connection that
+        // held is a relay that will have us; a run of short ones is a relay that
+        // will not, and the slot is worth more on the next relay down.
+        if (attempts == 0) {
+            clearRelayRefusal(url);
+        } else if (noteRelayRefusal(url)) {
+            // Ask for a rethink rather than waiting for somebody's relay list
+            // to land, which on a settled account may be never.
+            g_relay_ranks_dirty.store(true, .release);
+        }
+        const base = reconnectDelayMs(attempts);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(base + reconnectJitterMs(base, index, attempts))), .awake) catch {};
+    }
+}
+
+fn discoveredOnce(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    signer: nostr.keys.Signer,
+    index: usize,
+    url: []const u8,
+    authors: []const [32]u8,
+    gen_in: u32,
+) !void {
+    const authors_len_in = authors.len;
+    var relay = try nostr.relay.dial(gpa, io, url);
+    // Declared after `deinit` so it runs before it: the keeper must have let go
+    // of the pointer before the connection is freed.
+    defer relay.deinit();
+    offerLiveRelay(discovered_watch_base + index, relay);
+    defer offerLiveRelay(discovered_watch_base + index, null);
+
+    var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
+    try relay.subscribe(outbox_sub_id, buildRoutedFilters(authors[0..authors_len_in], &filter_buf));
+
+    // The notes this relay carries, so their engagement can be watched HERE.
+    //
+    // The pool threads have done this since counts existed, and these have not,
+    // and after the outbox landed these are the relays that carry most of the
+    // feed. So a note routed here showed no replies, no likes and no zaps for as
+    // long as it was on screen: the numbers only appeared once the note was
+    // opened, because a thread fetches engagement on its own path, and then they
+    // were in the table and the feed looked fine. That is why this reads as
+    // "counts load late" rather than as "counts are missing".
+    var feed_ids: [engagement_watch_cap]i64 = undefined;
+    var feed_id_hex: [engagement_watch_cap][64]u8 = undefined;
+    var feed_ids_len: usize = 0;
+    var engagement_watching: usize = 0;
+    var engagement_at: i64 = 0;
+    // Published only now, so the keeper never replaces a question that has not
+    // been asked yet. Cleared on the way out, before the connection is freed.
+    setRoutedLive(index, url, gen_in);
+    defer clearRoutedLive(index);
+
+    while (true) {
+        if (relaysPaused()) return;
+        // Widen as more of this relay's feed arrives, on the same rule the pool
+        // threads use: a subscription opened once at EOSE leaves every note that
+        // arrives afterwards reading zero forever.
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
+            now_ms - engagement_at > engagement_widen_ms)
+        {
+            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+            engagement_watching = feed_ids_len;
+            engagement_at = now_ms;
+        }
+        // The slot was pointed at a DIFFERENT relay. Nothing here is worth
+        // keeping, so drop it and let the loop dial whatever the slot holds now.
+        //
+        // A change of WHO is not checked here and must not be: this thread only
+        // reaches this line when the relay says something, and a relay with
+        // nothing to say says nothing. The keeper replaces the question on the
+        // live socket instead.
+        if (!routedSlotStillNames(index, url)) return;
+        var msg = (relay.receive() catch return) orelse return;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                if (std.mem.eql(u8, e.subscription_id, outbox_sub_id)) {
+                    // Verified before it is stored. This is a relay the reader
+                    // never chose, reached because a follow named it, so it gets
+                    // less trust than the pool rather than more.
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind == 1) {
+                        noteFeedNewest(e.event.created_at);
+                        rememberFeedId(&feed_ids, &feed_id_hex, &feed_ids_len, e.event);
+                    }
+                } else {
+                    // The engagement subscription. Verified too, so a forged
+                    // reaction cannot inflate a tally.
+                    if (nostr.event.verify(gpa, signer, e.event) catch false) {
+                        countEngagement(e.event, feed_ids[0..feed_ids_len]);
+                    }
+                }
+            },
+            .eose => |eo| {
+                // What this relay had, drained: now watch those notes.
+                if (engagement_watching == 0 and feed_ids_len > 0 and
+                    std.mem.eql(u8, eo.subscription_id, outbox_sub_id))
+                {
+                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                    engagement_watching = feed_ids_len;
+                    engagement_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+                }
+            },
+            .closed => return,
+            else => {},
+        }
+    }
+}
+
+/// One relay's ingest loop: dial, serve, and reconnect after a widening delay,
 /// forever.
 fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -22194,11 +30755,21 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
+    // Connections in a row that did not last `stable_connection_ms`.
+    var attempts: u6 = 0;
+    // The address last dialled, so re-pointing a slot starts a clean ladder
+    // instead of inheriting the previous relay's failures. Fixing a typo in a
+    // relay URL should take effect now, not in five minutes.
+    var tried_buf: [96]u8 = undefined;
+    var tried_len: usize = 0;
+
     while (true) {
         // An empty slot is not an error: it is a seat kept for a relay the
         // reader may add. It costs a sleeping thread and nothing else.
         if (relayAt(index) == null) {
             setRelayStatus(index, .offline);
+            attempts = 0;
+            tried_len = 0;
             io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
             continue;
         }
@@ -22206,16 +30777,30 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
         // pausing costs them nothing but the live tail.
         if (relaysPaused()) {
             setRelayStatus(index, .offline);
+            attempts = 0;
             io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
             continue;
         }
+        var url_buf: [96]u8 = undefined;
+        if (relaySnapshot(index, &url_buf)) |now| {
+            if (!relayUrlEql(now.url, tried_buf[0..tried_len])) {
+                attempts = 0;
+                tried_len = now.url.len;
+                @memcpy(tried_buf[0..tried_len], now.url);
+            }
+        }
         setRelayStatus(index, .connecting);
+        const opened_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         ingestOnce(gpa, io, signer, index) catch |err| {
             std.debug.print("plaza: [{s}] {s}\n", .{ relayUrlAt(index), @errorName(err) });
         };
         setRelayStatus(index, .offline);
         clearRelayRtt(index);
-        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+        const lasted = std.Io.Timestamp.now(io, .awake).toMilliseconds() - opened_at;
+        attempts = nextReconnectAttempts(attempts, lasted);
+        const wait = reconnectDelayMs(attempts);
+        const spread = reconnectJitterMs(wait, index, attempts);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait + spread)), .awake) catch {};
     }
 }
 
@@ -22229,7 +30814,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     const url = entry.url;
     const reads = entry.read;
     var relay = try nostr.relay.dial(gpa, io, url);
+    // Withdrawn BEFORE the connection is freed, and the defers unwind in
+    // reverse, so this one is declared second and runs first. The other order
+    // hands the keeper a pointer to a `Relay` that is already gone.
     defer relay.deinit();
+    offerLiveRelay(index, relay);
+    defer offerLiveRelay(index, null);
     setRelayStatus(index, .connected);
 
     // Follow-scoped: the starter pack's recent notes for the feed, plus their
@@ -22238,10 +30828,19 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     var authors: [max_follows + 1][32]u8 = undefined;
     // Snapshotted, not borrowed: `followSet` hands back a slice of a table the
     // UI thread rewrites when a follow lands, and this filter outlives the frame.
-    var authors_len: usize = followSnapshot(@ptrCast(&authors));
+    // Not every follow: the ones who write HERE, plus everyone no relay in
+    // either set is being asked about. See `fillPoolRoutes`.
+    //
+    // Before the routing existed this was the whole follow list on all eight
+    // relays, which asked every relay about two thousand strangers and told
+    // each of them the reader's entire social graph.
+    var authors_len: usize = poolAuthorsOrAll(index, &authors);
     // The generation this subscription was built for. When it moves, this
     // connection is asking the wrong question and re-asks below.
     var subscribed_gen = followGeneration();
+    // Set to the generation already served by `subscribeInbox` at dial below,
+    // so the loop does not immediately re-issue what was just sent.
+    var inbox_gen = identityGeneration();
     // Whether this subscription asked about the reader themselves. A connection
     // dialed while signed out did not, and its EOSE is not an answer about them.
     var asked_about_me = activePubkey() != null;
@@ -22249,14 +30848,6 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         authors[authors_len] = pk;
         authors_len += 1;
     }
-    const feed_kinds = feed_filter_kinds;
-    // kind:0 is who they are, kind:10002 is where they are: the reader's own
-    // relay list, and the relays their follows write to, which is what makes a
-    // suggestion under the add field a fact rather than a guess.
-    // kind:0 is who they are, 10002 is where they are, and 3 is who the reader
-    // follows: their own contact list, which nothing may be written over until
-    // it has been read.
-    const profile_kinds = profile_filter_kinds;
     // Two filters per chunk of authors, all in ONE REQ.
     //
     // `authors_len` INCLUDES the reader. An earlier version took the snapshot
@@ -22273,7 +30864,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // actually accept. The per-chunk limit stays whole for the same reason:
     // dividing it would starve whoever landed in the last chunk.
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = buildFeedFilters(authors[0..authors_len], &filter_buf);
+    const filters = buildFeedFilters(authors[0..authors_len], activePubkey(), feedSince(), &filter_buf);
     // What other people aimed at this reader. Its own subscription, never folded
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
@@ -22287,20 +30878,25 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
     // feed REQ asks for a 300-note backlog plus profiles, so timing it measures
-    // how much this relay had to send, not how fast it answers. The probe is a
-    // one-event query whose REQ-to-EOSE is the round trip the reader cares about,
-    // re-sent periodically so the number stays live. The AWAKE clock, so a system
-    // clock step cannot swing a reading.
+    // how much this relay had to send, not how fast it answers. The probe asks
+    // for an id that cannot exist, so the answer is an empty EOSE and the number
+    // is the round trip and nothing else. Re-sent periodically so it stays live,
+    // and CLOSED as soon as it answers. The AWAKE clock, so a system clock step
+    // cannot swing a reading.
     var probe_at: i64 = 0;
     var probed_at: i64 = 0;
 
     // The loaded notes' ids (and their hex), collected from the feed as it
     // arrives. On the feed's EOSE a second subscription opens for their
-    // engagement, so counts fold in alongside the feed on the same connection.
+    // engagement, so counts fold in alongside the feed on the same connection,
+    // and it is widened as more notes load.
     var feed_ids: [engagement_watch_cap]i64 = undefined;
     var feed_id_hex: [engagement_watch_cap][64]u8 = undefined;
     var feed_ids_len: usize = 0;
-    var engagement_open = false;
+    // How many of those ids the engagement subscription currently names, and
+    // when it was last (re)issued.
+    var engagement_watching: usize = 0;
+    var engagement_at: i64 = 0;
 
     while (true) {
         // A pause takes effect at the next message this relay sends: the thread
@@ -22328,7 +30924,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // leave following disabled for the whole session.
         if (reads and followGeneration() != subscribed_gen) {
             subscribed_gen = followGeneration();
-            authors_len = followSnapshot(@ptrCast(&authors));
+            authors_len = poolAuthorsOrAll(index, &authors);
             var next_authors_len = authors_len;
             asked_about_me = false;
             if (activePubkey()) |pk| {
@@ -22338,11 +30934,21 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     asked_about_me = true;
                 }
             }
-            const next_filters = [_]nostr.filter.Filter{
-                .{ .authors = authors[0..next_authors_len], .kinds = &feed_kinds, .limit = feed_request_limit },
-                .{ .authors = authors[0..next_authors_len], .kinds = &profile_kinds, .limit = profile_cap },
-            };
-            relay.subscribe("plaza-feed", &next_filters) catch {};
+            // Built by the SAME function the dial-time subscription uses.
+            //
+            // This path used to hand-roll its own pair of filters, and both of
+            // the things `buildFeedFilters` exists to prevent came back with it:
+            // every author named in ONE filter, which is past the size several
+            // relays accept once a real follow list is loaded, and a metadata
+            // limit taken from `profile_cap`, which is the size of a screen
+            // cache and has nothing to do with how many records to ask for.
+            //
+            // It mattered more here than anywhere, because this is the path
+            // every reader takes: Plaza dials before anyone has signed in, so
+            // the subscription that carries the actual account is always the
+            // re-issued one, never the one built at dial.
+            const next_filters = buildFeedFilters(authors[0..next_authors_len], activePubkey(), feedSince(), &filter_buf);
+            relay.subscribe("plaza-feed", next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
             // Asking only at dial was the whole feature's undoing, because Plaza
@@ -22351,6 +30957,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // connection, no matter who replied. Re-issuing here is also what
             // heals a REQ that failed to send, and what stops a socket carrying
             // the previous account's filter after a switch.
+        }
+        // The inbox rides its own generation: its filter names ONE pubkey, the
+        // reader's, so a contact-list change has nothing to do with it.
+        if (reads and identityGeneration() != inbox_gen) {
+            inbox_gen = identityGeneration();
             subscribeInbox(relay);
         }
         var msg = (try relay.receive()) orelse break;
@@ -22360,16 +30971,28 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // rides the next message rather than a timer; a relay too quiet to carry
         // one is also a relay whose latency nobody is waiting on.
         //
-        // A write-only relay is probed too: one newest note, which says nothing
-        // about who this reader follows or reads, and its answer is the latency
-        // shown beside a relay they do use.
+        // A write-only relay is probed too: a question about one id that does
+        // not exist, which says nothing about who this reader follows or reads,
+        // and its answer is the latency shown beside a relay they do use.
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         if (probe_at == 0 and (probed_at == 0 or now_ms - probed_at > probe_interval_ms)) {
-            const probe_filters = [_]nostr.filter.Filter{.{ .kinds = &feed_kinds, .limit = 1 }};
+            const probe_filters = probeFilters();
             if (relay.subscribe(probe_sub, &probe_filters)) |_| {
                 probe_at = now_ms;
                 probed_at = now_ms;
             } else |_| {}
+        }
+        // Widen the engagement subscription as more of the feed loads. It used
+        // to be opened once per connection over whatever had arrived by the
+        // feed's EOSE and never touched again, so every note past that point
+        // read zero likes, zero replies and zero zaps for the whole session, and
+        // so did every note that arrived live.
+        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
+            now_ms - engagement_at > engagement_widen_ms)
+        {
+            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+            engagement_watching = feed_ids_len;
+            engagement_at = now_ms;
         }
         switch (msg.value) {
             .event => |e| {
@@ -22392,26 +31015,29 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     if (result == .invalid) continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
-                    if (e.event.kind == 1) markRelaySeen(noteIdOf(e.event), index);
+                    if (e.event.kind == 1) {
+                        markRelaySeen(noteIdOf(e.event), index);
+                        // What the next subscription will start from.
+                        noteFeedNewest(e.event.created_at);
+                    }
                     if (e.event.kind == relay_list_kind) ingestRelayList(e.event);
                     if (e.event.kind == contact_list_kind) ingestContactList(e.event);
                     // Note this feed post so its engagement can be watched. Bounded
                     // to keep the `#e` filter a size relays accept.
-                    if (e.event.kind == 1 and feed_ids_len < engagement_watch_cap) {
-                        const nid = noteIdOf(e.event);
-                        var known = false;
-                        for (feed_ids[0..feed_ids_len]) |fid| {
-                            if (fid == nid) {
-                                known = true;
-                                break;
-                            }
-                        }
-                        if (!known) {
-                            feed_ids[feed_ids_len] = nid;
-                            hexLower(&feed_id_hex[feed_ids_len], e.event.id);
-                            feed_ids_len += 1;
-                        }
-                    }
+                    if (e.event.kind == 1) rememberFeedId(&feed_ids, &feed_id_hex, &feed_ids_len, e.event);
+                } else if (isOneShotSub(e.subscription_id)) {
+                    // Somebody else's question, answered on this socket. It goes
+                    // to the store like everything else and nothing is routed
+                    // back, which is exactly why the socket can be shared: there
+                    // is no caller waiting on a reply.
+                    //
+                    // This branch has to exist before anything uses `askPool`.
+                    // Without it a one-shot's events fall into the engagement
+                    // arm below and every profile fetched gets counted as
+                    // somebody reacting to a note.
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind == 1) noteFeedNewest(e.event.created_at);
                 } else {
                     // The engagement subscription: fold into the counts, verified
                     // so a forged reaction cannot inflate a tally.
@@ -22423,7 +31049,19 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - probe_at;
                     if (elapsed >= 0) recordRelayRtt(index, @intCast(@min(elapsed, std.math.maxInt(u16))));
                     probe_at = 0;
+                    // Answered, so close it. A REQ stays live past EOSE, and the
+                    // question has been answered: leaving it open is how the
+                    // probe became a standing subscription on every relay.
+                    relay.unsubscribe(probe_sub) catch {};
                 }
+                // A one-shot has been answered. Close it: a REQ stays live past
+                // EOSE, and leaving them open is how the latency probe became a
+                // standing subscription on every relay in the pool.
+                //
+                // Closed HERE, on the thread that owns the socket, and never
+                // before EOSE: relays dislike a CLOSE for a subscription they
+                // are still answering, which NDK's source says in as many words.
+                if (isOneShotSub(eo.subscription_id)) relay.unsubscribe(eo.subscription_id) catch {};
                 if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
                     // Only when THIS subscription actually asked about the
                     // reader. A guest-era filter names nine strangers, and its
@@ -22440,15 +31078,34 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     }
                 }
                 // Stored feed drained: now watch those notes' engagement.
-                if (!engagement_open and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
-                    engagement_open = true;
-                    var evals: [engagement_watch_cap][]const u8 = undefined;
-                    for (0..feed_ids_len) |i| evals[i] = &feed_id_hex[i];
-                    const eng_kinds = [_]u16{ 1, 6, 7, 9735 };
-                    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..feed_ids_len] }};
-                    const eng_filters = [_]nostr.filter.Filter{.{ .kinds = &eng_kinds, .tags = &eng_tags }};
-                    relay.subscribe("plaza-engagement", &eng_filters) catch {};
+                if (engagement_watching == 0 and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                    engagement_watching = feed_ids_len;
+                    engagement_at = now_ms;
                 }
+            },
+            .closed => |c| {
+                // A relay saying no. NIP-01's CLOSED carries a reason, and
+                // dropping it on the floor is what made a refused subscription
+                // indistinguishable from a quiet one: a green chip, "Live", and
+                // nothing arriving, for the rest of the connection, with no
+                // retry and nothing written down.
+                std.debug.print("plaza: [{s}] closed {s}: {s}\n", .{ url, c.subscription_id, c.message });
+                if (std.mem.eql(u8, c.subscription_id, probe_sub)) {
+                    // Only the latency reading is lost. Clear the pending sample
+                    // so the next message asks again rather than waiting forever
+                    // for an EOSE that is not coming.
+                    probe_at = 0;
+                } else if (std.mem.eql(u8, c.subscription_id, "plaza-feed")) {
+                    // The feed is what this connection is FOR, so end it and let
+                    // the reconnect ladder decide when to ask again. A relay that
+                    // refuses this filter now will usually refuse it in three
+                    // seconds too, which is exactly why that delay widens.
+                    return error.FeedSubscriptionClosed;
+                }
+                // The inbox and the engagement subscription are refused on their
+                // own terms. Either one is worth reporting and neither is worth
+                // tearing down a working feed for.
             },
             else => {},
         }
@@ -22457,4 +31114,193 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
 test {
     _ = @import("tests.zig");
+}
+
+// ---------------------------------------------------------------- the bunker
+//
+// Plaza signing for OTHER apps. The work is all in `plaza-signer` (see
+// src/signer/bunker.zig); this is the screen for it.
+//
+// The state here is a MIRROR of the daemon's, refreshed by polling, never the
+// source of truth. The daemon owns whether the bunker is on, who is connected
+// and who is waiting, because it is the process holding the key and answering
+// relays. A UI that kept its own copy would eventually disagree with the thing
+// actually signing, and the disagreement would be invisible.
+
+/// How long an approval lasts, mirroring the daemon's own four.
+pub const BunkerRemember = enum { once, hour, day, always };
+
+const bunker_state_key: u64 = 44;
+const bunker_toggle_key: u64 = 45;
+const bunker_decide_key: u64 = 46;
+const bunker_revoke_key: u64 = 47;
+
+/// How often the screen asks the daemon what it is doing.
+///
+/// Only while Settings is open. A connect request waits two minutes for an
+/// answer, so a second is quick enough that a reader watching the screen sees it
+/// appear, and idle enough to cost nothing when nobody is looking.
+const bunker_poll_ms: i64 = 1000;
+
+var g_bunker_on: bool = false;
+var g_bunker_url_buf: [512]u8 = undefined;
+var g_bunker_url_len: usize = 0;
+var g_bunker_pending_id: u64 = 0;
+var g_bunker_pending_client: [64]u8 = undefined;
+var g_bunker_pending_len: usize = 0;
+/// What the waiting client wants. Empty means it is asking to CONNECT, which
+/// the screen words differently: being let in at all is a different question
+/// from being allowed to sign something.
+var g_bunker_pending_ask: [24]u8 = undefined;
+var g_bunker_pending_ask_len: usize = 0;
+var g_bunker_pending_kind: i32 = -1;
+var g_bunker_clients: [8][64]u8 = undefined;
+var g_bunker_client_count: usize = 0;
+var g_bunker_polled_at: i64 = 0;
+
+pub fn bunkerOn() bool {
+    return g_bunker_on;
+}
+
+pub fn bunkerUrl() []const u8 {
+    return g_bunker_url_buf[0..g_bunker_url_len];
+}
+
+pub fn bunkerPendingClient() []const u8 {
+    return g_bunker_pending_client[0..g_bunker_pending_len];
+}
+
+pub fn bunkerClientCount() usize {
+    return g_bunker_client_count;
+}
+
+/// What the waiting client is asking for, in the reader's words.
+///
+/// A kind number is in there for a signature, because "sign a note" and "change
+/// who you follow" are the same sentence to a signer and very different things
+/// to a person. Only the kinds worth naming are named; the rest are honest about
+/// being a number nobody can read at a glance.
+pub fn bunkerAskLine(arena: std.mem.Allocator) []const u8 {
+    const ask = g_bunker_pending_ask[0..g_bunker_pending_ask_len];
+    if (ask.len == 0) return "wants to sign as you";
+    if (std.mem.eql(u8, ask, "nip44_encrypt")) return "wants to encrypt a message as you";
+    if (std.mem.eql(u8, ask, "nip44_decrypt")) return "wants to read an encrypted message of yours";
+    return switch (g_bunker_pending_kind) {
+        1 => "wants to post a note as you",
+        3 => "wants to change who you follow",
+        5 => "wants to delete something of yours",
+        6, 16 => "wants to repost as you",
+        7 => "wants to react as you",
+        0 => "wants to change your profile",
+        10000 => "wants to change who you have muted",
+        10002 => "wants to change your relay list",
+        else => std.fmt.allocPrint(arena, "wants to sign a kind {d} event as you", .{g_bunker_pending_kind}) catch "wants to sign something as you",
+    };
+}
+
+/// Whether the waiting request is a connect rather than an action.
+pub fn bunkerAskIsConnect() bool {
+    return g_bunker_pending_ask_len == 0;
+}
+
+/// Reads the daemon's answer into the mirror above.
+///
+/// Everything is replaced, never merged: this is a snapshot of what the daemon
+/// believes, and merging would let a stale client linger in the list after it
+/// had been revoked, which is the one thing this list exists to show truthfully.
+pub fn applyBunkerState(json: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const Client = struct { pubkey: []const u8 = "" };
+    const Pending = struct { id: u64 = 0, client: []const u8 = "", ask: []const u8 = "", kind: i32 = -1 };
+    const Body = struct {
+        enabled: bool = false,
+        url: []const u8 = "",
+        pending: ?Pending = null,
+        clients: []const Client = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Body, gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    g_bunker_on = parsed.value.enabled;
+    const n = @min(parsed.value.url.len, g_bunker_url_buf.len);
+    @memcpy(g_bunker_url_buf[0..n], parsed.value.url[0..n]);
+    g_bunker_url_len = n;
+
+    if (parsed.value.pending) |p| {
+        g_bunker_pending_id = p.id;
+        const c = @min(p.client.len, g_bunker_pending_client.len);
+        @memcpy(g_bunker_pending_client[0..c], p.client[0..c]);
+        g_bunker_pending_len = c;
+        const a = @min(p.ask.len, g_bunker_pending_ask.len);
+        @memcpy(g_bunker_pending_ask[0..a], p.ask[0..a]);
+        g_bunker_pending_ask_len = a;
+        g_bunker_pending_kind = p.kind;
+    } else {
+        g_bunker_pending_id = 0;
+        g_bunker_pending_len = 0;
+        g_bunker_pending_ask_len = 0;
+        g_bunker_pending_kind = -1;
+    }
+
+    g_bunker_client_count = 0;
+    for (parsed.value.clients) |c| {
+        if (g_bunker_client_count >= g_bunker_clients.len) break;
+        const len = @min(c.pubkey.len, g_bunker_clients[0].len);
+        @memcpy(g_bunker_clients[g_bunker_client_count][0..len], c.pubkey[0..len]);
+        g_bunker_client_count += 1;
+    }
+}
+
+pub fn bunkerClientAt(i: usize) []const u8 {
+    if (i >= g_bunker_client_count) return "";
+    return &g_bunker_clients[i];
+}
+
+pub fn applyBunkerStateForTest(json: []const u8) void {
+    applyBunkerState(json);
+}
+
+pub fn resetBunkerForTest() void {
+    g_bunker_on = false;
+    g_bunker_url_len = 0;
+    g_bunker_pending_id = 0;
+    g_bunker_pending_len = 0;
+    g_bunker_client_count = 0;
+}
+
+/// Asks the daemon what it is doing, at most once a second and only while the
+/// screen that shows it is open.
+fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
+    // NOT gated on the settings screen, and that was the bug that made this
+    // feature not work at all.
+    //
+    // The reader copies the link in Settings, switches to a browser, and pastes
+    // it into another app. Plaza is in the BACKGROUND at the moment the client
+    // connects, which is the only moment that matters: the relay thread is
+    // parked waiting for an approval, and if nothing is polling, nothing ever
+    // asks. The client waits, gets nothing, and times out. That is exactly what
+    // happened the first time this was tried against a real client.
+    //
+    // So it polls whenever the bunker is on, wherever the reader is, and the
+    // approval is a sheet rather than a row on one screen.
+    // The FIRST poll is unconditional, because "is it on" is exactly what this
+    // does not know yet. The signer puts itself back the way it was left, so a
+    // reader who turned it on last week starts with it serving; if Plaza waited
+    // to be told before asking, it would only find out when they next opened
+    // Settings, and until then a client connecting to that URL would park on an
+    // approval nobody was fetching.
+    if (g_bunker_polled_at != 0 and !g_bunker_on and model.stage != .settings) return;
+    if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
+    g_bunker_polled_at = now_ms;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{helper_port}) catch return;
+    var auth_buf: [96]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
+    fx.fetch(.{
+        .key = bunker_state_key,
+        .url = url,
+        .method = .GET,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.bunker_state),
+    });
 }

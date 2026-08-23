@@ -620,21 +620,107 @@ test "engagement counts one event against its single target, not every e-tag" {
     try testing.expectEqual(@as(u32, 1), main.engagementFor(parent_i64).likes);
 }
 
-test "engagement sums zap sats from the bolt11 amount" {
-    main.resetEngagementForTest();
-    defer main.resetEngagementForTest();
+/// A zap receipt whose `description` carries a real, signed kind:9734 asking
+/// about `target_hex`. Anything less is not a zap the counting path will take.
+fn zapReceipt(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    target_hex: []const u8,
+    invoice: []const u8,
+    amount_msat: ?[]const u8,
+) !nostr.event.Event {
+    // Every slice here is arena-allocated on purpose: `create` borrows the tag
+    // slice rather than copying it, so a local array would dangle the moment
+    // this function returned.
+    const req_e = try arena.dupe([]const u8, &.{ "e", target_hex });
+    var req_tags = try arena.alloc(nostr.event.Tag, if (amount_msat != null) @as(usize, 2) else 1);
+    req_tags[0] = req_e;
+    if (amount_msat) |a| req_tags[1] = try arena.dupe([]const u8, &.{ "amount", a });
+    const req = try nostr.event.create(arena, signer, kp, 1_800_000_000, 9734, req_tags, "", null);
+    const req_json = try nostr.event.toJson(arena, req);
+
+    var tags = try arena.alloc(nostr.event.Tag, 3);
+    tags[0] = try arena.dupe([]const u8, &.{ "e", target_hex });
+    tags[1] = try arena.dupe([]const u8, &.{ "bolt11", invoice });
+    tags[2] = try arena.dupe([]const u8, &.{ "description", req_json });
+    return nostr.event.create(arena, signer, kp, 1_800_000_001, 9735, tags, "", null);
+}
+
+test "a zap counts only when a signed request backs it, for this note" {
+    // The counting path used to add the receipt's own bolt11 string with
+    // nothing checked, and a kind:9735 is an ordinary public event. So any note
+    // could be given any total by publishing a receipt with a big invoice in it
+    // and no payment behind it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x42} ** 32);
 
     var target_id = [_]u8{0} ** 32;
     target_id[0] = 0x5A;
     const target_i64: i64 = @intCast(std.mem.readInt(u64, target_id[0..8], .big) & std.math.maxInt(i64));
     const target_hex = std.fmt.bytesToHex(target_id, .lower);
-    const e_tag = [_][]const u8{ "e", &target_hex };
-    const bolt11 = [_][]const u8{ "bolt11", "lnbc210n1pjxxxxx" }; // 21000 msat = 21 sats
-    const tags = [_]nostr.event.Tag{ &e_tag, &bolt11 };
     const feed = [_]i64{target_i64};
 
-    main.countEngagementForTest(engagementEvent(11, 9735, "", &tags), &feed);
-    try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    // A real one: signed request, about this note, 21 sats.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc210n1pjxxxxx", "21000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // A bare invoice with no request behind it: the forgery, now worth nothing.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const e_tag = [_][]const u8{ "e", &target_hex };
+        const bolt11 = [_][]const u8{ "bolt11", "lnbc10m1pxxx" }; // a million sats
+        const tags = [_]nostr.event.Tag{ &e_tag, &bolt11 };
+        main.countEngagementForTest(engagementEvent(11, 9735, "", &tags), &feed);
+        try testing.expectEqual(@as(u64, 0), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // A genuine receipt for a DIFFERENT note, replayed onto this one.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        var other = [_]u8{0} ** 32;
+        other[0] = 0x77;
+        const other_hex = std.fmt.bytesToHex(other, .lower);
+        // Request names the other note; the receipt's own e tag names this one.
+        const receipt = try zapReceipt(arena, signer, kp, &other_hex, "lnbc210n1pjxxxxx", "21000");
+        var tags = try arena.alloc(nostr.event.Tag, receipt.tags.len);
+        for (receipt.tags, 0..) |t, i| tags[i] = t;
+        tags[0] = try arena.dupe([]const u8, &.{ "e", &target_hex });
+        var moved = receipt;
+        moved.tags = tags;
+        main.countEngagementForTest(moved, &feed);
+        try testing.expectEqual(@as(u64, 0), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // Request and invoice disagreeing: the smaller wins, so neither number
+    // alone can inflate the total.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc10m1pxxx", "21000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(@as(u64, 21_000), main.engagementFor(target_i64).zap_msat);
+    }
+
+    // And a real request for an absurd amount is still clamped.
+    {
+        main.resetEngagementForTest();
+        defer main.resetEngagementForTest();
+        const receipt = try zapReceipt(arena, signer, kp, &target_hex, "lnbc51pxxx", "500000000000");
+        main.countEngagementForTest(receipt, &feed);
+        try testing.expectEqual(main.zap_msat_ceiling_for_test, main.engagementFor(target_i64).zap_msat);
+    }
 }
 
 test "bolt11 amounts parse across multipliers" {
@@ -663,9 +749,10 @@ test "note text splits into link, mention, and plain runs, colored by the identi
     try testing.expectEqualStrings("https://example.com/x", spans[3].text);
     try testing.expectEqualStrings("https://example.com/x", spans[3].link);
     try testing.expect(spans[3].color != null and spans[3].color.? == .info);
-    // We ask for no underline (the redesign's in-text URL is colored and
-    // nothing more). The renderer still draws one under any span carrying a
-    // link payload, which is why this asserts the REQUEST, not the pixels.
+    // No underline: an in-text URL is coloured and nothing more. This used to
+    // assert only the REQUEST, because the renderer drew a rule under any span
+    // carrying a link payload regardless. SDK 0.9.2 made the flag authoritative,
+    // so the request and the pixels are the same claim again.
     try testing.expect(!spans[3].underline);
     // Plain text has no link payload.
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
@@ -998,14 +1085,15 @@ test "a slot wanted on screen is never evicted for another visible picture" {
     // what the touch pass does for pictures on screen.
     const clock = main.touchMediaClockForTest();
     var fx: main.EffectsForTest = undefined;
+    const cap = main.maxMediaImagesForTest();
     var i: i64 = 1;
-    while (i <= 6) : (i += 1) {
+    while (i <= @as(i64, @intCast(cap))) : (i += 1) {
         const slot = main.claimMediaSlotForTest(&fx, i) orelse return error.NoSlot;
         slot.last_used = clock;
     }
-    // A seventh visible picture must get NOTHING rather than steal a wanted
+    // One more visible picture must get NOTHING rather than steal a wanted
     // slot: stealing is the thrash that decoded images every pass.
-    try testing.expect(main.claimMediaSlotForTest(&fx, 7) == null);
+    try testing.expect(main.claimMediaSlotForTest(&fx, @intCast(cap + 1)) == null);
 }
 
 test "avatar ids go to the authors on screen, and never exceed the registry cap" {
@@ -1049,7 +1137,7 @@ test "avatar ids go to the authors on screen, and never exceed the registry cap"
     var fx: main.EffectsForTest = undefined;
     main.assignAvatarSlotsForTest(&fx, &model);
 
-    const cap = main.max_avatar_images;
+    const cap = main.image_registry_slots;
     var seen = [_]bool{false} ** (cap + 1);
     var lent: usize = 0;
     for (keys) |k| {
@@ -1123,7 +1211,7 @@ test "an author deep in a thread gets a face once they are on screen" {
         std.debug.print("an author on screen still holds no face (was {d})\n", .{before});
         return error.DeepAuthorStarved;
     }
-    try testing.expect(after >= 1 and after <= main.max_avatar_images);
+    try testing.expect(after >= 1 and after <= main.image_registry_slots);
 }
 
 test "the logout confirmation replaces the log-out button" {
@@ -1403,6 +1491,78 @@ test "a NIP-46 response is matched to its request by id, and unknown ids are dro
 
     // A second response for the same id finds nothing: no double resolve.
     try testing.expect(main.takePendingContentForTest("req-1") == null);
+}
+
+test "only the signer we connected to can answer a signing request" {
+    // NIP-44 derives its conversation key from the SENDER, so a response from
+    // anybody at all decrypts, as long as they encrypted it to our client key.
+    // That key is public: it is the `p` tag on every request we publish. So the
+    // relay filter cannot be the only thing standing between the reader and a
+    // stranger's answer, and the handler has to check the sender itself.
+    //
+    // Left unchecked, an answer carrying a forged event is stored and published
+    // to the reader's own relays from the reader's own machine, and an answer
+    // carrying an error throws away the note they just wrote.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    const gpa = std.heap.page_allocator;
+
+    // Real keys, and a real sealed response, because a test that hands the
+    // handler undecryptable rubbish passes whether the check is there or not:
+    // the decrypt fails and the slot survives for the wrong reason. The
+    // stranger here does exactly what a stranger could do, correctly.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const client_kp = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const bunker_kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const stranger_kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    main.setRemotePubkeyForTest(bunker_kp.public_key);
+
+    try testing.expect(main.registerPendingForTest("f00dcafe", .connect, null));
+
+    // The stranger encrypts a perfectly valid ack to our client key, under the
+    // id of the request in flight. Nothing about the ciphertext is wrong: the
+    // conversation key comes from THEIR key, so it decrypts on our side.
+    var sealed = try nostr.nip46.seal(
+        gpa,
+        io,
+        signer,
+        stranger_kp,
+        client_kp.public_key,
+        "{\"id\":\"f00dcafe\",\"result\":\"ack\",\"error\":\"\"}",
+        1_700_000_000,
+    );
+    defer sealed.deinit();
+    main.deliverNip46ResponseForTest(signer, client_kp, sealed.event);
+
+    // The request is still waiting, which is the point: the stranger neither
+    // answered it nor consumed it.
+    if (main.takePendingContentForTest("f00dcafe") == null) {
+        std.debug.print("a stranger's response resolved the reader's pending request\n", .{});
+        return error.StrangerAnsweredForTheBunker;
+    }
+
+    // And the bunker's own answer, byte for byte the same message, still works.
+    try testing.expect(main.registerPendingForTest("f00dcafe", .connect, null));
+    var real = try nostr.nip46.seal(
+        gpa,
+        io,
+        signer,
+        bunker_kp,
+        client_kp.public_key,
+        "{\"id\":\"f00dcafe\",\"result\":\"ack\",\"error\":\"\"}",
+        1_700_000_000,
+    );
+    defer real.deinit();
+    main.deliverNip46ResponseForTest(signer, client_kp, real.event);
+    if (main.takePendingContentForTest("f00dcafe") != null) {
+        std.debug.print("the bunker's own answer was rejected along with the stranger's\n", .{});
+        return error.LockedOutTheRealSigner;
+    }
 }
 
 test "a heart filled by one account is not the next account's to un-like" {
@@ -3355,8 +3515,11 @@ test "an ancestor row is priced at what it draws, one line and two" {
         One.a = .{ .note = note, .lines = @intFromFloat(main.ancestorBodyLinesForTest(&note)) };
 
         const measured = try measuredHeight(arena, &model, One.row);
+        // The NESTED unit: an ancestor's body is set one register down, and
+        // that register is now boxed at the height it draws rather than at a
+        // full body line.
         const priced = main.ancestor_top_pad + main.ancestor_row_chrome_for_test +
-            @as(f32, @floatFromInt(One.a.lines)) * main.body_line_height;
+            @as(f32, @floatFromInt(One.a.lines)) * main.nested_line_height;
         if (@abs(measured - priced) > 0.5) {
             std.debug.print("\nancestor ({d} chars): draws {d}, priced {d}, lines {d}\n", .{ body.len, measured, priced, main.ancestorBodyLinesForTest(&One.a.note) });
             return error.EstimateDisagreesWithLayout;
@@ -3800,11 +3963,10 @@ test "with previews off a picture is one chip, and asking for it loads that one"
     model.notes[0] = threadNote(0xA1, 100, 0);
     model.notes[0].id = 7;
     const url = "https://host.example/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = @intCast(url.len);
-    model.notes[0].image_w = 1600;
-    model.notes[0].image_h = 900;
-    model.notes[0].image_bytes = 240_000;
+    const img = model.notes[0].setImageForTest(0, url);
+    img.w = 1600;
+    img.h = 900;
+    img.bytes = 240_000;
     model.notes_len = 1;
 
     main.setMediaPreviews(false);
@@ -3915,12 +4077,11 @@ test "a picture with a blurhash shows its colours before its bytes" {
     model.notes[0] = threadNote(0xA1, 100, 0);
     model.notes[0].id = 7;
     const url = "https://host.example/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = @intCast(url.len);
-    model.notes[0].image_aspect = 0.5;
+    const img = model.notes[0].setImageForTest(0, url);
+    img.aspect = 0.5;
     const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
-    @memcpy(model.notes[0].image_blur_buf[0..hash.len], hash);
-    model.notes[0].image_blur_len = @intCast(hash.len);
+    @memcpy(img.blur_buf[0..hash.len], hash);
+    img.blur_len = @intCast(hash.len);
     model.notes_len = 1;
 
     const p = try painted.Painted.render(arena, &model);
@@ -4018,9 +4179,8 @@ test "the pressable box is the picture, not the space around it" {
     // viewer for a picture the reader was not pointing at.
     var note = threadNote(0xA1, 100, 0);
     const url = "https://host.example/tall.jpg";
-    @memcpy(note.image_url_buf[0..url.len], url);
-    note.image_url_len = @intCast(url.len);
-    note.image_aspect = 2.0;
+    const img = note.setImageForTest(0, url);
+    img.aspect = 2.0;
 
     const height = main.pictureHeight(&note);
     const width = main.pictureWidth(&note);
@@ -4029,7 +4189,7 @@ test "the pressable box is the picture, not the space around it" {
     try testing.expectApproxEqAbs(height / 2.0, width, 0.5);
 
     // A landscape picture fills the column.
-    note.image_aspect = 0.5625;
+    img.aspect = 0.5625;
     try testing.expectApproxEqAbs(main.picture_column_width_for_test, main.pictureWidth(&note), 0.5);
 }
 
@@ -4073,7 +4233,7 @@ test "the queue stops asking, and lets go of what landed" {
     const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const stuck = [_]u8{0xc9} ** 32;
     try testing.expect(main.enqueueOutboxForTest(stuck, me, 1000));
-    for (0..main.max_outbox_rounds_for_test) |_| main.countOutboxRoundForTest(stuck);
+    for (0..main.rounds_before_stuck_for_test) |_| main.countOutboxRoundForTest(stuck);
     // It stops ASKING, and it stays: erasing a note the reader wrote, because
     // no relay would take it, is the one thing this queue exists to prevent.
     main.sweepOutboxForTest(1000);
@@ -4613,6 +4773,34 @@ test "a warmed picture is asked for at the address the row will look up" {
 }
 
 test "a follow's relay list is a suggestion, and only where they write" {
+    // Same three rules as ever, now reached through the store: only where they
+    // write, never a relay the reader is already on, and one list is one
+    // opinion however many times it arrives.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/suggest.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
     const tags = [_]nostr.event.Tag{
         &.{ "r", "wss://writes.example.com", "write" },
         &.{ "r", "wss://both.example.com" },
@@ -4621,25 +4809,107 @@ test "a follow's relay list is a suggestion, and only where they write" {
         // Already in the pool: not worth offering.
         &.{ "r", "wss://relay.damus.io" },
     };
-    const ev = nostr.event.Event{
-        .id = [_]u8{0} ** 32,
-        .pubkey = [_]u8{9} ** 32,
-        .created_at = 0,
-        .kind = 10002,
-        .tags = &tags,
-        .content = "",
-        .sig = [_]u8{0} ** 64,
-    };
-    main.resetRelaysForTest();
-    main.ingestRelayListForTest(ev);
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    main.rankRelaySuggestionsForTest(&store);
+
     try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
     var buf: [96]u8 = undefined;
-    try testing.expectEqualStrings("wss://writes.example.com", main.relaySuggestionCopy(0, &buf).?);
-    try testing.expectEqualStrings("wss://both.example.com", main.relaySuggestionCopy(1, &buf).?);
+    // Equal counts, so the tie-break orders them, and the order is stable
+    // rather than whatever the tags happened to say.
+    try testing.expectEqualStrings("wss://both.example.com", main.relaySuggestionCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://writes.example.com", main.relaySuggestionCopy(1, &buf).?);
 
-    // The same list again adds nothing: a suggestion is a fact, not a tally.
-    main.ingestRelayListForTest(ev);
+    // Ranking again over the same store changes nothing: it is a count of
+    // people, and there is still one person.
+    main.rankRelaySuggestionsForTest(&store);
     try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+}
+
+test "the relay more of your follows write to is offered first" {
+    // The bug this replaces: the first six write relays ever seen filled the
+    // table and everything after was dropped, so which six you were offered
+    // depended on whose relay list happened to arrive first. A relay one person
+    // uses could sit above one everybody uses.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/rank.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One person on the lonely relay, and they list it FIRST so arrival order
+    // would have put it at the top. Five on the popular one.
+    var list: [6][32]u8 = undefined;
+    for (0..6) |i| {
+        var secret = [_]u8{3} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        list[i] = kp.public_key;
+        const tags = if (i == 0)
+            [_]nostr.event.Tag{&.{ "r", "wss://lonely.example.com" }}
+        else
+            [_]nostr.event.Tag{&.{ "r", "wss://popular.example.com" }};
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), 10002, &tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), main.relaySuggestionCount());
+    try testing.expectEqualStrings("wss://popular.example.com", main.relaySuggestionCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://lonely.example.com", main.relaySuggestionCopy(1, &buf).?);
+}
+
+test "one person cannot outvote everyone by listing a relay twice" {
+    var table: [8]main.RelayRankForTest = undefined;
+    const urls = [_][]const u8{
+        "wss://a.example.com",
+        "wss://a.example.com/",
+        "WSS://A.example.com",
+    };
+    const len = main.foldWriteRelaysForTest(&table, 0, &urls);
+    try testing.expectEqual(@as(usize, 1), len);
+    try testing.expectEqual(@as(u16, 1), main.relayRankWritersForTest(table[0]));
+}
+
+test "one enthusiastic relay list does not outvote everyone else's" {
+    // Jumble's rule, and their reasoning: most people do not understand relays,
+    // so an author advertising a dozen is not telling you about a dozen places
+    // their notes reliably are. Only the first few of any one list count.
+    var table: [64]main.RelayRankForTest = undefined;
+    var urls: [16][]const u8 = undefined;
+    const names = [_][]const u8{
+        "wss://r0.example.com", "wss://r1.example.com", "wss://r2.example.com",
+        "wss://r3.example.com", "wss://r4.example.com", "wss://r5.example.com",
+        "wss://r6.example.com", "wss://r7.example.com", "wss://r8.example.com",
+        "wss://r9.example.com", "wss://ra.example.com", "wss://rb.example.com",
+    };
+    for (names, 0..) |n, i| urls[i] = n;
+    const len = main.foldWriteRelaysForTest(&table, 0, urls[0..names.len]);
+    try testing.expectEqual(main.outboxRelaysPerAuthorForTest, len);
+}
+
+test "a relay list that is nothing but junk contributes nothing" {
+    var table: [8]main.RelayRankForTest = undefined;
+    const urls = [_][]const u8{ "", "   ", "http://not-a-relay.example.com", "nostr:npub1x" };
+    try testing.expectEqual(@as(usize, 0), main.foldWriteRelaysForTest(&table, 0, &urls));
 }
 
 test "one relay under two spellings is one relay" {
@@ -4828,7 +5098,7 @@ test "an edit gives a note that gave up its rounds back" {
     const me = main.activePubkeyForTest() orelse return error.NoIdentity;
     const id = [_]u8{3} ** 32;
     try testing.expect(main.enqueueOutboxForTest(id, me, 100));
-    for (0..main.max_outbox_rounds_for_test) |_| main.markOutboxRoundForTest(id);
+    for (0..main.rounds_before_stuck_for_test) |_| main.markOutboxRoundForTest(id);
     try testing.expectEqual(@as(usize, 1), main.outboxCounts().stuck);
 
     main.forgetOutboxAcksForTest();
@@ -4990,14 +5260,43 @@ test "the name beat forwards the tags it read, the same as the sheet's save" {
 }
 
 test "a profile that will not parse does not become a blank profile" {
-    // Garbage in the store must not turn into an empty object with three fields
-    // written over it. It falls back to an object the edit is applied to, and
-    // the caller's stage machine is what decides whether to publish at all.
+    // This asserted the opposite of its own title: that garbage merged into an
+    // empty object with the sheet's fields written over it, on the reasoning
+    // that the caller would decide whether to publish. The caller does not. It
+    // publishes whatever the merge hands back, so an unreadable record came out
+    // the other side as a kind:0 holding nothing but a display name, and the
+    // reader's lightning address, NIP-05, banner and website were gone from
+    // every relay and every other client.
     var model = main.initialModel();
     model.profile_name_buffer.set("Alice");
-    const merged = main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model).?;
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, "not json at all", &model) == null);
+
+    // Not only outright garbage. Zig's JSON parser rejects an unpaired
+    // surrogate half, which parsers elsewhere in the ecosystem accept, so a
+    // profile carrying one is a real profile that this app cannot read. It is
+    // exactly the reader most likely to have a full profile to lose.
+    const lone_surrogate = "{\"name\":\"a\\ud83db\",\"lud16\":\"alice@example.com\"}";
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, lone_surrogate, &model) == null);
+
+    // A root that is valid JSON but not an object is the same story.
+    try testing.expect(main.mergeProfileJsonForTest(testing.allocator, "[1,2,3]", &model) == null);
+
+    // Only a caller that says there is nothing there starts from nothing. That
+    // is the literal `{}` handed over when no record was found.
+    const fresh = main.mergeProfileJsonForTest(testing.allocator, "{}", &model) orelse
+        return error.RefusedToWriteAFirstProfile;
+    defer testing.allocator.free(fresh);
+    try testing.expect(std.mem.indexOf(u8, fresh, "\"display_name\":\"Alice\"") != null);
+
+    // And the ordinary path still merges: a field the sheet does not show must
+    // come through the edit untouched, which is what the merge is for.
+    const held = "{\"name\":\"alice\",\"lud16\":\"alice@example.com\",\"nip05\":\"alice@example.com\"}";
+    const merged = main.mergeProfileJsonForTest(testing.allocator, held, &model) orelse
+        return error.LostAReadableProfile;
     defer testing.allocator.free(merged);
     try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@example.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
 }
 
 test "the sheet refuses to save until it has read the profile it would replace" {
@@ -6901,9 +7200,44 @@ test "a p tag alone is not a notification" {
     const other = [_]nostr.event.Tag{&.{ "p", "aa" ** 32 }};
     try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &other, 100), me) == null);
 
-    // Naming me IS a mention.
+    // Naming me in a note somebody wrote from scratch IS a mention: nothing
+    // put that tag there but the person writing.
     const mine = [_]nostr.event.Tag{&.{ "p", &me_hex }};
     try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(inboxEvent(1, 0xC1, &mine, 100), me).?);
+
+    // But the same tag on a REPLY says nothing, and this is what the title of
+    // this test was always about. NIP-10 has a reply carry every `p` tag of its
+    // parent plus the parent's author, so one word posted into a thread puts
+    // the reader's key on every message in it, forever. Two strangers talking
+    // three levels below a note of mine were arriving as "mentioned you", and
+    // in a busy thread that becomes the commonest row in the inbox.
+    const between_others = [_]nostr.event.Tag{
+        &.{ "e", "cc" ** 32, "", "root" },
+        &.{ "p", &me_hex },
+        &.{ "p", "dd" ** 32 },
+    };
+    try testing.expect(main.inboxVerbForTest(inboxEvent(1, 0xC1, &between_others, 100), me) == null);
+
+    // A reply whose last `p` tag is me is a reply TO me, even when this app has
+    // never seen the note being answered. Dropping those would trade one wrong
+    // answer for another.
+    const to_me = [_]nostr.event.Tag{
+        &.{ "e", "cc" ** 32, "", "root" },
+        &.{ "p", "dd" ** 32 },
+        &.{ "p", &me_hex },
+    };
+    try testing.expectEqual(main.InboxVerb.reply, main.inboxVerbForTest(inboxEvent(1, 0xC1, &to_me, 100), me).?);
+
+    // And being named in the TEXT of a reply is a mention wherever the tags
+    // fall, because somebody typed it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const npub = try nostr.nip19.encodeNpub(arena_state.allocator(), me);
+    var content_buf: [200]u8 = undefined;
+    const said = try std.fmt.bufPrint(&content_buf, "as nostr:{s} was saying", .{npub});
+    var mentions_me = inboxEvent(1, 0xC1, &between_others, 100);
+    mentions_me.content = said;
+    try testing.expectEqual(main.InboxVerb.mention, main.inboxVerbForTest(mentions_me, me).?);
 
     // A note naming twenty people is a broadcast, and being one of the twenty
     // is not a message. This is the cheapest filter that works.
@@ -6934,6 +7268,16 @@ test "a reaction that is not a like is not a notification" {
     // A downvote is not something to celebrate in a bell.
     like.content = "-";
     try testing.expect(main.inboxVerbForTest(like, me) == null);
+
+    // Everything else IS. Amethyst, Damus and Primal all send an emoji rather
+    // than "+" by default, and requiring "+" meant every one of those reactions
+    // produced no row, no badge and no glyph: the reader was told nobody had
+    // reacted while people had, and the emoji the row is built to draw could
+    // never get there.
+    for ([_][]const u8{ "❤️", "🔥", ":shakingeyes:", "+" }) |content| {
+        like.content = content;
+        try testing.expectEqual(main.InboxVerb.like, main.inboxVerbForTest(like, me).?);
+    }
 
     // Reposts and zaps are their own verbs.
     try testing.expectEqual(main.InboxVerb.repost, main.inboxVerbForTest(inboxEvent(6, 0xC2, &mine, 100), me).?);
@@ -7182,6 +7526,13 @@ test "the inbox survives a restart, targets and all" {
         &.{ "e", target_hex },
     }, 1_800_000_000);
     reply.id[0] = 0x6B;
+    // Into the STORE as well as the inbox, which is what really happens: the
+    // pool ingests the event and then files it. The inbox is rebuilt from the
+    // store's `p` tag index at launch now rather than from a parallel blob, so
+    // an event that was never stored is one that never happened. That is the
+    // point of the change: the blob could not carry the note's words or a
+    // reaction's glyph, so every restored row came back blank.
+    _ = try store.ingest(arena_state.allocator(), reply, .{});
     try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
     main.inboxMarkAllRead();
     const read_through = main.inboxReadThrough();
@@ -7464,32 +7815,6 @@ test "a keyboard shortcut fired under the sheet does not arm something invisible
     }
 }
 
-test "the page the reader is on stays inside the pages that exist" {
-    // The set moves underneath: a fresh contact list narrows the follows tab, an
-    // eviction shortens both. Clamping only where it is drawn meant the model
-    // stayed past the end, and Newer then did nothing visible once per page the
-    // reader had drifted by.
-    main.setIdentityForTest([_]u8{0xEF} ** 32);
-    defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
-
-    seedInbox(main.inbox_page * 3, 0xA0, 1_800_000_000);
-    var model = main.initialModel();
-    model.stage = .ready;
-    model.notifications_open = true;
-    model.notifications_everyone = true;
-
-    var fx: main.EffectsForTest = undefined;
-    // Walk past the end: it stops at the last page rather than running away.
-    for (0..10) |_| main.update(&model, .notifications_older, &fx);
-    try testing.expectEqual(@as(usize, 2), model.notifications_page);
-    // And one press back moves one page, not none.
-    main.update(&model, .notifications_newer, &fx);
-    try testing.expectEqual(@as(usize, 1), model.notifications_page);
-}
-
 test "an amount no one could have sent is not an amount" {
     // `bolt11` is a string the sender writes. The first version read it into a
     // u64 and drew whatever came out, which for a junk prefix was eighteen
@@ -7637,7 +7962,7 @@ test "the bell opens onto the notifications it counted" {
     model.notifications_open = true;
     // Whatever the sheet opens on by default, not what this test would prefer.
     const tree = try buildTree(arena, &model);
-    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "mentioned you in a note") != null);
     try testing.expect(findAnyText(tree.root, "Nothing from the people you follow yet. Everyone is in the other tab.") == null);
 }
 
@@ -7681,7 +8006,7 @@ test "a notification press asks the store, not the feed" {
     model.stage = .ready;
     model.notifications_open = true;
     const tree = try buildTree(arena, &model);
-    const row = findByLabel(tree.root, "replied to you") orelse findByLabel(tree.root, "mentioned you") orelse return error.RowMissing;
+    const row = findByLabel(tree.root, "replied to you") orelse findByLabel(tree.root, "mentioned you in a note") orelse return error.RowMissing;
     for (tree.handlers) |h| {
         if (h.id != row.id or h.event != .press) continue;
         switch (h.action) {
@@ -7714,51 +8039,36 @@ test "walking somewhere from the sheet closes the sheet" {
     try testing.expect(model.viewing_profile != null);
 }
 
-test "the notifications sheet lays its rows out INSIDE its card" {
-    // The tree said this screen was right for as long as it was wrong. `modalCard`
-    // sets a width and no height, so under a `.start` cross-alignment the card took
-    // its intrinsic height, the `grow = 1` scroll inside it resolved to ZERO, and
-    // the rows were laid out and painted down the bare window below the card with
-    // the footer drawn on top of the first one. Every assertion about the widget
-    // tree passed throughout. So this one asks the geometry instead.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0xD4} ** 32);
+test "the notifications page draws its rows in the reading column" {
+    // This replaces a test that asserted the rows sat inside a modal card. There
+    // is no card: notifications is an opaque level now, like threads, profiles,
+    // settings and the composer, because a scrim repaints the whole window every
+    // frame and the cost grows with it.
+    //
+    // What still matters is that a row lands in the column and not spread across
+    // a wide window, so the same note is the same width wherever it is shown.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    main.setIdentityForTest([_]u8{0x2f} ** 32);
     defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
 
-    var model = main.initialModel();
+    const model = try arena.create(main.Model);
+    model.* = main.initialModel();
     model.stage = .ready;
     model.notifications_open = true;
-    model.notifications_everyone = true;
-    seedInbox(12, 0x40, 1_800_000_000);
+    main.seedInboxUnreadForTest(6);
 
-    const p = try painted.Painted.render(arena, &model);
-    const card = p.fillRectOf(theme.palette.surface_modal) orelse return error.CardNotPainted;
-
-    // The card is a panel, not a strip: it has to be tall enough to hold a list.
-    try testing.expect(card.height > main.window_height / 2);
-
-    // The scroll region has somewhere to put them. This is the assertion that
-    // fails on the bug and passes here: the region laid out at height ZERO, so
-    // there was no viewport, nothing scrolled, and the rows below the first
-    // handful were unreachable however far the reader dragged.
-    const view = frameOfKind(p, .scroll_view) orelse return error.ScrollNotLaidOut;
-    try testing.expect(view.height > 200);
-    try testing.expect(view.y >= card.y - 1);
-
-    // The first row starts inside the viewport rather than at the top of the
-    // window, and the footer sits BELOW the region instead of on top of row one.
-    const rows = p.framesOf("mentioned you");
-    try testing.expect(rows.len > 0);
-    try testing.expect(rows[0].y >= view.y - 1);
-    const footer = frameOfText(p, "read state stays on this Mac") orelse return error.FooterNotPainted;
-    try testing.expect(footer.y >= view.y + view.height - 1);
-    try testing.expect(footer.y + footer.height <= card.y + card.height + 1);
+    const tree = try painted.Painted.renderAt(arena, model, main.window_width, main.window_height);
+    var widest: f32 = 0;
+    for (tree.layout.nodes) |n| {
+        if (n.widget.kind != .data_row) continue;
+        widest = @max(widest, n.widget.frame.width);
+    }
+    try testing.expect(widest > 0);
+    // The column, not the window. A row wider than the column means the centring
+    // row collapsed and every notification is running the full width.
+    try testing.expect(widest <= main.notifications_column_width_for_test + 1);
 }
 
 test "the sheet fits the view budget over the deepest thing under it" {
@@ -7813,44 +8123,6 @@ test "the sheet fits the view budget over the deepest thing under it" {
     try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view);
 }
 
-test "pages replace rather than pile up, and every notification is reachable" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0xD6} ** 32);
-    defer main.clearIdentityForTest();
-    main.resetInboxForTest();
-    main.forgetFollowsForTest();
-    defer main.resetInboxForTest();
-
-    var model = main.initialModel();
-    model.stage = .ready;
-    model.notifications_open = true;
-    model.notifications_everyone = true;
-    seedInbox(main.inbox_page * 2, 0x80, 1_800_000_000);
-
-    // One page's worth of rows, however many are held.
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
-        try testing.expect(findAnyText(tree.root, "1 of 2") != null);
-    }
-    // The second page REPLACES the first: the cost is the same either way, and
-    // the older items are reachable instead of being cut off at a page limit.
-    model.notifications_page = 1;
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expectEqual(main.inbox_page, countByLabel(tree.root, "mentioned you"));
-        try testing.expect(findAnyText(tree.root, "2 of 2") != null);
-    }
-    // A page number means nothing once the set under it changes.
-    var m2 = model;
-    var fx: main.EffectsForTest = undefined;
-    main.update(&m2, .{ .notifications_tab = 0 }, &fx);
-    try testing.expectEqual(@as(usize, 0), m2.notifications_page);
-}
-
 test "the notifications sheet renders what it holds" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -7882,7 +8154,7 @@ test "the notifications sheet renders what it holds" {
     _ = main.inboxAddForTest(inboxEvent(1, 0xCA, &mine, 1_800_000_000), 1_800_000_000);
 
     const tree = try buildTree(arena, &model);
-    try testing.expect(findAnyText(tree.root, "mentioned you") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "mentioned you in a note") != null);
     try testing.expect(findAnyText(tree.root, "Nothing yet. When somebody replies, mentions, likes, reposts or zaps you, it lands here.") == null);
 }
 
@@ -8208,11 +8480,13 @@ test "the client-tag switch is wired, and flipping it sticks" {
 }
 
 test "a zap total no invoice could hold does not take the screen down with it" {
-    // `bolt11` is a string on somebody else's event. Nothing validates it, and
-    // nothing can: a zap receipt is a text field anyone may publish. The action
-    // bar narrowed that saturating u64 total into a u32 to draw it, which is an
-    // abort in a safety build and a silently wrong number in the shipped one, and
-    // the input costs an attacker one signature.
+    // A zap total is a saturating u64, and the action bar narrowed it into a u32
+    // to draw it: an abort in a safety build, a silently wrong number in the
+    // shipped one. Receipts are validated and clamped on the way in now, so a
+    // single one can no longer produce a total like this; totals accumulate,
+    // though, and the arithmetic saturates, so the render still has to survive
+    // whatever it is handed. That is what this checks, so it sets the total
+    // directly rather than pretending a forged receipt could still do it.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -8232,17 +8506,7 @@ test "a zap total no invoice could hold does not take the screen down with it" {
     var e_hex: [64]u8 = undefined;
     for (model.thread_root.event_id, 0..) |b, i| _ = std.fmt.bufPrint(e_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
 
-    // One receipt claiming more millisats than there are millisats.
-    const receipt = nostr.event.Event{
-        .id = [_]u8{0x9F} ** 32,
-        .pubkey = [_]u8{0x77} ** 32,
-        .created_at = 1_800_000_000,
-        .kind = 9735,
-        .tags = &.{ &.{ "e", &e_hex }, &.{ "bolt11", "lnbc1000000000m1xxxx" } },
-        .content = "",
-        .sig = [_]u8{0} ** 64,
-    };
-    main.countEngagementForTest(receipt, &.{model.thread_root.id});
+    main.setZapMsatForTest(model.thread_root.id, std.math.maxInt(u64));
     // Well past what a u32 of sats can hold.
     try testing.expect(main.engagementFor(model.thread_root.id).zap_msat / 1000 > std.math.maxInt(u32));
 
@@ -9810,10 +10074,15 @@ test "the pool the app is born with holds no retired relay" {
     try testing.expect(main.relayCount() >= 3);
 }
 
-test "the window is square" {
+test "the window is square where the reading happens" {
     // A feed is a column of rows. The wide-and-short default spent its extra
     // width on margin while showing four notes at a time.
-    try testing.expectEqual(main.window_width, main.window_height);
+    //
+    // The square is the READING AREA, not the window. It was the same thing
+    // until the second rail existed; now the window carries 238pt of chrome
+    // down its left side, and asserting the window itself would either shrink
+    // the room by that much or quietly stop meaning anything.
+    try testing.expectEqual(main.window_width - main.rails_width, main.window_height);
 }
 
 test "there is always something under a name" {
@@ -10099,18 +10368,6 @@ const modal_cases = [_]ModalCase{
         }.f,
     },
     .{
-        .name = "notifications",
-        .label = "Notifications",
-        .dismiss = .close_notifications,
-        .control = "Everyone",
-        .open = struct {
-            fn f(m: *Model) void {
-                m.stage = .ready;
-                m.notifications_open = true;
-            }
-        }.f,
-    },
-    .{
         .name = "edit profile",
         .label = "Edit profile",
         .dismiss = .close_profile_edit,
@@ -10125,6 +10382,23 @@ const modal_cases = [_]ModalCase{
 };
 
 /// The node index of the dialog labelled `label`.
+/// A modal SURFACE by its accessible label: the panel or dialog that carries it,
+/// never a text node that happens to share the wording. A card's heading is
+/// usually the same words as its dialog's label ("Edit profile" both names the
+/// sheet and titles it), and matching that instead found a 62x18 label where the
+/// backdrop should be.
+fn modalSurfaceIndex(p: painted.Painted, label: []const u8) ?usize {
+    for (p.layout.nodes, 0..) |node, i| {
+        switch (node.widget.kind) {
+            .panel, .dialog => {},
+            else => continue,
+        }
+        if (!std.mem.eql(u8, node.widget.semantics.label, label)) continue;
+        return i;
+    }
+    return null;
+}
+
 fn modalDialogIndex(p: painted.Painted, label: []const u8) ?usize {
     for (p.layout.nodes, 0..) |node, i| {
         if (node.widget.kind != .dialog) continue;
@@ -10218,6 +10492,21 @@ test "a press outside a modal's card closes it, and a press inside never does" {
         // left of one is backdrop at every height.
         try testing.expect(card.x > 8);
 
+        // The BACKDROP fills the window. This is the property SDK 0.9.2 broke and
+        // the reason these five surfaces were restructured: a dialog is placed
+        // and sized by the runtime now, so the dim and the dismiss target had to
+        // stop being the dialog. Asserting the frame rather than trusting the
+        // markup, because the whole failure mode was markup that still read as
+        // full-window while laying out as a 420pt box.
+        const scrim = p.layout.nodes[modalSurfaceIndex(p, c.label) orelse root].widget.frame;
+        if (scrim.width < main.window_width or scrim.height < main.window_height) {
+            std.debug.print(
+                "{s}: the backdrop is {d:.0}x{d:.0} inside a {d:.0}x{d:.0} window, so it does not cover it\n",
+                .{ c.name, scrim.width, scrim.height, main.window_width, main.window_height },
+            );
+            return error.BackdropDoesNotCoverTheWindow;
+        }
+
         // Outside: halfway between the window edge and the card, at three
         // heights, so a rule that happens to hold level with the card's middle
         // is not mistaken for one that holds.
@@ -10308,13 +10597,15 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
     model.notes[0].id = 1;
     const url = "https://example.com/a.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = url.len;
+    _ = model.notes[0].setImageForTest(0, url);
     model.notes_len = 1;
     model.expanded_note = 1;
 
     const p = try painted.Painted.render(arena, &model);
-    const viewer = modalDialogIndex(p, "Expanded image") orelse return error.NoViewer;
+    // By LABEL, not by kind: the viewer is a panel rather than a dialog, because
+    // a picture wants the whole window and a dialog is centred at its preferred
+    // size. What the test cares about is the surface that closes on a press.
+    const viewer = modalSurfaceIndex(p, "Expanded image") orelse return error.NoViewer;
     const centre = try p.pressMsgAt(main.window_width / 2, main.window_height / 2) orelse
         return error.ViewerBackdropIsDead;
     try testing.expectEqualStrings(@tagName(Msg.close_image), @tagName(centre));
@@ -11591,8 +11882,7 @@ test "picture slots follow the reader down a long thread" {
         model.thread_notes[i].pubkey = [_]u8{0x55} ** 32;
         model.thread_notes[i].event_id = [_]u8{@intCast(i + 1)} ** 32;
         const url = "https://example.com/a.jpg";
-        @memcpy(model.thread_notes[i].image_url_buf[0..url.len], url);
-        model.thread_notes[i].image_url_len = url.len;
+        _ = model.thread_notes[i].setImageForTest(0, url);
     }
     model.thread_notes_len = count;
     _ = try painted.Painted.render(arena, &model);
@@ -11608,6 +11898,7 @@ test "picture slots follow the reader down a long thread" {
     // Now the reader is at the BOTTOM. The pass runs over what is on screen.
     const bottom = [_]i64{ 925, 926, 927 };
     main.recordVisibleNotesForTest(&bottom);
+    main.beginImagePassForTest();
     main.scanMediaFetchesForTest(&fx, &model);
 
     // The pictures that scrolled away are no longer claimed as wanted, which is
@@ -11701,8 +11992,7 @@ test "a picture that will not load says so instead of waiting forever" {
     model.notes[0].id = 4242;
     model.notes[0].pubkey = [_]u8{0x2b} ** 32;
     const url = "https://haven.example.com/gone.jpg";
-    @memcpy(model.notes[0].image_url_buf[0..url.len], url);
-    model.notes[0].image_url_len = url.len;
+    _ = model.notes[0].setImageForTest(0, url);
     model.notes_len = 1;
 
     // Still coming: no failure said, because none has happened.
@@ -11732,17 +12022,116 @@ test "a picture that will not load says so instead of waiting forever" {
     }
 }
 
+test "opening a reply asks about the conversation, not just that reply" {
+    // NIP-10 is what makes this necessary. A reply carries an `e` tag for the
+    // ROOT and one for its immediate parent, so a grandchild of the note in the
+    // reader's hand names its parent and the root, and never the note in
+    // between. Asking only about the note pressed therefore returned its direct
+    // children and nothing else: no siblings, no parent, no root post, and
+    // nothing under those children.
+    const focal = [_]u8{0xf0} ** 32;
+    const root = [_]u8{0x0a} ** 32;
+    var root_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&root_hex, "{x}", .{root}) catch unreachable;
+
+    var out: [2][32]u8 = undefined;
+
+    // A reply in the middle of a thread: both ids, the pressed note first.
+    const marked = [_]nostr.event.Tag{
+        &.{ "e", &root_hex, "", "root" },
+        &.{ "e", "b" ** 64, "", "reply" },
+    };
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &marked, &out));
+    try testing.expectEqualSlices(u8, &focal, &out[0]);
+    try testing.expectEqualSlices(u8, &root, &out[1]);
+
+    // A root post has nothing above it, so there is nothing to add.
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &.{}, &out));
+    try testing.expectEqualSlices(u8, &focal, &out[0]);
+
+    // A note that names ITSELF as its root is one id, not the same id twice.
+    var focal_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&focal_hex, "{x}", .{focal}) catch unreachable;
+    const self_rooted = [_]nostr.event.Tag{&.{ "e", &focal_hex, "", "root" }};
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &self_rooted, &out));
+
+    // A quote is not an ancestor: a mention-marked tag must not be taken as the
+    // root, or pressing a note that quotes another opens the wrong thread.
+    const quoting = [_]nostr.event.Tag{&.{ "e", &root_hex, "", "mention" }};
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &quoting, &out));
+
+    // An old-style positional reply, with no marker at all, still resolves.
+    const positional = [_]nostr.event.Tag{&.{ "e", &root_hex }};
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &positional, &out));
+    try testing.expectEqualSlices(u8, &root, &out[1]);
+}
+
 test "a host having a moment is not the same as a host saying no" {
     // A 404 is an answer and the box says so. A timeout, a rate limit or a 5xx
     // is the network having a moment, and marking a good picture permanently
     // broken over one of those is the quote fetch's old mistake in a place the
     // reader can see.
     for ([_]u16{ 404, 410, 403, 400 }) |final| {
-        try testing.expect(main.mediaFailureIsFinalForTest(final));
+        try testing.expectEqual(main.ImageFailure.give_up, main.classifyImageFailure(.ok, final));
     }
-    for ([_]u16{ 0, 408, 429, 500, 502, 503 }) |transient| {
-        try testing.expect(!main.mediaFailureIsFinalForTest(transient));
+    for ([_]u16{ 408, 429, 500, 502, 503 }) |transient| {
+        try testing.expectEqual(main.ImageFailure.retry, main.classifyImageFailure(.ok, transient));
     }
+    // No answer at all is the network, whatever status field came with it.
+    for ([_]native_sdk.EffectFetchOutcome{ .connect_failed, .tls_failed, .protocol_failed, .timed_out }) |outcome| {
+        try testing.expectEqual(main.ImageFailure.retry, main.classifyImageFailure(outcome, 0));
+    }
+}
+
+test "a picture too big to decode is not downloaded again forever" {
+    // This is the one the status code cannot answer. An oversized or truncated
+    // body comes back 200: the host did nothing wrong and will send exactly the
+    // same bytes next time. Reading only the status put the slot back to idle,
+    // and the scan that refills idle slots runs on the one-second tick AND on
+    // every scroll event, so one picture too large for the decoder was
+    // re-downloaded for as long as the reader looked at it.
+    try testing.expectEqual(main.ImageFailure.give_up, main.classifyImageFailure(.ok, 200));
+
+    // Driven through the real handler, because the classification is only half
+    // of it: the slot has to end up somewhere the refill scan will not pick up.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_001;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    // A 200 carrying more than the decoder will take.
+    const too_big = try arena.alloc(u8, 250_000);
+    @memset(too_big, 0);
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 200, too_big);
+    if (!main.mediaFailed(note_id)) {
+        std.debug.print("an oversized picture went back to idle, so it will be fetched again\n", .{});
+        return error.WouldRefetchForever;
+    }
+}
+
+test "a picture the network lost is retried, but not without end" {
+    // The mirror of the case above, and the one the avatar path used to get
+    // wrong in the other direction: a 503 is the host having a moment, so the
+    // picture is worth asking for again. Bounded, so that no future mistake in
+    // the classification can turn "worth asking again" into a download loop.
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_002;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 503, "");
+    try testing.expect(main.mediaIdleForTest(note_id));
+    try testing.expectEqual(@as(u8, 1), main.mediaAttemptsForTest(note_id).?);
+
+    main.deliverMediaResponseForTest(&fx, note_id, .connect_failed, 0, "");
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 429, "");
+    try testing.expect(main.mediaIdleForTest(note_id));
+
+    // The fourth is where it stops.
+    main.deliverMediaResponseForTest(&fx, note_id, .timed_out, 0, "");
+    try testing.expect(main.mediaFailed(note_id));
 }
 
 test "a quote still loading looks like the card that will replace it" {
@@ -11900,7 +12289,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -11921,6 +12310,13 @@ test "no view paints past the right edge at the narrowest the window can be" {
     const long_site = "https://" ++ ("a" ** 112) ++ ".example";
     const long_nip05 = ("h" ** 60) ++ "@" ++ ("d" ** 60) ++ ".example";
     const long_relay = "wss://" ++ ("r" ** 96) ++ ".example.com";
+    // A place's name and its feed's name, at the capacity of the buffers that
+    // receive them (`place_name_cap`, `place_feed_name_cap`). Both are a
+    // stranger's, and both land in fixed-width chrome.
+    const long_place = "P" ** 64;
+    const long_feed = "F" ** 48;
+    // A host's markdown, with a heading and a list, wide enough to wrap.
+    const long_about = "# " ++ ("A" ** 60) ++ "\n\nA description a stranger wrote, long enough to wrap more than once in the column it is given.\n\n- " ++ ("b" ** 70) ++ "\n- and another\n";
     // Exactly the 128 bytes `lud16_buf` holds. A single byte over and the
     // parser drops the field without a word, which is correct of it and made
     // the first version of this measure an empty line.
@@ -12001,6 +12397,9 @@ test "no view paints past the right edge at the narrowest the window can be" {
         _ = main.addRelayForTest(long_relay, true, true);
         _ = main.addRelayForTest("wss://relay.example.org", true, true);
         main.seedInboxUnreadForTest(3);
+        // Every state starts out of every place, or one state's room and one
+        // state's rail leak into the next one's measurement.
+        main.resetPlacesForTest();
         switch (st) {
             .feed, .feed_with_link => {},
             .thread => {
@@ -12026,6 +12425,51 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 _ = main.enqueueOutboxForTest(model.notes[0].pubkey, model.notes[0].pubkey, 1_800_000_000);
                 model.outbox_pending = 1;
                 model.menu = .outbox;
+            },
+            // The second rail, full, with a visit above the list: every string
+            // on it is a stranger's, and the rail is a fixed 180pt column that
+            // cannot grow to fit one.
+            .places_rail => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceForTest([_]u8{0x71} ** 32, "one", long_place);
+                main.update(model, .place_enter, &fx);
+                main.visitPlaceForTest([_]u8{0x72} ** 32, "two", "Bass Pistol");
+                main.update(model, .place_enter, &fx);
+                main.goToOwnPlazaForTest();
+                main.visitPlaceForTest([_]u8{0x73} ** 32, "three", long_place);
+                main.goToOwnPlazaForTest();
+                main.setRailForTest(true);
+            },
+            // Inside a place, which replaces the scope line with a header of a
+            // stranger's name, their feed's name, and their markdown.
+            // Entered, with the description open behind its control: the
+            // widest the header can be, because that row then carries the
+            // About toggle as well as Leave.
+            .place_about => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x75} ** 32, "five", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(true);
+                main.setPlaceInfoForTest(.open);
+            },
+            // The same card with the leave warning up, which is the taller of
+            // the two states and carries a sentence of its own.
+            .place_leaving => {
+                var fx: main.EffectsForTest = undefined;
+                main.visitPlaceWithFeedForTest([_]u8{0x76} ** 32, "six", long_place, long_feed);
+                main.setPlaceHomeForTest(long_about);
+                main.update(model, .place_enter, &fx);
+                main.setRailForTest(true);
+                main.setPlaceInfoForTest(.leaving);
+            },
+            .place_visiting => {
+                main.visitPlaceWithFeedForTest([_]u8{0x74} ** 32, "four", long_place, long_feed);
+                // The longest thing the header can say about the connection,
+                // measured with the longest name and feed name beside it.
+                main.setPlaceLinkForTest(.unreachable_relay);
+                main.setRailForTest(true);
             },
             .menu_note => model.note_menu = model.notes[0].id,
         }
@@ -12071,7 +12515,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .place_about, .place_leaving, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -12473,6 +12917,48 @@ test "the feed rebuilds inside a frame with every account a reader can follow" {
         );
         return error.FeedRebuildTooSlow;
     }
+
+    // And what the app actually does between two ticks, at the same ceiling, on
+    // the same machine, in the same run: one note lands and the list already in
+    // hand is merged with it. The number above is what that replaces, and the
+    // pair is only comparable because nothing else moved between them.
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetFeedChangeDetectionForTest();
+    main.tickForTest(model, 1_800_002_000);
+
+    const own = try nostr.keys.Signer.init().keyPairFromSecretKey([_]u8{98} ** 32);
+    var splice_best: u64 = std.math.maxInt(u64);
+    var stamp: i64 = 1_800_003_000;
+    for (0..3) |_| {
+        const rounds = 5;
+        var elapsed_ns: u64 = 0;
+        for (0..rounds) |_| {
+            stamp += 1;
+            const body = try std.fmt.allocPrint(arena, "arriving at {d}", .{stamp});
+            const ev = try nostr.event.create(arena, signer, own, stamp, 1, &.{}, body, null);
+            _ = try main.plazaIngestForTest(arena, ev);
+            // Only the tick is timed. Signing and storing are the relay
+            // thread's work in the app and would swamp the thing being read.
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            main.tickForTest(model, 1_800_003_500);
+            const dt = t0.durationTo(std.Io.Timestamp.now(io, .awake));
+            elapsed_ns += @intCast(@max(dt.toNanoseconds(), 0));
+        }
+        splice_best = @min(splice_best, elapsed_ns / rounds);
+    }
+
+    std.debug.print(
+        "[perf] {d} follows (the ceiling): {d}us per tick with one note arriving\n",
+        .{ follows, splice_best / 1000 },
+    );
+
+    // The assertion is the counter, not the clock: the merge did not read the
+    // window back. A stopwatch says what this machine was doing; this says what
+    // the code did.
+    const work_before = main.feedWork();
+    main.tickForTest(model, 1_800_003_500);
+    try testing.expectEqual(work_before.full_reads, main.feedWork().full_reads);
 }
 
 test "a long follow list is split across filters that relays accept, in one REQ" {
@@ -12501,7 +12987,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     }
 
     var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = main.buildFeedFilters(authors, &buf);
+    const filters = main.buildFeedFilters(authors, null, null, &buf);
 
     // Two filters per chunk: the notes and the metadata.
     try testing.expectEqual(@as(usize, 10), filters.len);
@@ -12537,15 +13023,156 @@ test "a long follow list is split across filters that relays accept, in one REQ"
         if (f.kinds.?.len == 1) try testing.expectEqual(@as(u32, 300), f.limit.?);
     }
 
+    // The metadata limit is derived from the chunk, never from a screen cache.
+    //
+    // These are replaceable records, so a relay holds at most one of each per
+    // author: the right number to ask for is the number of authors times the
+    // number of kinds, and anything else is a coincidence. Asserting it because
+    // the number that used to be here was `profile_cap`, the size of the
+    // in-memory profile table, which permitted a fraction of a chunk and left
+    // the rest of those people nameless.
+    for (filters) |f| {
+        if (f.kinds.?.len == 1) continue;
+        try testing.expectEqual(@as(u32, @intCast(f.authors.?.len * f.kinds.?.len)), f.limit.?);
+    }
+
+    // Nobody else's contact list. It is asked for in one place, the profile
+    // card's follow counts, and the worker that opens a profile fetches that
+    // person's kind:3 itself. Asking here asked every relay for the contact
+    // list of every follow at dial: two thousand `p` tags is well over a
+    // hundred kilobytes, so it was megabytes per relay for a question nobody
+    // had asked about people whose profile may never be opened.
+    for (filters) |f| {
+        for (f.kinds.?) |k| try testing.expect(k != 3);
+    }
+
     // A list that fits in one chunk is still one chunk, not a special case.
     const few = try arena.alloc([32]u8, 9);
     for (few, 0..) |*a, i| {
         @memset(a, 0);
         a[0] = @intCast(i);
     }
-    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, &buf).len);
+    try testing.expectEqual(@as(usize, 2), main.buildFeedFilters(few, null, null, &buf).len);
     // And nobody at all asks nothing, rather than asking about everybody.
-    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), main.buildFeedFilters(&.{}, null, null, &buf).len);
+
+    // The reader's OWN contact list is still asked for, on its own filter. That
+    // one is not a nicety: nothing may write over a replaceable record it has
+    // not read back, and the follow list is the one where getting that wrong
+    // empties an account. Dropping kind:3 from the bulk filter is only safe
+    // because this exists.
+    const me = [_]u8{0xC3} ** 32;
+    const with_me = main.buildFeedFilters(few, me, null, &buf);
+    try testing.expectEqual(@as(usize, 3), with_me.len);
+    const own = with_me[with_me.len - 1];
+    try testing.expectEqual(@as(usize, 1), own.authors.?.len);
+    try testing.expectEqualSlices(u8, &me, &own.authors.?[0]);
+    var asks_contacts = false;
+    for (own.kinds.?) |k| {
+        if (k == 3) asks_contacts = true;
+    }
+    try testing.expect(asks_contacts);
+}
+
+test "a relay that keeps dropping is asked less and less often" {
+    // The wait doubles from three seconds and stops at five minutes, so a relay
+    // that is down, that has stopped taking this reader, or that accepts the
+    // handshake and hangs up is not dialled twelve hundred times an hour for as
+    // long as the app is open.
+    try testing.expectEqual(@as(u64, 3_000), main.reconnectDelayMs(0));
+    try testing.expectEqual(@as(u64, 6_000), main.reconnectDelayMs(1));
+    try testing.expectEqual(@as(u64, 12_000), main.reconnectDelayMs(2));
+    try testing.expectEqual(@as(u64, 96_000), main.reconnectDelayMs(5));
+    try testing.expectEqual(@as(u64, 300_000), main.reconnectDelayMs(7));
+    // And it stops there rather than growing into hours, or wrapping.
+    try testing.expectEqual(@as(u64, 300_000), main.reconnectDelayMs(63));
+
+    // The ladder is cleared by a connection that LASTED, never by one that
+    // merely opened. A relay that accepts the socket and drops it immediately
+    // is the case this exists for: without the rule its ladder resets on every
+    // open and it is redialled at three seconds forever.
+    try testing.expectEqual(@as(u6, 1), main.nextReconnectAttempts(0, 1_200));
+    try testing.expectEqual(@as(u6, 2), main.nextReconnectAttempts(1, 59_999));
+    try testing.expectEqual(@as(u6, 0), main.nextReconnectAttempts(5, 60_000));
+    try testing.expectEqual(@as(u6, 0), main.nextReconnectAttempts(63, 3_600_000));
+    // A clock that reads backwards must not clear it either.
+    try testing.expectEqual(@as(u6, 4), main.nextReconnectAttempts(3, -1));
+    // And the count saturates instead of wrapping back to a short wait.
+    try testing.expectEqual(@as(u6, 63), main.nextReconnectAttempts(63, 0));
+}
+
+test "the latency probe cannot deliver a single event" {
+    // The probe exists to time a round trip, and that is ALL it should cost. It
+    // used to ask for kind:1 with no author, no since and no until, which is a
+    // subscription to every text note the relay receives, from anyone, held open
+    // for the life of the connection: every one of those events was parsed,
+    // allocated and secp256k1-verified before being thrown away.
+    //
+    // Asserting the property rather than the wording: whatever the probe asks
+    // for, an ordinary note must not match it.
+    const filters = main.probeFilters();
+    try testing.expectEqual(@as(usize, 1), filters.len);
+    const f = filters[0];
+
+    const ev = nostr.event.Event{
+        .id = [_]u8{0x9c} ** 32,
+        .pubkey = [_]u8{0x11} ** 32,
+        .created_at = 1_700_000_000,
+        .kind = 1,
+        .tags = &.{},
+        .content = "an ordinary note",
+        .sig = [_]u8{0} ** 64,
+    };
+    try testing.expect(!f.matches(ev));
+
+    // And it is narrow by construction, not by luck: it names exact ids, so
+    // there is no kind, author or time window for anything to arrive through.
+    try testing.expect(f.ids != null);
+    try testing.expect(f.kinds == null);
+    try testing.expect(f.authors == null);
+    try testing.expect(f.tags == null);
+    // Belt and braces: even a relay that matched it somehow sends one event.
+    try testing.expectEqual(@as(u32, 1), f.limit.?);
+}
+
+test "every engagement query asks the same bounded question" {
+    // Three screens ask for replies, reposts, likes and zaps over a list of note
+    // ids. They were three copies and they drifted: the feed's, which is the one
+    // re-issued on every reconnect, ended up with no cap at all, so the relay
+    // chose how much of four kinds across 128 note ids to send back.
+    const values = [_][]const u8{ "a" ** 64, "b" ** 64 };
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = &values }};
+    const f = main.engagementFilter(&tags);
+
+    try testing.expect(f.limit != null);
+    try testing.expectEqual(@as(u32, 500), f.limit.?);
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 6, 7, 9735 }, f.kinds.?);
+    try testing.expectEqual(@as(usize, 1), f.tags.?.len);
+    try testing.expectEqual(@as(u8, 'e'), f.tags.?[0].letter);
+    try testing.expectEqual(@as(usize, 2), f.tags.?[0].values.len);
+}
+
+test "eight relays that drop together do not come back together" {
+    // The whole pool goes down on one network blip, so without a spread all
+    // eight threads redial in the same millisecond, and keep doing it, forever.
+    // Assert the consequence: eight distinct wake-up times, none of them more
+    // than a quarter past the wait.
+    const wait = main.reconnectDelayMs(0);
+    var seen: [8]u64 = undefined;
+    for (0..8) |i| {
+        const jitter = main.reconnectJitterMs(wait, i, 0);
+        try testing.expect(jitter <= wait / 4);
+        seen[i] = wait + jitter;
+    }
+    for (seen, 0..) |a, i| {
+        for (seen[i + 1 ..]) |b| {
+            if (a == b) return error.RelaysStillInLockstep;
+        }
+    }
+
+    // Two relays that DID start aligned are separated by the attempt count, so
+    // a slot that fails while its neighbour recovers drifts apart from it.
+    try testing.expect(main.reconnectJitterMs(wait, 3, 0) != main.reconnectJitterMs(wait, 3, 1));
 }
 
 test "the window cannot be declared smaller than its own floor" {
@@ -13107,4 +13734,5687 @@ test "a reply whose parent is missing says so instead of posing as a direct repl
     try testing.expect(!direct.?.parent_missing);
     try testing.expectEqual(@as(u8, 2), nested.?.depth);
     try testing.expect(!nested.?.parent_missing);
+}
+
+test "a wanted profile is never silently dropped, however many are wanted" {
+    // The old table held 48 and, once full, looked for a slot already asked the
+    // maximum number of times. Finding none it fell off the end of the function
+    // having queued nothing at all. With 144 notifications that is what it did
+    // every time, which is why a name only ever appeared after visiting that
+    // person's profile: visiting asks for one pubkey, so it survived the churn.
+    //
+    // No shipping client caps authors here. NDK merges them with no limit at
+    // all; Amethyst rebuilds one REQ from every name currently on screen.
+    main.resetWantedProfilesForTest();
+
+    const many = 300;
+    var i: usize = 0;
+    while (i < many) : (i += 1) {
+        var pk = [_]u8{0} ** 32;
+        pk[0] = @intCast(i % 251);
+        pk[1] = @intCast(i / 251);
+        pk[2] = @intCast(i % 7 + 1);
+        main.wantProfileForTest(pk);
+    }
+
+    // Every distinct key asked for is still being asked for. The exact count is
+    // not the point: that none of them vanished is.
+    try testing.expect(main.wantedProfileCountForTest() >= 200);
+}
+
+test "a reaction three levels down someone else's thread is not my notification" {
+    // NIP-10 has a reply carry every p tag of its parent plus the parent's
+    // author, and a NIP-25 reaction copies the p tags of what it reacts to. So
+    // a reader's pubkey propagates down every thread they ever touched, and
+    // matching ANY p tag filed a stranger reacting to a stranger's reply as a
+    // notification about the reader.
+    //
+    // NIP-25: the target event's pubkey should be LAST among the p tags.
+    main.setIdentityForTest([_]u8{0xA7} ** 32);
+    defer main.clearIdentityForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, k| _ = std.fmt.bufPrint(me_hex[k * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const someone = "dd" ** 32;
+
+    // My key is present, but the LAST p tag is somebody else: this reaction is
+    // about their note, and my key is only riding along from the thread.
+    var not_mine = inboxEvent(7, 0x31, &.{
+        &.{ "p", &me_hex },
+        &.{ "p", someone },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_100);
+    not_mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(not_mine, me) == null);
+
+    // My key last: this one really is about my note.
+    var mine = inboxEvent(7, 0x32, &.{
+        &.{ "p", someone },
+        &.{ "p", &me_hex },
+        &.{ "e", "ab" ** 32 },
+    }, 1_800_000_200);
+    mine.content = "+";
+    try testing.expect(main.inboxVerbForTest(mine, me) != null);
+}
+
+test "a tag copy that could not complete reads as no base, not as an empty one" {
+    // The splice base for every replaceable write comes through `dupeTags`, and
+    // the writes decide how much to keep by counting what is in it. An empty
+    // slice is a true answer for a record with no tags and a destructive one for
+    // a copy that ran short: the follow list's shrink guard compares against
+    // this same slice, so zero to one reads as growth and passes.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "aa" ** 32 },
+        &.{ "p", "bb" ** 32 },
+    };
+
+    // Enough memory: the copy is whole and every field survives.
+    const ok = main.dupeTagsForTest(a.allocator(), &tags) orelse return error.CopyRefusedWithMemoryAvailable;
+    try testing.expectEqual(@as(usize, 2), ok.len);
+    try testing.expectEqualStrings("p", ok[0][0]);
+
+    // Not enough: null, so the caller takes its store-miss path. Anything that
+    // returned a short or empty slice here would be reported as a real base.
+    var failing = testing.FailingAllocator.init(a.allocator(), .{ .fail_index = 1 });
+    try testing.expect(main.dupeTagsForTest(failing.allocator(), &tags) == null);
+}
+
+test "a note nobody took is still offered, long after the app calls it stuck" {
+    // The queue used to give up after six rounds, about eleven minutes on the
+    // old ladder. Close a lid for twelve, or spend that long on a captive
+    // portal where TCP connects and TLS does not, and every queued note was
+    // abandoned for the life of the install: never offered again, the count
+    // surviving restarts, and sixteen of them filling the queue so the account
+    // could not post from that install at all.
+    main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
+
+    const id = [_]u8{0x31} ** 32;
+    main.setIdentityForTest([_]u8{0x99} ** 32);
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expect(main.enqueueOutboxForTest(id, me, 0));
+
+    // Well past the point the app starts calling it stuck.
+    for (0..main.rounds_before_stuck_for_test + 4) |_| main.countOutboxRoundForTest(id);
+
+    // The word on the row, which is all it is now.
+    try testing.expectEqual(main.OutboxState.stuck, main.outboxStateForTest(id).?);
+
+    // And it is still collected, given enough time on the widening delay.
+    var due: [16][32]u8 = undefined;
+    const n = main.collectOutboxDueForTest(&due, 100_000);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualSlices(u8, &id, &due[0]);
+}
+
+test "a relay coming back puts a note at the front of the queue, but a flapping one cannot" {
+    // The backoff was only ever reset by editing the relay list, so a note that
+    // had widened out to an hourly retry stayed there even when the network
+    // came back a second later.
+    main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
+
+    const id = [_]u8{0x32} ** 32;
+    main.setIdentityForTest([_]u8{0x99} ** 32);
+    const me = main.activePubkeyForTest() orelse return error.NoIdentity;
+    try testing.expect(main.enqueueOutboxForTest(id, me, 0));
+    for (0..4) |_| main.countOutboxRoundForTest(id);
+    try testing.expect(main.outboxRoundsForTest(id).? > 0);
+
+    // Offline, then back: the ladder resets.
+    main.setRelayStatusForTest(0, false);
+    main.setRelayStatusForTest(0, true);
+    try testing.expectEqual(@as(u8, 0), main.outboxRoundsForTest(id).?);
+
+    // A relay that accepts the handshake and drops it reconnects every three
+    // seconds. If each of those reset the ladder, the widening delay would
+    // never widen and a dead relay would be dialled without pause.
+    for (0..6) |_| main.countOutboxRoundForTest(id);
+    const before = main.outboxRoundsForTest(id).?;
+    for (0..5) |_| {
+        main.setRelayStatusForTest(0, false);
+        main.setRelayStatusForTest(0, true);
+    }
+    try testing.expectEqual(before, main.outboxRoundsForTest(id).?);
+}
+
+test "a feed author with no name is asked about, before the row is on screen" {
+    // The wanted set had exactly two sources: the inbox, and quoted notes. The
+    // feed registered nobody. That was survivable only while `refreshProfiles`
+    // walked the whole follow list, and when that walk left the render path the
+    // feed lost its only source of names. Real accounts, with profiles sitting
+    // on the relays, drew as a raw npub and a two-character avatar for the
+    // whole session.
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // A feed longer than one screen, so the band matters.
+    const rows = 40;
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        var note = threadNote(@intCast(i + 1), @intCast(1000 - @as(i64, @intCast(i))), 0);
+        note.id = @intCast(i + 1);
+        note.pubkey = [_]u8{@intCast(i + 1)} ** 32;
+        model.notes[i] = note;
+    }
+    model.notes_len = rows;
+    main.setVisibleRangeForTest(0, 4);
+
+    main.wantProfilesAheadForTest(&model);
+
+    // On screen: asked about, obviously.
+    try testing.expect(main.isProfileWantedForTest([_]u8{1} ** 32));
+    try testing.expect(main.isProfileWantedForTest([_]u8{5} ** 32));
+
+    // And ahead of the fold, which is the point: a name that only starts
+    // loading when the row appears is a name the reader watches arrive. It is
+    // also what lets a face be warmed early, since the picture URL lives in the
+    // kind:0 and there is nothing to warm until it lands.
+    try testing.expect(main.isProfileWantedForTest([_]u8{12} ** 32));
+
+    // Not the whole feed, though: the band is bounded, or a long scrollback
+    // would ask about everybody at once.
+    try testing.expect(!main.isProfileWantedForTest([_]u8{40} ** 32));
+}
+
+test "a reply is routed to the read relays of the people it names" {
+    // Plaza sent every note to the reader's own write relays and nowhere else.
+    // If the person being replied to does not read those relays, their client
+    // never sees the reply and never tells them, so a thread started from Plaza
+    // reads one-sided to everybody else in it. Plaza's own inbox subscription
+    // is the mirror of this and was already correct, so the app received what
+    // others routed to it and did not reciprocate.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x51} ** 32);
+
+    // Their kind:10002: one relay they read, one they only write to.
+    var tags = try arena.alloc(nostr.event.Tag, 2);
+    tags[0] = try arena.dupe([]const u8, &.{ "r", "wss://inbox.example", "read" });
+    tags[1] = try arena.dupe([]const u8, &.{ "r", "wss://outbox.example", "write" });
+    const list = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, tags, "", null);
+
+    var parsed = try nostr.nip65.parseRelayList(testing.allocator, list);
+    defer parsed.deinit();
+
+    var reads: usize = 0;
+    var write_only: usize = 0;
+    for (parsed.list.entries) |e| {
+        if (e.read) reads += 1;
+        if (e.write and !e.read) write_only += 1;
+    }
+    // The routing rule the delivery pass applies: a relay they only WRITE to
+    // will never show them anything, so a reply left there reaches nobody.
+    try testing.expectEqual(@as(usize, 1), reads);
+    try testing.expectEqual(@as(usize, 1), write_only);
+
+    // A recipient relay that is already one of the reader's own is not dialled
+    // a second time, and the comparison is the pool's own, so a trailing slash
+    // is not a different relay.
+    main.resetRelaysToBootstrapForTest();
+    try testing.expect(!main.poolHasRelayForTest("wss://inbox.example"));
+    var buf: [96]u8 = undefined;
+    if (main.relaySnapshot(0, &buf)) |first| {
+        try testing.expect(main.poolHasRelayForTest(first.url));
+    }
+}
+
+test "reaching the bottom asks the relays for what came before" {
+    // Reaching the end of the loaded feed used to raise the store's query limit
+    // and nothing else. The store answers with what it has, so once the initial
+    // backfill ran out the list stopped growing: no older history, no
+    // end-of-feed state, no way to reach anything from before the app was
+    // opened. Grepping this file for `.until` returned nothing at all, which is
+    // the whole bug: no filter Plaza ever sent carried one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const total = 1200;
+    const authors = try arena.alloc([32]u8, total);
+    for (authors, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i / 256);
+        a[1] = @intCast(i % 256);
+    }
+
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const until: i64 = 1_700_000_000;
+    const filters = main.buildOlderFilters(authors, until, &buf);
+
+    // Chunked like the live subscription, because the same relays refuse the
+    // same oversized filter.
+    try testing.expectEqual(@as(usize, 3), filters.len);
+    var counted: usize = 0;
+    for (filters) |f| {
+        try testing.expect(f.authors.?.len <= 500);
+        counted += f.authors.?.len;
+        // The point of the whole change.
+        try testing.expectEqual(until, f.until.?);
+        // Notes only: profiles and relay lists are replaceable, so there is no
+        // older copy to page back to and asking for one wastes the budget.
+        try testing.expectEqual(@as(usize, 1), f.kinds.?.len);
+        try testing.expectEqual(@as(u16, 1), f.kinds.?[0]);
+    }
+    try testing.expectEqual(total, counted);
+
+    // An empty follow set asks nothing rather than asking about everybody.
+    try testing.expectEqual(@as(usize, 0), main.buildOlderFilters(&.{}, until, &buf).len);
+}
+
+test "the feed asks only for what it does not already hold" {
+    // No feed filter ever carried a `since`, so every reconnect re-asked for
+    // the full three hundred per chunk from every relay. A flapping relay was
+    // handed a fifteen-hundred-event question every few seconds, and each of
+    // those events cost a Schnorr verify before the store recognised it as a
+    // duplicate. `subscribeInbox` has done this correctly since it was written.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const authors = try arena.alloc([32]u8, 600);
+    for (authors, 0..) |*a, i| {
+        @memset(a, 0);
+        a[0] = @intCast(i / 256);
+        a[1] = @intCast(i % 256);
+    }
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+
+    // A cold store asks for everything: bounding it would leave a new install
+    // looking at an empty feed. This is Notedeck's rule.
+    for (main.buildFeedFilters(authors, null, null, &buf)) |f| {
+        try testing.expect(f.since == null);
+    }
+
+    const newest: i64 = 1_800_000_000;
+    const filters = main.buildFeedFilters(authors, null, newest, &buf);
+    var notes: usize = 0;
+    var meta: usize = 0;
+    for (filters) |f| {
+        if (f.kinds.?.len == 1 and f.kinds.?[0] == 1) {
+            notes += 1;
+            try testing.expectEqual(newest, f.since.?);
+        } else {
+            meta += 1;
+            // Deliberately unbounded. A profile or relay list edited while the
+            // app was closed carries an older created_at than the newest note
+            // held, so a since here would hide the very update that matters.
+            try testing.expect(f.since == null);
+        }
+    }
+    try testing.expect(notes > 0);
+    try testing.expect(meta > 0);
+}
+
+// -- The feed brings itself up to date without re-reading the store ----------
+//
+// The feed used to answer "has anything changed" by asking the store for the
+// whole window again, once a second, on the render thread. Measured in the
+// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
+// screenful, 10.8 ms twenty pages down, against a 16.7 ms frame.
+//
+// These assert on WHICH PATH RAN and how much it parsed, never on a stopwatch.
+// The test binary is Debug and the machine is shared, so a timing assertion here
+// measures the machine. A counter measures the code.
+
+/// A store, an identity, a follow set and a model, wired the way the app wires
+/// them, with change detection reset so a test starts from a known place.
+const FeedFixture = struct {
+    tmp: std.testing.TmpDir,
+    store: nostr.store.Store,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    model: *main.Model,
+
+    fn init(arena: std.mem.Allocator, name: []const u8) !*FeedFixture {
+        const f = try arena.create(FeedFixture);
+        f.tmp = testing.tmpDir(.{});
+        var pbuf: [128]u8 = undefined;
+        const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/{s}.mdb", .{ f.tmp.sub_path, name });
+        f.store = try nostr.store.Store.open(db_path, .{});
+        f.signer = nostr.keys.Signer.init();
+        f.kp = try f.signer.keyPairFromSecretKey([_]u8{77} ** 32);
+        main.resetProfilesForTest();
+        main.resetMediaForTest();
+        main.setIdentityForTest([_]u8{77} ** 32);
+        main.setStoreForTest(&f.store);
+        main.resetFeedChangeDetectionForTest();
+        main.resetFeedWork();
+        f.model = try arena.create(main.Model);
+        f.model.* = main.initialModel();
+        f.model.stage = .ready;
+        return f;
+    }
+
+    fn deinit(f: *FeedFixture) void {
+        main.setStoreForTest(null);
+        main.clearIdentityForTest();
+        main.resetProfilesForTest();
+        f.signer.deinit();
+        f.store.deinit();
+        f.tmp.cleanup();
+    }
+
+    /// Stores an event the way the app does: through the one door, which is
+    /// where an arrival announces itself.
+    fn arrive(f: *FeedFixture, arena: std.mem.Allocator, created_at: i64, content: []const u8) !nostr.event.Event {
+        const ev = try signedNote(arena, f.signer, f.kp, created_at, content);
+        _ = try main.plazaIngestForTest(arena, ev);
+        return ev;
+    }
+
+    fn tick(f: *FeedFixture, now_s: i64) void {
+        main.tickForTest(f.model, now_s);
+    }
+
+    fn ids(f: *FeedFixture, out: []i64) []i64 {
+        for (f.model.notes[0..f.model.notes_len], 0..) |n, i| out[i] = n.id;
+        return out[0..f.model.notes_len];
+    }
+};
+
+test "a tick with nothing new does not read the feed back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "quiet");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+    const after_first = main.feedWork();
+
+    // Nine more ticks with nothing arriving. This is the app at rest, and it
+    // used to be nine more full reads of the whole follow list.
+    for (0..9) |_| f.tick(1_800_000_100);
+    const at_rest = main.feedWork();
+    try testing.expectEqual(after_first.full_reads, at_rest.full_reads);
+    try testing.expectEqual(after_first.splices, at_rest.splices);
+    try testing.expectEqual(after_first.parses, at_rest.parses);
+}
+
+test "an event of another kind does not read the feed back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "otherkind");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // A reaction to it. The store's event count moves, which is the only signal
+    // the feed used to have, and it meant a full read every time anyone liked
+    // anything anywhere.
+    const like = try nostr.event.create(arena, f.signer, f.kp, 1_800_000_010, 7, &.{}, "+", null);
+    _ = try main.plazaIngestForTest(arena, like);
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads, after.full_reads);
+    try testing.expectEqual(before.splices, after.splices);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a note that arrives is merged into the list, not fetched again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "splice");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "older");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    const newer = try f.arrive(arena, 1_800_000_050, "newer");
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads, after.full_reads);
+    try testing.expectEqual(before.splices + 1, after.splices);
+    // One note parsed, not two: the card already on screen carried over.
+    try testing.expectEqual(before.parses + 1, after.parses);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    try testing.expectEqual(main.noteIdOf(newer), f.model.notes[0].id);
+}
+
+test "a spliced feed holds the same notes in the same order as a full read" {
+    // The guard against the two paths drifting. Everything else here checks one
+    // path; this one checks they agree, which is the property that matters and
+    // the one a future change is most likely to break.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "agree");
+    defer f.deinit();
+
+    // Deliberately out of order, and with FIVE sharing one second. Five,
+    // because the tie-break is the part most easily got wrong and one pair
+    // catches it only half the time: an id order that happens to match arrival
+    // order proves nothing. Ids are hashes, so five in a row matching by chance
+    // is one in a hundred and twenty.
+    const tie = 1_800_000_030;
+    const stamps = [_]i64{ tie, 1_800_000_010, 1_800_000_070, tie, tie, 1_800_000_050, tie, 1_800_000_020, tie };
+    for (stamps, 0..) |at, i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        _ = try f.arrive(arena, at, body);
+        // A tick between each, so every one of them lands as a splice into a
+        // list that already exists rather than as part of one big read.
+        f.tick(1_800_000_100);
+    }
+    try testing.expectEqual(stamps.len, f.model.notes_len);
+
+    var spliced_buf: [16]i64 = undefined;
+    const spliced = f.ids(&spliced_buf);
+    var snapshot: [16]i64 = undefined;
+    @memcpy(snapshot[0..spliced.len], spliced);
+
+    // The store's rule, stated directly rather than inferred: created_at
+    // descending, then id descending. Asserting it here and not only against a
+    // full read means the two cannot agree on the WRONG order.
+    var prev: ?main.Note = null;
+    for (f.model.notes[0..f.model.notes_len]) |note| {
+        if (prev) |p| {
+            try testing.expect(p.created_at >= note.created_at);
+            if (p.created_at == note.created_at) {
+                try testing.expect(std.mem.order(u8, &p.event_id, &note.event_id) == .gt);
+            }
+        }
+        prev = note;
+    }
+
+    main.reconcileForTest(f.model, &f.store, 1_800_000_100);
+    var full_buf: [16]i64 = undefined;
+    const full = f.ids(&full_buf);
+
+    try testing.expectEqualSlices(i64, snapshot[0..spliced.len], full);
+}
+
+test "a card already on screen survives a splice unparsed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "sentinel");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "the original text");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    const sentinel = "SENTINEL";
+    @memcpy(f.model.notes[0].content_buf[0..sentinel.len], sentinel);
+    f.model.notes[0].content_len = sentinel.len;
+
+    _ = try f.arrive(arena, 1_800_000_050, "another note");
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    var found = false;
+    for (f.model.notes[0..f.model.notes_len]) |*note| {
+        if (std.mem.eql(u8, note.content(), sentinel)) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "a note from someone the reader does not follow is not spliced in" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "stranger");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "mine");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    // A thread fetch or a quote lookup stores notes by people the reader does
+    // not follow. They go through the same door and land in the same buffer, so
+    // the splice has to reject them the way the full read's author filter does.
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{88} ** 32);
+    const theirs = try signedNote(arena, other, other_kp, 1_800_000_090, "not in this feed");
+    _ = try main.plazaIngestForTest(arena, theirs);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    // And a full read agrees, which is the point: the splice is not allowed to
+    // be more or less permissive than the query it replaces.
+    main.reconcileForTest(f.model, &f.store, 1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a deletion is read back in full, because a splice can only add" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "deletion");
+    defer f.deinit();
+
+    const doomed = try f.arrive(arena, 1_800_000_000, "regrettable");
+    _ = try f.arrive(arena, 1_800_000_050, "fine");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+    const before = main.feedWork();
+
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{doomed.id}) catch unreachable;
+    const tags = [_]nostr.event.Tag{&.{ "e", &hex }};
+    const del = try nostr.event.create(arena, f.signer, f.kp, 1_800_000_060, 5, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, del);
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads + 1, after.full_reads);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "paging down is read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "paging");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // Notes below the old window belong now, and nothing arriving says so.
+    main.loadOlderForTest(f.model);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(before.full_reads + 1, main.feedWork().full_reads);
+}
+
+test "more arrivals than the buffer holds are read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "overflow");
+    defer f.deinit();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    // A backfill: more lands between two ticks than the buffer can name. The
+    // list in hand cannot be brought up to date by splicing, and the honest
+    // answer is the expensive one, not a quietly incomplete feed.
+    main.overflowFeedArrivalsForTest();
+    f.tick(1_800_000_100);
+
+    const after = main.feedWork();
+    try testing.expectEqual(before.full_reads + 1, after.full_reads);
+    try testing.expectEqual(before.splices, after.splices);
+}
+
+test "a changed follow set is read back in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "follows");
+    defer f.deinit();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+
+    _ = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    const before = main.feedWork();
+
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{88} ** 32);
+    const list = [_][32]u8{other_kp.public_key};
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    f.tick(1_800_000_100);
+
+    try testing.expectEqual(before.full_reads + 1, main.feedWork().full_reads);
+}
+
+test "a note announced twice appears once" {
+    // `.added` fires only for an event the store did not have, so the app
+    // should never announce one that is already on screen. The splice checks
+    // anyway, because the failure is a note drawn twice with the same id, and
+    // the row keys, the media slots and the engagement counts are all keyed on
+    // that id.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "twice");
+    defer f.deinit();
+
+    const ev = try f.arrive(arena, 1_800_000_000, "one");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+
+    main.noteFeedArrivalForTest(ev.id);
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+}
+
+test "a note older than a full window is not spliced into it" {
+    // The window holds the newest `feed_limit`. A note that arrives older than
+    // everything in a full window does not belong in it, and a splice that
+    // added it anyway would push the oldest note out and disagree with a full
+    // read, which is the drift these two paths must not have.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "toolate");
+    defer f.deinit();
+
+    f.model.feed_limit = 3;
+    for (0..3) |i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        _ = try f.arrive(arena, 1_800_000_100 + @as(i64, @intCast(i)), body);
+    }
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    const oldest_shown = f.model.notes[2].id;
+
+    _ = try f.arrive(arena, 1_800_000_000, "long ago");
+    f.tick(1_800_000_200);
+
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(oldest_shown, f.model.notes[2].id);
+    // Parsed nothing: it was rejected before `noteFrom` ran, which is the point
+    // of checking the window edge before parsing rather than after.
+    const before = main.feedWork().parses;
+    f.tick(1_800_000_200);
+    try testing.expectEqual(before, main.feedWork().parses);
+
+    // And a full read of the same store shows the same three.
+    main.reconcileForTest(f.model, &f.store, 1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(oldest_shown, f.model.notes[2].id);
+}
+
+test "a note that fills a gap below the window arrives when the reader pages down" {
+    // The other half: the note rejected above is not lost, it is simply not in
+    // this window. Paging down has to find it, or "not spliced in" would mean
+    // "dropped".
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const f = try FeedFixture.init(arena, "pagedown");
+    defer f.deinit();
+
+    f.model.feed_limit = 2;
+    for (0..2) |i| {
+        const body = try std.fmt.allocPrint(arena, "recent {d}", .{i});
+        _ = try f.arrive(arena, 1_800_000_100 + @as(i64, @intCast(i)), body);
+    }
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+
+    const old_one = try f.arrive(arena, 1_800_000_000, "long ago");
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 2), f.model.notes_len);
+
+    f.model.feed_limit = 4;
+    f.tick(1_800_000_200);
+    try testing.expectEqual(@as(usize, 3), f.model.notes_len);
+    try testing.expectEqual(main.noteIdOf(old_one), f.model.notes[2].id);
+}
+
+// -- A connection that stopped answering ------------------------------------
+//
+// A relay's ingest thread blocks in `receive` until the relay speaks. A peer
+// that goes away without closing leaves that thread waiting forever behind a
+// green dot: no error, no timeout, no reconnect, and nothing able to tell it
+// apart from a quiet night. The keeper is a separate thread precisely because
+// the waiting one cannot notice anything.
+//
+// Its decision is a pure function of two numbers, so it is asserted here
+// without a socket, a thread or a clock.
+
+test "a connection that has never spoken is not a stalled one" {
+    // The window between the handshake and the relay's first word. Treating a
+    // missing measurement as an infinite one would cut off every relay that
+    // took a moment to answer, which is every relay on a slow network.
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, null));
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, 999_999));
+}
+
+test "a talking relay is left alone" {
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(0, null));
+    try testing.expectEqual(
+        main.KeeperActionForTest.leave_it,
+        main.keeperActionForTest(main.relayPingAfterMsForTest - 1, null),
+    );
+}
+
+test "a relay that has gone quiet is asked whether it is still there" {
+    try testing.expectEqual(
+        main.KeeperActionForTest.ping,
+        main.keeperActionForTest(main.relayPingAfterMsForTest, null),
+    );
+}
+
+test "a quiet relay is asked once per interval, not once per look" {
+    // The keeper looks every few seconds and the interval is half a minute. A
+    // socket that has stopped answering would otherwise collect a dozen pings
+    // on its way to being declared dead.
+    const idle = main.relayPingAfterMsForTest + 5_000;
+    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(idle, 5_000));
+    try testing.expectEqual(
+        main.KeeperActionForTest.ping,
+        main.keeperActionForTest(idle, main.relayPingAfterMsForTest),
+    );
+}
+
+test "a relay that answers none of three pings is given up on" {
+    try testing.expectEqual(
+        main.KeeperActionForTest.give_up,
+        main.keeperActionForTest(main.relayDeadAfterMsForTest, 0),
+    );
+    // And the deadline wins over the ping interval: a socket this far gone is
+    // not asked again, it is closed.
+    try testing.expectEqual(
+        main.KeeperActionForTest.give_up,
+        main.keeperActionForTest(main.relayDeadAfterMsForTest + 60_000, main.relayDeadAfterMsForTest),
+    );
+}
+
+test "the deadline is a multiple of the interval, so silence is answered before it is fatal" {
+    // Not decoration: if the deadline were under the interval, the keeper would
+    // declare a relay dead without ever having asked it anything, and every
+    // quiet connection in the pool would be recycled on a timer.
+    try testing.expect(main.relayDeadAfterMsForTest >= main.relayPingAfterMsForTest * 2);
+}
+
+test "a quiet relay still counts as a relay" {
+    // The pool summary drives an "offline, reconnecting" banner over the whole
+    // app. A relay with an open socket, live subscriptions and a publish path
+    // that works is not offline, and saying so on a slow night would be the
+    // same kind of lie as the green dot, pointing the other way.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example", true, true);
+    main.setRelayStatusForTest(0, true);
+    try testing.expectEqual(@as(usize, 1), main.liveRelayCountForTest());
+
+    main.setRelayQuietForTest(0);
+    try testing.expect(main.relayStatusQuietForTest(0));
+    try testing.expectEqual(@as(usize, 1), main.liveRelayCountForTest());
+    // And it is still a relay a note can go out on.
+    try testing.expect(main.relayStatusConnectedForTest(0));
+}
+
+test "coming back from quiet is not a network recovery" {
+    // The outbox widens its retry delay when nothing can be reached and pulls it
+    // back when a relay returns. A relay answering the keepalive it was just
+    // sent is news about one socket, not about the network, and letting it reset
+    // the ladder would mean a quiet pool resetting it every minute forever.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example", true, true);
+    main.forgetOutboxAcksForTest();
+
+    main.setRelayStatusForTest(0, false);
+    main.setRelayStatusForTest(0, true);
+    const after_real_recovery = main.outboxWokeForTest();
+    try testing.expect(after_real_recovery);
+
+    main.resetOutboxWokeForTest();
+    main.setRelayQuietForTest(0);
+    main.setRelayStatusForTest(0, true);
+    try testing.expect(!main.outboxWokeForTest());
+}
+
+// -- A fetch that cannot run forever ----------------------------------------
+//
+// Every fetch that is not the feed dials its own socket, asks one question and
+// reads until EOSE. A relay that accepts the REQ and then goes quiet used to
+// hold that thread for the life of the process, and a message-count bound does
+// not help: a relay that sends nothing never reaches the count either.
+//
+// The keeper holds an absolute deadline on each of them. Its decision is pure
+// over the deadline table, so it is asserted here without a socket or a thread.
+
+test "a fetch inside its budget is left alone" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(0, 10_000);
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(9_999, &out));
+}
+
+test "a fetch past its budget is cut off" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(3, 10_000);
+    const n = main.expiredOneShotsForTest(10_000, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 3), out[0]);
+}
+
+test "an empty slot is not a fetch that ran out of time" {
+    // Zero is the empty marker, and a keeper reading it as a deadline in 1970
+    // would try to shut down every unused slot on every tick.
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(std.math.maxInt(i64), &out));
+}
+
+test "a fetch already cut off is not cut off again" {
+    // The slot stays in the table until its owner clears it, because clearing
+    // it from the keeper would hand the slot to another fetch while the first
+    // one still holds the pointer. So the keeper has to stop acting on it
+    // without forgetting it.
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(5, 1_000);
+    try testing.expectEqual(@as(usize, 1), main.expiredOneShotsForTest(2_000, &out));
+    main.markOneShotCutForTest(5);
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(2_000, &out));
+    try testing.expectEqual(@as(usize, 0), main.expiredOneShotsForTest(std.math.maxInt(i64), &out));
+}
+
+test "several overdue fetches are all cut, not just the first" {
+    main.clearOneShotsForTest();
+    defer main.clearOneShotsForTest();
+    var out: [main.oneShotSlotsForTest]usize = undefined;
+
+    main.seatOneShotForTest(0, 1_000);
+    main.seatOneShotForTest(1, 50_000);
+    main.seatOneShotForTest(2, 1_000);
+    const n = main.expiredOneShotsForTest(2_000, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 0), out[0]);
+    try testing.expectEqual(@as(usize, 2), out[1]);
+}
+
+test "the bunker listener is watched alongside the pool" {
+    // It is not a pool relay: no badge, no slot in the reader's list, never
+    // published to. It is the same kind of thing though, a socket held open by
+    // a thread blocked in `receive`, and when it half-opens remote signing
+    // stops with no error anywhere. Its slot sits past the pool's, which is why
+    // the keeper's status updates have to stay inside the pool's range.
+    try testing.expectEqual(main.maxRelaysForTest, main.bunkerWatchSlotForTest);
+}
+
+test "a one-shot budget is shorter than the connection deadline it borrows" {
+    // A fetch is a question with an answer; a pool connection is a
+    // conversation. Bounding the fetch by the connection's ninety seconds would
+    // leave a wedged profile lookup sitting for a minute and a half, and there
+    // is nothing to wait for: the relay was asked one thing.
+    try testing.expect(main.oneShotBudgetMsForTest < main.relayDeadAfterMsForTest);
+}
+
+// -- Reading where your follows actually write -------------------------------
+//
+// The pool asks every relay in it about every person the reader follows, so a
+// follow who writes only to relays the reader is not on is invisible: no error,
+// no empty state, they simply are not there. These connect to the top few
+// relays the ranking found that the reader is NOT already on, and ask each only
+// about the people who write there.
+
+test "a relay the reader is not on is dialled, and asked only about its writers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/outbox.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Four people on one relay the reader is not on, two on another.
+    var list: [6][32]u8 = undefined;
+    for (0..6) |i| {
+        var secret = [_]u8{5} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        list[i] = kp.public_key;
+        const tags = if (i < 4)
+            [_]nostr.event.Tag{&.{ "r", "wss://many.example.com" }}
+        else
+            [_]nostr.event.Tag{&.{ "r", "wss://few.example.com" }};
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+    _ = main.setFollowsForTest(&list, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(@as(usize, 2), main.discoveredCount());
+    var buf: [96]u8 = undefined;
+    // The busier relay first, and each asked only about its own writers. That
+    // is the whole point: a small relay gets asked about its handful of people,
+    // not about two thousand strangers.
+    try testing.expectEqualStrings("wss://many.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 4), main.discoveredAuthorCount(0));
+    try testing.expectEqualStrings("wss://few.example.com", main.discoveredUrlCopy(1, &buf).?);
+    try testing.expectEqual(@as(usize, 2), main.discoveredAuthorCount(1));
+}
+
+test "a relay the reader is already on gets no second connection" {
+    // It is already being asked about everybody. A discovered slot for it would
+    // be a duplicate socket asking a narrower version of the same question.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{6} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/dupe.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://mine.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(@as(usize, 0), main.discoveredCount());
+}
+
+test "rewriting the routes tells the connections to re-ask" {
+    // A thread holds the generation it dialled under and drops the connection
+    // when it moves. Without the bump, a slot changing hands would keep feeding
+    // the store answers to a question nobody is asking any more, until the
+    // socket happened to drop.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{7} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/gen.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://somewhere.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    const before = main.discoveredGenerationForTest(0);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(main.discoveredGenerationForTest(0) != before);
+}
+
+test "the discovered pool is separate from the eight the outbox counts" {
+    // `max_relays` is eight because a delivery is recorded in a `u8` bitmap,
+    // one bit per slot. A ninth slot would silently stop being counted and
+    // every note would look undelivered forever, so these connections live
+    // past the pool and never publish.
+    try testing.expectEqual(main.maxRelaysForTest + 1, main.discoveredWatchBaseForTest);
+    try testing.expect(main.relayWatchSlotsForTest >= main.discoveredWatchBaseForTest + main.maxDiscoveredRelaysForTest);
+    // And a discovered connection is watched by the keeper like any other, or a
+    // relay nobody chose could half-open and sit there.
+    try testing.expect(main.maxDiscoveredRelaysForTest > 0);
+}
+
+test "the ranking and the routing pick the same relays for one author" {
+    // They did not, and the disagreement was invisible: an author listing
+    // [A, A, B, C, D] had D counted by the ranking (which skipped the repeat
+    // before counting against the cap) and dropped by the routing (which
+    // counted raw tags), so D got a connection with nobody on it. One function
+    // now, so they cannot drift again.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{8} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/drift.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // The repeat is what does it: counted once by the selection, so the fourth
+    // distinct relay is still inside the cap.
+    const tags = [_]nostr.event.Tag{
+        &.{ "r", "wss://a.example.com" },
+        &.{ "r", "wss://a.example.com/" },
+        &.{ "r", "wss://b.example.com" },
+        &.{ "r", "wss://c.example.com" },
+        &.{ "r", "wss://d.example.com" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // The author names four distinct relays, and exactly two get connections:
+    // coverage stops at the target, so a third relay carrying only somebody
+    // already covered twice is a thread and a socket for nothing.
+    //
+    // Counting is the assertion, not "every slot with a url has authors": the
+    // empty-relay guard makes that true whether or not the two selections
+    // agree, and it masked this drift when the test was first written. A relay
+    // the ranking counted and the routing dropped shows up as a missing
+    // connection, which is the only place it is visible.
+    var routed: usize = 0;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        if (main.discoveredUrlCopy(i, &buf) == null) continue;
+        routed += 1;
+        try testing.expect(main.discoveredAuthorCount(i) > 0);
+    }
+    try testing.expectEqual(@as(usize, main.routeCoverageTargetForTest), routed);
+
+    // And the one author really is covered twice, which is what stopped it.
+    const cov = main.routeCoverageForTest();
+    try testing.expectEqual(@as(usize, 1), cov.reached);
+    try testing.expectEqual(@as(usize, 1), cov.doubly_reached);
+    try testing.expectEqual(@as(usize, 0), cov.residual);
+}
+
+test "an unchanged route table does not tell the connections to re-ask" {
+    // The ranking reruns every time a relay list lands, and during a cold start
+    // hundreds of them land. If each rerun bumped the generation, every
+    // discovered connection would drop and redial each time, and the pool would
+    // spend the whole startup reconnecting instead of reading. Seen in a live
+    // run before this: three connections, each redialled inside two minutes,
+    // for a route table that had not changed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{11} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/stable.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://steady.example.com" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    const follows = [_][32]u8{kp.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    main.rankRelaySuggestionsForTest(&store);
+    const settled = main.discoveredGenerationForTest(0);
+    const settled_1 = main.discoveredGenerationForTest(1);
+    try testing.expectEqual(@as(usize, 1), main.discoveredCount());
+
+    // Five more runs over the same store. Nothing has moved, so nothing should
+    // be told that it has.
+    for (0..5) |_| main.rankRelaySuggestionsForTest(&store);
+    try testing.expectEqual(settled, main.discoveredGenerationForTest(0));
+
+    // But a real change still gets through: somebody else, writing elsewhere.
+    const other = try signer.keyPairFromSecretKey([_]u8{12} ** 32);
+    const other_tags = [_]nostr.event.Tag{&.{ "r", "wss://elsewhere.example.com" }};
+    const other_ev = try nostr.event.create(arena, signer, other, 1_800_000_001, 10002, &other_tags, "", null);
+    _ = try main.plazaIngestForTest(arena, other_ev);
+    const both = [_][32]u8{ kp.public_key, other.public_key };
+    _ = main.setFollowsForTest(&both, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expectEqual(@as(usize, 2), main.discoveredCount());
+
+    // The NEW relay's slot moved. The one that was already connected did not,
+    // which is the whole point of a counter per slot: a stranger publishing a
+    // relay list must not cost the connections that were already right.
+    try testing.expect(main.discoveredGenerationForTest(1) != settled_1);
+    try testing.expectEqual(settled, main.discoveredGenerationForTest(0));
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://steady.example.com", main.discoveredUrlCopy(0, &buf).?);
+}
+
+test "a relay that stays in the set keeps its seat" {
+    // The choice comes back in coverage order, and that order moves whenever
+    // anybody's relay list does. Filling the slots in that order would hand one
+    // relay's socket to another because they swapped places in a ranking, and
+    // both connections would be dropped and redialled to do it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/seat.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One author on `quiet`, so it is the only relay worth dialling and it
+    // lands in slot 0.
+    const quiet = [_][]const u8{"wss://quiet.example.com"};
+    const one = [_][]const []const u8{&quiet};
+    var first: [1][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &one, &first);
+    _ = main.setFollowsForTest(&first, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://quiet.example.com", main.discoveredUrlCopy(0, &buf).?);
+    const seat_gen = main.discoveredGenerationForTest(0);
+
+    // Now three more people, all on `busy`. It outranks `quiet` by three to
+    // one, so a coverage-ordered fill would put it in slot 0 and push `quiet`
+    // into slot 1: two redials to learn nothing.
+    const busy = [_][]const u8{"wss://busy.example.com"};
+    const four = [_][]const []const u8{ &quiet, &busy, &busy, &busy };
+    var follows: [4][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &four, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Both are routed, and `quiet` is still where it was.
+    try testing.expectEqualStrings("wss://quiet.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqualStrings("wss://busy.example.com", main.discoveredUrlCopy(1, &buf).?);
+    // Its question did not change either, so its counter did not move: the
+    // socket is never touched.
+    try testing.expectEqual(seat_gen, main.discoveredGenerationForTest(0));
+}
+
+test "a live connection is not dropped for one more author" {
+    // Coverage is computed from relay lists that arrive one at a time, so the
+    // margin between two candidates moves all day. Without a margin the set
+    // flaps: one person's kind:10002 lands, a challenger passes the incumbent
+    // by a single author, and a live socket is torn down to gain one.
+    // One more author is not enough once a relay carries more than four, which
+    // is where the twenty-five per cent comes from.
+    try testing.expect(!main.worthEvictingForTest(6, 5));
+    try testing.expect(!main.worthEvictingForTest(9, 8));
+    try testing.expect(!main.worthEvictingForTest(31, 30));
+    // Nor is a draw.
+    try testing.expect(!main.worthEvictingForTest(4, 4));
+    // A quarter more is, exactly at the line and past it.
+    try testing.expect(main.worthEvictingForTest(5, 4));
+    try testing.expect(main.worthEvictingForTest(10, 8));
+    try testing.expect(main.worthEvictingForTest(40, 4));
+    // An incumbent reaching nobody new is defending nothing.
+    try testing.expect(main.worthEvictingForTest(1, 0));
+    try testing.expect(main.worthEvictingForTest(0, 0));
+}
+
+test "a narrowly better relay does not take a connected relay's place" {
+    // The margin, where it actually bites: the budget is full, and a candidate
+    // that reaches one more person than the relay already connected asks for
+    // its socket. It does not get it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/flap.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Everyone writes to exactly one relay, so no relay ever covers anybody
+    // twice and each one's gain is simply how many people are on it.
+    //
+    // Enough big relays to fill every slot but one, counted off the budget. A
+    // spare slot means no contention, the margin is never consulted, and the
+    // test proves nothing while still passing.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const big_writers = 7;
+    const inc_writers = 5;
+    const narrow_writers = 6;
+    const wide_writers = 9;
+
+    var specs = std.ArrayList([]const []const u8).empty;
+    for (0..budget - 1) |g| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://big-{d}.example.com", .{g});
+        for (0..big_writers) |_| try specs.append(arena, one);
+    }
+    const inc = try arena.alloc([]const u8, 1);
+    inc[0] = "wss://incumbent.example.com";
+    for (0..inc_writers) |_| try specs.append(arena, inc);
+    const without_challenger = specs.items.len;
+
+    const cha = try arena.alloc([]const u8, 1);
+    cha[0] = "wss://challenger.example.com";
+    for (0..wide_writers) |_| try specs.append(arena, cha);
+    const narrowly_ahead = without_challenger + narrow_writers;
+
+    const follows = try arena.alloc([32]u8, specs.items.len);
+    try seedRelayLists(arena, signer, specs.items, follows);
+
+    // Round one: without the challenger's people, `incumbent` earns the seat.
+    _ = main.setFollowsForTest(follows[0..without_challenger], 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://incumbent.example.com"));
+    try testing.expect(!routedHolds("wss://challenger.example.com"));
+
+    // Round two: six of the challenger's follows appear. Six beats five, but
+    // not by a quarter, so the socket stays where it is.
+    _ = main.setFollowsForTest(follows[0..narrowly_ahead], 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://incumbent.example.com"));
+    try testing.expect(!routedHolds("wss://challenger.example.com"));
+
+    // And the margin is a margin, not a veto: a relay that reaches enough more
+    // people does take the seat. Nine against five is well past a quarter.
+    _ = main.setFollowsForTest(follows, 1_800_000_002);
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds("wss://challenger.example.com"));
+    try testing.expect(!routedHolds("wss://incumbent.example.com"));
+}
+
+/// Whether any routed slot is pointed at this relay.
+fn routedHolds(url: []const u8) bool {
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
+        if (std.mem.eql(u8, u, url)) return true;
+    }
+    return false;
+}
+
+test "a route that changed in its last author has changed" {
+    // Amethyst shipped this comparison as a `forEachIndexed` with a return
+    // inside it, which returns from the lambda rather than the function, so
+    // only the first filter was ever compared. A relay whose author list
+    // changed anywhere but the front looked unchanged, and its subscription was
+    // never replaced.
+    var a: [4][32]u8 = undefined;
+    for (&a, 0..) |*x, i| {
+        x.* = [_]u8{0} ** 32;
+        x[0] = @intCast(i + 1);
+    }
+    const url = "wss://same.example.com";
+
+    var b = a;
+    try testing.expect(main.sameRouteForTest(url, &a, url, &b));
+
+    // The first.
+    b = a;
+    b[0][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // The LAST. This is the one that was broken.
+    b = a;
+    b[b.len - 1][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // And one in the middle, for completeness.
+    b = a;
+    b[2][31] = 9;
+    try testing.expect(!main.sameRouteForTest(url, &a, url, &b));
+
+    // A different relay, and a shorter list.
+    b = a;
+    try testing.expect(!main.sameRouteForTest(url, &a, "wss://other.example.com", &b));
+    try testing.expect(!main.sameRouteForTest(url, &a, url, b[0..3]));
+}
+
+test "the same relay with a new question keeps its url and moves its counter" {
+    // The two facts a live connection branches on when its slot moves: if the
+    // url is the same it replaces its REQ in place, and if it is not it drops
+    // the socket. So a change of WHO must move the counter and leave the url
+    // alone, or the connection either never re-asks or redials to do it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/reask.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const there = [_][]const u8{"wss://there.example.com"};
+    const two = [_][]const []const u8{ &there, &there };
+    var follows: [2][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &two, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("wss://there.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 2), main.discoveredAuthorCount(0));
+    const before = main.discoveredGenerationForTest(0);
+
+    // A third person, writing to the same relay. Same url, one more author.
+    const three = [_][]const []const u8{ &there, &there, &there };
+    var wider: [3][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &three, &wider);
+    _ = main.setFollowsForTest(&wider, 1_800_000_001);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqualStrings("wss://there.example.com", main.discoveredUrlCopy(0, &buf).?);
+    try testing.expectEqual(@as(usize, 3), main.discoveredAuthorCount(0));
+    try testing.expect(main.discoveredGenerationForTest(0) != before);
+}
+
+test "a relay is set aside only after a run of failures, and not forever" {
+    // A handshake fails for a blip as well as for a refusal, so one is not a
+    // verdict. Measured in a single live run: the paid relay failed every time
+    // and a free one in my own pool failed once and was fine on the retry.
+    const strikes = main.routedRefusalStrikesForTest;
+    const window = main.routedRefusalMsForTest;
+    const t: i64 = 1_000_000;
+
+    try testing.expect(!main.relayIsRefusedForTest(0, t, t));
+    try testing.expect(!main.relayIsRefusedForTest(strikes - 1, t, t));
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, t));
+
+    // Pinned against the literal, not against the constant. Everything else
+    // here counts off `strikes`, so all of it stays true if the constant drops
+    // to one and a single blip starts costing a relay six hours. This is the
+    // line that refuses that, and it is the property, not the number.
+    try testing.expect(main.routedRefusalStrikesForTest > 1);
+    try testing.expect(!main.relayIsRefusedForTest(1, t, t));
+
+    // A record with no timestamp is not a verdict either. Zero is a real
+    // reading on some clocks, so "never" is -1 and it has to be distinguished.
+    try testing.expect(!main.relayIsRefusedForTest(strikes, -1, t));
+
+    // It expires. A subscription, a block and an outage all end.
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, t + window - 1));
+    try testing.expect(!main.relayIsRefusedForTest(strikes, t, t + window));
+
+    // With no clock, a strike already recorded still counts. Nothing is dialled
+    // before the clock exists, so this is the safe reading rather than a live
+    // case: it can only set a relay aside, never wrongly reinstate one.
+    try testing.expect(main.relayIsRefusedForTest(strikes, t, null));
+    try testing.expect(!main.relayIsRefusedForTest(strikes - 1, t, null));
+}
+
+test "a relay that will not have us gives up its slot to the next one down" {
+    // Coverage says which relays carry the people you follow. It does not say
+    // which of them will talk to you. The best relay by coverage on my own
+    // account refuses the websocket handshake, and held a routed slot dialling
+    // and failing forever while the coverage counter reported its writers as
+    // reached.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/refused.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.forgetRefusedRelaysForTest();
+    defer main.forgetRefusedRelaysForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // One relay each, two more relays than there are slots, so setting one
+    // aside has somewhere for the slot to go. With slots to spare the choice
+    // takes everything and being set aside costs nothing visible.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const specs = try arena.alloc([]const []const u8, budget + 2);
+    for (specs, 0..) |*spec, i| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://r{d:0>2}.example.com", .{i});
+        spec.* = one;
+    }
+    const follows = try arena.alloc([32]u8, specs.len);
+    try seedRelayLists(arena, signer, specs, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    try testing.expectEqual(budget, routedCount());
+    // Whichever one it picked first: that is the one to refuse.
+    var buf: [96]u8 = undefined;
+    const chosen = main.discoveredUrlCopy(0, &buf).?;
+    var chosen_owned: [96]u8 = undefined;
+    @memcpy(chosen_owned[0..chosen.len], chosen);
+    const victim = chosen_owned[0..chosen.len];
+
+    // One strike short of the line changes nothing: a blip must not cost a
+    // relay its slot.
+    const t: i64 = 5_000_000;
+    for (0..main.routedRefusalStrikesForTest - 1) |i| {
+        try testing.expect(!main.noteRelayRefusalAtForTest(victim, t + @as(i64, @intCast(i))));
+    }
+    try testing.expectEqual(@as(usize, 0), main.refusedRelayCountForTest());
+    main.rankRelaySuggestionsForTest(&store);
+    try testing.expect(routedHolds(victim));
+
+    // The strike that does it says so, so the caller knows to ask for a rethink
+    // rather than waiting for somebody's relay list to land.
+    try testing.expect(main.noteRelayRefusalAtForTest(victim, t + 10));
+    try testing.expectEqual(@as(usize, 1), main.refusedRelayCountForTest());
+
+    main.rankRelaySuggestionsForTest(&store);
+    // Gone, and the slot went to a relay that might answer rather than being
+    // left empty. Both halves matter: dropping it and shrinking the pool would
+    // cost reach instead of recovering it.
+    try testing.expect(!routedHolds(victim));
+    try testing.expectEqual(budget, routedCount());
+
+    // And it comes back when it starts working.
+    main.clearRelayRefusalForTest(victim);
+    try testing.expectEqual(@as(usize, 0), main.refusedRelayCountForTest());
+}
+
+test "a socket whose owner is blocked reading it is re-asked by the keeper" {
+    // The owner of a routed connection cannot re-ask on its own. It spends its
+    // life inside `receive`, which blocks until the relay says something, and a
+    // relay with nothing new to say says nothing. Driving a route change under
+    // a live connection and watching it not notice took forty seconds of a
+    // real run, which is how this got written.
+    const here = "wss://here.example.com";
+    const there = "wss://there.example.com";
+
+    // Nothing connected in this slot: nothing to do to it.
+    try testing.expectEqual(main.RouteFollowUp.leave_it, main.routeFollowUpForTest("", 0, here, 7));
+    // Connected and current.
+    try testing.expectEqual(main.RouteFollowUp.leave_it, main.routeFollowUpForTest(here, 7, here, 7));
+    // Same relay, the slot moved: replace the question, keep the socket. This
+    // is the case the whole mechanism exists for.
+    try testing.expectEqual(main.RouteFollowUp.re_ask, main.routeFollowUpForTest(here, 7, here, 8));
+    // A trailing slash is the same relay, not a different one, or every
+    // recompute would look like a repoint and redial the whole set.
+    try testing.expectEqual(main.RouteFollowUp.re_ask, main.routeFollowUpForTest(here, 7, here ++ "/", 8));
+    // Pointed at somebody else: close it.
+    try testing.expectEqual(main.RouteFollowUp.retire, main.routeFollowUpForTest(here, 7, there, 8));
+    // Slot emptied: close it.
+    try testing.expectEqual(main.RouteFollowUp.retire, main.routeFollowUpForTest(here, 7, "", 8));
+}
+
+test "every routed connection asks under one subscription id" {
+    // A REQ under an id the relay already holds is a replacement rather than a
+    // second subscription, and that is the entire mechanism: two ids would
+    // leave the old question standing and the relay would send both answers.
+    try testing.expectEqualStrings("plaza-outbox", main.outboxSubIdForTest);
+    // And it must not look like a one-shot, which is swept on a deadline.
+    try testing.expect(!std.mem.startsWith(u8, main.outboxSubIdForTest, main.oneShotSubPrefixForTest));
+}
+
+test "the routing waits for the flurry to stop" {
+    // A cold start lands hundreds of relay lists in a few seconds, and each one
+    // is a reason to redo the ranking. Redoing it on each one is work the next
+    // one throws away, and every intermediate answer is a route table nobody
+    // should act on.
+    const settle = main.routeSettleMsForTest;
+    const floor = main.routeRecomputeMinMsForTest;
+    const cap = main.routeSettleMaxMsForTest;
+
+    // Nothing wanted, nothing to do.
+    try testing.expect(!main.routeRecomputeDueForTest(null, null, null));
+    // Wanted, and nothing has ever landed or run: the first ranking is not
+    // delayed by a window it has no reason to wait for.
+    try testing.expect(main.routeRecomputeDueForTest(0, null, null));
+
+    // A list just landed. Wait for quiet.
+    try testing.expect(!main.routeRecomputeDueForTest(1, 1, null));
+    try testing.expect(!main.routeRecomputeDueForTest(settle - 1, settle - 1, null));
+    try testing.expect(main.routeRecomputeDueForTest(settle, settle, null));
+
+    // Quiet, but the last run was moments ago. The floor still holds.
+    try testing.expect(!main.routeRecomputeDueForTest(settle, settle, floor - 1));
+    try testing.expect(main.routeRecomputeDueForTest(settle, settle, floor));
+
+    // A steady trickle, one list every second forever. Without the cap this
+    // never runs at all.
+    try testing.expect(!main.routeRecomputeDueForTest(cap - 1, 1, cap - 1));
+    try testing.expect(main.routeRecomputeDueForTest(cap, 1, cap));
+}
+
+// -- Asking on a socket that is already open ---------------------------------
+//
+// A one-shot used to dial its own connection to every relay in turn: eight TLS
+// handshakes and a parked thread to learn one display name. The pool already
+// holds those sockets, and no shipping client dials for a one-shot.
+//
+// The property that makes sharing safe is that there is nothing to route back.
+// Every event goes to the store on the thread that owns the socket, whoever
+// asked, and the render thread reads the store. A subscription id names a
+// question, never a caller waiting on an answer.
+
+test "a one-shot subscription id is recognisable as one" {
+    // The relay threads dispatch on this. Anything that is not the feed, the
+    // inbox or a one-shot falls into the engagement arm and is counted as
+    // somebody reacting to a note, so a question that does not announce itself
+    // does not merely go unanswered: it inflates a tally.
+    try testing.expect(main.isOneShotSubForTest(main.oneShotSubPrefixForTest ++ "profiles"));
+    try testing.expect(main.isOneShotSubForTest(main.oneShotSubPrefixForTest ++ "quotes"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-feed"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-inbox"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-engagement"));
+    try testing.expect(!main.isOneShotSubForTest("plaza-thread"));
+}
+
+test "asking the pool with nothing connected asks nobody, and does not dial" {
+    // The whole point is that it uses sockets that already exist. With no live
+    // connection there is nothing to write to, and the honest result is zero
+    // relays asked rather than a connection opened to make the number look
+    // better. A test binary must never reach the network.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://relay.example.com", true, true);
+
+    const kinds = [_]u16{0};
+    const authors = [_][32]u8{[_]u8{7} ** 32};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .limit = 1 }};
+    try testing.expectEqual(@as(usize, 0), main.askPoolForTest(main.oneShotSubPrefixForTest ++ "profiles", &filters));
+}
+
+test "a write-only relay is not asked a question" {
+    // Asking a relay that takes writes and answers no filters is asking it the
+    // wrong thing. It keeps its socket, for publishing.
+    //
+    // Asserted on WHICH SLOTS are chosen, not on how many were asked. With no
+    // live socket in a test every slot is skipped anyway, so a count passes
+    // whether or not the read marker is honoured: removing the check failed
+    // nothing when this test was first written.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://reads.example.com", true, false);
+    _ = main.addRelayForTest("wss://writeonly.example.com", false, true);
+    _ = main.addRelayForTest("wss://both.example.com", true, true);
+
+    var slots: [8]usize = undefined;
+    const n = main.askableSlotsForTest(&slots);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 0), slots[0]);
+    try testing.expectEqual(@as(usize, 2), slots[1]);
+}
+
+test "a relay the reader is not on is asked without a since" {
+    // `feedSince` is "the newest note I hold, minus an hour". On the pool's own
+    // relays that is right: they have been answering this question all along,
+    // so anything older is already in the store.
+    //
+    // A routed relay has answered nothing. It was dialled because it holds
+    // notes from people whose posts the reader has never had, and every one of
+    // those is older than the newest note the reader holds from anybody else.
+    // A `since` there asks a relay full of missing history for the last hour of
+    // it, which is how this shipped in v0.3.0 and delivered almost nothing.
+    var authors: [3][32]u8 = undefined;
+    for (&authors, 0..) |*a, i| {
+        a.* = [_]u8{0} ** 32;
+        a[0] = @intCast(i + 1);
+    }
+
+    // The feed HAS to be holding a note, or `feedSince` returns null for want
+    // of one and this test passes whether or not the code asks for a bound.
+    // Removing the fix failed nothing until this line existed.
+    main.setFeedNewestForTest(1_800_000_000);
+    defer main.setFeedNewestForTest(0);
+    try testing.expect(main.feedSinceForTest() != null);
+
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = main.buildRoutedFiltersForTest(&authors, &buf);
+
+    try testing.expect(filters.len > 0);
+    for (filters) |f| {
+        try testing.expectEqual(@as(?i64, null), f.since);
+    }
+}
+
+test "the pool's own relays still get a since" {
+    // The other half, so the two cannot be conflated later: the pool HAS been
+    // answering, so bounding it is what stops every reconnect re-downloading
+    // the backlog. Only the note filter carries it; the metadata filter is
+    // deliberately unbounded, because a profile edited while the app was closed
+    // is older than the newest note held.
+    var authors: [2][32]u8 = undefined;
+    for (&authors, 0..) |*a, i| {
+        a.* = [_]u8{0} ** 32;
+        a[0] = @intCast(i + 1);
+    }
+    var buf: [main.max_feed_filters]nostr.filter.Filter = undefined;
+    const filters = main.buildFeedFilters(&authors, null, 1_800_000_000, &buf);
+
+    var with_since: usize = 0;
+    for (filters) |f| {
+        if (f.since != null) with_since += 1;
+    }
+    try testing.expect(with_since > 0);
+}
+
+// -- Every socket asks only about the people it can answer for ---------------
+//
+// The pool used to ask all eight of its relays about every followed author. Now
+// each is asked about the follows who write there, plus the residual: everyone
+// no relay in either set is being asked about.
+//
+// Defining the residual correctly is the whole risk. It is NOT "authors with no
+// relay list": an author who publishes only to a relay that did not make the
+// cut has a list and is still asked of nobody, and vanishes with no error and
+// no empty state. That is the exact failure the outbox model exists to fix.
+
+/// Seeds a store with one kind:10002 per author and returns the follow set.
+fn seedRelayLists(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    specs: []const []const []const u8,
+    out: [][32]u8,
+) !void {
+    for (specs, 0..) |urls, i| {
+        var secret = [_]u8{21} ** 32;
+        secret[31] = @intCast(i + 1);
+        const kp = try signer.keyPairFromSecretKey(secret);
+        out[i] = kp.public_key;
+        if (urls.len == 0) continue;
+        var tags = try arena.alloc(nostr.event.Tag, urls.len);
+        for (urls, 0..) |u, j| {
+            const t = try arena.alloc([]const u8, 2);
+            t[0] = "r";
+            t[1] = u;
+            tags[j] = t;
+        }
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), 10002, tags, "", null);
+        _ = try main.plazaIngestForTest(arena, ev);
+    }
+}
+
+test "every followed author is asked of at least one relay" {
+    // THE invariant. A follow that appears in nobody's filters is a person who
+    // silently stops existing in the feed, which is worse than a slow feed and
+    // is the thing routing is most likely to break while improving reach.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/cover.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // MORE distinct relays than the routed budget can hold, which is the whole
+    // point: with only a couple of relays everything gets routed and the
+    // residual is never exercised, so the test passes without testing anything.
+    // Removing the residual entirely failed nothing until this list grew.
+    //
+    // One writes to the reader's own relay, two share a popular one, one has no
+    // relay list at all, and the rest each write to a relay of their own that
+    // is too unpopular to be chosen.
+    const specs = [_][]const []const u8{
+        &.{"wss://mine.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{},
+        &.{"wss://lonely-a.example.com"},
+        &.{"wss://lonely-b.example.com"},
+        &.{"wss://lonely-c.example.com"},
+        &.{"wss://lonely-d.example.com"},
+        &.{"wss://lonely-e.example.com"},
+        &.{"wss://lonely-f.example.com"},
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Collect every author named anywhere: the routed relays, then the pool.
+    var seen = [_]bool{false} ** specs.len;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        var ubuf: [96]u8 = undefined;
+        if (main.discoveredUrlCopy(i, &ubuf) == null) continue;
+        var abuf: [main.discoveredAuthorsCapForTest][32]u8 = undefined;
+        const n = main.discoveredAuthorsForTest(i, &abuf);
+        for (abuf[0..n]) |a| {
+            for (follows, 0..) |f, k| {
+                if (std.mem.eql(u8, &a, &f)) seen[k] = true;
+            }
+        }
+    }
+    var pool_buf: [main.max_follows + 1][32]u8 = undefined;
+    const pn = main.poolAuthorsForTest(0, &pool_buf);
+    for (pool_buf[0..pn]) |a| {
+        for (follows, 0..) |f, k| {
+            if (std.mem.eql(u8, &a, &f)) seen[k] = true;
+        }
+    }
+
+    for (seen, 0..) |ok, k| {
+        if (!ok) {
+            std.debug.print("\nfollow {d} is asked of no relay at all\n", .{k});
+            return error.AuthorAskedOfNobody;
+        }
+    }
+
+    // And the residual is actually carrying people here, or the loop above
+    // proved coverage in a case where routing happened to reach everyone.
+    try testing.expect(main.residualCountForTest() > 0);
+}
+
+test "a pool relay is asked about the follows who write there" {
+    // The other half of the pivot: not everyone, just the people it can answer
+    // for, plus the residual.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/poolroute.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Two write to the reader's relay, three write only elsewhere and will be
+    // picked up by a routed relay instead.
+    const specs = [_][]const []const u8{
+        &.{"wss://mine.example.com"},
+        &.{"wss://mine.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+        &.{"wss://busy.example.com"},
+    };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var pool_buf: [main.max_follows + 1][32]u8 = undefined;
+    const pn = main.poolAuthorsForTest(0, &pool_buf);
+
+    // The two who write here are named, and nobody is left over, so the pool's
+    // question shrank from five to two.
+    try testing.expectEqual(@as(usize, 0), main.residualCountForTest());
+    try testing.expectEqual(@as(usize, 2), pn);
+    for (pool_buf[0..pn]) |a| {
+        try testing.expect(std.mem.eql(u8, &a, &follows[0]) or std.mem.eql(u8, &a, &follows[1]));
+    }
+}
+
+test "an author nobody was routed to lands in the residual" {
+    // The case that makes the pivot safe. This author HAS a relay list, so
+    // "authors with no list" would miss them, and their relay is too unpopular
+    // to be chosen, so routing misses them too.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/residual.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Enough distinct one-author relays to overflow the routed budget, so the
+    // last ones cannot be chosen. Counted off the budget rather than written
+    // out: with fewer relays than slots everybody is routed, the residual is
+    // trivially empty, and the test passes without ever reaching the case.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const spare = 3;
+    const specs = try arena.alloc([]const []const u8, budget + spare);
+    for (specs, 0..) |*spec, i| {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = try std.fmt.allocPrint(arena, "wss://only-{d}.example.com", .{i});
+        spec.* = one;
+    }
+    const follows = try arena.alloc([32]u8, specs.len);
+    try seedRelayLists(arena, signer, specs, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Nobody shares a relay with anybody, so the budget reaches exactly its own
+    // number of people and the rest have to go somewhere. A count, not "more
+    // than nothing": the residual losing one person is the failure this guards.
+    try testing.expectEqual(@as(usize, spare), main.residualCountForTest());
+}
+
+test "before anything is routed, a pool relay still asks about everyone" {
+    // The first dial happens before any relay list has been read back, so the
+    // route table is empty. Asking about nobody then would open the app to a
+    // blank feed that fills only once somebody's kind:10002 arrives.
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+    main.clearRoutesForTest();
+
+    var follows: [4][32]u8 = undefined;
+    for (&follows, 0..) |*f, i| {
+        f.* = [_]u8{0} ** 32;
+        f[0] = @intCast(i + 1);
+    }
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    var buf: [main.max_follows + 1][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), main.poolAuthorsForTest(0, &buf));
+    try testing.expectEqual(follows.len, main.poolAuthorsOrAllForTest(0, &buf));
+}
+
+test "coverage beats popularity when the popular relays carry the same crowd" {
+    // The reason ranking and routing need different algorithms. Three relays
+    // are popular and carry an overlapping crowd; one quiet relay is the only
+    // way to reach two people. Top-N by popularity spends the whole budget on
+    // the crowd and never reaches them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/cover2.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // The crowd has to outnumber the budget or this proves nothing: with fewer
+    // candidate relays than slots everything is dialled and the two orderings
+    // cannot disagree. One person may name at most `outbox_relays_per_author`
+    // relays, so the crowd comes in groups of that many, each group's relays
+    // carrying only that group.
+    const budget = main.maxDiscoveredRelaysForTest;
+    const per_author = main.outboxRelaysPerAuthorForTest;
+    const groups = (budget - 1) / 2;
+    const per_group = 5;
+    // Coverage needs two relays per group and one slot left for the quiet
+    // relay, and popularity has to run out of budget before it reaches that
+    // relay. If a change to the budget breaks either, this fails loudly rather
+    // than passing hollow.
+    try testing.expect(groups * 2 + 1 <= budget);
+    try testing.expect(groups * per_author > budget);
+
+    var specs = std.ArrayList([]const []const u8).empty;
+    for (0..groups) |g| {
+        const urls = try arena.alloc([]const u8, per_author);
+        for (urls, 0..) |*u, j| u.* = try std.fmt.allocPrint(arena, "wss://crowd-{d}-{d}.example.com", .{ g, j });
+        for (0..per_group) |_| try specs.append(arena, urls);
+    }
+    const quiet_url = "wss://onlyhere.example.com";
+    const quiet = try arena.alloc([]const u8, 1);
+    quiet[0] = quiet_url;
+    try specs.append(arena, quiet);
+
+    const follows = try arena.alloc([32]u8, specs.items.len);
+    try seedRelayLists(arena, signer, specs.items, follows);
+    _ = main.setFollowsForTest(follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Everybody reached, including the one nobody popular carries.
+    const cov = main.routeCoverageForTest();
+    try testing.expectEqual(specs.items.len, cov.reached);
+    try testing.expectEqual(@as(usize, 0), cov.residual);
+    try testing.expect(routedHolds(quiet_url));
+
+    // And the popularity order really does leave that person out, which is the
+    // half of this the coverage numbers cannot show. Every crowd relay carries
+    // five writers against the quiet relay's one, so the suggestions never
+    // mention it while the routing dials it.
+    var sbuf: [96]u8 = undefined;
+    for (0..main.relaySuggestionCount()) |i| {
+        const u = main.relaySuggestionCopy(i, &sbuf) orelse continue;
+        try testing.expect(!std.mem.eql(u8, u, quiet_url));
+    }
+
+    // The budget is not spent, either. Two relays per group is enough to carry
+    // that group twice, so the greedy stops rather than opening sockets to
+    // relays whose people are already covered.
+    try testing.expectEqual(groups * 2 + 1, routedCount());
+}
+
+/// How many routed slots hold a relay.
+fn routedCount() usize {
+    var n: usize = 0;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        if (main.discoveredUrlCopy(i, &buf) != null) n += 1;
+    }
+    return n;
+}
+
+test "a relay the reader is already on is not dialled again, but still counts as cover" {
+    // The pool is already connected. Spending a routed slot on it would be a
+    // duplicate socket, and ignoring what it carries would spend the budget
+    // re-reaching people who are already reachable.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/poolcover.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    _ = main.addRelayForTest("wss://mine.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    const mine = [_][]const u8{"wss://mine.example.com"};
+    const specs = [_][]const []const u8{ &mine, &mine, &mine };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    // Nothing to dial: everyone writes where the reader already is.
+    var buf: [96]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), main.discoveredUrlCopy(0, &buf));
+    // And they are not residual either, because the pool covers them.
+    try testing.expectEqual(@as(usize, 0), main.residualCountForTest());
+}
+
+test "the candidate cap is counted, not swallowed" {
+    // A cap that drops work in silence reads as a complete answer. This one was
+    // hit exactly on a real account (128 distinct relays for 257 follows) and
+    // nobody knew, because nothing said so.
+    const cov = main.routeCoverageForTest();
+    _ = cov;
+    try testing.expect(@hasField(main.RouteCoverage, "candidates_dropped"));
+}
+
+test "a relay carrying only people the pool already covers twice is not dialled" {
+    // What the pre-seed is for. The reader's own relays are already connected,
+    // so whoever they carry is already reached; a routed slot spent on a relay
+    // carrying only those people is a thread and a socket that reach nobody
+    // new. Without counting the pool's coverage first, the greedy sees a big
+    // number and takes it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/preseed.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.clearRelaysForTest();
+    defer main.resetRelaysToBootstrapForTest();
+    // TWO of the reader's own relays, so the crowd on them reaches the coverage
+    // target without any routed relay at all.
+    _ = main.addRelayForTest("wss://m1.example.com", true, true);
+    _ = main.addRelayForTest("wss://m2.example.com", true, true);
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.setIdentityForTest([_]u8{77} ** 32);
+    defer main.clearIdentityForTest();
+
+    // The crowd writes to both of the reader's relays AND to a third the reader
+    // is not on. That third one reaches nobody new. One more person writes only
+    // somewhere else, and IS worth a slot.
+    const crowd = [_][]const u8{ "wss://m1.example.com", "wss://m2.example.com", "wss://redundant.example.com" };
+    const alone = [_][]const u8{"wss://only-here.example.com"};
+    const specs = [_][]const []const u8{ &crowd, &crowd, &crowd, &crowd, &alone };
+    var follows: [specs.len][32]u8 = undefined;
+    try seedRelayLists(arena, signer, &specs, &follows);
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    main.rankRelaySuggestionsForTest(&store);
+
+    var saw_redundant = false;
+    var saw_only_here = false;
+    var buf: [96]u8 = undefined;
+    for (0..main.maxDiscoveredRelaysForTest) |i| {
+        const u = main.discoveredUrlCopy(i, &buf) orelse continue;
+        if (std.mem.eql(u8, u, "wss://redundant.example.com")) saw_redundant = true;
+        if (std.mem.eql(u8, u, "wss://only-here.example.com")) saw_only_here = true;
+    }
+    // The one that reaches somebody new is dialled; the one that does not is
+    // not, even though four follows write there and only one writes to the
+    // other. Popularity would have picked it first.
+    try testing.expect(saw_only_here);
+    try testing.expect(!saw_redundant);
+}
+
+// -- A mention is a person, and pressing one says so --------------------------
+
+test "rendering a mention records where its label landed and whom it names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{7} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"jack\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hey nostr:{s} welcome", .{npub});
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
+
+    try testing.expectEqualStrings("hey @jack welcome", buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), mentions.all().len);
+    const ref = mentions.all()[0];
+    // The recorded range is the label in the RENDERED buffer, not the token in
+    // the source: the pubkey is gone from the text by then, which is the whole
+    // reason this table exists.
+    try testing.expectEqualStrings("@jack", buf[ref.off..][0..ref.len]);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(ref.link()).?));
+}
+
+test "a mention's link payload is a person and an http link is not" {
+    const pk = [_]u8{9} ** 32;
+    var mentions = main.MentionList{};
+    var buf: [64]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const npub = try nostr.nip19.encodeNpub(arena_state.allocator(), pk);
+    const src = try std.fmt.allocPrint(arena_state.allocator(), "nostr:{s}", .{npub});
+    _ = main.renderContentInto(&buf, src, &.{}, &mentions);
+
+    try testing.expect(main.mentionLinkPubkey(mentions.all()[0].link()) != null);
+    // Everything a paragraph's one link handler can otherwise be given. The two
+    // share a message, so telling them apart is not a nicety: getting it wrong
+    // means either a profile press shelling out to the browser, or a stranger's
+    // URL being read as thirty-two bytes of pubkey.
+    try testing.expect(main.mentionLinkPubkey("https://example.com/x") == null);
+    try testing.expect(main.mentionLinkPubkey("") == null);
+    // Exactly the payload's length, and starting with the same letter, and still
+    // not a mention, because the byte after it is not zero.
+    try testing.expect(main.mentionLinkPubkey("p" ++ ("a" ** 33)) == null);
+    // Carrying the tag is not enough either. Without the length checked first,
+    // these two read a pubkey out of a buffer that is not one: the short one
+    // reaches past its end, and the long one takes the wrong thirty-two bytes.
+    try testing.expect(main.mentionLinkPubkey("p\x00short") == null);
+    try testing.expect(main.mentionLinkPubkey("p\x00" ++ ("z" ** 40)) == null);
+}
+
+test "a mention with a space in the name is one pressable span, not two" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena);
+
+    const pk = [_]u8{11} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"Sepehr Safari\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "gm nostr:{s} o/", .{npub});
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
+    const text = buf[0..n];
+
+    const spans = main.contentSpansIn(&ui, text, mentions.all(), 0);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try testing.expectEqualStrings("gm ", spans[0].text);
+    // The `@`-to-first-space heuristic reads this as `@Sepehr` and leaves the
+    // surname behind as plain text. The recorded range knows how long the label
+    // is because it is what wrote it.
+    try testing.expectEqualStrings("@Sepehr Safari", spans[1].text);
+    try testing.expectEqualStrings(" o/", spans[2].text);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(spans[1].link).?));
+}
+
+test "an offset recorded before the trim still points at the label after it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{13} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"ana\"}");
+
+    // The picture is lifted out of the text and drawn as a picture, which is
+    // what strands the whitespace the trim then removes, and the trim shifts
+    // everything after it to the left.
+    const image = "https://example.com/a.jpg";
+    const src = try std.fmt.allocPrint(arena, "{s} nostr:{s}", .{ image, npub });
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const n = main.renderContentInto(&buf, src, &.{image}, &mentions);
+
+    try testing.expectEqualStrings("@ana", buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), mentions.all().len);
+    const ref = mentions.all()[0];
+    try testing.expectEqual(@as(u16, 0), ref.off);
+    try testing.expectEqualStrings("@ana", buf[ref.off..][0..ref.len]);
+}
+
+test "mentions map onto a piece of the content, not only the whole of it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena);
+
+    const pk = [_]u8{17} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    const p = main.upsertProfile(pk).?;
+    main.parseMetadataInto(p, "{\"name\":\"bo\"}");
+
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hello nostr:{s}", .{npub});
+    const n = main.renderContentInto(&buf, src, &.{}, &mentions);
+    const text = buf[0..n];
+
+    // What a body does when it splits around a quote card: the paragraph after
+    // the rule is handed a slice starting part-way in, and the offsets recorded
+    // against the whole have to be read relative to that.
+    const tail_at: usize = 6;
+    const spans = main.contentSpansIn(&ui, text[tail_at..], mentions.all(), tail_at);
+    try testing.expectEqual(@as(usize, 1), spans.len);
+    try testing.expectEqualStrings("@bo", spans[0].text);
+    try testing.expectEqualSlices(u8, &pk, &(main.mentionLinkPubkey(spans[0].link).?));
+
+    // And with the offset NOT applied, the same mention is not found, so the
+    // check above is testing the rebasing rather than passing for free.
+    const wrong = main.contentSpansIn(&ui, text[tail_at..], mentions.all(), 0);
+    try testing.expect(wrong.len == 0 or main.mentionLinkPubkey(wrong[0].link) == null);
+}
+
+test "past the cap a mention still reads as a name, it just does not open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var src = std.ArrayList(u8).empty;
+    defer src.deinit(arena);
+    const over = main.noteMaxMentionsForTest + 1;
+    for (0..over) |i| {
+        // A fill no other test names, so none of these has a cached display name
+        // and every one of them renders as `@npub1…`. The profile cache is
+        // global, and counting labels only works if they all look the same.
+        var pk = [_]u8{0xA5} ** 32;
+        pk[31] = @intCast(i);
+        const npub = try nostr.nip19.encodeNpub(arena, pk);
+        try src.print(arena, "nostr:{s} ", .{npub});
+    }
+
+    var buf: [2048]u8 = undefined;
+    var mentions = main.MentionList{};
+    const n = main.renderContentInto(&buf, src.items, &.{}, &mentions);
+
+    // Every one of them is rendered.
+    try testing.expectEqual(over, std.mem.count(u8, buf[0..n], "@npub1"));
+    // The table holds what it can hold, and nothing beyond it is claimed.
+    try testing.expectEqual(main.noteMaxMentionsForTest, mentions.all().len);
+
+    // And they are in offset order. The span walk reads the table with a single
+    // cursor rather than searching it at every byte, which is only correct
+    // because recording happens as the content is walked. Nothing else in the
+    // code says so out loud, so it is said here.
+    var previous: u16 = 0;
+    for (mentions.all(), 0..) |ref, k| {
+        if (k > 0) try testing.expect(ref.off > previous);
+        previous = ref.off;
+    }
+}
+
+test "pressing a mention opens that profile, and pressing a link does not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{19} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, pk);
+    var buf: [220]u8 = undefined;
+    var mentions = main.MentionList{};
+    const src = try std.fmt.allocPrint(arena, "hi nostr:{s}", .{npub});
+    _ = main.renderContentInto(&buf, src, &.{}, &mentions);
+
+    var model = Model{};
+    var fx: main.EffectsForTest = undefined;
+    // The message a paragraph sends for ANY link it carries, which is the whole
+    // reason the payload has to say which kind it is.
+    main.update(&model, Msg{ .open_url = mentions.all()[0].link() }, &fx);
+    try testing.expect(model.viewing_profile != null);
+    try testing.expectEqualSlices(u8, &pk, &model.viewing_profile.?);
+}
+
+test "a decoded image is refused by size before anything multiplies it" {
+    // Ordinary pictures, including a large photograph.
+    try testing.expect(main.imageSizeUsable(1, 1));
+    try testing.expect(main.imageSizeUsable(4032, 3024));
+    try testing.expect(main.imageSizeUsable(8000, 4000));
+
+    // Nothing to decode.
+    try testing.expect(!main.imageSizeUsable(0, 100));
+    try testing.expect(!main.imageSizeUsable(100, 0));
+
+    // A single dimension past the cap, which is what keeps the area check from
+    // being computed on numbers that could wrap.
+    try testing.expect(!main.imageSizeUsable(20000, 4));
+    try testing.expect(!main.imageSizeUsable(4, 20000));
+
+    // Both dimensions plausible on their own, and their product is not: this is
+    // the shape a file built to make an app allocate takes, and it is the one a
+    // per-dimension limit alone lets through.
+    try testing.expect(!main.imageSizeUsable(16000, 16000));
+
+    // The largest thing stb itself will hand back. Reached only through the
+    // dimension check, which is the point: the area check never runs on it.
+    try testing.expect(!main.imageSizeUsable(1 << 24, 1 << 24));
+}
+
+// -- Reposting ----------------------------------------------------------------
+
+test "a repost carries the tags other clients read it by" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x41} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+    main.clearLastPublishedTagsForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x43} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "worth passing on");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+
+    const tags = main.lastPublishedTagsForTest();
+    const e = tagNamed(tags, "e") orelse return error.NoETagOnTheRepost;
+    const p = tagNamed(tags, "p") orelse return error.NoPTagOnTheRepost;
+
+    var id_hex: [64]u8 = undefined;
+    var author_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&id_hex, "{x}", .{ev.id});
+    _ = try std.fmt.bufPrint(&author_hex, "{x}", .{ev.pubkey});
+
+    try testing.expectEqualStrings(&id_hex, e[1]);
+    try testing.expectEqualStrings(&author_hex, p[1]);
+
+    // Four fields, and the THIRD is the empty relay hint. This is the one that
+    // matters to get right and the easy one to get wrong: the author belongs in
+    // the fourth field, so dropping the empty hint would slide the pubkey into
+    // the hint's place and tell every reader to dial it as a relay.
+    try testing.expectEqual(@as(usize, 4), e.len);
+    try testing.expectEqualStrings("", e[2]);
+    try testing.expectEqualStrings(&author_hex, e[3]);
+
+    // No `k` tag. Jumble and NDK both add one only for a kind other than 1, and
+    // every note in this feed is a kind:1.
+    try testing.expect(tagNamed(tags, "k") == null);
+}
+
+test "reposting fills the icon at once but leaves the count to the crowd" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x45} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x47} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "pass it on");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    try testing.expect(!main.engagementFor(id).reposted_by_me);
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+
+    try testing.expect(main.engagementFor(id).reposted_by_me);
+    // NOT the count. Our own kind:6 arrives through the same subscription as
+    // everybody else's and is counted there; adding one here would show two.
+    try testing.expectEqual(@as(u32, 0), main.engagementFor(id).reposts);
+}
+
+test "a guest reaching for repost is remembered rather than dropped" {
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x49} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "hello");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+    try testing.expectEqual(id, model.pending.repost);
+    try testing.expect(model.joining);
+    // Nothing published, so nothing claims to have been reposted.
+    try testing.expect(!main.engagementFor(id).reposted_by_me);
+}
+
+test "reposting twice is one repost" {
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x4B} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4D} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "once");
+
+    var model = main.initialModel();
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .repost = id }, &fx);
+    main.clearLastPublishedTagsForTest();
+    // The second press publishes nothing. There is no un-repost (Jumble simply
+    // disables the button, NDK offers none), so a second press must not send a
+    // duplicate either.
+    main.update(&model, Msg{ .repost = id }, &fx);
+    try testing.expectEqual(@as(usize, 0), main.lastPublishedTagsForTest().len);
+    try testing.expect(main.engagementFor(id).reposted_by_me);
+}
+
+test "a repost carries the note it repeats, so a reader needs no second fetch" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4F} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/repost.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "the words being repeated");
+    _ = try store.ingest(arena, ev, .{});
+
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    // With the store in hand, the content is the reposted event itself. NIP-18
+    // says it should be, and Jumble and NDK both put it there, which is what
+    // lets a reader who has never seen the note render it without asking.
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    const content = main.repostContent(arena, &note);
+    try testing.expect(std.mem.indexOf(u8, content, "the words being repeated") != null);
+    try testing.expect(std.mem.startsWith(u8, content, "{\"id\":\""));
+    try testing.expect(std.mem.indexOf(u8, content, "\"sig\":\"") != null);
+
+    // And with no store it is empty rather than wrong. An empty content is
+    // legal, and is what those clients fall back to as well; a note the store
+    // has lost still reposts, it just costs the reader a fetch.
+    main.setStoreForTest(null);
+    try testing.expectEqualStrings("", main.repostContent(arena, &note));
+}
+
+// -- The mute list you already have -------------------------------------------
+
+test "a kind:10000 arriving names who this reader has muted" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const noisy = [_]u8{0x52} ** 32;
+    const quiet = [_]u8{0x53} ** 32;
+    var noisy_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&noisy_hex, "{x}", .{noisy});
+
+    // Signed by the READER, which is the only mute list that means anything to
+    // them. `p` is the public half.
+    const tags = [_]nostr.event.Tag{&.{ "p", &noisy_hex }};
+    const ev = try muteListEvent(arena, &signer, [_]u8{0x51} ** 32, 1_800_000_000, &tags, "");
+    main.ingestMuteListForTest(ev);
+
+    try testing.expect(main.isMuted(noisy));
+    try testing.expect(!main.isMuted(quiet));
+    try testing.expectEqual(@as(usize, 1), main.muteCount());
+}
+
+test "somebody else's mute list is not this reader's" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x54} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const victim = [_]u8{0x55} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{victim});
+    const tags = [_]nostr.event.Tag{&.{ "p", &hex }};
+
+    // A stranger's mute list, arriving through the same door as the reader's.
+    // Adopting it would let anybody on the network hide anybody from anybody.
+    const ev = try muteListEvent(arena, &signer, [_]u8{0x56} ** 32, 1_800_000_000, &tags, "");
+    main.ingestMuteListForTest(ev);
+    try testing.expect(!main.isMuted(victim));
+    try testing.expectEqual(@as(usize, 0), main.muteCount());
+}
+
+test "an older mute list does not undo a newer one" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x57} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x58} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_200, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A relay replaying an older copy. Replaceable events are decided by
+    // created_at, and a stale one arriving late must not unmute somebody.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &.{}, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A newer one that unmutes them does.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_300, &.{}, ""));
+    try testing.expect(!main.isMuted(who));
+}
+
+test "an empty mute list is an answer, not a malformed event" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x59} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x5A} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // This is where a mute list differs from a contact list. An empty kind:3 is
+    // ignored, because a reader with no follows has no feed; an empty kind:10000
+    // is somebody who unmuted everybody, and ignoring it would leave the last
+    // person they unmuted hidden for good.
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_200, &.{}, ""));
+    try testing.expect(!main.isMuted(who));
+    try testing.expectEqual(@as(usize, 0), main.muteCount());
+}
+
+test "signing out takes the mute list with it" {
+    main.forgetMutesForTest();
+    const me = [_]u8{0x5B} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const who = [_]u8{0x5C} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{who});
+    const with = [_]nostr.event.Tag{&.{ "p", &hex }};
+    main.ingestMuteListForTest(try muteListEvent(arena, &signer, me, 1_800_000_100, &with, ""));
+    try testing.expect(main.isMuted(who));
+
+    // A second account must not inherit the first one's hidden people, even
+    // before its own list has arrived.
+    main.setIdentityForTest([_]u8{0x5D} ** 32);
+    try testing.expect(!main.isMuted(who));
+}
+
+/// A kind:10000 signed by `author_secret`, for the mute tests above.
+fn muteListEvent(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    author_secret: [32]u8,
+    created_at: i64,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.event.Event {
+    const kp = try signer.keyPairFromSecretKey(author_secret);
+    return try nostr.event.create(arena, signer.*, kp, created_at, 10000, tags, content, null);
+}
+
+test "a muted author's notes never become cards" {
+    main.forgetMutesForTest();
+    main.forgetFollowsForTest();
+    const me = [_]u8{0x61} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.forgetFollowsForTest();
+        main.clearIdentityForTest();
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const loud_kp = try signer.keyPairFromSecretKey([_]u8{0x62} ** 32);
+    const fine_kp = try signer.keyPairFromSecretKey([_]u8{0x63} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/muted.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    _ = try store.ingest(arena, try signedNote(arena, signer, loud_kp, 1_800_000_100, "from the muted one"), .{});
+    _ = try store.ingest(arena, try signedNote(arena, signer, fine_kp, 1_800_000_200, "from the other one"), .{});
+
+    const follows = [_][32]u8{ loud_kp.public_key, fine_kp.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    // Both, before anything is muted.
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_300);
+    try testing.expectEqual(@as(usize, 2), model.notes_len);
+
+    // And one, after.
+    const muted = [_][32]u8{loud_kp.public_key};
+    try testing.expect(main.setMutesForTest(&muted, 1_800_000_250));
+    main.reconcileForTest(&model, &store, 1_800_000_300);
+    try testing.expectEqual(@as(usize, 1), model.notes_len);
+    try testing.expectEqualStrings("from the other one", model.notes[0].content());
+}
+
+test "a muted person's reply does not reach the inbox" {
+    main.forgetMutesForTest();
+    const me_secret = [_]u8{0x65} ** 32;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me_kp = try signer.keyPairFromSecretKey(me_secret);
+
+    // The SECRET, which is what this takes: handing it a pubkey signs the app in
+    // as somebody else entirely, and every `p` tag below then names a stranger.
+    main.setIdentityForTest(me_secret);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+    }
+
+    const heckler = try signer.keyPairFromSecretKey([_]u8{0x66} ** 32);
+    var me_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&me_hex, "{x}", .{me_kp.public_key});
+    const tags = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    const at_me = try nostr.event.create(arena, signer, heckler, 1_800_000_100, 1, &tags, "oi", null);
+
+    // Files, while they are not muted.
+    main.resetInboxForTest();
+    try testing.expect(main.inboxAddForTest(at_me, 1_800_000_200));
+
+    // And does not, once they are. A mute that hides somebody from the feed but
+    // still lets them ring the notification bell has not muted them.
+    main.resetInboxForTest();
+    const muted = [_][32]u8{heckler.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_150);
+    try testing.expect(!main.inboxAddForTest(at_me, 1_800_000_200));
+}
+
+test "a muted person's reply is hidden, but the thread they are in still opens" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x67} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/thread.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    const op = try signer.keyPairFromSecretKey([_]u8{0x68} ** 32);
+    const civil = try signer.keyPairFromSecretKey([_]u8{0x69} ** 32);
+    const heckler = try signer.keyPairFromSecretKey([_]u8{0x6A} ** 32);
+
+    const root = try signedNote(arena, signer, op, 1_800_000_000, "the opening note");
+    _ = try store.ingest(arena, root, .{});
+    var root_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&root_hex, "{x}", .{root.id});
+    const reply_tags = [_]nostr.event.Tag{&.{ "e", &root_hex, "", "root" }};
+    _ = try store.ingest(arena, try nostr.event.create(arena, signer, civil, 1_800_000_100, 1, &reply_tags, "a fair point", null), .{});
+    _ = try store.ingest(arena, try nostr.event.create(arena, signer, heckler, 1_800_000_200, 1, &reply_tags, "noise", null), .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = main.noteFrom(root, 1_800_000_300).id;
+    model.thread_root = main.noteFrom(root, 1_800_000_300);
+
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    const before = model.thread_notes_len;
+    try testing.expect(before >= 2);
+
+    const muted = [_][32]u8{heckler.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_250);
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    try testing.expectEqual(before - 1, model.thread_notes_len);
+    for (model.thread_notes[0..model.thread_notes_len]) |n| {
+        try testing.expect(!std.mem.eql(u8, &n.pubkey, &heckler.public_key));
+    }
+
+    // And muting the AUTHOR of the note does not close the thread on you. Opening
+    // one is asking to read that note; answering with an empty screen would be
+    // the app refusing a question the reader had just asked.
+    const muted_op = [_][32]u8{op.public_key};
+    _ = main.setMutesForTest(&muted_op, 1_800_000_260);
+    main.refreshThreadNotesForTest(&model, 1_800_000_300);
+    try testing.expectEqualStrings("the opening note", model.thread_root.content());
+}
+
+// -- A client you can make quiet ----------------------------------------------
+
+test "hiding a count stops the app asking relays for it" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Everything on: replies, reposts, reactions, zaps.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    // This is the whole feature. Taking the number away has to take the REQUEST
+    // away, or it is a number painted over: the bytes still arrive, still parse,
+    // still land in the store, and the app is only pretending to be quieter.
+    main.setHidden(.reaction_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+
+    main.setHidden(.zap_totals, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+
+    // And back, so this is a preference rather than a one-way door.
+    main.setHidden(.reaction_counts, false);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7 }, main.engagementKindsForTest());
+}
+
+test "hiding repost counts does not claim to stop fetching them" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    main.setHidden(.repost_counts, true);
+    // Kind 6 stays. Whether YOU reposted something is read out of the same
+    // stream as everybody else's reposts, so dropping it would leave the repost
+    // icon unable to say it had already been pressed. The registry says so in
+    // the row's own words rather than letting the reader assume otherwise.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    for (main.hideables) |h| {
+        if (!std.mem.eql(u8, h.id, "repost_counts")) continue;
+        try testing.expectEqual(@as(usize, 0), h.drops.len);
+        try testing.expect(std.mem.indexOf(u8, h.detail, "Still fetched") != null);
+    }
+}
+
+test "every hideable has a stable id, a label and a sentence" {
+    // The ids go in a file and will go in a NIP-78 record, so a rename silently
+    // un-hides whatever somebody had already hidden. The sentence is what the
+    // settings screen shows instead of leaving a reader to guess whether hiding
+    // something stops it being downloaded.
+    for (main.hideables, 0..) |h, i| {
+        try testing.expect(h.id.len > 0);
+        try testing.expect(h.label.len > 0);
+        try testing.expect(h.detail.len > 0);
+        for (main.hideables[i + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, h.id, other.id));
+        }
+    }
+}
+
+test "the settings screen lists everything hideable, not only what is hidden" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    // Hide one, so the screen is in the state where a reader has forgotten what
+    // they did and has come looking. Every row is still here, which is the whole
+    // reason this screen exists: there is nothing left in the feed to press.
+    main.setHidden(.zap_totals, true);
+    const tree = try buildTree(arena, &model);
+    for (main.hideables) |h| {
+        try testing.expect(findAnyText(tree.root, h.label) != null);
+    }
+}
+
+test "what is hidden survives a restart, and is written by id" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("", main.hiddenLine(&buf));
+
+    main.setHidden(.reaction_counts, true);
+    main.setHidden(.zap_totals, true);
+    const line = main.hiddenLine(&buf);
+    // By NAME. A list of booleans in registry order would mean that adding an
+    // element, or reordering one, silently moves everybody's preferences onto
+    // different things.
+    try testing.expect(std.mem.indexOf(u8, line, "reaction_counts") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "zap_totals") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "repost_counts") == null);
+
+    // Round trip: what was written comes back as the same three answers.
+    var kept: [64]u8 = undefined;
+    @memcpy(kept[0..line.len], line);
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    main.applyHiddenLine(kept[0..line.len]);
+    try testing.expect(main.isTakenAway(.reaction_counts));
+    try testing.expect(main.isTakenAway(.zap_totals));
+    try testing.expect(!main.isTakenAway(.repost_counts));
+    // And the subscription is narrowed from the first frame, not once somebody
+    // opens settings.
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+}
+
+test "a settings file from a newer Plaza still opens here" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // An id this build has never heard of, beside two it has. Refusing the whole
+    // line would drop the preferences it does understand; this reader downgraded
+    // one version and should not lose the rest of their settings for it.
+    main.applyHiddenLine("reaction_counts,link_previews_from_the_future,zap_totals");
+    try testing.expect(main.isTakenAway(.reaction_counts));
+    try testing.expect(main.isTakenAway(.zap_totals));
+    try testing.expect(!main.isTakenAway(.repost_counts));
+}
+
+// -- Muting from here ---------------------------------------------------------
+
+/// A store, an identity, and this account's own kind:10000 in it. Returns the
+/// keypair so a test can talk about "me".
+fn muteFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.keys.KeyPair {
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10000, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadMutesFromStoreForTest();
+    return kp;
+}
+
+test "muting splices onto the list rather than replacing it" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mutew.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const already = [_]u8{0x82} ** 32;
+    var already_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&already_hex, "{x}", .{already});
+    // A list with somebody already muted, a muted hashtag, a muted word and a
+    // muted thread. NIP-51 puts all of those here and Plaza reads none of the
+    // last three.
+    const existing = [_]nostr.event.Tag{
+        &.{ "p", &already_hex },
+        &.{ "t", "politics" },
+        &.{ "word", "airdrop" },
+        &.{ "e", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" },
+    };
+    _ = try muteFixture(arena, &signer, &store, &existing, "");
+
+    const fresh = [_]u8{0x83} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, fresh, true));
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    var fresh_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&fresh_hex, "{x}", .{fresh});
+
+    // The new one is on it.
+    try testing.expect(std.mem.indexOf(u8, written, &fresh_hex) != null);
+    // And so is everything that was already there. THE PROPERTY: dropping what
+    // this app does not read would delete filters the reader set in a client
+    // that does.
+    try testing.expect(std.mem.indexOf(u8, written, &already_hex) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "politics") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "airdrop") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "00112233445566778899aabb") != null);
+}
+
+test "unmuting removes exactly one name" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/unmute.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const a = [_]u8{0x84} ** 32;
+    const b = [_]u8{0x85} ** 32;
+    var a_hex: [64]u8 = undefined;
+    var b_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&a_hex, "{x}", .{a});
+    _ = try std.fmt.bufPrint(&b_hex, "{x}", .{b});
+    const existing = [_]nostr.event.Tag{ &.{ "p", &a_hex }, &.{ "p", &b_hex } };
+    _ = try muteFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isMuted(a));
+    try testing.expect(main.isMuted(b));
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, a, false));
+
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, &a_hex) == null);
+    try testing.expect(std.mem.indexOf(u8, written, &b_hex) != null);
+    try testing.expect(!main.isMuted(a));
+    try testing.expect(main.isMuted(b));
+}
+
+test "with no mute list read back, nothing is published" {
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x86} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/nolist.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    // The whole point. "No mute list found" and "the fetch has not landed" are
+    // the same thing from here, and one of them ends with the reader's real
+    // mutes replaced by a list holding one name. So it refuses, and says so.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.no_list_yet, main.writeMuteForTest(&fx, [_]u8{0x87} ** 32, true));
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10000) == null);
+    try testing.expect(main.muteBlockedReason() != null);
+}
+
+test "a private half this app cannot read stops the write instead of erasing it" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/private.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kept = [_]u8{0x88} ** 32;
+    var kept_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&kept_hex, "{x}", .{kept});
+    const existing = [_]nostr.event.Tag{&.{ "p", &kept_hex }};
+    // Content that is present and is not something this app can decrypt: a
+    // NIP-04 payload, or a NIP-44 one sealed to a key it does not hold. Either
+    // way it holds private mutes, and they are not this app's to throw away.
+    _ = try muteFixture(arena, &signer, &store, &existing, "AgY7fT?iv=notreallyanythingwecanopen");
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(
+        main.MuteWrite.private_half_unreadable,
+        main.writeMuteForTest(&fx, [_]u8{0x89} ** 32, true),
+    );
+
+    // Jumble's bug, not reproduced: its decrypt failure yields an empty tag list
+    // and the write then publishes an empty content, taking every private mute
+    // with it. Nothing was published here at all.
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, &kept_hex) != null);
+    var new_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&new_hex, "{x}", .{[_]u8{0x89} ** 32});
+    try testing.expect(std.mem.indexOf(u8, written, &new_hex) == null);
+}
+
+test "muting yourself is not a thing" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/self.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kp = try muteFixture(arena, &signer, &store, &.{}, "");
+    var fx: main.EffectsForTest = undefined;
+    // It would hide your own notes from your own feed.
+    try testing.expectEqual(main.MuteWrite.nothing_to_do, main.writeMuteForTest(&fx, kp.public_key, true));
+}
+
+test "a private half this app CAN read survives a public mute" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/privkept.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const secretly = [_]u8{0x8A} ** 32;
+    var secretly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&secretly_hex, "{x}", .{secretly});
+    const plain = try std.fmt.allocPrint(arena, "[[\"p\",\"{s}\"]]", .{secretly_hex});
+    // NIP-51's private half: a JSON tag array, encrypted to yourself.
+    // The explicit-nonce form, so the ciphertext is the same on every run and
+    // the assertion below can compare it byte for byte.
+    const ck = try nostr.nip44.conversationKey(signer, kp.secret_key, kp.public_key);
+    const sealed = try nostr.nip44.encryptWithConversationKey(arena, ck, plain, [_]u8{0x5C} ** 32);
+
+    const publicly = [_]u8{0x8B} ** 32;
+    var publicly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&publicly_hex, "{x}", .{publicly});
+    const existing = [_]nostr.event.Tag{&.{ "p", &publicly_hex }};
+    _ = try muteFixture(arena, &signer, &store, &existing, sealed);
+
+    // Both halves are in force before the write.
+    try testing.expect(main.isMuted(publicly));
+    try testing.expect(main.isMuted(secretly));
+
+    var fx: main.EffectsForTest = undefined;
+    const fresh = [_]u8{0x8C} ** 32;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, fresh, true));
+
+    // THE PROPERTY, and the whole reason this write is careful. The content is
+    // opaque to the splice: it is somebody's private mutes, sealed. Publishing
+    // a public mute must carry those bytes through untouched, and must not
+    // replace them with an empty string, which is what Jumble does whenever its
+    // decrypt fails.
+    const content = main.ownRecordContentForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings(sealed, content);
+
+    // And they are still muted afterwards, read back through the write.
+    try testing.expect(main.isMuted(secretly));
+    try testing.expect(main.isMuted(publicly));
+    try testing.expect(main.isMuted(fresh));
+}
+
+test "the profile offers Mute, and says why when it cannot" {
+    main.forgetMutesForTest();
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mutebtn.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const them = [_]u8{0x8D} ** 32;
+
+    // No mute list read yet: the control is there and disabled, with a reason.
+    // A control that vanishes is one the reader wonders about, and one that
+    // silently does nothing is worse.
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+    main.setStoreForTest(&store);
+    try testing.expect(main.muteBlockedReason() != null);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = them;
+    var tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Mute") != null);
+
+    // With a list in hand it becomes live, and reads back the state it is in.
+    main.clearIdentityForTest();
+    _ = try muteFixture(arena, &signer, &store, &.{}, "");
+    try testing.expect(main.muteBlockedReason() == null);
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, them, true));
+    var model2 = main.initialModel();
+    model2.stage = .ready;
+    model2.viewing_profile = them;
+    tree = try buildTree(arena, &model2);
+    try testing.expect(findAnyText(tree.root, "Muted") != null);
+}
+
+test "hiding a count narrows the feed's subscription and leaves notifications alone" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    main.setHidden(.reaction_counts, true);
+    main.setHidden(.zap_totals, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+
+    // And the inbox keeps asking its own question. Hiding how many people liked
+    // a note is not asking to stop being told when somebody likes YOURS: two
+    // different questions, two subscriptions, and only one of them narrows.
+    //
+    // This is here because the settings copy said "stops Plaza asking relays for
+    // reactions at all", which was false while this array said otherwise. The
+    // sentence is fixed; this is what keeps it fixed.
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, &main.inbox_kinds);
+}
+
+test "a muted author's note is dropped on arrival, not just on a full read" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetMutesForTest();
+    defer main.forgetMutesForTest();
+
+    const f = try FeedFixture.init(arena, "mutedsplice");
+    defer f.deinit();
+
+    var loud_signer = nostr.keys.Signer.init();
+    defer loud_signer.deinit();
+    const loud = try loud_signer.keyPairFromSecretKey([_]u8{0x91} ** 32);
+
+    // Followed, so the arrival is one this feed is otherwise about, and muted.
+    // BOTH set before the first tick: each of them invalidates the feed, and an
+    // invalidated feed reads the whole window back, which is the other path and
+    // the one already covered.
+    const follows = [_][32]u8{ f.kp.public_key, loud.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+    const muted = [_][32]u8{loud.public_key};
+    _ = main.setMutesForTest(&muted, 1_800_000_050);
+
+    // One note on screen, so the NEXT tick takes the splice path rather than
+    // reading the whole window back. That is the distinction this test is for:
+    // the feed has two ways in and only one of them was covered.
+    _ = try f.arrive(arena, 1_800_000_000, "before");
+    f.tick(1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), f.model.notes_len);
+    const before_splices = main.feedWork().splices;
+
+    const shouted = try signedNote(arena, loud_signer, loud, 1_800_000_200, "from the muted one");
+    _ = try main.plazaIngestForTest(arena, shouted);
+    f.tick(1_800_000_300);
+
+    // The splice ran, and it kept nothing.
+    try testing.expect(main.feedWork().splices > before_splices);
+    for (f.model.notes[0..f.model.notes_len]) |n| {
+        try testing.expect(!std.mem.eql(u8, &n.pubkey, &loud.public_key));
+    }
+}
+
+test "hiding a verb hides its count and stops its fetch too" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    // The hierarchy. Hiding the VERB has to take the count with it: an icon
+    // that is not drawn has nowhere to put a number, so treating the two as
+    // independent would leave a count nobody can see still being downloaded.
+    main.setHidden(.reactions, true);
+    try testing.expect(main.countHidden(.reactions, .reaction_counts));
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+
+    // And it holds with only the count hidden, which is the other half.
+    main.setHidden(.reactions, false);
+    main.setHidden(.reaction_counts, true);
+    try testing.expect(main.countHidden(.reactions, .reaction_counts));
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+}
+
+test "reply counts can be hidden, and that stops the feed asking for replies" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Kind 1 here is the engagement subscription asking for REPLIES to the
+    // notes on screen, which is a different question from the feed's own
+    // subscription asking for notes by author. Dropping it costs the reply
+    // count and nothing else; a thread still fetches its own replies.
+    main.setHidden(.reply_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 6, 7, 9735 }, main.engagementKindsForTest());
+
+    main.setHidden(.reply_counts, false);
+    main.setHidden(.replies, true);
+    try testing.expectEqualSlices(u16, &.{ 6, 7, 9735 }, main.engagementKindsForTest());
+}
+
+test "reposting is hideable but never claims to stop being fetched" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    // Both repost rows, verb and count, leave kind 6 in place. Whether YOU
+    // reposted something arrives on that same stream, so dropping it would
+    // leave the verb unable to say it had already been pressed.
+    main.setHidden(.reposts, true);
+    main.setHidden(.repost_counts, true);
+    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+
+    for (main.hideables) |h| {
+        if (!std.mem.eql(u8, h.id, "reposts") and !std.mem.eql(u8, h.id, "repost_counts")) continue;
+        try testing.expectEqual(@as(usize, 0), h.drops.len);
+        try testing.expect(std.mem.indexOf(u8, h.detail, "Still fetched") != null);
+    }
+}
+
+test "every hideable lines up with its enum tag" {
+    // The registry is indexed by the enum, and a row in the wrong place would
+    // hide the wrong thing. There is a comptime check for exactly this; this is
+    // the runtime statement of the same property, so the intent is visible to
+    // somebody reading the tests rather than only to the compiler.
+    try testing.expectEqual(@typeInfo(main.Hideable).@"enum".fields.len, main.hideables.len);
+    inline for (@typeInfo(main.Hideable).@"enum".fields) |field| {
+        try testing.expectEqualStrings(field.name, main.hideables[field.value].id);
+    }
+}
+
+test "the notes settings screen lists all eight, verbs and counts" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x73} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    main.setHidden(.zaps, true);
+    const tree = try buildTree(arena, &model);
+    for (main.hideables) |h| {
+        try testing.expect(findAnyText(tree.root, h.label) != null);
+    }
+    // And the section is not called QUIET any more, which read as
+    // do-not-disturb: a switch about notifications rather than about what a
+    // note row draws.
+    try testing.expect(findAnyText(tree.root, "QUIET") == null);
+    try testing.expect(findAnyText(tree.root, "NOTES") != null);
+}
+
+test "a hidden verb is gone from the note row, not just its number" {
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x75} ** 32);
+
+    main.setIdentityForTest([_]u8{0x76} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(try signedNote(arena, signer, kp, 1_800_000_000, "a note with a verb row"), 1_800_000_100);
+    model.notes_len = 1;
+
+    // All four verbs are on the row to begin with.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") != null);
+        try testing.expect(findByLabel(tree.root, "Reply") != null);
+        try testing.expect(findByLabel(tree.root, "Repost") != null);
+    }
+
+    // Hiding the verb removes the control itself. Hiding only its count would
+    // leave the icon sitting there, which is the thing this is not.
+    main.setHidden(.reactions, true);
+    main.setHidden(.replies, true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") == null);
+        try testing.expect(findByLabel(tree.root, "Reply") == null);
+        // Untouched, so this is the verb being hidden rather than the whole row
+        // failing to build.
+        try testing.expect(findByLabel(tree.root, "Repost") != null);
+    }
+
+    // Hiding only the COUNT leaves the verb pressable, which is the other half
+    // of the pair and the reason there are two rows per verb.
+    main.setHidden(.reactions, false);
+    main.setHidden(.reaction_counts, true);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByLabel(tree.root, "Like") != null);
+    }
+}
+
+test "a note's id is remembered once, and the table is bounded" {
+    var ids: [main.engagementWatchCapForTest]i64 = undefined;
+    var hex: [main.engagementWatchCapForTest][64]u8 = undefined;
+    var len: usize = 0;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x81} ** 32);
+
+    const one = try signedNote(arena, signer, kp, 1_800_000_000, "first");
+    main.rememberFeedIdForTest(&ids, &hex, &len, one);
+    try testing.expectEqual(@as(usize, 1), len);
+
+    // The same note arriving again, which is the ordinary case: several relays
+    // carry it. It must not take a second slot, or the `#e` filter fills with
+    // duplicates and the cap is reached on a fraction of the feed.
+    main.rememberFeedIdForTest(&ids, &hex, &len, one);
+    try testing.expectEqual(@as(usize, 1), len);
+
+    const two = try signedNote(arena, signer, kp, 1_800_000_001, "second");
+    main.rememberFeedIdForTest(&ids, &hex, &len, two);
+    try testing.expectEqual(@as(usize, 2), len);
+
+    // And it stops at the cap rather than writing past the array. The `#e`
+    // filter has to stay a size relays accept.
+    //
+    // A note NOT already in the table, which the first version of this got
+    // wrong: reusing `two` meant the dedup scan found it and returned before the
+    // cap was ever consulted, so the assertion passed while the branch it exists
+    // for was never reached.
+    const fresh = try signedNote(arena, signer, kp, 1_800_000_002, "past the cap");
+    len = main.engagementWatchCapForTest;
+    main.rememberFeedIdForTest(&ids, &hex, &len, fresh);
+    try testing.expectEqual(main.engagementWatchCapForTest, len);
+}
+
+test "the proxy is only bypassed when it refused the host, not the picture" {
+    // 400 with "Domain or TLD blocked by policy" is what wsrv.nl answers for a
+    // Blossom host that serves the same file directly. 403 and 451 are the same
+    // refusal by other names.
+    try testing.expect(main.proxyRefusedHost(.ok, 400));
+    try testing.expect(main.proxyRefusedHost(.ok, 403));
+    try testing.expect(main.proxyRefusedHost(.ok, 451));
+
+    // NOT a 404: the source is missing and will be missing directly too, so a
+    // fallback is a second download with a known answer.
+    try testing.expect(!main.proxyRefusedHost(.ok, 404));
+
+    // NOT a 200 that produced no usable image. That is our own size limit, and
+    // going direct only makes it worse, because the proxy was the thing
+    // shrinking the picture. Two existing tests caught this when the fallback
+    // fired on every failure.
+    try testing.expect(!main.proxyRefusedHost(.ok, 200));
+
+    // And nothing that never reached a host: a retry, not a refusal.
+    try testing.expect(!main.proxyRefusedHost(.ok, 500));
+    try testing.expect(!main.proxyRefusedHost(.ok, 429));
+}
+
+test "the proxy toggle decides whether a URL is rewritten at all" {
+    const original = "https://blossom.ditto.pub/abc.jpeg";
+    var buf: [1024]u8 = undefined;
+
+    // The proxy URL too: a test process never loads the settings file, so this
+    // starts empty, and an empty proxy means "use the original" whatever the
+    // switch says.
+    main.setMediaProxy("https://wsrv.nl/");
+    main.setMediaProxyOn(true);
+    defer main.setMediaProxyOn(true);
+    const proxied = main.feedImageUrlForTest(&buf, original);
+    try testing.expect(std.mem.indexOf(u8, proxied, "wsrv.nl") != null);
+
+    // Off, the picture's own URL is used untouched, which is what somebody
+    // reaches for when a proxy is refusing their images.
+    main.setMediaProxyOn(false);
+    var buf2: [1024]u8 = undefined;
+    try testing.expectEqualStrings(original, main.feedImageUrlForTest(&buf2, original));
+}
+
+// -- A note with more than one picture ----------------------------------------
+
+test "every image in a note becomes a picture, and none is left in the text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x81} ** 32);
+
+    // Derek's note, in shape: three images on one line, each with its own imeta.
+    const a = "https://blossom.example/aaa.jpeg";
+    const b = "https://blossom.example/bbb.jpeg";
+    const c = "https://blossom.example/ccc.jpeg";
+    const content = try std.fmt.allocPrint(arena, "Bon dia, Nostr. {s} {s} {s}", .{ a, b, c });
+    const tags = [_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ a, "dim 2040x1536", "blurhash abc" },
+        &.{ "imeta", "url " ++ b, "dim 768x1020" },
+        &.{ "imeta", "url " ++ c, "dim 768x1020" },
+    };
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &tags, content, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(@as(usize, 3), note.imageCount());
+    try testing.expectEqualStrings(a, note.imageAt(0).url());
+    try testing.expectEqualStrings(b, note.imageAt(1).url());
+    try testing.expectEqualStrings(c, note.imageAt(2).url());
+
+    // The whole point of the bug report: none of them may be left behind as a
+    // raw link beside the pictures. Before this, the first became a picture and
+    // the other two sat in the body as URLs.
+    try testing.expectEqualStrings("Bon dia, Nostr.", note.content());
+
+    // Each keeps its OWN imeta, not the first one's, which is what lets a
+    // portrait shot beside a landscape reserve the right space.
+    try testing.expectEqual(@as(u16, 2040), note.imageAt(0).w);
+    try testing.expectEqual(@as(u16, 768), note.imageAt(1).w);
+    try testing.expectEqualStrings("abc", note.imageAt(0).blurhash());
+    try testing.expectEqualStrings("", note.imageAt(1).blurhash());
+}
+
+test "a note past the picture cap keeps the rest as links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x82} ** 32);
+
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(arena);
+    const over = main.max_note_images + 2;
+    for (0..over) |i| try content.print(arena, "https://blossom.example/{d}.jpeg ", .{i});
+
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, content.items, null);
+    const note = main.noteFrom(ev, 1_800_000_100);
+
+    try testing.expectEqual(main.max_note_images, note.imageCount());
+    // The overflow stays readable rather than vanishing: it is still a link the
+    // reader can open, which is what the single-image build did for everything
+    // after the first.
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/4.jpeg") != null);
+    try testing.expect(std.mem.indexOf(u8, note.content(), "/0.jpeg") == null);
+}
+
+test "each picture of a note gets its own media slot" {
+    // They shared one key before, so a gallery's cells fought over a single slot
+    // and only ever one of them could be loaded.
+    const note_id: i64 = 0x0123_4567;
+    const first = main.mediaKeyForTest(note_id, 0);
+    try testing.expectEqual(note_id, first);
+
+    var seen: [main.max_note_images]i64 = undefined;
+    for (0..main.max_note_images) |i| {
+        seen[i] = main.mediaKeyForTest(note_id, i);
+        try testing.expect(seen[i] >= 0);
+        for (seen[0..i]) |earlier| try testing.expect(earlier != seen[i]);
+    }
+}
+
+test "a URL that prefixes another does not strand the longer one's tail" {
+    // `.../a.jpeg` is a prefix of `.../a.jpeg?x=1`. Removing the short one first
+    // would leave `?x=1` sitting in the body as debris.
+    var buf: [512]u8 = undefined;
+    const short = "https://h.example/a.jpeg";
+    const long = "https://h.example/a.jpeg?w=9";
+    const omit = [_][]const u8{ short, long };
+    const n = main.renderContentInto(&buf, "look " ++ long ++ " end", &omit, null);
+    try testing.expectEqualStrings("look  end", buf[0..n]);
+}
+
+test "three pictures draw as three cells across the column, not one and two links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x83} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 91;
+    _ = model.notes[0].setImageForTest(0, "https://h.example/a.jpg");
+    _ = model.notes[0].setImageForTest(1, "https://h.example/b.jpg");
+    _ = model.notes[0].setImageForTest(2, "https://h.example/c.jpg");
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    // One pressable cell per picture. The single-image build drew exactly one
+    // whatever the note carried.
+    try testing.expectEqual(@as(usize, 3), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
+
+test "one picture still fills the column, so nothing about a plain note moved" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x84} ** 32);
+    defer main.clearIdentityForTest();
+    main.setMediaPreviews(true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 92;
+    const img = model.notes[0].setImageForTest(0, "https://h.example/only.jpg");
+    img.aspect = 0.6;
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expectEqual(@as(usize, 1), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
+
+// -- Signing for other apps ---------------------------------------------------
+
+test "the signing screen mirrors the daemon, and a revoked client leaves it" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    // Off, with nothing to show.
+    try testing.expect(!main.bunkerOn());
+    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1",
+        \\ "pending":{"id":7,"client":"aa11"},
+        \\ "clients":[{"pubkey":"bb22"},{"pubkey":"cc33"}]}
+    );
+    try testing.expect(main.bunkerOn());
+    try testing.expectEqualStrings("bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1", main.bunkerUrl());
+    try testing.expectEqualStrings("aa11", main.bunkerPendingClient());
+    try testing.expectEqual(@as(usize, 2), main.bunkerClientCount());
+
+    // The daemon is the source of truth and every answer REPLACES the mirror.
+    // Merging would let a client that had just been disconnected linger in the
+    // list, which is the one thing this list exists to show truthfully.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc","pending":null,"clients":[{"pubkey":"cc33"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), main.bunkerClientCount());
+    try testing.expectEqualStrings("cc33", main.bunkerClientAt(0)[0..4]);
+    // And the prompt goes when the daemon says it is gone, rather than sticking
+    // around for somebody to answer a question nobody is asking any more.
+    try testing.expectEqual(@as(usize, 0), main.bunkerPendingClient().len);
+}
+
+test "switching the bunker off empties what the screen shows" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"bb22"}]}
+    );
+    try testing.expect(main.bunkerUrl().len > 0);
+
+    // The daemon drops every session when it is switched off, and the screen
+    // has to follow. A URL still on screen for a bunker that is off is a link
+    // somebody would paste into another app and then wonder about.
+    main.applyBunkerStateForTest(
+        \\{"enabled":false,"url":"","pending":null,"clients":[]}
+    );
+    try testing.expect(!main.bunkerOn());
+    try testing.expectEqual(@as(usize, 0), main.bunkerUrl().len);
+    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
+}
+
+test "the settings screen carries the signing section" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "SIGNING") != null);
+        try testing.expect(findByLabel(tree.root, "Sign for other apps") != null);
+        // Off: no link, because there is nothing to hand anybody yet.
+        try testing.expect(findAnyText(tree.root, "Copy link") == null);
+    }
+
+    // A waiting client puts the question on the screen, with both answers.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":{"id":3,"client":"dd44"},"clients":[]}
+    );
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "Copy link") != null);
+        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") != null);
+        try testing.expect(findAnyText(tree.root, "Approve") != null);
+        try testing.expect(findAnyText(tree.root, "Deny") != null);
+    }
+
+    // And a connected one can be disconnected from the same place.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"ee55"}]}
+    );
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") == null);
+        try testing.expect(findAnyText(tree.root, "Disconnect") != null);
+    }
+}
+
+test "the signing card's text stays inside the window" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x93} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://3e294d2fd339bb16a5403a86e3664947dd408c4d87a0066524f8a573ae53ca8e?relay=wss%3A%2F%2Fnostr.oxtr.dev&relay=wss%3A%2F%2Ftheforest.nostr1.com&relay=wss%3A%2F%2Frelay.primal.net&secret=9f4184c6ddbdf3f185f7d32839457b72","pending":null,"clients":[]}
+    );
+
+    const p = try painted.Painted.render(arena, &model);
+    const hint = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.";
+    const frame = frameOfText(p, hint) orelse return error.HintNotDrawn;
+
+    // The reported bug, as a number. A wrapping paragraph with nothing bounding
+    // its width lays out at its natural width, so `wrap` is obeyed and useless:
+    // this sentence ran off the right edge of the card and out of the window.
+    // The window is the outer bound and the one a reader actually sees broken.
+    const window_right = main.window_width;
+    try testing.expect(frame.x + frame.width <= window_right);
+
+    // And the link itself, which is longer and would go first.
+    const url_frame = frameOfTextContaining(p, "bunker://3e294d2f") orelse return error.UrlNotDrawn;
+    try testing.expect(url_frame.x + url_frame.width <= window_right);
+}
+
+test "the prompt says what is being asked, in words a person can act on" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A connect is the client asking to be let in, which is a different
+    // question from being allowed to do something.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":1,"client":"aa","ask":"","kind":-1},"clients":[]}
+    );
+    try testing.expect(main.bunkerAskIsConnect());
+    try testing.expectEqualStrings("wants to sign as you", main.bunkerAskLine(arena));
+
+    // A signature names what it would DO. "Sign a kind 3" and "change who you
+    // follow" are the same thing to a signer and very different to a person,
+    // and this app's own history is why: a bad kind:3 empties a follow list.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":2,"client":"aa","ask":"sign_event","kind":3},"clients":[]}
+    );
+    try testing.expect(!main.bunkerAskIsConnect());
+    try testing.expectEqualStrings("wants to change who you follow", main.bunkerAskLine(arena));
+
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":3,"client":"aa","ask":"sign_event","kind":1},"clients":[]}
+    );
+    try testing.expectEqualStrings("wants to post a note as you", main.bunkerAskLine(arena));
+
+    // An unnamed kind is honest about being a number rather than pretending to
+    // know what it is.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":4,"client":"aa","ask":"sign_event","kind":31337},"clients":[]}
+    );
+    try testing.expect(std.mem.indexOf(u8, main.bunkerAskLine(arena), "31337") != null);
+
+    // And decryption is named for what it exposes, not for its method.
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":5,"client":"aa","ask":"nip44_decrypt","kind":-1},"clients":[]}
+    );
+    try testing.expectEqualStrings("wants to read an encrypted message of yours", main.bunkerAskLine(arena));
+}
+
+test "the prompt offers a duration, not just yes and no" {
+    main.resetBunkerForTest();
+    defer main.resetBunkerForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x95} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.applyBunkerStateForTest(
+        \\{"enabled":true,"url":"bunker://a","pending":{"id":9,"client":"bb","ask":"sign_event","kind":1},"clients":[]}
+    );
+
+    const tree = try buildTree(arena, &model);
+    // A prompt with only yes and no is one people learn to hit yes on. All
+    // four of Amber's positions have to be one press away.
+    try testing.expect(findAnyText(tree.root, "Allow once") != null);
+    try testing.expect(findAnyText(tree.root, "Allow for a day") != null);
+    try testing.expect(findAnyText(tree.root, "Always") != null);
+    try testing.expect(findAnyText(tree.root, "Deny") != null);
+    // And it appears over the FEED, not only in Settings: the reader is not in
+    // Settings when another app asks.
+    try testing.expect(findAnyTextContaining(tree.root, "wants to post a note as you"));
+}
+
+test "a picture bigger than one response body is assembled from its slices" {
+    // The bug this exists for: every photo in a Nostr feed is 300 KB to 2 MB,
+    // and one response body carries at most 240 KiB, so before this the whole
+    // class of pictures simply never appeared.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_001;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const slice = main.maxImageBytesForTest();
+    const first = try arena.alloc(u8, slice);
+    @memset(first, 0xAA);
+    const second = try arena.alloc(u8, slice);
+    @memset(second, 0xBB);
+    const last = try arena.alloc(u8, 131_761); // short: the host had no more
+    @memset(last, 0xCC);
+
+    // A full slice always means "ask again": the host gave exactly what was
+    // asked for, so there is no way to tell from the length alone that the
+    // picture ended there.
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendMediaSliceForTest(note_id, first).?);
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendMediaSliceForTest(note_id, second).?);
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendMediaSliceForTest(note_id, last).?);
+
+    // Byte-identical, in order. A gap or an overlap between slices would still
+    // decode into a picture, just the wrong one, so length alone is not enough.
+    const whole = main.mediaPartialForTest(note_id) orelse return error.NothingAssembled;
+    try testing.expectEqual(slice * 2 + last.len, whole.len);
+    try testing.expect(std.mem.allEqual(u8, whole[0..slice], 0xAA));
+    try testing.expect(std.mem.allEqual(u8, whole[slice .. slice * 2], 0xBB));
+    try testing.expect(std.mem.allEqual(u8, whole[slice * 2 ..], 0xCC));
+    main.resetMediaForTest();
+}
+
+test "a picture that fits in one slice is whole without allocating anything" {
+    // The common case, and the one that must not get slower: a thumbnail comes
+    // back short on the first answer and decodes straight from the response.
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_002;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendMediaSliceForTest(note_id, "small").?);
+    try testing.expect(main.mediaPartialForTest(note_id) == null);
+    main.resetMediaForTest();
+}
+
+test "the ranges asked for tile the file, with no gap and no overlap" {
+    var buf: [64]u8 = undefined;
+    const slice = main.maxImageBytesForTest();
+    try testing.expectEqualStrings("bytes=0-245759", main.rangeHeaderForTest(&buf, 0).?);
+    // The second request starts at the byte after the first window's last, which
+    // is exactly the length assembled so far.
+    var buf2: [64]u8 = undefined;
+    try testing.expectEqualStrings("bytes=245760-491519", main.rangeHeaderForTest(&buf2, slice).?);
+}
+
+test "a picture past the ceiling is refused rather than assembled forever" {
+    // The bytes are a stranger's, held whole in memory before they decode, so
+    // something has to say when to stop. A host that answers a full slice every
+    // time would otherwise be a download with no end.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_003;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const slice = main.maxImageBytesForTest();
+    const full = try arena.alloc(u8, slice);
+    @memset(full, 0xDD);
+
+    var sent: usize = 0;
+    while (sent < main.maxImageDownloadBytesForTest()) : (sent += slice) {
+        if (main.appendMediaSliceForTest(note_id, full)) |outcome| {
+            try testing.expectEqual(main.SliceOutcome.want_more, outcome);
+        } else {
+            main.resetMediaForTest();
+            return; // refused, which is the point
+        }
+    }
+    std.debug.print("assembled past the ceiling without refusing\n", .{});
+    return error.NoCeiling;
+}
+
+test "a slice buffer never outlives the fetch that was filling it" {
+    // A half-assembled picture is bytes nobody will decode. Every way a fetch
+    // can end has to drop it, or a feed of failing hosts leaks megabytes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 78_004;
+    main.resetMediaForTest();
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    const full = try arena.alloc(u8, main.maxImageBytesForTest());
+    @memset(full, 0xEE);
+    _ = main.appendMediaSliceForTest(note_id, full);
+    try testing.expect(main.mediaPartialForTest(note_id) != null);
+
+    // The host stops answering partway through.
+    main.deliverMediaResponseForTest(&fx, note_id, .timed_out, 0, "");
+    try testing.expect(main.mediaPartialForTest(note_id) == null);
+    main.resetMediaForTest();
+}
+
+test "a screen of picture-heavy notes gets more slots than the old fixed share" {
+    // The reported bug, as a number. Two notes, four pictures and three, is what
+    // a Nostr feed actually looks like, and the reserved share of six meant the
+    // seventh cell could never hold a picture however idle the rest of the
+    // registry was. Seven has to be reachable now.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    main.beginImagePassForTest();
+
+    var lent: usize = 0;
+    var seen = [_]bool{false} ** (main.image_registry_slots + 1);
+    for (0..7) |i| {
+        const slot = main.claimMediaSlotForTest(&fx, @intCast(80_100 + i)) orelse continue;
+        const id = main.acquireImageIdForTest(&fx) orelse continue;
+        slot.image_id = id;
+        slot.last_used = main.imageClockForTest();
+        // Never the same id twice: two pictures sharing one would draw the same
+        // pixels, which is worse than one of them missing.
+        if (seen[@intCast(id)]) {
+            std.debug.print("registry id {d} lent twice\n", .{id});
+            return error.DuplicateImageId;
+        }
+        seen[@intCast(id)] = true;
+        lent += 1;
+    }
+    if (lent < 7) {
+        std.debug.print("only {d} of 7 pictures on screen could hold pixels\n", .{lent});
+        return error.StillCappedAtTheOldShare;
+    }
+}
+
+test "a face and a picture draw from the same pool, oldest off screen first" {
+    // The point of one allocator. A profile page wants a banner and many faces
+    // and no pictures; a feed of photo notes wants the opposite. Under reserved
+    // shares each screen left the other kind's capacity idle, so what decides is
+    // time off screen, not what kind of image it is.
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    // Every id held by a face that is on screen right now.
+    main.beginImagePassForTest();
+    for (0..main.image_registry_slots) |i| {
+        const pk = [_]u8{@intCast(i + 1)} ** 32;
+        main.setProfileAvatarForTest(pk, @intCast(i + 1), .loaded);
+        main.markAvatarWantedForTest(pk);
+    }
+
+    // Nothing may be taken while every holder is visible: the caller shows
+    // initials this frame rather than evicting something the reader can see.
+    if (main.chooseImageIdForTest()) |id| {
+        std.debug.print("id {d} was offered while its holder was on screen\n", .{id});
+        return error.WouldEvictSomethingVisible;
+    }
+
+    // Now give them DIFFERENT ages: each pass marks one more face, so the one
+    // marked earliest and never again has been off screen longest.
+    for (0..main.image_registry_slots) |i| {
+        main.beginImagePassForTest();
+        // Everyone from `i` onward is still being read; everyone before has
+        // scrolled away, and how long ago is what separates them.
+        for (i..main.image_registry_slots) |j| {
+            main.markAvatarWantedForTest([_]u8{@intCast(j + 1)} ** 32);
+        }
+    }
+
+    // The reader scrolls to a note with pictures. The oldest face is the one a
+    // picture gets: which one is decided by time off screen, not by kind.
+    main.beginImagePassForTest();
+    const offered = main.chooseImageIdForTest() orelse return error.NoSlotForPicture;
+    if (offered != 1) {
+        std.debug.print("offered id {d}, but id 1 has been off screen longest\n", .{offered});
+        return error.TookTheWrongOne;
+    }
+
+    // And the face the reader IS looking at is never the one taken.
+    main.beginImagePassForTest();
+    main.markAvatarWantedForTest([_]u8{1} ** 32);
+    const next = main.chooseImageIdForTest() orelse return error.NoSlotForPicture;
+    if (next == 1) {
+        std.debug.print("took the face that is on screen instead of one that is not\n", .{});
+        return error.EvictedTheVisibleFace;
+    }
+}
+
+test "a face assembles from slices too, and never outlives its fetch" {
+    // Faces and banners were left on one request when pictures moved to slices,
+    // so a full-size profile picture straight from its own host still drew
+    // initials for exactly the reason a photo drew a blank cell. One Download,
+    // three consumers.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    const pk = [_]u8{0x2a} ** 32;
+    main.setProfileAvatarForTest(pk, 1, .fetching);
+
+    const full = try arena.alloc(u8, main.maxImageBytesForTest());
+    @memset(full, 0x5a);
+    try testing.expectEqual(main.SliceOutcome.want_more, main.appendAvatarSliceForTest(pk, full).?);
+    try testing.expectEqual(main.SliceOutcome.complete, main.appendAvatarSliceForTest(pk, "tail").?);
+    try testing.expectEqual(@as(usize, 1), main.avatarPartialCountForTest());
+
+    // The host stops answering partway through the next one: the bytes go with
+    // the fetch, or a feed of failing hosts leaks megabytes of faces.
+    main.deliverAvatarResponseForTest(&fx, pk, .timed_out, 0, "");
+    try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
+
+    // And a busy effect table is the other way a fetch ends without an answer.
+    // It sends the face back to idle to be asked again from the start, so what
+    // it already had has to go with it: keeping it would splice the front of
+    // one download onto the front of the next.
+    _ = main.appendAvatarSliceForTest(pk, full);
+    try testing.expectEqual(@as(usize, 1), main.avatarPartialCountForTest());
+    main.deliverAvatarResponseForTest(&fx, pk, .rejected, 0, "");
+    try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
+}
+
+test "only the follows nobody can be routed to are put to the indexers" {
+    // The outbox bootstrap. To route to somebody you need their kind:10002, and
+    // you cannot ask their write relays for it, because finding them IS the
+    // question. Plaza only ever learned a relay list from a relay it was
+    // already reading, so a follow whose list lives anywhere else was never
+    // routed to and never appeared, with no error and no empty state.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const known = try signer.keyPairFromSecretKey([_]u8{3} ** 32);
+    const unknown = try signer.keyPairFromSecretKey([_]u8{4} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/indexer.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.resetIndexerAskedForTest();
+    defer main.resetIndexerAskedForTest();
+    // Without an identity the follow table is not owned and `followSet` hands
+    // back the starter pack, so the sweep would be measuring the wrong people.
+    main.setIdentityForTest([_]u8{88} ** 32);
+    defer main.clearIdentityForTest();
+
+    const follows = [_][32]u8{ known.public_key, unknown.public_key };
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    // One of the two has published a relay list Plaza already holds.
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://writes.example.com", "write" }};
+    const ev = try nostr.event.create(arena, signer, known, 1_800_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    var out: [8][32]u8 = undefined;
+    const n = main.collectUnroutedForTest(&out);
+
+    // Exactly the one with nothing on disk. Asking about the other would be
+    // asking a question already answered.
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(std.mem.eql(u8, &out[0], &unknown.public_key));
+}
+
+test "a follow with no relay list anywhere is asked once, not on every rebuild" {
+    // The routing table is rebuilt whenever a relay list lands, and somebody who
+    // has never published one is unroutable at every one of those rebuilds. If
+    // the sweep re-asked each time, a single account with no kind:10002 would
+    // put a REQ to four relays for the life of the session.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const nobody = try signer.keyPairFromSecretKey([_]u8{5} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/asked.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetRelaysForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    main.resetIndexerAskedForTest();
+    defer main.resetIndexerAskedForTest();
+    main.setIdentityForTest([_]u8{89} ** 32);
+    defer main.clearIdentityForTest();
+
+    const follows = [_][32]u8{nobody.public_key};
+    _ = main.setFollowsForTest(&follows, 1_800_000_000);
+
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), main.collectUnroutedForTest(&out));
+
+    // Once the sweep has put them to the indexers, they are off the list even
+    // though the store still holds nothing for them: an attempt that came back
+    // empty is still an attempt, which is what Amethyst's LRU gets wrong when
+    // it evicts and resurrects a question already given up on.
+    main.markIndexerAskedForTest(nobody.public_key);
+    try testing.expectEqual(@as(usize, 0), main.collectUnroutedForTest(&out));
+}
+
+test "the indexers are asked, never joined, and never published as ours" {
+    // They answer one question and are not part of the reader's identity. The
+    // failure to avoid is Notedeck's, where the bootstrap set is spliced into
+    // the user's own advertised relays the first time they edit their list, so
+    // editing one relay publishes four you never chose.
+    main.resetRelaysForTest();
+
+    const before = main.relaySlots();
+    for (main.indexerRelaysForTest()) |url| {
+        try testing.expect(std.mem.startsWith(u8, url, "wss://"));
+    }
+    // Naming them does not dial them into the pool.
+    try testing.expectEqual(before, main.relaySlots());
+
+    // And the chunk stays inside what a relay will accept in one filter: an
+    // unchunked 2000-author array is past the limit on most, and they truncate
+    // or CLOSE without saying which.
+    try testing.expect(main.indexerChunkForTest() <= 100);
+    try testing.expect(main.indexerChunkForTest() > 0);
+}
+
+test "a long note is kept whole, not cut where the old buffer ended" {
+    // The reported bug: a release announcement of ~1900 bytes was stored into a
+    // 1024-byte buffer, so "Show more" expanded onto a note that stopped
+    // mid-sentence. Nothing in the UI said a limit had been hit, because the
+    // text just ended.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Built to the shape that broke: many short lines, well past the old cap.
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(arena);
+    var line: usize = 0;
+    while (body.items.len < 1900) : (line += 1) {
+        try body.print(arena, "line {d}: something worth reading to the end\n", .{line});
+    }
+    const written = try arena.dupe(u8, body.items);
+    try testing.expect(written.len > 1024); // the old cap
+    try testing.expect(written.len < main.noteContentCapForTest());
+
+    var out: [main.note_content_cap_for_test]u8 = undefined;
+    const n = main.renderContentInto(&out, written, &.{}, null);
+
+    // Whole, and byte-identical against the SOURCE TRIMMED, because the renderer
+    // strips leading and trailing whitespace on purpose. Trimming is the only
+    // difference allowed here: nothing else about this content is rewritten, so
+    // any other shortfall is a cut.
+    const want = std.mem.trim(u8, written, " \t\r\n");
+    try testing.expectEqual(want.len, n);
+    try testing.expectEqualStrings(want, out[0..n]);
+
+    // And the tail specifically, because a cut shows up at the END and a test
+    // that only checks a length can pass on a buffer of zeroes.
+    try testing.expect(std.mem.endsWith(u8, out[0..n], "to the end"));
+}
+
+test "thread replies order by arrival then time, and ties keep their order" {
+    // sortThreadNotes sorts an array of indices and permutes the notes by
+    // following cycles, because a Note is kilobytes and the standard library
+    // refuses to sort an element type that large at all. The permutation is the
+    // part worth pinning: a cycle walked wrong loses or duplicates a reply.
+    var notes: [6]main.Note = .{ .{}, .{}, .{}, .{}, .{}, .{} };
+
+    // Deliberately not already sorted, and with a tie in the middle: two notes
+    // sharing (arrival, created_at) must come out in the order they went in.
+    const seed = [_]struct { id: i64, arrival: u32, created_at: i64 }{
+        .{ .id = 10, .arrival = 2, .created_at = 500 },
+        .{ .id = 11, .arrival = 1, .created_at = 900 },
+        .{ .id = 12, .arrival = 1, .created_at = 100 },
+        .{ .id = 13, .arrival = 3, .created_at = 50 },
+        .{ .id = 14, .arrival = 1, .created_at = 900 }, // ties with id 11
+        .{ .id = 15, .arrival = 2, .created_at = 400 },
+    };
+    for (seed, 0..) |sd, i| {
+        notes[i].id = sd.id;
+        notes[i].arrival = sd.arrival;
+        notes[i].created_at = sd.created_at;
+    }
+
+    main.sortThreadNotes(&notes);
+
+    // arrival 1: 12 (t=100), then 11 and 14 (both t=900, input order kept).
+    // arrival 2: 15 (t=400), then 10 (t=500). arrival 3: 13.
+    const want = [_]i64{ 12, 11, 14, 15, 10, 13 };
+    for (want, 0..) |id, i| {
+        if (notes[i].id != id) {
+            std.debug.print("position {d}: want id {d}, got {d}\n", .{ i, id, notes[i].id });
+            return error.WrongOrder;
+        }
+    }
+
+    // Every note still present exactly once: a mishandled cycle drops one and
+    // duplicates another, which an order check alone can miss.
+    var seen: [6]bool = @splat(false);
+    for (notes) |n| {
+        const idx: usize = @intCast(n.id - 10);
+        if (seen[idx]) return error.DuplicatedNote;
+        seen[idx] = true;
+    }
+    for (seen) |ok| try testing.expect(ok);
+}
+
+test "a whole batch arriving at once keeps the order it arrived in" {
+    // A thread that loads in one go gives every reply the same arrival stamp,
+    // and relays answer in whatever order they please, so this is the case that
+    // decides whether a conversation can reshuffle under the reader between
+    // rebuilds.
+    //
+    // Honest about what this test is: it pins the behaviour, it does not catch a
+    // regression. Swapping the stable sort for the unstable one leaves it green,
+    // because the unstable sort happens to preserve equal elements at these
+    // sizes too. That is exactly why the comparator carries no tiebreak: a
+    // second mechanism no probe can falsify is one to delete, not to keep.
+    const n = 40;
+    var notes: [n]main.Note = @splat(.{});
+    for (0..n) |i| {
+        notes[i].id = @intCast(1000 + i);
+        notes[i].arrival = 7; // one batch
+        notes[i].created_at = 12345; // written the same second
+    }
+
+    main.sortThreadNotes(&notes);
+
+    for (0..n) |i| {
+        const want: i64 = @intCast(1000 + i);
+        if (notes[i].id != want) {
+            std.debug.print("tie at {d}: want id {d}, got {d}\n", .{ i, want, notes[i].id });
+            return error.TiesReordered;
+        }
+    }
+}
+
+test "the vendored decoder cannot read WEBP, which is why avatars need the platform" {
+    // This is the fact the avatar path rests on, and it is worth a test because
+    // getting it wrong broke every face in the app.
+    //
+    // src/stb_impl.c builds stb for JPEG, PNG and GIF only. The image proxy
+    // hands back WEBP: 327 of the 400 files in my own media cache. So a decode
+    // path that sends small images to stb ALONE sends them to a decoder that
+    // cannot read the format they arrive in, and every avatar falls back to
+    // initials. `decodeAndRegister` therefore keeps the platform decoder as a
+    // format fallback for the small consumers, even though it returns a larger
+    // image than they asked for.
+    //
+    // A bare RIFF/WEBP signature is enough: stb refusing it proves no WEBP
+    // decoder is compiled in. If somebody later enables one, or vendors
+    // libwebp, this goes red and the fallback can be revisited on purpose
+    // rather than deleted by accident.
+    const webp_signature = "RIFF\x24\x00\x00\x00WEBPVP8 ";
+    try testing.expect(!main.stbCanDecodeForTest(webp_signature));
+
+    // The formats it IS built for still decode, so the assertion above is about
+    // WEBP and not about the buffer being short.
+    const png_1x1 = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0aIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB\x60\x82";
+    try testing.expect(main.stbCanDecodeForTest(png_1x1));
+}
+
+test "a reply in the feed says what it answers" {
+    // A feed that mixes replies in with root notes shows half a conversation:
+    // an answer with no question reads as a non sequitur, or worse as something
+    // the person said unprompted.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+
+    const parent_id = [_]u8{0xab} ** 32;
+    const parent_author = [_]u8{0xcd} ** 32;
+
+    var note = main.Note{};
+    note.id = 4242;
+    note.reply_parent = parent_id;
+    note.has_reply_parent = true;
+
+    // Before the parent resolves the line is still there, holding its place,
+    // saying the neutral thing rather than flickering a name in later.
+    {
+        const tree = try main.buildReplyContextForTest(arena, &note);
+        try testing.expect(std.mem.indexOf(u8, tree, "reply to") != null);
+    }
+
+    // Once it resolves it names the author and shows the opening words.
+    main.fillQuoteForTest(parent_id, parent_author, "sorry, only cold snow up here :D");
+    {
+        const tree = try main.buildReplyContextForTest(arena, &note);
+        try testing.expect(std.mem.indexOf(u8, tree, "reply to") != null);
+        if (std.mem.indexOf(u8, tree, "cold snow") == null) {
+            std.debug.print("the line does not carry the answered note's words: {s}\n", .{tree});
+            return error.NoSnippet;
+        }
+    }
+
+    // A root note gets no line at all.
+    var root = main.Note{};
+    root.id = 99;
+    try testing.expect(!root.has_reply_parent);
+}
+
+test "the snippet stops at one line and on a character boundary" {
+    // A snippet cut mid-codepoint draws a replacement glyph, which is a worse
+    // thing to show than a shorter snippet.
+    const multi = "first line\nsecond line should never appear";
+    try testing.expectEqualStrings("first line", main.firstLineOfForTest(multi, 200));
+
+    // Cut inside a multi-byte character: the result must still be valid UTF-8.
+    const emoji = "aaa\u{1F600}bbb";
+    const cut = main.firstLineOfForTest(emoji, 5); // lands inside the 4-byte emoji
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expectEqualStrings("aaa", cut);
+}
+
+test "building a reply queues the note it answers, so the line can fill in" {
+    // The line is only ever useful if something actually goes and fetches the
+    // parent. `noteFrom` is where that has to happen, because it is the one
+    // place every note in the feed passes through, and a test that fills the
+    // cache by hand proves nothing about it.
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+
+    const parent_hex = "ab" ** 32;
+    const tags = [_]nostr.event.Tag{
+        &.{ "e", parent_hex, "", "reply" },
+    };
+    const ev = nostr.event.Event{
+        .id = [_]u8{0x11} ** 32,
+        .pubkey = [_]u8{0x22} ** 32,
+        .created_at = 1000,
+        .kind = 1,
+        .tags = &tags,
+        .content = "answering you",
+        .sig = [_]u8{0} ** 64,
+    };
+
+    const note = main.noteFrom(ev, 2000);
+    try testing.expect(note.has_reply_parent);
+
+    if (main.quoteForTest(note.reply_parent) == null) {
+        std.debug.print("the answered note was never queued, so the line stays generic forever\n", .{});
+        return error.ParentNeverRequested;
+    }
+}
+
+test "a place is read out of a stranger's event, using Hallway's own field names" {
+    // The names are fiatjaf's, not mine: `window.hallway.universe` is a flat
+    // object of 41 camelCase keys embedded in every site his deployer ships. A
+    // place published once should mean the same thing in both clients.
+    const gpa = testing.allocator;
+
+    const good =
+        \\{"appName":"nOasis","homeMarkdown":"# Rules\n\n- be interesting",
+        \\ "hardcodedFeeds":[{"name":"Spatia-Arcana","relays":["wss://spatia-arcana.com"]}]}
+    ;
+    const m = main.parsePlace(gpa, good) orelse return error.NoPlace;
+    try testing.expectEqualStrings("nOasis", m.name());
+    try testing.expectEqualStrings("# Rules\n\n- be interesting", m.home());
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("Spatia-Arcana", m.feeds[0].name());
+    try testing.expectEqualStrings("wss://spatia-arcana.com", m.feeds[0].relay());
+
+    // The other 38 keys are ignored rather than refused, so a place carrying the
+    // whole object still applies the three this version reads.
+    const full =
+        \\{"appName":"Later","defaultPrimaryColor":"CYAN","feedKinds":[1,6,20],
+        \\ "kindGroups":[{"kinds":[1,6],"label":"Notes"}],
+        \\ "indexerUrls":["wss://purplepag.es"],"dearrowYoutube":true,
+        \\ "hardcodedFeeds":[{"relays":["wss://a.example"],"pubkeys":["abcd"]}]}
+    ;
+    const n = main.parsePlace(gpa, full) orelse return error.NoPlace;
+    try testing.expectEqualStrings("Later", n.name());
+    try testing.expectEqual(@as(u8, 1), n.feeds_len);
+    // A feed with no name of its own is labelled by its host: Hallway's own
+    // data has one like this, so it is a real case and not a hypothetical.
+    try testing.expectEqualStrings("a.example", n.feeds[0].name());
+
+    // Not a place at all. kind:30078 is shared by every app that stores
+    // settings, so an empty document must not be applied as one.
+    try testing.expect(main.parsePlace(gpa, "{}") == null);
+    try testing.expect(main.parsePlace(gpa, "{\"unrelated\":true}") == null);
+    try testing.expect(main.parsePlace(gpa, "not json") == null);
+}
+
+test "a place cannot point Plaza at a relay it should not dial" {
+    // The relay URL is the one field that reaches the network, so it is checked
+    // rather than trusted.
+    const gpa = testing.allocator;
+
+    const refused = [_][]const u8{
+        "ws://plain.example", // cleartext
+        "http://not.a.relay",
+        "wss://", // nothing after the scheme
+        "wss://has space.example",
+        "wss://has\nnewline.example", // would smuggle a line into a frame
+        "wss://has\ttab.example",
+    };
+    for (refused) |url| {
+        if (main.isSafeRelayUrl(url)) {
+            std.debug.print("accepted a relay it should refuse: {s}\n", .{url});
+            return error.UnsafeRelayAccepted;
+        }
+    }
+    try testing.expect(main.isSafeRelayUrl("wss://basspistol.org"));
+
+    // A feed picks the first relay it WILL dial, rather than the first listed:
+    // one bad entry must not cost the whole feed.
+    const mixed =
+        \\{"appName":"Mixed","hardcodedFeeds":[
+        \\ {"name":"ok","relays":["ws://plain.example","wss://good.example"]},
+        \\ {"name":"none","relays":["http://nope.example"]}]}
+    ;
+    const m = main.parsePlace(gpa, mixed) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 1), m.feeds_len);
+    try testing.expectEqualStrings("wss://good.example", m.feeds[0].relay());
+}
+
+test "an overlong place field is cut on a character boundary" {
+    // A name or home text longer than the buffer is a stranger's choice, not an
+    // error, so it is cut. Cut mid-character it would draw a replacement glyph.
+    const gpa = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"appName\":\"");
+    var i: usize = 0;
+    while (i < 40) : (i += 1) try buf.appendSlice(gpa, "\u{1F600}"); // 4 bytes each, 160 total
+    try buf.appendSlice(gpa, "\"}");
+
+    const m = main.parsePlace(gpa, buf.items) orelse return error.NoPlace;
+    try testing.expect(m.name_len > 0);
+    try testing.expect(m.name_len <= 64);
+    if (!std.unicode.utf8ValidateSlice(m.name())) {
+        std.debug.print("the cut name is not valid UTF-8: {any}\n", .{m.name()});
+        return error.CutMidCharacter;
+    }
+}
+
+test "a plaza:// link names what to fetch and nothing else" {
+    // A link can arrive from a note, a DM, anywhere. It carries an address, not
+    // a place, so the worst a hostile one can do is point Plaza at an event that
+    // is not a place (refused by the parser) or one that is (shown before it
+    // applies).
+    const ok = main.parsePlazaLink("plaza://place/naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1qqxnzd3cxqmrzv3exgmr2wfeqgs9n", ok);
+
+    // A trailing slash, query or fragment is a link shortener's, not the address.
+    const trimmed = main.parsePlazaLink("plaza://place/naddr1abc?utm_source=x") orelse
+        return error.NoLink;
+    try testing.expectEqualStrings("naddr1abc", trimmed);
+
+    const refused = [_][]const u8{
+        "plaza://place/", // nothing to fetch
+        "plaza://place/nevent1abc", // not an address
+        "plaza://place/NADDR1ABC", // bech32 is lowercase
+        "plaza://place/naddr1 abc", // a space is not bech32
+        "plaza://something/naddr1abc", // an action this version does not know
+        // The old spelling. It was `plaza://mode/` while the feature was named
+        // after fiatjaf's proposal, and nothing outside this machine ever held
+        // one, so it is refused rather than carried: two spellings for one verb
+        // is the drift the vocabulary rules exist to stop.
+        "plaza://mode/naddr1abc",
+        "plaza://naddr1abc", // no action at all
+        "https://evil.example/naddr1abc", // not our scheme
+        "plaza://place/naddr1abc/../../etc", // path games
+    };
+    for (refused) |link| {
+        if (main.parsePlazaLink(link) != null) {
+            std.debug.print("accepted a link it should refuse: {s}\n", .{link});
+            return error.BadLinkAccepted;
+        }
+    }
+}
+
+test "entering a place keeps it, and nothing else is gated on it" {
+    // The correction that reshaped this feature: entering is about KEEPING a
+    // place, not about permission. Somebody may enter, stay across restarts,
+    // and never post; somebody else may read and post while only visiting.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x77} ** 32;
+    main.visitPlaceForTest(host, "plaza-place-test", "Bass Pistol");
+
+    // Visiting: you are in it, and it is not kept.
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Entering twice is not two places. A link followed again while already
+    // entered must not duplicate the row.
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+
+    // Leaving takes it out of the list AND out of the place.
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expect(!main.placeIsKept());
+}
+
+test "returning to a place already entered arrives kept, not visiting" {
+    // The link works whether or not the place is in the list. Following it for
+    // one already entered must not offer to enter it again.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x33} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.placeIsKept());
+
+    // Walk out without leaving, then follow the link again.
+    main.clearActivePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    if (!main.placeIsKept()) {
+        std.debug.print("a place already entered came back as visiting\n", .{});
+        return error.KeptPlaceForgotten;
+    }
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+}
+
+test "a place remembers what was in it, so returning is not an empty room" {
+    // Reported: entering a place showed "Connecting to the relay pool" and
+    // nothing else until a stranger's relay answered, which on a slow one is a
+    // long time to stare at nothing. The rest of this app is local-first and a
+    // place was not.
+    //
+    // The notes are already in the store from last visit. The only missing
+    // piece was knowing WHICH of them belong to this place, because nothing
+    // records the relay an event arrived on, so the ids ride with the place.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const host = [_]u8{0x5a} ** 32;
+    main.visitPlaceForTest(host, "somewhere", "Somewhere");
+    main.update(&model, .place_enter, &fx);
+
+    // Notes arrive from the place's relay.
+    var ids: [3][32]u8 = .{ @splat(1), @splat(2), @splat(3) };
+    main.seedPlaceFeedForTest(&ids);
+    try testing.expectEqual(@as(usize, 3), main.placeFeedCount());
+
+    // The REAL save path has to carry them onto the kept entry, not a helper
+    // called only by this test.
+    main.savePlacesForTest();
+    if (main.keptPlaceSeenLenForTest(0) != 3) {
+        std.debug.print("saving did not remember the room: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.NotRemembered;
+    }
+
+    // And the REAL entry path has to put them back before any socket answers.
+    main.clearPlaceFeedForTest();
+    try testing.expectEqual(@as(usize, 0), main.placeFeedCount());
+    main.startPlaceFeedForTest(0);
+    if (main.placeFeedCount() != 3) {
+        std.debug.print("returned to an empty room: {d} ids\n", .{main.placeFeedCount()});
+        return error.EmptyOnReturn;
+    }
+}
+
+test "the room is written down while it is being read, not only when entered" {
+    // The bug behind an empty room on relaunch: the file was written on Enter
+    // and never again, and at that moment the place has no notes yet. So the
+    // place was remembered and its contents never were.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0x6b} ** 32, "later", "Later");
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Notes arrive after entering, which is always.
+    var ids: [2][32]u8 = .{ @splat(9), @splat(8) };
+    main.seedPlaceFeedForTest(&ids);
+
+    // Too soon: a flush every tick would rewrite the file constantly.
+    main.flushPlaceIdsForTest(0);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+
+    // Once the interval has passed, what is on screen is what is written down.
+    main.flushPlaceIdsForTest(3600);
+    if (main.keptPlaceSeenLenForTest(0) != 2) {
+        std.debug.print("the room was never written down: {d}\n", .{main.keptPlaceSeenLenForTest(0)});
+        return error.RoomNotFlushed;
+    }
+
+    // And it does not rewrite when nothing changed.
+    main.setKeptPlaceSeenLenForTest(0, 0);
+    main.flushPlaceIdsForTest(7200);
+    try testing.expectEqual(@as(u16, 0), main.keptPlaceSeenLenForTest(0));
+}
+
+test "inside a place the feed is not called Following" {
+    // It said "Following" under a place header, which is simply false: those
+    // are not the reader's follows, which is the whole point of a room.
+    const model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const own = model.scope_name();
+    try testing.expect(std.mem.eql(u8, own, "Following") or std.mem.eql(u8, own, "Starter pack"));
+
+    main.visitPlaceWithFeedForTest([_]u8{0x4d} ** 32, "somewhere", "Somewhere", "The relay");
+    const inside = model.scope_name();
+    if (std.mem.eql(u8, inside, "Following") or std.mem.eql(u8, inside, "Starter pack")) {
+        std.debug.print("a place still calls its feed \"{s}\"\n", .{inside});
+        return error.PlaceCalledFollowing;
+    }
+    try testing.expectEqualStrings("The relay", inside);
+
+    // A place whose feed has no name of its own still must not borrow yours.
+    main.visitPlaceForTest([_]u8{0x4e} ** 32, "nameless", "Nameless");
+    try testing.expectEqualStrings("This place", model.scope_name());
+}
+
+test "a place says what its own connection is doing" {
+    // The status bar counts the pool, and a place's relay is deliberately not
+    // in it, so a place that is slow or unreachable looked exactly like a
+    // connected one while the bar reported 5/5.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqual(main.PlaceLink.idle, main.placeLink());
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqual(main.PlaceLink.connecting, main.placeLink());
+
+    // Walking out resets it, so the next place never inherits the last one's
+    // failure.
+    main.setPlaceLinkForTest(.unreachable_relay);
+    main.clearPlaceFeedForTest();
+    if (main.placeLink() != .idle) {
+        std.debug.print("a new place inherited the last one's state: {t}\n", .{main.placeLink()});
+        return error.StaleLinkState;
+    }
+}
+
+/// Three places in the list, entered in order, and out of all of them.
+fn seedPlacesForRail(model: *main.Model, fx: *main.EffectsForTest) void {
+    main.visitPlaceForTest([_]u8{0xa1} ** 32, "one", "Bass Pistol");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "two", "Coldcard Hack");
+    main.update(model, .place_enter, fx);
+    main.visitPlaceForTest([_]u8{0xa3} ** 32, "three", "Sparc Noasis");
+    main.update(model, .place_enter, fx);
+    main.goToOwnPlazaForTest();
+}
+
+test "the places rail folds and comes back, and Home leaves it alone" {
+    // Home hiding the switcher is what the first version did, and it made
+    // coming back from your own feed to a room cost two presses. The rail is
+    // the Places icon's to open and close, and nothing else touches it.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Off until there is something to put in it.
+    try testing.expect(!main.railOpen());
+
+    main.togglePlacesRailForTest();
+    try testing.expect(main.railOpen());
+    main.togglePlacesRailForTest();
+    try testing.expect(!main.railOpen());
+
+    // Entering a place turns it on, because that is the moment it has a seat
+    // to show.
+    main.visitPlaceForTest([_]u8{0xe1} ** 32, "one", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.railOpen());
+
+    // And Home does not take it away again.
+    main.goHomeForTest(&model);
+    if (!main.railOpen()) return error.HomeFoldedTheSwitcher;
+    try testing.expect(main.activePlace() == null);
+}
+
+test "Home closes the room without leaving the place" {
+    // Two different verbs that were one button for as long as there was no rail
+    // to put the place back on. Home means your own feed; the place stays.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xb1} ** 32, "bass", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    try testing.expect(main.activePlace() != null);
+
+    main.goHomeForTest(&model);
+    if (main.activePlace() != null) return error.HomeStayedInTheRoom;
+    if (main.keptPlaceCount() != 1) {
+        std.debug.print("Home dropped the place from the list: {d} left\n", .{main.keptPlaceCount()});
+        return error.HomeLeftThePlace;
+    }
+
+    // And the rail puts you straight back.
+    main.openKeptPlaceForTest(0);
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(main.placeIsKept());
+}
+
+test "a visit is not thrown away by pressing Home" {
+    // A visit is deliberately not in the list, so once Home could close a room
+    // there was nothing on the rail to get back to one. Peeking at your own
+    // feed for a second destroyed the room you were reading.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xc1} ** 32, "guest", "Somewhere");
+    try testing.expect(!main.placeIsKept());
+
+    var model = main.initialModel();
+    main.goHomeForTest(&model);
+    try testing.expect(main.activePlace() == null);
+    if (main.visitingPlaceForTest() == null) return error.TheVisitWasLost;
+
+    main.resumeVisitForTest();
+    const back = main.activePlace() orelse return error.CouldNotGoBackToTheVisit;
+    try testing.expectEqualStrings("Somewhere", back.name());
+    // Still a visit. Going back into it is not the same as entering it.
+    try testing.expect(!main.placeIsKept());
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+}
+
+test "entering a place takes it out of the visiting seat" {
+    // The seat is for a visit in progress. Once the place is in the list it has
+    // a row of its own, and leaving the seat set would draw it twice: once
+    // under Visiting and once under Entered.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xd1} ** 32, "one", "Bass Pistol");
+    main.goHomeForTest(&model);
+    try testing.expect(main.visitingPlaceForTest() != null);
+
+    main.resumeVisitForTest();
+    main.update(&model, .place_enter, &fx);
+    main.goHomeForTest(&model);
+    if (main.visitingPlaceForTest() != null) return error.AnEnteredPlaceIsStillAVisit;
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+}
+
+test "reopening lands on the place that was open, not the last one entered" {
+    // Restoring `g_places_len - 1` was right while entering was the only way
+    // to be in a place. With a way out that is not leaving, "the last one
+    // entered" and "the one I was looking at" came apart.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    try testing.expectEqual(@as(usize, 3), main.keptPlaceCount());
+
+    // Open the FIRST, which is not the last one entered.
+    main.openKeptPlaceForTest(0);
+    var buf: [160]u8 = undefined;
+    const line = main.activePlaceLine(&buf);
+    try testing.expect(line.len > 65);
+
+    // The restart, as boot actually does it: the list is read back, the line
+    // says which one, and the app opens it. Asserting on the index alone left
+    // the decision itself untested, which a probe that put "the last one
+    // entered" back walked straight through.
+    main.applyActivePlaceLineForTest(line);
+    main.goToOwnPlazaForTest();
+    main.restoreOpenPlaceForTest();
+    const landing = main.activePlaceIndexForTest() orelse return error.BootOpenedNoPlace;
+    if (landing != 0) {
+        std.debug.print("boot opened place {d}, not the one that was open (0)\n", .{landing});
+        return error.BootOpenedTheWrongPlace;
+    }
+
+    // Home at quit means home at launch.
+    main.goToOwnPlazaForTest();
+    try testing.expectEqualStrings("", main.activePlaceLine(&buf));
+    main.applyActivePlaceLineForTest("");
+    main.restoreOpenPlaceForTest();
+    if (main.activePlace() != null) return error.BootOpenedAPlaceNobodyWasIn;
+
+    // Written by author and `d`, so a place leaving the list cannot hand its
+    // index to whichever one slid into it.
+    main.openKeptPlaceForTest(2);
+    const third = main.activePlaceLine(&buf);
+    var addr: [160]u8 = undefined;
+    const third_len = third.len;
+    @memcpy(addr[0..third_len], third);
+    main.openKeptPlaceForTest(0);
+    main.update(&model, .place_leave, &fx);
+    main.applyActivePlaceLineForTest(addr[0..third_len]);
+    const shifted = main.bootPlaceIndexForTest() orelse return error.BootLostThePlaceAfterALeave;
+    try testing.expectEqual(@as(usize, 1), shifted);
+}
+
+test "walking the places goes both ways and wraps" {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+
+    // From your own feed, forward is the first and back is the last.
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 1), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(1);
+    try testing.expectEqual(@as(?usize, 0), main.activePlaceIndexForTest());
+    main.stepPlaceForTest(-1);
+    try testing.expectEqual(@as(?usize, 2), main.activePlaceIndexForTest());
+
+    // And it puts the rail where the eye is going to look.
+    try testing.expect(main.railOpen());
+}
+
+test "the bounce goes out of the room and back into the same one" {
+    // The key exists because a place is a ROOM: being in one hides your own
+    // feed entirely, so the way out has to be as cheap as the way in, and the
+    // way back must not land somewhere else.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+    main.openKeptPlaceForTest(1);
+
+    main.bouncePlaceForTest();
+    try testing.expect(main.activePlace() == null);
+
+    main.bouncePlaceForTest();
+    const landed = main.activePlaceIndexForTest() orelse return error.BounceLandedNowhere;
+    if (landed != 1) {
+        std.debug.print("the bounce came back into place {d}, not the one it left (1)\n", .{landed});
+        return error.BounceLandedInTheWrongRoom;
+    }
+}
+
+test "a shortcut sends the message its tile sends" {
+    // A key that reimplements what a control does is a second implementation to
+    // keep in step, and this app has one already declared for compose and
+    // settings. The places keys go through the same messages.
+    try testing.expectEqual(main.Msg.toggle_places_rail, main.onCommandForTest("places-rail").?);
+    try testing.expectEqual(main.Msg.place_bounce, main.onCommandForTest("place-bounce").?);
+    try testing.expectEqual(main.Msg{ .place_step = -1 }, main.onCommandForTest("place-prev").?);
+    try testing.expectEqual(main.Msg{ .place_step = 1 }, main.onCommandForTest("place-next").?);
+    try testing.expect(main.onCommandForTest("no-such-key") == null);
+}
+
+test "every place you have entered has a seat on the rail" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Empty first: the rail has to explain itself, because a link is the only
+    // door v1 has and a blank column teaches nobody where to find one.
+    main.setRailForTest(true);
+    {
+        const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+        var said_how = false;
+        for (p.layout.nodes) |n| {
+            if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) said_how = true;
+        }
+        if (!said_how) return error.TheEmptyRailSaysNothing;
+    }
+
+    seedPlacesForRail(&model, &fx);
+    main.setRailForTest(true);
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    // Three DISTINCT names, not three matching nodes. Counting matches let a
+    // probe that drew place 0 three times pass: the same seat repeated is
+    // exactly the failure this is here to catch.
+    const wanted = [_][]const u8{ "Bass Pistol", "Coldcard Hack", "Sparc Noasis" };
+    var seen = [_]bool{false} ** wanted.len;
+    var still_empty = false;
+    for (p.layout.nodes) |n| {
+        for (wanted, 0..) |w, i| {
+            if (std.mem.eql(u8, n.widget.text, w)) seen[i] = true;
+        }
+        if (std.mem.indexOf(u8, n.widget.text, "plaza://") != null) still_empty = true;
+    }
+    for (wanted, seen) |w, ok| {
+        if (!ok) {
+            std.debug.print("the rail drew no seat for \"{s}\"\n", .{w});
+            return error.APlaceHasNoSeat;
+        }
+    }
+    if (still_empty) return error.TheRailStillSaysItIsEmpty;
+
+    // Folded away, it draws nothing at all: contents follow the selection, and
+    // the one boolean beside it decides whether they are on screen.
+    main.setRailForTest(false);
+    const folded = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    for (folded.layout.nodes) |n| {
+        if (std.mem.eql(u8, n.widget.text, "Bass Pistol")) return error.TheFoldedRailIsStillDrawn;
+    }
+}
+
+test "the status bar does not call a place the starter pack" {
+    // It lowered "Following" and returned "starter pack" for everything else,
+    // which was safe while those were the only two scopes and became a lie the
+    // moment a place could be one: the bar said "caught up, starter pack" under
+    // a header naming somebody else's room.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expectEqualStrings("following", main.lowerScopeForTest("Following"));
+    try testing.expectEqualStrings("starter pack", main.lowerScopeForTest("Starter pack"));
+    try testing.expectEqualStrings("The relay", main.lowerScopeForTest("The relay"));
+
+    var model = main.initialModel();
+    model.notes_len = 3;
+    main.visitPlaceWithFeedForTest([_]u8{0xf1} ** 32, "bass", "Bass Pistol", "The relay");
+    const line = model.caught_up(arena_state.allocator());
+    if (std.mem.indexOf(u8, line, "starter pack") != null) {
+        std.debug.print("the status bar says \"{s}\" inside a place\n", .{line});
+        return error.ThePlaceIsCalledTheStarterPack;
+    }
+    try testing.expectEqualStrings("Caught up · The relay · 3 notes", line);
+}
+
+test "a place whose notes are already stored still fills" {
+    // The report: open the app with no places entered, follow a link to one you
+    // have been in before, and it sits on "Connecting" forever while its relay
+    // is connected and answering. Enter it and restart, and it works.
+    //
+    // The cause was one level above the rebuild. A place's notes arrive on its
+    // own socket and are ingested like anything else, so a room the reader has
+    // never seen fires the store-count check and fills. A room they HAVE seen
+    // does not: every note is a duplicate, the count never moves, and the tick
+    // decides there is nothing to do without ever asking the place. Restarting
+    // hid it, because boot's first tick is stale for other reasons anyway.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5b} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/place-stale.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+    defer main.setStoreForTest(null);
+
+    // Everything the place will send is ALREADY in the store, which is the
+    // whole point: this is a room the reader has been in before.
+    var ids: [3][32]u8 = undefined;
+    for (0..3) |i| {
+        const ev = try signedNote(arena, signer, kp, 1_800_000_000 + @as(i64, @intCast(i)), "a note from the room");
+        _ = try store.ingest(arena, ev, .{});
+        ids[i] = ev.id;
+    }
+
+    // A tick with no place, so the store count is settled and the next one
+    // cannot ride in on it.
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.refreshForTest(&model, &store, 1_800_000_100);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    // Now visit, and let the place's socket deliver. Nothing new reaches the
+    // store, so the revision counter is the only thing that says so.
+    main.visitPlaceWithFeedForTest([_]u8{0x5c} ** 32, "room", "Bass Pistol", "The relay");
+    main.seedPlaceFeedForTest(&ids);
+    main.refreshForTest(&model, &store, 1_800_000_100);
+
+    if (model.notes_len == 0) {
+        std.debug.print("the place stayed empty: \"{s}\"\n", .{model.empty_text()});
+        return error.ThePlaceNeverFilled;
+    }
+    try testing.expectEqual(@as(usize, 3), model.notes_len);
+}
+
+test "an empty place says what its own relay is doing, not the pool's" {
+    // A place's relay is deliberately outside the eight, so "Connecting to the
+    // relay pool" under a place header describes a connection that has nothing
+    // to do with the empty screen it is explaining.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    var model = main.initialModel();
+    try testing.expectEqualStrings("Connecting to the relay pool…", model.empty_text());
+
+    main.visitPlaceWithFeedForTest([_]u8{0x5d} ** 32, "room", "Bass Pistol", "The relay");
+    main.setPlaceLinkForTest(.connecting);
+    try testing.expectEqualStrings("Connecting to this place…", model.empty_text());
+
+    main.setPlaceLinkForTest(.unreachable_relay);
+    const failed = model.empty_text();
+    if (std.mem.indexOf(u8, failed, "pool") != null) {
+        std.debug.print("an unreachable place blames the pool: \"{s}\"\n", .{failed});
+        return error.ThePlaceBlamedThePool;
+    }
+
+    main.setPlaceLinkForTest(.connected);
+    try testing.expectEqualStrings("Nothing here yet.", model.empty_text());
+}
+
+test "a smaller line is asked for by its size, not by scaling every span" {
+    // A paragraph's line box and baseline come from `size * max(1, largest span
+    // scale)`. The floor of 1 means a paragraph whose spans are ALL scaled DOWN
+    // keeps a full-size baseline in a full-size box: 13.5pt text drawn on a
+    // 14.5pt baseline inside an 18.125pt box. A point lower than the text
+    // around it, with a point and a quarter of extra air above, which is what
+    // the reply-context line looked like next to the note it belongs to.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest("");
+    const body = "hop on @primal august workout challenge.";
+    const b = @min(body.len, model.notes[0].content_buf.len);
+    @memcpy(model.notes[0].content_buf[0..b], body[0..b]);
+    model.notes[0].content_len = @intCast(b);
+    model.notes[0].reply_parent = [_]u8{0x42} ** 32;
+    model.notes[0].has_reply_parent = true;
+    model.notes_len = 1;
+    main.seedQuoteForTest([_]u8{0x42} ** 32, [_]u8{0x31} ** 32, 1_800_000_000, "the note being answered");
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+
+    // Every run of the context line, by the size it actually draws at.
+    var line_y: ?f32 = null;
+    var runs: usize = 0;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.indexOf(u8, t.text, "reply to") != null or
+                std.mem.indexOf(u8, t.text, "being answered") != null;
+            if (!mine) continue;
+            runs += 1;
+            // 13.5, the `.sm` token, NOT 14.5 scaled down to look like it.
+            try testing.expectApproxEqAbs(@as(f32, 13.5), t.size, 0.001);
+            // Both runs of the line share one baseline, whatever their weight.
+            if (line_y) |y| {
+                if (@abs(y - t.origin.y) > 0.001) {
+                    std.debug.print("the context line draws runs at y={d:.3} and y={d:.3}\n", .{ y, t.origin.y });
+                    return error.RunsOffTheirSharedBaseline;
+                }
+            } else line_y = t.origin.y;
+        },
+        else => {},
+    };
+    if (runs < 2) return error.TheContextLineNeverDrewBothRuns;
+
+    // And the box is the height that size needs: 13.5 * 1.25, not 14.5 * 1.25.
+    var boxed = false;
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, "reply to") == null) continue;
+        boxed = true;
+        if (@abs(n.widget.frame.height - 16.875) > 0.01) {
+            std.debug.print(
+                "the context line reserves {d:.3}pt for 13.5pt text (16.875 is its own height)\n",
+                .{n.widget.frame.height},
+            );
+            return error.TheLineIsBoxedForATextItDoesNotDraw;
+        }
+    }
+    try testing.expect(boxed);
+
+    // The body around it is untouched: full size, one baseline across the
+    // plain text and the mention that sits in the middle of it.
+    var body_y: ?f32 = null;
+    for (p.commands) |c| switch (c) {
+        .draw_text => |t| {
+            const mine = std.mem.eql(u8, t.text, "hop on ") or
+                std.mem.eql(u8, t.text, "@primal") or
+                std.mem.eql(u8, t.text, " august workout challenge.");
+            if (!mine) continue;
+            try testing.expectApproxEqAbs(@as(f32, 14.5), t.size, 0.001);
+            if (body_y) |y| try testing.expectApproxEqAbs(y, t.origin.y, 0.001) else body_y = t.origin.y;
+        },
+        else => {},
+    };
+    try testing.expect(body_y != null);
+}
+
+test "every bundled face agrees about where the baseline is" {
+    // The macOS host draws a run with `drawAtPoint:(x, baseline - size)` into a
+    // flipped context, and AppKit then puts the baseline `round(ascender)`
+    // below that point. Subtracting the point SIZE asserts "ascent == size",
+    // which is a per-FACE number, so two faces on one line diverge by the
+    // difference in their ascents.
+    //
+    // Ours did: Geist-Regular ships 920/-220/100 and the other three shipped
+    // 1005/-295/0, which at a 14.5pt body put every medium, bold and mono run
+    // exactly 2pt BELOW the regular text beside it. Mentions, the reply
+    // context label, bold names next to regular meta: all of them sat low, and
+    // nothing on the Zig side could see it, because the display list carries
+    // one baseline for the whole line and is correct.
+    //
+    // scripts/harmonize-font-metrics.py made the four agree. This is what
+    // notices if a font update ever pulls them apart again.
+    const faces = [_]struct { name: []const u8, ttf: []const u8 }{
+        .{ .name = "Geist-Regular", .ttf = theme.geist_ttf },
+        .{ .name = "Geist-Medium", .ttf = theme.geist_medium_ttf },
+        .{ .name = "Geist-Bold", .ttf = theme.geist_bold_ttf },
+        .{ .name = "GeistMono-Regular", .ttf = theme.geist_mono_ttf },
+    };
+
+    var want: ?[6]i16 = null;
+    for (faces) |face| {
+        const m = try verticalMetrics(face.ttf);
+        if (want) |w| {
+            if (!std.mem.eql(i16, &w, &m)) {
+                std.debug.print(
+                    "\n{s} has vertical metrics {any}, and Geist-Regular has {any}.\n" ++
+                        "Two faces that disagree draw on two different baselines. Run\n" ++
+                        "  python3 scripts/harmonize-font-metrics.py\n",
+                    .{ face.name, m, w },
+                );
+                return error.FacesDisagreeAboutTheBaseline;
+            }
+        } else want = m;
+    }
+    // And they agree on numbers that are actually there, not on all zeroes.
+    try testing.expect(want.?[0] > 0);
+}
+
+/// hhea ascender/descender/lineGap and OS/2 sTypoAscender/Descender/LineGap,
+/// read straight out of the sfnt. Six numbers, because macOS picks the typo set
+/// when USE_TYPO_METRICS is on and the hhea set when it is not, and a face is
+/// only safe if both agree with everyone else's.
+fn verticalMetrics(ttf: []const u8) ![6]i16 {
+    if (ttf.len < 12) return error.NotAFont;
+    const count = std.mem.readInt(u16, ttf[4..6], .big);
+    var hhea: ?usize = null;
+    var os2: ?usize = null;
+    for (0..count) |i| {
+        const entry = 12 + i * 16;
+        if (entry + 16 > ttf.len) return error.NotAFont;
+        const tag = ttf[entry..][0..4];
+        const off = std.mem.readInt(u32, ttf[entry + 8 ..][0..4], .big);
+        if (std.mem.eql(u8, tag, "hhea")) hhea = off;
+        if (std.mem.eql(u8, tag, "OS/2")) os2 = off;
+    }
+    const h = hhea orelse return error.NoHhea;
+    const o = os2 orelse return error.NoOs2;
+    if (h + 10 > ttf.len or o + 74 > ttf.len) return error.NotAFont;
+    return .{
+        std.mem.readInt(i16, ttf[h + 4 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 6 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[h + 8 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 68 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 70 ..][0..2], .big),
+        std.mem.readInt(i16, ttf[o + 72 ..][0..2], .big),
+    };
+}
+
+test "a reply snippet stops saying npub once the name lands" {
+    // The snippet is baked into text the same way a note body is: a mention
+    // becomes "@Name", or an abbreviated npub when no name is known yet. A body
+    // re-parses when a display name arrives, because the names generation
+    // moving invalidates every card. The quote cache had no such stamp, so a
+    // snippet rendered before its mentioned author's kind:0 landed kept the
+    // npub for as long as the entry lived, which is the raw "@npub1..." showing
+    // in a reply context line while the same person's name reads correctly two
+    // rows down.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6d} ** 32);
+    const mentioned = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quote-names.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    main.resetProfilesForTest();
+    main.resetQuotesForTest();
+    defer main.resetProfilesForTest();
+    defer main.resetQuotesForTest();
+
+    // A note that mentions somebody nobody has a name for yet.
+    const npub = try nostr.nip19.encodeNpub(arena, mentioned.public_key);
+    const body = try std.fmt.allocPrint(arena, "hello nostr:{s} how are you", .{npub});
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, body, null);
+    _ = try store.ingest(arena, ev, .{});
+
+    main.wantQuoteForTest(ev.id);
+    main.refreshQuotesForTest(&store);
+    const before = main.quoteTextForTest(ev.id) orelse return error.TheQuoteNeverLoaded;
+    if (std.mem.indexOf(u8, before, "npub1") == null) {
+        std.debug.print("expected an npub while the name is unknown, got \"{s}\"\n", .{before});
+        return error.NoNpubToBeginWith;
+    }
+
+    // The name lands, exactly as it does live: a kind:0 into the store, then
+    // the profile pass that reads it and moves the names generation.
+    var meta_buf: [128]u8 = undefined;
+    const meta = try std.fmt.bufPrint(&meta_buf, "{{\"name\":\"Rabble\"}}", .{});
+    const kind0 = try nostr.event.create(arena, signer, mentioned, 1_800_000_060, 0, &.{}, meta, null);
+    _ = try store.ingest(arena, kind0, .{});
+    main.refreshProfilesForTest(&store);
+    main.refreshQuotesForTest(&store);
+
+    const after = main.quoteTextForTest(ev.id) orelse return error.TheQuoteWentAway;
+    if (std.mem.indexOf(u8, after, "npub1") != null) {
+        std.debug.print("the snippet still says npub after the name landed: \"{s}\"\n", .{after});
+        return error.TheSnippetKeptTheNpub;
+    }
+    try testing.expect(std.mem.indexOf(u8, after, "@Rabble") != null);
+}
+
+test "a place says what it is behind one control, and leaving takes two presses" {
+    // The host's markdown used to sit inline above the feed on every visit,
+    // which is a wall of somebody else's words in front of the thing it is
+    // selling. And Leave sat in the header a few pixels from Enter, where one
+    // press did it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    const about = "House rules: be interesting, or be quiet.";
+    main.visitPlaceWithFeedForTest([_]u8{0x81} ** 32, "bass", "Bass Pistol", "The relay");
+    main.setPlaceHomeForTest(about);
+    main.update(&model, .place_enter, &fx);
+
+    // Nothing of the host's text over the feed, and no Leave within reach.
+    const closed = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (paintsText(closed, about)) return error.TheDescriptionIsBackOverTheFeed;
+    if (paintsText(closed, "Leave")) return error.LeaveIsOnePressAway;
+    try testing.expect(paintsText(closed, "Info"));
+
+    // Info says what this place is, who hosts it and where it reads from.
+    main.update(&model, .open_place_info, &fx);
+    const open = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(open, about)) return error.InfoDidNotShowTheDescription;
+    try testing.expect(paintsText(open, "Host"));
+    try testing.expect(paintsText(open, "The relay"));
+    try testing.expect(paintsText(open, "Leave"));
+
+    // The first Leave asks. It must not have left yet.
+    main.update(&model, .place_leave_request, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    const asking = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (!paintsText(asking, "Leave this place?")) return error.LeavingNeverAsked;
+    try testing.expect(paintsText(asking, "Cancel"));
+
+    // Backing out changes nothing.
+    main.update(&model, .place_leave_cancel, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    try testing.expectEqual(main.PlaceInfo.open, main.placeInfo());
+
+    // The second one does it, and takes the card down with it.
+    main.update(&model, .place_leave_request, &fx);
+    main.update(&model, .place_leave, &fx);
+    try testing.expectEqual(@as(usize, 0), main.keptPlaceCount());
+    try testing.expect(main.activePlace() == null);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
+}
+
+/// Whether any text node on the page carries this string.
+fn paintsText(p: painted.Painted, needle: []const u8) bool {
+    for (p.layout.nodes) |n| {
+        if (std.mem.indexOf(u8, n.widget.text, needle) != null) return true;
+    }
+    return false;
+}
+
+test "logging out takes your places with you" {
+    // Which communities somebody belongs to is sensitive, which is the whole
+    // reason the list is a file on their own disk rather than an event on a
+    // relay. That is also what made it outlive a logout: a relay-backed list
+    // goes when the key does, and a file does not go until something deletes
+    // it. The next account to sign in on this Mac inherited the last one's
+    // rail, fully populated, opened straight into whichever place they had been
+    // reading.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+
+    main.visitPlaceForTest([_]u8{0x92} ** 32, "one", "Bass Pistol");
+    main.update(&model, .place_enter, &fx);
+    main.visitPlaceForTest([_]u8{0x93} ** 32, "two", "The Pleb Table");
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 2), main.keptPlaceCount());
+    try testing.expect(main.activePlace() != null);
+    try testing.expect(main.railOpen());
+
+    // A visit in the seat too, so the session-only half is covered.
+    main.goToOwnPlazaForTest();
+    main.visitPlaceForTest([_]u8{0x94} ** 32, "three", "Somewhere");
+    main.goToOwnPlazaForTest();
+    try testing.expect(main.visitingPlaceForTest() != null);
+
+    main.performLogoutForTest(&model, &fx);
+
+    if (main.keptPlaceCount() != 0) {
+        std.debug.print("the next account inherits {d} places\n", .{main.keptPlaceCount()});
+        return error.ThePlacesOutlivedTheAccount;
+    }
+    if (main.activePlace() != null) return error.StillInsideTheLastAccountsPlace;
+    if (main.visitingPlaceForTest() != null) return error.TheVisitOutlivedTheAccount;
+    // And nothing on disk points the next launch back into one.
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("", main.activePlaceLine(&buf));
+    try testing.expect(main.bootPlaceIndexForTest() == null);
+    // The rail folds, because an empty rail that is still out is a column
+    // saying the previous reader had none.
+    try testing.expect(!main.railOpen());
+}
+
+test "the end of the feed is something relays say, not something silence says" {
+    // `added == 0` was the whole test, and every failure in the paging worker
+    // is a `catch continue`: a dial that could not connect, a subscribe that
+    // was refused. So an offline round and a round where every relay answered
+    // "nothing older" produced the same zero. The latch is write-once for the
+    // life of the process, so one paging attempt made on a train dead-ended the
+    // feed until the app restarted.
+    main.resetFeedEndForTest();
+    defer main.resetFeedEndForTest();
+    try testing.expect(!main.feedEndReached());
+
+    // Nobody reached: not an end.
+    try testing.expect(!main.feedEndLatchesForTest(0, 0, 0));
+    // Reached, but nobody finished answering: still not an end.
+    try testing.expect(!main.feedEndLatchesForTest(3, 0, 0));
+    // Asked and answered, and there was nothing older. That is an end.
+    try testing.expect(main.feedEndLatchesForTest(3, 3, 0));
+    // Answered and there WAS something older, so plainly not the end.
+    try testing.expect(!main.feedEndLatchesForTest(3, 3, 7));
+    // One relay answering is enough to know, even if others never dialled.
+    try testing.expect(main.feedEndLatchesForTest(3, 1, 0));
+}
+
+test "changing who the feed asks about un-ends it" {
+    // The end of history is an answer about a question. Change the question and
+    // the answer stops being about anything. The reset existed only as a test
+    // helper with no callers, so the latch outlived every change to the author
+    // set and to the relays.
+    main.resetFeedEndForTest();
+    defer main.resetFeedEndForTest();
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+
+    main.setFeedEndForTest();
+    try testing.expect(main.feedEndReached());
+    main.forgetFollowsForTest();
+    if (main.feedEndReached()) return error.TheFeedStayedEndedAfterTheFollowsChanged;
+
+    // And a relay nobody has asked yet may hold what the feed decided was not
+    // there.
+    main.setFeedEndForTest();
+    _ = main.addRelayForTest("wss://relay.example.test", true, false);
+    if (main.feedEndReached()) return error.TheFeedStayedEndedAfterANewRelay;
+}
+
+test "a paste that does not fit says so instead of vanishing" {
+    // The composer caps the draft at 4096 and the retained editor caps at half
+    // a megabyte, so a longer paste is clamped on the way in. Nothing read the
+    // buffer's `truncated` flag, whose own documentation calls it a "loud seam
+    // for paste", so the overflow disappeared without a word: the counter read
+    // "0 left", which says the box is exactly full, not that a third of what
+    // was just pasted is gone. Measured live at 6064 bytes pasted, 4096 kept,
+    // 1968 lost, cut mid-word.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    // Something that fits: nothing to report.
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "a short note" } }, &fx);
+    try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+
+    // And something that does not.
+    const cap = main.compose_capacity_for_test;
+    const big = try arena_state.allocator().alloc(u8, cap + 500);
+    @memset(big, 'x');
+    main.update(&model, .{ .draft_edit = .{ .insert_text = big } }, &fx);
+    if (model.draft_dropped == 0) {
+        std.debug.print("{d} bytes went in over a {d} cap and nothing was reported\n", .{ big.len, cap });
+        return error.TheOverflowVanishedInSilence;
+    }
+    // The draft is full, and what did not fit is exactly what was refused.
+    try testing.expectEqual(cap, model.draft().len);
+    try testing.expectEqual(big.len - (cap - "a short note".len), model.draft_dropped);
+
+    // The composer says it, rather than "0 left".
+    const line = main.composeReachForTest(arena_state.allocator(), model.draft().len, model.draft_dropped);
+    if (std.mem.indexOf(u8, line, "did not fit") == null) {
+        std.debug.print("the composer says \"{s}\"\n", .{line});
+        return error.TheComposerNeverSaidSo;
+    }
+
+    // Clearing the box clears the warning with it.
+    main.update(&model, .close_compose, &fx);
+    try testing.expectEqual(@as(usize, 0), model.draft_dropped);
 }

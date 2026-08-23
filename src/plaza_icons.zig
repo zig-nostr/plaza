@@ -40,6 +40,11 @@ const dashed_ring_icon = svg_icon.parseComptime(@embedFile("icons/dashed-ring.sv
 // The crossroads mark: four filled blocks framing the central void. Single
 // color, tinted by the foreground token, resized never redrawn.
 const mark_icon = svg_icon.parseComptime(@embedFile("icons/mark.svg"));
+// Places. Lucide's map pin, in the same dialect; the built-in set has none.
+// A pin rather than a grid of tiles because the whole vocabulary is
+// geographic (a plaza in a city, places around it), and because a grid of
+// four blocks is what the Plaza mark already is.
+const places_icon = svg_icon.parseComptime(@embedFile("icons/app-places.svg"));
 
 pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "reply", .icon = &reply_icon },
@@ -51,4 +56,5 @@ pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "bell", .icon = &bell_icon },
     .{ .name = "dashed-ring", .icon = &dashed_ring_icon },
     .{ .name = "mark", .icon = &mark_icon },
+    .{ .name = "places", .icon = &places_icon },
 };

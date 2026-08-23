@@ -62,11 +62,65 @@ pub fn build(b: *std.Build) void {
     app.exe.root_module.linkLibrary(stb);
     app.tests.root_module.linkLibrary(stb);
 
+    // Receiving a `plaza://` link. The SDK registers the scheme (app.zon's
+    // `.url_schemes` becomes CFBundleURLTypes) but delivers nothing: the macOS
+    // host implements no inbound URL path at all, so Plaza installs its own
+    // Apple Event handler. macOS-only, like the Keychain shim, and for the same
+    // reason: there is no AppKit anywhere else.
+    //
+    // The EXE only. The test binary never receives an Apple Event and linking
+    // AppKit into it would make the suite depend on a window server.
+    if (app.exe.root_module.resolved_target.?.result.os.tag == .macos) {
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/urlscheme.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
+        // AppKit reaches Security.framework's headers, and those include
+        // `libDER/DERItem.h`, which lives in the SDK's usr/include rather than
+        // inside any framework. The signer build hit this first; same fix.
+        const sdk_path = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
+        app.exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
+        app.exe.root_module.linkFramework("AppKit", .{});
+    }
+
     // plaza-signer: the isolated keyholder daemon. A SEPARATE binary from the
     // SDK app, built from the nostr library ALONE (no SDK), so the process that
     // holds the key links none of the UI's image or JSON parsers. Plaza spawns
     // it at launch and talks to it over loopback.
     addSigner(b, app.exe.root_module.resolved_target.?, app.exe.root_module.optimize.?);
+    addSeedFeed(b, app.exe.root_module.resolved_target.?);
+}
+
+/// Builds `seed-feed`, which fills a store with a fixed corpus so the frame
+/// budget measures the same app twice. Library-only, like the signer: it wants
+/// a store and nothing else.
+fn addSeedFeed(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/seed_feed/main.zig"),
+        .target = target,
+        // Debug: it runs once before a measurement and is not measured itself.
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    linkNostr(b, mod);
+
+    const exe = b.addExecutable(.{ .name = "seed-feed", .root_module = mod });
+    // Deliberately NOT `b.installArtifact`.
+    //
+    // `scripts/package-macos.sh` puts whatever build.zig installs into the app
+    // bundle, and derives that list rather than naming binaries, because naming
+    // them by hand once shipped a release with no signer daemon in it. The same
+    // rule read the other way: anything installed here is handed to everybody
+    // who downloads Plaza. This one fabricates a feed to measure against, and
+    // it went out in v0.3.0 and v0.4.0 doing nothing but taking up space in a
+    // signed bundle.
+    //
+    // So it is built on request. `zig build seed-feed` puts it in zig-out/bin
+    // for the harness; a plain `zig build` does not.
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("seed-feed", "Build the fixed-corpus seeder that scripts/frame-budget.sh measures against")
+        .dependOn(&install.step);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test-seed-feed", "Run the seed-feed tests").dependOn(&run_tests.step);
 }
 
 /// Builds the plaza-signer daemon and its test step. Library-only: it imports
@@ -79,6 +133,33 @@ fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
     });
     linkNostr(b, mod);
+
+    // The Keychain shim, and the frameworks behind it. Only the daemon links
+    // this: it is the process that holds the key, and the render process has no
+    // business being able to read it.
+    // The SDK's framework directory, asked for rather than assumed. This module
+    // is built plainly, without the `--sysroot` the app build passes, so Zig has
+    // nowhere to look for Security.framework and says so ("searched paths:
+    // none"). `xcrun` is how every other tool on this machine answers the same
+    // question, and hardcoding a versioned SDK path would break on the next
+    // Xcode update.
+    if (target.result.os.tag == .macos) {
+        // The whole shim is macOS-only, C file included. There is no Keychain
+        // elsewhere, and the Zig side compiles its calls out on other targets
+        // and falls back to the key file, which is what those platforms had
+        // anyway. Adding the C unconditionally is what broke the Linux build:
+        // `Security/Security.h` is not a header that exists there.
+        mod.addCSourceFile(.{ .file = b.path("src/keychain.c"), .flags = &.{"-O2"} });
+        mod.addIncludePath(b.path("src"));
+        const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
+        mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+        // And the SDK's headers: Security.framework's own headers include
+        // `libDER/DERItem.h`, which lives in usr/include rather than inside the
+        // framework. The app build gets this from `-isysroot`.
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+        mod.linkFramework("Security", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    }
 
     const exe = b.addExecutable(.{ .name = "plaza-signer", .root_module = mod });
     b.installArtifact(exe);
@@ -94,9 +175,31 @@ fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 fn linkNostr(b: *std.Build, mod: *std.Build.Module) void {
     const nostr = b.dependency("nostr", .{
         .target = mod.resolved_target.?,
-        .optimize = mod.optimize.?,
+        .optimize = libraryOptimize(mod.optimize.?),
     });
     mod.addImport("nostr", nostr.module("nostr"));
+}
+
+/// The library is built one notch safer than the app that links it.
+///
+/// Zig's bounds, overflow and cast checks are compiled OUT of ReleaseFast, and
+/// ReleaseFast is what ships. That is the right trade for the render thread and
+/// the wrong one for `nostr`, because everything the library parses is bytes a
+/// stranger chose: a relay's frames, an event's JSON, a tag, a bech32 string
+/// pasted out of somebody's note. An index derived from a length field in that
+/// input is exactly what a safety check is for.
+///
+/// So ReleaseFast gets a ReleaseSafe library, and Debug and ReleaseSafe are left
+/// alone. Measured on this app, that costs nothing anybody can see: the frame
+/// budget does not move, because parsing happens on the relay threads and the
+/// render thread's own work is Plaza's code, not the library's. Building the
+/// WHOLE app ReleaseSafe was measured too, and it is not free at all: rebuild
+/// 290us to 852us, layout 1377us to 2650us, three budgets blown.
+fn libraryOptimize(app: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    return switch (app) {
+        .ReleaseFast, .ReleaseSmall => .ReleaseSafe,
+        .Debug, .ReleaseSafe => app,
+    };
 }
 
 /// The `.min_width` the manifest declares for the startup window.

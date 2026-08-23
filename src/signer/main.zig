@@ -24,8 +24,93 @@ const std = @import("std");
 const nostr = @import("nostr");
 const ipc = nostr.signer_ipc;
 const keystore = nostr.keystore;
+const bunker = @import("bunker.zig");
 
 const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
+/// Whether the reader turned the signer on, and the secret their bunker:// URL
+/// carries. 0600 like the key beside it: the secret is not the key, but it is
+/// the one thing standing between a public pubkey and a connect attempt.
+const bunker_file_name = "signer.bunker";
+
+test {
+    // The bunker lives in its own file; without this its tests never run.
+    _ = bunker;
+}
+
+// ------------------------------------------------------------- the keychain
+//
+// Where the key lives now. The 0600 file is still read, so an existing install
+// keeps working and is migrated on the next start, and it is still written when
+// the Keychain refuses, which is the shape Amethyst's desktop side uses: OS
+// credential manager, encrypted-file fallback.
+//
+// What moving it buys, exactly: the login keychain is encrypted, so a copied
+// home directory, a Time Machine backup and a stolen disk yield nothing without
+// the login password. A 0600 file hands all three over.
+//
+// What it does NOT buy, measured rather than assumed: protection from another
+// process running as this user. A keychain item's ACL binds to the creating
+// app's designated requirement, and an AD-HOC signature has none. Two ad-hoc
+// binaries read each other's items, and `security find-generic-password` printed
+// the secret with no prompt at all. The transcript is in keychain.c. Nothing in
+// this app may claim app-level isolation on the strength of this.
+
+/// macOS only. Everywhere else these compile out and the key file is used,
+/// which is what those platforms had before this existed: there is no Keychain
+/// to move into, and pretending otherwise would be a fallback that silently
+/// stores nothing.
+const has_keychain = @import("builtin").os.tag == .macos;
+
+extern fn plaza_keychain_set(service: [*:0]const u8, account: [*:0]const u8, data: [*]const u8, len: c_ulong) c_int;
+extern fn plaza_keychain_get(service: [*:0]const u8, account: [*:0]const u8, out: [*]u8, out_cap: c_ulong, out_len: *c_ulong) c_int;
+extern fn plaza_keychain_delete(service: [*:0]const u8, account: [*:0]const u8) c_int;
+
+const keychain_service = "com.zig-nostr.plaza";
+const keychain_account = "signer-key";
+
+/// Stores the secret in the Keychain. False when it refused, and the caller
+/// falls back to the file.
+fn keychainStore(secret: [32]u8) bool {
+    if (comptime !has_keychain) return false;
+    return plaza_keychain_set(keychain_service, keychain_account, &secret, secret.len) == 0;
+}
+
+/// Whether the plain key file may be removed after a migration attempt.
+///
+/// All three have to hold, and this is the one decision in the app that can
+/// destroy an identity: the file is the only copy of somebody's key on this Mac,
+/// and there is no undo. `keychainStore` returning true says the call succeeded,
+/// not that the bytes are retrievable, so the copy is read back and compared
+/// before anything is deleted.
+///
+/// A key still in a plain file is a weaker position. A key in neither is not a
+/// position at all, so every doubt keeps the file.
+fn safeToRemovePlainKey(stored: bool, read_back: ?[32]u8, original: [32]u8) bool {
+    if (!stored) return false;
+    const back = read_back orelse return false;
+    return std.mem.eql(u8, &back, &original);
+}
+
+/// Reads the secret back, or null when there is none, which from here is the
+/// same as the Keychain being unavailable: try the file.
+fn keychainLoad() ?[32]u8 {
+    if (comptime !has_keychain) return null;
+    var out: [32]u8 = undefined;
+    var n: c_ulong = 0;
+    if (plaza_keychain_get(keychain_service, keychain_account, &out, out.len, &n) != 0) return null;
+    // Length checked rather than trusted: the item is whatever sits in the
+    // keychain under that name, which is not necessarily what this app put there.
+    if (n != out.len) {
+        std.crypto.secureZero(u8, &out);
+        return null;
+    }
+    return out;
+}
+
+fn keychainForget() void {
+    if (comptime !has_keychain) return;
+    _ = plaza_keychain_delete(keychain_service, keychain_account);
+}
 
 // ------------------------------------------------------------------- state
 
@@ -81,13 +166,17 @@ const State = struct {
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return error.BadKey;
 
-        var hexbuf: [64]u8 = undefined;
-        _ = hexLower(&hexbuf, secret);
-        keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+        // The Keychain first. The file is written only when it refuses, so a
+        // healthy install never has the secret sitting in a plain file at all.
+        if (!keychainStore(secret)) {
+            var hexbuf: [64]u8 = undefined;
+            _ = hexLower(&hexbuf, secret);
+            keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+                std.crypto.secureZero(u8, &hexbuf);
+                return e;
+            };
             std.crypto.secureZero(u8, &hexbuf);
-            return e;
-        };
-        std.crypto.secureZero(u8, &hexbuf);
+        }
 
         self.secret = secret;
         self.pubkey = kp.public_key;
@@ -102,11 +191,26 @@ const State = struct {
         if (self.secret) |*sk| std.crypto.secureZero(u8, sk[0..]);
         self.secret = null;
         self.pubkey = null;
+        // BOTH, whichever this install happens to use. Clearing one and leaving
+        // the other is a logout the next start quietly undoes.
+        keychainForget();
         self.key_dir.deleteFile(io, self.key_path) catch {};
     }
 
     /// Loads a persisted secret at startup, if any.
     fn load(self: *State, gpa: std.mem.Allocator, io: std.Io) void {
+        if (keychainLoad()) |secret| {
+            var signer = nostr.keys.Signer.init();
+            defer signer.deinit();
+            if (signer.keyPairFromSecretKey(secret)) |kp| {
+                self.lock();
+                defer self.unlock();
+                self.secret = secret;
+                self.pubkey = kp.public_key;
+                return;
+            } else |_| {}
+        }
+
         // A plain read of the raw-hex key file: keystore.readKeyFile is for
         // ncryptsec content only, which this is deliberately not.
         const hex = self.key_dir.readFileAlloc(io, self.key_path, gpa, std.Io.Limit.limited(128)) catch return;
@@ -121,6 +225,25 @@ const State = struct {
         var signer = nostr.keys.Signer.init();
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return;
+        // Migrate: this install predates the Keychain. Moved rather than copied,
+        // because leaving the plain file behind would leave the weaker of the
+        // two deciding how exposed the key is.
+        //
+        // READ BACK AND COMPARED before the file goes, and that is not a
+        // formality. This is the only copy of somebody's identity on this Mac,
+        // and `keychainStore` returning 0 says the call succeeded, not that the
+        // bytes are retrievable. If the copy cannot be read back exactly, the
+        // file stays and nothing was migrated: a key still in a plain file is a
+        // weaker position, and a key in neither is not a position at all.
+        const stored = keychainStore(secret);
+        // Read back only when the write claimed to succeed: a user whose
+        // Keychain refuses writes should not also pay a pointless read on every
+        // launch.
+        const read_back: ?[32]u8 = if (stored) keychainLoad() else null;
+        if (safeToRemovePlainKey(stored, read_back, secret)) {
+            self.key_dir.deleteFile(io, self.key_path) catch {};
+        }
+
         self.lock();
         defer self.unlock();
         self.secret = secret;
@@ -198,6 +321,15 @@ pub fn main(init: std.process.Init) !void {
     var dir = std.Io.Dir.cwd().createDirPathOpen(io, state_dir, .{}) catch std.Io.Dir.cwd();
     g_state = .{ .key_dir = dir, .key_path = key_file_name };
     g_state.load(gpa, io);
+    g_bunker_dir = dir;
+
+    // Back on if it was on when the app last closed, with the SAME secret.
+    //
+    // Both halves matter, and the secret is the half that is easy to miss: a
+    // fresh one would leave the toggle looking right while every bunker:// URL
+    // the reader had already handed out was refused, which reads as "the other
+    // app broke" rather than as anything Plaza did.
+    restoreBunker(gpa, io, dir);
 
     // The bearer token: read the file Plaza wrote (0600). Every request carries
     // it, so a stray process on the machine cannot drive the signer.
@@ -307,9 +439,9 @@ fn runImport(init: std.process.Init) !void {
     std.debug.print("Imported {s}\nStart Plaza to use it.\n", .{npub});
 }
 
-/// Reads one secret line. On a terminal, echo is disabled so nothing is shown;
-/// when stdin is a pipe, it just reads the line. The returned slice points into
-/// `buf` (which the caller zeroes).
+/// Reads ONE secret line. On a terminal, echo is disabled so nothing is shown;
+/// when stdin is a pipe, it takes exactly one line and leaves the rest. The
+/// returned slice points into `buf` (which the caller zeroes).
 fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
     _ = io;
     const stdin_fd: std.posix.fd_t = 0;
@@ -326,9 +458,23 @@ fn readSecret(io: std.Io, prompt: []const u8, buf: []u8) ?[]const u8 {
         std.posix.tcsetattr(stdin_fd, .NOW, base) catch {};
         std.debug.print("\n", .{});
     };
-    const n = std.posix.read(stdin_fd, buf) catch return null;
-    if (n == 0) return null;
-    return std.mem.trim(u8, buf[0..n], " \t\r\n");
+    // A byte at a time, because this is asked twice in a row for an ncryptsec
+    // and a plain read into a big buffer takes whatever the pipe has: the first
+    // call would swallow the key AND the passphrase, and the second would find
+    // nothing left. A terminal hides it (canonical mode hands over one line per
+    // read), so it only shows up when the input is piped, which is how a script
+    // would drive this.
+    var len: usize = 0;
+    while (len < buf.len) {
+        var one: [1]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &one) catch return null;
+        if (n == 0) break; // end of input: whatever was read is the line
+        if (one[0] == '\n') break;
+        buf[len] = one[0];
+        len += 1;
+    }
+    if (len == 0) return null;
+    return std.mem.trim(u8, buf[0..len], " \t\r");
 }
 
 /// POSTs an import to a running daemon over loopback. Returns null when nothing
@@ -456,7 +602,21 @@ fn handleConn(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream) !void {
         return handleCipher(gpa, io, w, body, .decrypt);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/reset")) {
         g_state.reset(io);
+        // The signer goes with the key it was signing for. Leaving the secret
+        // behind would mean the next key set up on this Mac inherited a URL
+        // strangers already hold, and `disable` is also what ends the sessions
+        // that were granted against the key just removed.
+        g_bunker.disable();
+        forgetBunker(io);
         return handlePubkey(gpa, w);
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/bunker")) {
+        return handleBunkerState(gpa, w);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker")) {
+        return handleBunkerToggle(gpa, io, w, body);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker/decide")) {
+        return handleBunkerDecide(gpa, w, body);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/bunker/revoke")) {
+        return handleBunkerRevoke(gpa, w, body);
     }
     return respond(w, 404, "no such endpoint");
 }
@@ -611,4 +771,238 @@ test "hex encoding is lowercase and full width" {
     var out: [64]u8 = undefined;
     const bytes = [_]u8{0xab} ** 32;
     try std.testing.expectEqualStrings("ab" ** 32, hexLower(&out, bytes));
+}
+
+test "the keychain round-trips a secret and forgetting it removes it" {
+    if (comptime !has_keychain) return error.SkipZigTest;
+    // A real Keychain call against this machine, under a test-only account so
+    // it can never touch the one a running Plaza uses.
+    const account = "signer-key-test";
+    defer _ = plaza_keychain_delete(keychain_service, account);
+
+    const secret = [_]u8{0x5a} ** 32;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_set(keychain_service, account, &secret, secret.len));
+
+    var out: [32]u8 = undefined;
+    var n: c_ulong = 0;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_get(keychain_service, account, &out, out.len, &n));
+    try std.testing.expectEqual(@as(c_ulong, 32), n);
+    try std.testing.expectEqualSlices(u8, &secret, &out);
+
+    // Storing again replaces rather than failing on a duplicate, which is what
+    // adopting a new key does.
+    const second = [_]u8{0x5b} ** 32;
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_set(keychain_service, account, &second, second.len));
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_get(keychain_service, account, &out, out.len, &n));
+    try std.testing.expectEqualSlices(u8, &second, &out);
+
+    // And forgetting means gone, including a second forget of nothing.
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
+    try std.testing.expect(plaza_keychain_get(keychain_service, account, &out, out.len, &n) != 0);
+    try std.testing.expectEqual(@as(c_int, 0), plaza_keychain_delete(keychain_service, account));
+}
+
+test "the plain key file survives every way a migration can go wrong" {
+    const key = [_]u8{0x11} ** 32;
+
+    // The only case that removes it: written, read back, and identical.
+    try std.testing.expect(safeToRemovePlainKey(true, key, key));
+
+    // The Keychain refused the write. Nothing is there, so the file is
+    // everything.
+    try std.testing.expect(!safeToRemovePlainKey(false, null, key));
+
+    // The write claimed success and the read came back empty. This is the case
+    // the comparison exists for: a store call returning 0 says the call
+    // succeeded, not that the bytes are retrievable.
+    try std.testing.expect(!safeToRemovePlainKey(true, null, key));
+
+    // Read back, but not what we put in. One byte is enough: a key that is
+    // nearly right is not a key at all, and deleting the file here would leave
+    // the reader with an identity they can no longer sign as.
+    var off_by_one = key;
+    off_by_one[31] ^= 0x01;
+    try std.testing.expect(!safeToRemovePlainKey(true, off_by_one, key));
+
+    // And a stale item from some earlier install, which is the shape a wrong
+    // read most plausibly takes on a machine that has run this before.
+    try std.testing.expect(!safeToRemovePlainKey(true, [_]u8{0x22} ** 32, key));
+}
+
+// ------------------------------------------------------------- the bunker
+//
+// Four endpoints, all loopback and all behind the same bearer token as the rest
+// of this server. The UI polls `/bunker` and posts the reader's answers.
+
+var g_bunker: bunker.Bunker = .{};
+/// Where the on/off and the secret are written down. Set at boot beside the
+/// key dir, because that is the one directory this process is given.
+var g_bunker_dir: ?std.Io.Dir = null;
+
+/// Writes down whether the signer is on, and the secret its URL carries.
+///
+/// Best-effort, like Plaza's own settings: a machine that cannot write this
+/// still signs, it just forgets by the next launch. The secret is written even
+/// when the answer is off, so turning it back on hands out the URL the reader
+/// already gave to their other apps rather than a new one.
+fn saveBunker(io: std.Io) void {
+    const dir = g_bunker_dir orelse return;
+    var buf: [128]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "on={s}\nsecret={s}\n", .{
+        if (g_bunker.isEnabled()) "yes" else "no",
+        g_bunker.secret(),
+    }) catch return;
+    dir.writeFile(io, .{
+        .sub_path = bunker_file_name,
+        .data = data,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch {};
+}
+
+/// Drops what was written down, secret and all.
+fn forgetBunker(io: std.Io) void {
+    const dir = g_bunker_dir orelse return;
+    dir.deleteFile(io, bunker_file_name) catch {};
+}
+
+/// Puts the signer back the way the reader left it.
+///
+/// The secret is adopted whether or not it was on, so an "off" that the reader
+/// flips back on keeps the URL they had. Turning it on needs a key, and there
+/// may not be one yet (a fresh install, or a locked one): then this does
+/// nothing and the reader turns it on themselves once there is.
+fn restoreBunker(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) void {
+    const raw = dir.readFileAlloc(io, bunker_file_name, gpa, std.Io.Limit.limited(256)) catch return;
+    defer gpa.free(raw);
+
+    var on = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const name = line[0..eq];
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
+        if (std.mem.eql(u8, name, "on")) on = std.mem.eql(u8, value, "yes");
+        if (std.mem.eql(u8, name, "secret")) _ = g_bunker.adoptSecret(value);
+    }
+    if (!on) return;
+
+    const secret = g_state.take() orelse return;
+    g_bunker.enable(io);
+    bunker.start(gpa, &g_bunker, secret);
+}
+
+/// GET /bunker: everything the settings screen draws, in one answer.
+///
+/// One request rather than four, because the UI polls this on a timer and a
+/// screen that needs four round trips to say one thing is four chances to show a
+/// half-updated state.
+fn handleBunkerState(gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+
+    try out.appendSlice(gpa, "{\"enabled\":");
+    try out.appendSlice(gpa, if (g_bunker.isEnabled()) "true" else "false");
+    try out.appendSlice(gpa, ",\"version\":");
+    try out.print(gpa, "{d}", .{g_bunker.version.load(.acquire)});
+
+    // The URL only exists while it is on. Showing a stale one for a bunker that
+    // is off would be handing somebody a link that cannot work.
+    try out.appendSlice(gpa, ",\"url\":\"");
+    if (g_bunker.isEnabled()) {
+        var pk_hex: [64]u8 = undefined;
+        if (g_state.pubkeyHex(&pk_hex)) |hex| {
+            var url_buf: [512]u8 = undefined;
+            if (bunker.uri(&url_buf, hex, &bunker.default_relays, g_bunker.secret())) |url| {
+                try out.appendSlice(gpa, url);
+            } else |_| {}
+        }
+    }
+    try out.appendSlice(gpa, "\"");
+
+    try out.appendSlice(gpa, ",\"pending\":");
+    if (g_bunker.firstPendingFull()) |p| {
+        var c_hex: [64]u8 = undefined;
+        // `ask` is empty for a connect, which is the client asking to be let in
+        // rather than asking to do something. The screen words those two
+        // differently and cannot tell them apart from the pubkey alone.
+        try out.print(gpa, "{{\"id\":{d},\"client\":\"{s}\",\"ask\":\"{s}\",\"kind\":{d}}}", .{
+            p.id,
+            hexLower(&c_hex, p.client),
+            if (p.ask) |a| @tagName(a) else "",
+            p.kind,
+        });
+    } else {
+        try out.appendSlice(gpa, "null");
+    }
+
+    try out.appendSlice(gpa, ",\"clients\":[");
+    var first = true;
+    for (g_bunker.clients) |c| {
+        if (!c.used) continue;
+        if (!first) try out.appendSlice(gpa, ",");
+        first = false;
+        var c_hex: [64]u8 = undefined;
+        try out.print(gpa, "{{\"pubkey\":\"{s}\"}}", .{hexLower(&c_hex, c.pubkey)});
+    }
+    try out.appendSlice(gpa, "]}");
+
+    return respondJson(w, 200, out.items);
+}
+
+/// POST /bunker {"on": true|false}
+fn handleBunkerToggle(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { on: bool = false };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+
+    if (!parsed.value.on) {
+        g_bunker.disable();
+        saveBunker(io);
+        return handleBunkerState(gpa, w);
+    }
+    // Nothing to serve with. Turning a bunker on before there is a key would
+    // publish a pubkey that cannot sign.
+    const secret = g_state.take() orelse return respondErr(gpa, w, 409, "no key yet");
+    const was_on = g_bunker.isEnabled();
+    g_bunker.enable(io);
+    // Threads only on the transition, so a second press does not stack another
+    // three onto the relays.
+    if (!was_on) bunker.start(gpa, &g_bunker, secret);
+    // After `enable`, which is what mints the secret on the first ever press.
+    saveBunker(io);
+    return handleBunkerState(gpa, w);
+}
+
+/// POST /bunker/decide {"id": N, "allow": true|false}
+fn handleBunkerDecide(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { id: u64 = 0, allow: bool = false, remember: []const u8 = "once" };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+    // An unrecognised duration is `once`, the shortest one. A typo must not
+    // silently grant something forever.
+    const how_long: nostr.nip46.Remember = if (std.mem.eql(u8, parsed.value.remember, "hour"))
+        .hour
+    else if (std.mem.eql(u8, parsed.value.remember, "day"))
+        .day
+    else if (std.mem.eql(u8, parsed.value.remember, "always"))
+        .always
+    else
+        .once;
+    _ = g_bunker.decideFor(parsed.value.id, parsed.value.allow, how_long);
+    return handleBunkerState(gpa, w);
+}
+
+/// POST /bunker/revoke {"pubkey": "<hex>"}
+fn handleBunkerRevoke(gpa: std.mem.Allocator, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { pubkey: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Body, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respondErr(gpa, w, 400, "bad request");
+    defer parsed.deinit();
+    if (parsed.value.pubkey.len != 64) return respondErr(gpa, w, 400, "bad pubkey");
+    var pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pk, parsed.value.pubkey) catch return respondErr(gpa, w, 400, "bad pubkey");
+    _ = g_bunker.revoke(pk);
+    return handleBunkerState(gpa, w);
 }

@@ -1,9 +1,14 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.2.7
+### What's new in v0.12.1
 
-- **See who a note will notify, and switch anyone off.** The composer and the reply box list the people who will be tagged. Press a name to drop them, press it again to put them back. Replies tag everyone already in the thread, so this is how you keep one reply from reaching a dozen inboxes.
-- **A reply that answers a note Plaza does not have now says so**, instead of quietly appearing as a reply to the note at the top of the thread. It reads "The note this answers is not on your relays yet", and it may fill in when a relay answers.
+**Logging out takes your places with you.** The list of places you have entered is a file on your own disk, which is what keeps it private, and it is also why it outlived the account: a list kept on a relay goes when your key does, and a file sits there until something deletes it. So logging out left the rail exactly as it was, and the next person to sign in on that Mac opened straight into whichever place the last one had been reading. Logout already cleared the follows, the mutes, the drafts and everything else that belongs to an account rather than to a machine. Places are newer than that and were never added to it.
+
+**Nothing you paste disappears without being told.** Paste a note longer than the composer holds and the overflow was simply gone, cut mid-word, with the counter reading "0 left" as though you had filled it exactly. On a six thousand character paste that is nearly two thousand characters of your own writing, thrown away in silence. It now says how much did not fit.
+
+**The starter pack names the right people.** Three of the nine accounts a new install follows were labelled with somebody else's name. The keys were always right, so nobody has been following anyone they should not have been, but the app was telling newcomers the wrong thing about who they were reading, and saying it about real people. Every one of the nine is now checked against its owner's own domain.
+
+**The feed stops giving up on history.** Scrolling to the bottom asks the relays for older notes, and if that attempt came back empty the feed decided there was nothing older and never asked again. It could not tell "every relay says that is all of it" from "nothing answered", so one attempt made offline ended your feed until you restarted the app. It now waits to be told.
 
 ### Install
 
