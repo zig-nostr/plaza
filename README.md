@@ -100,6 +100,40 @@ three tries gives up its slot to the next one down and is tried again in six
 hours. Before that, the same count said 202 and fifty of those people were
 behind a closed door.
 
+## Make it quiet
+
+Which parts of Nostr are worth your attention is your call, not mine. Settings
+has eight switches that take things away: replying, reposting, reacting,
+zapping, and the count beside each one.
+
+Hiding is not covering up. Turn off reactions and Plaza stops asking relays for
+them. The subscription drops kind 7, those events never arrive, and that is less
+to download, less to parse and less sitting on your disk. A hidden thing is
+absent rather than painted over.
+
+Two of the eight are honest exceptions, and the switch says so where you flip
+it. Your own reposts arrive in the same stream as everybody else's, so hiding
+the repost verb changes what is drawn and nothing more. Claiming the data was
+gone would be easy and untrue.
+
+Notifications are a separate subscription and keep their own. Hide reaction
+counts in the feed and you will still hear when somebody likes your note.
+
+## Places
+
+A place is somebody's corner of Nostr: their relay, and what that relay serves.
+A `plaza://place/` link opens the one it names, and while you are in it you are
+reading that rather than your own feed. Your own relays are left alone, and
+leaving puts you back where you were.
+
+You arrive as a visitor and can read and post straight away. Entering keeps the
+place on a rail down the side of the window, one press away from then on, and
+leaving takes it off again. Nothing is gated on entering, posting included:
+whether a post lands is between you and that place's relays.
+
+The format is fiatjaf's Hallway universe object, read exactly as it is written,
+so a place published once means the same thing in both.
+
 ## Performance
 
 The feed is a windowed list: it builds only the rows near the viewport, so what

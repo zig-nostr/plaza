@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/instal
 
 The installer downloads this release, verifies its SHA-256, installs `Plaza.app` to `/Applications`, clears the download-quarantine flag, and opens it.
 
-It touches the app bundle and nothing else. Your key, your session and your local store live in `~/.plaza` and are left alone, so upgrading never costs you your identity.
+It touches the app bundle and nothing else. Your session and your local store live in `~/.plaza`, your key in the login Keychain, and both are left alone, so upgrading never costs you your identity.
 
 ### Why it is not notarized
 

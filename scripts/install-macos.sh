@@ -106,7 +106,7 @@ main() {
   # --- install (replace any existing copy) ---------------------------------
   #
   # Only the BUNDLE is replaced. Nothing here touches ~/.plaza, which holds the
-  # reader's key, their session and their local store: an upgrade that quietly
+  # reader's session and their local store (their key is in the login Keychain): an upgrade that quietly
   # took the key with it would be the worst bug this project could ship.
   if [ -e "$dest/$app" ]; then
     say "Replacing the existing ${app} in ${dest}..."
