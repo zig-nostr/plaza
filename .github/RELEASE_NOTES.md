@@ -1,14 +1,12 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.12.1
+### What's new in v0.12.2
 
-**Logging out takes your places with you.** The list of places you have entered is a file on your own disk, which is what keeps it private, and it is also why it outlived the account: a list kept on a relay goes when your key does, and a file sits there until something deletes it. So logging out left the rail exactly as it was, and the next person to sign in on that Mac opened straight into whichever place the last one had been reading. Logout already cleared the follows, the mutes, the drafts and everything else that belongs to an account rather than to a machine. Places are newer than that and were never added to it.
+**Faces that were stuck behind a proxy refusing their host.** Plaza asks an image proxy to fetch and shrink pictures, and the default one refuses whole domains by policy rather than by picture: any `.pub` address comes back as "Domain or TLD blocked by policy". Ditto's media server is `blossom.ditto.pub`, so anybody whose picture lives there arrived as initials and a flat colour band, on every screen, and stayed that way.
 
-**Nothing you paste disappears without being told.** Paste a note longer than the composer holds and the overflow was simply gone, cut mid-word, with the counter reading "0 left" as though you had filled it exactly. On a six thousand character paste that is nearly two thousand characters of your own writing, thrown away in silence. It now says how much did not fit.
+The feed's own pictures already knew what to do about this: when the proxy refuses the host rather than the picture, ask the host itself. Faces and banners never learned it, so notes rendered and the people in them did not. Both now do, once per picture, and only when it was the host that was refused. A picture the proxy could not find is not asked for again, because it will not be at the host either.
 
-**The starter pack names the right people.** Three of the nine accounts a new install follows were labelled with somebody else's name. The keys were always right, so nobody has been following anyone they should not have been, but the app was telling newcomers the wrong thing about who they were reading, and saying it about real people. Every one of the nine is now checked against its owner's own domain.
-
-**The feed stops giving up on history.** Scrolling to the bottom asks the relays for older notes, and if that attempt came back empty the feed decided there was nothing older and never asked again. It could not tell "every relay says that is all of it" from "nothing answered", so one attempt made offline ended your feed until you restarted the app. It now waits to be told.
+A face fetched this way is the full-size file rather than the small one the proxy would have returned, which costs more to download and is why this happens only when there is no other way to get the picture at all.
 
 ### Install
 
