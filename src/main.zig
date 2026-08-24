@@ -6940,6 +6940,13 @@ pub fn setProfileAvatarForTest(pubkey: [32]u8, image_id: u64, state: enum { idle
     };
 }
 
+/// Whether this face is idle, and whether it is now pinned to its own host
+/// rather than the proxy. Both are what the host-refusal fallback moves.
+pub fn avatarFallbackStateForTest(pubkey: [32]u8) ?struct { idle: bool, direct: bool } {
+    const p = lookupProfile(pubkey) orelse return null;
+    return .{ .idle = p.avatar_state == .idle, .direct = p.avatar_direct };
+}
+
 pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
     const p = lookupProfile(pubkey) orelse return 0;
     return p.image_id;
