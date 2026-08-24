@@ -24,9 +24,8 @@ client.
 > the pool. A `plaza://place/` link opens somebody else's corner of Nostr: their
 > relay, and whatever it serves, without disturbing your own.
 >
-> Not there yet, and tracked in the open milestones: putting a picture in a
-> note, setting an avatar, sending a zap, search, and private messages. macOS
-> first.
+> Not there yet: putting a picture in a note, setting an avatar, sending a zap,
+> search, and private messages. macOS first.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
@@ -67,12 +66,12 @@ Following somebody on Nostr does not mean you will see them. If they publish
 only to relays you are not connected to, they are simply absent: no error, no
 empty state, nothing to say a person is missing.
 
-Plaza reads where the people you follow actually write. It takes their NIP-65
-relay lists, works out which relays reach the most of them, connects to the ones
-you are not already on, and asks each relay only about the people who write
-there. A small relay is asked about its dozen writers rather than about everyone
-you follow. Anybody no chosen relay carries is asked of your own relays, so
-nobody falls through.
+Plaza reads where the people you follow actually write, which is the pattern
+people call the outbox model. It takes their NIP-65 relay lists, works out which
+relays reach the most of them, connects to the ones you are not already on, and
+asks each relay only about the people who write there. A small relay is asked
+about its dozen writers rather than about everyone you follow. Anybody no chosen
+relay carries is asked of your own relays, so nobody falls through.
 
 Getting those lists is its own problem, because you cannot ask somebody's relays
 where their relays are. Plaza asks four well-known relays that one question, and
