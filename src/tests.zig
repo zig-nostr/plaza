@@ -17411,6 +17411,57 @@ test "a face whose host the proxy refuses is asked for directly" {
     try testing.expectEqualStrings(src, direct);
 }
 
+test "a refused host sends the face back through its own door, once" {
+    defer main.resetProfilesForTest();
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const pk = [_]u8{0x3b} ** 32;
+    main.setProfileAvatarForTest(pk, 1, .fetching);
+
+    // wsrv.nl's refusal of the HOST. The face goes back to idle so the next
+    // pass asks again, and it is now pinned to its own host.
+    main.deliverAvatarResponseForTest(&fx, pk, .ok, 400, "");
+    const after = main.avatarFallbackStateForTest(pk).?;
+    try testing.expect(after.idle);
+    try testing.expect(after.direct);
+
+    // Once. A second refusal, this time from the host itself, is a real
+    // failure: there is nowhere else to ask, so it must not loop.
+    main.setProfileAvatarForTest(pk, 1, .fetching);
+    main.deliverAvatarResponseForTest(&fx, pk, .ok, 400, "");
+    const again = main.avatarFallbackStateForTest(pk).?;
+    try testing.expect(!again.idle);
+}
+
+test "a 404 is the picture missing, so it is not retried against the host" {
+    defer main.resetProfilesForTest();
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const pk = [_]u8{0x3c} ** 32;
+    main.setProfileAvatarForTest(pk, 1, .fetching);
+
+    // Missing at the proxy means missing at the host too, so going direct is a
+    // second download with a known answer.
+    main.deliverAvatarResponseForTest(&fx, pk, .ok, 404, "");
+    try testing.expect(!main.avatarFallbackStateForTest(pk).?.direct);
+}
+
 test "the proxy toggle decides whether a URL is rewritten at all" {
     const original = "https://blossom.ditto.pub/abc.jpeg";
     var buf: [1024]u8 = undefined;
