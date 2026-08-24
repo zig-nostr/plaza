@@ -6830,6 +6830,11 @@ const Profile = struct {
     /// Cleared on a successful load, on a changed picture URL, and by the
     /// Settings retry.
     avatar_attempts: u8 = 0,
+    /// Ask this face's own host rather than the proxy, because the proxy
+    /// refused the HOST rather than the picture. One flag rather than a
+    /// counter, because it is one alternative: proxy, then source, then give
+    /// up. Cleared with the rest of the avatar when the picture URL changes.
+    avatar_direct: bool = false,
     /// A face too big for one response body. Same problem as a feed picture and
     /// the same answer: a profile picture straight from its own host is often a
     /// full-size photo, and one that drew initials was never undecodable, only
@@ -8586,8 +8591,10 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
                 profile.picture_len = @intCast(trimmed.len);
                 if (profile.avatar_state != .fetching) profile.avatar_state = .idle;
                 // A different picture is a different resource, so whatever the
-                // last one failed at says nothing about this one.
+                // last one failed at says nothing about this one, including
+                // which host refused it.
                 profile.avatar_attempts = 0;
+                profile.avatar_direct = false;
             }
         }
     }
@@ -10978,7 +10985,7 @@ fn warmAvatar(fx: *Effects, p: *Profile) bool {
     if (p.image_id != 0 or p.avatar_state == .loaded) return false;
 
     var url_buf: [1024]u8 = undefined;
-    const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+    const url = avatarUrl(&url_buf, p.picture(), p.avatar_direct);
     if (cachedImageExists(url)) {
         p.warm_state = .done;
         return false;
@@ -11081,7 +11088,7 @@ fn handleAvatarWarmed(response: native_sdk.EffectResponse) void {
     if (response.outcome != .ok or response.status != 200 or response.truncated) return;
     if (response.body.len == 0 or response.body.len > max_image_bytes) return;
     var url_buf: [1024]u8 = undefined;
-    const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+    const url = avatarUrl(&url_buf, p.picture(), p.avatar_direct);
     storeCachedImage(url, response.body);
 }
 
@@ -11120,7 +11127,7 @@ fn scanAvatarFetches(fx: *Effects) void {
         if (!p.used or p.avatar_state != .idle or p.picture_len == 0 or p.image_id == 0) continue;
 
         var url_buf: [1024]u8 = undefined;
-        const url = mediaUrl(&url_buf, p.picture(), avatar_target_px, .square);
+        const url = avatarUrl(&url_buf, p.picture(), p.avatar_direct);
         const n = @min(url.len, p.url_buf.len);
         @memcpy(p.url_buf[0..n], url[0..n]);
         p.url_len = @intCast(n);
@@ -11177,6 +11184,17 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     // 503, one rate limit, or one dropped connection.
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0 or response.body.len > max_image_bytes) {
         p.down.release();
+        // The proxy refusing the HOST is a different question from the picture
+        // being unusable, so it gets the source itself rather than another go
+        // at the same wall. Once per face, and only while the proxy is what was
+        // used, so it can never loop. The attempt counter is untouched.
+        if (g_media_direct_fallback and g_media_proxy_on and !p.avatar_direct and
+            proxyRefusedHost(response.outcome, response.status))
+        {
+            p.avatar_direct = true;
+            p.avatar_state = .idle;
+            return;
+        }
         p.avatar_state = switch (classifyImageFailure(response.outcome, response.status)) {
             .give_up => .failed,
             .retry => blk: {
@@ -11391,6 +11409,17 @@ fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
     return feedImageUrlDirect(buf, src, false);
 }
 
+/// A face's URL, with `direct` skipping the proxy and asking the host itself.
+///
+/// The proxy refuses some hosts by policy rather than by picture: wsrv.nl
+/// answers 400 for a `.pub` domain, which is where Ditto's Blossom server
+/// lives, so those faces never arrive at all without this. The picture is
+/// still resized by us afterwards, the same as a feed image fetched direct.
+fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    if (direct) return src;
+    return mediaUrl(buf, src, avatar_target_px, .square);
+}
+
 /// The same, with `direct` skipping the proxy and asking the host itself.
 ///
 /// The picture is still resized afterwards, by us: `decodeAndRegister` scales
@@ -11402,6 +11431,10 @@ fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
         mediaUrl(buf, src, gif_target_px, .animation)
     else
         mediaUrl(buf, src, media_target_px, .inside);
+}
+
+pub fn avatarUrlForTest(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    return avatarUrl(buf, src, direct);
 }
 
 pub fn feedImageUrlForTest(buf: []u8, src: []const u8) []const u8 {
@@ -12429,6 +12462,9 @@ fn retryFailedImages() void {
         if (p.used and p.avatar_state == .failed) {
             p.avatar_state = .idle;
             p.avatar_attempts = 0;
+            // A new proxy gets to answer for itself, so the face goes back
+            // through it rather than staying pinned to its own host.
+            p.avatar_direct = false;
         }
     }
     for (&g_media) |*m| {
@@ -19170,6 +19206,9 @@ var g_banner_asked_for: ?[32]u8 = null;
 var g_banner_state: enum { idle, fetching, loaded, failed } = .idle;
 var g_banner_url_buf: [1024]u8 = undefined;
 var g_banner_url_len: u16 = 0;
+/// Ask the banner's own host rather than the proxy, for the same reason a face
+/// does. Cleared whenever the banner is started for somebody else.
+var g_banner_direct: bool = false;
 
 fn bannerUrl() []const u8 {
     return g_banner_url_buf[0..g_banner_url_len];
@@ -19204,13 +19243,16 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
         g_banner_for = pubkey;
         g_banner_state = .idle;
         g_banner_url_len = 0;
+        // A different person's banner is a different host, so it goes through
+        // the proxy first like any other.
+        g_banner_direct = false;
     }
     if (g_banner_state != .idle) return;
 
     const raw = personBanner(pubkey);
     if (raw.len == 0) return;
     var url_buf: [1024]u8 = undefined;
-    const url = mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const url = if (g_banner_direct) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
     const n = @min(url.len, g_banner_url_buf.len);
     @memcpy(g_banner_url_buf[0..n], url[0..n]);
     g_banner_url_len = @intCast(n);
@@ -19281,6 +19323,15 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         response.body.len == 0 or response.body.len > max_image_bytes)
     {
         g_banner_down.release();
+        // The proxy refusing the HOST, not the picture. Once, and only while
+        // the proxy is what was used.
+        if (g_media_direct_fallback and g_media_proxy_on and !g_banner_direct and
+            proxyRefusedHost(response.outcome, response.status))
+        {
+            g_banner_direct = true;
+            g_banner_state = .idle;
+            return;
+        }
         g_banner_state = .failed;
         return;
     }

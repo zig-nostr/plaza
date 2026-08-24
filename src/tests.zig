@@ -17379,6 +17379,38 @@ test "the proxy is only bypassed when it refused the host, not the picture" {
     try testing.expect(!main.proxyRefusedHost(.ok, 429));
 }
 
+test "a face whose host the proxy refuses is asked for directly" {
+    // wsrv.nl answers 400 for a .pub domain, which is where Ditto's Blossom
+    // server lives, so these faces never arrived at all: the fallback existed
+    // only on the feed's pictures and the avatar path went straight to giving
+    // up. Same for the banner beside it.
+    const src = "https://blossom.ditto.pub/94582539b065a7a561c3d6ded50c5edec85fccca9882095a4e7c81b05d12fd51.jpeg";
+
+    // Pin the proxy state this asserts about, and put it back: these are
+    // globals and the suite shares them.
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    const saved_on = main.mediaProxyOn();
+    defer {
+        main.setMediaProxy(saved_buf[0..saved_len]);
+        main.setMediaProxyOn(saved_on);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaProxy("https://wsrv.nl/");
+
+    var proxied_buf: [1024]u8 = undefined;
+    const proxied = main.avatarUrlForTest(&proxied_buf, src, false);
+    try testing.expect(std.mem.indexOf(u8, proxied, "wsrv.nl") != null);
+    try testing.expect(!std.mem.eql(u8, proxied, src));
+
+    // Direct is the source itself, untouched: no proxy, no resize parameters.
+    var direct_buf: [1024]u8 = undefined;
+    const direct = main.avatarUrlForTest(&direct_buf, src, true);
+    try testing.expectEqualStrings(src, direct);
+}
+
 test "the proxy toggle decides whether a URL is rewritten at all" {
     const original = "https://blossom.ditto.pub/abc.jpeg";
     var buf: [1024]u8 = undefined;
