@@ -9356,18 +9356,18 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                 "notes_len",        "live_relays",            "offline_relays",   "draft_buffer",
-        "stage",                 "login_buffer",     "logout_pending",         "proxy_buffer",
-        "proxy_saved",           "feed_scroll",      "feed_limit",             "draft",            "draft_empty",
-        "identity",              "has_notes",        "empty",                  "status",           "empty_text",
-        "footer",                "note_list",        "expanded_note",          "composing",        "caught_up",
-        "relay_health",          "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip",
-        "guest_strip_dismissed", "joining",          "pending",                "naming",           "name_buffer",
-        "name_draft",            "name_empty",       "toast_buf",              "toast_len",        "toast_until",
-        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",
-        "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
-        "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
-        "thread_seq",            "thread_open_at",
+        "notes",            "notes_len",              "live_relays",      "offline_relays",   "draft_buffer",
+        "stage",            "login_buffer",           "logout_pending",   "proxy_buffer",     "proxy_saved",
+        "feed_scroll",      "feed_limit",             "draft",            "draft_empty",      "identity",
+        "has_notes",        "empty",                  "status",           "empty_text",       "footer",
+        "note_list",        "expanded_note",          "composing",        "caught_up",        "relay_health",
+        "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip", "guest_strip_dismissed",
+        "joining",          "pending",                "naming",           "name_buffer",      "name_draft",
+        "name_empty",       "toast_buf",              "toast_len",        "toast_until",      "toast_text",
+        "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",     "viewing_thread",
+        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",      "thread_notes",
+        "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",   "thread_seq",
+        "thread_open_at",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
