@@ -10628,6 +10628,85 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     }
 }
 
+test "the join sheet's dialog and card are the same box" {
+    // The hole this closes was invisible in the tree and only in the frames:
+    // both elements were present, correctly nested, and 48pt different in
+    // width. Assert the geometry, not the markup.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    for (modal_cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const p = try painted.Painted.render(arena, &model);
+        const root = modalDialogIndex(p, c.label) orelse return error.NoModalDialog;
+        const card_index = modalCardIndex(p, root) orelse return error.NoModalCard;
+        const dialog = p.layout.nodes[root].widget.frame;
+        const card = p.layout.nodes[card_index].widget.frame;
+        if (@abs(dialog.width - card.width) > 0.5) {
+            std.debug.print(
+                "{s}: the dialog is {d:.0}pt wide around a {d:.0}pt card, so {d:.0}pt of it belongs to neither\n",
+                .{ c.name, dialog.width, card.width, dialog.width - card.width },
+            );
+            return error.DialogWiderThanItsCard;
+        }
+    }
+}
+
+test "the gap between a dialog and its card is not a hole through the modal" {
+    // A dialog wider than the card inside it leaves a band that belongs to
+    // neither: the card absorbs presses, the backdrop dismisses, and the strip
+    // between them did neither. It sits above the backdrop, so a press there
+    // reached the feed underneath and opened whatever it landed on.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    for (modal_cases) |c| {
+        var model = main.initialModel();
+        c.open(&model);
+        const p = try painted.Painted.render(arena, &model);
+
+        const root = modalDialogIndex(p, c.label) orelse return error.NoModalDialog;
+        const card_index = modalCardIndex(p, root) orelse return error.NoModalCard;
+        const dialog = p.layout.nodes[root].widget.frame;
+        const card = p.layout.nodes[card_index].widget.frame;
+
+        // Every band of the dialog the card does not cover, on both sides.
+        const bands = [_]f32{
+            dialog.x + (card.x - dialog.x) / 2,
+            (card.x + card.width) + ((dialog.x + dialog.width) - (card.x + card.width)) / 2,
+        };
+        for (bands) |x| {
+            const inside_dialog = x >= dialog.x and x <= dialog.x + dialog.width;
+            const outside_card = x < card.x or x > card.x + card.width;
+            if (!inside_dialog or !outside_card) continue;
+            const y = card.y + card.height / 2;
+            const msg = try p.pressMsgAt(x, y) orelse {
+                std.debug.print(
+                    "{s}: a press at ({d:.0}, {d:.0}), inside the dialog but outside the card, dispatches NOTHING, so it falls through to whatever is under the modal\n",
+                    .{ c.name, x, y },
+                );
+                return error.HoleThroughTheModal;
+            };
+            const landed = @tagName(msg);
+            const ok = std.mem.eql(u8, landed, @tagName(c.dismiss)) or
+                std.mem.eql(u8, landed, "absorb_press");
+            if (!ok) {
+                std.debug.print("{s}: a press in the dialog's own margin dispatched {s}\n", .{ c.name, landed });
+                return error.HoleThroughTheModal;
+            }
+        }
+    }
+}
+
 test "a card that absorbs presses states its own surface" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
