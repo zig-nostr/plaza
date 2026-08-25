@@ -3320,6 +3320,11 @@ const compose_sheet_width: f32 = 560;
 /// widths on purpose: the sheet holds three choices and has to lay them out as
 /// cards; the name card holds one field and one question, and a card that wide
 /// around a single input reads as a form.
+/// The requester's key in the approval card: 64 hex characters that have to fit
+/// one line inside a 440pt card, because a key broken across a line break is a
+/// key nobody checks.
+const bunker_key_scale: f32 = 10.0 / 14.5;
+
 /// The join sheet's one width, for the dialog AND for every card inside it.
 ///
 /// They used to differ (a 420 dialog around a 372 card) and the 48pt band
@@ -15259,41 +15264,51 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
             .width = settings_column_width,
             .semantics = .{ .label = "An app wants to sign as you" },
         }, .{
-            settingsCard(ui, .{
-                ui.column(.{ .gap = 0, .grow = 1 }, .{
-                    ui.paragraph(
-                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body_strong } },
-                        &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
-                    ),
-                    vgap(ui, 7),
-                    ui.paragraph(
-                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                        &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
-                    ),
-                    vgap(ui, 7),
-                    ui.paragraph(
-                        .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                        &.{.{
-                            .text = if (bunkerAskIsConnect())
-                                "Letting it in does not let it sign yet: it is asked again the first time it wants to. If it already gave up waiting, approve anyway and connect again from the app, because this is remembered."
-                            else
-                                "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
-                            .scale = mono_hint_scale,
-                        }},
-                    ),
-                    vgap(ui, 12),
-                    // Four answers rather than two. Amber's shape: "not now",
-                    // "for a while" and "stop asking" all reachable in one
-                    // press, because a prompt with only yes and no is one
-                    // people learn to hit yes on.
-                    ui.row(.{ .gap = 8, .cross = .center }, .{
-                        ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
-                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
-                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
-                        ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
-                    }),
+            // `modalCard`, not `settingsCard`. The settings card wraps its
+            // children in a column of its own that grows, and this content
+            // wraps: three paragraphs each asking to grow inside a column that
+            // also grew made them compete for a height none of them could have,
+            // and they were painted over each other. The requester's key
+            // printed through the sentence under it and the four answers
+            // printed through that.
+            //
+            // Nothing here grows. Each paragraph is as tall as its own wrapped
+            // text, and the card is as tall as the lot.
+            modalCard(ui, settings_column_width, ui.column(.{ .gap = 8 }, .{
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
+                    &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
+                ),
+                // 64 hex characters, at a size that fits them on one line. At
+                // the usual hint scale the last character wrapped alone onto a
+                // second line, which reads as a rendering fault on the one
+                // string in this card that has to be read carefully.
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                    &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = bunker_key_scale }},
+                ),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+                    &.{.{
+                        .text = if (bunkerAskIsConnect())
+                            "Approving does not let it sign yet: it is asked again the first time it wants to, and this answer is remembered."
+                        else
+                            "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
+                        .scale = mono_hint_scale,
+                    }},
+                ),
+                vgap(ui, 4),
+                // Four answers rather than two. Amber's shape: "not now",
+                // "for a while" and "stop asking" all reachable in one press,
+                // because a prompt with only yes and no is one people learn to
+                // hit yes on.
+                ui.row(.{ .gap = 8, .cross = .center }, .{
+                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
+                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
+                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
+                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
                 }),
-            }),
+            })),
         }),
     });
 }
@@ -31262,6 +31277,17 @@ pub fn bunkerClientCount() usize {
 /// who you follow" are the same sentence to a signer and very different things
 /// to a person. Only the kinds worth naming are named; the rest are honest about
 /// being a number nobody can read at a glance.
+/// Puts a waiting client on the approval card, for tests and for driving the
+/// card in a running app without a second client to hand.
+pub fn setBunkerPendingForTest(client: []const u8) void {
+    const n = @min(client.len, g_bunker_pending_client.len);
+    @memcpy(g_bunker_pending_client[0..n], client[0..n]);
+    g_bunker_pending_len = n;
+    g_bunker_pending_id = 1;
+    g_bunker_pending_ask_len = 0;
+    g_bunker_pending_kind = -1;
+}
+
 pub fn bunkerAskLine(arena: std.mem.Allocator) []const u8 {
     const ask = g_bunker_pending_ask[0..g_bunker_pending_ask_len];
     if (ask.len == 0) return "wants to sign as you";
