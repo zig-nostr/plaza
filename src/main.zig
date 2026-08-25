@@ -15524,26 +15524,49 @@ fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
     }, .{inner});
 }
 
+fn joinHeading(ui: *AppUi) AppUi.Node {
+    return ui.paragraph(
+        .{ .style = .{ .foreground = theme.palette.text_primary } },
+        &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
+    );
+}
+
+fn joinSubheading(ui: *AppUi) AppUi.Node {
+    return ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = theme.palette.text_muted } },
+        &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
+    );
+}
+
 /// The join ladder: three ways in, most confident first, always the way back.
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    // Padding and gaps, not hand-placed spacers. The sheet used to inset itself
-    // with a vgap/hgap frame around a gap:0 column, which meant every space in
-    // it was a separate number nobody could see next to its neighbours: 16, 6,
-    // 13, 6, 7, 13, 8, 13, 16. The rhythm below is padding 20, 8 between a
-    // label and what it labels, and 16 between groups.
-    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 16, .padding = 20 }, .{
-        ui.column(.{ .gap = 6 }, .{
-            if (model.pending.waiting()) intentPill(ui, model) else ui.spacer(0),
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
-            ),
-            ui.paragraph(
-                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
-            ),
-        }),
+    // Gaps, not hand-placed spacers, and the card's own padding rather than a
+    // second one inside it. The sheet used to inset itself with a vgap/hgap
+    // frame around a gap:0 column, so every space in it was a separate number
+    // nobody could see next to its neighbours: 16, 6, 13, 6, 7, 13, 8, 13, 16.
+    //
+    // It then had `.padding = 20` on top of the `.card`'s own 24, which is a
+    // 44pt inset on a 420pt sheet, and `.grow = 1` stretched the column past
+    // what its children needed so the last row overflowed 18pt into the bottom
+    // padding: 50pt of air above the title and 26 below the way out. The card
+    // pads itself; this column only says how far apart its groups sit.
+    return modalCard(ui, join_sheet_width, ui.column(.{ .gap = 16 }, .{
+        // Two shapes rather than one with a `spacer(0)` in it. A zero-size
+        // child is still a child, so the gap above it was paid whether or not
+        // there was a pill to separate: 6pt of air on top of the card's own
+        // padding, which is why the title sat lower than the rungs sat left.
+        if (model.pending.waiting())
+            ui.column(.{ .gap = 6 }, .{
+                intentPill(ui, model),
+                joinHeading(ui),
+                joinSubheading(ui),
+            })
+        else
+            ui.column(.{ .gap = 6 }, .{
+                joinHeading(ui),
+                joinSubheading(ui),
+            }),
         ui.column(.{ .gap = 8 }, .{
             joinLabel(ui, "NEW HERE"),
             // Making a key means the keyholder daemon making it, so with no
@@ -15600,6 +15623,11 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
             ui.spacer(1),
         }),
+        // The way out is a list item, which carries its own slack for the press
+        // target, and that slack is not padding: it left the underline sitting
+        // 6pt off the card's edge while every other side had 24. This is the
+        // difference, measured from a screenshot rather than guessed.
+        vgap(ui, 2),
     }));
 }
 
@@ -15607,7 +15635,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// this is one field, not the whole ladder again. Paste the link, connect.
 fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
+    return modalCard(ui, join_sheet_width, ui.column(.{ .gap = 12 }, .{
         ui.row(.{ .cross = .center, .gap = 6 }, .{
             backControl(ui, "Back", .close_bunker),
             ui.paragraph(
@@ -15626,6 +15654,10 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
         }, .{}),
         ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, model.login_status()),
         ui.button(.{ .variant = .primary, .disabled = model.login_empty(), .on_press = .login_submit }, "Connect"),
+        // Same as the ladder's way out: a button's own press slack is not
+        // padding, so without this the Connect button sits 7pt off the card's
+        // edge against 24 on the other three sides.
+        vgap(ui, 5),
     }));
 }
 
