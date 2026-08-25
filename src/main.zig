@@ -3320,13 +3320,19 @@ const compose_sheet_width: f32 = 560;
 /// widths on purpose: the sheet holds three choices and has to lay them out as
 /// cards; the name card holds one field and one question, and a card that wide
 /// around a single input reads as a form.
-const join_sheet_width: f32 = 372;
+/// The join sheet's one width, for the dialog AND for every card inside it.
+///
+/// They used to differ (a 420 dialog around a 372 card) and the 48pt band
+/// between them belonged to neither: the card absorbs presses and the backdrop
+/// dismisses, so a press in the band dispatched nothing and reached the feed
+/// underneath, which opened whatever it landed on. A dialog wider than its card
+/// is a hole through the modal, so there is one number now.
+const join_sheet_width: f32 = 420;
 const name_card_width: f32 = 340;
 /// The two other modal card widths, named because a `.dialog` now needs its
 /// width stated: the SDK centres a modal at its preferred size and falls back to
 /// a 420pt default, which silently clamped the profile card's 400 + 16 padding.
 const profile_edit_card_width: f32 = 400;
-const join_card_width: f32 = 420;
 const join_title_scale: f32 = 17.0 / 14.5;
 const join_sub_scale: f32 = 11.5 / 14.5;
 const join_label_scale: f32 = 9.0 / 14.5;
@@ -15294,7 +15300,7 @@ fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
 
 fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     return modalScrim(ui, "Join", .close_join, ui.el(.dialog, .{
-        .width = join_card_width,
+        .width = join_sheet_width,
         .on_dismiss = .close_join,
         .semantics = .{ .label = "Join" },
     }, .{
@@ -15521,93 +15527,79 @@ fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
 /// The join ladder: three ways in, most confident first, always the way back.
 fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 0 }, .{
-        vgap(ui, 16),
-        ui.row(.{ .gap = 0 }, .{
-            hgap(ui, 16),
-            ui.column(.{ .grow = 1, .gap = 0 }, .{
-                if (model.pending.waiting()) intentPill(ui, model) else ui.spacer(0),
-                if (model.pending.waiting()) vgap(ui, 11) else ui.spacer(0),
-                ui.paragraph(
-                    .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
-                ),
-                vgap(ui, 6),
+    // Padding and gaps, not hand-placed spacers. The sheet used to inset itself
+    // with a vgap/hgap frame around a gap:0 column, which meant every space in
+    // it was a separate number nobody could see next to its neighbours: 16, 6,
+    // 13, 6, 7, 13, 8, 13, 16. The rhythm below is padding 20, 8 between a
+    // label and what it labels, and 16 between groups.
+    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 16, .padding = 20 }, .{
+        ui.column(.{ .gap = 6 }, .{
+            if (model.pending.waiting()) intentPill(ui, model) else ui.spacer(0),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = "How do you want to join?", .weight = .bold, .scale = join_title_scale }},
+            ),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
+            ),
+        }),
+        ui.column(.{ .gap = 8 }, .{
+            joinLabel(ui, "NEW HERE"),
+            // Making a key means the keyholder daemon making it, so with no
+            // keyholder installed there is no route to a new identity at all:
+            // this rung is not degraded, it is impossible. Say that, and say
+            // what fixes it, rather than leaving the app's primary call to
+            // action sitting there swallowing presses.
+            //
+            // The WHY goes under the card, not in it. A rung's subtitle is one
+            // line: the row that holds it centres a column it has already been
+            // sized against, so a subtitle that wraps to three lines runs past
+            // the card's own bottom edge and paints the last line half outside
+            // it. The tree cannot see that and every structural assertion
+            // passed over it. Only the frames say so. Down here it is a plain
+            // flow child, where wrapping is bounded and behaves.
+            if (keyholderMissing())
+                joinCard(ui, "plus", false, "Create your identity", "Not possible in this copy of Plaza.", null, false)
+            else
+                joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
+            if (keyholderMissing())
                 ui.paragraph(
                     .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                    &.{.{ .text = "Everything here is signed with a key of your own, not an account someone holds for you.", .scale = join_sub_scale }},
-                ),
-                vgap(ui, 13),
-                joinLabel(ui, "NEW HERE"),
-                vgap(ui, 6),
-                // Making a key means the keyholder daemon making it, so with no
-                // keyholder installed there is no route to a new identity at
-                // all: this rung is not degraded, it is impossible. Say that,
-                // and say what fixes it, rather than leaving the app's primary
-                // call to action sitting there swallowing presses.
-                //
-                // The WHY goes under the card, not in it. A rung's subtitle is
-                // one line: the row that holds it centres a column it has
-                // already been sized against, so a subtitle that wraps to three
-                // lines runs 7px past the card's own bottom edge and paints the
-                // last line half outside it. The tree cannot see that (the
-                // string is all there, in one node, correctly nested) and every
-                // structural assertion passed over it. Only the frames say so,
-                // which is what "the ladder's rungs hold their own copy" now
-                // asserts. Down here it is a plain flow child of the sheet's
-                // column, where wrapping is bounded and behaves.
-                if (keyholderMissing())
-                    joinCard(ui, "plus", false, "Create your identity", "Not possible in this copy of Plaza.", null, false)
-                else
-                    joinCard(ui, "plus", false, "Create your identity", "Ready in seconds. Nothing to write down.", .join_create, true),
-                if (keyholderMissing()) vgap(ui, 7) else ui.spacer(0),
-                if (keyholderMissing())
-                    ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-                        &.{.{ .text = "Notary, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
-                    )
-                else
-                    ui.spacer(0),
-                vgap(ui, 13),
-                joinLabel(ui, "ALREADY ON NOSTR"),
-                vgap(ui, 6),
-                // Bringing a key still works with no keyholder: the paste lands
-                // in this process instead (see `.open_notary_import`). It is a
-                // weaker promise than the one this line normally makes, so the
-                // line changes with it. Selling Notary's isolation and then
-                // taking the nsec into a Plaza text field would be the copy
-                // lying about where the key went.
-                if (keyholderMissing())
-                    joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_notary_import, false)
-                else
-                    joinCard(ui, "download", false, "Bring your key", "Goes into Notary. Plaza itself never sees it.", .open_notary_import, false),
-                vgap(ui, 8),
-                joinCard(ui, "notary", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
-                vgap(ui, 13),
-                ui.row(.{ .cross = .center, .gap = 0 }, .{
-                    ui.el(.list_item, .{
-                        .padding = 0.01,
-                        .on_press = Msg.close_join,
-                        .style = .{ .quiet_hover = true },
-                        .autofocus = true,
-                        .semantics = .{ .role = .button, .label = "Keep browsing", .focusable = true },
-                    }, .{
-                        ui.paragraph(
-                            .{ .style = .{ .foreground = p.text_secondary } },
-                            &.{.{ .text = "Keep browsing", .weight = .medium, .underline = true, .scale = menu_scale }},
-                        ),
-                    }),
-                    hgap(ui, 10),
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = p.text_dim } },
-                        &.{.{ .text = "reading never needs an identity", .monospace = true, .scale = mono_chip_scale }},
-                    ),
-                    ui.spacer(1),
-                }),
-            }),
-            hgap(ui, 16),
+                    &.{.{ .text = "Notary, the part of Plaza that holds your key, is missing from this install, so Plaza cannot make one. Reinstalling Plaza fixes it.", .scale = join_card_sub_scale }},
+                )
+            else
+                ui.spacer(0),
         }),
-        vgap(ui, 13),
+        ui.column(.{ .gap = 8 }, .{
+            joinLabel(ui, "ALREADY ON NOSTR"),
+            // Bringing a key still works with no keyholder: the paste lands in
+            // this process instead (see `.open_notary_import`). It is a weaker
+            // promise than the one this line normally makes, so the line
+            // changes with it. Selling Notary's isolation and then taking the
+            // nsec into a Plaza text field would be the copy lying about where
+            // the key went.
+            if (keyholderMissing())
+                joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_notary_import, false)
+            else
+                joinCard(ui, "download", false, "Bring your key", "Goes into Notary. Plaza itself never sees it.", .open_notary_import, false),
+            joinCard(ui, "notary", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+        }),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.el(.list_item, .{
+                .padding = 0.01,
+                .on_press = Msg.close_join,
+                .style = .{ .quiet_hover = true },
+                .autofocus = true,
+                .semantics = .{ .role = .button, .label = "Keep browsing", .focusable = true },
+            }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_secondary } },
+                    &.{.{ .text = "Keep browsing", .weight = .medium, .underline = true, .scale = menu_scale }},
+                ),
+            }),
+            ui.spacer(1),
+        }),
     }));
 }
 
@@ -15615,7 +15607,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
 /// this is one field, not the whole ladder again. Paste the link, connect.
 fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalCard(ui, 372, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
+    return modalCard(ui, join_sheet_width, ui.column(.{ .grow = 1, .gap = 12, .padding = 20 }, .{
         ui.row(.{ .cross = .center, .gap = 6 }, .{
             backControl(ui, "Back", .close_bunker),
             ui.paragraph(
