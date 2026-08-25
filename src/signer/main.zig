@@ -600,6 +600,8 @@ fn handleConn(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream) !void {
         return handleCipher(gpa, io, w, body, .encrypt);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, ipc.path_nip44_decrypt)) {
         return handleCipher(gpa, io, w, body, .decrypt);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/export")) {
+        return handleExport(gpa, io, w, body);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/reset")) {
         g_state.reset(io);
         // The signer goes with the key it was signing for. Leaving the secret
@@ -630,6 +632,45 @@ fn handlePubkey(gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
     };
     const json = body.toJson(gpa) catch return respond(w, 500, "out of memory");
     defer gpa.free(json);
+    return respondJson(w, 200, json);
+}
+
+/// Hand the key back to the person who owns it.
+///
+/// A nostr key cannot be replaced, so a key that cannot leave this Mac is an
+/// identity that dies with it. Plaza tells people the key is theirs; this is
+/// what makes that true.
+///
+/// Unlike Notary there is no passphrase to check against: this key lives in the
+/// login Keychain, which is what stands between it and anybody else. So the
+/// passphrase here is one the reader chooses AT EXPORT, to encrypt the backup
+/// with. Given one, the answer is a NIP-49 `ncryptsec1…` that is safe to keep.
+/// Given none, it is the `nsec1…` itself, which is not.
+fn handleExport(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Req = struct { passphrase: []const u8 = "" };
+    var parsed = ipc.parse(Req, gpa, body) catch return respondErr(gpa, w, 400, "malformed export");
+    defer parsed.deinit();
+
+    var secret = g_state.take() orelse return respondErr(gpa, w, 409, "no key");
+    defer std.crypto.secureZero(u8, &secret);
+
+    const pass = parsed.value.passphrase;
+    const key = if (pass.len == 0)
+        nostr.nip19.encodeNsec(gpa, secret) catch return respond(w, 500, "out of memory")
+    else
+        // `known_insecure` is the honest flag: this copy is about to be read off
+        // a screen and put on a clipboard, which is exactly what that value in
+        // NIP-49 is for. Claiming otherwise in the backup itself would be a lie
+        // told to whatever reads it next.
+        keystore.encryptKey(gpa, io, secret, pass, .known_insecure) catch return respond(w, 500, "could not encrypt");
+    defer {
+        std.crypto.secureZero(u8, key);
+        gpa.free(key);
+    }
+
+    var out: [512]u8 = undefined;
+    const json = std.fmt.bufPrint(&out, "{{\"key\":\"{s}\"}}", .{key}) catch
+        return respond(w, 500, "out of memory");
     return respondJson(w, 200, json);
 }
 

@@ -3093,6 +3093,7 @@ else
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nsec_key: u64 = 101;
+const export_nsec_key: u64 = 102;
 const copy_nevent_key: u64 = 103;
 const copy_bunker_key: u64 = 104;
 const copy_note_text_key: u64 = 104;
@@ -9194,6 +9195,11 @@ pub const Model = struct {
     // local secret key is revealed for backup.
     logout_pending: bool = false,
     reveal_nsec: bool = false,
+    /// The secret key as the keyholder handed it back, held only while the
+    /// reader is looking at it. Empty when the key is still in this process, in
+    /// which case it is read straight off `g_identity_kp` instead.
+    exported_nsec_buf: [128]u8 = [_]u8{0} ** 128,
+    exported_nsec_len: usize = 0,
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
@@ -9507,7 +9513,9 @@ pub const Model = struct {
     /// Whether the identity is a local key (so its secret can be backed up here).
     pub fn is_local_key(self: *const Model) bool {
         _ = self;
-        return g_signer_kind == .local;
+        // Local OR keyholder: both are keys this Mac holds and can hand back.
+        // A remote bunker's key is somebody else's to export.
+        return g_signer_kind == .local or g_signer_kind == .helper;
     }
     /// Whether the local secret key is hidden (the reveal toggle's off state).
     pub fn nsec_hidden(self: *const Model) bool {
@@ -9519,9 +9527,19 @@ pub const Model = struct {
     }
     /// The revealed nsec (bech32 secret key), or empty when hidden or not local.
     pub fn revealed_nsec(self: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!self.reveal_nsec or g_signer_kind != .local) return "";
+        if (!self.reveal_nsec) return "";
+        // A key this Mac holds is either still in this process or has been
+        // moved into the keyholder. The second is the normal case since the
+        // upgrade, and it is what left this whole panel showing nothing: the
+        // reveal read a keypair that had been cleared, so a key created in
+        // Plaza could not be backed up at all.
+        if (self.exported_nsec_len > 0) return self.exported_nsec_buf[0..self.exported_nsec_len];
         const kp = g_identity_kp orelse return "";
         return nostr.nip19.encodeNsec(arena, kp.secret_key) catch "";
+    }
+    /// Whether the key is waiting on the keyholder to hand it back.
+    pub fn nsec_loading(self: *const Model) bool {
+        return self.reveal_nsec and self.exported_nsec_len == 0 and g_identity_kp == null;
     }
     /// Whether the logout confirmation is not yet showing.
     pub fn logout_idle(self: *const Model) bool {
@@ -13552,6 +13570,7 @@ pub const Msg = union(enum) {
     close_settings,
     /// Reveal (or hide) the local secret key for backup.
     toggle_nsec,
+    nsec_exported: native_sdk.EffectResponse,
     /// Copy the signed-in npub to the clipboard.
     copy_npub,
     /// Copy the local secret key (nsec) to the clipboard.
@@ -13900,7 +13919,11 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.column(.{ .gap = 0 }, .{
                     ui.paragraph(
                         .{ .wrap = true, .style = .{ .foreground = p.text_sheet_title } },
-                        &.{.{ .text = model.revealed_nsec(ui.arena), .monospace = true, .scale = mono_row_scale }},
+                        &.{.{
+                            .text = if (model.nsec_loading()) "Asking the keyholder…" else model.revealed_nsec(ui.arena),
+                            .monospace = true,
+                            .scale = mono_row_scale,
+                        }},
                     ),
                     vgap(ui, 9),
                     ui.row(.{ .cross = .center, .gap = 8 }, .{
@@ -25584,7 +25607,32 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.reveal_nsec = false;
             model.stage = .ready;
         },
-        .toggle_nsec => model.reveal_nsec = !model.reveal_nsec,
+        .toggle_nsec => {
+            model.reveal_nsec = !model.reveal_nsec;
+            if (!model.reveal_nsec) {
+                // Hidden means gone, not merely covered up. A key sitting in a
+                // window nobody is looking at is what the keyholder exists to
+                // prevent.
+                std.crypto.secureZero(u8, &model.exported_nsec_buf);
+                model.exported_nsec_len = 0;
+                return;
+            }
+            // The key left this process when it moved into the keyholder, so
+            // showing it means asking for it back.
+            if (g_signer_kind == .helper and model.exported_nsec_len == 0) {
+                helperFetch(fx, export_nsec_key, "/export", "{}", Effects.responseMsg(.nsec_exported));
+            }
+        },
+        .nsec_exported => |response| {
+            if (response.outcome != .ok or response.status != 200) return;
+            var scratch: [512]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const R = struct { key: []const u8 = "" };
+            const parsed = std.json.parseFromSliceLeaky(R, fba.allocator(), response.body, .{ .ignore_unknown_fields = true }) catch return;
+            const n = @min(parsed.key.len, model.exported_nsec_buf.len);
+            @memcpy(model.exported_nsec_buf[0..n], parsed.key[0..n]);
+            model.exported_nsec_len = n;
+        },
         .copy_npub => {
             const pk = activePubkey() orelse return;
             var scratch: [1024]u8 = undefined;
@@ -25593,7 +25641,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.writeClipboard(.{ .key = copy_npub_key, .text = npub });
         },
         .copy_nsec => {
-            if (g_signer_kind != .local) return;
+            // Whichever copy is in hand: the one the keyholder handed back, or
+            // the in-process keypair when the key has not moved yet.
+            if (model.exported_nsec_len > 0) {
+                fx.writeClipboard(.{ .key = copy_nsec_key, .text = model.exported_nsec_buf[0..model.exported_nsec_len] });
+                return;
+            }
             const kp = g_identity_kp orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
