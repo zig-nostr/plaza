@@ -3092,7 +3092,6 @@ else
 // Effect keys for the two Settings clipboard copies (npub, nsec). Clipboard
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
-const copy_nsec_key: u64 = 101;
 const copy_nevent_key: u64 = 103;
 const copy_bunker_key: u64 = 104;
 const copy_note_text_key: u64 = 104;
@@ -9193,7 +9192,6 @@ pub const Model = struct {
     // Settings: whether the "log out" confirmation is showing, and whether the
     // local secret key is revealed for backup.
     logout_pending: bool = false,
-    reveal_nsec: bool = false,
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
@@ -9358,18 +9356,18 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                 "notes_len",        "live_relays",            "offline_relays",   "draft_buffer",
-        "stage",                 "login_buffer",     "logout_pending",         "reveal_nsec",      "proxy_buffer",
-        "proxy_saved",           "feed_scroll",      "feed_limit",             "draft",            "draft_empty",
-        "identity",              "has_notes",        "empty",                  "status",           "empty_text",
-        "footer",                "note_list",        "expanded_note",          "composing",        "caught_up",
-        "relay_health",          "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip",
-        "guest_strip_dismissed", "joining",          "pending",                "naming",           "name_buffer",
-        "name_draft",            "name_empty",       "toast_buf",              "toast_len",        "toast_until",
-        "toast_text",            "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",
-        "viewing_thread",        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",
-        "thread_notes",          "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",
-        "thread_seq",            "thread_open_at",
+        "notes",            "notes_len",              "live_relays",      "offline_relays",   "draft_buffer",
+        "stage",            "login_buffer",           "logout_pending",   "proxy_buffer",     "proxy_saved",
+        "feed_scroll",      "feed_limit",             "draft",            "draft_empty",      "identity",
+        "has_notes",        "empty",                  "status",           "empty_text",       "footer",
+        "note_list",        "expanded_note",          "composing",        "caught_up",        "relay_health",
+        "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip", "guest_strip_dismissed",
+        "joining",          "pending",                "naming",           "name_buffer",      "name_draft",
+        "name_empty",       "toast_buf",              "toast_len",        "toast_until",      "toast_text",
+        "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",     "viewing_thread",
+        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",      "thread_notes",
+        "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",   "thread_seq",
+        "thread_open_at",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -9503,25 +9501,6 @@ pub const Model = struct {
             .remote => "Remote signer",
             .helper => "Notary",
         };
-    }
-    /// Whether the identity is a local key (so its secret can be backed up here).
-    pub fn is_local_key(self: *const Model) bool {
-        _ = self;
-        return g_signer_kind == .local;
-    }
-    /// Whether the local secret key is hidden (the reveal toggle's off state).
-    pub fn nsec_hidden(self: *const Model) bool {
-        return !self.reveal_nsec;
-    }
-    /// Whether the secret key is currently revealed.
-    pub fn nsec_shown(self: *const Model) bool {
-        return self.reveal_nsec;
-    }
-    /// The revealed nsec (bech32 secret key), or empty when hidden or not local.
-    pub fn revealed_nsec(self: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!self.reveal_nsec or g_signer_kind != .local) return "";
-        const kp = g_identity_kp orelse return "";
-        return nostr.nip19.encodeNsec(arena, kp.secret_key) catch "";
     }
     /// Whether the logout confirmation is not yet showing.
     pub fn logout_idle(self: *const Model) bool {
@@ -13551,11 +13530,9 @@ pub const Msg = union(enum) {
     /// Return from Settings to the feed.
     close_settings,
     /// Reveal (or hide) the local secret key for backup.
-    toggle_nsec,
     /// Copy the signed-in npub to the clipboard.
     copy_npub,
     /// Copy the local secret key (nsec) to the clipboard.
-    copy_nsec,
     /// Ask to log out: show the confirmation.
     logout_request,
     /// Dismiss the logout confirmation.
@@ -13880,38 +13857,15 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     n += 1;
 
-    // The backup card has no home in the design, and dropping it would drop the
-    // only way off this machine with the key that IS the account. It lives under
-    // the signer line, which is exactly the row it qualifies.
-    if (model.is_local_key()) {
-        rows[n] = ui.column(.{ .gap = 0 }, .{
-            cardDivider(ui),
-            ui.paragraph(
-                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                &.{.{ .text = "This key lives only on this Mac. Back it up so losing the Mac is not losing the account. Plaza never sends it anywhere.", .scale = mono_hint_scale }},
-            ),
-            vgap(ui, 9),
-            if (model.nsec_hidden())
-                ui.row(.{ .cross = .center, .gap = 0 }, .{
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Reveal secret key"),
-                    ui.spacer(1),
-                })
-            else
-                ui.column(.{ .gap = 0 }, .{
-                    ui.paragraph(
-                        .{ .wrap = true, .style = .{ .foreground = p.text_sheet_title } },
-                        &.{.{ .text = model.revealed_nsec(ui.arena), .monospace = true, .scale = mono_row_scale }},
-                    ),
-                    vgap(ui, 9),
-                    ui.row(.{ .cross = .center, .gap = 8 }, .{
-                        ui.button(.{ .size = .sm, .on_press = Msg.copy_nsec }, "Copy nsec"),
-                        ui.spacer(1),
-                        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.toggle_nsec }, "Hide"),
-                    }),
-                }),
-        });
-        n += 1;
-    }
+    // The backup used to be here, and could not work: a key minted in Plaza is
+    // moved into the keyholder in the background, which clears the in-process
+    // copy, so this panel vanished the moment it became relevant and its reveal
+    // read a keypair that was gone.
+    //
+    // It lives in the signer's own window now, which is the process that holds
+    // the key. Plaza asking for a key to show would be Plaza holding one, and
+    // "the key never enters the client" is the sentence this whole arrangement
+    // exists to keep true. The row above is what opens that window.
 
     return settingsSection(ui, "IDENTITY", "", settingsCard(ui, .{rows[0..n]}));
 }
@@ -25581,24 +25535,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_settings => {
             model.logout_pending = false;
-            model.reveal_nsec = false;
             model.stage = .ready;
         },
-        .toggle_nsec => model.reveal_nsec = !model.reveal_nsec,
         .copy_npub => {
             const pk = activePubkey() orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
             const npub = nostr.nip19.encodeNpub(fba.allocator(), pk) catch return;
             fx.writeClipboard(.{ .key = copy_npub_key, .text = npub });
-        },
-        .copy_nsec => {
-            if (g_signer_kind != .local) return;
-            const kp = g_identity_kp orelse return;
-            var scratch: [1024]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const nsec = nostr.nip19.encodeNsec(fba.allocator(), kp.secret_key) catch return;
-            fx.writeClipboard(.{ .key = copy_nsec_key, .text = nsec });
         },
         .logout_request => model.logout_pending = true,
         .logout_cancel => model.logout_pending = false,
@@ -30293,7 +30237,6 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // out over the next account's relays, counted in their status bar as
     // something the app owed THEM.
     model.logout_pending = false;
-    model.reveal_nsec = false;
     model.notes_len = 0;
     // Never a locked door: signing out lands on the guest feed, reading
     // uninterrupted (the pool and store keep running), not a welcome wall.

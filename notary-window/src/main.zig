@@ -31,6 +31,8 @@ const create_key: u64 = 3;
 const status_key: u64 = 4;
 const bunker_key: u64 = 5;
 const copy_bunker_key: u64 = 6;
+const export_key: u64 = 7;
+const copy_backup_key: u64 = 8;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
 
 // 452 wide per the design, and one height for every state rather than a window
@@ -111,7 +113,16 @@ const Model = struct {
     /// this window then says nothing about it rather than showing a dead link.
     bunker_url_buf: [512]u8 = undefined,
     bunker_len: usize = 0,
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub", "bunker_url_buf", "bunker_len" };
+    /// The key as the daemon handed it back, held only while it is on screen.
+    /// This window is where a key may be shown, because it is the process that
+    /// already holds one; Plaza is the one that must never see it.
+    backup_buf: [256]u8 = undefined,
+    backup_len: usize = 0,
+    backup_is_secret: bool = false,
+    backup_pass: canvas.TextBuffer(128) = .{},
+    backup_open: bool = false,
+    backup_copied: bool = false,
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub", "bunker_url_buf", "bunker_len", "backup_buf", "backup_len", "backup_pass", "backup_open", "backup_copied", "backup_is_secret" };
 
     /// Reads the daemon's bunker state. Only the URL is wanted here: approving
     /// clients and disconnecting them belong on Plaza's own settings screen,
@@ -199,9 +210,16 @@ const Msg = union(enum) {
     status_done: native_sdk.EffectResponse,
     bunker_done: native_sdk.EffectResponse,
     copy_bunker,
+    open_backup,
+    close_backup,
+    backup_pass_edit: canvas.TextInputEvent,
+    export_encrypted,
+    export_secret,
+    export_done: native_sdk.EffectResponse,
+    copy_backup,
     close,
 
-    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "copy_bunker", "close" };
+    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "copy_bunker", "open_backup", "close_backup", "backup_pass_edit", "export_encrypted", "export_secret", "copy_backup", "close" };
 };
 
 pub const AppUi = canvas.Ui(Msg);
@@ -311,6 +329,38 @@ fn requestCreate(model: *Model, fx: *Effects) void {
 /// Fired alongside the status request rather than on a timer: this window is
 /// opened, read and closed, so one look when it opens is the whole of what it
 /// needs. Plaza's settings screen is the live view.
+/// Asks the daemon for the key, in whichever form was pressed.
+///
+/// This request exists in THIS window and not in Plaza. The key is allowed to
+/// be here: this is the process that holds it, and showing it is the one thing
+/// a signer can do that a client must not. Plaza asking would put a key in the
+/// client, which is the sentence the whole arrangement is built to keep true.
+fn requestExport(model: *Model, fx: *Effects, secret: bool) void {
+    if (g_token_len == 0) return;
+    model.backup_is_secret = secret;
+    model.backup_copied = false;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/export", .{daemon_port}) catch return;
+    var auth_buf: [160]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token()}) catch return;
+    var body_buf: [256]u8 = undefined;
+    const Body = struct { passphrase: []const u8 };
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{
+        .passphrase = if (secret) "" else model.backup_pass.text(),
+    }, .{})}) catch return;
+    fx.fetch(.{
+        .key = export_key,
+        .url = url,
+        .method = .POST,
+        .headers = &.{
+            .{ .name = "Authorization", .value = auth },
+            .{ .name = "content-type", .value = "application/json" },
+        },
+        .body = body,
+        .on_response = Effects.responseMsg(.export_done),
+    });
+}
+
 fn requestBunker(model: *Model, fx: *Effects) void {
     _ = model;
     if (g_token_len == 0) return;
@@ -375,6 +425,36 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .pass_edit => |e| model.pass_buffer.apply(e),
         .copy_command => fx.writeClipboard(.{ .key = copy_key, .text = import_command }),
+        .open_backup => model.backup_open = true,
+        .close_backup => {
+            // Closing takes the key with it. A key left on screen behind a
+            // window nobody is looking at is the thing this process exists to
+            // prevent.
+            model.backup_open = false;
+            std.crypto.secureZero(u8, &model.backup_buf);
+            model.backup_len = 0;
+            model.backup_pass.set("");
+            model.backup_copied = false;
+        },
+        .backup_pass_edit => |e| model.backup_pass.apply(e),
+        .export_encrypted => requestExport(model, fx, false),
+        .export_secret => requestExport(model, fx, true),
+        .export_done => |response| {
+            if (response.outcome != .ok or response.status != 200) return;
+            var scratch: [640]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const R = struct { key: []const u8 = "" };
+            const parsed = std.json.parseFromSliceLeaky(R, fba.allocator(), response.body, .{ .ignore_unknown_fields = true }) catch return;
+            const n = @min(parsed.key.len, model.backup_buf.len);
+            @memcpy(model.backup_buf[0..n], parsed.key[0..n]);
+            model.backup_len = n;
+            model.backup_pass.set("");
+        },
+        .copy_backup => {
+            if (model.backup_len == 0) return;
+            model.backup_copied = true;
+            fx.writeClipboard(.{ .key = copy_backup_key, .text = model.backup_buf[0..model.backup_len] });
+        },
         .copy_bunker => {
             if (model.bunker_len == 0) return;
             fx.writeClipboard(.{ .key = copy_bunker_key, .text = model.bunker_url_buf[0..model.bunker_len] });
@@ -759,15 +839,125 @@ fn madeView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// What Notary holds, for a reader who came to look rather than to do anything.
 /// The same shape as a finished ceremony, because it is the same fact: this
 /// process has the key, and here is whose it is.
+/// The screen this window sits on once a key exists.
+///
+/// Not `resultView`. That one centres everything, which suits a ceremony that
+/// just happened and does not suit a screen somebody reads: a heading, an npub,
+/// a link and a backup panel centred one under another is a column of unrelated
+/// middles with no edge to follow. This reads down the left, like Notary.
 fn holdingView(ui: *AppUi, model: *const Model) AppUi.Node {
-    return resultView(
-        ui,
-        model,
-        ui.appIcon(.{ .width = 30, .height = 30, .style = .{ .foreground = ink.notary } }, "notary"),
-        "Notary is holding your key",
-        "It signs when Plaza asks. The key is on this Mac, in this process, and has never been in Plaza.",
-        "Close",
-    );
+    return ui.scroll(.{ .grow = 1 }, .{
+        inset(ui, 20, ui.column(.{ .grow = 1, .gap = 14 }, .{
+            vgap(ui, 4),
+            ui.row(.{ .cross = .center, .gap = 10 }, .{
+                ui.appIcon(.{ .width = 22, .height = 22, .style = .{ .foreground = ink.notary } }, "notary"),
+                ui.column(.{ .grow = 1, .gap = 2 }, .{
+                    ui.paragraph(
+                        .{ .style = .{ .foreground = ink.title } },
+                        &.{.{ .text = "Notary is holding your key", .weight = .medium, .scale = px(14) }},
+                    ),
+                    ui.paragraph(
+                        .{ .wrap = true, .style = .{ .foreground = ink.body } },
+                        &.{.{ .text = "It signs when Plaza asks. The key is on this Mac, in this process, and has never been in Plaza.", .scale = px(11.5) }},
+                    ),
+                }),
+            }),
+            if (model.npub_len > 0)
+                labelled(ui, "This account", ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = ink.good_text } },
+                    &.{.{ .text = model.npub(), .monospace = true, .scale = px(10.5) }},
+                ))
+            else
+                ui.spacer(0),
+            bunkerRow(ui, model),
+            backupSection(ui, model),
+            vgap(ui, 2),
+            ui.row(.{ .gap = 0 }, .{
+                ui.button(.{ .size = .sm, .on_press = Msg.close }, "Close"),
+                ui.spacer(1),
+            }),
+            vgap(ui, 6),
+        })),
+    });
+}
+
+/// A small heading over a thing, left aligned, the shape Notary uses.
+fn labelled(ui: *AppUi, label: []const u8, body: AppUi.Node) AppUi.Node {
+    return ui.column(.{ .gap = 5 }, .{
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.chrome_text } },
+            &.{.{ .text = label, .monospace = true, .scale = px(10) }},
+        ),
+        body,
+    });
+}
+
+/// Backing the key up, which can only happen here.
+///
+/// Plaza had this panel and could not fill it: the key leaves that process the
+/// moment it is made. Asking Plaza to show a key would also be asking it to
+/// hold one, which is the arrangement's whole point, so the panel lives in the
+/// process that already has it.
+fn backupSection(ui: *AppUi, model: *const Model) AppUi.Node {
+    if (!model.backup_open) {
+        return ui.column(.{ .gap = 6 }, .{
+            ui.row(.{ .gap = 0 }, .{
+                ui.button(.{ .size = .sm, .on_press = Msg.open_backup }, "Back up this key"),
+                ui.spacer(1),
+            }),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = ink.footnote } },
+                &.{.{ .text = "This Mac holds the only copy. A nostr key cannot be replaced, so losing the Mac without a backup loses the account.", .scale = px(10.5) }},
+            ),
+        });
+    }
+    return ui.column(.{ .gap = 8 }, .{
+        ui.paragraph(
+            .{ .style = .{ .foreground = ink.title } },
+            &.{.{ .text = "Back up this key", .weight = .medium, .scale = px(12.5) }},
+        ),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = ink.body } },
+            &.{.{ .text = "A passphrase gives you an encrypted copy, which is the one to keep: it is useless to anyone without that passphrase. Without one you get the key itself, which is not.", .scale = px(11) }},
+        ),
+        ui.el(.textarea, .{
+            .text = model.backup_pass.text(),
+            .placeholder = "Passphrase for the encrypted copy",
+            .on_input = AppUi.inputMsg(.backup_pass_edit),
+            // Tall enough for its own placeholder. At 30 the descenders were
+            // shaved off and the line read as a rendering fault.
+            .height = 38,
+        }, .{}),
+        ui.row(.{ .gap = 8 }, .{
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.export_encrypted }, "Encrypted copy"),
+            ui.button(.{ .size = .sm, .on_press = Msg.export_secret }, "The key itself"),
+            ui.spacer(1),
+            ui.button(.{ .size = .sm, .on_press = Msg.close_backup }, "Done"),
+        }),
+        if (model.backup_len > 0)
+            ui.column(.{ .gap = 6 }, .{
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = if (model.backup_is_secret) ink.bad else ink.footnote } },
+                    &.{.{
+                        .text = if (model.backup_is_secret)
+                            "This is the key itself. Anyone who reads it becomes you, and it cannot be taken back."
+                        else
+                            "Encrypted. Keep it anywhere; keep the passphrase somewhere else.",
+                        .scale = px(10.5),
+                    }},
+                ),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = ink.good_text } },
+                    &.{.{ .text = model.backup_buf[0..model.backup_len], .monospace = true, .scale = px(10) }},
+                ),
+                ui.row(.{ .gap = 0 }, .{
+                    ui.button(.{ .size = .sm, .on_press = Msg.copy_backup }, if (model.backup_copied) "Copied" else "Copy"),
+                    ui.spacer(1),
+                }),
+            })
+        else
+            ui.spacer(0),
+    });
 }
 
 /// The bunker link, under the result, when the daemon is serving one.
@@ -778,20 +968,16 @@ fn holdingView(ui: *AppUi, model: *const Model) AppUi.Node {
 /// without its consequences being read.
 fn bunkerRow(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.bunker_len == 0) return ui.spacer(0);
-    return ui.column(.{ .gap = 0, .cross = .center }, .{
-        vgap(ui, 14),
+    return labelled(ui, "Other apps can sign with this key", ui.column(.{ .gap = 6 }, .{
         ui.paragraph(
-            .{ .style = .{ .foreground = ink.chrome_text } },
-            &.{.{ .text = "Other apps can sign with this key", .scale = px(11) }},
-        ),
-        vgap(ui, 6),
-        ui.paragraph(
-            .{ .wrap = true, .grow = 1, .text_alignment = .center, .style = .{ .foreground = ink.body } },
+            .{ .wrap = true, .style = .{ .foreground = ink.body } },
             &.{.{ .text = model.bunker_url_buf[0..model.bunker_len], .monospace = true, .scale = px(9.5) }},
         ),
-        vgap(ui, 8),
-        ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker }, "Copy link"),
-    });
+        ui.row(.{ .gap = 0 }, .{
+            ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker }, "Copy link"),
+            ui.spacer(1),
+        }),
+    }));
 }
 
 fn waitingView(ui: *AppUi, line: []const u8) AppUi.Node {

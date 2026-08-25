@@ -151,7 +151,7 @@ test "login text is classified by prefix" {
     try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin(""));
 }
 
-test "the settings screen shows the identity, key backup, and logout" {
+test "the settings screen shows the identity, the way to the signer, and logout" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -174,9 +174,15 @@ test "the settings screen shows the identity, key backup, and logout" {
     try testing.expect(findAnyText(tree.root, "Signing with a local key") != null);
     try testing.expect(findAnyText(tree.root, "Edit profile") != null);
     try testing.expect(findAnyText(tree.root, "Copy npub") != null);
-    // The key-backup card has no home in the design and must not be dropped: a
-    // local key is the account, and this is the only way to take a copy of it.
-    try testing.expect(findAnyText(tree.root, "Reveal secret key") != null);
+    // The key is NOT offered here, and that is the point. Backing it up happens
+    // in the signer's own window, which is the process that holds it: Plaza
+    // showing a key would be Plaza holding one. What this screen owes the
+    // reader is the way to that window.
+    try testing.expect(findAnyText(tree.root, "Reveal secret key") == null);
+    // The way to that window is the "Open Notary" link on the signer row, which
+    // needs both a keyholder holding the key and the window binary beside the
+    // app. Neither is true of a bare test model, so its presence is not asserted
+    // here; its absence from THIS screen is the property that matters.
     // So is the media proxy, which is a privacy setting with no other UI.
     try testing.expect(findAnyText(tree.root, "Media proxy") != null);
     try testing.expect(findAnyText(tree.root, "Load media previews") != null);
@@ -3324,7 +3330,6 @@ test "a deep back-stack still lays out" {
     main.setIdentityForTest([_]u8{0x33} ** 32);
     defer main.clearIdentityForTest();
     defer main.resetRelaysForTest();
-    model.reveal_nsec = true;
 
     // Every depth the stack can reach, including full, and with the Settings
     // sheet over it. Settings is a SHEET now rather than a screen, so it no
@@ -10778,7 +10783,6 @@ fn openFullSettings(model: *Model) void {
         .sig = [_]u8{0} ** 64,
     });
     model.stage = .settings;
-    model.reveal_nsec = true;
 }
 
 test "a relay edit that will not be published says so on the screen" {
