@@ -5,15 +5,17 @@
 //! UI, and that separation is the point: Plaza's UI runs image decoders and a
 //! relay JSON parser on bytes off the wire, so the key must not live there. The
 //! key enters this process (typed into the ceremony window, which POSTs it to
-//! /setup) and never leaves it: no endpoint returns the secret.
+//! /setup) and leaves it only when the reader asks for a backup (/export).
 //!
 //! Built from the nostr library alone, never the SDK. The wire types are the
 //! library's `signer_ipc`, so every product speaks the identical protocol.
 //!
-//! At rest the key is a raw 32-byte secret in a 0600 file. There is no
-//! passphrase encryption yet: a passphrase keystore does not exist, and NIP-49
-//! with no passphrase would be theater. The security delivered today is process
-//! isolation; at-rest encryption arrives with a real passphrase keystore.
+//! At rest the key lives in the login Keychain, which is encrypted with the
+//! login password. There is no passphrase of its own: the Keychain is already
+//! encrypted, so a second secret would protect something already protected, and
+//! caching it to avoid a prompt per launch would put it back in the Keychain.
+//! On a platform with no Keychain the key is a raw 32-byte secret in a 0600
+//! file, which is what those platforms have always used.
 //!
 //! Spawned by Plaza with `--serve --port N --state-dir DIR --token-file FILE
 //! --parent-pid PID`. It binds loopback only, authenticates every request with
@@ -26,7 +28,9 @@ const ipc = nostr.signer_ipc;
 const keystore = nostr.keystore;
 const bunker = @import("bunker.zig");
 
-const key_file_name = "signer.key"; // raw 32-byte secret, hex, 0600
+// Raw 32-byte secret, hex, 0600. Read on every start, but written only where
+// there is no Keychain to hold it: legacy installs and non-macOS platforms.
+const key_file_name = "signer.key";
 /// Whether the reader turned the signer on, and the secret their bunker:// URL
 /// carries. 0600 like the key beside it: the secret is not the key, but it is
 /// the one thing standing between a public pubkey and a connect attempt.
@@ -39,10 +43,10 @@ test {
 
 // ------------------------------------------------------------- the keychain
 //
-// Where the key lives now. The 0600 file is still read, so an existing install
-// keeps working and is migrated on the next start, and it is still written when
-// the Keychain refuses, which is the shape Amethyst's desktop side uses: OS
-// credential manager, encrypted-file fallback.
+// Where the key lives now. The 0600 file is still READ, so an existing install
+// keeps working and is migrated on the next start. It is no longer WRITTEN when
+// the Keychain refuses: that file holds the secret in the clear, and arriving
+// there silently is worse than refusing to store a key at all. See issue #310.
 //
 // What moving it buys, exactly: the login keychain is encrypted, so a copied
 // home directory, a Time Machine backup and a stolen disk yield nothing without
@@ -89,6 +93,27 @@ fn safeToRemovePlainKey(stored: bool, read_back: ?[32]u8, original: [32]u8) bool
     if (!stored) return false;
     const back = read_back orelse return false;
     return std.mem.eql(u8, &back, &original);
+}
+
+/// Where the key goes, given what the Keychain said.
+///
+/// A decision function rather than an inline branch because of what the wrong
+/// answer costs. The old behaviour wrote the raw secret to a 0600 file whenever
+/// the Keychain refused: a silent downgrade to something weaker than the reader
+/// asked for, on the one path nobody ever watches, which is issue #310.
+/// Refusing costs a rare setup. Falling back costs the property the Keychain
+/// was adopted for, and says nothing while it does.
+///
+/// `keychain_available` is `has_keychain`, taken as an argument so both kinds
+/// of platform can be tested from either one.
+const StorePlan = enum { stored, write_file, refuse };
+
+fn planAfterKeychain(stored: bool, keychain_available: bool) StorePlan {
+    if (stored) return .stored;
+    // Nothing refused it here: there is no Keychain on this platform, so the
+    // 0600 file is the store, exactly as it was before the Keychain existed.
+    if (!keychain_available) return .write_file;
+    return .refuse;
 }
 
 /// Reads the secret back, or null when there is none, which from here is the
@@ -166,16 +191,18 @@ const State = struct {
         defer signer.deinit();
         const kp = signer.keyPairFromSecretKey(secret) catch return error.BadKey;
 
-        // The Keychain first. The file is written only when it refuses, so a
-        // healthy install never has the secret sitting in a plain file at all.
-        if (!keychainStore(secret)) {
-            var hexbuf: [64]u8 = undefined;
-            _ = hexLower(&hexbuf, secret);
-            keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+        switch (planAfterKeychain(keychainStore(secret), has_keychain)) {
+            .stored => {},
+            .refuse => return error.KeychainRefused,
+            .write_file => {
+                var hexbuf: [64]u8 = undefined;
+                _ = hexLower(&hexbuf, secret);
+                keystore.writeNewKeyFile(io, self.key_dir, self.key_path, &hexbuf) catch |e| {
+                    std.crypto.secureZero(u8, &hexbuf);
+                    return e;
+                };
                 std.crypto.secureZero(u8, &hexbuf);
-                return e;
-            };
-            std.crypto.secureZero(u8, &hexbuf);
+            },
         }
 
         self.secret = secret;
@@ -434,6 +461,7 @@ fn runImport(init: std.process.Init) !void {
     var g = State{ .key_dir = dir, .key_path = key_file_name };
     g.adopt(io, secret) catch |e| switch (e) {
         error.AlreadyInitialized => fail("a key is already set up"),
+        error.KeychainRefused => fail("the Keychain refused, so your key was not saved"),
         else => fail("could not store the key"),
     };
     std.debug.print("Imported {s}\nStart Plaza to use it.\n", .{npub});
@@ -701,6 +729,10 @@ fn handleSetup(gpa: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, body: []co
 
     g_state.adopt(io, secret) catch |e| return switch (e) {
         error.AlreadyInitialized => respondErr(gpa, w, 409, "a key is already set up"),
+        // Said in full rather than as "could not store the key": the reader has
+        // to know their key was NOT saved anywhere, and why, or they will
+        // assume they have an identity they do not have.
+        error.KeychainRefused => respondErr(gpa, w, 500, "The Keychain refused, so your key was not saved"),
         else => respondErr(gpa, w, 500, "could not store the key"),
     };
     return handlePubkey(gpa, w);
@@ -868,6 +900,28 @@ test "the plain key file survives every way a migration can go wrong" {
     // And a stale item from some earlier install, which is the shape a wrong
     // read most plausibly takes on a machine that has run this before.
     try std.testing.expect(!safeToRemovePlainKey(true, [_]u8{0x22} ** 32, key));
+}
+
+test "a Keychain that refuses never sends the key to a plain file" {
+    // The whole of issue #310 in one line: on a platform WITH a Keychain, a
+    // refusal is refused. It does not become a file write. If this ever reads
+    // `.write_file` again, the signer is back to storing a raw secret in the
+    // clear on the one path nobody watches.
+    try std.testing.expectEqual(StorePlan.refuse, planAfterKeychain(false, true));
+
+    // And the setup that worked is left alone.
+    try std.testing.expectEqual(StorePlan.stored, planAfterKeychain(true, true));
+}
+
+test "a platform with no Keychain still uses the file" {
+    // Not a fallback: there is nothing to have refused. `keychainStore` returns
+    // false on these targets because it compiles out, so reading that as a
+    // refusal would leave Linux and Windows unable to store a key at all.
+    try std.testing.expectEqual(StorePlan.write_file, planAfterKeychain(false, false));
+
+    // Unreachable in practice (the call compiles out to false), and pinned so
+    // the answer does not depend on which of the two arguments is read first.
+    try std.testing.expectEqual(StorePlan.stored, planAfterKeychain(true, false));
 }
 
 // ------------------------------------------------------------- the bunker
