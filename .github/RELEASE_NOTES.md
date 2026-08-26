@@ -1,14 +1,10 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.12.4
+### What's new in v0.12.5
 
-**You can take a copy of your key.** Creating a key in Plaza left no way to get it out again, which matters more here than it sounds: a nostr key cannot be replaced, so the only copy being on one Mac means losing the Mac loses the account. The screen that removes a key even told you to make sure you had its nsec written down first, with nothing anywhere that would give you one.
+**Your key is never written down in the clear.** Plaza keeps your key in the login Keychain, and when the Keychain would not take it the signer wrote the key to a file on your disk instead, unencrypted, and said nothing. A healthy Mac never reached that, which is most of why it was worth fixing: the one path nobody ever watches quietly left the key weaker than the one you asked for, and there was no way to tell from the outside.
 
-Backing up happens in the signer's own window, the same one that minted the key, rather than in Plaza's settings. That is the point rather than an inconvenience: Plaza fetching a key so it could show it to you would make Plaza a program that holds your key, and it is built not to be. Open it from Settings, next to the line that says what is signing for you.
-
-There are two forms. The encrypted one is still behind a passphrase you choose, so it is safe to keep in a password manager or on paper. The other is the key itself, and says so in red, because anyone who reads it becomes you and there is no taking it back.
-
-**An app asking to sign no longer prints over itself.** When another app asked to sign as you, the card that asks whether to allow it drew its three lines on top of one another: the requester's key through the sentence below it, and the four answers through that. On the one card in the app that has to be read carefully before you press anything.
+It now refuses. A key it cannot store safely is not stored at all, and it says so instead of reporting a generic failure, so there is no version of this where you believe you have an identity that is actually sitting on disk in the open.
 
 ### Install
 
