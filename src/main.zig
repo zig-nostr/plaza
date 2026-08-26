@@ -5241,6 +5241,25 @@ fn restoreHelperIdentity(pubkey_hex: []const u8) bool {
 
 /// Completes an async helper setup. On a fresh create it adopts the minted
 /// identity and opens the name beat; a transient failure requeues for the tick.
+/// What a failed `/setup` puts on screen. The daemon's own words when it sent
+/// any, because the one failure a reader can act on is a Keychain that would
+/// not hold the key, and "Could not set up your key" reads like a hiccup worth
+/// retrying rather than "you do not have an identity". The generic line is for
+/// a daemon that answered with nothing parseable.
+fn reportHelperSetupFailure(model: *Model, body: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Failure, gpa, body) catch {
+        setToast(model, "Could not set up your key");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.@"error".len == 0) {
+        setToast(model, "Could not set up your key");
+        return;
+    }
+    setToast(model, parsed.value.@"error");
+}
+
 fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     const purpose = g_helper_pending_in_flight;
     g_helper_pending_in_flight = .none;
@@ -5251,7 +5270,7 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     if (response.status != 200) {
         // A migration is a silent background upgrade: on failure the in-process
         // key keeps working, so say nothing. Foreground setups report.
-        if (purpose != .migrate) setToast(model, "Could not set up your key");
+        if (purpose != .migrate) reportHelperSetupFailure(model, response.body);
         return;
     }
     const gpa = std.heap.page_allocator;

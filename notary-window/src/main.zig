@@ -258,6 +258,21 @@ const ink = struct {
     const bad = C.rgb8(229, 115, 115);
 };
 
+/// Puts the daemon's own words on screen when it sent any, and the caller's
+/// line when it did not.
+///
+/// The failure this exists for is a Keychain that will not hold the key.
+/// "Could not import that key." reads as "that key was wrong" and invites the
+/// reader to try it again, which will fail the same way forever; what actually
+/// happened is that nothing was saved, and only the daemon knows that.
+fn setDaemonNotice(model: *Model, body: []const u8, fallback: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Failure, gpa, body) catch return setNotice(model, fallback);
+    defer parsed.deinit();
+    if (parsed.value.@"error".len == 0) return setNotice(model, fallback);
+    setNotice(model, parsed.value.@"error");
+}
+
 fn setNotice(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.msg_buf.len);
     @memcpy(model.msg_buf[0..n], text[0..n]);
@@ -505,7 +520,10 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pass_buffer.clear();
             if (response.outcome != .ok or response.status != 200) {
                 model.stage = .failed;
-                setNotice(model, if (response.status == 409) "A key is already set up." else "Could not import that key.");
+                if (response.status == 409)
+                    setNotice(model, "A key is already set up.")
+                else
+                    setDaemonNotice(model, response.body, "Could not import that key.");
                 return;
             }
             _ = adoptPubkey(model, response.body);
@@ -514,12 +532,12 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .create_done => |response| {
             if (response.outcome != .ok or response.status != 200) {
                 model.stage = .failed;
-                setNotice(model, if (response.status == 409)
-                    "A key is already set up."
+                if (response.status == 409)
+                    setNotice(model, "A key is already set up.")
                 else if (response.outcome != .ok)
-                    "Notary isn't answering yet."
+                    setNotice(model, "Notary isn't answering yet.")
                 else
-                    "Notary could not make a key.");
+                    setDaemonNotice(model, response.body, "Notary could not make a key.");
                 return;
             }
             _ = adoptPubkey(model, response.body);
