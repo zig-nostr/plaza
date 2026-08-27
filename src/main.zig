@@ -9248,10 +9248,6 @@ pub const Model = struct {
     /// came back on the next rebuild. Cleared by the next edit, because a new
     /// query is a new question.
     mention_dismissed: bool = false,
-    /// WHICH note has its menu open, by id, or 0 for none. A bool was enough
-    /// while the only menu in the app hung off the thread's focal note; every
-    /// post carries one now, and a shared flag would open all of them at once.
-    note_menu: i64 = 0,
     // Whether the notifications sheet is up, and which tab it shows.
     notifications_open: bool = false,
     /// Which notifications the sheet shows. EVERYONE by default, because that is
@@ -10098,6 +10094,9 @@ pub const Model = struct {
     }
 
     fn rebuildNotes(self: *Model, store: *nostr.store.Store, now_s: i64) void {
+        // Whatever the feed ends up holding, the relays get told about it. On
+        // every path out of here, including the two that return early.
+        defer publishFeedWatch(self.notes[0..self.notes_len]);
         const kinds = [_]u16{1};
         // Scope the feed to the follow set (the starter pack) plus the user's own
         // notes, so it reads as a real follow feed, not a firehose. Filtering
@@ -13476,9 +13475,6 @@ pub const Msg = union(enum) {
     close_notifications,
     notifications_tab: u8,
     notifications_read_all,
-    /// The note overflow menu.
-    toggle_note_menu: i64,
-    close_note_menu,
     /// The one action behind the note menu. The payload says which way: 0 means
     /// a guest reached for it, 1 follow, 2 unfollow.
     follow_author: u8,
@@ -13521,9 +13517,6 @@ pub const Msg = union(enum) {
     show_more_replies,
     /// Show or re-hide the replies from outside the follow graph.
     toggle_outside_replies,
-    /// Sign out, asked for from the account menu: opens Settings with the
-    /// confirmation showing, so the menu never signs anyone out on one press.
-    open_settings_logout,
     /// Copy a note's nevent address to the clipboard.
     copy_nevent: i64,
     /// Open a note on the web (njump), for sharing it outside nostr.
@@ -16729,15 +16722,15 @@ fn threadRowAt(ui: *AppUi, rows_ctx: *const ThreadRows, index: usize) AppUi.Node
     const plan = rows_ctx.rowAt(index);
     const inner = switch (plan) {
         .ancestor => |ai| ancestorRow(ui, &rows_ctx.ancestors[ai], ai == 0),
-        .focal => threadRoot(ui, rows_ctx.model, rows_ctx.root, rows_ctx.ancestors.len == 0),
+        .focal => threadRoot(ui, rows_ctx.root, rows_ctx.ancestors.len == 0),
         .composer => replyComposer(ui, rows_ctx.model, rows_ctx.root),
         // `first` draws the full-width rule under the note being answered, and
         // `last` suppresses the trailing one: a rule with nothing under it is a
         // dangling line, and its trailing space is what tips a thread that fits
         // into reporting more content than it draws. So the flags are about what
         // is ACTUALLY above and below the block, held replies included.
-        .block => |bi| replyBlock(ui, rows_ctx.model, &rows_ctx.blocks[bi], rows_ctx.root.pubkey, bi == 0, bi + 1 == rows_ctx.shown and rows_ctx.hidden == 0 and rows_ctx.outside.len == 0),
-        .outside_block => |oi| replyBlock(ui, rows_ctx.model, &rows_ctx.outside[oi], rows_ctx.root.pubkey, oi == 0 and rows_ctx.shown == 0, oi + 1 == rows_ctx.outside.len),
+        .block => |bi| replyBlock(ui, &rows_ctx.blocks[bi], rows_ctx.root.pubkey, bi == 0, bi + 1 == rows_ctx.shown and rows_ctx.hidden == 0 and rows_ctx.outside.len == 0),
+        .outside_block => |oi| replyBlock(ui, &rows_ctx.outside[oi], rows_ctx.root.pubkey, oi == 0 and rows_ctx.shown == 0, oi + 1 == rows_ctx.outside.len),
         .show_more => showMoreReplies(ui, rows_ctx.hidden_held),
         .outside_line => outsideGraphRow(ui, rows_ctx.outside_held, rows_ctx.outside_open),
         .footer => listeningFooter(ui),
@@ -16990,7 +16983,7 @@ fn identityHandle(ui: *AppUi, note: *const Note, fill: bool) AppUi.Node {
 /// The focused root note: the same 40px avatar and 14px inset as the feed and
 /// the replies (so every row's avatar and text share one left edge), set apart
 /// by a slightly larger name, the name-over-handle stack, and the composer below.
-fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) AppUi.Node {
+fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
     const c = engagementFor(note.id);
     // A fixed-width column, centred by the scroll column's `cross = .center`. No
     // outer growing row: a `grow` child in the scroll's column grows vertically
@@ -17039,7 +17032,7 @@ fn threadRoot(ui: *AppUi, model: *const Model, note: *const Note, leads: bool) A
         }),
         vgap(ui, 12),
         focalStats(ui, c),
-        focalVerbs(ui, model, note),
+        focalVerbs(ui, note),
     });
 }
 
@@ -17083,22 +17076,50 @@ fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
 
 /// The focal note's tallies, as words rather than icons: the verbs below carry
 /// the actions, so these are the numbers, stated plainly.
+///
+/// A tally that has been turned off is GONE, not zeroed. It used to be zeroed,
+/// which meant somebody who switched every count off in Settings watched the
+/// feed lose its numbers and then opened a thread to "0 replies 0 reposts 0
+/// likes 0 sats" across the top of it. That is worse than leaving them on: it
+/// states four facts about the note, all four of them false, in the register the
+/// app uses for facts. This line is nothing BUT counts, so when a count is
+/// hidden there is nothing left for it to say, and when every one is hidden
+/// there is nothing left for the band to say either.
 fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
     const p = theme.palette;
+    const kids = ui.arena.alloc(AppUi.Node, 10) catch return ui.spacer(0);
+    var n: usize = 0;
+    kids[n] = hgap(ui, thread_inset + 2);
+    n += 1;
+    kids[n] = vgap(ui, 33);
+    n += 1;
+    var any = false;
+    const stats = [_]struct { hidden: bool, count: u64, one: []const u8, many: []const u8 }{
+        .{ .hidden = countHidden(.replies, .reply_counts), .count = c.replies, .one = "reply", .many = "replies" },
+        .{ .hidden = countHidden(.reposts, .repost_counts), .count = c.reposts, .one = "repost", .many = "reposts" },
+        .{ .hidden = countHidden(.reactions, .reaction_counts), .count = c.likes, .one = "like", .many = "likes" },
+        .{ .hidden = countHidden(.zaps, .zap_totals), .count = c.zap_msat / 1000, .one = "sat", .many = "sats" },
+    };
+    for (stats) |stat| {
+        if (stat.hidden) continue;
+        // The gap belongs BETWEEN tallies, so it is charged by the one that
+        // follows another rather than reserved by every one of them: hiding the
+        // first would otherwise leave the row starting 18px further in than the
+        // note above it.
+        if (any) {
+            kids[n] = hgap(ui, 18);
+            n += 1;
+        }
+        kids[n] = statCount(ui, stat.count, stat.one, stat.many);
+        n += 1;
+        any = true;
+    }
+    if (!any) return ui.spacer(0);
+    kids[n] = ui.spacer(1);
+    n += 1;
     return ui.column(.{ .gap = 0 }, .{
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
-        ui.row(.{ .cross = .center, .gap = 0 }, .{
-            hgap(ui, thread_inset + 2),
-            vgap(ui, 33),
-            statCount(ui, if (countHidden(.replies, .reply_counts)) 0 else c.replies, "reply", "replies"),
-            hgap(ui, 18),
-            statCount(ui, if (countHidden(.reposts, .repost_counts)) 0 else c.reposts, "repost", "reposts"),
-            hgap(ui, 18),
-            statCount(ui, if (countHidden(.reactions, .reaction_counts)) 0 else c.likes, "like", "likes"),
-            hgap(ui, 18),
-            statCount(ui, if (countHidden(.zaps, .zap_totals)) 0 else c.zap_msat / 1000, "sat", "sats"),
-            ui.spacer(1),
-        }),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{kids[0..n]}),
         ui.separator(.{ .width = thread_column_width, .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
 }
@@ -17119,12 +17140,13 @@ fn statCount(ui: *AppUi, n: u64, singular: []const u8, plural: []const u8) AppUi
 /// reads as a row that lost its middle. The counts are left off, because the
 /// stats line directly above states them in words: this is the same builder,
 /// told not to repeat itself.
-fn focalVerbs(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
+fn focalVerbs(ui: *AppUi, note: *const Note) AppUi.Node {
+    if (!anyVerbShown()) return ui.spacer(0);
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 2),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             hgap(ui, thread_inset),
-            engagementRowAt(ui, model, note, false),
+            engagementRowAt(ui, note, false),
         }),
         vgap(ui, 4),
     });
@@ -18621,7 +18643,7 @@ fn orphanNote(ui: *AppUi) AppUi.Node {
     });
 }
 
-fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
     const p = theme.palette;
     const note = block.parent;
     const kids = ui.arena.alloc(AppUi.Node, block.children.len * 2) catch return ui.spacer(0);
@@ -18684,7 +18706,7 @@ fn replyBlock(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_a
                 if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                 if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
                 vgap(ui, 8),
-                engagementRow(ui, model, note),
+                engagementRow(ui, note),
             }),
             hgap(ui, thread_inset),
         }),
@@ -18839,8 +18861,8 @@ pub fn ancestorRowForTest(ui: *AppUi, ancestor: *const Ancestor, first: bool) Ap
     return ancestorRow(ui, ancestor, first);
 }
 
-pub fn replyBlockForTest(ui: *AppUi, model: *const Model, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
-    return replyBlock(ui, model, block, root_author, first, last);
+pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+    return replyBlock(ui, block, root_author, first, last);
 }
 
 /// The rows a level can hold whose height is a fixed constant, so a test can
@@ -20198,7 +20220,7 @@ fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
 fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
     return switch (rows.rowAt(index)) {
         .person => profileCard(ui, rows.model, rows.pubkey),
-        .note => |ni| noteCard(ui, rows.model, &rows.notes[ni]),
+        .note => |ni| noteCard(ui, &rows.notes[ni]),
         .empty => profileEmptyRow(ui, rows),
     };
 }
@@ -20346,7 +20368,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.failed = true;
             return ui.column(.{}, .{});
         };
-        for (built, 0..) |*row, offset| row.* = noteCard(ui, model, &model.notes[window.start_index + offset]);
+        for (built, 0..) |*row, offset| row.* = noteCard(ui, &model.notes[window.start_index + offset]);
         break :blk built;
     };
 
@@ -21172,44 +21194,13 @@ pub fn lowerScopeForTest(scope: []const u8) []const u8 {
 }
 
 /// What a note offers beyond its verbs: where it is, what it says, and what to
-/// do about whoever wrote it.
+/// do about whoever wrote it. Reached by right-clicking anywhere on the row.
 ///
-/// The same items back the right-click menu (`noteContextItems`), because two
-/// lists would be two lists to keep in step and the reader would find different
-/// actions depending on which way they reached for them.
-fn noteMenu(ui: *AppUi, note: *const Note) AppUi.Node {
-    const rows = ui.arena.alloc(AppUi.Node, 7) catch return ui.spacer(0);
-    var n: usize = 0;
-    // No glyphs. Two of these four had one and two did not, which reads as two
-    // items with something extra rather than as one list: a menu's items are
-    // alike, and a glyph on some of them is a difference that means nothing.
-    rows[n] = menuRow(ui, "Copy note address", null, null, Msg{ .copy_nevent = note.id });
-    n += 1;
-    rows[n] = menuRow(ui, "Quote", null, null, Msg{ .quote_note = note.id });
-    n += 1;
-    rows[n] = menuRow(ui, "Copy text", null, null, Msg{ .copy_note_text = note.id });
-    n += 1;
-    rows[n] = menuRow(ui, "Open on the web", null, null, Msg{ .open_web = note.id });
-    n += 1;
-    rows[n] = menuSeparatorRow(ui);
-    n += 1;
-    rows[n] = followMenuRow(ui, note.pubkey);
-    n += 1;
-    // Its OWN dismiss, not the chrome's. `menuSurfacePlaced` sends `close_menu`,
-    // which clears `model.menu`, and this menu's open state is `model.note_menu`:
-    // Escape and a press outside hid it for one frame and the next rebuild put
-    // it straight back, because nothing had told the model. The helper that takes
-    // a dismiss message exists for exactly this, and says so.
-    return menuSurfacePlacedDismissing(ui, 220, .below, .end, Msg.close_note_menu, rows[0..n]);
-}
-
-/// The same actions as the note's menu, for a right-click anywhere on the row.
-///
-/// One list, not two. A right-click that offered a different set from the `...`
-/// beside it would be two menus to keep in step, and the reader would find
-/// different actions depending on which way they reached for them. The runtime
-/// presents these as the platform's own menu where there is one, and as the same
-/// anchored surface everything else uses where there is not.
+/// This is the only list. There used to be a second one behind an ellipsis in
+/// the verb row, carrying the same actions, which meant two lists to keep in
+/// step and a reader finding different things depending on which way they
+/// reached. The runtime presents these as the platform's own menu where there is
+/// one, and as an anchored surface where there is not.
 fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppUi.ContextMenuItem {
     const items = ui.arena.alloc(AppUi.ContextMenuItem, 7) catch return &.{};
     var n: usize = 0;
@@ -21232,9 +21223,13 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
     return items[0..n];
 }
 
-/// The follow entry for a right-click, in the same states the menu row has.
+/// The follow entry for a right-click, in whatever state it is honestly in.
+///
 /// Disabled rather than absent where it cannot act, so the reason is visible
-/// instead of the action silently missing.
+/// instead of the action silently missing. Not "Follow", greyed: the app is
+/// still looking for a list it must not write over, and saying so is the point.
+/// A silently dead Follow is what every client that got this safety right got
+/// wrong.
 fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
     const me = activePubkey();
     if (me) |pk| {
@@ -21243,20 +21238,6 @@ fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
     if (followBlockedReason()) |reason| return .{ .label = reason, .enabled = false };
     if (isFollowedByMe(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = 2 } };
     return .{ .label = "Follow", .msg = Msg{ .follow_author = 1 } };
-}
-
-/// The follow line, in whatever state it is honestly in.
-fn followMenuRow(ui: *AppUi, author: [32]u8) AppUi.Node {
-    const me = activePubkey();
-    const is_me = if (me) |pk| std.mem.eql(u8, &pk, &author) else false;
-    if (is_me) return menuRow(ui, "This is you", null, null, null);
-    if (me == null) return menuRow(ui, "Follow", null, null, Msg{ .follow_author = 0 });
-    // Not "Follow", greyed. The reason is worth saying: the app is still
-    // looking for a list it must not write over. A silently dead Follow
-    // button is what every client that got this safety right got wrong.
-    if (followBlockedReason()) |reason| return menuRow(ui, reason, null, null, null);
-    if (isFollowedByMe(author)) return menuRow(ui, "Unfollow", null, null, Msg{ .follow_author = 2 });
-    return menuRow(ui, "Follow", null, null, Msg{ .follow_author = 1 });
 }
 
 /// A rule between groups of menu items.
@@ -21496,7 +21477,7 @@ fn npubShort() []const u8 {
 /// the PR for review.
 fn accountMenu(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    const rows = ui.arena.alloc(AppUi.Node, 5) catch return ui.spacer(0);
+    const rows = ui.arena.alloc(AppUi.Node, 4) catch return ui.spacer(0);
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
         vgap(ui, 34),
@@ -21524,11 +21505,14 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
         rows[n] = menuRow(ui, "Open Notary", null, null, .open_notary_window);
         n += 1;
     }
-    // No glyph. "Open Notary" and "Sign out" carry none, and one icon among
-    // three reads as a mistake rather than as emphasis.
+    // No glyph. "Open Notary" carries none either, and one icon among two reads
+    // as a mistake rather than as emphasis.
+    //
+    // No "Sign out" here. It only ever opened Settings with the confirmation
+    // showing, so it was a second door to a room this menu already has a door
+    // to, and the one thing on a status menu that could end a session is a
+    // strange thing to keep a press away from the relay count.
     rows[n] = menuRow(ui, "Settings…", null, "Cmd+,", .open_settings);
-    n += 1;
-    rows[n] = menuRow(ui, "Sign out", null, null, .open_settings_logout);
     n += 1;
     return menuSurface(ui, 240, rows[0..n]);
 }
@@ -21951,12 +21935,22 @@ fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) App
 /// How much of a note's identity row belongs to the name and the handle.
 ///
 /// The row is the identity block, a 6px gap, then the time. The time is the
-/// app's own string ("4h via Amethyst" at its longest), so it is the part that
-/// can be budgeted; the name and the handle are a stranger's, so they get what
-/// is left and are held to it. Sixty-four characters of display name and a
-/// hundred and twenty-eight of NIP-05 both fit the buffers that receive them,
-/// which is to say both will arrive eventually.
-const time_column_width: f32 = 124;
+/// app's own string, so it is the part that can be budgeted; the name and the
+/// handle are a stranger's, so they get what is left and are held to it.
+/// Sixty-four characters of display name and a hundred and twenty-eight of
+/// NIP-05 both fit the buffers that receive them, which is to say both will
+/// arrive eventually.
+///
+/// 136, not the 124 it was. The budget was set against "4h via Amethyst" and the
+/// real longest is "11h via Damus Notedeck": a client name may be fourteen
+/// characters and an age may be three, and at 124 that string was one character
+/// too wide. It did not elide, it WRAPPED, onto a second line the row had
+/// reserved no height for, so it painted over the handle beneath it and was
+/// clipped away again depending on what else was on screen. That is the flicker
+/// somebody sees scrolling past it. The line is single-line now (see the
+/// paragraph that draws it), and this is the width that keeps the longest thing
+/// it can honestly say inside its own box rather than leaning on the ellipsis.
+const time_column_width: f32 = 136;
 const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
 
 /// How long a stranger's string may be where something sits BESIDE it.
@@ -22092,29 +22086,43 @@ const verb_slot_width: f32 = 64;
 const verb_slot_height: f32 = 30;
 const verb_icon_size: f32 = 15;
 
-/// The engagement row: reply, repost, like, zap, bookmark, more, in that fixed
-/// order, each an icon and its crowd count (the count omitted at zero).
+/// The engagement row: reply, repost, like, zap, in that fixed order, each an
+/// icon and its crowd count (the count omitted at zero).
 ///
-/// Every icon people expect is drawn, including the ones with nothing behind
-/// them yet: this is a deliberate call for the first release, so the row reads
-/// as the row every other client has rather than as a shorter one that has lost
-/// something. Reply and like work. Repost and zap carry REAL counts and no
-/// action, so they keep the full tint (dimming them would misreport the crowd
-/// to say something about the app). Bookmark and more carry nothing at all and
-/// are drawn quieter to say so. None of the four takes hover, focus or a press,
-/// so nothing here answers a click with silence.
-fn engagementRow(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
-    return engagementRowAt(ui, model, note, true);
+/// It used to carry two more. A bookmark, which had nothing behind it and was
+/// drawn quiet to say so, and an ellipsis that opened the note's menu. Both are
+/// gone. The bookmark was a control that could only ever disappoint somebody who
+/// pressed it, and the ellipsis offered exactly what a right-click on the row
+/// already offers, so it was a second door to one room, taking up a slot and a
+/// hit target to get there. The right-click menu is the door now
+/// (`noteContextItems`), on every row and on the focal note.
+///
+/// Reply and like work. Repost and zap carry REAL counts and no action, so they
+/// keep the full tint: dimming them would misreport the crowd in order to say
+/// something about the app.
+fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
+    if (!anyVerbShown()) return ui.spacer(0);
+    return engagementRowAt(ui, note, true);
+}
+
+/// Whether the verb row has anything left to draw.
+///
+/// Four verbs, each removable in Settings, and nothing else in the row since the
+/// bookmark and the ellipsis went. Turning all four off used to leave the gap
+/// above the row and the row's own height behind, so the bottom of every note
+/// kept a band of nothing where the verbs had been.
+fn anyVerbShown() bool {
+    return !isTakenAway(.replies) or !isTakenAway(.reposts) or
+        !isTakenAway(.reactions) or !isTakenAway(.zaps);
 }
 
 /// The same row, told whether to carry its counts. The focal note in a thread
 /// does not: the stats line above it already states every one of them in words,
 /// and a number said twice in two registers is the second one looking like a
 /// control.
-fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: bool) AppUi.Node {
+fn engagementRowAt(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     const p = theme.palette;
     const glyph = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_metric } };
-    const quiet = AppUi.ElementOptions{ .width = verb_icon_size, .height = verb_icon_size, .style = .{ .foreground = p.text_dim } };
     const c = engagementFor(note.id);
     return ui.row(.{ .gap = 0, .cross = .center }, .{
         // Reply opens the note's thread, where the pinned composer answers it.
@@ -22131,39 +22139,7 @@ fn engagementRowAt(ui: *AppUi, model: *const Model, note: *const Note, counts: b
         // The zap count is summed sats (msat / 1000); the action itself waits
         // on a wallet.
         if (isTakenAway(.zaps)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !countHidden(.zaps, .zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
-        verbSlot(ui, ui.appIcon(quiet, "bookmark")),
-        // The one unfinished-looking glyph that is not unfinished: it opens the
-        // note's menu, the same one the thread's header has always had, with the
-        // note's address, its words and its author behind it.
-        //
-        // The press sits on the SLOT rather than inside it, which is the one
-        // place in this row that is safe: it is the last slot, so a target the
-        // full 64 wide can only reach into the inert bookmark beside it, and a
-        // wrapper of its own cost a node on every row in the feed and put the
-        // app's worst frame over its node budget.
-        ui.row(.{
-            .width = verb_slot_width,
-            .cross = .center,
-            .gap = 0,
-            .on_press = Msg{ .toggle_note_menu = note.id },
-            .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "More", .focusable = true },
-        }, .{moreSlotChildren(ui, model, note, glyph)}),
     });
-}
-
-/// The more-slot's children: the glyph, and the menu only when it is THIS note's
-/// menu that is open.
-///
-/// A slice rather than `if (open) menu else spacer(0)`, because a placeholder is
-/// charged a widget node on every row whether or not it draws, and one per feed
-/// row was enough to put the app's worst frame over the budget the suite holds.
-fn moreSlotChildren(ui: *AppUi, model: *const Model, note: *const Note, glyph: AppUi.ElementOptions) []const AppUi.Node {
-    const kids = ui.arena.alloc(AppUi.Node, 2) catch return &.{};
-    kids[0] = ui.icon(glyph, "ellipsis");
-    if (model.note_menu != note.id) return kids[0..1];
-    kids[1] = noteMenu(ui, note);
-    return kids[0..2];
 }
 
 /// One verb in its slot: the control at the left, the rest of the slot empty.
@@ -23037,7 +23013,7 @@ fn quoteTime(ui: *AppUi, created_at: i64) []const u8 {
 /// and the engagement row. The content is a fixed reading column centered in
 /// the window, with a hairline under each row as the only separation. Keyed by
 /// the note id so the list diff holds scroll position across reconciles.
-fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
+fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
     var node = ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
             // A `list_item`, because that is the kind the renderer washes on
@@ -23081,9 +23057,24 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                             // wherever it ran out, leaving a ragged gap after
                             // "6m via Damus" that grew as the string got
                             // shorter.
+                            //
+                            // ONE line, always. A paragraph in a stated width
+                            // wraps, and a client name long enough to need a
+                            // second line got one: "11h via Damus Notedeck"
+                            // broke after "Damus" and hung "Notedeck" under it,
+                            // into the handle's row. Scrolling then flickered it
+                            // between two lines and one, because the row's
+                            // height and the width this box is measured at are
+                            // settled in different passes and a wrap sits right
+                            // on the boundary between them. A single line cannot
+                            // do that, and the engine trims the tail with the
+                            // same metrics it paints with, so a name that does
+                            // not fit ends in an ellipsis instead of moving the
+                            // furniture.
                             ui.paragraph(
                                 .{
                                     .width = time_column_width,
+                                    .wrap = false,
                                     .text_alignment = .end,
                                     .style = .{ .foreground = theme.palette.text_faint_alt },
                                 },
@@ -23103,8 +23094,8 @@ fn noteCard(ui: *AppUi, model: *const Model, note: *const Note) AppUi.Node {
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                         if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
                         if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
-                        vgap(ui, 10),
-                        engagementRow(ui, model, note),
+                        if (anyVerbShown()) vgap(ui, 10) else ui.spacer(0),
+                        engagementRow(ui, note),
                     }),
                     hgap(ui, row_pad_side),
                 }),
@@ -25006,10 +24997,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             inboxMarkAllRead();
             markInboxDirty();
         },
-        .toggle_note_menu => |id| model.note_menu = if (model.note_menu == id) 0 else id,
-        .close_note_menu => model.note_menu = 0,
         .follow_author => |direction| {
-            model.note_menu = 0;
             // A guest reaching for Follow is first intent, the same as reaching
             // for the composer: the sheet rises rather than the press failing.
             if (direction == 0 or model.is_guest()) {
@@ -25239,7 +25227,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.menu = .none;
         },
         .copy_nevent => |id| {
-            model.note_menu = 0;
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
@@ -25250,7 +25237,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // njump renders any nostr event as a web page, which is how a note is
         // shared with someone who is not on nostr yet.
         .open_web => |id| {
-            model.note_menu = 0;
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
@@ -25264,7 +25250,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // `q` tag at publish, so the reference in the text and the tag on the
         // event can never disagree: they are derived from the same bytes.
         .quote_note => |id| {
-            model.note_menu = 0;
             if (model.is_guest()) {
                 model.joining = true;
                 model.pending = .post;
@@ -25303,18 +25288,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_mentions => model.mention_dismissed = true,
         .copy_note_text => |id| {
-            model.note_menu = 0;
             // The words as the note wrote them, not as the feed renders them:
             // a paste that came back with `@name` where the author typed a
             // `nostr:` reference is not the note, it is a screenshot of one.
             const note = model.noteById(id) orelse return;
             fx.writeClipboard(.{ .key = copy_note_text_key, .text = note.content() });
             setToast(model, "Copied");
-        },
-        .open_settings_logout => {
-            model.menu = .none;
-            model.logout_pending = true;
-            update(model, .open_settings, fx);
         },
         .name_edit => |edit| model.name_buffer.apply(edit),
         .name_save => {
@@ -25503,8 +25482,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             openEvent(model, id);
         },
         .close_thread => {
-            // A menu left open would reopen over whatever the reader lands on.
-            model.note_menu = 0;
             closeThread(model);
         },
         .go_home => goHome(model),
@@ -28498,7 +28475,6 @@ fn enterProfile(model: *Model, pubkey: [32]u8) void {
     model.viewing_profile = pubkey;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
-    model.note_menu = 0;
     model.reply_buffer.clear();
     wantProfile(pubkey);
     model.profile_tab = .notes;
@@ -28558,7 +28534,6 @@ fn goHome(model: *Model) void {
     model.thread_loading = false;
     model.thread_notes_len = 0;
     model.reply_buffer.clear();
-    model.note_menu = 0;
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
@@ -28583,7 +28558,6 @@ fn closeThread(model: *Model) void {
     model.thread_outside_open[model.currentLevel()] = false;
     model.reply_buffer.clear();
     model.thread_notes_len = 0;
-    model.note_menu = 0;
     if (model.thread_stack_len > 0) {
         model.thread_stack_len -= 1;
         const prev = model.thread_stack[model.thread_stack_len];
@@ -30359,6 +30333,100 @@ fn rememberFeedId(
     len.* += 1;
 }
 
+// -- What the feed is SHOWING, rather than what happened to arrive -----------
+//
+// The watch list was built only from events that came down the wire this
+// session, while the feed's own REQ carries a `since` off the newest stored
+// note. So on any store that is not cold, the feed draws notes nobody has asked
+// a relay about, and every one of them reads zero replies, zero reposts, zero
+// likes and zero sats for the whole session. A guest sees it worst, because a
+// starter-pack feed is nearly all store after the first launch, and it looked
+// like guests simply do not get counts.
+//
+// It also explains the shape of it: opening a note fetches THAT note's
+// engagement on its own socket, so a count would appear for exactly the note
+// somebody had looked at, stay when they went back, and nowhere else.
+//
+// So the view publishes what it is drawing, and each relay worker folds that in
+// before it asks. Written by the view thread, read by every relay thread, under
+// a lock of its own: the engagement table has one already and taking it here
+// would mean holding two in an order nothing else in the app agrees on.
+var g_feed_watch_lock = std.atomic.Value(bool).init(false);
+var g_feed_watch_ids: [engagement_watch_cap]i64 = undefined;
+var g_feed_watch_hex: [engagement_watch_cap][64]u8 = undefined;
+var g_feed_watch_len: usize = 0;
+/// Moves whenever the published set CHANGES, so a worker can tell "the feed grew
+/// while I was reading" from "the same feed, redrawn". A redraw happens on every
+/// tick; re-asking every relay four times a second is a different bug.
+var g_feed_watch_gen = std.atomic.Value(u32).init(0);
+
+fn lockFeedWatch() void {
+    while (g_feed_watch_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn unlockFeedWatch() void {
+    g_feed_watch_lock.store(false, .release);
+}
+
+/// The view thread, after a feed rebuild. Newest first and bounded, which is
+/// the order the feed is already in: what a reader is looking at is what its
+/// counts are wanted for.
+fn publishFeedWatch(notes: []const Note) void {
+    lockFeedWatch();
+    defer unlockFeedWatch();
+    const n = @min(notes.len, engagement_watch_cap);
+    var changed = n != g_feed_watch_len;
+    for (notes[0..n], 0..) |note, i| {
+        if (!changed and g_feed_watch_ids[i] != note.id) changed = true;
+        g_feed_watch_ids[i] = note.id;
+        hexLower(&g_feed_watch_hex[i], note.event_id);
+    }
+    g_feed_watch_len = n;
+    if (changed) _ = g_feed_watch_gen.fetchAdd(1, .monotonic);
+}
+
+fn feedWatchGeneration() u32 {
+    return g_feed_watch_gen.load(.monotonic);
+}
+
+/// Folds the published set into one worker's watch list, keeping what that
+/// socket already knew. Returns the new length.
+fn mergeFeedWatch(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: usize,
+) usize {
+    lockFeedWatch();
+    defer unlockFeedWatch();
+    var n = len;
+    outer: for (0..g_feed_watch_len) |i| {
+        if (n >= engagement_watch_cap) break;
+        for (ids[0..n]) |seen| {
+            if (seen == g_feed_watch_ids[i]) continue :outer;
+        }
+        ids[n] = g_feed_watch_ids[i];
+        hex[n] = g_feed_watch_hex[i];
+        n += 1;
+    }
+    return n;
+}
+
+pub fn publishFeedWatchForTest(notes: []const Note) void {
+    publishFeedWatch(notes);
+}
+
+pub fn mergeFeedWatchForTest(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: usize,
+) usize {
+    return mergeFeedWatch(ids, hex, len);
+}
+
+pub fn feedWatchGenerationForTest() u32 {
+    return feedWatchGeneration();
+}
+
 fn subscribeEngagement(relay: *nostr.relay.Relay, hex: *const [engagement_watch_cap][64]u8, count: usize) void {
     if (count == 0) return;
     var evals: [engagement_watch_cap][]const u8 = undefined;
@@ -30740,6 +30808,7 @@ fn discoveredOnce(
     var feed_ids_len: usize = 0;
     var engagement_watching: usize = 0;
     var engagement_at: i64 = 0;
+    var engagement_gen: u32 = 0;
     // Published only now, so the keeper never replaces a question that has not
     // been asked yet. Cleared on the way out, before the connection is freed.
     setRoutedLive(index, url, gen_in);
@@ -30751,12 +30820,22 @@ fn discoveredOnce(
         // threads use: a subscription opened once at EOSE leaves every note that
         // arrives afterwards reading zero forever.
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
-            now_ms - engagement_at > engagement_widen_ms)
+        // Two things can put a note in front of a reader without a count: one
+        // arriving here, and one the view read out of the store. Both are asked
+        // about, and the second is why this no longer waits for `watching > 0`:
+        // a connection whose first EOSE found nothing had no way back to
+        // watching anything at all, for the rest of its life.
+        const watch_gen = feedWatchGeneration();
+        if (now_ms - engagement_at > engagement_widen_ms and
+            (watch_gen != engagement_gen or feed_ids_len > engagement_watching))
         {
-            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
-            engagement_watching = feed_ids_len;
-            engagement_at = now_ms;
+            feed_ids_len = mergeFeedWatch(&feed_ids, &feed_id_hex, feed_ids_len);
+            engagement_gen = watch_gen;
+            if (feed_ids_len > 0) {
+                subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                engagement_watching = feed_ids_len;
+                engagement_at = now_ms;
+            }
         }
         // The slot was pointed at a DIFFERENT relay. Nothing here is worth
         // keeping, so drop it and let the loop dial whatever the slot holds now.
@@ -30790,12 +30869,14 @@ fn discoveredOnce(
             },
             .eose => |eo| {
                 // What this relay had, drained: now watch those notes.
-                if (engagement_watching == 0 and feed_ids_len > 0 and
-                    std.mem.eql(u8, eo.subscription_id, outbox_sub_id))
-                {
-                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
-                    engagement_watching = feed_ids_len;
-                    engagement_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+                if (engagement_watching == 0 and std.mem.eql(u8, eo.subscription_id, outbox_sub_id)) {
+                    feed_ids_len = mergeFeedWatch(&feed_ids, &feed_id_hex, feed_ids_len);
+                    engagement_gen = feedWatchGeneration();
+                    if (feed_ids_len > 0) {
+                        subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                        engagement_watching = feed_ids_len;
+                        engagement_at = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+                    }
                 }
             },
             .closed => return,
@@ -30956,6 +31037,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // when it was last (re)issued.
     var engagement_watching: usize = 0;
     var engagement_at: i64 = 0;
+    var engagement_gen: u32 = 0;
 
     while (true) {
         // A pause takes effect at the next message this relay sends: the thread
@@ -31046,12 +31128,23 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // feed's EOSE and never touched again, so every note past that point
         // read zero likes, zero replies and zero zaps for the whole session, and
         // so did every note that arrived live.
-        if (engagement_watching > 0 and feed_ids_len > engagement_watching and
-            now_ms - engagement_at > engagement_widen_ms)
+        //
+        // And it asked only about arrivals, which left every note the view read
+        // out of the store unwatched. That is most of the feed on any launch but
+        // the first. Both sources are folded in here now, and the "already
+        // watching" guard is gone with them: a connection whose first EOSE found
+        // nothing had no way back to watching anything for the rest of its life.
+        const watch_gen = feedWatchGeneration();
+        if (now_ms - engagement_at > engagement_widen_ms and
+            (watch_gen != engagement_gen or feed_ids_len > engagement_watching))
         {
-            subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
-            engagement_watching = feed_ids_len;
-            engagement_at = now_ms;
+            feed_ids_len = mergeFeedWatch(&feed_ids, &feed_id_hex, feed_ids_len);
+            engagement_gen = watch_gen;
+            if (feed_ids_len > 0) {
+                subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                engagement_watching = feed_ids_len;
+                engagement_at = now_ms;
+            }
         }
         switch (msg.value) {
             .event => |e| {
@@ -31136,11 +31229,16 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                         }
                     }
                 }
-                // Stored feed drained: now watch those notes' engagement.
-                if (engagement_watching == 0 and feed_ids_len > 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
-                    subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
-                    engagement_watching = feed_ids_len;
-                    engagement_at = now_ms;
+                // Stored feed drained: now watch those notes' engagement, plus
+                // whatever the view is drawing out of the store.
+                if (engagement_watching == 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                    feed_ids_len = mergeFeedWatch(&feed_ids, &feed_id_hex, feed_ids_len);
+                    engagement_gen = feedWatchGeneration();
+                    if (feed_ids_len > 0) {
+                        subscribeEngagement(relay, &feed_id_hex, feed_ids_len);
+                        engagement_watching = feed_ids_len;
+                        engagement_at = now_ms;
+                    }
                 }
             },
             .closed => |c| {

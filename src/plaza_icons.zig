@@ -22,9 +22,11 @@ const svg_icon = canvas.svg_icon;
 const reply_icon = svg_icon.parseComptime(@embedFile("icons/app-reply.svg"));
 const like_icon = svg_icon.parseComptime(@embedFile("icons/app-heart.svg"));
 const zap_icon = svg_icon.parseComptime(@embedFile("icons/app-zap.svg"));
-// Save for later. Lucide's bookmark, in the same dialect as the rest: the SDK's
-// built-in set has no counterpart (its `save` is a floppy disk), and every other
-// client puts one in the verb row.
+// Save for later, and still waiting. Lucide's bookmark, in the same dialect as
+// the rest: the SDK's built-in set has no counterpart (its `save` is a floppy
+// disk). It used to be drawn in the verb row with nothing behind it, which is a
+// control that can only disappoint whoever presses it, so the row stopped
+// drawing it. The glyph stays registered for the day the feature arrives.
 const bookmark_icon = svg_icon.parseComptime(@embedFile("icons/app-bookmark.svg"));
 // A picture, for saying that a note carries one where the picture itself cannot
 // be drawn. Lucide's image, in the same dialect; the built-in set has none.

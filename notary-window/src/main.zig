@@ -33,7 +33,56 @@ const bunker_key: u64 = 5;
 const copy_bunker_key: u64 = 6;
 const export_key: u64 = 7;
 const copy_backup_key: u64 = 8;
+const watch_key: u64 = 9;
+const watch_timer_key: u64 = 1;
+
+/// How often the paste screen asks the daemon whether a key has turned up.
+///
+/// The terminal card on that screen offers a command that puts a key straight
+/// into the daemon without this window touching it, and Plaza notices within a
+/// tick and signs in. This window did not: it sat on the paste field with a
+/// signed-in Plaza behind it, and the only way out was to close it. A second is
+/// slow enough to cost nothing on a loopback port and quick enough that the
+/// screen has changed by the time somebody looks back at it.
+const watch_interval_ms: u32 = 1000;
 const import_command = "/Applications/Plaza.app/Contents/MacOS/plaza-signer import";
+
+/// What a hidden passphrase field draws instead of its characters.
+///
+/// One star per BYTE, so the mask is exactly as long as the text it stands for.
+/// That is what keeps the caret honest: every offset the runtime stamps into an
+/// edit event is an offset into the string it drew, and a mask of the same
+/// length maps those straight through to the real buffer. A prettier bullet
+/// would be three bytes wide and every click would land elsewhere.
+const passphrase_stars = [_]u8{'*'} ** 200;
+
+fn stars(len: usize) []const u8 {
+    return passphrase_stars[0..@min(len, passphrase_stars.len)];
+}
+
+/// Apply one edit to a passphrase buffer, and leave the caret where the field is
+/// actually drawing it.
+///
+/// The runtime keeps its own copy of the text it is editing. A masked field
+/// hands it stars while the real characters go in here, so the two disagree the
+/// moment anything is typed, and the runtime answers that by re-seeding the
+/// drawn caret at the end of the line. Left alone the buffer would keep
+/// inserting where the reader last clicked while the caret they can SEE sits at
+/// the end, so the next keystroke lands somewhere they are not looking. Every
+/// character is a star, so nothing about it looks wrong until the daemon says
+/// the passphrase does not match. Deletions stay in step on their own (both
+/// sides lose one glyph and neither re-seeds), so it is only insertions that
+/// have to follow the caret home.
+fn applyMaskedEdit(buf: anytype, event: canvas.TextInputEvent, masked: bool) void {
+    buf.apply(event);
+    if (!masked) return;
+    switch (event) {
+        .insert_text, .set_composition, .commit_composition => {
+            buf.selection = canvas.TextSelection.collapsed(buf.text().len);
+        },
+        else => {},
+    }
+}
 
 // 452 wide per the design, and one height for every state rather than a window
 // that resizes under the reader. A ceremony window that jumps size between its
@@ -122,7 +171,12 @@ const Model = struct {
     backup_pass: canvas.TextBuffer(128) = .{},
     backup_open: bool = false,
     backup_copied: bool = false,
-    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub", "bunker_url_buf", "bunker_len", "backup_buf", "backup_len", "backup_pass", "backup_open", "backup_copied", "backup_is_secret" };
+    /// Whether each passphrase field is showing its characters. Off on every
+    /// launch: a revealed passphrase is a thing to ask for, not a state to be
+    /// left in.
+    pass_showing: bool = false,
+    backup_pass_showing: bool = false,
+    pub const view_unbound = .{ "stage", "key_buffer", "pass_buffer", "key", "pass", "is_ncryptsec", "npub_hint", "notice", "can_import", "key_problem", "npub", "bunker_url_buf", "bunker_len", "backup_buf", "backup_len", "backup_pass", "backup_open", "backup_copied", "backup_is_secret", "pass_showing", "backup_pass_showing", "shown_pass", "shown_backup_pass" };
 
     /// Reads the daemon's bunker state. Only the URL is wanted here: approving
     /// clients and disconnecting them belong on Plaza's own settings screen,
@@ -145,6 +199,18 @@ const Model = struct {
     }
     pub fn pass(self: *const Model) []const u8 {
         return self.pass_buffer.text();
+    }
+    /// What the passphrase FIELDS draw. `pass` and `backup_pass` above are what
+    /// gets sent; these are deliberately separate, so a change to the mask can
+    /// never reach the daemon and a change to the request can never reach the
+    /// glass.
+    pub fn shown_pass(self: *const Model) []const u8 {
+        if (self.pass_showing) return self.pass_buffer.text();
+        return stars(self.pass_buffer.text().len);
+    }
+    pub fn shown_backup_pass(self: *const Model) []const u8 {
+        if (self.backup_pass_showing) return self.backup_pass.text();
+        return stars(self.backup_pass.text().len);
     }
     pub fn is_ncryptsec(self: *const Model) bool {
         return std.mem.startsWith(u8, self.key(), "ncryptsec1");
@@ -208,18 +274,23 @@ const Msg = union(enum) {
     import_done: native_sdk.EffectResponse,
     create_done: native_sdk.EffectResponse,
     status_done: native_sdk.EffectResponse,
+    /// The paste screen's poll: has a key turned up without this window's help?
+    watch_tick: native_sdk.EffectTimer,
+    watch_done: native_sdk.EffectResponse,
     bunker_done: native_sdk.EffectResponse,
     copy_bunker,
     open_backup,
     close_backup,
     backup_pass_edit: canvas.TextInputEvent,
+    toggle_pass,
+    toggle_backup_pass,
     export_encrypted,
     export_secret,
     export_done: native_sdk.EffectResponse,
     copy_backup,
     close,
 
-    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "copy_bunker", "open_backup", "close_backup", "backup_pass_edit", "export_encrypted", "export_secret", "copy_backup", "close" };
+    pub const view_unbound = .{ "key_edit", "pass_edit", "do_import", "do_create", "copy_command", "copy_bunker", "open_backup", "close_backup", "backup_pass_edit", "export_encrypted", "export_secret", "copy_backup", "close", "watch_tick", "watch_done" };
 };
 
 pub const AppUi = canvas.Ui(Msg);
@@ -303,6 +374,17 @@ fn tokensFn(model: *const Model) canvas.DesignTokens {
 
 fn boot(model: *Model, fx: *Effects) void {
     canvas.icons.registerAppIcons(&notary_icons.app_icons);
+    if (g_mode == .import_key) {
+        // One reading now to learn what was already there, then one a second,
+        // for as long as the reader is still on the paste screen.
+        requestWatch(fx);
+        fx.startTimer(.{
+            .key = watch_timer_key,
+            .interval_ms = watch_interval_ms,
+            .mode = .repeating,
+            .on_fire = Effects.timerMsg(.watch_tick),
+        });
+    }
     if (g_mode == .create_key) {
         model.stage = .minting;
         requestCreate(model, fx);
@@ -337,6 +419,48 @@ fn requestCreate(model: *Model, fx: *Effects) void {
         .body = "{\"method\":\"create\"}",
         .on_response = Effects.responseMsg(.create_done),
     });
+}
+
+/// Whether the daemon already held a key when this window opened, and whether
+/// that has been established yet.
+///
+/// The distinction is the whole safety of the watch. A key sitting at `/pubkey`
+/// says nothing about where it came from: it could be the one the reader is
+/// about to type in a terminal, or one left over from a session that did not
+/// shut down cleanly. Announcing the second as a finished import would tell
+/// somebody they had imported a stranger's key. So only the TRANSITION counts,
+/// and the first reading is spent finding out which side of it this window
+/// opened on.
+var g_watch_baseline_known = false;
+var g_key_present_at_open = false;
+
+/// Asks the daemon whether it is holding a key yet, for the paste screen.
+fn requestWatch(fx: *Effects) void {
+    if (g_token_len == 0) return;
+    var url_buf: [48]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{daemon_port}) catch return;
+    var auth_buf: [160]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token()}) catch return;
+    fx.fetch(.{
+        .key = watch_key,
+        .url = url,
+        .method = .GET,
+        .headers = &.{.{ .name = "Authorization", .value = auth }},
+        .on_response = Effects.responseMsg(.watch_done),
+    });
+}
+
+/// What one reading of `/pubkey` means for a window still on the paste screen.
+///
+/// Split out from the effect so the rule can be exercised without a daemon: it
+/// is the piece that decides whether somebody is told their key arrived.
+const Watch = enum { note_baseline, arrived, keep_waiting };
+
+fn watchVerdict(holds_key: bool, baseline_known: bool, present_at_open: bool) Watch {
+    if (!baseline_known) return .note_baseline;
+    // Already there when this window opened, so its appearance now is not news.
+    if (present_at_open) return .keep_waiting;
+    return if (holds_key) .arrived else .keep_waiting;
 }
 
 /// Asks the daemon for the bunker link, if it is serving one.
@@ -414,6 +538,14 @@ fn requestStatus(model: *Model, fx: *Effects) void {
     });
 }
 
+/// Whether a `/pubkey` body actually carries one, without touching the model.
+/// The watch asks this once a second, so it owns what it parses.
+fn bodyHasPubkey(body: []const u8) bool {
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, std.heap.page_allocator, body) catch return false;
+    defer parsed.deinit();
+    return parsed.value.pubkey.len == 64;
+}
+
 /// Reads the pubkey the daemon reports back and remembers it as an npub. Returns
 /// false when the body is not a pubkey, which is the daemon answering something
 /// this window does not understand.
@@ -438,7 +570,8 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.key_buffer.apply(e);
             model.msg_len = 0;
         },
-        .pass_edit => |e| model.pass_buffer.apply(e),
+        .pass_edit => |e| applyMaskedEdit(&model.pass_buffer, e, !model.pass_showing),
+        .toggle_pass => model.pass_showing = !model.pass_showing,
         .copy_command => fx.writeClipboard(.{ .key = copy_key, .text = import_command }),
         .open_backup => model.backup_open = true,
         .close_backup => {
@@ -451,7 +584,8 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.backup_pass.set("");
             model.backup_copied = false;
         },
-        .backup_pass_edit => |e| model.backup_pass.apply(e),
+        .backup_pass_edit => |e| applyMaskedEdit(&model.backup_pass, e, !model.backup_pass_showing),
+        .toggle_backup_pass => model.backup_pass_showing = !model.backup_pass_showing,
         .export_encrypted => requestExport(model, fx, false),
         .export_secret => requestExport(model, fx, true),
         .export_done => |response| {
@@ -518,6 +652,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // daemon now.
             model.key_buffer.clear();
             model.pass_buffer.clear();
+            model.pass_showing = false;
             if (response.outcome != .ok or response.status != 200) {
                 model.stage = .failed;
                 if (response.status == 409)
@@ -559,6 +694,35 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             model.stage = .holding;
+        },
+        .watch_tick => |t| {
+            if (t.outcome != .fired or model.stage != .paste) return;
+            requestWatch(fx);
+        },
+        .watch_done => |response| {
+            // A daemon that is not answering, or is answering something else, is
+            // not a key arriving. The paste field stays where it is; the reader
+            // has a working way to get a key in either way.
+            const holds_key = response.outcome == .ok and response.status == 200 and
+                bodyHasPubkey(response.body);
+            switch (watchVerdict(holds_key, g_watch_baseline_known, g_key_present_at_open)) {
+                .note_baseline => {
+                    g_watch_baseline_known = true;
+                    g_key_present_at_open = holds_key;
+                },
+                .keep_waiting => {},
+                .arrived => {
+                    if (model.stage != .paste) return;
+                    if (!adoptPubkey(model, response.body)) return;
+                    // Whatever was half-typed here is not the key that got in,
+                    // and it is still an nsec sitting in a field.
+                    model.key_buffer.clear();
+                    model.pass_buffer.clear();
+                    model.pass_showing = false;
+                    model.stage = .imported;
+                    fx.cancelTimer(watch_timer_key);
+                },
+            }
         },
         .close => fx.closeWindow("main"),
     }
@@ -664,13 +828,17 @@ fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
                 .style = .{ .background = ink.field_bg, .border = ink.field_border, .radius = 9, .stroke_width = 1 },
             }, .{}),
             if (model.is_ncryptsec())
-                ui.el(.textarea, .{
-                    .text = model.pass(),
-                    .placeholder = "Passphrase",
-                    .on_input = AppUi.inputMsg(.pass_edit),
-                    .height = 36,
-                    .style = .{ .background = ink.field_bg, .border = ink.field_border, .radius = 9, .stroke_width = 1 },
-                }, .{})
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.el(.textarea, .{
+                        .text = model.shown_pass(),
+                        .placeholder = "Passphrase",
+                        .on_input = AppUi.inputMsg(.pass_edit),
+                        .height = 36,
+                        .grow = 1,
+                        .style = .{ .background = ink.field_bg, .border = ink.field_border, .radius = 9, .stroke_width = 1 },
+                    }, .{}),
+                    revealButton(ui, model.pass_showing, .toggle_pass),
+                })
             else if (hint.len > 0)
                 validKeyBox(ui, hint)
             else if (problem.len > 0)
@@ -689,6 +857,23 @@ fn pasteView(ui: *AppUi, model: *const Model) AppUi.Node {
         })),
         ui.spacer(1),
     });
+}
+
+/// The eye beside a passphrase field.
+///
+/// Hidden is the default and the reveal is one press away, which is the pair a
+/// passphrase field needs: nobody can check what they typed through a row of
+/// stars, and nobody should have to trust a room to type one.
+fn revealButton(ui: *AppUi, showing: bool, msg: Msg) AppUi.Node {
+    return ui.el(.button, .{
+        .width = 34,
+        .height = 34,
+        .icon = "eye",
+        .variant = if (showing) .secondary else .ghost,
+        .on_press = msg,
+        .style = .{ .foreground = if (showing) ink.title else ink.footnote },
+        .semantics = .{ .role = .button, .label = if (showing) "Hide the passphrase" else "Show the passphrase", .focusable = true },
+    }, .{});
 }
 
 /// The live confirmation: which identity this key signs as, before it is handed
@@ -938,14 +1123,18 @@ fn backupSection(ui: *AppUi, model: *const Model) AppUi.Node {
             .{ .wrap = true, .style = .{ .foreground = ink.body } },
             &.{.{ .text = "A passphrase gives you an encrypted copy, which is the one to keep: it is useless to anyone without that passphrase. Without one you get the key itself, which is not.", .scale = px(11) }},
         ),
-        ui.el(.textarea, .{
-            .text = model.backup_pass.text(),
-            .placeholder = "Passphrase for the encrypted copy",
-            .on_input = AppUi.inputMsg(.backup_pass_edit),
-            // Tall enough for its own placeholder. At 30 the descenders were
-            // shaved off and the line read as a rendering fault.
-            .height = 38,
-        }, .{}),
+        ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.el(.textarea, .{
+                .text = model.shown_backup_pass(),
+                .placeholder = "Passphrase for the encrypted copy",
+                .on_input = AppUi.inputMsg(.backup_pass_edit),
+                // Tall enough for its own placeholder. At 30 the descenders were
+                // shaved off and the line read as a rendering fault.
+                .height = 38,
+                .grow = 1,
+            }, .{}),
+            revealButton(ui, model.backup_pass_showing, .toggle_backup_pass),
+        }),
         ui.row(.{ .gap = 8 }, .{
             ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg.export_encrypted }, "Encrypted copy"),
             ui.button(.{ .size = .sm, .on_press = Msg.export_secret }, "The key itself"),
@@ -1119,6 +1308,93 @@ fn hasControl(widget: canvas.Widget, label: []const u8) bool {
         if (hasControl(child, label)) return true;
     }
     return false;
+}
+
+test "the paste screen notices a key that arrived without it" {
+    // The terminal card on that screen hands out a command that puts a key
+    // straight into the daemon. Plaza notices within a tick and signs in; this
+    // window did not, so the reader ended up with a signed-in Plaza behind a
+    // window still asking them to paste an nsec.
+    //
+    // Only the TRANSITION counts. A key already sitting at /pubkey when this
+    // window opened could be one left over from a session that did not shut
+    // down cleanly, and announcing that as a finished import would tell somebody
+    // they had imported a stranger's key.
+    try testing.expectEqual(Watch.note_baseline, watchVerdict(false, false, false));
+    try testing.expectEqual(Watch.note_baseline, watchVerdict(true, false, false));
+
+    // Opened with nothing there, and then something arrives: that is the case
+    // this exists for.
+    try testing.expectEqual(Watch.keep_waiting, watchVerdict(false, true, false));
+    try testing.expectEqual(Watch.arrived, watchVerdict(true, true, false));
+
+    // Opened with a key already there: nothing it does later is news.
+    try testing.expectEqual(Watch.keep_waiting, watchVerdict(true, true, true));
+    try testing.expectEqual(Watch.keep_waiting, watchVerdict(false, true, true));
+}
+
+test "a passphrase field draws stars, and the daemon still gets the passphrase" {
+    var m = Model{};
+    m.pass_buffer.apply(.{ .insert_text = "hunter2" });
+    m.backup_pass.apply(.{ .insert_text = "hunter2" });
+
+    // Hidden on a fresh model: nothing has to be pressed to get there.
+    try testing.expect(!m.pass_showing);
+    try testing.expect(!m.backup_pass_showing);
+    try testing.expectEqualStrings("*******", m.shown_pass());
+    try testing.expectEqualStrings("*******", m.shown_backup_pass());
+
+    // What gets sent is untouched. This is the half that would break silently if
+    // the mask were ever applied to the buffer instead of to the drawing.
+    try testing.expectEqualStrings("hunter2", m.pass());
+    try testing.expectEqualStrings("hunter2", m.backup_pass.text());
+
+    m.pass_showing = true;
+    m.backup_pass_showing = true;
+    try testing.expectEqualStrings("hunter2", m.shown_pass());
+    try testing.expectEqualStrings("hunter2", m.shown_backup_pass());
+}
+
+test "the mask is exactly as long as what it covers" {
+    // Not cosmetic. The runtime stamps caret and selection offsets into the
+    // string it DREW, and those offsets are replayed onto the buffer holding the
+    // real text. They only line up while the two are the same length, so a
+    // three-byte bullet in place of the star would put every click on the wrong
+    // character. Multibyte input is the case that proves the rule.
+    var m = Model{};
+    m.pass_buffer.apply(.{ .insert_text = "hüntér2" });
+    try testing.expectEqual(m.pass().len, m.shown_pass().len);
+    m.backup_pass.apply(.{ .insert_text = "hüntér2" });
+    try testing.expectEqual(m.backup_pass.text().len, m.shown_backup_pass().len);
+}
+
+test "typing into a hidden field leaves the caret where the field draws it" {
+    // The runtime edits its OWN copy of what it drew. Once that copy is stars
+    // and this one is characters, an insert makes them disagree and the runtime
+    // puts the drawn caret back at the end of the line. If this buffer kept its
+    // own idea of where it was, the next keystroke would land somewhere the
+    // reader is not looking, and with every character a star the only symptom
+    // would be the daemon refusing a passphrase they typed correctly.
+    var m = Model{};
+    m.pass_buffer.apply(.{ .insert_text = "abcdef" });
+    m.pass_buffer.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+
+    applyMaskedEdit(&m.pass_buffer, .{ .insert_text = "Z" }, true);
+    try testing.expectEqualStrings("abcZdef", m.pass());
+    try testing.expectEqual(@as(usize, 7), m.pass_buffer.selection.focus);
+
+    // Revealed, the drawn text IS this text, so the runtime keeps the caret and
+    // this buffer must keep it too: ordinary mid-string editing comes back.
+    m.pass_buffer.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+    applyMaskedEdit(&m.pass_buffer, .{ .insert_text = "Y" }, false);
+    try testing.expectEqualStrings("abcYZdef", m.pass());
+    try testing.expectEqual(@as(usize, 4), m.pass_buffer.selection.focus);
+
+    // Deleting never re-seeds: both sides lose one glyph, so the caret stays.
+    m.pass_buffer.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+    applyMaskedEdit(&m.pass_buffer, .delete_backward, true);
+    try testing.expectEqualStrings("abYZdef", m.pass());
+    try testing.expectEqual(@as(usize, 2), m.pass_buffer.selection.focus);
 }
 
 test "a finished ceremony waits for the reader" {
