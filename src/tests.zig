@@ -3547,7 +3547,7 @@ test "a reply block's rail paints too" {
         var parent: main.Note = undefined;
         var of: main.Model = .{};
         fn row(ui: *main.AppUi) main.AppUi.Node {
-            return main.replyBlockForTest(ui, &of, &block, [_]u8{0} ** 32, true, true);
+            return main.replyBlockForTest(ui, &block, [_]u8{0} ** 32, true, true);
         }
     };
     const body = "A reply long enough to wrap past its own disc, so the rail below that disc has somewhere to run.";
@@ -6418,7 +6418,7 @@ test "a full follow list rebuilds the feed fast enough to do it every second" {
     }
 }
 
-test "the note menu says which way it goes, and refuses when it cannot know" {
+test "a note's follow entry says which way it goes, and refuses when it cannot know" {
     // The one control that writes a contact list. Every state it can be in is
     // asserted here, because the harness cannot open a thread by pressing a row
     // (true on main too), and because the dangerous state is the one that must
@@ -6435,7 +6435,6 @@ test "the note menu says which way it goes, and refuses when it cannot know" {
     model.thread_root = threadNote(0xAA, 100, 0);
     model.thread_root.id = 1;
     model.thread_root.pubkey = author;
-    model.note_menu = model.thread_root.id;
 
     // A guest: the menu offers Follow, and pressing it raises the join sheet
     // rather than failing quietly.
@@ -6443,45 +6442,52 @@ test "the note menu says which way it goes, and refuses when it cannot know" {
     main.forgetFollowsForTest();
     main.forgetOwnRecordAnswersForTest();
     {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "Follow") != null);
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        try testing.expect(menu.label("Follow") != null);
     }
 
-    // Signed in, but nobody has said who they follow yet: the menu says what it
-    // is waiting for instead of offering a press.
+    // Signed in, but nobody has said who they follow yet: the entry says what it
+    // is waiting for, and refuses the press.
     main.setIdentityForTest([_]u8{0x66} ** 32);
     main.setIdentityMintedForTest(false);
     defer main.clearIdentityForTest();
     {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "Looking for your follow list…") != null);
-        try testing.expect(findAnyText(tree.root, "Unfollow") == null);
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        const waiting = menu.label("Looking for your follow list…") orelse return error.NotWaiting;
+        try testing.expect(!waiting.enabled);
+        try testing.expect(menu.label("Unfollow") == null);
     }
 
     // A key minted here has no history to lose: Follow.
     main.resetRelaysForTest();
     main.setIdentityMintedForTest(true);
     {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "Follow") != null);
-        try testing.expect(findAnyText(tree.root, "Looking for your follow list…") == null);
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        try testing.expect(menu.label("Follow") != null);
+        try testing.expect(menu.label("Looking for your follow list…") == null);
     }
 
-    // Already following: the menu offers the way back out.
+    // Already following: the way back out is offered.
     var list: [1][32]u8 = undefined;
     list[0] = author;
     _ = main.setFollowsForTest(&list, 1_800_000_000);
     {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "Unfollow") != null);
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        try testing.expect(menu.label("Unfollow") != null);
     }
 
     // Their own note: no follow control at all, in either direction.
     model.thread_root.pubkey = main.activePubkeyForTest().?;
     {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "This is you") != null);
-        try testing.expect(findAnyText(tree.root, "Unfollow") == null);
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        const mine = menu.label("This is you") orelse return error.NotSelf;
+        try testing.expect(!mine.enabled);
+        try testing.expect(menu.label("Unfollow") == null);
     }
 }
 
@@ -6497,7 +6503,6 @@ test "a guest pressing follow is offered the join sheet, not a silent failure" {
     var fx: main.EffectsForTest = undefined;
     main.update(&model, Msg{ .follow_author = 0 }, &fx);
     try testing.expect(model.joining);
-    try testing.expectEqual(@as(i64, 0), model.note_menu);
 }
 
 test "a contact list arriving from a relay becomes the feed's scope" {
@@ -8287,6 +8292,117 @@ test "the feed draws via without spending a node on it" {
     try testing.expectEqual(nodes_with, countNodes(after.root));
 }
 
+test "the time and via line is one line, whatever the note says it was written with" {
+    // "11h via Damus Notedeck" used to wrap. The second line hung into the
+    // handle's row, and because a row's height and the width this box is
+    // measured at are settled in different passes, scrolling flickered it
+    // between two lines and one, sometimes losing the second line entirely.
+    //
+    // Asserted as the FLAG rather than as a measured height, and that is an
+    // admitted limit rather than a shortcut: this harness lays out the real tree
+    // but does not carry the real glyph metrics (see the header of painted.zig),
+    // so a height assertion here answers a question about a font that is not the
+    // one the window uses. It passed with the wrap put back, which is how that
+    // was found out. The flag is the whole of the decision, so the flag is what
+    // is guarded here; the pixels were checked by rendering the app.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const ev = nostr.event.Event{
+        .id = [_]u8{0xD1} ** 32,
+        .pubkey = [_]u8{0x52} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = &.{&.{ "client", "Damus Notedeck" }},
+        .content = "wrapped once",
+        .sig = [_]u8{0} ** 64,
+    };
+    model.notes[0] = main.noteFrom(ev, 1_800_003_600);
+    model.notes_len = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    var found = false;
+    for (p.layout.nodes) |node| {
+        const w = node.widget;
+        if (w.kind != .text or w.spans.len < 2) continue;
+        if (std.mem.indexOf(u8, w.text, " via ") == null) continue;
+        found = true;
+        if (!w.text_no_wrap) {
+            std.debug.print("the meta line \"{s}\" is allowed to wrap again\n", .{w.text});
+            return error.MetaLineCanWrap;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "the feed asks about the notes it is SHOWING, not only the ones that arrived" {
+    // The watch list was built purely from events coming down the wire, and the
+    // feed's own REQ carries a `since` off the newest stored note. So on any
+    // launch but the first, the feed draws notes nobody has asked a relay about
+    // and every one of them reads zero replies, zero reposts, zero likes and
+    // zero sats for the session. A guest saw it worst: a starter-pack feed is
+    // nearly all store once it has been read once, which made it look like
+    // guests do not get counts at all.
+    var notes: [3]main.Note = undefined;
+    for (&notes, 0..) |*n, i| {
+        n.* = main.Note{ .created_at = 1_800_000_000 };
+        n.id = @intCast(100 + i);
+        n.event_id = [_]u8{@intCast(0xA0 + i)} ** 32;
+    }
+    main.publishFeedWatchForTest(notes[0..]);
+
+    // A socket that has heard nothing still has the whole visible feed to ask
+    // about. This is the case that used to watch nothing at all.
+    var ids: [main.engagementWatchCapForTest]i64 = undefined;
+    var hex: [main.engagementWatchCapForTest][64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 3), main.mergeFeedWatchForTest(&ids, &hex, 0));
+    try testing.expectEqual(@as(i64, 100), ids[0]);
+    try testing.expectEqualStrings("a0" ** 32, &hex[0]);
+
+    // What the socket already knew is kept, and nothing is asked about twice.
+    ids[0] = 100;
+    hex[0] = [_]u8{'z'} ** 64;
+    try testing.expectEqual(@as(usize, 3), main.mergeFeedWatchForTest(&ids, &hex, 1));
+
+    // A redraw of the same feed is not news. Every tick rebuilds it, and
+    // re-asking every relay four times a second is a different bug.
+    const gen = main.feedWatchGenerationForTest();
+    main.publishFeedWatchForTest(notes[0..]);
+    try testing.expectEqual(gen, main.feedWatchGenerationForTest());
+
+    // A feed that actually moved is.
+    main.publishFeedWatchForTest(notes[0..2]);
+    try testing.expect(main.feedWatchGenerationForTest() != gen);
+}
+
+test "the account menu offers no way to sign out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The chip this menu hangs off says how many relays are answering and
+    // whether the signer is up. Ending the session is not that, and this row
+    // never ended one anyway: it opened Settings with the confirmation showing,
+    // which is where the control lives and where it stays.
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.menu = .account;
+
+    const p = try painted.Painted.render(arena, &model);
+    // The row that stays, so a menu that failed to open cannot pass this.
+    try testing.expect(findAnyText(p.tree.root, "Settings…") != null);
+    if (findAnyText(p.tree.root, "Sign out") != null) {
+        std.debug.print("the account menu still offers Sign out\n", .{});
+        return error.SignOutStillThere;
+    }
+}
+
 test "nothing that calls itself a button is dead" {
     // The recurring failure in this app is not a broken control, it is a control
     // that LOOKS live and does nothing: a badge saying "W" while filters still
@@ -8337,16 +8453,13 @@ test "nothing that calls itself a button is dead" {
             }
         }.f },
         .{
-            .name = "note menu",
+            .name = "a thread",
             .prepare = struct {
                 fn f(m: *main.Model) void {
                     m.stage = .ready;
                     m.viewing_thread = 1;
                     m.thread_root = threadNote(0xAA, 100, 0);
                     m.thread_root.id = 1;
-                    // The state the first version of this test could not reach, and
-                    // where its invariant was already false.
-                    m.note_menu = m.thread_root.id;
                 }
             }.f,
         },
@@ -8870,6 +8983,40 @@ fn pressableByLabel(tree: AppUi.Tree, widget: canvas.Widget, label: []const u8) 
         if (pressableByLabel(tree, child, label)) return true;
     }
     return false;
+}
+
+/// The right-click items the first note in the tree offers, and the message
+/// behind one of them by label.
+///
+/// The note's actions used to live in an anchored surface behind an ellipsis, so
+/// tests reached them by opening that surface and looking for rendered text.
+/// There is one list now and the runtime presents it, so what a test can see is
+/// the declared items rather than drawn rows.
+const ContextItems = struct {
+    id: canvas.ObjectId,
+    items: []const canvas.WidgetContextMenuItem,
+
+    fn label(self: ContextItems, want: []const u8) ?canvas.WidgetContextMenuItem {
+        for (self.items) |item| {
+            if (std.mem.eql(u8, item.label, want)) return item;
+        }
+        return null;
+    }
+
+    fn msgFor(self: ContextItems, tree: AppUi.Tree, want: []const u8) ?Msg {
+        for (self.items, 0..) |item, i| {
+            if (std.mem.eql(u8, item.label, want)) return tree.msgForContextMenu(self.id, i);
+        }
+        return null;
+    }
+};
+
+fn noteContext(p: painted.Painted) ?ContextItems {
+    for (p.layout.nodes) |node| {
+        if (node.widget.context_menu.len == 0) continue;
+        return .{ .id = node.widget.id, .items = node.widget.context_menu };
+    }
+    return null;
 }
 
 /// The message behind the press on the widget carrying this accessibility label.
@@ -11001,9 +11148,13 @@ test "every verb people expect is under a note" {
     const arena = arena_state.allocator();
 
     // Show them all, including the ones with nothing behind them yet: a row
-    // missing repost or bookmark reads as a client that lost them, not one that
-    // has not written them. None of the unfinished ones takes a press, so
-    // nothing here answers a click with silence.
+    // missing repost reads as a client that lost it, not one that has not
+    // written it. None of the unfinished ones takes a press, so nothing here
+    // answers a click with silence.
+    //
+    // Four, not six. A bookmark that could only ever disappoint whoever pressed
+    // it is not a verb people expect, and the ellipsis beside it opened a menu a
+    // right-click already opens.
     main.setIdentityForTest([_]u8{0x77} ** 32);
     defer main.clearIdentityForTest();
 
@@ -11015,7 +11166,7 @@ test "every verb people expect is under a note" {
 
     const p = try painted.Painted.render(arena, &model);
     var found: usize = 0;
-    for ([_][]const u8{ "reply", "repeat", "like", "zap", "bookmark", "ellipsis" }) |name| {
+    for ([_][]const u8{ "reply", "repeat", "like", "zap" }) |name| {
         for (p.layout.nodes) |node| {
             // Two channels, because the SDK has two icon builders: `appIcon`
             // puts the name in `Widget.icon` (so a missing app glyph draws the
@@ -11032,7 +11183,18 @@ test "every verb people expect is under a note" {
             return error.MissingVerb;
         }
     }
-    try testing.expectEqual(@as(usize, 6), found);
+    try testing.expectEqual(@as(usize, 4), found);
+
+    // And the two that went are really gone, by the same two channels.
+    for ([_][]const u8{ "bookmark", "ellipsis" }) |name| {
+        for (p.layout.nodes) |node| {
+            const by_channel = node.widget.icon.len > 0 and std.mem.eql(u8, node.widget.icon, name);
+            const by_text = node.widget.kind == .icon and std.mem.eql(u8, node.widget.text, name);
+            if (!by_channel and !by_text) continue;
+            std.debug.print("\"{s}\" is still drawn under a note\n", .{name});
+            return error.RemovedVerbStillThere;
+        }
+    }
 }
 
 // ---- P10: a quoted picture ---------------------------------------------------
@@ -11350,51 +11512,37 @@ fn oneNoteFeed(model: *Model) void {
     model.notes_len = 1;
 }
 
-test "the last verb under a post opens that post's menu, and only that post's" {
+test "no post carries a bookmark or an ellipsis" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Both were drawn on every row and neither did anything a reader wanted.
+    // The bookmark had nothing behind it at all, and the ellipsis opened a menu
+    // carrying exactly what a right-click on the row already carries, so it was
+    // a slot and a hit target spent on a second door to one room.
     main.setIdentityForTest([_]u8{0x77} ** 32);
     defer main.clearIdentityForTest();
 
     var model = main.initialModel();
     oneNoteFeed(&model);
-    // A second note, so "opens the menu" can be told apart from "opens every
-    // menu": the state behind this was one shared bool until every post had one.
-    model.notes[1] = main.Note{ .created_at = 1_799_999_000 };
-    model.notes[1].id = 99;
-    model.notes[1].pubkey = [_]u8{0x3c} ** 32;
-    model.notes_len = 2;
 
-    {
-        const p = try painted.Painted.render(arena, &model);
-        const msg = pressMsgByLabel(p.tree, "More") orelse return error.NoMoreControl;
-        switch (msg) {
-            .toggle_note_menu => |id| try testing.expectEqual(@as(i64, 4242), id),
-            else => {
-                std.debug.print("the more verb sends {s}\n", .{@tagName(msg)});
-                return error.WrongMessage;
-            },
+    const p = try painted.Painted.render(arena, &model);
+    for (p.layout.nodes) |node| {
+        const w = node.widget;
+        if (std.mem.eql(u8, w.semantics.label, "More")) return error.EllipsisStillThere;
+        if (w.icon.len > 0 and std.mem.eql(u8, w.icon, "bookmark")) return error.BookmarkStillThere;
+    }
+
+    // And what the ellipsis used to reach is still reachable, by the door that
+    // was always there.
+    const menu = noteContext(p) orelse return error.NoContextMenu;
+    for ([_][]const u8{ "Copy note address", "Quote", "Copy text", "Open on the web" }) |want| {
+        if (menu.label(want) == null) {
+            std.debug.print("a right-click offers no \"{s}\"\n", .{want});
+            return error.MissingContextItem;
         }
-        // Closed, so nothing of the menu is on screen.
-        try testing.expect(findAnyText(p.tree.root, "Copy note address") == null);
     }
-
-    // Open the FIRST note's menu.
-    var fx: main.EffectsForTest = undefined;
-    main.update(&model, Msg{ .toggle_note_menu = 4242 }, &fx);
-    {
-        const p = try painted.Painted.render(arena, &model);
-        // Exactly one menu on screen, not one per row.
-        try testing.expectEqual(@as(usize, 1), countAnyText(p.tree.root, "Copy note address"));
-        try testing.expect(findAnyText(p.tree.root, "Copy text") != null);
-        try testing.expect(findAnyText(p.tree.root, "Open on the web") != null);
-    }
-
-    // The same press closes it again.
-    main.update(&model, Msg{ .toggle_note_menu = 4242 }, &fx);
-    try testing.expectEqual(@as(i64, 0), model.note_menu);
 }
 
 test "a post's address is in its menu, not under its body" {
@@ -11422,11 +11570,11 @@ test "a post's address is in its menu, not under its body" {
         }
     }
 
-    model.note_menu = model.thread_root.id;
     {
         const p = try painted.Painted.render(arena, &model);
-        const msg = pressMsgByLabel(p.tree, "Copy note address") orelse {
-            std.debug.print("the menu offers no way to copy the address\n", .{});
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        const msg = menu.msgFor(p.tree, "Copy note address") orelse {
+            std.debug.print("a right-click offers no way to copy the address\n", .{});
             return error.NoCopyAddress;
         };
         switch (msg) {
@@ -11468,31 +11616,6 @@ test "every post answers a right-click with the same actions as its menu" {
         }
     }
     try testing.expect(rows >= 1);
-}
-
-test "a note has exactly one menu trigger" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // The state is per NOTE, not per control, so a second trigger keyed on the
-    // same note does not toggle between them: it opens both menus at once, one
-    // over the note and one over whatever is below it. Caught live.
-    main.setIdentityForTest([_]u8{0x77} ** 32);
-    defer main.clearIdentityForTest();
-
-    var model = main.initialModel();
-    oneNoteFeed(&model);
-    model.viewing_thread = 1;
-    model.thread_root = model.notes[0];
-    model.note_menu = model.thread_root.id;
-
-    const p = try painted.Painted.render(arena, &model);
-    const triggers = countAnyText(p.tree.root, "Copy note address");
-    if (triggers != 1) {
-        std.debug.print("{d} menus open over one note\n", .{triggers});
-        return error.TwoMenus;
-    }
 }
 
 test "the status bar is on screen wherever the reader is" {
@@ -11601,14 +11724,14 @@ test "a new account is offered Follow on the starter pack, not Unfollow" {
     model.notes[0].id = 77;
     model.notes[0].pubkey = packed_in;
     model.notes_len = 1;
-    model.note_menu = 77;
 
     const p = try painted.Painted.render(arena, &model);
-    if (findAnyText(p.tree.root, "Unfollow") != null) {
+    const menu = noteContext(p) orelse return error.NoContextMenu;
+    if (menu.label("Unfollow") != null) {
         std.debug.print("a starter-pack author is offered Unfollow\n", .{});
         return error.OfferedUnfollow;
     }
-    const msg = pressMsgByLabel(p.tree, "Follow") orelse {
+    const msg = menu.msgFor(p.tree, "Follow") orelse {
         std.debug.print("no way to follow a starter-pack author\n", .{});
         return error.NoFollowOffer;
     };
@@ -11716,9 +11839,10 @@ test "dismissing a surface clears the state that opened it" {
     // reads as a control that does not work.
     //
     // Found live on the note menu, which sent `close_menu` (the chrome's state)
-    // while its own open flag is `note_menu`, and then on the mention picker,
-    // which had no open flag at all. Both had the same shape: the surface is on
-    // screen after the dismiss it declared.
+    // while its own open flag was its own, and then on the mention picker, which
+    // had no open flag at all. Both had the same shape: the surface is on screen
+    // after the dismiss it declared. That note menu is gone (a right-click does
+    // its job now), so the picker is what stands guard over the shape.
     main.setIdentityForTest([_]u8{0x77} ** 32);
     defer main.clearIdentityForTest();
 
@@ -11728,15 +11852,6 @@ test "dismissing a surface clears the state that opened it" {
         open: *const fn (*Model) void,
     };
     const cases = [_]Case{
-        .{ .name = "the note menu", .text = "Copy note address", .open = struct {
-            fn f(m: *Model) void {
-                m.stage = .ready;
-                m.notes[0] = main.Note{ .created_at = 1_800_000_000 };
-                m.notes[0].id = 4242;
-                m.notes_len = 1;
-                m.note_menu = 4242;
-            }
-        }.f },
         .{
             .name = "the mention picker",
             .text = "inserts a nostr: link, not just a name",
@@ -12372,7 +12487,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // this fails until the floor moves with it.
     const floor = @import("window_floor").manifest_min_width;
 
-    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox, menu_note };
+    const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox };
 
     main.clearLinkPreviewsForTest();
     defer main.clearLinkPreviewsForTest();
@@ -12554,7 +12669,6 @@ test "no view paints past the right edge at the narrowest the window can be" {
                 main.setPlaceLinkForTest(.unreachable_relay);
                 main.setRailForTest(true);
             },
-            .menu_note => model.note_menu = model.notes[0].id,
         }
 
         const p = try painted.Painted.renderAt(arena_state.allocator(), model, floor, floor);
@@ -12598,7 +12712,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // state ever stops reaching its screen this fails here rather than
         // reporting a clean sweep of a screen it never drew.
         switch (st) {
-            .places_rail, .place_visiting, .place_about, .place_leaving, .menu_scope, .menu_relays, .menu_account, .menu_outbox, .menu_note => {
+            .places_rail, .place_visiting, .place_about, .place_leaving, .menu_scope, .menu_relays, .menu_account, .menu_outbox => {
                 if (p.layout.nodes.len <= base_nodes) {
                     std.debug.print(
                         "\n{s} rendered {d} nodes and the feed under it renders {d}: the menu never opened, so this state measures nothing\n",
@@ -16775,6 +16889,130 @@ test "hiding a count stops the app asking relays for it" {
     // And back, so this is a preference rather than a one-way door.
     main.setHidden(.reaction_counts, false);
     try testing.expectEqualSlices(u16, &.{ 1, 6, 7 }, main.engagementKindsForTest());
+}
+
+test "a thread's tallies go away with the counts, rather than reading zero" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+    model.viewing_thread = 1;
+    model.thread_root = model.notes[0];
+    // The feed obeyed these switches and the thread did not: somebody who
+    // turned every count off watched the feed lose its numbers, opened a note,
+    // and got "0 replies 0 reposts 0 likes 0 sats" across the top of it. Four
+    // statements about the note, all four false, in the register the app uses
+    // for facts.
+    const rules_with_stats = blk: {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(findTally(p.tree.root, "replies"));
+        break :blk countKind(p.tree.root, .separator);
+    };
+
+    main.setHidden(.reply_counts, true);
+    main.setHidden(.repost_counts, true);
+    main.setHidden(.reaction_counts, true);
+    main.setHidden(.zap_totals, true);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        // A tally, not any text carrying the word: "Show 3 more replies" is a
+        // control and stays. A tally reads "<number> <noun>".
+        for ([_][]const u8{ "replies", "reposts", "likes", "sats" }) |word| {
+            if (findTally(p.tree.root, word)) {
+                std.debug.print("the thread still tallies \"{s}\" with its counts hidden\n", .{word});
+                return error.TallyStillThere;
+            }
+        }
+        // And the band goes with them. Two rules with nothing between them is a
+        // gap that reads as something failing to load.
+        if (countKind(p.tree.root, .separator) >= rules_with_stats) {
+            std.debug.print("the tally band is empty rather than gone\n", .{});
+            return error.EmptyBandLeftBehind;
+        }
+    }
+
+    // One back on: that one alone, and no band of zeroes around it.
+    main.setHidden(.reply_counts, false);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(findTally(p.tree.root, "replies"));
+        try testing.expect(!findTally(p.tree.root, "sats"));
+    }
+}
+
+fn countKind(widget: canvas.Widget, kind: canvas.WidgetKind) usize {
+    var n: usize = if (widget.kind == kind) 1 else 0;
+    for (widget.children) |child| n += countKind(child, kind);
+    return n;
+}
+
+/// A tally line: a number, a space, then the noun. Distinguishes "12 replies"
+/// from the "Show 3 more replies" control, which is not a count of anything and
+/// stays whatever the switches say.
+fn findTally(widget: canvas.Widget, noun: []const u8) bool {
+    if (widget.kind == .text and widget.text.len > 0 and std.ascii.isDigit(widget.text[0])) {
+        if (std.mem.endsWith(u8, widget.text, noun)) return true;
+    }
+    for (widget.children) |child| {
+        if (findTally(child, noun)) return true;
+    }
+    return false;
+}
+
+test "turning every verb off leaves no band where the row was" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+
+    const with_verbs = try painted.Painted.render(arena, &model);
+    try testing.expect(countKind(with_verbs.tree.root, .icon) > 0);
+    const tall = noteCardHeight(with_verbs);
+    try testing.expect(tall > 0);
+
+    // The row used to be four verbs, a bookmark and an ellipsis, so switching
+    // the four off still left two glyphs holding it open. With those gone it
+    // empties completely, and an empty row is a band of nothing under every
+    // note: the gap above it belongs to the verbs and goes with them.
+    for ([_]main.Hideable{ .replies, .reposts, .reactions, .zaps }) |what| main.setHidden(what, true);
+    const without = try painted.Painted.render(arena, &model);
+    const short = noteCardHeight(without);
+    // The row is 30px and the gap above it is 10. Dropping only the row leaves
+    // the gap, which is the dead band: 40 is both of them going together.
+    const verbs_and_their_gap: f32 = 40;
+    if (tall - short < verbs_and_their_gap) {
+        std.debug.print(
+            "a note is {d:.1}px with its verbs and {d:.1}px without: {d:.1}px of the row is still reserved\n",
+            .{ tall, short, verbs_and_their_gap - (tall - short) },
+        );
+        return error.DeadBandLeftBehind;
+    }
+}
+
+/// The height of the note card, which is what a reader sees shrink when the row
+/// under it goes away. The tallest `list_item` on screen: the feed's rows are
+/// that kind, and so are several one-line things in the chrome.
+fn noteCardHeight(p: painted.Painted) f32 {
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind != .data_row) continue;
+        if (!std.mem.eql(u8, node.widget.semantics.label, "Open thread")) continue;
+        return node.widget.frame.height;
+    }
+    return 0;
 }
 
 test "hiding repost counts does not claim to stop fetching them" {
