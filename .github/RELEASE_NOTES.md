@@ -1,10 +1,18 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.12.5
+### What's new in v0.12.6
 
-**Your key is never written down in the clear.** Plaza keeps your key in the login Keychain, and when the Keychain would not take it the signer wrote the key to a file on your disk instead, unencrypted, and said nothing. A healthy Mac never reached that, which is most of why it was worth fixing: the one path nobody ever watches quietly left the key weaker than the one you asked for, and there was no way to tell from the outside.
+**Posts show their replies, reposts, likes and zaps again.** Plaza only ever asked relays about notes that arrived while the app was open, and it asks for what is newer than the newest note it already has. So on every launch after the first, most of your feed was made of notes nobody had asked about, and all four numbers read zero. Opening a post fetched that one post's numbers, which is why they would appear for exactly the one you had looked at and nowhere else. Plaza now asks about the posts it is showing you.
 
-It now refuses. A key it cannot store safely is not stored at all, and it says so instead of reporting a generic failure, so there is no version of this where you believe you have an identity that is actually sitting on disk in the open.
+**A post's date line stopped flickering.** "11h via Damus Notedeck" was a few pixels too wide for the space it had, so it broke onto a second line that had nowhere to go: it painted over the handle below it and vanished again as you scrolled. It stays on one line now, in a column wide enough for the longest thing it can say.
+
+**Turning the counts off turns them off in threads too.** With every count hidden, opening a post still put "0 replies 0 reposts 0 likes 0 sats" across the top of it. A hidden count is gone now rather than shown as zero, and with all four hidden the whole band goes with them.
+
+**The bookmark and the "..." are gone from under each post.** The bookmark did nothing, and the "..." opened a menu carrying exactly what a right-click on the post already carries. Right-click is still there, with all of it: quote, copy, open on the web, follow. Turning every verb off now leaves no empty band behind either.
+
+**Sign out left the menu behind the relay count.** It only opened Settings with the confirmation showing, and Settings is where it lives.
+
+**The signer window keeps up with your terminal.** If you import a key with the terminal command it offers, the window notices within a second instead of sitting on the paste screen. **And its two passphrase fields draw stars**, with an eye beside them, hidden every time it opens.
 
 ### Install
 
