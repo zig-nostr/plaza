@@ -1,18 +1,22 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.12.6
+### What's new in v0.13.0
 
-**Posts show their replies, reposts, likes and zaps again.** Plaza only ever asked relays about notes that arrived while the app was open, and it asks for what is newer than the newest note it already has. So on every launch after the first, most of your feed was made of notes nobody had asked about, and all four numbers read zero. Opening a post fetched that one post's numbers, which is why they would appear for exactly the one you had looked at and nowhere else. Plaza now asks about the posts it is showing you.
+**Your key is no longer in Plaza.** Not hidden, not encrypted, not held carefully: absent. There is no longer anywhere in this app that a secret key can be put.
 
-**A post's date line stopped flickering.** "11h via Damus Notedeck" was a few pixels too wide for the space it had, so it broke onto a second line that had nowhere to go: it painted over the handle below it and vanished again as you scrolled. It stays on one line now, in a column wide enough for the longest thing it can say.
+Plaza used to make one and keep it at `~/.plaza/identity.key`, readable only by you. That sounds protective and is not: file permissions separate *users*, not *apps*, and every app you run is you. Any of them could read that file. A Nostr identity is the one thing that cannot be replaced once it leaks.
 
-**Turning the counts off turns them off in threads too.** With every count hidden, opening a post still put "0 replies 0 reposts 0 likes 0 sats" across the top of it. A hidden count is gone now rather than shown as zero, and with all four hidden the whole band goes with them.
+So Plaza ships **Notary**, starts it as its own process, and asks it to sign. The two talk over a channel with no name, no path and no port — nothing else on your Mac can reach it, and nothing has to guess who is asking, because only the app that opened the channel is holding it.
 
-**The bookmark and the "..." are gone from under each post.** The bookmark did nothing, and the "..." opened a menu carrying exactly what a right-click on the post already carries. Right-click is still there, with all of it: quote, copy, open on the web, follow. Turning every verb off now leaves no empty band behind either.
+**Bringing a key opens Notary.** Pasting one into Plaza is refused, and the field says where it goes instead. That is the point rather than a limitation: an app that accepts your key is an app holding the one thing you cannot replace.
 
-**Sign out left the menu behind the relay count.** It only opened Settings with the confirmation showing, and Settings is where it lives.
+**Signing out leaves your key in Notary.** It used to delete it. Leaving a client and taking your identity off your Mac are different things, and one press in one app should not do the second. To remove a key from this machine, open Notary.
 
-**The signer window keeps up with your terminal.** If you import a key with the terminal command it offers, the window notices within a second instead of sitting on the paste screen. **And its two passphrase fields draw stars**, with an eye beside them, hidden every time it opens.
+**A signer that is locked now says so.** Plaza read a locked Notary as an empty one and offered to create a key over the top of the one you already had. Nothing was lost, because Notary refuses that, but you got an error instead of the passphrase box that would have worked.
+
+**Plaza no longer signs for other apps.** Notary does, in its own window, with its own approval list and its own way to revoke. Nothing is lost; it moved to the app that holds the key.
+
+**Fixed along the way.** Pictures on `.pub` hosts never loaded. The time-and-via line on each post stopped sitting against the right edge. A note could be reported as failed and then published anyway, seconds later, when a signature arrived after Plaza had given up on it.
 
 ### Install
 
