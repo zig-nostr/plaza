@@ -6222,6 +6222,77 @@ test "unfollowing removes exactly one name" {
     try testing.expect(!saw_bob);
 }
 
+test "an unfollow the keyholder never signed is put back" {
+    // Plaza v0.13.0 shipped unable to sign anything: Notary refused every local
+    // request until somebody answered a question no window could reach. The app
+    // took the refusal, moved the follow set anyway, and showed the press as
+    // done. The acceptance journey caught it by reading the list back off the
+    // relay and finding the unfollow had reached nothing.
+    //
+    // The signing half is fixed in Notary. This is the other half: the app must
+    // not go on claiming a write that no signature ever covered.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{93} ** 32);
+    main.setIdentityForTest([_]u8{93} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    main.silenceTestSignerForTest(true);
+    defer main.silenceTestSignerForTest(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/undo.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "p", "aa" ** 32 },
+        &.{ "p", "bb" ** 32 },
+        &.{ "p", "cc" ** 32 },
+    };
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+    main.noteOwnContactsAnsweredForTest(kp.public_key);
+
+    var bob: [32]u8 = undefined;
+    @memset(&bob, 0xbb);
+    var fx: main.EffectsForTest = undefined;
+    try testing.expect(main.writeFollowForTest(&fx, bob, false));
+
+    // The press moves the live list first, which is deliberate: the feed has to
+    // answer immediately. Nothing here disputes that.
+    try testing.expectEqual(@as(usize, 2), main.followSetForTest().len);
+
+    // And the keyholder refuses. 403 is the concrete one this shipped against:
+    // "awaiting approval", for a question nobody could reach.
+    main.handleHelperSignedForTest(.{ .key = 0, .outcome = .ok, .status = 403, .body = "" });
+
+    var model = main.initialModel();
+    main.scanHelperSignForTest(&model);
+
+    // Put back, all three, with the one that was taken out among them.
+    const live = main.followSetForTest();
+    try testing.expectEqual(@as(usize, 3), live.len);
+    var saw_bob = false;
+    for (live) |f| {
+        if (std.mem.eql(u8, &f, &bob)) saw_bob = true;
+    }
+    try testing.expect(saw_bob);
+
+    // And the reader is told. A silent revert is the same lie told backwards.
+    try testing.expect(model.toast_text().len > 0);
+}
+
 test "no follow is written before a relay has said who you already follow" {
     // The hard rule. "Nobody answered" and "you follow nobody" look identical
     // from here, and publishing under the second reading replaces a list of
