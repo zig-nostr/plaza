@@ -1791,6 +1791,9 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // something to erase: whatever a previous client put there comes forward,
     // for the same reason a contact list's legacy relay map does.
     const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
+    // The stamp being replaced, so a signature that never arrives does not leave
+    // the pool claiming to be newer than the list the reader really has.
+    armUndo(.{ .relay_list = heldRelayListStamp() });
     signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false);
     // What the pool now represents. Without this the app's own event would come
     // back from a relay and be adopted over the pool that produced it, and worse,
@@ -5165,13 +5168,19 @@ fn scanHelperSign(model: *Model) void {
         if (restorable and model.draft_empty()) {
             model.draft_buffer.set(c);
             saveDraft(c);
+            // Said out loud, because the notice this used to rely on cannot be
+            // read: its string lives in `Model.identity()`, which is listed in
+            // `view_unbound` and rendered by nothing. So a reader saw "Posted",
+            // and thirty seconds later their draft reappeared with no reason
+            // given. A toast is the surface every other failed write now uses.
+            setToast(model, "Not signed. Your draft is back.");
         }
         gpa.free(c);
     }
     if (restorable) g_helper_sign_notice.store(true, .release);
     // Fires whether or not the note was restorable. A follow write carries no
     // draft to give back, which is exactly why its failure used to be silent.
-    undoFollowWrite(model);
+    applyUndo(model);
 }
 
 /// A helper sign that failed, surfaced once in the composer so a restored draft
@@ -5623,6 +5632,11 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // held for a restore is dropped and any earlier failure notice retired.
     releaseHelperSign();
     g_helper_sign_notice.store(false, .release);
+    // There is nothing left to take back: this press is signed. Dropped here
+    // rather than when the event is ingested, because an ingest that fails
+    // would otherwise leave the record armed and let a LATER unrelated failure
+    // revert a press that really was published.
+    releaseUndo();
     ingestAndPublish(gpa, out, null);
 }
 // The listener runs for one connection generation. A logout or a reconnect
@@ -17820,6 +17834,8 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     var next: [max_mutes][32]u8 = undefined;
     var n = mutesFromTags(owned_tags, &next);
     n += privateMutes(gpa, content, next[n..]);
+    // Armed before the set moves, with the stamp being replaced.
+    armUndo(.{ .mute = .{ .pubkey = pubkey, .added = muting, .created_at = g_mute_created_at } });
     _ = setMutes(next[0..n], created);
 
     signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false);
@@ -18655,7 +18671,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     const n = followsFromTags(owned_tags, &next);
     // Armed BEFORE the list moves, with the stamp being replaced, so a
     // signature that never comes back has somewhere to go back to.
-    armFollowUndo(pubkey, following, g_follow_created_at);
+    armUndo(.{ .follow = .{ .pubkey = pubkey, .added = following, .created_at = g_follow_created_at } });
     _ = setFollows(next[0..n], created);
 
     // Remembered as the base for the next press BEFORE the write seam is handed
@@ -18745,10 +18761,6 @@ fn releasePendingFollowBase(stored_at: i64) void {
     if (g_pending_follow_tags == null) return;
     if (stored_at < g_pending_follow_created_at) return;
     clearPendingFollowBase();
-    // The write is in the store, so there is nothing left to take back. Same
-    // lifetime as the base by construction: both exist only for the gap
-    // between a press and its event coming home.
-    g_follow_undo_active = false;
 }
 
 /// What one follow press changed, held only until that write is known to have
@@ -18763,53 +18775,159 @@ fn releasePendingFollowBase(stored_at: i64) void {
 ///
 /// One name, one direction and the stamp to go back to. A press toggles exactly
 /// one person, so undoing it needs nothing more than that.
-var g_follow_undo_active: bool = false;
-var g_follow_undo_pubkey: [32]u8 = undefined;
-var g_follow_undo_added: bool = false;
-var g_follow_undo_created_at: i64 = 0;
+///
+/// ONE slot, for every kind of write, because only one signature is ever in
+/// flight: every write goes through `signerReady()`, which is
+/// `.helper => !g_helper_sign.active`, so a second press is refused while the
+/// first is still out. That is also what makes this correct where a free
+/// standing flag was not. The slot always describes the write whose signature
+/// just failed, so a failed note cannot revert a follow that really was
+/// published.
+const PendingUndo = union(enum) {
+    none,
+    follow: ListPress,
+    mute: ListPress,
+    like: i64,
+    unlike: Unlike,
+    /// The stamp to go back to. This one is written to disk, so a failure that
+    /// leaves it forward keeps the reader's real relay list out ACROSS
+    /// RESTARTS, not just for the session.
+    relay_list: i64,
+    repost: i64,
+    /// The typed text, owned here, so a refused reply is not destroyed.
+    reply: []const u8,
+    profile,
 
-/// Arms the undo for a press that is about to be signed.
-fn armFollowUndo(pubkey: [32]u8, added: bool, previous_created_at: i64) void {
-    g_follow_undo_active = true;
-    g_follow_undo_pubkey = pubkey;
-    g_follow_undo_added = added;
-    g_follow_undo_created_at = previous_created_at;
+    const ListPress = struct { pubkey: [32]u8, added: bool, created_at: i64 };
+    const Unlike = struct { note_id: i64, reaction_id: [32]u8 };
+};
+
+var g_pending_undo: PendingUndo = .none;
+
+/// Records what a press changed, immediately before it changes it.
+fn armUndo(u: PendingUndo) void {
+    releaseUndo();
+    g_pending_undo = u;
 }
 
-/// Puts the follow set back after a signature that never arrived, and says so.
+/// Drops the record without applying it: the signature came back.
+fn releaseUndo() void {
+    switch (g_pending_undo) {
+        .reply => |text| std.heap.page_allocator.free(text),
+        else => {},
+    }
+    g_pending_undo = .none;
+}
+
+pub fn pendingUndoIsNoneForTest() bool {
+    return g_pending_undo == .none;
+}
+
+/// Arms the un-like record directly. The real `unlike` needs a live note and an
+/// `Effects` to reach the signer, and what is under test here is what happens
+/// AFTER the id has already been dropped, which is the state that produced the
+/// double reaction.
+pub fn armUnlikeUndoForTest(note_id: i64, reaction_id: [32]u8) void {
+    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
+}
+
+pub fn applyUndoForTest(model: *Model) void {
+    applyUndo(model);
+}
+
+/// Puts back whatever the last press changed, after a signature that never
+/// arrived, and says so.
 ///
-/// Silence was the whole defect. A reader who unfollows somebody and is shown
-/// the button they pressed has no way to learn that nothing was published, and
-/// on the next launch the person is still there.
-fn undoFollowWrite(model: *Model) void {
-    if (!g_follow_undo_active) return;
-    g_follow_undo_active = false;
-    const pubkey = g_follow_undo_pubkey;
-    const added = g_follow_undo_added;
-    const restored_at = g_follow_undo_created_at;
-
-    // Snapshot under the lock, rebuild outside it: `setFollows` takes the same
-    // lock and this one is not reentrant.
-    var next: [max_follows_tracked][32]u8 = undefined;
-    var n: usize = 0;
-    lockFollows();
-    for (g_follows[0..g_follow_count]) |f| {
-        if (added and std.mem.eql(u8, &f, &pubkey)) continue;
-        if (n >= next.len) break;
-        next[n] = f;
-        n += 1;
+/// Silence was the whole defect. A reader who unfollows somebody, or mutes
+/// them, and is shown the state they asked for has no way to learn that nothing
+/// was published; on the next launch the person is still there.
+fn applyUndo(model: *Model) void {
+    const undo = g_pending_undo;
+    g_pending_undo = .none;
+    switch (undo) {
+        .none => return,
+        .follow => |p| {
+            var next: [max_follows_tracked][32]u8 = undefined;
+            var n: usize = 0;
+            // Snapshot under the lock, rebuild outside it: `setFollows` takes
+            // the same lock and this one is not reentrant.
+            lockFollows();
+            for (g_follows[0..g_follow_count]) |f| {
+                if (p.added and std.mem.eql(u8, &f, &p.pubkey)) continue;
+                if (n >= next.len) break;
+                next[n] = f;
+                n += 1;
+            }
+            unlockFollows();
+            if (!p.added and n < next.len) {
+                next[n] = p.pubkey;
+                n += 1;
+            }
+            // The base went with the press, so it goes back with it. Leaving it
+            // would make the next press build on a list nobody published.
+            clearPendingFollowBase();
+            _ = setFollows(next[0..n], p.created_at);
+            setToast(model, "Not signed. Put that back.");
+        },
+        .mute => |p| {
+            var next: [max_mutes][32]u8 = undefined;
+            var n: usize = 0;
+            lockMutes();
+            for (g_mutes[0..g_mute_count]) |m| {
+                if (p.added and std.mem.eql(u8, &m, &p.pubkey)) continue;
+                if (n >= next.len) break;
+                next[n] = m;
+                n += 1;
+            }
+            unlockMutes();
+            if (!p.added and n < next.len) {
+                next[n] = p.pubkey;
+                n += 1;
+            }
+            // Restoring the stamp is the half that matters most here. The press
+            // stamped the list forward, and `ingestMuteList` drops anything at
+            // or below the stamp it holds, so without this the reader's real
+            // mute list could not reach the screen again for the whole session.
+            _ = setMutes(next[0..n], p.created_at);
+            setToast(model, "Not signed. Put that back.");
+        },
+        .like => |note_id| {
+            _ = forgetLike(note_id);
+            setToast(model, "That like was not signed.");
+        },
+        .unlike => |u| {
+            // The reaction id was dropped before signing, so the heart emptied
+            // and the kind:7 stayed on every relay. Putting the id back is what
+            // stops the next press publishing a SECOND reaction.
+            rememberLike(u.note_id, u.reaction_id);
+            setToast(model, "That was not signed.");
+        },
+        .repost => |note_id| {
+            clearRepostedByMe(note_id);
+            setToast(model, "That repost was not signed.");
+        },
+        .relay_list => |stamp| {
+            setRelayListStamp(stamp);
+            saveRelays();
+            // And the edit is pending again. `clearRelayListPublish` runs on the
+            // handoff rather than on a publish, so without this a refused
+            // signature is recorded as delivered and never retried, which is the
+            // opposite of what its own comment promises.
+            g_relay_list_dirty = true;
+            setToast(model, "Your relays were not saved. Trying again.");
+        },
+        .reply => |text| {
+            // Into the reply box it was taken from, and only if the reader has
+            // not started typing another one.
+            if (model.reply_empty()) model.reply_buffer.set(text);
+            std.heap.page_allocator.free(text);
+            setToast(model, "Not signed. Your reply is back.");
+        },
+        .profile => {
+            model.profile_stage = .failed;
+            setToast(model, "That was not saved.");
+        },
     }
-    unlockFollows();
-    if (!added and n < next.len) {
-        next[n] = pubkey;
-        n += 1;
-    }
-
-    // The base went with the press, so it goes back with it. Leaving it would
-    // make the next press build on a list that was never published.
-    clearPendingFollowBase();
-    _ = setFollows(next[0..n], restored_at);
-    setToast(model, "Not signed. Put that back.");
 }
 
 /// Puts the app in the state a bunker or a Notary key leaves it in: a contact
@@ -25770,6 +25888,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 replayPending(model);
                 return;
             }
+            // Armed BEFORE the write, not after: `armUndo` releases what was
+            // there, so arming after a signature that already came back would
+            // leave a record with nothing to undo.
+            armUndo(.profile);
             publishName(model, fx);
             setToast(model, "Name set");
             replayPending(model);
@@ -26415,6 +26537,11 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // Mastodon handle) live in kind:0's tags, and republishing with none would
     // delete them as silently as dropping a JSON key.
     const tags = dupeTags(gpa, prev_tags) orelse return;
+    // The cache was seeded above so the sheet shows the edit at once. If the
+    // signature never comes back, that seeding is what has to be contradicted:
+    // "Saved here and sent to your relays" is otherwise the last word on an
+    // edit that reached nobody.
+    armUndo(.profile);
     signAndPublish(fx, gpa, created, 0, tags, merged, false);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
@@ -27023,6 +27150,12 @@ fn publishReply(model: *Model, fx: *Effects) void {
     // reply can carry a hashtag, a mention or a picture exactly like a note can,
     // and it used to carry none of them.
     const tags = contentTags(gpa, content, thread[0..filled], model.mentionsOff());
+    // Its own copy, because `content` belongs to the write seam from here and a
+    // reply is not `restorable`: the composer's restore path holds one draft and
+    // hands it to the composer, which is the wrong box for this text.
+    if (std.heap.page_allocator.dupe(u8, text)) |kept| {
+        armUndo(.{ .reply = kept });
+    } else |_| {}
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false);
     model.reply_buffer.clear();
 }
@@ -27554,6 +27687,7 @@ fn like(model: *const Model, fx: *Effects, note_id: i64) void {
     const tags = buildLikeTags(gpa, note) orelse return;
     const content = gpa.dupe(u8, "+") catch return;
     const id = nostr.event.computeId(gpa, pk, created, 7, tags, content) catch return;
+    armUndo(.{ .like = note_id });
     rememberLike(note_id, id);
     signAndPublish(fx, gpa, created, 7, tags, content, false);
 }
@@ -27580,6 +27714,7 @@ fn repost(model: *Model, fx: *Effects, note_id: i64) void {
     // Filled before the signature comes back, the same way a like is. Our own
     // kind:6 arrives through the engagement subscription a moment later and sets
     // the same flag from the crowd, so this only covers the gap.
+    armUndo(.{ .repost = note_id });
     markRepostedByMe(note_id);
     signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false);
 }
@@ -27603,10 +27738,27 @@ fn markRepostedByMe(note_id: i64) void {
     row.counts.reposted_by_me = true;
 }
 
+/// Clears it again, for a repost whose signature never came back.
+///
+/// The flag used to be written `true` and nothing else, so a refused repost
+/// left the button dead for the rest of the process (`repost` returns early on
+/// it), and, because it is not cleared on logout either, dead for the next
+/// account to sign in as well.
+fn clearRepostedByMe(note_id: i64) void {
+    engagementLock();
+    defer engagementUnlock();
+    const row = ensureEngagement(note_id) orelse return;
+    row.counts.reposted_by_me = false;
+}
+
 /// Publishes a kind:5 deletion of our own reaction and empties the heart at once.
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
     const reaction_id = forgetLike(note_id) orelse return;
+    // The id is already gone from the table by here, so the undo carries it:
+    // without it a refused un-like empties the heart, leaves the kind:7 on
+    // every relay, and the next press publishes a second reaction.
+    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
     const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
     const content = gpa.dupe(u8, "") catch return;
     signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false);
@@ -27716,9 +27868,23 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     // note the app knows it owes the reader. A queue with no room says so:
     // publishing anyway would be a note nobody is tracking while the banner
     // promises that anything written is kept.
-    if (isReaderNote(ev.kind) and !enqueueOutbox(ev.id, ev.pubkey, nowSeconds())) {
-        g_outbox_overflow.store(true, .monotonic);
-        return;
+    if (isReaderNote(ev.kind)) {
+        if (!enqueueOutbox(ev.id, ev.pubkey, nowSeconds())) {
+            g_outbox_overflow.store(true, .monotonic);
+            return;
+        }
+    } else if (verify == null) {
+        // Everything else this reader signs: a follow, a mute, a like, a relay
+        // list. Tracked so that a write which acks NO relay is retried and
+        // counted like a note, instead of being published once and forgotten.
+        //
+        // Best effort, deliberately. The refusal above is right for a note,
+        // whose text the reader would otherwise lose with nothing tracking it.
+        // A follow is not that: refusing to publish it because the queue is
+        // full would turn a full queue into silently dropped writes, which is
+        // worse than an untracked publish and is a failure this app did not
+        // have before.
+        _ = enqueueOutbox(ev.id, ev.pubkey, nowSeconds());
     }
     // A test drives the write path, not the network. Its pool names hosts that
     // do not resolve, and a detached dial thread for one of those outlives the
@@ -29766,6 +29932,9 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             // Whole, or not published: the id is computed over these tags, so
             // a partial copy is an event the verify below would drop anyway.
             out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
+            // Signed, so there is nothing to take back. Same reasoning as the
+            // built-in signer's: released on the signature, not on the ingest.
+            releaseUndo();
             ingestAndPublish(gpa, out, signer);
         },
     }
@@ -29826,7 +29995,7 @@ fn scanPendingRemote(model: *Model) void {
         gpa.free(c);
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
-    if (any_sign_failed) undoFollowWrite(model);
+    if (any_sign_failed) applyUndo(model);
     if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }
 

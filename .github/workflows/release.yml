@@ -20,7 +20,7 @@ env:
   # and "whatever notary's main happened to be that afternoon" is not something
   # anybody could reproduce later. Bump it deliberately, with the Plaza release
   # that needs it.
-  NOTARY_REF: v0.10.2
+  NOTARY_REF: v0.10.3
 
 jobs:
   macos-app:
