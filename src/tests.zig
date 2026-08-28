@@ -20141,3 +20141,51 @@ test "a pasted secret key is refused and pointed at Notary" {
     try testing.expectEqual(main.LoginTarget.bunker, main.classifyLogin("bunker://abc?relay=wss://r"));
     try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("npub1abcdef"));
 }
+
+test "Notary can sign for Plaza and for your other devices at once" {
+    // These were made mutually exclusive, and that was wrong. The rule worth
+    // keeping is that no UNIDENTIFIED caller gets in. A relay client is a
+    // NIP-46 client and proves who it is with its own keypair, which is the one
+    // identity here that cannot be forged, so serving relays adds no such
+    // caller.
+    //
+    // Excluding it did real harm: a phone would need a Notary of its own, and
+    // two processes cannot hold one key, so a standalone Notary and Plaza's
+    // lock each other out. There was no arrangement in which both worked.
+    defer main.setSignForDevices(false);
+
+    // Off by default. Not caution about who gets in, but about putting the
+    // process that holds the key on the network at all.
+    main.setSignForDevices(false);
+    try testing.expect(!main.signForDevices());
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, main.Msg.sign_for_devices_toggle, &fx);
+    try testing.expect(main.signForDevices());
+
+    // And the reader is told it lands on the next launch, because the daemon's
+    // relay threads start once, with the key. A switch that looks like it did
+    // something and did not is worse than one that says so.
+    const said = model.toast_buf[0..model.toast_len];
+    if (std.mem.indexOf(u8, said, "Restart") == null) {
+        std.debug.print("\nthe app said \"{s}\"\n", .{said});
+        return error.DidNotSayWhenItTakesEffect;
+    }
+
+    main.update(&model, main.Msg.sign_for_devices_toggle, &fx);
+    try testing.expect(!main.signForDevices());
+}
+
+test "the relay flag reaches the keyholder only when it is asked for" {
+    // The spawn is what carries it, so this reads the spawn.
+    const src = @embedFile("main.zig");
+    const at = std.mem.indexOf(u8, src, ".argv = if (g_sign_for_devices)").?;
+    const window = src[at .. at + 320];
+    // Both arms present, and only one of them asks for relays.
+    try testing.expect(std.mem.indexOf(u8, window, "--serve-relays") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, window, "--serve-relays"));
+    // And a kernel-chosen port either way: a well-known one is something else
+    // can be sitting on first.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, window, "127.0.0.1:0"));
+}

@@ -9,14 +9,15 @@ four clicks, and the feed renders from disk. It's built on the
 through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
-> **Status: active development (`v0.12.1`).** Plaza installs and runs today. It
+> **Status: active development (`v0.12.6`).** Plaza installs and runs today. It
 > opens straight into a feed, signed in as nobody: nine accounts to start from,
 > already populated, with a strip along the top offering a key when you want
-> one. Create an identity, bring an existing key, or connect an external signer
-> (Notary) over NIP-46. On a shipped build the key never enters Plaza on any of
-> the three: `plaza-signer` is a separate process that mints or adopts it, keeps
-> it in the login Keychain, and answers signing requests over loopback, so the
-> process decoding images and parsing relay JSON holds no secret. The feed
+> one. Create an identity in Notary, bring an existing key there, or connect an
+> external signer over NIP-46. **Your key never enters Plaza.** There is no
+> field in it that can hold one. Plaza ships Notary, starts it as its own child
+> process, and asks it for signatures over a channel nothing else on the machine
+> can reach, so the process decoding images and parsing relay JSON holds no
+> secret and cannot be made to. The feed
 > carries real names, avatars and pictures, rendered from a local store that a
 > pool of background threads keeps filled, no IPC on the read path, so it is on
 > screen before any relay answers. Composing signs a note (in the keyholder, or
@@ -48,8 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/instal
 macOS on Apple Silicon. The installer verifies the download's SHA-256, installs
 `Plaza.app`, clears the download-quarantine flag so it opens without a Gatekeeper
 detour, and launches it. It touches the bundle and nothing else: your session
-and local store live in `~/.plaza`, your key in the login Keychain, and both
-survive every upgrade.
+and local store live in `~/.plaza`, your key stays in Notary, and both survive
+every upgrade.
 
 Plaza is ad-hoc signed and not notarized on purpose. It signs notes with your
 key, so the trust anchor is a build you can reproduce rather than an Apple
