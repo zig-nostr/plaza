@@ -8338,6 +8338,66 @@ test "the time and via line is one line, whatever the note says it was written w
     try testing.expect(found);
 }
 
+test "the time and via line ends where the card ends" {
+    // It stopped ending there. `wrap = false` fixed a flicker and silently
+    // broke the alignment beside it: the toolkit gives a NON-WRAPPING paragraph
+    // an infinite max_width (text_spans.zig:627), and its aligner returns early
+    // on a width that is not finite (:565), so `text_alignment = .end` is
+    // ignored on any single-line paragraph. The box stayed in the right place
+    // and the words inside it sat at the left, so "35m via Amethyst" hung a
+    // ragged gap off the card's edge that grew as the string got shorter.
+    //
+    // So the alignment is done by LAYOUT now, which the toolkit does honour: a
+    // stated-width row, a spacer that takes the slack, and a paragraph that
+    // hugs its own text at the end of it.
+    //
+    // Asserted against the note body, because both live in the same column and
+    // the whole complaint was that one ended short of the other. Box geometry,
+    // not glyph metrics, so this harness can answer it (see painted.zig).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Short, long, and longer than the column: the gap the reader saw was
+    // widest for the shortest string, and the longest is what the column was
+    // measured against in the first place.
+    for ([_][]const u8{ "Amethyst", "Damus Notedeck", "An Absurdly Long Client Name" }) |client| {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const ev = nostr.event.Event{
+            .id = [_]u8{0xD2} ** 32,
+            .pubkey = [_]u8{0x53} ** 32,
+            .created_at = 1_800_000_000,
+            .kind = 1,
+            .tags = &.{&.{ "client", client }},
+            .content = "GM",
+            .sig = [_]u8{0} ** 64,
+        };
+        model.notes[0] = main.noteFrom(ev, 1_800_002_100);
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        var meta_right: ?f32 = null;
+        var body_right: ?f32 = null;
+        for (p.layout.nodes) |node| {
+            const w = node.widget;
+            if (w.kind != .text) continue;
+            const f = w.frame;
+            if (std.mem.indexOf(u8, w.text, " via ") != null) meta_right = f.x + f.width;
+            if (std.mem.eql(u8, w.text, "GM")) body_right = f.x + f.width;
+        }
+        const meta = meta_right orelse return error.NoMetaLine;
+        const body = body_right orelse return error.NoBody;
+        if (@abs(meta - body) > 0.5) {
+            std.debug.print(
+                "\"{s}\": the meta line ends at {d:.1}, the card ends at {d:.1}\n",
+                .{ client, meta, body },
+            );
+            return error.MetaLineNotFlush;
+        }
+    }
+}
+
 test "the feed asks about the notes it is SHOWING, not only the ones that arrived" {
     // The watch list was built purely from events coming down the wire, and the
     // feed's own REQ carries a `since` off the newest stored note. So on any
@@ -12330,6 +12390,59 @@ test "a picture the network lost is retried, but not without end" {
     // The fourth is where it stops.
     main.deliverMediaResponseForTest(&fx, note_id, .timed_out, 0, "");
     try testing.expect(main.mediaFailed(note_id));
+}
+
+test "a picture the proxy refuses by host is asked of the host itself" {
+    // The avatar path has had this since the day it shipped and the PICTURE
+    // path has only ever had the predicate tested, never the wiring. Same
+    // refusal, same host, and a photograph is the half a reader actually
+    // notices: wsrv.nl answers 400 for a `.pub` domain, which is where Ditto's
+    // Blossom server lives, and the same file comes back fine from the host.
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_010;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    const after = main.mediaFallbackStateForTest(note_id).?;
+    try testing.expect(after.direct);
+    try testing.expect(after.idle);
+    // Not a failed attempt: this is a different question, not another go at
+    // the same one.
+    try testing.expectEqual(@as(u8, 0), main.mediaAttemptsForTest(note_id).?);
+
+    // Once. A refusal from the HOST is a real failure with nowhere left to
+    // ask, so it must not loop.
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    try testing.expect(!main.mediaFallbackStateForTest(note_id).?.idle);
+}
+
+test "a picture missing at the proxy is missing at the host too" {
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_011;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    // A 404 is the source, not the proxy. Going direct would be a second
+    // download with an answer already known.
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 404, "");
+    try testing.expect(!main.mediaFallbackStateForTest(note_id).?.direct);
 }
 
 test "a quote still loading looks like the card that will replace it" {

@@ -11818,6 +11818,13 @@ pub fn mediaIdleForTest(note_id: i64) bool {
     return m.state == .idle;
 }
 
+/// Whether this note's picture is now pinned to its own host rather than the
+/// proxy, and whether it will be asked for again.
+pub fn mediaFallbackStateForTest(note_id: i64) ?struct { idle: bool, direct: bool } {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return .{ .idle = m.state == .idle, .direct = m.direct };
+}
+
 /// Delivers one picture-fetch response for `note_id` the way the runtime would,
 /// so a test can drive the failure paths rather than the classifier alone.
 /// How many faces are holding a half-assembled picture. Zero at rest.
@@ -21941,16 +21948,27 @@ fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) App
 /// NIP-05 both fit the buffers that receive them, which is to say both will
 /// arrive eventually.
 ///
-/// 136, not the 124 it was. The budget was set against "4h via Amethyst" and the
-/// real longest is "11h via Damus Notedeck": a client name may be fourteen
-/// characters and an age may be three, and at 124 that string was one character
-/// too wide. It did not elide, it WRAPPED, onto a second line the row had
-/// reserved no height for, so it painted over the handle beneath it and was
-/// clipped away again depending on what else was on screen. That is the flicker
-/// somebody sees scrolling past it. The line is single-line now (see the
-/// paragraph that draws it), and this is the width that keeps the longest thing
-/// it can honestly say inside its own box rather than leaning on the ellipsis.
-const time_column_width: f32 = 136;
+/// 148, and it has been wrong twice in opposite directions.
+///
+/// It was 124, set against "4h via Amethyst" while the real longest is
+/// "11h via Damus Notedeck": a client name may be fourteen characters and an
+/// age may be three. That string did not elide, it WRAPPED, onto a second line
+/// the row had reserved no height for, so it painted over the handle beneath
+/// and was clipped away again depending on what else was on screen. That was
+/// the flicker somebody saw scrolling past it.
+///
+/// 136 stopped the wrap and was still too narrow: it was measured against
+/// "11h" and "35m" is wider, so the same client name overflowed by eight
+/// points. It did not show, because the box was definite and the engine elided
+/// the tail. Now that the box hugs its text (see the paragraph that draws it),
+/// an overflow has nowhere to hide, so this is measured against the widest AGE
+/// as well as the longest NAME.
+///
+/// It cannot cover a name of fourteen wide glyphs; that would want two hundred
+/// points and eat the column the name and handle live in. Such a name overflows
+/// a little rather than eliding, which is the one thing this arrangement gives
+/// up, and it is a `client` tag nobody ships against a row that still reads.
+const time_column_width: f32 = 148;
 const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
 
 /// How long a stranger's string may be where something sits BESIDE it.
@@ -23071,15 +23089,17 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                             // same metrics it paints with, so a name that does
                             // not fit ends in an ellipsis instead of moving the
                             // furniture.
-                            ui.paragraph(
-                                .{
-                                    .width = time_column_width,
-                                    .wrap = false,
-                                    .text_alignment = .end,
-                                    .style = .{ .foreground = theme.palette.text_faint_alt },
-                                },
-                                timeSpans(ui, note, meta_scale),
-                            ),
+                            ui.row(.{ .gap = 0, .width = time_column_width }, .{
+                                ui.spacer(1),
+                                ui.paragraph(
+                                    .{
+                                        .wrap = false,
+                                        .text_alignment = .end,
+                                        .style = .{ .foreground = theme.palette.text_faint_alt },
+                                    },
+                                    timeSpans(ui, note, meta_scale),
+                                ),
+                            }),
                         }),
                         vgap(ui, 5),
                         // What this answers, above the answer. Feed only: in a
