@@ -4346,19 +4346,24 @@ var g_remote_status = std.atomic.Value(u8).init(0);
 // health-checks it; routing the actual signing through it comes next. The port
 // is Plaza-specific (not notary's 8787), so a standalone Notary and the
 // built-in one never collide.
-const helper_port: u16 = 8790;
+/// The port Plaza's own daemon landed on, learned from its stdout.
+///
+/// Zero until it says so. It used to be a constant, chosen to avoid colliding
+/// with a standalone Notary on 8787, and a constant is exactly what something
+/// else can sit on first.
+var g_helper_port: u16 = 0;
+
+/// The one line of the daemon's stdout Plaza reads. Must match
+/// `approval_http.port_line_prefix` in Notary.
+const helper_port_prefix = "notary-approval-port";
 const helper_spawn_key: u64 = 40;
 const helper_poll_key: u64 = 41;
 // The daemon binary (a sibling of Plaza's own executable) and the shared token,
 // resolved once in main and read by boot/tick.
 var g_helper_bin_buf: [1024]u8 = undefined;
 var g_helper_bin_len: usize = 0;
-var g_helper_token_buf: [64]u8 = undefined;
-var g_helper_token_len: usize = 0;
-var g_helper_state_dir_buf: [512]u8 = undefined;
-var g_helper_state_dir_len: usize = 0;
-var g_helper_token_path_buf: [512]u8 = undefined;
-var g_helper_token_path_len: usize = 0;
+var g_helper_secret_buf: [64]u8 = undefined;
+var g_helper_secret_len: usize = 0;
 // 0 starting, 1 uninitialized (reachable, no key yet), 2 ready (holds a key),
 // 3 unreachable. Reachable at all (1 or 2) is what proves the loopback IPC.
 var g_helper_state = std.atomic.Value(u8).init(0);
@@ -4368,11 +4373,46 @@ var g_helper_state = std.atomic.Value(u8).init(0);
 var g_helper_polled_at: i64 = 0;
 const helper_health_interval_s: i64 = 5;
 
+pub fn helperTokenForTest() []const u8 {
+    return helperToken();
+}
+
+/// Puts the daemon into the "answering and holding a key" state, so a test can
+/// ask what the OTHER conditions do.
+pub fn setHelperReadyForTest() void {
+    g_helper_state.store(2, .release);
+}
+
+pub fn helperReachableForTest() bool {
+    return helperReachable();
+}
+
+pub fn helperPortForTest() u16 {
+    return g_helper_port;
+}
+
+pub fn setHelperPortForTest(port: u16) void {
+    g_helper_port = port;
+}
+
+pub fn helperSecretForTest() []const u8 {
+    return g_helper_secret_buf[0..g_helper_secret_len];
+}
+
+pub fn mintHelperSecretForTest(io: std.Io) void {
+    var raw: [24]u8 = undefined;
+    io.randomSecure(&raw) catch return;
+    const written = std.fmt.bufPrint(&g_helper_secret_buf, "{x}\n", .{raw}) catch return;
+    g_helper_secret_len = written.len;
+}
+
 fn helperBin() []const u8 {
     return g_helper_bin_buf[0..g_helper_bin_len];
 }
+/// The secret, without the newline the pipe carries, for the auth header.
 fn helperToken() []const u8 {
-    return g_helper_token_buf[0..g_helper_token_len];
+    if (g_helper_secret_len == 0) return "";
+    return g_helper_secret_buf[0 .. g_helper_secret_len - 1];
 }
 
 /// Whether the launch probe found the keyholder daemon beside Plaza.
@@ -4494,35 +4534,32 @@ pub fn signerStatusLabelForTest() []const u8 {
 /// layer and a said-out-loud one in the join ladder, rather than a spawn of a
 /// path that does not exist.
 fn resolveHelper(init: std.process.Init) void {
-    // The daemon lives beside Plaza's own executable.
+    // The daemon lives beside Plaza's own executable. It is Notary's, not a
+    // second signer of Plaza's own: one keyholder, built and audited once.
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return markKeyholderMissing();
-    g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "plaza-signer");
+    g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "signer");
     if (g_helper_bin_len == 0) return markKeyholderMissing();
     g_keyholder = .found;
 
-    const home = init.environ_map.get("HOME") orelse ".";
-    const state_dir = std.fmt.bufPrint(&g_helper_state_dir_buf, "{s}/.plaza", .{home}) catch return;
-    g_helper_state_dir_len = state_dir.len;
-    const token_path = std.fmt.bufPrint(&g_helper_token_path_buf, "{s}/.plaza/signer.token", .{home}) catch return;
-    g_helper_token_path_len = token_path.len;
-
-    // A fresh 32-byte token, hex-encoded, so a stray process on the machine
-    // cannot drive the signer even if it guesses the port.
-    var raw: [32]u8 = undefined;
+    // The secret Plaza hands its daemon, minted here and written NOWHERE.
+    //
+    // It used to be a token in a 0600 file, which is the shape every local
+    // signing agent uses and the shape none of them defends. File permissions
+    // separate USERS, not apps: every app you run could read that file and
+    // sign as you. Measured on this machine, along with the two other places a
+    // secret leaks: a process's argv (`ps` prints it) and its environment
+    // (`ps -Eww` prints it).
+    //
+    // A pipe to a child has none of those properties. It has no name and no
+    // path, so there is nothing for another program to open, and holding it is
+    // the whole of the proof. That is why Plaza starts its own daemon rather
+    // than looking for a shared one: a keyholder anything can reach has to
+    // decide who may reach it, and nobody has solved that on the desktop.
+    var raw: [24]u8 = undefined;
     init.io.randomSecure(&raw) catch return;
-    var hexbuf: [64]u8 = undefined;
-    _ = hexLower(&hexbuf, raw);
-    @memcpy(g_helper_token_buf[0..64], &hexbuf);
-    g_helper_token_len = 64;
-
-    var d = plazaDir(init.io, init.environ_map) catch return;
-    defer d.close(init.io);
-    d.writeFile(init.io, .{
-        .sub_path = "signer.token",
-        .data = &hexbuf,
-        .flags = .{ .permissions = secret_file_permissions },
-    }) catch return;
+    const written = std.fmt.bufPrint(&g_helper_secret_buf, "{x}\n", .{raw}) catch return;
+    g_helper_secret_len = written.len;
 }
 
 // The Notary ceremony window binary. In a packaged app it sits beside Plaza in
@@ -4764,9 +4801,9 @@ const ceremony_created_code: i32 = 9;
 /// logout is not undone when the health-check next reads /pubkey. Fire and
 /// forget; the g_logged_out latch covers the window until it lands.
 fn helperReset(fx: *Effects) void {
-    if (g_helper_token_len == 0) return;
+    if (g_helper_secret_len == 0) return;
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reset", .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reset", .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{
@@ -4777,25 +4814,24 @@ fn helperReset(fx: *Effects) void {
     });
 }
 
-/// Spawns the keyholder daemon: keyless, it idles serving /pubkey and /setup.
-/// The parent-pid is Plaza's, so the daemon exits when Plaza does.
+/// Starts Plaza's own keyholder: keyless at first, idling on /pubkey and
+/// /setup until somebody brings a key.
+///
+/// Port ZERO. There is no shared address, so there is nothing for anything else
+/// to be sitting on and nothing for Plaza to be tricked into talking to; the
+/// daemon says on stdout where it landed. The secret goes down the pipe, which
+/// is the only channel another program running as this user cannot read.
+///
+/// The daemon is Plaza's CHILD and dies with it. That is not a limitation: a
+/// keyholder that outlives its app is a keyholder something else can find.
 fn spawnHelper(fx: *Effects) void {
-    if (g_helper_bin_len == 0 or g_helper_token_len == 0) return;
-    var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{helper_port}) catch return;
-    var pid_buf: [16]u8 = undefined;
-    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()}) catch return;
+    if (g_helper_bin_len == 0 or g_helper_secret_len == 0) return;
     fx.spawn(.{
         .key = helper_spawn_key,
-        .argv = &.{
-            helperBin(),    "--serve",
-            "--port",       port_str,
-            "--state-dir",  g_helper_state_dir_buf[0..g_helper_state_dir_len],
-            "--token-file", g_helper_token_path_buf[0..g_helper_token_path_len],
-            "--parent-pid", pid_str,
-        },
+        .argv = &.{ helperBin(), "--approval-http", "127.0.0.1:0" },
+        .stdin = g_helper_secret_buf[0..g_helper_secret_len],
+        .on_line = Effects.lineMsg(.helper_line),
         .on_exit = Effects.exitMsg(.helper_exited),
-        .output = .collect,
     });
 }
 
@@ -4803,7 +4839,7 @@ fn spawnHelper(fx: *Effects) void {
 /// state) proves the loopback IPC works; a connection error keeps it at
 /// unreachable and the tick tries again.
 fn pollHelper(fx: *Effects) void {
-    if (g_helper_token_len == 0) return;
+    if (g_helper_secret_len == 0) return;
     // Signed OUT, this proves the IPC at startup and catches a key appearing
     // later (a terminal or window import), so Plaza adopts it live: poll every
     // tick. Signed IN, the status bar now reports whether Notary can actually
@@ -4817,7 +4853,7 @@ fn pollHelper(fx: *Effects) void {
         g_helper_polled_at = now;
     }
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{
@@ -4910,7 +4946,7 @@ const helper_setup_key: u64 = 42;
 const helper_sign_key: u64 = 43;
 
 fn helperReachable() bool {
-    return g_helper_state.load(.acquire) >= 1;
+    return g_helper_port != 0 and g_helper_state.load(.acquire) >= 1;
 }
 
 /// Queues a helper setup and fires it now if the daemon is already up (else the
@@ -4949,8 +4985,13 @@ var g_helper_pending_in_flight: HelperSetup = .none;
 /// A POST to the daemon with the bearer token. The body is copied by the effect,
 /// so a stack buffer is fine.
 fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup))) void {
+    // Nowhere to send it yet. The daemon takes a kernel-chosen port and says
+    // which one on stdout, so between the spawn and that line there is no
+    // address: sending to port zero would be a request nobody could answer and
+    // a failure the caller would read as a signer that is not working.
+    if (g_helper_port == 0) return;
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}" ++ path, .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}" ++ path, .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{
@@ -13781,6 +13822,8 @@ pub const Msg = union(enum) {
     /// Confirm logout: wipe the session (and a local key) and return to onboarding.
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
+    /// One line of the daemon's stdout. Only one matters: the port it bound.
+    helper_line: native_sdk.EffectLine,
     helper_exited: native_sdk.EffectExit,
     notary_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
@@ -13872,7 +13915,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "copy_bunker_url", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "copy_bunker_url", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -25109,6 +25152,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 requestWantedQuotes();
             }
         },
+        .helper_line => |line| {
+            // The daemon says where it landed, and until it does there is
+            // nowhere to send anything. Everything else it prints is for a
+            // human reading a terminal.
+            const text = std.mem.trim(u8, line.line, " \t\r\n");
+            if (!std.mem.startsWith(u8, text, helper_port_prefix)) return;
+            const rest = std.mem.trim(u8, text[helper_port_prefix.len..], " \t");
+            const port = std.fmt.parseInt(u16, rest, 10) catch return;
+            if (port == 0) return;
+            g_helper_port = port;
+        },
+
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
@@ -31722,7 +31777,7 @@ fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
     if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
     g_bunker_polled_at = now_ms;
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{

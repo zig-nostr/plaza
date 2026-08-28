@@ -20047,3 +20047,53 @@ test "a test identity signs the way the app does, through the keyholder" {
     try testing.expectEqualSlices(u8, &kp.public_key, &published.pubkey);
     try testing.expect(try nostr.event.verify(testing.allocator, signer, published));
 }
+
+test "the keyholder's secret is minted fresh and never written down" {
+    // The whole local security model is this one property. Plaza used to hand
+    // its signer a token through a 0600 file, which is the shape every local
+    // signing agent uses and the shape none of them defends: file permissions
+    // separate USERS, not apps, so every app you run could read it and sign as
+    // you. Measured on this machine, along with the other two places a secret
+    // leaks: a process's argv (`ps` prints it) and its environment (`ps -Eww`
+    // prints it). A pipe to a child has no name and no path, so there is
+    // nothing to open.
+    const io = testing.io;
+    main.mintHelperSecretForTest(io);
+    const first = try testing.allocator.dupe(u8, main.helperSecretForTest());
+    defer testing.allocator.free(first);
+
+    try testing.expect(first.len >= 32);
+    // Newline-terminated, because the daemon's read needs something to stop on.
+    try testing.expectEqual(@as(u8, '\n'), first[first.len - 1]);
+    // The header presents it without the terminator.
+    try testing.expectEqualStrings(first[0 .. first.len - 1], main.helperTokenForTest());
+
+    // Fresh per launch. Two runs sharing a secret would mean a secret that
+    // outlives the process that minted it, which is a secret worth stealing.
+    main.mintHelperSecretForTest(io);
+    try testing.expect(!std.mem.eql(u8, first, main.helperSecretForTest()));
+}
+
+test "nothing is sent to the keyholder before it says where it is" {
+    // The daemon takes a kernel-chosen port and reports it on stdout, so
+    // between the spawn and that line there is no address at all. Sending to
+    // port zero would be a request nobody could answer, and the caller would
+    // read the failure as a signer that is not working.
+    // The daemon is answering AND holding a key, so the only thing standing
+    // between Plaza and a request is not knowing the address. Without that
+    // being the only difference this test passes for the wrong reason, which is
+    // how it passed with the guard removed.
+    main.setHelperReadyForTest();
+    main.setHelperPortForTest(0);
+    defer main.setHelperPortForTest(0);
+    try testing.expect(!main.helperReachableForTest());
+
+    // Told the port, and now it is reachable.
+    main.setHelperPortForTest(51234);
+    try testing.expect(main.helperReachableForTest());
+
+    // And a port it has NOT heard is not one it invents. This is the constant
+    // that used to be here.
+    main.setHelperPortForTest(8790);
+    try testing.expectEqual(@as(u16, 8790), main.helperPortForTest());
+}
