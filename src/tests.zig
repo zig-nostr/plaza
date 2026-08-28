@@ -19980,3 +19980,61 @@ test "the note's deadline and the wire's are one number" {
     // reach for it.
     try testing.expect(main.helperSignTimeoutSecondsForTest() >= 20);
 }
+
+test "a locked keyholder is not an empty one" {
+    // Plaza tested only for "ready" and read every other answer as "reachable,
+    // no key here". So a Notary holding a key it cannot use yet looked like a
+    // Notary holding nothing.
+    //
+    // The library's contract names this as the mistake worth designing the
+    // vocabulary against: a client that believes a keyholder is empty offers to
+    // make a key over the top of an identity somebody already has, and a nostr
+    // key cannot be replaced. Nothing was destroyed, because Notary refuses a
+    // second setup, but the reader pressed "Create your identity", got a toast,
+    // and was never offered the one thing that would have worked.
+    var model = main.initialModel();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    const pk = "ab" ** 32;
+    var buf: [256]u8 = undefined;
+    const locked = try std.fmt.bufPrint(&buf, "{{\"state\":\"locked\",\"pubkey\":\"{s}\"}}", .{pk});
+    main.deliverHelperPubkeyForTest(&model, locked);
+
+    try testing.expectEqual(main.HelperState.locked, main.helperStateForTest());
+    // And the screen says which of the two it is, because they want opposite
+    // things from the reader: one wants a key, the other wants a passphrase.
+    try testing.expectEqualStrings("Notary is locked", main.signerStatusLabelForTest());
+    // Holding a key is not signing.
+    try testing.expect(!main.signerIsHealthy());
+
+    // An answer this app does not recognise counts as "cannot sign", never as
+    // "no key yet", which is the rule stated beside the constants.
+    var other: [128]u8 = undefined;
+    const future = try std.fmt.bufPrint(&other, "{{\"state\":\"something-new\",\"pubkey\":\"{s}\"}}", .{pk});
+    main.deliverHelperPubkeyForTest(&model, future);
+    try testing.expect(main.helperStateForTest() != .empty);
+    try testing.expect(!main.signerIsHealthy());
+
+    // Empty really is empty, and says so.
+    main.deliverHelperPubkeyForTest(&model, "{\"state\":\"uninitialized\",\"pubkey\":\"\"}");
+    try testing.expectEqual(main.HelperState.empty, main.helperStateForTest());
+    try testing.expectEqualStrings("Notary has no key", main.signerStatusLabelForTest());
+}
+
+test "a queued setup never fires at a keyholder that already holds a key" {
+    // Offering to create a key over the top of an existing identity is the one
+    // mistake the protocol's state vocabulary exists to prevent, because a
+    // nostr key cannot be replaced. Notary refuses a second setup, so nothing
+    // is destroyed, but the reader presses "Create your identity" and gets a
+    // toast instead of the passphrase box that would have worked.
+    try testing.expect(main.helperSetupMayFireForTest(true, .empty));
+
+    try testing.expect(!main.helperSetupMayFireForTest(true, .locked));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .ready));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .starting));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .unreachable_));
+
+    // And nothing goes out when nothing was asked for.
+    try testing.expect(!main.helperSetupMayFireForTest(false, .empty));
+}

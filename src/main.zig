@@ -4358,9 +4358,48 @@ var g_helper_bin_buf: [1024]u8 = undefined;
 var g_helper_bin_len: usize = 0;
 var g_helper_secret_buf: [64]u8 = undefined;
 var g_helper_secret_len: usize = 0;
-// 0 starting, 1 uninitialized (reachable, no key yet), 2 ready (holds a key),
-// 3 unreachable. Reachable at all (1 or 2) is what proves the loopback IPC.
+/// What the keyholder last said about itself.
+///
+/// Four values, and the fourth is the one that was missing: LOCKED, meaning it
+/// holds a key it cannot use yet. Plaza tested only for "ready" and read
+/// everything else as "reachable, no key here", so a locked Notary read as an
+/// empty one. The library's own contract names that as the mistake worth
+/// designing against: a client that believes a keyholder is empty offers to
+/// make a key over the top of an identity somebody already has, and a nostr key
+/// cannot be replaced.
+///
+/// Nothing was destroyed, because Notary refuses a second setup. But the reader
+/// pressed "Create your identity", got a toast, and was never offered the one
+/// thing that would have worked, which is to unlock.
+pub const HelperState = enum(u8) {
+    starting = 0,
+    /// Reachable, holds no key. Ready to be set up.
+    empty = 1,
+    /// Reachable, holds a key, signing.
+    ready = 2,
+    /// Not answering.
+    unreachable_ = 3,
+    /// Reachable, holds a key it cannot use until somebody unlocks it.
+    locked = 4,
+};
 var g_helper_state = std.atomic.Value(u8).init(0);
+
+fn helperState() HelperState {
+    return @enumFromInt(g_helper_state.load(.acquire));
+}
+
+/// Delivers one /pubkey answer the way the runtime would.
+pub fn deliverHelperPubkeyForTest(model: *Model, body: []const u8) void {
+    handleHelperPubkey(model, .{ .key = helper_poll_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+pub fn helperSetupPendingForTest() bool {
+    return g_helper_setup != .none;
+}
+
+pub fn helperStateForTest() HelperState {
+    return helperState();
+}
 /// When the signed-in health check last ran, and how often it may run. The
 /// signed-out poll is every tick (it is waiting for a key to appear); this is the
 /// quieter beat that keeps the status bar honest afterwards.
@@ -4872,9 +4911,27 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, response.body) catch return;
     defer parsed.deinit();
-    const ready = std.mem.eql(u8, parsed.value.state, nostr.signer_ipc.state_ready);
-    g_helper_state.store(if (ready) 2 else 1, .release);
-    if (!ready) {
+    const ipc = nostr.signer_ipc;
+    // Three states, told apart. Anything this app does not recognise counts as
+    // "cannot sign", never as "no key yet", which is the rule the contract
+    // states beside the constants.
+    const state: HelperState = if (std.mem.eql(u8, parsed.value.state, ipc.state_ready))
+        .ready
+    else if (std.mem.eql(u8, parsed.value.state, ipc.state_locked))
+        .locked
+    else if (std.mem.eql(u8, parsed.value.state, ipc.state_uninitialized))
+        .empty
+    else
+        .locked;
+    g_helper_state.store(@intFromEnum(state), .release);
+
+    if (state == .locked) {
+        // It HOLDS a key. Saying nothing here is what made a locked keyholder
+        // look like an empty one: the latch below is cleared only by evidence
+        // that the key is really gone, and this is not that evidence.
+        return;
+    }
+    if (state != .ready) {
         // The daemon says it holds nothing, which is the only real evidence the
         // logout's reset landed. Whatever key appears next is a new one.
         g_logged_out_pk = null;
@@ -4958,8 +5015,27 @@ fn queueHelperSetup(fx: *Effects, kind: HelperSetup, secret: ?[32]u8) void {
 
 /// Fires a queued setup once the daemon is reachable. Called on the tick and
 /// right after queueing.
+/// Whether a queued setup may go out.
+///
+/// A LOCKED keyholder already holds a key, so firing a setup at it offers to
+/// make one over the top of an identity somebody already has, and a nostr key
+/// cannot be replaced. Notary refuses, so nothing is destroyed, but the reader
+/// gets a toast where they should be getting a passphrase box.
+///
+/// A predicate rather than a line inside the sender, because the sender needs
+/// an effects channel and a test has none.
+fn helperSetupMayFire(queued: bool, state: HelperState) bool {
+    if (!queued) return false;
+    return state == .empty;
+}
+
+pub fn helperSetupMayFireForTest(queued: bool, state: HelperState) bool {
+    return helperSetupMayFire(queued, state);
+}
+
 fn driveHelperSetup(fx: *Effects) void {
-    if (g_helper_setup == .none or !helperReachable()) return;
+    if (!helperReachable()) return;
+    if (!helperSetupMayFire(g_helper_setup != .none, helperState())) return;
     const gpa = std.heap.page_allocator;
     switch (g_helper_setup) {
         .none => {},
@@ -21881,7 +21957,7 @@ const SignerStatus = struct { label: []const u8, glyph: []const u8, color: canva
 /// carries this as a colour; the identity card needs it as a fact.
 pub fn signerIsHealthy() bool {
     return switch (g_signer_kind) {
-        .helper => g_helper_state.load(.monotonic) == 2,
+        .helper => helperState() == .ready,
         .remote => !g_remote_sign_notice.load(.acquire),
         .local => true,
     };
@@ -21899,11 +21975,15 @@ fn signerStatus() SignerStatus {
         // coming up; the install is short a file.
         .helper => if (keyholderMissing())
             .{ .label = "Notary is not installed", .glyph = "notary", .color = p.status_warning }
-        else switch (g_helper_state.load(.monotonic)) {
-            2 => .{ .label = "Notary ready", .glyph = "notary", .color = p.status_success },
-            1 => .{ .label = "Notary has no key", .glyph = "notary", .color = p.status_warning },
-            3 => .{ .label = "Notary unreachable", .glyph = "notary", .color = p.text_faint_alt },
-            else => .{ .label = "Notary starting", .glyph = "notary", .color = p.status_warning },
+        else switch (helperState()) {
+            .ready => .{ .label = "Notary ready", .glyph = "notary", .color = p.status_success },
+            // It HOLDS your key. Saying "has no key" here was the bug: it reads
+            // as an empty keyholder waiting to be set up, when what it wants is
+            // a passphrase.
+            .locked => .{ .label = "Notary is locked", .glyph = "notary", .color = p.status_warning },
+            .empty => .{ .label = "Notary has no key", .glyph = "notary", .color = p.status_warning },
+            .unreachable_ => .{ .label = "Notary unreachable", .glyph = "notary", .color = p.text_faint_alt },
+            .starting => .{ .label = "Notary starting", .glyph = "notary", .color = p.status_warning },
         },
         // A remote bunker: reachable is the whole question, and the remote path
         // already tracks a failed round trip.
