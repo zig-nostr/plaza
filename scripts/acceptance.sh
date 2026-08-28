@@ -371,14 +371,30 @@ journey_guest() {
   # handed, and the defect is which size that is. It only exists in a real
   # window, so it is only catchable here.
   snap
-  local want_h canvas_h
+  # Against the WINDOW's own height, not the one app.zon asks for.
+  #
+  # The defect this exists for is a canvas that does not match the window it
+  # lives in, which is what put the status bar below the bottom edge. Comparing
+  # to app.zon was a proxy for that, and only a valid one when the window
+  # actually gets the size it asked for. On a screen too small to hold it, macOS
+  # gives the window less, the canvas correctly matches, and the proxy fails on
+  # an app that is behaving. That is what a CI runner does, and a check that goes
+  # red on a correct app is a check people learn to ignore.
+  local want_h window_h canvas_h
   want_h=$(grep -oE '\.height = [0-9]+' "$ROOT/app.zon" | head -1 | grep -oE '[0-9]+')
+  window_h=$(grep -oE '^window @w1 .* bounds=\([0-9-]+,[0-9-]+ [0-9]+x[0-9]+\)' "$SNAP" \
+    | head -1 | grep -oE 'x[0-9]+\)' | grep -oE '[0-9]+')
   canvas_h=$(grep -oE 'main-canvas#[0-9]+ role=group name="" bounds=\(0,0 [0-9]+x[0-9]+\)' \
     "$SNAP" | head -1 | grep -oE 'x[0-9]+\)' | grep -oE '[0-9]+')
-  if [ -n "$canvas_h" ] && [ "$canvas_h" = "$want_h" ]; then
-    pass "the canvas is the ${want_h}pt app.zon declares, so nothing is laid out past the window"
+  if [ -z "$window_h" ] || [ -z "$canvas_h" ]; then
+    fail "could not read the window and canvas heights from the snapshot"
+  elif [ "$canvas_h" = "$window_h" ]; then
+    pass "the canvas fills its ${window_h}pt window, so nothing is laid out past the bottom edge"
+    # Worth saying, never worth failing on: a screen too small to hold the
+    # window is the runner's business, not the app's.
+    [ "$window_h" = "$want_h" ] || info "the window got ${window_h}pt of the ${want_h}pt app.zon asks for (a smaller screen)"
   else
-    fail "app.zon asks for a ${want_h}pt window and the canvas is ${canvas_h:-unknown}pt. Anything on the bottom edge is off screen (see plaza#100)"
+    fail "the window is ${window_h}pt and the canvas is ${canvas_h}pt. Anything on the bottom edge is off screen (see plaza#100)"
   fi
 
   stop_app
