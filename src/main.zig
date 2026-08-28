@@ -13963,6 +13963,8 @@ pub const Msg = union(enum) {
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
     /// One line of the daemon's stdout. Only one matters: the port it bound.
+    /// Notary opened a NIP-51 list's private half.
+    private_half: native_sdk.EffectResponse,
     helper_line: native_sdk.EffectLine,
     helper_exited: native_sdk.EffectExit,
     notary_exited: native_sdk.EffectExit,
@@ -14049,7 +14051,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -17871,12 +17873,224 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
 /// the name says "readable" rather than "empty" on purpose: a reader glancing at
 /// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
 /// opposite of what the guard is for.
-fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
-    const kp = g_identity_kp orelse return false;
-    const signer = g_identity_signer orelse return false;
-    const me = activePubkey() orelse return false;
-    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return false;
+/// The decrypted private half of a NIP-51 list, once Notary has opened it.
+///
+/// NIP-51 puts the private half of a list in `content`, encrypted to yourself.
+/// Plaza used to open it inline, against a secret key in this process. There is
+/// no secret key in this process any more, and asking the keyholder is a round
+/// trip, while every caller here answers a question that has to be answered NOW:
+/// is this account muted, and may this list be written back.
+///
+/// So the round trip happens once and the answer is kept. A caller reads this
+/// cache and gets a synchronous answer or nothing; nothing queues the ask and
+/// stays "cannot read", which is the same fail-safe as before and the one that
+/// matters: content that is present and unreadable means the list is NOT
+/// written back. Publishing a list whose private half you could not read
+/// deletes every private entry in it, which is a real bug in a real client and
+/// is why the guard exists.
+const PrivateHalf = struct {
+    used: bool = false,
+    state: enum { idle, asking, open, refused } = .idle,
+    /// The ciphertext this entry is about, by hash: the ciphertext itself runs
+    /// to kilobytes and this only has to tell two of them apart.
+    id: [32]u8 = [_]u8{0} ** 32,
+    plain_buf: [4096]u8 = undefined,
+    plain_len: u16 = 0,
+
+    fn plain(self: *const PrivateHalf) []const u8 {
+        return self.plain_buf[0..self.plain_len];
+    }
+};
+
+/// One per list a reader can have a private half in: mutes, bookmarks, and room
+/// for two more before anything has to be evicted.
+var g_private_halves: [4]PrivateHalf = [_]PrivateHalf{.{}} ** 4;
+
+/// The ciphertext each slot is about, held because the ask happens on a later
+/// tick than the read that noticed it was needed.
+const PrivateCiphertext = struct {
+    buf: [4096]u8 = undefined,
+    len: u16 = 0,
+    fn slice(self: *const PrivateCiphertext) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+var g_private_ciphertext: [4]PrivateCiphertext = [_]PrivateCiphertext{.{}} ** 4;
+
+/// Effect keys for the decrypts, one per slot.
+const private_half_key_base: u64 = 48;
+
+fn privateHalfId(content: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &out, .{});
+    return out;
+}
+
+fn privateHalfFor(content: []const u8) ?*PrivateHalf {
+    const id = privateHalfId(content);
+    for (&g_private_halves) |*h| {
+        if (h.used and std.mem.eql(u8, &h.id, &id)) return h;
+    }
+    return null;
+}
+
+/// The plaintext, or null with the ask queued.
+fn privateHalfOpened(content: []const u8) ?[]const u8 {
+    if (content.len == 0) return null;
+    if (privateHalfFor(content)) |h| {
+        return if (h.state == .open) h.plain() else null;
+    }
+    // Never seen. Claim a slot so the tick asks Notary for it. The oldest
+    // unopened one goes first; an opened one is worth more than a pending ask.
+    const id = privateHalfId(content);
+    for (&g_private_halves, 0..) |*h, i| {
+        if (!h.used) return claimPrivateHalf(i, id, content);
+    }
+    for (&g_private_halves, 0..) |*h, i| {
+        if (h.state != .open) return claimPrivateHalf(i, id, content);
+    }
+    return null;
+}
+
+/// Takes slot `i` for this ciphertext and keeps a copy of it, because the ask
+/// goes out on a later tick than the read that noticed it was needed.
+fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
+    if (content.len > g_private_ciphertext[i].buf.len) return null;
+    g_private_halves[i] = .{ .used = true, .state = .idle, .id = id };
+    @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
+    g_private_ciphertext[i].len = @intCast(content.len);
+    // A test has no tick to fire the ask on, so its stand-in keyholder answers
+    // here. In the app this returns null and the answer arrives a tick later,
+    // which is the whole reason this is a cache and not a call.
+    if (builtin.is_test) {
+        answerPrivateHalfForTest(std.heap.page_allocator, i, content);
+        if (g_private_halves[i].state == .open) return g_private_halves[i].plain();
+    }
+    return null;
+}
+
+pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
+    const id = privateHalfId(content);
+    for (&g_private_halves) |*h| {
+        if (!h.used or std.mem.eql(u8, &h.id, &id)) {
+            h.* = .{ .used = true, .state = .open, .id = id };
+            const n = @min(plain.len, h.plain_buf.len);
+            @memcpy(h.plain_buf[0..n], plain[0..n]);
+            h.plain_len = @intCast(n);
+            return;
+        }
+    }
+}
+
+/// Asks Notary to open one private half, if any is waiting and the keyholder
+/// can answer. One at a time: these are rare, and a batch would need the
+/// ciphertexts held somewhere while the answer travels.
+fn scanPrivateHalves(fx: *Effects) void {
+    if (!signerIsHealthy()) return;
+    const me = activePubkey() orelse return;
+    for (&g_private_halves, 0..) |*h, i| {
+        if (!h.used or h.state != .idle) continue;
+        const content = g_private_ciphertext[i].slice();
+        if (content.len == 0) {
+            h.state = .refused;
+            continue;
+        }
+        const gpa = std.heap.page_allocator;
+        var peer_hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch return;
+        // To yourself: both sides of the conversation key are this account's,
+        // which is what NIP-51 means by a half encrypted to yourself.
+        const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{content} }).toJson(gpa) catch return;
+        defer gpa.free(body);
+        h.state = .asking;
+        if (builtin.is_test) {
+            answerPrivateHalfForTest(gpa, i, content);
+            return;
+        }
+        helperFetch(fx, private_half_key_base + @as(u64, @intCast(i)), "/nip44/decrypt", body, Effects.responseMsg(.private_half));
+        return;
+    }
+}
+
+/// Notary's answer: the plaintext, or a refusal this reader has to live with.
+fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
+    if (response.key < private_half_key_base) return;
+    const i = response.key - private_half_key_base;
+    if (i >= g_private_halves.len) return;
+    const h = &g_private_halves[@intCast(i)];
+    if (!h.used) return;
+    if (response.outcome != .ok or response.status != 200) {
+        // Refused, or the keyholder is not there. NOT "the half is empty": the
+        // whole point of this cache is that unreadable and empty are different
+        // answers, and treating them alike is what deletes somebody's list.
+        h.state = .refused;
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
+        h.state = .refused;
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.items.len == 0) {
+        h.state = .refused;
+        return;
+    }
+    const plain = parsed.value.items[0];
+    const n = @min(plain.len, h.plain_buf.len);
+    @memcpy(h.plain_buf[0..n], plain[0..n]);
+    h.plain_len = @intCast(n);
+    h.state = .open;
+    // The mute set was read with this half closed, so it is short by whatever
+    // was in it. Read it again now that it can be.
+    loadMutesFromStore();
+    invalidateFeed();
+}
+
+/// The keyholder a test has, for the decrypt path. Only in a test binary.
+fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []const u8) void {
+    const secret = g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, kp.public_key, content) catch {
+        g_private_halves[i].state = .refused;
+        return;
+    };
     defer gpa.free(plain);
+    const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handlePrivateHalf(.{ .key = private_half_key_base + @as(u64, @intCast(i)), .outcome = .ok, .status = 200, .body = body });
+}
+
+/// Delivers one decrypt answer for slot zero the way the runtime would, so a
+/// test can drive a keyholder that refuses.
+pub fn deliverPrivateHalfForTest(status: u16, body: []const u8) void {
+    handlePrivateHalf(.{ .key = private_half_key_base, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
+}
+
+/// Puts slot zero in the "asked, waiting" state for a given ciphertext.
+pub fn askPrivateHalfForTest(content: []const u8) void {
+    g_private_halves[0] = .{ .used = true, .state = .asking, .id = privateHalfId(content) };
+    const n = @min(content.len, g_private_ciphertext[0].buf.len);
+    @memcpy(g_private_ciphertext[0].buf[0..n], content[0..n]);
+    g_private_ciphertext[0].len = @intCast(n);
+}
+
+pub fn privateMutesForTest(content: []const u8, out: [][32]u8) usize {
+    return privateMutes(std.heap.page_allocator, content, out);
+}
+
+pub fn privateHalfIsReadableForTest(content: []const u8) bool {
+    return privateHalfIsReadable(std.heap.page_allocator, content);
+}
+
+pub fn forgetPrivateHalvesForTest() void {
+    g_private_halves = [_]PrivateHalf{.{}} ** 4;
+}
+
+fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
+    const plain = privateHalfOpened(content) orelse return false;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
     defer parsed.deinit();
     // It decrypted and parsed. Whatever is in it, this app understood the half it
@@ -17933,12 +18147,10 @@ fn ingestMuteList(ev: nostr.event.Event) void {
 /// away every private mute the reader had.
 fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
     if (content.len == 0 or out.len == 0) return 0;
-    const kp = g_identity_kp orelse return 0;
-    const signer = g_identity_signer orelse return 0;
-    const me = activePubkey() orelse return 0;
-    // To yourself, so both sides of the conversation key are this account's.
-    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return 0;
-    defer gpa.free(plain);
+    // From the cache Notary fills, not from a secret key here. A miss queues
+    // the ask and reads as "cannot read", which is the fail-safe every caller
+    // already handles.
+    const plain = privateHalfOpened(content) orelse return 0;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
     defer parsed.deinit();
     var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
@@ -25030,6 +25242,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
+                // A list whose private half Notary has not opened yet. Reading
+                // it needs the keyholder now that no secret lives here.
+                scanPrivateHalves(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
                 drivePendingIntent(model, fx);
@@ -25066,6 +25281,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 requestWantedQuotes();
             }
         },
+        .private_half => |response| handlePrivateHalf(response),
+
         .helper_line => |line| {
             // The daemon says where it landed, and until it does there is
             // nowhere to send anything. Everything else it prints is for a

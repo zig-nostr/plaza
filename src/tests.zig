@@ -17313,11 +17313,12 @@ fn muteFixture(
 ) !nostr.keys.KeyPair {
     const secret = [_]u8{0x81} ** 32;
     const kp = try signer.keyPairFromSecretKey(secret);
-    // An in-process key, deliberately. These tests are about reading the
-    // ENCRYPTED half of a NIP-51 list, which Plaza decrypts inline against its
-    // own secret. That is the one feature that stops working when the key
-    // leaves this process, and this fixture is where it will announce itself.
-    main.setLocalIdentityForTest(secret);
+    // Through the keyholder, like everything else. These tests are about
+    // reading the ENCRYPTED half of a NIP-51 list, which used to happen inline
+    // against a secret key in this process. There is no secret key here now, so
+    // the half is opened by asking Notary, and the fixture that predicted this
+    // is where the change landed.
+    main.setIdentityForTest(secret);
     main.setStoreForTest(store);
     const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10000, tags, content, null);
     _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
@@ -20037,4 +20038,73 @@ test "a queued setup never fires at a keyholder that already holds a key" {
 
     // And nothing goes out when nothing was asked for.
     try testing.expect(!main.helperSetupMayFireForTest(false, .empty));
+}
+
+test "a private half Notary has not opened yet is unreadable, not empty" {
+    // The distinction this whole cache exists for. Plaza used to open the
+    // private half of a NIP-51 list inline against a secret key in this
+    // process; there is no secret here now, so it asks the keyholder, and an
+    // answer that has not arrived yet must not read as "the half is empty".
+    //
+    // Treating them alike is how a client publishes a list back with every
+    // private entry deleted. Jumble does exactly that, which is why the guard
+    // this feeds was written in the first place.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+
+    // No keyholder has opened anything, and nothing can: there is no identity,
+    // so the stand-in cannot answer either.
+    const ciphertext = "AqRcpq0Cw2h2Vd5Tk1Fk5w==?iv=notarealciphertext";
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), main.privateMutesForTest(ciphertext, &out));
+    // Zero mutes AND unreadable, which is not the same as zero mutes and empty.
+    try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
+}
+
+test "an opened private half is read without asking again" {
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    const ciphertext = "whatever-the-keyholder-was-given";
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{[_]u8{0x5a} ** 32});
+    const plain = try std.fmt.allocPrint(testing.allocator, "[[\"p\",\"{s}\"]]", .{hex});
+    defer testing.allocator.free(plain);
+
+    main.openPrivateHalfForTest(ciphertext, plain);
+    try testing.expect(main.privateHalfIsReadableForTest(ciphertext));
+
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), main.privateMutesForTest(ciphertext, &out));
+    try testing.expectEqualSlices(u8, &[_]u8{0x5a} ** 32, &out[0]);
+}
+
+test "a keyholder that refuses to open a private half leaves it unreadable" {
+    // The other half of the same distinction, and the one an app meets in
+    // practice: Notary answering 403 because nobody approved the decrypt, or
+    // 409 because the key is locked, or not answering at all.
+    //
+    // None of those means the list is empty. Recording them as "open with no
+    // content" would publish the list back with every private entry deleted,
+    // which is the bug this whole cache is shaped around.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+
+    const ciphertext = "a-half-the-keyholder-will-not-open";
+
+    for ([_]u16{ 403, 409, 500, 0 }) |status| {
+        main.askPrivateHalfForTest(ciphertext);
+        main.deliverPrivateHalfForTest(status, "{\"error\":\"refused\"}");
+        if (main.privateHalfIsReadableForTest(ciphertext)) {
+            std.debug.print("\nstatus {d} was treated as a readable half\n", .{status});
+            return error.RefusalReadAsEmpty;
+        }
+    }
+
+    // And an answer carrying no items is not an empty list either.
+    main.askPrivateHalfForTest(ciphertext);
+    main.deliverPrivateHalfForTest(200, "{\"items\":[]}");
+    try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
 }
