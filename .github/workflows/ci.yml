@@ -62,6 +62,31 @@ jobs:
   # in the protocol library rather than in Plaza, filed as zig-nostr/nostr#59
   # (found by this job on its first run), and Windows joins the matrix as soon
   # as it lands.
+  # A release page's text is a hand-written file, and Notary shipped a release
+  # describing the PREVIOUS one: the release commit bumped the versions and the
+  # changelog and forgot this file, and nothing anywhere noticed. Whoever reads
+  # that page is told about a release that is not the one they are downloading.
+  #
+  # Plaza publishes the same way and had the same hole. One grep on every push.
+  release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The release notes name the version being released
+        run: |
+          version="$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' app.zon | head -1)"
+          [ -n "$version" ] || { echo "could not read the version from app.zon"; exit 1; }
+          if ! grep -qF "What's new in v$version" .github/RELEASE_NOTES.md; then
+            echo "app.zon says $version, but .github/RELEASE_NOTES.md does not say"
+            echo "\"What's new in v$version\". The release page takes its text from that"
+            echo "file, so publishing now would describe a different release."
+            echo
+            echo "It currently says:"
+            grep -n "What's new in" .github/RELEASE_NOTES.md || echo "  (nothing)"
+            exit 1
+          fi
+          echo "release notes are for v$version"
   portability:
     name: portability (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
