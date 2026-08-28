@@ -4727,9 +4727,31 @@ const Ceremony = enum { import_key, create_key, status };
 /// that made the request can tell a key it just minted from a key that was
 /// already sitting in the daemon: a window watching /pubkey sees "ready" either
 /// way, and would introduce somebody's leftover key as the reader's new identity.
-fn spawnNotaryWindow(fx: *Effects, ceremony: Ceremony) void {
-    if (g_notary_win_len == 0) return;
+/// Where this app's keyholder is listening, written down for the whole process
+/// so it can be handed to the window as an argv value.
+var g_notary_addr_buf: [32]u8 = undefined;
+var g_notary_addr_len: usize = 0;
+
+/// Opens the key window ON THIS APP'S KEYHOLDER, or does not open it at all.
+///
+/// Returns false when the keyholder has not reported its port yet, and the
+/// caller says so. Opening anyway is what produced the bug this exists for: the
+/// window went looking for a keyholder of its own and, in a packaged app where
+/// `signer` sits beside it, started a SECOND one. The reader then unlocked a
+/// keyholder this app was not using, and sat in guest mode with their key right
+/// there. Restarting did it again, because it does the same thing every time.
+fn spawnNotaryWindow(fx: *Effects, ceremony: Ceremony) bool {
+    if (g_notary_win_len == 0) return false;
     const bin = g_notary_win_buf[0..g_notary_win_len];
+    // No port, no window. There is no safe fallback: the fallback IS the bug.
+    if (g_helper_port == 0 or g_helper_secret_len == 0) return false;
+    const addr = std.fmt.bufPrint(&g_notary_addr_buf, "127.0.0.1:{d}", .{g_helper_port}) catch return false;
+    g_notary_addr_len = addr.len;
+    const address = g_notary_addr_buf[0..g_notary_addr_len];
+    // The secret goes down the pipe, never into argv: `ps` prints argv to every
+    // program running as this user, and this is the one credential that lets
+    // anything reach the keyholder.
+    const secret = g_helper_secret_buf[0..g_helper_secret_len];
     // Two calls rather than one with a computed argv: `&.{...}` over runtime
     // values is a pointer to a temporary, and handing the effect layer one that
     // outlives its scope is the kind of bug that shows up as a garbled argv on
@@ -4742,23 +4764,27 @@ fn spawnNotaryWindow(fx: *Effects, ceremony: Ceremony) void {
     switch (ceremony) {
         .import_key => fx.spawn(.{
             .key = notary_spawn_key,
-            .argv = &.{bin},
+            .argv = &.{ bin, "--approval-http", address },
+            .stdin = secret,
             .output = .collect,
             .on_exit = Effects.exitMsg(.notary_exited),
         }),
         .create_key => fx.spawn(.{
             .key = notary_spawn_key,
-            .argv = &.{ bin, "--create" },
+            .argv = &.{ bin, "--approval-http", address, "--create" },
+            .stdin = secret,
             .output = .collect,
             .on_exit = Effects.exitMsg(.notary_exited),
         }),
         .status => fx.spawn(.{
             .key = notary_spawn_key,
-            .argv = &.{ bin, "--status" },
+            .argv = &.{ bin, "--approval-http", address, "--status" },
+            .stdin = secret,
             .output = .collect,
             .on_exit = Effects.exitMsg(.notary_exited),
         }),
     }
+    return true;
 }
 
 /// What the ceremony window did, learned when it goes.
@@ -5513,7 +5539,7 @@ fn beginCreate(fx: *Effects) void {
     g_logged_out = false;
     g_ceremony = .running;
     g_ceremony_adopted = false;
-    spawnNotaryWindow(fx, .create_key);
+    _ = spawnNotaryWindow(fx, .create_key);
 }
 
 /// Deletes the legacy in-process key file, once its secret is safe in the daemon.
@@ -25779,7 +25805,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // No fallback to a Plaza field. There is no field in this app that
             // can take a key, so dropping to one would be offering a screen
             // that refuses whatever is typed into it.
-            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else setToast(model, "Notary is missing from this install.");
+            if (!ceremonyCanTakeKey()) setToast(model, "Notary is missing from this install.") else if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is still starting. Try that again in a moment.");
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -25939,7 +25965,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // other app on the machine can read what this one writes down.
                 .nsec => {
                     g_login_error.store(@intFromEnum(LoginError.key_goes_to_notary), .release);
-                    spawnNotaryWindow(fx, .import_key);
+                    if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is still starting. Try that again in a moment.");
                 },
                 // Pair with the external signer from the bunker URL; on success
                 // the feed comes up and posts route through it. A bad URL keeps
@@ -26028,7 +26054,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanMediaFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
-        .open_notary_window => spawnNotaryWindow(fx, .status),
+        .open_notary_window => if (!spawnNotaryWindow(fx, .status)) setToast(model, "Your keyholder is still starting. Try that again in a moment."),
         // Deliberately empty: see `Msg.absorb_press`. The press has already done
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},
