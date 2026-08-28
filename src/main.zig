@@ -1791,10 +1791,9 @@ fn publishRelayListReporting(fx: *Effects) bool {
     // something to erase: whatever a previous client put there comes forward,
     // for the same reason a contact list's legacy relay map does.
     const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
-    // The stamp being replaced, so a signature that never arrives does not leave
-    // the pool claiming to be newer than the list the reader really has.
-    armUndo(.{ .relay_list = heldRelayListStamp() });
-    signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false);
+    // `heldRelayListStamp()` is still the OLD stamp here: `setRelayListStamp`
+    // runs below, after the handoff.
+    signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false, .{ .relay_list = heldRelayListStamp() });
     // What the pool now represents. Without this the app's own event would come
     // back from a relay and be adopted over the pool that produced it, and worse,
     // a list the reader signed BEFORE this one would still be newer than the
@@ -17834,11 +17833,11 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     var next: [max_mutes][32]u8 = undefined;
     var n = mutesFromTags(owned_tags, &next);
     n += privateMutes(gpa, content, next[n..]);
-    // Armed before the set moves, with the stamp being replaced.
-    armUndo(.{ .mute = .{ .pubkey = pubkey, .added = muting, .created_at = g_mute_created_at } });
+    // Read BEFORE the set moves, for the same reason the contact list does.
+    const undo_stamp = g_mute_created_at;
     _ = setMutes(next[0..n], created);
 
-    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false);
+    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false, .{ .mute = .{ .pubkey = pubkey, .added = muting, .created_at = undo_stamp } });
     return .published;
 }
 
@@ -18669,15 +18668,15 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // the next press on somebody past the cap does nothing.
     var next: [max_follows_tracked][32]u8 = undefined;
     const n = followsFromTags(owned_tags, &next);
-    // Armed BEFORE the list moves, with the stamp being replaced, so a
-    // signature that never comes back has somewhere to go back to.
-    armUndo(.{ .follow = .{ .pubkey = pubkey, .added = following, .created_at = g_follow_created_at } });
+    // Read BEFORE the list moves: `setFollows` overwrites it, so taking it at
+    // the call below would hand back the stamp this press just wrote.
+    const undo_stamp = g_follow_created_at;
     _ = setFollows(next[0..n], created);
 
     // Remembered as the base for the next press BEFORE the write seam is handed
     // the originals, since it owns them from here and the remote path frees them.
     setPendingFollowBase(owned_tags, content, created);
-    signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false);
+    signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false, .{ .follow = .{ .pubkey = pubkey, .added = following, .created_at = undo_stamp } });
     return .published;
 }
 
@@ -18783,7 +18782,7 @@ fn releasePendingFollowBase(stored_at: i64) void {
 /// standing flag was not. The slot always describes the write whose signature
 /// just failed, so a failed note cannot revert a follow that really was
 /// published.
-const PendingUndo = union(enum) {
+pub const PendingUndo = union(enum) {
     none,
     follow: ListPress,
     mute: ListPress,
@@ -18823,10 +18822,23 @@ pub fn pendingUndoIsNoneForTest() bool {
     return g_pending_undo == .none;
 }
 
-/// Arms the un-like record directly. The real `unlike` needs a live note and an
-/// `Effects` to reach the signer, and what is under test here is what happens
-/// AFTER the id has already been dropped, which is the state that produced the
-/// double reaction.
+/// Arms an undo directly, for the writes whose real path needs a live note, a
+/// live `Effects` or a relay behind it. Arming itself is not what these check:
+/// `signAndPublish` takes the record as an argument, so a write cannot reach
+/// the signer without one. What they check is that each record puts the right
+/// thing back.
+pub fn armUndoForTest(u: PendingUndo) void {
+    armUndo(u);
+}
+
+pub fn markRepostedByMeForTest(note_id: i64) void {
+    markRepostedByMe(note_id);
+}
+
+pub fn repostedByMeForTest(note_id: i64) bool {
+    return engagementFor(note_id).reposted_by_me;
+}
+
 pub fn armUnlikeUndoForTest(note_id: i64, reaction_id: [32]u8) void {
     armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
 }
@@ -25888,10 +25900,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 replayPending(model);
                 return;
             }
-            // Armed BEFORE the write, not after: `armUndo` releases what was
-            // there, so arming after a signature that already came back would
-            // leave a record with nothing to undo.
-            armUndo(.profile);
             publishName(model, fx);
             setToast(model, "Name set");
             replayPending(model);
@@ -26541,8 +26549,7 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // signature never comes back, that seeding is what has to be contradicted:
     // "Saved here and sent to your relays" is otherwise the last word on an
     // edit that reached nobody.
-    armUndo(.profile);
-    signAndPublish(fx, gpa, created, 0, tags, merged, false);
+    signAndPublish(fx, gpa, created, 0, tags, merged, false, .profile);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
     // that reaches no relay is not retried. What IS true is that the edit is
@@ -26631,7 +26638,7 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
 pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
     const gpa = std.heap.page_allocator;
     const owned = gpa.dupe(u8, content) catch return;
-    signAndPublish(fx, gpa, created, kind, tags, owned, false);
+    signAndPublish(fx, gpa, created, kind, tags, owned, false, .none);
 }
 
 pub fn activePubkeyForTest() ?[32]u8 {
@@ -26798,7 +26805,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
     const tags = dupeTags(gpa, prev_tags) orelse return;
-    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false);
+    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false, .profile);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
         if (upsertProfile(pk)) |prof| parseMetadataInto(prof, json);
@@ -26959,7 +26966,9 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     const tags = contentTags(gpa, owned, &.{}, model.mentionsOff());
     // A composer draft: kind:1 carrying whatever its own text implies,
     // restorable to the composer if a remote signer never answers.
-    signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true);
+    // `.none` on purpose: this is the one write that IS `restorable`, so the
+    // draft it came from is what gets handed back.
+    signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true, .none);
     model.draft_buffer.clear();
     model.draft_dropped = 0;
     return true;
@@ -26971,7 +26980,19 @@ fn submitPost(model: *Model, fx: *Effects) bool {
 /// remote paths reference them after this returns, and the write seam intends
 /// them to outlive the detached publish). `restorable` marks a composer draft,
 /// so only a lost post is put back in the composer, never a reaction.
-fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags_in: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags_in: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, undo: PendingUndo) void {
+    // What to take back if this signature never arrives, taken as an ARGUMENT
+    // rather than armed by the caller beforehand.
+    //
+    // Every write in this app moved the screen before it signed and none of
+    // them put it back, and the reason the whole class existed is that arming
+    // was a separate step a caller could simply not do. A parameter cannot be
+    // forgotten: a new write does not compile until it has said what its undo
+    // is, and `.none` is a decision spelled out loud rather than an omission.
+    //
+    // It also fixes the ordering hazard. Arming after the write dispatched
+    // could release a record the response had already consumed.
+    armUndo(undo);
     // Here, rather than at each call site, because this is the ONE door every
     // published event goes through: a switch the reader turned on has to hold for
     // the note they write, the note they repost and the note they quote, and a
@@ -27153,10 +27174,8 @@ fn publishReply(model: *Model, fx: *Effects) void {
     // Its own copy, because `content` belongs to the write seam from here and a
     // reply is not `restorable`: the composer's restore path holds one draft and
     // hands it to the composer, which is the wrong box for this text.
-    if (std.heap.page_allocator.dupe(u8, text)) |kept| {
-        armUndo(.{ .reply = kept });
-    } else |_| {}
-    signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false);
+    const kept: PendingUndo = if (std.heap.page_allocator.dupe(u8, text)) |c| .{ .reply = c } else |_| .none;
+    signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false, kept);
     model.reply_buffer.clear();
 }
 
@@ -27687,9 +27706,8 @@ fn like(model: *const Model, fx: *Effects, note_id: i64) void {
     const tags = buildLikeTags(gpa, note) orelse return;
     const content = gpa.dupe(u8, "+") catch return;
     const id = nostr.event.computeId(gpa, pk, created, 7, tags, content) catch return;
-    armUndo(.{ .like = note_id });
     rememberLike(note_id, id);
-    signAndPublish(fx, gpa, created, 7, tags, content, false);
+    signAndPublish(fx, gpa, created, 7, tags, content, false, .{ .like = note_id });
 }
 
 /// Publishes a kind:6 repost, and fills the icon at once.
@@ -27714,9 +27732,8 @@ fn repost(model: *Model, fx: *Effects, note_id: i64) void {
     // Filled before the signature comes back, the same way a like is. Our own
     // kind:6 arrives through the engagement subscription a moment later and sets
     // the same flag from the crowd, so this only covers the gap.
-    armUndo(.{ .repost = note_id });
     markRepostedByMe(note_id);
-    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false);
+    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false, .{ .repost = note_id });
 }
 
 /// Sets the "ours" flag on a note's row before the crowd confirms it.
@@ -27755,13 +27772,12 @@ fn clearRepostedByMe(note_id: i64) void {
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
     const reaction_id = forgetLike(note_id) orelse return;
+    const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
+    const content = gpa.dupe(u8, "") catch return;
     // The id is already gone from the table by here, so the undo carries it:
     // without it a refused un-like empties the heart, leaves the kind:7 on
     // every relay, and the next press publishes a second reaction.
-    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
-    const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
-    const content = gpa.dupe(u8, "") catch return;
-    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false);
+    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
 }
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.

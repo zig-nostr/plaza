@@ -16926,6 +16926,67 @@ test "a mute the keyholder never signed is put back, stamp and all" {
     try testing.expect(main.isMuted(noisy));
 }
 
+test "every other write nobody signed is put back too" {
+    // The five that shipped with the undo but without a test for it. Arming is
+    // not what these check: `signAndPublish` takes the record as an argument,
+    // so a write cannot reach the signer without stating one. What these check
+    // is that each record puts the RIGHT thing back, which is the half a
+    // compiler cannot enforce.
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetLikesForTest();
+    main.resetEngagementForTest();
+    defer {
+        main.resetLikesForTest();
+        main.resetEngagementForTest();
+    }
+
+    const note_id: i64 = 909;
+
+    // A like that was never signed leaves no phantom heart behind.
+    main.rememberLikeForTest(note_id, [_]u8{0x31} ** 32);
+    try testing.expect(main.isLikedForTest(note_id));
+    {
+        var model = main.initialModel();
+        main.armUndoForTest(.{ .like = note_id });
+        main.applyUndoForTest(&model);
+        try testing.expect(!main.isLikedForTest(note_id));
+        try testing.expect(model.toast_text().len > 0);
+    }
+
+    // A repost that was never signed does not leave the button dead. It used to
+    // set a flag written only ever `true` and not cleared on logout, so the
+    // press stayed spent for the process AND for the next account.
+    {
+        var model = main.initialModel();
+        main.markRepostedByMeForTest(note_id);
+        try testing.expect(main.repostedByMeForTest(note_id));
+        main.armUndoForTest(.{ .repost = note_id });
+        main.applyUndoForTest(&model);
+        try testing.expect(!main.repostedByMeForTest(note_id));
+    }
+
+    // A reply that was never signed gives the typed text back.
+    {
+        var model = main.initialModel();
+        const kept = try std.heap.page_allocator.dupe(u8, "the answer I actually typed");
+        main.armUndoForTest(.{ .reply = kept });
+        main.applyUndoForTest(&model);
+        try testing.expectEqualStrings("the answer I actually typed", model.reply_draft());
+    }
+
+    // And a relay list that was never signed puts its stamp back, which is the
+    // half that outlives the press: it is written to disk, so leaving it forward
+    // keeps the reader's real list out across restarts.
+    {
+        var model = main.initialModel();
+        main.setRelayListStampForTest(9_000);
+        main.armUndoForTest(.{ .relay_list = 1_234 });
+        main.applyUndoForTest(&model);
+        try testing.expectEqual(@as(i64, 1_234), main.relayListStampForTest());
+    }
+}
+
 test "an un-like nobody signed keeps the reaction it was going to delete" {
     // `unlike` drops the reaction id BEFORE signing, so a refusal used to empty
     // the heart while the kind:7 stayed on every relay, and the next press took
