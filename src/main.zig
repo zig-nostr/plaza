@@ -5169,6 +5169,9 @@ fn scanHelperSign(model: *Model) void {
         gpa.free(c);
     }
     if (restorable) g_helper_sign_notice.store(true, .release);
+    // Fires whether or not the note was restorable. A follow write carries no
+    // draft to give back, which is exactly why its failure used to be silent.
+    undoFollowWrite(model);
 }
 
 /// A helper sign that failed, surfaced once in the composer so a restored draft
@@ -18650,6 +18653,9 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // the next press on somebody past the cap does nothing.
     var next: [max_follows_tracked][32]u8 = undefined;
     const n = followsFromTags(owned_tags, &next);
+    // Armed BEFORE the list moves, with the stamp being replaced, so a
+    // signature that never comes back has somewhere to go back to.
+    armFollowUndo(pubkey, following, g_follow_created_at);
     _ = setFollows(next[0..n], created);
 
     // Remembered as the base for the next press BEFORE the write seam is handed
@@ -18739,6 +18745,71 @@ fn releasePendingFollowBase(stored_at: i64) void {
     if (g_pending_follow_tags == null) return;
     if (stored_at < g_pending_follow_created_at) return;
     clearPendingFollowBase();
+    // The write is in the store, so there is nothing left to take back. Same
+    // lifetime as the base by construction: both exist only for the gap
+    // between a press and its event coming home.
+    g_follow_undo_active = false;
+}
+
+/// What one follow press changed, held only until that write is known to have
+/// landed.
+///
+/// The press moves the live list before anything is signed, which is what makes
+/// the feed answer immediately and is worth keeping. What was missing is the
+/// other half: if the signature never comes back, nothing put the list back, so
+/// the app went on showing a follow that reached no relay. Worse, the stamp the
+/// press wrote outranked the real list for the rest of the session, so the
+/// account could not even be corrected by re-reading it.
+///
+/// One name, one direction and the stamp to go back to. A press toggles exactly
+/// one person, so undoing it needs nothing more than that.
+var g_follow_undo_active: bool = false;
+var g_follow_undo_pubkey: [32]u8 = undefined;
+var g_follow_undo_added: bool = false;
+var g_follow_undo_created_at: i64 = 0;
+
+/// Arms the undo for a press that is about to be signed.
+fn armFollowUndo(pubkey: [32]u8, added: bool, previous_created_at: i64) void {
+    g_follow_undo_active = true;
+    g_follow_undo_pubkey = pubkey;
+    g_follow_undo_added = added;
+    g_follow_undo_created_at = previous_created_at;
+}
+
+/// Puts the follow set back after a signature that never arrived, and says so.
+///
+/// Silence was the whole defect. A reader who unfollows somebody and is shown
+/// the button they pressed has no way to learn that nothing was published, and
+/// on the next launch the person is still there.
+fn undoFollowWrite(model: *Model) void {
+    if (!g_follow_undo_active) return;
+    g_follow_undo_active = false;
+    const pubkey = g_follow_undo_pubkey;
+    const added = g_follow_undo_added;
+    const restored_at = g_follow_undo_created_at;
+
+    // Snapshot under the lock, rebuild outside it: `setFollows` takes the same
+    // lock and this one is not reentrant.
+    var next: [max_follows_tracked][32]u8 = undefined;
+    var n: usize = 0;
+    lockFollows();
+    for (g_follows[0..g_follow_count]) |f| {
+        if (added and std.mem.eql(u8, &f, &pubkey)) continue;
+        if (n >= next.len) break;
+        next[n] = f;
+        n += 1;
+    }
+    unlockFollows();
+    if (!added and n < next.len) {
+        next[n] = pubkey;
+        n += 1;
+    }
+
+    // The base went with the press, so it goes back with it. Leaving it would
+    // make the next press build on a list that was never published.
+    clearPendingFollowBase();
+    _ = setFollows(next[0..n], restored_at);
+    setToast(model, "Not signed. Put that back.");
 }
 
 /// Puts the app in the state a bunker or a Notary key leaves it in: a contact
@@ -29712,6 +29783,7 @@ fn scanPendingRemote(model: *Model) void {
     const generation = g_remote_generation.load(.acquire);
     var restore: ?[]const u8 = null;
     var sign_failed = false;
+    var any_sign_failed = false;
     var connect_failed = false;
 
     pendingLock();
@@ -29737,6 +29809,9 @@ fn scanPendingRemote(model: *Model) void {
                     if (slot_restorable and restore == null) restore = c else gpa.free(c);
                 }
                 if (slot_restorable) sign_failed = true;
+                // Any failed signature, restorable or not, may have been a
+                // follow press whose list already moved.
+                any_sign_failed = true;
             },
             .connect => {
                 if (content) |c| gpa.free(c);
@@ -29751,6 +29826,7 @@ fn scanPendingRemote(model: *Model) void {
         gpa.free(c);
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
+    if (any_sign_failed) undoFollowWrite(model);
     if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }
 
