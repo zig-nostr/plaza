@@ -4850,14 +4850,7 @@ fn spawnHelper(fx: *Effects) void {
     if (g_helper_bin_len == 0 or g_helper_secret_len == 0) return;
     fx.spawn(.{
         .key = helper_spawn_key,
-        // `--serve-relays` makes this keyholder answer your OTHER devices too,
-        // over NIP-46, where a client proves who it is with its own keypair.
-        // Read at spawn, so the setting takes effect on the next launch: a
-        // daemon's relay threads are started once, with the key.
-        .argv = if (g_sign_for_devices)
-            &.{ helperBin(), "--approval-http", "127.0.0.1:0", "--serve-relays" }
-        else
-            &.{ helperBin(), "--approval-http", "127.0.0.1:0" },
+        .argv = &.{ helperBin(), "--approval-http", "127.0.0.1:0" },
         .stdin = g_helper_secret_buf[0..g_helper_secret_len],
         .on_line = Effects.lineMsg(.helper_line),
         .on_exit = Effects.exitMsg(.helper_exited),
@@ -9735,15 +9728,6 @@ pub const Model = struct {
     }
     /// The status line under the sign-in field: a synchronous parse error, or
     /// the async bunker-connect state.
-    /// What the "sign for my other devices" switch actually does.
-    pub fn sign_for_devices_explainer(self: *const Model) []const u8 {
-        _ = self;
-        if (signForDevices()) {
-            return "Notary answers your phone and your other clients over relays, as well as Plaza. They connect with a bunker link from Notary's own window.";
-        }
-        return "Notary here signs only for Plaza. Turn this on and it also answers your other clients over relays, using the same key.";
-    }
-
     pub fn login_status(self: *const Model) []const u8 {
         _ = self;
         switch (@as(LoginError, @enumFromInt(g_login_error.load(.acquire)))) {
@@ -13963,8 +13947,6 @@ pub const Msg = union(enum) {
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
     proxy_toggle,
-    /// Whether Plaza's keyholder also answers other devices over relays.
-    sign_for_devices_toggle,
     direct_fallback_toggle,
     /// Index into `hideables`.
     hide_toggle: u8,
@@ -14024,7 +14006,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "sign_for_devices_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -14247,34 +14229,6 @@ fn identitySection(ui: *AppUi, model: *const Model) AppUi.Node {
         // the few seconds of the ceremony that made the key.
         if (model.can_open_notary()) settingsLink(ui, "Open Notary", Msg.open_notary_window) else ui.spacer(0),
     });
-    n += 1;
-
-    // Whether the keyholder Plaza starts also answers your OTHER devices.
-    //
-    // Not a second signer and not a second key: the same Notary, additionally
-    // reachable over relays, where a client proves who it is with its own
-    // keypair. Off by default because it puts the process holding your key on
-    // the network, which is a real change and yours to make.
-    const p2 = theme.palette;
-    rows[n] = ui.el(.checkbox, .{
-        .size = .sm,
-        .checked = signForDevices(),
-        .text = "Sign for my other devices",
-        .on_toggle = Msg.sign_for_devices_toggle,
-        .style = .{
-            .accent = p2.surface_control_solid,
-            .accent_foreground = p2.on_accent,
-            .border = p2.border_radio,
-            .radius = 4,
-            .stroke_width = 1.5,
-        },
-        .semantics = .{ .label = "Sign for my other devices", .focusable = true },
-    }, .{});
-    n += 1;
-    rows[n] = ui.paragraph(
-        .{ .wrap = true, .style = .{ .foreground = p2.text_faint } },
-        &.{.{ .text = model.sign_for_devices_explainer(), .scale = mono_hint_scale }},
-    );
     n += 1;
 
     // The backup used to be here, and could not work: a key minted in Plaza is
@@ -25812,20 +25766,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             setClientTag(!clientTag());
             saveSettings();
         },
-        .sign_for_devices_toggle => {
-            setSignForDevices(!signForDevices());
-            // The daemon's relay threads start once, with the key, so this
-            // takes effect next launch. Saying so beats a switch that looks
-            // like it did something and did not.
-            // Short enough to survive the toast buffer, which is 48 bytes and
-            // truncates without saying so: the first version of this line lost
-            // the word "restart", which was the only word that mattered.
-            setToast(model, if (signForDevices())
-                "On for other devices. Restart Plaza to apply."
-            else
-                "Off for other devices. Restart Plaza to apply.");
-        },
-
         .proxy_toggle => {
             setMediaProxyOn(!mediaProxyOn());
             saveSettings();
@@ -30229,7 +30169,6 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_direct_fallback = true;
     g_hidden = @splat(false);
     g_rail_open = false;
-    g_sign_for_devices = false;
     g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
@@ -30249,33 +30188,9 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "sign_for_devices")) g_sign_for_devices = std.mem.eql(u8, line[eq + 1 ..], "on");
         // An empty value is meaningful here too: it is your own Plaza.
         if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
     }
-}
-
-/// Whether Plaza's keyholder also answers your other devices, over relays.
-///
-/// OFF by default, and the default is the only cautious thing about it. There
-/// is no new door here: a client reaching Notary over a relay is a NIP-46
-/// client and proves who it is with its own keypair, which is the one identity
-/// in this system nothing can forge. What turning it on does change is that the
-/// process holding your key is on the network, and that is a decision to make
-/// rather than one to inherit.
-///
-/// With it off, your phone would need a Notary of its own and cannot have one:
-/// two processes cannot hold the same key, so a standalone Notary and this one
-/// lock each other out. On is what makes one keyholder mean one.
-var g_sign_for_devices: bool = false;
-
-pub fn signForDevices() bool {
-    return g_sign_for_devices;
-}
-
-pub fn setSignForDevices(on: bool) void {
-    g_sign_for_devices = on;
-    saveSettings();
 }
 
 /// Where the places you have entered are written.
@@ -30411,7 +30326,7 @@ fn saveSettings() void {
     var place_buf: [160]u8 = undefined;
     const place = activePlaceLine(&place_buf);
     var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nsign_for_devices={s}\nplace={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
@@ -30419,7 +30334,6 @@ fn saveSettings() void {
         if (g_media_proxy_on) "on" else "off",
         if (g_media_direct_fallback) "on" else "off",
         if (g_rail_open) "on" else "off",
-        if (g_sign_for_devices) "on" else "off",
         place,
     }) catch return;
     dir.writeFile(io, .{
