@@ -86,7 +86,7 @@ cleanup() {
   # window and the keyholder daemon are children, and a killed parent does not
   # take them with it.
   pkill -f "$ROOT/zig-out/bin/plaza" 2>/dev/null || true
-  pkill -f "notary-window/zig-out/bin/notary-window" 2>/dev/null || true
+  pkill -f "notary/gui/zig-out/bin/notary" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -287,12 +287,12 @@ journey_bundle() {
   # `set -e` would exit the run at the exact moment the check found something.
   local alive=0
   pgrep -f "$app/Contents/MacOS/plaza$" >/dev/null 2>&1 && alive=$((alive + 1)) || true
-  pgrep -f "$app/Contents/MacOS/plaza-signer" >/dev/null 2>&1 && alive=$((alive + 1)) || true
+  pgrep -f "$app/Contents/MacOS/signer" >/dev/null 2>&1 && alive=$((alive + 1)) || true
 
   if [ "$alive" -eq 2 ]; then
     pass "the app and its keyholder daemon are both running"
   else
-    fail "expected the app and plaza-signer to be running, found $alive of 2"
+    fail "expected the app and its signer to be running, found $alive of 2"
   fi
 
   # It wrote a store under the disposable home rather than anywhere else.

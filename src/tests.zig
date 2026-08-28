@@ -9352,13 +9352,13 @@ test "a keyholder that is not there is reported missing, not formatted into a pa
     // version of this that only formatted is what shipped a bundle with no
     // keyholder in it: the app spawned a file that was not there, said so on
     // stderr, and carried on believing it had a daemon.
-    try testing.expectEqual(@as(usize, 0), main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer"));
+    try testing.expectEqual(@as(usize, 0), main.resolveSiblingForTest(std.testing.io, &out, dir, "signer"));
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plaza-signer", .data = "not really a binary" });
-    const n = main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "signer", .data = "not really a binary" });
+    const n = main.resolveSiblingForTest(std.testing.io, &out, dir, "signer");
     var want_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&want_buf, "{s}/plaza-signer", .{dir}),
+        try std.fmt.bufPrint(&want_buf, "{s}/signer", .{dir}),
         out[0..n],
     );
 }

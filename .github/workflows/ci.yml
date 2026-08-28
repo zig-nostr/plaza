@@ -41,8 +41,6 @@ jobs:
       # and `zig build test` both walk straight past it. Its 21 tests had never
       # run on any machine but mine, including the ones guarding the migration
       # that can delete somebody's only copy of their key.
-      - name: Test the keyholder daemon
-        run: zig build test-signer
 
       - name: Build
         run: native build
@@ -50,13 +48,6 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src
 
-      - name: Notary window (check, test, build, format)
-        working-directory: notary-window
-        run: |
-          native check
-          native test
-          native build
-          zig fmt --check src
 
   # Linux builds the whole stack (the library with its vendored secp256k1 and
   # LMDB, the stb codecs, and the app) and runs the test suite, so a portability
@@ -107,8 +98,6 @@ jobs:
       # Here as much as on macOS: `planAfterKeychain` is the one decision that
       # answers differently per platform, so a change that is right on macOS and
       # wrong on Linux has to fail here rather than at a reader's first launch.
-      - name: Test the keyholder daemon
-        run: zig build test-signer
 
       # The app ships ReleaseFast, and two things only exist there. The frame
       # budgets skip themselves in Debug, because a Debug rebuild is six times

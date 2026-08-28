@@ -11,6 +11,17 @@ on:
 permissions:
   contents: write # create the release and upload the .app
 
+env:
+  # The Notary release this Plaza ships. Plaza carries Notary's daemon and its
+  # window rather than a signer of its own, so the keyholder has one
+  # implementation, built and audited once.
+  #
+  # A TAG, not a branch. A release is the one artifact nobody gets to re-check,
+  # and "whatever notary's main happened to be that afternoon" is not something
+  # anybody could reproduce later. Bump it deliberately, with the Plaza release
+  # that needs it.
+  NOTARY_REF: v0.10.0
+
 jobs:
   macos-app:
     name: package · ad-hoc sign · publish
@@ -36,20 +47,28 @@ jobs:
       # The tests run on every pull request, but a tag can be pushed at any
       # commit, and a release is the one artifact nobody gets to re-check. So the
       # suite runs again here and the release does not exist if it fails. Both
-      # halves, because the bundle carries both binaries.
+      # halves, because the bundle carries more than one binary.
       - name: Test
         run: native test
 
-      - name: Test the ceremony window
-        working-directory: notary-window
-        run: native test
+      # Plaza ships NOTARY's daemon and window rather than a signer of its own,
+      # so the keyholder has one implementation instead of two. Pinned to a tag
+      # rather than tracking a branch: a release is the one artifact nobody gets
+      # to re-check, and "whatever notary's main happened to be" is not a thing
+      # anybody could reproduce later.
+      - name: Check out Notary
+        uses: actions/checkout@v4
+        with:
+          repository: zig-nostr/notary
+          ref: ${{ env.NOTARY_REF }}
+          path: .notary
 
-      # The script builds both binaries itself from cleared zig-outs, refuses to
-      # package a plaza carrying the automation server, injects the ceremony
-      # window and signs inside-out. See its comments: a bare `native package`
-      # signs whatever is already in zig-out/bin and carries no second binary.
+      # The script clears both zig-outs, refuses to package a plaza carrying the
+      # automation server, injects Notary's two binaries and signs inside-out.
+      # See its comments: a bare `native package` signs whatever is already in
+      # zig-out/bin and carries no second binary.
       - name: Package the app (ad-hoc signed)
-        run: scripts/package-macos.sh
+        run: scripts/package-macos.sh --notary .notary
 
       - name: Zip the .app (ditto preserves the signature)
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Plaza.app" "Plaza-${{ github.ref_name }}-macos.zip"

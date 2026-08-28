@@ -4335,7 +4335,7 @@ var g_remote_status = std.atomic.Value(u8).init(0);
 
 // ------------------------------------------------- the isolated signer helper
 //
-// plaza-signer holds the key in a separate PROCESS, reached over loopback HTTP.
+// Notary's daemon holds the key in a separate PROCESS, reached over loopback.
 // Plaza spawns it at launch, writes it a 0600 bearer token, and (for now)
 // health-checks it; routing the actual signing through it comes next. The port
 // is Plaza-specific (not notary's 8787), so a standalone Notary and the
@@ -4592,12 +4592,16 @@ var g_logout_reset_due: bool = false;
 fn resolveNotaryWindow(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return;
-    // Packaged: a sibling. Dev: the sub-project's own zig-out, because unlike
-    // the daemon it is built by a separate build.zig and never lands in Plaza's
-    // bin directory. Sibling first, that being the shipped layout.
-    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "notary-window");
+    // Notary's OWN window, not a second one of Plaza's. Bringing a key is the
+    // one thing Plaza deliberately cannot do: the key never touches this
+    // process, so the screen that receives it belongs to the app that holds it.
+    //
+    // Packaged: a sibling. Dev: Notary's checkout beside this one, because it
+    // is built by a separate build.zig and never lands in Plaza's bin
+    // directory. Sibling first, that being the shipped layout.
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "notary");
     if (g_notary_win_len != 0) return;
-    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "../../notary-window/zig-out/bin/notary-window");
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "../../../notary/gui/zig-out/bin/notary");
 }
 
 /// Whether there is a Notary holding this account's key AND a window to show it
@@ -4655,8 +4659,8 @@ pub fn setSignerKindForTest(kind: []const u8) void {
 
 /// Pretends the ceremony window was (or was not) found beside Plaza.
 pub fn setNotaryWindowFoundForTest(found: bool) void {
-    g_notary_win_len = if (found) "/nonexistent/notary-window".len else 0;
-    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary-window".len], "/nonexistent/notary-window");
+    g_notary_win_len = if (found) "/nonexistent/notary".len else 0;
+    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary".len], "/nonexistent/notary");
 }
 
 /// Whether a helper setup is sitting queued, waiting for the daemon to answer.

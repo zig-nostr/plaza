@@ -2,7 +2,11 @@
 #
 # Builds Plaza.app for macOS: a ReleaseFast binary in an ad-hoc signed bundle.
 #
-#   scripts/package-macos.sh [--output dist/Plaza.app]
+#   scripts/package-macos.sh --notary <path> [--output dist/Plaza.app]
+#
+# `--notary` is a checkout of the notary repo. Plaza ships Notary's daemon and
+# its window rather than a signer of its own, so the keyholder is built and
+# audited once instead of twice.
 #
 # Ad-hoc signed, NOT notarized, on purpose. Plaza holds a signing key, so the
 # trust anchor is a build anyone can reproduce from source rather than an Apple
@@ -16,7 +20,14 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/dist/Plaza.app"
-[ "${1:-}" = "--output" ] && { out="${2:?--output needs a path}"; }
+notary_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="${2:?--output needs a path}"; shift 2 ;;
+    --notary) notary_dir="${2:?--notary needs a path}"; shift 2 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
 
 [ "$(uname -s)" = "Darwin" ] || die "packaging a .app needs macOS."
 command -v native >/dev/null 2>&1 || die "the Native SDK CLI is not on PATH (npm install -g @native-sdk/cli)."
@@ -52,21 +63,24 @@ native build .
 hits="$(strings zig-out/bin/plaza | grep -c "native-sdk-automation" || true)"
 [ "$hits" = "0" ] || die "the built binary carries the automation server ($hits marker(s)). Refusing to package it."
 
-# Plaza is three processes, not one: the app, `plaza-signer` (the isolated
-# keyholder daemon that actually holds the secret), and `notary-window` (the key
-# ceremony, in its own window). Both helpers are resolved as SIBLINGS of argv[0],
-# so both have to sit in Contents/MacOS, and `native package` carries exactly one
-# executable.
+# Plaza is three processes, not one: the app, `signer` (the keyholder daemon
+# that holds the secret) and `Notary` (the window where a key is brought and
+# unlocked). Both are NOTARY's, not Plaza's own: one keyholder, built and
+# audited once, rather than a second implementation of the most dangerous code
+# in the project. Both are resolved as SIBLINGS of argv[0], so both sit in
+# Contents/MacOS, and `native package` carries exactly one executable.
 #
-# The list is derived rather than typed out. My first version of this script
-# hand-copied the ceremony window, because that was the missing binary I happened
-# to be looking at, and shipped a bundle with no keyholder daemon at all:
-# `resolveHelper` formats the sibling path with no access check and no fallback,
-# so the app would have spawned a file that was not there, silently, and "Create
-# your identity" would have dead-ended in a released build. Whatever build.zig
-# installs belongs beside the app, so ask build.zig instead of remembering.
-say "Building the ceremony window..."
-(cd notary-window && rm -rf zig-out && native build .)
+# They are built from a checkout of the notary repo rather than by this build,
+# which is what --notary points at. The app degrades SILENTLY when a sibling is
+# missing (`resolveHelper` formats the path with an access check and gives up),
+# so the by-name assertion below is what keeps a release from being where that
+# is discovered. A bundle with no keyholder in it has shipped once already.
+[ -n "${notary_dir:-}" ] || die "pass --notary <path to a notary checkout>"
+[ -d "$notary_dir" ] || die "--notary '$notary_dir' is not a directory"
+
+say "Building Notary's daemon and window..."
+(cd "$notary_dir/daemon" && zig build -Doptimize=ReleaseFast)
+(cd "$notary_dir/gui" && rm -rf zig-out && native build .)
 
 # Packaged UNSIGNED on purpose. A signature covers the bundle's contents, so
 # copying binaries in afterwards invalidates it. Inject first, then sign
@@ -82,8 +96,10 @@ for bin in zig-out/bin/*; do
   say "  + $name"
   cp "$bin" "$out/Contents/MacOS/$name"
 done
-say "  + notary-window"
-cp notary-window/zig-out/bin/notary-window "$out/Contents/MacOS/notary-window"
+say "  + signer (Notary's daemon)"
+cp "$notary_dir/daemon/zig-out/bin/signer" "$out/Contents/MacOS/signer"
+say "  + notary (the key window)"
+cp "$notary_dir/gui/zig-out/bin/notary" "$out/Contents/MacOS/notary"
 
 say "Signing inside-out..."
 for bin in "$out/Contents/MacOS/"*; do
@@ -97,7 +113,7 @@ codesign --verify --deep --strict "$out" || die "the bundle failed signature ver
 # Assert what a working bundle needs, by name. The loop above is what keeps this
 # list from going stale, but the app degrades SILENTLY when a sibling is missing,
 # so the release is the wrong place to find out.
-for required in plaza plaza-signer notary-window; do
+for required in plaza signer notary; do
   [ -x "$out/Contents/MacOS/$required" ] || die "$required is missing from the bundle."
 done
 
@@ -110,7 +126,7 @@ done
 # accident; the loop above still does the actual work.
 for bin in "$out/Contents/MacOS/"*; do
   case "$(basename "$bin")" in
-    plaza | plaza-signer | notary-window) ;;
+    plaza | signer | notary) ;;
     *) die "$(basename "$bin") is in the bundle and is not a binary Plaza runs. If it belongs, name it here; if it does not, stop installing it in build.zig." ;;
   esac
 done
