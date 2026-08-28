@@ -276,7 +276,22 @@ journey_bundle() {
 
   local app="$WORK/Plaza.app" home="$WORK/bundle-home"
   mkdir -p "$home"
-  (cd "$ROOT" && scripts/package-macos.sh --output "$app" >"$WORK/package.log" 2>&1) \
+
+  # The bundle carries Notary's daemon and window, so packaging needs a Notary
+  # checkout. At the SAME tag the release workflow pins, read from the workflow
+  # rather than typed here: a bundle built against a different Notary is not the
+  # bundle anybody downloads, and this journey exists to test the one they do.
+  local notary_ref
+  notary_ref="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' "$ROOT/.github/workflows/release.yml" | head -1)"
+  [ -n "$notary_ref" ] || { fail "could not read NOTARY_REF from the release workflow"; return; }
+  local notary="$WORK/notary"
+  info "packaging against notary $notary_ref"
+  if ! git clone -q --depth 1 --branch "$notary_ref" https://github.com/zig-nostr/notary.git "$notary" 2>"$WORK/notary-clone.log"; then
+    skip "could not fetch notary $notary_ref. See $WORK/notary-clone.log"
+    return
+  fi
+
+  (cd "$ROOT" && scripts/package-macos.sh --notary "$notary" --output "$app" >"$WORK/package.log" 2>&1) \
     || { fail "packaging failed. See $WORK/package.log"; return; }
   pass "the bundle built and passed signature verification"
 
