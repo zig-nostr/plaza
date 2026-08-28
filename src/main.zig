@@ -4983,6 +4983,11 @@ var g_helper_pending_in_flight: HelperSetup = .none;
 /// A POST to the daemon with the bearer token. The body is copied by the effect,
 /// so a stack buffer is fine.
 fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup))) void {
+    helperFetchTimeout(fx, key, path, body, on_response, helper_sign_timeout_ms);
+}
+
+/// The same, with the wire deadline stated rather than inherited.
+fn helperFetchTimeout(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup)), timeout_ms: u32) void {
     // Nowhere to send it yet. The daemon takes a kernel-chosen port and says
     // which one on stdout, so between the spawn and that line there is no
     // address: sending to port zero would be a request nobody could answer and
@@ -4998,6 +5003,7 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
         .method = .POST,
         .headers = &.{.{ .name = "Authorization", .value = auth }},
         .body = body,
+        .timeout_ms = timeout_ms,
         .on_response = on_response,
     });
 }
@@ -5032,10 +5038,32 @@ var g_helper_sign: HelperSign = .{};
 /// which have no other view of the event that actually goes out.
 var g_last_published_tags: []const nostr.event.Tag = &.{};
 
-/// How long a helper sign may be out before the note is handed back. The daemon
-/// is on loopback and answers in about a millisecond, so this is not a latency
-/// budget: it is the backstop for a response that never arrives at all.
-const helper_sign_timeout_s: i64 = 10;
+/// How long a sign may be out before the note is handed back.
+///
+/// Ten seconds was safe while the keyholder answered in about a millisecond and
+/// could not do anything else. Notary can refuse and ask a person, and the
+/// answer to that arrives on a human timescale. The app-side backstop and the
+/// wire timeout must agree, and they did not: the fetch carried no timeout at
+/// all, so the SDK's default of thirty seconds applied while this fired at ten.
+///
+/// What that gap does is worse than a slow note. At ten seconds Plaza restores
+/// the draft and says the sign failed, while the request is still live; an
+/// answer at twenty then publishes an event the reader was told had failed. For
+/// those twenty seconds `signerReady` reports true because this slot is clear,
+/// while the effect key is still held, so the NEXT sign is rejected by the SDK
+/// and silently does nothing.
+///
+/// So the two are one number now, stated in both places from here.
+const helper_sign_timeout_s: i64 = 30;
+const helper_sign_timeout_ms: u32 = @intCast(helper_sign_timeout_s * 1000);
+
+pub fn helperSignTimeoutSecondsForTest() i64 {
+    return helper_sign_timeout_s;
+}
+
+pub fn helperSignTimeoutMillisForTest() u32 {
+    return helper_sign_timeout_ms;
+}
 
 /// Remembers a note handed to the daemon, so a failure has something to give
 /// back. Called BEFORE the request is built, because building it can fail too
@@ -5456,6 +5484,12 @@ fn answerHelperSignForTest(gpa: std.mem.Allocator, unsigned_json: []const u8) vo
     handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
 }
 
+/// Delivers one signed-event answer the way the runtime would, so a test can
+/// hand the app an event it did NOT ask for.
+pub fn deliverHelperSignedForTest(body: []const u8) void {
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+
 fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // A refusal, a timeout, a rejected effect, or a daemon that is not there.
     // The tick hands the note back; this line used to be where it was dropped.
@@ -5492,6 +5526,38 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
         failHelperSign();
         return;
     };
+    // Checked, not trusted, and that is a change of mind rather than an
+    // oversight. The old reasoning was written down here: "it came from our own
+    // daemon over authenticated loopback". It was true when the daemon was a
+    // binary Plaza built and shipped. It is not now: the keyholder is a
+    // separate product whose key can be changed, removed or replaced between
+    // the moment Plaza asked whose key it was and the moment an answer arrives.
+    //
+    // Two things, and the second is the one that matters. A signature proves
+    // the event was signed by the key it names. It says nothing about WHOSE key
+    // that is, so publishing without the second check would put a note on
+    // relays under an account the reader is not signed in to, over their name,
+    // with nothing on screen to say so.
+    var verifier = nostr.keys.Signer.init();
+    defer verifier.deinit();
+    const mine = activePubkey() orelse {
+        failHelperSign();
+        return;
+    };
+    if (!std.mem.eql(u8, &out.pubkey, &mine)) {
+        failHelperSign();
+        return;
+    }
+    if (nostr.event.verify(gpa, verifier, out)) |ok| {
+        if (!ok) {
+            failHelperSign();
+            return;
+        }
+    } else |_| {
+        failHelperSign();
+        return;
+    }
+
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }

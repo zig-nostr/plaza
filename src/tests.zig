@@ -19896,3 +19896,87 @@ test "nothing is sent to the keyholder before it says where it is" {
     main.setHelperPortForTest(8790);
     try testing.expectEqual(@as(u16, 8790), main.helperPortForTest());
 }
+
+test "an event signed by somebody else is not published under your name" {
+    // The keyholder is a separate product now. Its key can be changed, removed
+    // or replaced between the moment Plaza asked whose key it was and the
+    // moment an answer comes back, so what it returns is checked rather than
+    // trusted. The old comment here said "it came from our own daemon over
+    // authenticated loopback", which was true when Plaza built and shipped that
+    // daemon and stopped being true when it did not.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x21} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    // A perfectly valid event, signed by a real key, that is not the reader's.
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const theirs = try nostr.event.create(arena, other, other_kp, 1_800_000_000, 1, &.{}, "under your name", null);
+    const theirs_json = try nostr.event.toJson(arena, theirs);
+    const body = try (nostr.signer_ipc.SignEvent{ .event = theirs_json }).toJson(arena);
+
+    main.deliverHelperSignedForTest(body);
+
+    // Nothing was published. A signature proves the event was signed by the key
+    // it names; it says nothing about WHOSE key that is, and publishing on that
+    // alone puts a note on relays under an account nobody is signed in to.
+    if (main.lastPublishedForTest()) |ev| {
+        std.debug.print("\npublished an event by {x} while signed in as somebody else\n", .{ev.pubkey});
+        return error.PublishedSomebodyElsesEvent;
+    }
+}
+
+test "an event whose signature does not check is not published either" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const secret = [_]u8{0x23} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    var ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "tampered", null);
+    // The right author, and a signature that is not one. Whoever is answering
+    // could be anything; the account is only as safe as what is checked.
+    ev.sig[0] ^= 0xff;
+    const json = try nostr.event.toJson(arena, ev);
+    const body = try (nostr.signer_ipc.SignEvent{ .event = json }).toJson(arena);
+
+    main.deliverHelperSignedForTest(body);
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+test "the note's deadline and the wire's are one number" {
+    // They were two, and they disagreed. The fetch carried no timeout at all,
+    // so the SDK's thirty-second default applied while the app-side backstop
+    // fired at ten.
+    //
+    // The gap is worse than a slow note. At ten seconds Plaza restores the
+    // draft and says the sign failed, while the request is still live; an
+    // answer at twenty then publishes an event the reader was just told had
+    // failed. For those twenty seconds `signerReady` reports true because the
+    // slot is clear, while the effect key is still held, so the next sign is
+    // rejected by the SDK and silently does nothing.
+    //
+    // Latent while the keyholder answered in a millisecond and could do nothing
+    // else. Notary can refuse and ask a person, and that answer comes back on a
+    // human timescale.
+    try testing.expectEqual(
+        @as(u32, @intCast(main.helperSignTimeoutSecondsForTest() * 1000)),
+        main.helperSignTimeoutMillisForTest(),
+    );
+    // And long enough to be worth having: a person has to see the prompt and
+    // reach for it.
+    try testing.expect(main.helperSignTimeoutSecondsForTest() >= 20);
+}
