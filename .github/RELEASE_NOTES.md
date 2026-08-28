@@ -1,9 +1,19 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.13.1
+### What's new in v0.13.2
 
-**Fixed: v0.13.0 could not write anything.** Following somebody, muting, posting, reacting, editing your profile: all of it was refused before it reached a relay, and the app showed the press as done. If you ran v0.13.0, nothing you wrote in it was published. That release is now marked a pre-release and this one replaces it.
+**Fixed: a write that was never signed no longer looks like it worked.** Every press in this app moves the screen straight away, which is what makes it feel immediate and is worth keeping. What was missing was the other half: if the signature never came back, nothing put any of it back. So a follow, a mute, a like, a repost or a profile edit could reach no relay at all while the app showed it as done.
 
-The cause was in the pairing. Plaza starts its own keyholder and asks it to sign, and that keyholder asked for approval on the first signature of each kind, then filed the question where nothing could answer it. Notary v0.10.2 settles it: a keyholder started by the app it serves was handed a one-time secret by that app over a channel nothing else can reach, so it already knows who is asking. A client that arrives over a relay still answers to the approval queue, because that one really can be anybody.
+Two of them were worse than that. A mute stamped your list forward, which kept your real mute list off the screen for the rest of the session, so somebody you had asked never to see again stayed visible with no way to correct it. A relay-list edit did the same and wrote its stamp to disk, so it survived a restart.
 
-**And a write nobody signed is now taken back.** Pressing Follow moves the list straight away, which is what makes the feed answer immediately, and that stays. What was missing was the other half: when a signature never arrived, nothing put the list back. The app went on showing a follow that had reached no relay, and would not accept the real list from a relay for the rest of the session. Now the press is undone and you are told it was not signed.
+Now each of those is put back, and says so.
+
+**A refused reply keeps what you typed.** It used to be cleared and gone.
+
+**A restored draft tells you why.** If a note could not be signed, the draft came back with no explanation.
+
+**Your other writes are retried.** Only notes were tracked and retried before, so anything else that reached no relay was published once and forgotten.
+
+**Fixed: the terminal command for importing a key named the wrong app.** If you installed Plaza on its own, the key window told you to run a command inside `Notary.app`, which is not on your Mac unless you installed Notary separately as well. It now names the signer Plaza ships.
+
+**Fixed: turning off "answering your other devices" looked like it did nothing.** The setting was saved correctly, but the window read its state back from the keyholder, which kept reporting the value it had at startup, so the switch flipped back.
