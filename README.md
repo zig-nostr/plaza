@@ -9,7 +9,7 @@ four clicks, and the feed renders from disk. It's built on the
 through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
-> **Status: active development (`v0.12.6`).** Plaza installs and runs today. It
+> **Status: active development (`v0.13.0`).** Plaza installs and runs today. It
 > opens straight into a feed, signed in as nobody: nine accounts to start from,
 > already populated, with a strip along the top offering a key when you want
 > one. Create an identity in Notary, bring an existing key there, or connect an
