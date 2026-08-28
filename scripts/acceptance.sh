@@ -211,7 +211,12 @@ open_followed_profile() {
 fetch_list() { # out-file
   local out="$1" raw="$1.raw"
   : >"$raw"
-  bounded 45 nak req -k 3 -l 1 -a "$PUBKEY" "$RELAY" >"$raw" 2>/dev/null || true
+  # </dev/null is not decoration. `nak req` takes a filter on stdin when stdin is
+  # not a terminal, so with no redirect it blocks forever waiting for one and the
+  # bound above kills it at 45s. That reads as "the relay did not answer", which
+  # is how I first read it. It only works by luck when this is run by hand from a
+  # terminal, and never under CI or any other non-tty caller.
+  bounded 45 nak req -k 3 -l 1 -a "$PUBKEY" "$RELAY" >"$raw" 2>/dev/null </dev/null || true
   head -1 "$raw" >"$out" || true
   # A zero-byte file is "the relay answered with nothing", which is a real and
   # different outcome from "nak is missing"; the caller reports it as such.
@@ -399,10 +404,10 @@ journey_follows() {
   build
   local secret="$PLAZA_ACCEPTANCE_KEY"
   case "$secret" in
-    nsec1*) secret="$(nak decode "$secret" | python3 -c 'import json,sys; print(json.load(sys.stdin)["private_key"])')" ;;
+    nsec1*) secret="$(nak decode "$secret" </dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["private_key"])')" ;;
   esac
   [ "${#secret}" -eq 64 ] || { fail "PLAZA_ACCEPTANCE_KEY is not a 32 byte secret key"; return; }
-  PUBKEY="$(nak key public "$secret")"
+  PUBKEY="$(nak key public "$secret" </dev/null)"
   info "account $PUBKEY"
 
   local base="$WORK/list-before.json"
