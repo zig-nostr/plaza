@@ -12,7 +12,7 @@
   <separator/>
   <text size="sm" wrap="true" foreground="text_muted">Already on Nostr? Paste your nsec to bring your key, or a bunker link to sign with your own signer and keep the key off this device.</text>
   <input-group width="340">
-    <textarea text="{login_draft}" placeholder="nsec1… or bunker://…" on-input="login_edit" on-submit="login_submit"/>
+    <textarea text="{login_draft}" placeholder="bunker://…" on-input="login_edit" on-submit="login_submit"/>
     <input-group-actions>
       <text size="sm" foreground="text_muted">{login_status}</text>
       <spacer grow="1"/>

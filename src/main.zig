@@ -4308,16 +4308,22 @@ fn clearFeedArrivals() void {
 // zero-config local signer; connecting an external signer (Notary, over NIP-46,
 // so the key never touches the client) is the next onboarding option, and swaps
 // in at `signAndPublish` below.
-var g_identity_signer: ?nostr.keys.Signer = null;
-var g_identity_kp: ?nostr.keys.KeyPair = null;
 var g_identity_npub_buf: [24]u8 = undefined;
 var g_identity_npub_len: usize = 0;
 
 // How composed notes are signed: with the local key, or remotely over NIP-46 by
 // an external signer (Notary) so the secret key never enters Plaza. `submitPost`
 // branches on this; it is set once during onboarding.
-const SignerKind = enum { local, remote, helper };
-var g_signer_kind: SignerKind = .local;
+/// Where the signature comes from. There is no third answer any more.
+///
+/// `local` used to mean a secret key in THIS process. Plaza does not hold one:
+/// file permissions separate users, not apps, so a key this app wrote down was
+/// readable by every app on the machine, and the one thing a nostr identity
+/// cannot survive is being copied.
+///
+/// The default is `helper` with no identity adopted, which is what a guest is.
+const SignerKind = enum { remote, helper };
+var g_signer_kind: SignerKind = .helper;
 
 // Remote-signer (NIP-46) connection state, set at connect time and read by the
 // background threads. The ephemeral client keypair is Plaza's transport identity
@@ -4538,8 +4544,9 @@ pub fn setSignerKindHelperForTest() void {
     g_test_signer_silent = true;
 }
 
+/// Hands the keyholder back to the stand-in, for a test that took it.
 pub fn setSignerKindLocalForTest() void {
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
     g_test_signer_silent = false;
 }
 
@@ -4548,9 +4555,13 @@ pub fn signerKindNameForTest() []const u8 {
     return @tagName(g_signer_kind);
 }
 
-/// Whether a secret key is sitting in THIS process. False is the shipped state.
+/// Whether a secret key is sitting in THIS process.
+///
+/// A constant false, and that is the assertion rather than a stub: there is no
+/// longer a variable in this program that can hold one. The test that reads
+/// this is what keeps that true, by failing the day somebody adds one back.
 pub fn holdsKeyInProcessForTest() bool {
-    return g_identity_kp != null;
+    return false;
 }
 
 pub fn signerStatusLabelForTest() []const u8 {
@@ -4558,7 +4569,7 @@ pub fn signerStatusLabelForTest() []const u8 {
 }
 
 /// Resolves the daemon (a sibling of Plaza's own executable, so it works both
-/// from the dev tree and a packaged bundle), mints a fresh bearer token, and
+/// from the dev tree and a packaged bundle) and mints the secret it is handed
 /// writes it 0600 under ~/.plaza.
 ///
 /// When the daemon is not there, this returns having set NOTHING: no path, no
@@ -4600,33 +4611,23 @@ fn resolveHelper(init: std.process.Init) void {
 var g_notary_win_buf: [1024]u8 = undefined;
 var g_notary_win_len: usize = 0;
 const notary_spawn_key: u64 = 44;
-const helper_reset_key: u64 = 45;
-// Set on logout, so the health-check does not re-adopt the daemon's key before
-// the async /reset lands. Cleared when the user explicitly signs in again.
+// Set on logout, so the health-check does not hand the key straight back.
+// Cleared when the reader explicitly signs in again.
 var g_logged_out: bool = false;
 
-/// WHICH key signed out, held until the daemon confirms it no longer has it.
+/// WHICH key signed out.
 ///
-/// The bare latch above was the only thing keeping a signed-out key out, and
-/// `beginCreate` clears it before any new key exists. `helperReset` is
-/// fire-and-forget with no response handler, and the SDK drops a rejected effect
-/// with no trace when every slot is busy, which Plaza can reach on a frame that
-/// is also fetching avatars, NIP-05 checks and media. So: reset lost, latch
-/// dropped by pressing Create, and one second later the poll re-adopted the key
-/// the reader had just left. Their create fails with AlreadyInitialized, nothing
-/// says so, and the next note goes out under the old identity.
+/// The bare latch above was not enough on its own: `beginCreate` clears it, and
+/// one second later the poll re-adopted the account the reader had just left,
+/// their create failed as already-initialized with nothing on screen saying so,
+/// and the next note went out under the old identity.
 ///
-/// A pubkey is the precise version of that latch. It is cleared the moment the
-/// daemon reports itself uninitialized, which is the only honest evidence the
-/// reset actually landed, so re-importing the SAME key deliberately still works.
+/// It matters more now, not less. Signing out of Plaza leaves the key in
+/// Notary, so `/pubkey` reports that key on every poll for as long as it is
+/// there. "Signed out" is a fact this app has to remember for itself rather
+/// than something the keyholder will ever confirm, and a pubkey is the precise
+/// version of it: re-importing the SAME key deliberately still signs in.
 var g_logged_out_pk: ?[32]u8 = null;
-/// How many times a lost reset is re-sent before giving up and staying signed
-/// out. Bounded because a daemon that refuses forever must not be asked forever.
-const logout_reset_retries = 5;
-var g_logout_reset_tries: u8 = 0;
-/// A lost reset waiting to be re-sent from the tick, which is where `Effects`
-/// is reachable. The health-check that notices only has the response.
-var g_logout_reset_due: bool = false;
 
 fn resolveNotaryWindow(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
@@ -4688,12 +4689,7 @@ pub fn deliverNip46ResponseForTest(
 }
 
 pub fn setSignerKindForTest(kind: []const u8) void {
-    g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
-        .helper
-    else if (std.mem.eql(u8, kind, "remote"))
-        .remote
-    else
-        .local;
+    g_signer_kind = if (std.mem.eql(u8, kind, "remote")) .remote else .helper;
 }
 
 /// Pretends the ceremony window was (or was not) found beside Plaza.
@@ -4834,23 +4830,6 @@ var g_ceremony_adopted = false;
 /// The window's exit code when, and only when, it minted a key.
 const ceremony_created_code: i32 = 9;
 
-/// Tells the daemon to forget the key (wipe memory + delete the file), so a
-/// logout is not undone when the health-check next reads /pubkey. Fire and
-/// forget; the g_logged_out latch covers the window until it lands.
-fn helperReset(fx: *Effects) void {
-    if (g_helper_secret_len == 0) return;
-    var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reset", .{g_helper_port}) catch return;
-    var auth_buf: [96]u8 = undefined;
-    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
-    fx.fetch(.{
-        .key = helper_reset_key,
-        .url = url,
-        .method = .POST,
-        .headers = &.{.{ .name = "Authorization", .value = auth }},
-    });
-}
-
 /// Starts Plaza's own keyholder: keyless at first, idling on /pubkey and
 /// /setup until somebody brings a key.
 ///
@@ -4935,7 +4914,6 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
         // The daemon says it holds nothing, which is the only real evidence the
         // logout's reset landed. Whatever key appears next is a new one.
         g_logged_out_pk = null;
-        g_logout_reset_tries = 0;
         return;
     }
 
@@ -4952,12 +4930,11 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
         var still: [32]u8 = undefined;
         if (std.fmt.hexToBytes(&still, parsed.value.pubkey)) |_| {
             if (std.mem.eql(u8, &still, &left)) {
-                // The reset did not land. Ask again on the tick, which is where
-                // the effects live, a bounded number of times.
-                if (g_logout_reset_tries < logout_reset_retries) {
-                    g_logout_reset_tries += 1;
-                    g_logout_reset_due = true;
-                }
+                // Still the key this reader signed out of, and it will BE that
+                // key until they remove it in Notary. Signing out of a client
+                // does not take an identity off the machine, so this is the
+                // expected answer rather than a reset that failed to land, and
+                // the latch simply holds.
                 return;
             }
         } else |_| {}
@@ -4984,9 +4961,8 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     replayPending(model);
 }
 
-// The signed-in helper identity: its pubkey lives here (the SECRET lives only in
-// the daemon). `.helper` is the built-in local key now; `g_identity_kp` stays
-// null for it, so the key is never in this process.
+// The signed-in identity: its PUBKEY lives here and the secret lives only in
+// the keyholder. There is no field in this program that can hold a secret key.
 var g_helper_identity_pk: [32]u8 = undefined;
 var g_helper_has_identity = false;
 
@@ -5315,7 +5291,7 @@ fn signerReady() bool {
         // One key, one sign. The bunker's table has eight slots keyed by request
         // id, so it does not collide, and a local key signs inline.
         .helper => !g_helper_sign.active,
-        .remote, .local => true,
+        .remote => true,
     };
 }
 
@@ -5408,9 +5384,6 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
 /// Adopts a helper-held identity: only the pubkey lives here, never the secret
 /// (that stays in the daemon). Clears any in-UI local key.
 fn adoptHelperIdentity(pk: [32]u8) void {
-    if (g_identity_signer) |*sig| sig.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_helper_identity_pk = pk;
     g_helper_has_identity = true;
     g_signer_kind = .helper;
@@ -5793,14 +5766,20 @@ fn clearPending() void {
 // A synchronous error from the unified login field (nsec / bunker), shown under
 // it. `.none` while idle or when the async bunker path is in charge (its state
 // comes from `g_remote_status`). See `LoginError` and `Model.login_status`.
-const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2 };
+const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2, key_goes_to_notary = 3 };
 var g_login_error = std.atomic.Value(u8).init(0);
 
-/// What the pasted login text is: a secret key to import, a signer to connect,
-/// or neither.
+/// What the pasted login text is: a signer to connect, a secret key that
+/// belongs somewhere else, or neither.
 pub const LoginTarget = enum { nsec, bunker, invalid };
 
 /// Classifies pasted login text by its prefix. Pure, so it is unit-tested.
+///
+/// `nsec` is still recognised, and that is the point of keeping it. Plaza no
+/// longer takes a secret key ANYWHERE: it does not hold one, so a field that
+/// swallowed one would be asking for the most dangerous thing a person owns and
+/// then handing it straight on. Recognising it is how the reader gets told
+/// where it goes instead of "that does not look like a signer".
 pub fn classifyLogin(text: []const u8) LoginTarget {
     const t = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, t, "nsec1")) return .nsec;
@@ -8942,7 +8921,6 @@ fn nowSeconds() i64 {
 /// show alongside the follows you read.
 fn activePubkey() ?[32]u8 {
     return switch (g_signer_kind) {
-        .local => if (g_identity_kp) |kp| kp.public_key else null,
         .remote => g_remote_pubkey,
         .helper => if (g_helper_has_identity) g_helper_identity_pk else null,
     };
@@ -9747,8 +9725,11 @@ pub const Model = struct {
     pub fn login_status(self: *const Model) []const u8 {
         _ = self;
         switch (@as(LoginError, @enumFromInt(g_login_error.load(.acquire)))) {
-            .format => return "Paste an nsec or a bunker link.",
+            .format => return "Paste a bunker link, or bring your key in Notary.",
             .bad_key => return "That doesn't look like a valid key.",
+            // Not an error the reader made. Their key is fine; it belongs in
+            // the app that holds keys, and that app is opening.
+            .key_goes_to_notary => return "Your key goes in Notary, not here. Opening it now.",
             .none => {},
         }
         return switch (g_remote_status.load(.acquire)) {
@@ -9769,7 +9750,6 @@ pub const Model = struct {
     pub fn identity_kind_label(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "Local key",
             .remote => "Remote signer",
             .helper => "Notary",
         };
@@ -9795,26 +9775,18 @@ pub const Model = struct {
             return "A note you just posted has not been signed yet. Signing out now will lose it.";
         }
         return switch (g_signer_kind) {
-            // Followable: the reveal-and-copy card in Settings is right there,
-            // and it is gated on exactly this kind.
-            .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
-            // Notary held it, and Notary is asked to forget it. The two cases
-            // are not the same thing and used to share one sentence that was
-            // false for both.
+            // Nothing is deleted, and that is the change worth stating plainly.
             //
-            // The old text said "Back it up first if you want to keep this
-            // identity", pointing at a control that does not exist: the reveal
-            // card is local-key only, the daemon's route table has no export and
-            // its own module doc says no endpoint returns the secret, and the
-            // ceremony window tells the reader there is nothing to write down.
-            // A key minted here therefore ends here, and since `createLocalIdentity`
-            // has no callers, minted here is what every new identity is. Saying
-            // so is the least this can do until there is a real way to save one.
-            .helper => if (g_identity_minted_here)
-                "Notary made this key and it exists nowhere else. Signing out deletes it for good: your notes stay on relays, but nothing will ever be able to post, reply or edit your profile as this account again."
-            else
-                "Your key will be removed from Notary on this device. You can sign in again with the same key.",
+            // Signing out of Plaza used to ask Notary to forget the key, which
+            // conflated two different acts: leaving a client, and taking your
+            // identity off the machine. One press in one app should not destroy
+            // an identity every other app was using. So Plaza stops using the
+            // key and Notary keeps holding it.
+            //
+            // Which means the reader has to be told where it went, or "signed
+            // out" reads as "gone" and they go looking for a key that is fine.
+            .helper => "You'll be signed out of Plaza and returned to the welcome screen. Your key stays in Notary, so you can sign back in. To remove it from this Mac, open Notary.",
         };
     }
     /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
@@ -9830,7 +9802,6 @@ pub const Model = struct {
     pub fn signer_line(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "Signing with a local key",
             .remote => "Signing via a remote signer",
             .helper => "Signing via Notary",
         };
@@ -9848,7 +9819,6 @@ pub const Model = struct {
     pub fn signer_sub(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "The key is on this Mac, in this app.",
             .remote => "The key never leaves your signer. Plaza asks it to sign.",
             .helper => "The key is held by Notary on this Mac, not by Plaza.",
         };
@@ -10644,24 +10614,6 @@ fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
 /// outside them.
 var g_test_secret: ?[32]u8 = null;
 
-/// A test that genuinely needs an in-process secret key.
-///
-/// Two of them do: the ones about reading the ENCRYPTED half of a NIP-51 list,
-/// which Plaza decrypts inline against `g_identity_kp`. That is the one feature
-/// that stops working when the key leaves this process, and asking Notary to
-/// decrypt instead is a round trip this code path does not make yet. When the
-/// local signer kind is deleted these two are what fails, loudly, which is
-/// exactly where the work should announce itself.
-pub fn setLocalIdentityForTest(secret: [32]u8) void {
-    var signer = nostr.keys.Signer.init();
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        return;
-    };
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-}
-
 pub fn setIdentityForTest(secret: [32]u8) void {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -10672,11 +10624,8 @@ pub fn setIdentityForTest(secret: [32]u8) void {
 
 /// Clears the active identity again. For tests.
 pub fn clearIdentityForTest() void {
-    if (g_identity_signer) |*sgn| sgn.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_identity_npub_len = 0;
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
     g_test_secret = null;
     g_helper_has_identity = false;
 }
@@ -22171,7 +22120,6 @@ pub fn signerIsHealthy() bool {
     return switch (g_signer_kind) {
         .helper => helperState() == .ready,
         .remote => !g_remote_sign_notice.load(.acquire),
-        .local => true,
     };
 }
 
@@ -22203,8 +22151,6 @@ fn signerStatus() SignerStatus {
             .{ .label = "Signer unreachable", .glyph = "notary", .color = p.status_warning }
         else
             .{ .label = "Signer connected", .glyph = "notary", .color = p.status_success },
-        // A key in this process: always able to sign, and honest about being local.
-        .local => .{ .label = "Local key", .glyph = "notary", .color = p.status_success },
     };
 }
 
@@ -25192,10 +25138,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // A logout's reset that never reached the daemon, re-sent. Left
                 // undone, the daemon keeps the key the reader just left and the
                 // health-check would sign them back into it.
-                if (g_logout_reset_due) {
-                    g_logout_reset_due = false;
-                    helperReset(fx);
-                }
                 // Their published relay list, taken on this thread so no ingest
                 // thread ever swaps the pool out from under the others.
                 _ = adoptRelayList();
@@ -25370,8 +25312,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appear on the next tick.
             model.composing = false;
             setToast(model, if (g_signer_kind == .remote) "Sent to your signer" else "Posted");
-            // The first local post is the calm moment to suggest a backup.
-            if (g_signer_kind == .local and !model.backup_nudge_dismissed)
+            // The first post is the calm moment to suggest a backup, and the
+            // backup lives in Notary now: this app has nothing to back up.
+            if (g_identity_minted_here and !model.backup_nudge_dismissed)
                 model.backup_nudge = true;
         },
         .open_compose => {
@@ -25771,17 +25714,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
             const raw = std.mem.trim(u8, model.login_buffer.text(), " \t\r\n");
             switch (classifyLogin(raw)) {
-                // Import an existing key: it lands on disk (0600) as the local
-                // identity. A bad nsec keeps us on onboarding with an error.
+                // A secret key, pasted into a client. Plaza does not take it,
+                // and does not take it INTO MEMORY either: the text stays in
+                // the field the reader typed it in, and the reader is sent to
+                // the app that holds keys.
+                //
+                // Refusing rather than accepting is the whole shape of this
+                // change. A client that accepts an nsec is a client holding the
+                // one thing that cannot be replaced if it leaks, and every
+                // other app on the machine can read what this one writes down.
                 .nsec => {
-                    if (!importNsec(raw)) return;
-                    persistSession();
-                    // Tolerate an nsec pasted into the bunker step: close the
-                    // sheet the same way the bunker success path does.
-                    model.joining = false;
-                    model.bunker_mode = false;
-                    enterFeed(model);
-                    replayPending(model);
+                    g_login_error.store(@intFromEnum(LoginError.key_goes_to_notary), .release);
+                    spawnNotaryWindow(fx, .import_key);
                 },
                 // Pair with the external signer from the bunker URL; on success
                 // the feed comes up and posts route through it. A bad URL keeps
@@ -26725,7 +26669,7 @@ pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectRespo
 /// 3 unreachable) plus a remote identity, so the presentation is testable
 /// without a live bunker. For tests.
 pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
-    g_signer_kind = if (status == 0) .local else .remote;
+    g_signer_kind = if (status == 0) .helper else .remote;
     g_remote_status.store(status, .release);
     g_remote_sign_notice.store(false, .release);
     if (npub_len > 0) {
@@ -26828,12 +26772,6 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
     // and every other seam in this file stops short of the event itself.
     g_last_published_tags = tags;
     switch (g_signer_kind) {
-        .local => {
-            const signer = g_identity_signer orelse return;
-            const kp = g_identity_kp orelse return;
-            const ev = nostr.event.create(gpa, signer, kp, created, kind, tags, content_owned, null) catch return;
-            ingestAndPublish(gpa, ev, null);
-        },
         .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
         .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable),
     }
@@ -30051,105 +29989,29 @@ fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
     return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
 }
 
-/// Loads the identity from `identity.key` if present, adopting it and returning
-/// true. Never generates a key, that is the onboarding action's job.
-fn loadIdentityIfPresent(io: std.Io, environ: *const std.process.Environ.Map) bool {
-    var dir = plazaDir(io, environ) catch return false;
+/// Whether a key from an older Plaza is still sitting on this disk.
+///
+/// Plaza used to keep the raw secret at `$HOME/.plaza/identity.key`, mode 0600.
+/// It does not read it any more, and it does not move it either: importing it
+/// would mean this process holding a secret key, which is the whole thing that
+/// stopped.
+///
+/// So the file is LEFT ALONE and the reader is told it is there. Deleting
+/// somebody's only copy of an identity because an app was rewritten is not a
+/// migration, and silently orphaning it is worse: they would land on the
+/// welcome screen as a guest with their account still on the disk and nothing
+/// on screen connecting the two.
+var g_legacy_key_found = false;
+
+pub fn legacyKeyOnDisk() bool {
+    return g_legacy_key_found;
+}
+
+fn noticeLegacyKey(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-
-    const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "identity.key", gpa, std.Io.Limit.limited(64)) catch return false;
-    defer gpa.free(raw);
-    if (raw.len != 32) return false;
-
-    var signer = nostr.keys.Signer.init();
-    var secret: [32]u8 = undefined;
-    @memcpy(&secret, raw[0..32]);
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        return false;
-    };
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    // Queue a silent, background upgrade: move this in-process key into the
-    // isolated daemon. The tick fires it once the daemon is reachable; on
-    // success the identity becomes helper-held and identity.key is deleted. If
-    // it never lands, the key keeps working in-process, no loss.
-    g_helper_setup_secret = secret;
-    g_helper_setup = .migrate;
-    return true;
-}
-
-/// Generates a fresh identity, persists it (mode 0600), and adopts it. Backs the
-/// onboarding "create identity" action, using the io and environment stashed in
-/// `main`. Returns true on success.
-fn createLocalIdentity() bool {
-    const io = g_io orelse return false;
-    const environ = g_environ orelse return false;
-
-    var signer = nostr.keys.Signer.init();
-    const kp = signer.generateKeyPair(io) catch {
-        signer.deinit();
-        return false;
-    };
-
-    persistIdentityKey(io, environ, kp.secret_key);
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    return true;
-}
-
-/// Imports an existing key from a bech32 `nsec`, persists it (mode 0600), and
-/// adopts it as the local identity. Backs the onboarding "paste your nsec" path.
-/// On a malformed key sets the login error and returns false.
-fn importNsec(nsec: []const u8) bool {
-    const io = g_io orelse return false;
-    const environ = g_environ orelse return false;
-    const gpa = std.heap.page_allocator;
-
-    const secret = nostr.nip19.decodeNsec(gpa, nsec) catch {
-        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
-        return false;
-    };
-    var signer = nostr.keys.Signer.init();
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
-        return false;
-    };
-
-    persistIdentityKey(io, environ, secret);
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    return true;
-}
-
-/// Writes the raw 32-byte secret to `$HOME/.plaza/identity.key` at mode 0600,
-/// replacing any existing file. A failure to persist is non-fatal: the session
-/// still runs with the in-memory key (it just will not survive a relaunch).
-fn persistIdentityKey(io: std.Io, environ: *const std.process.Environ.Map, secret: [32]u8) void {
-    var dir = plazaDir(io, environ) catch |err| {
-        std.debug.print("plaza: could not open key dir: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer dir.close(io);
-    // Replace any prior key (a logout deletes it, so normally there is none).
-    dir.deleteFile(io, "identity.key") catch {};
-    dir.writeFile(io, .{
-        .sub_path = "identity.key",
-        .data = &secret,
-        .flags = .{ .permissions = secret_file_permissions },
-    }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
-}
-
-/// Sets the identity globals: the signer, the keypair, and the abbreviated npub
-/// the composer shows. The signer's secp256k1 context is used only on the UI
-/// thread.
-fn setIdentity(signer: nostr.keys.Signer, kp: nostr.keys.KeyPair) void {
-    g_identity_signer = signer;
-    g_identity_kp = kp;
-    const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
-    g_identity_npub_len = npub.len;
+    const st = dir.statFile(io, "identity.key", .{}) catch return;
+    g_legacy_key_found = st.size == 32;
 }
 
 // ------------------------------------------------------------------- session
@@ -30172,7 +30034,6 @@ fn persistSession() void {
 
     var buf: [1024]u8 = undefined;
     const data = switch (g_signer_kind) {
-        .local => std.fmt.bufPrint(&buf, "kind=local\nminted={d}\n", .{@intFromBool(g_identity_minted_here)}) catch return,
         .helper => blk: {
             if (!g_helper_has_identity) return;
             var pk_hex: [64]u8 = undefined;
@@ -30210,11 +30071,9 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
     const gpa = std.heap.page_allocator;
 
     const raw = dir.readFileAlloc(io, "session", gpa, std.Io.Limit.limited(2048)) catch {
-        // No session file: adopt a legacy local key if one is on disk.
-        if (loadIdentityIfPresent(io, environ)) {
-            persistSession();
-            return true;
-        }
+        // No session file. An older Plaza kept its key here; it is not read
+        // and not moved, only noticed, so the reader can be told where it is.
+        noticeLegacyKey(io, environ);
         return false;
     };
     defer gpa.free(raw);
@@ -30242,7 +30101,13 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
     }
 
     if (std.mem.eql(u8, kind, "helper")) return restoreHelperIdentity(f_pubkey);
-    if (std.mem.eql(u8, kind, "local")) return loadIdentityIfPresent(io, environ);
+    // A session written by a Plaza that held its own key. There is no such
+    // identity any more, so this lands on the welcome screen; the notice says
+    // where the key it was pointing at still is.
+    if (std.mem.eql(u8, kind, "local")) {
+        noticeLegacyKey(io, environ);
+        return false;
+    }
     if (std.mem.eql(u8, kind, "remote")) return restoreRemoteSigner(gpa, f_pubkey, f_relay, f_client_secret, f_secret);
     return false;
 }
@@ -30534,27 +30399,28 @@ pub fn loggedOutPubkeyForTest() ?[32]u8 {
 }
 
 fn performLogout(model: *Model, fx: *Effects) void {
-    // Forget the key in the daemon's MEMORY, not just on disk: without this the
-    // health-check reads /pubkey, still sees the key, and re-adopts within a
-    // tick. The latch holds until the async reset lands.
-    if (g_signer_kind == .helper) helperReset(fx);
+    // Notary is NOT touched. Signing out of a client is not the same act as
+    // taking your key off the machine, and conflating them means one press in
+    // one app destroys an identity every other app was using. The key stays
+    // where it lives; this app stops using it.
+    //
+    // Which makes the latch below the whole mechanism rather than a backstop.
+    // The keyholder still holds the key and will keep saying so on every
+    // health check, so "signed out" is a fact Plaza has to remember for itself.
+    _ = fx;
     g_logged_out = true;
     // WHICH key left, so the health-check can refuse to hand it back even after
     // an explicit sign-in drops the latch above.
     g_logged_out_pk = activePubkey();
-    g_logout_reset_tries = 0;
-    g_logout_reset_due = false;
     if (g_io) |io| if (g_environ) |environ| {
         if (plazaDir(io, environ)) |dir_const| {
             var dir = dir_const;
             defer dir.close(io);
+            // The session, and nothing else. No key file is removed, by
+            // either name: `identity.key` belongs to a Plaza that held its own
+            // key and is left where its owner can find it, and the keyholder's
+            // file is the keyholder's.
             dir.deleteFile(io, "session") catch {};
-            if (g_signer_kind == .local) dir.deleteFile(io, "identity.key") catch {};
-            // The helper's key lives in the daemon's file; remove it too, so a
-            // logout leaves no key on disk. (The running daemon keeps its copy
-            // in memory until it exits with Plaza; recreating an identity in the
-            // same session needs a restart.)
-            if (g_signer_kind == .helper) dir.deleteFile(io, "signer.key") catch {};
         } else |_| {}
     };
 
@@ -30569,12 +30435,9 @@ fn performLogout(model: *Model, fx: *Effects) void {
     releaseHelperSign();
     g_helper_sign_notice.store(false, .release);
 
-    if (g_identity_signer) |*s| s.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_identity_npub_len = 0;
     g_helper_has_identity = false;
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
     g_remote_client_kp = null;
     g_remote_relay_len = 0;
     g_remote_secret_len = 0;

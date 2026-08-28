@@ -1852,34 +1852,32 @@ test "a second sign in the same tick is refused, not swallowed" {
     try testing.expect(main.submitPostForTest(&model, &fx));
 }
 
-test "the sign-out warning does not promise a backup that does not exist" {
-    // It said "Back it up first if you want to keep this identity", pointing at
-    // a control that does not exist for a Notary key: the reveal card is gated
-    // on a local key, the daemon's route table has no export and its own module
-    // doc says no endpoint returns the secret, and the ceremony window tells the
-    // reader there is nothing to write down. Since `createLocalIdentity` has no
-    // callers, every identity minted today is one of these, so the instruction
-    // was false for the default case.
+test "signing out says the key stays in Notary, because it does" {
+    // Signing out of Plaza used to ask Notary to forget the key. That
+    // conflated two different acts: leaving a client, and taking your identity
+    // off the machine. One press in one app should not destroy an identity
+    // every other app was using, so Plaza stops using the key and Notary keeps
+    // holding it.
+    //
+    // Which makes the sentence load-bearing. "Signed out" reads as "gone"
+    // unless it says otherwise, and a reader who believes their key is gone
+    // goes looking for a key that is perfectly fine.
     var model = main.initialModel();
     main.setSignerKindHelperForTest();
     defer main.setSignerKindLocalForTest();
     defer main.setIdentityMintedForTest(false);
 
-    main.setIdentityMintedForTest(true);
-    const minted = model.logout_warning();
-    try testing.expect(std.mem.indexOf(u8, minted, "Back it up first") == null);
-    try testing.expect(std.mem.indexOf(u8, minted, "exists nowhere else") != null);
-    try testing.expect(std.mem.indexOf(u8, minted, "for good") != null);
-
-    // A key the reader pasted in themselves is a different fact, and saying the
-    // same thing about it would be its own kind of wrong.
-    main.setIdentityMintedForTest(false);
-    const imported = model.logout_warning();
-    try testing.expect(std.mem.indexOf(u8, imported, "sign in again with the same key") != null);
-
-    // A local key really can be copied first, from a card that is right there.
-    main.setSignerKindLocalForTest();
-    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "Copy it first") != null);
+    for ([_]bool{ true, false }) |minted| {
+        main.setIdentityMintedForTest(minted);
+        const said = model.logout_warning();
+        if (std.mem.indexOf(u8, said, "stays in Notary") == null) {
+            std.debug.print("\nminted={}: \"{s}\"\n", .{ minted, said });
+            return error.DidNotSayWhereTheKeyIs;
+        }
+        // And it must not threaten a deletion that no longer happens.
+        try testing.expect(std.mem.indexOf(u8, said, "for good") == null);
+        try testing.expect(std.mem.indexOf(u8, said, "deletes") == null);
+    }
 }
 
 test "a note still being signed is not thrown away without saying so" {
@@ -20107,4 +20105,39 @@ test "a keyholder that refuses to open a private half leaves it unreadable" {
     main.askPrivateHalfForTest(ciphertext);
     main.deliverPrivateHalfForTest(200, "{\"items\":[]}");
     try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
+}
+
+test "no secret key can live in this process" {
+    // The property the whole consolidation exists for, asserted rather than
+    // described. Plaza held its identity in `g_identity_kp` and wrote it to
+    // `~/.plaza/identity.key` at mode 0600, which sounds protective and is not:
+    // file permissions separate USERS, not apps, so every app on the machine
+    // could read it. A nostr identity is the one thing that cannot be replaced
+    // after it leaks.
+    //
+    // There is now no field in this program that can hold one, so this is a
+    // constant. It is here to fail the day somebody adds one back.
+    const secret = [_]u8{0x31} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+
+    try testing.expect(!main.holdsKeyInProcessForTest());
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+
+    // Signed in all the same: the account is known by its pubkey, and the
+    // signatures come from the keyholder.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    try testing.expectEqualSlices(u8, &kp.public_key, &main.activePubkeyForTest().?);
+}
+
+test "a pasted secret key is refused and pointed at Notary" {
+    // A client that accepts an nsec is a client holding the one thing that
+    // cannot be replaced if it leaks. So the field still RECOGNISES one, which
+    // is the point: recognising it is how the reader gets told where it goes
+    // instead of "that does not look like a signer".
+    try testing.expectEqual(main.LoginTarget.nsec, main.classifyLogin("nsec1abcdef"));
+    try testing.expectEqual(main.LoginTarget.bunker, main.classifyLogin("bunker://abc?relay=wss://r"));
+    try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("npub1abcdef"));
 }
