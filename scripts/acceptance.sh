@@ -39,7 +39,10 @@ set -euo pipefail
 
 RELAY="${PLAZA_ACCEPTANCE_RELAY:-wss://nos.lol}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK="${TMPDIR:-/tmp}/plaza-acceptance.$$"
+# Overridable so CI can put the logs somewhere it can upload them afterwards. A
+# red run whose app.log is inside a runner's temp dir is a red run nobody can
+# read.
+WORK="${PLAZA_ACCEPTANCE_WORK:-${TMPDIR:-/tmp}/plaza-acceptance.$$}"
 SNAP="$ROOT/.zig-cache/native-sdk-automation/snapshot.txt"
 APP_PID=""
 

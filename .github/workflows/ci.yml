@@ -136,3 +136,64 @@ jobs:
       - name: Check formatting
         shell: bash
         run: zig fmt --check src
+
+  # The suite that runs the app rather than its parts.
+  #
+  # Every unit test passed while v0.13.0 could not write to a relay at all, and
+  # while the window was laid out 32 points taller than its own canvas. Neither
+  # is visible to a test that never opens a window, and both were caught here.
+  # It ran because I asked it to, which is not a check.
+  #
+  # Two of the four journeys, deliberately:
+  #
+  #   guest   a cold start fills a feed, creates no key, and the canvas is the
+  #           size app.zon asks for.
+  #   bundle  the real packaging path, with Notary's binaries injected and the
+  #           signature verified, then launched.
+  #
+  # Not `frames`: it is a p90 against a budget, and a shared runner only ever
+  # reads slow, so it would fail for reasons that are nothing to do with the
+  # change under test. Not `follows`: it publishes signed events and needs a key.
+  acceptance:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.9.2
+
+      - name: A cold start, in a real window
+        env:
+          PLAZA_ACCEPTANCE_WORK: ${{ runner.temp }}/acceptance-guest
+        run: bash scripts/acceptance.sh guest
+
+      # Clones Notary at the tag the release workflow pins and packages against
+      # it, so this is the bundle people download rather than one built against
+      # whatever happened to be nearby.
+      - name: The packaged bundle comes up
+        env:
+          PLAZA_ACCEPTANCE_WORK: ${{ runner.temp }}/acceptance-bundle
+        run: bash scripts/acceptance.sh bundle
+
+      # A red run whose logs are gone is a red run nobody can act on.
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-logs
+          path: |
+            ${{ runner.temp }}/acceptance-guest/*.log
+            ${{ runner.temp }}/acceptance-bundle/*.log
+          if-no-files-found: ignore
