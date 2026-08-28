@@ -1,35 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.13.0
+### What's new in v0.13.1
 
-**Your key is no longer in Plaza.** Not hidden, not encrypted, not held carefully: absent. There is no longer anywhere in this app that a secret key can be put.
+**Fixed: v0.13.0 could not write anything.** Following somebody, muting, posting, reacting, editing your profile: all of it was refused before it reached a relay, and the app showed the press as done. If you ran v0.13.0, nothing you wrote in it was published. That release is now marked a pre-release and this one replaces it.
 
-Plaza used to make one and keep it at `~/.plaza/identity.key`, readable only by you. That sounds protective and is not: file permissions separate *users*, not *apps*, and every app you run is you. Any of them could read that file. A Nostr identity is the one thing that cannot be replaced once it leaks.
+The cause was in the pairing. Plaza starts its own keyholder and asks it to sign, and that keyholder asked for approval on the first signature of each kind, then filed the question where nothing could answer it. Notary v0.10.2 settles it: a keyholder started by the app it serves was handed a one-time secret by that app over a channel nothing else can reach, so it already knows who is asking. A client that arrives over a relay still answers to the approval queue, because that one really can be anybody.
 
-So Plaza ships **Notary**, starts it as its own process, and asks it to sign. The two talk over a channel with no name, no path and no port — nothing else on your Mac can reach it, and nothing has to guess who is asking, because only the app that opened the channel is holding it.
-
-**Bringing a key opens Notary.** Pasting one into Plaza is refused, and the field says where it goes instead. That is the point rather than a limitation: an app that accepts your key is an app holding the one thing you cannot replace.
-
-**Signing out leaves your key in Notary.** It used to delete it. Leaving a client and taking your identity off your Mac are different things, and one press in one app should not do the second. To remove a key from this machine, open Notary.
-
-**A signer that is locked now says so.** Plaza read a locked Notary as an empty one and offered to create a key over the top of the one you already had. Nothing was lost, because Notary refuses that, but you got an error instead of the passphrase box that would have worked.
-
-**Plaza no longer signs for other apps.** Notary does, in its own window, with its own approval list and its own way to revoke. Nothing is lost; it moved to the app that holds the key.
-
-**Fixed along the way.** Pictures on `.pub` hosts never loaded. The time-and-via line on each post stopped sitting against the right edge. A note could be reported as failed and then published anyway, seconds later, when a signature arrived after Plaza had given up on it.
-
-### Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/install-macos.sh | bash
-```
-
-The installer downloads this release, verifies its SHA-256, installs `Plaza.app` to `/Applications`, clears the download-quarantine flag, and opens it.
-
-It touches the app bundle and nothing else. Your session and your local store live in `~/.plaza`, your key stays in Notary, and both are left alone, so upgrading never costs you your identity.
-
-### Why it is not notarized
-
-Plaza signs notes with your key. The trust anchor for that is a build you can reproduce from source, not an Apple signature you cannot inspect. Read the [installer](https://github.com/zig-nostr/plaza/blob/main/scripts/install-macos.sh), or skip it and [build from source](https://github.com/zig-nostr/plaza#build): the same `scripts/package-macos.sh` that produced this artifact runs on your machine.
-
-If you would rather not connect a key at all, Plaza reads without one, and every gated verb asks at the moment you reach for it.
+**And a write nobody signed is now taken back.** Pressing Follow moves the list straight away, which is what makes the feed answer immediately, and that stays. What was missing was the other half: when a signature never arrived, nothing put the list back. The app went on showing a follow that had reached no relay, and would not accept the real list from a relay for the rest of the session. Now the press is undone and you are told it was not signed.
