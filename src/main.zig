@@ -4583,6 +4583,12 @@ fn resolveHelper(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return markKeyholderMissing();
     g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "signer");
+    if (g_helper_bin_len == 0) {
+        // Dev tree: Notary's checkout beside this one. Plaza's build does not
+        // produce a keyholder any more, so without this a developer run has no
+        // signer at all and every sign silently dead-ends.
+        g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "../../../notary/daemon/zig-out/bin/signer");
+    }
     if (g_helper_bin_len == 0) return markKeyholderMissing();
     g_keyholder = .found;
 
