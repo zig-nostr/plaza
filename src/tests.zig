@@ -171,7 +171,7 @@ test "the settings screen shows the identity, the way to the signer, and logout"
     try testing.expect(findAnyText(tree.root, "APPEARANCE") != null);
     try testing.expect(findAnyText(tree.root, "FEED") != null);
     // The identity card says what signs, and offers the way into the profile.
-    try testing.expect(findAnyText(tree.root, "Signing with a local key") != null);
+    try testing.expect(findAnyText(tree.root, "Signing via Notary") != null);
     try testing.expect(findAnyText(tree.root, "Edit profile") != null);
     try testing.expect(findAnyText(tree.root, "Copy npub") != null);
     // The key is NOT offered here, and that is the point. Backing it up happens
@@ -12646,7 +12646,7 @@ test "a follow that could not be written says why instead of nothing" {
 
     // And once the signature comes back, the same press works.
     main.releaseHelperSignForTest();
-    main.setSignerKindLocalForTest();
+    main.silenceTestSignerForTest(false); // the keyholder answers again
     model.toast_len = 0;
     main.update(&model, main.Msg{ .follow_person = 1 }, &fx);
     try testing.expect(main.isFollowedByMe(stranger));
@@ -17313,7 +17313,11 @@ fn muteFixture(
 ) !nostr.keys.KeyPair {
     const secret = [_]u8{0x81} ** 32;
     const kp = try signer.keyPairFromSecretKey(secret);
-    main.setIdentityForTest(secret);
+    // An in-process key, deliberately. These tests are about reading the
+    // ENCRYPTED half of a NIP-51 list, which Plaza decrypts inline against its
+    // own secret. That is the one feature that stops working when the key
+    // leaves this process, and this fixture is where it will announce itself.
+    main.setLocalIdentityForTest(secret);
     main.setStoreForTest(store);
     const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10000, tags, content, null);
     _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
@@ -20008,4 +20012,38 @@ test "a paste that does not fit says so instead of vanishing" {
     // Clearing the box clears the warning with it.
     main.update(&model, .close_compose, &fx);
     try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+}
+
+test "a test identity signs the way the app does, through the keyholder" {
+    // The suite's ~400 "be somebody" tests used to hold a secret key in this
+    // process and sign inline. Plaza does not do that any more, so neither do
+    // they: the shim knows a pubkey and asks a keyholder, and the keyholder in
+    // a test is a stand-in that answers the way the daemon does.
+    //
+    // Worth pinning, because the suite passes either way. Nothing else asserts
+    // WHICH path produced a signature, so without this a change could quietly
+    // put four hundred tests back on a code path the app no longer has.
+    const secret = [_]u8{0x77} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    // Asking a keyholder, with no secret key in this process, and the account
+    // is still ours.
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+    try testing.expect(!main.holdsKeyInProcessForTest());
+    try testing.expectEqualSlices(u8, &kp.public_key, &main.activePubkeyForTest().?);
+
+    var fx: main.EffectsForTest = undefined;
+    main.signAndPublishForTest(&fx, 1_800_000_000, 1, &.{}, "through the keyholder");
+
+    const published = main.lastPublishedForTest() orelse return error.NothingPublished;
+    // A real signature over the real content, by the account we said we were.
+    try testing.expectEqualSlices(u8, &kp.public_key, &published.pubkey);
+    try testing.expect(try nostr.event.verify(testing.allocator, signer, published));
 }

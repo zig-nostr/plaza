@@ -4454,12 +4454,30 @@ pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
 
 /// Adopts the Notary signer kind for the active test identity, so the status
 /// line can be asked what it says about a daemon that is not there.
+/// Says that this test drives the keyholder's answers itself.
+///
+/// A test that reaches for this one is asking about what happens WHILE a
+/// signature is out, or when the answer is a 401, or when none comes at all.
+/// The stand-in keyholder that answers every other test instantly would give
+/// it a success before it could look, so switching kind here silences it.
 pub fn setSignerKindHelperForTest() void {
     g_signer_kind = .helper;
+    g_test_signer_silent = true;
 }
 
 pub fn setSignerKindLocalForTest() void {
     g_signer_kind = .local;
+    g_test_signer_silent = false;
+}
+
+/// Which kind of signer this app is using, by name.
+pub fn signerKindNameForTest() []const u8 {
+    return @tagName(g_signer_kind);
+}
+
+/// Whether a secret key is sitting in THIS process. False is the shipped state.
+pub fn holdsKeyInProcessForTest() bool {
+    return g_identity_kp != null;
 }
 
 pub fn signerStatusLabelForTest() []const u8 {
@@ -5087,6 +5105,18 @@ pub fn lastPublishedTagsForTest() []const nostr.event.Tag {
     return g_last_published_tags;
 }
 
+/// The last event this app actually published, so a test can check the
+/// SIGNATURE rather than only the tags.
+var g_last_published: ?nostr.event.Event = null;
+
+pub fn lastPublishedForTest() ?nostr.event.Event {
+    return g_last_published;
+}
+
+pub fn forgetLastPublishedForTest() void {
+    g_last_published = null;
+}
+
 pub fn clearLastPublishedTagsForTest() void {
     g_last_published_tags = &.{};
 }
@@ -5164,6 +5194,19 @@ pub fn signInFlight() bool {
 
 /// Puts the built-in signer in the state it is in while a signature is out, so
 /// a test can drive the press that lands during one.
+/// Stops the test keyholder from answering, so a test can look at a note while
+/// it is still out being signed.
+///
+/// The stand-in daemon answers instantly, which is right for the tests that
+/// only want to be somebody and publish something. The ones about what happens
+/// while a signature is in flight, or when it never comes back, need the answer
+/// held.
+var g_test_signer_silent: bool = false;
+
+pub fn silenceTestSignerForTest(silent: bool) void {
+    g_test_signer_silent = silent;
+}
+
 pub fn holdHelperSignForTest() void {
     g_signer_kind = .helper;
     g_helper_sign.active = true;
@@ -5207,11 +5250,15 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
         return;
     };
     defer gpa.free(body);
-    // A test drives what happens to the NOTE, which is everything above and
-    // everything the response handler does. It cannot drive the loopback: an
-    // `Effects` is not constructible outside a running app, so this call would
-    // fault on undefined memory. Comptime, so the shipped binary has no branch.
-    if (builtin.is_test) return;
+    // A test cannot drive the loopback: an `Effects` is not constructible
+    // outside a running app, so the fetch below would fault on undefined
+    // memory. It stands in for the daemon instead, and answers the way the
+    // daemon does, so the response handler is exercised rather than skipped.
+    // Comptime, so the shipped binary has no branch.
+    if (builtin.is_test) {
+        if (!g_test_signer_silent) answerHelperSignForTest(gpa, unsigned_json);
+        return;
+    }
     helperFetch(fx, helper_sign_key, "/sign", body, Effects.responseMsg(.helper_signed));
 }
 
@@ -5348,6 +5395,28 @@ fn deleteIdentityKeyFile() void {
 /// Ingests and publishes a signed event returned by the daemon. Trusted: it
 /// came from our own daemon over authenticated loopback. A kind:0 seeds the
 /// profile cache so the name shows at once.
+/// The keyholder a test has: signs what was asked for and answers exactly as
+/// the daemon would, so `handleHelperSigned` runs for real.
+///
+/// Only compiled into a test binary. It exists so that the four hundred tests
+/// that "are somebody" drive the path that ships rather than one that does not,
+/// which is worth more than the shortcut it replaces.
+fn answerHelperSignForTest(gpa: std.mem.Allocator, unsigned_json: []const u8) void {
+    const secret = g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    var parsed = nostr.event.fromJson(gpa, unsigned_json) catch return;
+    defer parsed.deinit();
+    const ev = parsed.value;
+    const signed = nostr.event.create(gpa, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
+    const signed_json = nostr.event.toJson(gpa, signed) catch return;
+    defer gpa.free(signed_json);
+    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+
 fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // A refusal, a timeout, a rejected effect, or a daemon that is not there.
     // The tick hands the note back; this line used to be where it was dropped.
@@ -10381,7 +10450,28 @@ fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
 /// Adopts `secret` as the active local identity. For tests: the feed scopes
 /// its queries to the follow set plus the signed-in user, so a test that
 /// stores its own events needs to BE somebody.
-pub fn setIdentityForTest(secret: [32]u8) void {
+/// The key a test's stand-in daemon signs with.
+///
+/// Plaza does not hold a secret key any more, so a test cannot be somebody by
+/// being given one. It is somebody the way the shipped app is: it knows a
+/// pubkey and asks a keyholder for signatures. The keyholder in a test is the
+/// few lines at the end of `requestHelperSign`, and this is the key it uses.
+///
+/// The point is not the convenience. Four hundred tests call the shim below,
+/// and pointing them at the helper path means four hundred tests now exercise
+/// the path that ships, instead of a local-key arm that no longer exists
+/// outside them.
+var g_test_secret: ?[32]u8 = null;
+
+/// A test that genuinely needs an in-process secret key.
+///
+/// Two of them do: the ones about reading the ENCRYPTED half of a NIP-51 list,
+/// which Plaza decrypts inline against `g_identity_kp`. That is the one feature
+/// that stops working when the key leaves this process, and asking Notary to
+/// decrypt instead is a round trip this code path does not make yet. When the
+/// local signer kind is deleted these two are what fails, loudly, which is
+/// exactly where the work should announce itself.
+pub fn setLocalIdentityForTest(secret: [32]u8) void {
     var signer = nostr.keys.Signer.init();
     const kp = signer.keyPairFromSecretKey(secret) catch {
         signer.deinit();
@@ -10391,6 +10481,14 @@ pub fn setIdentityForTest(secret: [32]u8) void {
     setIdentity(signer, kp);
 }
 
+pub fn setIdentityForTest(secret: [32]u8) void {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    g_test_secret = secret;
+    adoptHelperIdentity(kp.public_key);
+}
+
 /// Clears the active identity again. For tests.
 pub fn clearIdentityForTest() void {
     if (g_identity_signer) |*sgn| sgn.deinit();
@@ -10398,6 +10496,8 @@ pub fn clearIdentityForTest() void {
     g_identity_kp = null;
     g_identity_npub_len = 0;
     g_signer_kind = .local;
+    g_test_secret = null;
+    g_helper_has_identity = false;
 }
 
 /// Forces the next reconcile to do the full work rather than take the
@@ -26215,6 +26315,14 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
 }
 
+/// Publishes one event the way any press does, so a test can ask what actually
+/// went out rather than what a helper built.
+pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const owned = gpa.dupe(u8, content) catch return;
+    signAndPublish(fx, gpa, created, kind, tags, owned, false);
+}
+
 pub fn activePubkeyForTest() ?[32]u8 {
     return activePubkey();
 }
@@ -27415,6 +27523,7 @@ fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nost
 /// process-lifetime allocation, since the detached publisher reads it after
 /// this returns.
 fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer) void {
+    if (builtin.is_test) g_last_published = ev;
     if (g_store == null) return;
     if (verify) |signer| {
         // A note we did not produce: verification is the gate into the store
