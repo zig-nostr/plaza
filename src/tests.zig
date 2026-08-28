@@ -171,7 +171,7 @@ test "the settings screen shows the identity, the way to the signer, and logout"
     try testing.expect(findAnyText(tree.root, "APPEARANCE") != null);
     try testing.expect(findAnyText(tree.root, "FEED") != null);
     // The identity card says what signs, and offers the way into the profile.
-    try testing.expect(findAnyText(tree.root, "Signing with a local key") != null);
+    try testing.expect(findAnyText(tree.root, "Signing via Notary") != null);
     try testing.expect(findAnyText(tree.root, "Edit profile") != null);
     try testing.expect(findAnyText(tree.root, "Copy npub") != null);
     // The key is NOT offered here, and that is the point. Backing it up happens
@@ -1852,34 +1852,32 @@ test "a second sign in the same tick is refused, not swallowed" {
     try testing.expect(main.submitPostForTest(&model, &fx));
 }
 
-test "the sign-out warning does not promise a backup that does not exist" {
-    // It said "Back it up first if you want to keep this identity", pointing at
-    // a control that does not exist for a Notary key: the reveal card is gated
-    // on a local key, the daemon's route table has no export and its own module
-    // doc says no endpoint returns the secret, and the ceremony window tells the
-    // reader there is nothing to write down. Since `createLocalIdentity` has no
-    // callers, every identity minted today is one of these, so the instruction
-    // was false for the default case.
+test "signing out says the key stays in Notary, because it does" {
+    // Signing out of Plaza used to ask Notary to forget the key. That
+    // conflated two different acts: leaving a client, and taking your identity
+    // off the machine. One press in one app should not destroy an identity
+    // every other app was using, so Plaza stops using the key and Notary keeps
+    // holding it.
+    //
+    // Which makes the sentence load-bearing. "Signed out" reads as "gone"
+    // unless it says otherwise, and a reader who believes their key is gone
+    // goes looking for a key that is perfectly fine.
     var model = main.initialModel();
     main.setSignerKindHelperForTest();
     defer main.setSignerKindLocalForTest();
     defer main.setIdentityMintedForTest(false);
 
-    main.setIdentityMintedForTest(true);
-    const minted = model.logout_warning();
-    try testing.expect(std.mem.indexOf(u8, minted, "Back it up first") == null);
-    try testing.expect(std.mem.indexOf(u8, minted, "exists nowhere else") != null);
-    try testing.expect(std.mem.indexOf(u8, minted, "for good") != null);
-
-    // A key the reader pasted in themselves is a different fact, and saying the
-    // same thing about it would be its own kind of wrong.
-    main.setIdentityMintedForTest(false);
-    const imported = model.logout_warning();
-    try testing.expect(std.mem.indexOf(u8, imported, "sign in again with the same key") != null);
-
-    // A local key really can be copied first, from a card that is right there.
-    main.setSignerKindLocalForTest();
-    try testing.expect(std.mem.indexOf(u8, model.logout_warning(), "Copy it first") != null);
+    for ([_]bool{ true, false }) |minted| {
+        main.setIdentityMintedForTest(minted);
+        const said = model.logout_warning();
+        if (std.mem.indexOf(u8, said, "stays in Notary") == null) {
+            std.debug.print("\nminted={}: \"{s}\"\n", .{ minted, said });
+            return error.DidNotSayWhereTheKeyIs;
+        }
+        // And it must not threaten a deletion that no longer happens.
+        try testing.expect(std.mem.indexOf(u8, said, "for good") == null);
+        try testing.expect(std.mem.indexOf(u8, said, "deletes") == null);
+    }
 }
 
 test "a note still being signed is not thrown away without saying so" {
@@ -2866,13 +2864,18 @@ test "bringing a key through the Notary window signs you in after a sign-out" {
     main.setIdentityForTest([_]u8{0xe3} ** 32);
     main.performLogoutForTest(&model, &fx);
     try testing.expect(main.loggedOutForTest());
-    // The real message, through the real handler. With no Notary window found,
-    // `ceremonyCanTakeKey` is false and the arm takes its fallback rung without
-    // touching `Effects`, which is why the latch clear sits above the branch.
+    // The real message, through the real handler. With no Notary window found
+    // the arm cannot open one and says so, without touching `Effects`, which is
+    // why the latch clear sits ABOVE the branch rather than inside it.
+    //
+    // The latch is the point of this test, not where the press lands. A
+    // sign-out earlier in the run turns adopt-on-appear off, and a "Bring your
+    // key" that leaves it off swallows the whole import: the key reaches the
+    // keyholder, the poll refuses it once a second, and the reader sits in
+    // guest mode until they quit and reopen.
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
     main.update(&model, .open_notary_import, &fx);
     try testing.expect(!main.loggedOutForTest());
-    try testing.expectEqual(main.Stage.onboarding, model.stage);
 }
 
 test "the reader's own face goes in the rail seat, not their initials" {
@@ -8338,6 +8341,66 @@ test "the time and via line is one line, whatever the note says it was written w
     try testing.expect(found);
 }
 
+test "the time and via line ends where the card ends" {
+    // It stopped ending there. `wrap = false` fixed a flicker and silently
+    // broke the alignment beside it: the toolkit gives a NON-WRAPPING paragraph
+    // an infinite max_width (text_spans.zig:627), and its aligner returns early
+    // on a width that is not finite (:565), so `text_alignment = .end` is
+    // ignored on any single-line paragraph. The box stayed in the right place
+    // and the words inside it sat at the left, so "35m via Amethyst" hung a
+    // ragged gap off the card's edge that grew as the string got shorter.
+    //
+    // So the alignment is done by LAYOUT now, which the toolkit does honour: a
+    // stated-width row, a spacer that takes the slack, and a paragraph that
+    // hugs its own text at the end of it.
+    //
+    // Asserted against the note body, because both live in the same column and
+    // the whole complaint was that one ended short of the other. Box geometry,
+    // not glyph metrics, so this harness can answer it (see painted.zig).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Short, long, and longer than the column: the gap the reader saw was
+    // widest for the shortest string, and the longest is what the column was
+    // measured against in the first place.
+    for ([_][]const u8{ "Amethyst", "Damus Notedeck", "An Absurdly Long Client Name" }) |client| {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const ev = nostr.event.Event{
+            .id = [_]u8{0xD2} ** 32,
+            .pubkey = [_]u8{0x53} ** 32,
+            .created_at = 1_800_000_000,
+            .kind = 1,
+            .tags = &.{&.{ "client", client }},
+            .content = "GM",
+            .sig = [_]u8{0} ** 64,
+        };
+        model.notes[0] = main.noteFrom(ev, 1_800_002_100);
+        model.notes_len = 1;
+
+        const p = try painted.Painted.render(arena, &model);
+        var meta_right: ?f32 = null;
+        var body_right: ?f32 = null;
+        for (p.layout.nodes) |node| {
+            const w = node.widget;
+            if (w.kind != .text) continue;
+            const f = w.frame;
+            if (std.mem.indexOf(u8, w.text, " via ") != null) meta_right = f.x + f.width;
+            if (std.mem.eql(u8, w.text, "GM")) body_right = f.x + f.width;
+        }
+        const meta = meta_right orelse return error.NoMetaLine;
+        const body = body_right orelse return error.NoBody;
+        if (@abs(meta - body) > 0.5) {
+            std.debug.print(
+                "\"{s}\": the meta line ends at {d:.1}, the card ends at {d:.1}\n",
+                .{ client, meta, body },
+            );
+            return error.MetaLineNotFlush;
+        }
+    }
+}
+
 test "the feed asks about the notes it is SHOWING, not only the ones that arrived" {
     // The watch list was built purely from events coming down the wire, and the
     // feed's own REQ carries a `since` off the newest stored note. So on any
@@ -9292,13 +9355,13 @@ test "a keyholder that is not there is reported missing, not formatted into a pa
     // version of this that only formatted is what shipped a bundle with no
     // keyholder in it: the app spawned a file that was not there, said so on
     // stderr, and carried on believing it had a daemon.
-    try testing.expectEqual(@as(usize, 0), main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer"));
+    try testing.expectEqual(@as(usize, 0), main.resolveSiblingForTest(std.testing.io, &out, dir, "signer"));
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plaza-signer", .data = "not really a binary" });
-    const n = main.resolveSiblingForTest(std.testing.io, &out, dir, "plaza-signer");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "signer", .data = "not really a binary" });
+    const n = main.resolveSiblingForTest(std.testing.io, &out, dir, "signer");
     var want_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&want_buf, "{s}/plaza-signer", .{dir}),
+        try std.fmt.bufPrint(&want_buf, "{s}/signer", .{dir}),
         out[0..n],
     );
 }
@@ -9329,14 +9392,20 @@ test "with no keyholder the create rung says why and stops being a button" {
     // it from drifting back INTO the card, where it paints outside the border.
     try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
 
-    // The two rungs that still work are untouched, and bringing a key gives up
-    // its Notary promise, because with no daemon the paste lands in this
-    // process. Copy that sells isolation over a field that does not have it is
-    // the lie this app can least afford.
-    try testing.expect(pressableByLabel(tree, tree.root, "Bring your key"));
+    // Bringing a key goes the same way, and for the same reason: there is
+    // nowhere for a key to go. It used to fall back to a field in this process,
+    // and that fallback is gone with the field. A rung that leads to a screen
+    // refusing every key it is given is worse than one that says it cannot.
+    try testing.expect(findAnyText(tree.root, "Bring your key") != null);
+    try testing.expectEqual(@as(?Msg, null), pressMsgByLabel(tree, "Bring your key"));
+
+    // The rung that still works is the one that needs nothing from this
+    // machine: your key is already in a signer somewhere else.
     try testing.expect(pressableByLabel(tree, tree.root, "Use your own signer"));
-    try testing.expect(findAnyText(tree.root, "Goes into Notary. Plaza itself never sees it.") == null);
-    try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") != null);
+    try testing.expect(findAnyText(tree.root, "Opens Notary. Plaza itself never sees it.") == null);
+    // And nothing anywhere still offers to keep a key in this app, which is a
+    // promise it can no longer make about anything.
+    try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") == null);
 }
 
 test "with no keyholder nothing queues a mint that can never fire" {
@@ -9358,7 +9427,7 @@ test "with no keyholder nothing queues a mint that can never fire" {
     try testing.expect(!main.helperSetupQueuedForTest());
 }
 
-test "with no keyholder a pasted key goes to the field, not to a window that cannot take it" {
+test "with no keyholder there is nowhere for a key to go, and the app says so" {
     main.clearIdentityForTest();
     defer main.setNotaryWindowFoundForTest(false);
 
@@ -9374,8 +9443,10 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
     main.setKeyholderMissingForTest(false);
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
 
-    // And the branch that reads it lands somewhere the reader can actually
-    // finish: window present, keyholder absent, so the paste goes to the field.
+    // And the branch that reads it says so, rather than opening a screen that
+    // refuses every key it is given. There is no field in this app that can
+    // hold one, so "somewhere the reader can finish" is nowhere: the honest
+    // move is to name what is missing.
     main.setNotaryWindowFoundForTest(true);
     main.setKeyholderMissingForTest(true);
     defer main.setKeyholderMissingForTest(false);
@@ -9384,7 +9455,8 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
     model.joining = true;
     var fx: main.EffectsForTest = undefined;
     main.update(&model, .open_notary_import, &fx);
-    try testing.expect(model.stage == .onboarding);
+    try testing.expect(model.stage != .onboarding);
+    try testing.expect(std.mem.indexOf(u8, model.toast_buf[0..model.toast_len], "missing") != null);
 }
 
 /// Every line of text INSIDE one of the join ladder's rungs has to end inside it.
@@ -12332,6 +12404,133 @@ test "a picture the network lost is retried, but not without end" {
     try testing.expect(main.mediaFailed(note_id));
 }
 
+test "a picture the proxy refuses by host is asked of the host itself" {
+    // The avatar path has had this since the day it shipped and the PICTURE
+    // path has only ever had the predicate tested, never the wiring. Same
+    // refusal, same host, and a photograph is the half a reader actually
+    // notices: wsrv.nl answers 400 for a `.pub` domain, which is where Ditto's
+    // Blossom server lives, and the same file comes back fine from the host.
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_010;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    const after = main.mediaFallbackStateForTest(note_id).?;
+    try testing.expect(after.direct);
+    try testing.expect(after.idle);
+    // Not a failed attempt: this is a different question, not another go at
+    // the same one.
+    try testing.expectEqual(@as(u8, 0), main.mediaAttemptsForTest(note_id).?);
+
+    // Once. A refusal from the HOST is a real failure with nowhere left to
+    // ask, so it must not loop.
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    try testing.expect(!main.mediaFallbackStateForTest(note_id).?.idle);
+}
+
+test "a refused host is remembered past the slot that discovered it" {
+    // The bug a reader saw as "pictures on that host still do not load, even
+    // though faces on it do".
+    //
+    // The refusal was remembered on the media SLOT. The fallback sets the slot
+    // idle so it will be asked again, and an idle slot is exactly what
+    // `claimMediaSlot` evicts, so the flag went out with it: scroll the picture
+    // off screen and back and it asked the proxy again, was refused again, and
+    // was evicted again. It could loop forever without ever once reaching the
+    // host that would have served it.
+    //
+    // A face never had this problem, because its flag lives on the profile,
+    // which is keyed by pubkey and outlives any amount of scrolling. That is
+    // the whole of why one came back and the other did not.
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+        main.forgetProxyRefusals();
+    }
+    main.forgetProxyRefusals();
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    const src = "https://blossom.ditto.pub/deadbeef.jpg";
+    var buf: [1024]u8 = undefined;
+
+    // Before anything is known, the picture goes through the proxy. A test
+    // process never loads the settings file, so the proxy is set here.
+    main.setMediaProxy("https://wsrv.nl/");
+    main.forgetProxyRefusals();
+    try testing.expect(!std.mem.eql(u8, main.feedImageUrlForTest(&buf, src), src));
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_020;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+    main.setMediaSlotHostForTest(note_id, "blossom.ditto.pub");
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    try testing.expect(main.mediaFallbackStateForTest(note_id).?.direct);
+
+    // The refusal now outlives the slot. This is the assertion the old code
+    // could not make: it is about the HOST, not about one picture.
+    try testing.expect(main.proxyRefusesHost(src));
+    try testing.expectEqualStrings(src, main.feedImageUrlForTest(&buf, src));
+
+    // Including a DIFFERENT picture on the same host, which never has to spend
+    // the round trip that discovers the refusal.
+    try testing.expectEqualStrings(
+        "https://blossom.ditto.pub/other.png",
+        main.feedImageUrlForTest(&buf, "https://blossom.ditto.pub/other.png"),
+    );
+
+    // And not a picture somewhere else.
+    const elsewhere = "https://i.nostr.build/abc.jpg";
+    try testing.expect(!main.proxyRefusesHost(elsewhere));
+
+    // A different proxy answers for itself rather than inheriting this one's
+    // policy.
+    main.setMediaProxy("https://images.example.test/");
+    try testing.expect(!main.proxyRefusesHost(src));
+}
+
+test "a host is read out of a URL the way the refusal is filed" {
+    try testing.expectEqualStrings("blossom.ditto.pub", main.hostOfForTest("https://blossom.ditto.pub/a.jpg"));
+    // A port is not part of what the proxy refused.
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://example.test:8443/a.jpg"));
+    // Userinfo is not the host, and taking it as one would file the refusal
+    // under a string an author chose.
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://user@example.test/a.jpg"));
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://example.test"));
+    try testing.expectEqualStrings("", main.hostOfForTest("not a url"));
+}
+
+test "a picture missing at the proxy is missing at the host too" {
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+    }
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_011;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+
+    // A 404 is the source, not the proxy. Going direct would be a second
+    // download with an answer already known.
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 404, "");
+    try testing.expect(!main.mediaFallbackStateForTest(note_id).?.direct);
+}
+
 test "a quote still loading looks like the card that will replace it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -12459,7 +12658,7 @@ test "a follow that could not be written says why instead of nothing" {
 
     // And once the signature comes back, the same press works.
     main.releaseHelperSignForTest();
-    main.setSignerKindLocalForTest();
+    main.silenceTestSignerForTest(false); // the keyholder answers again
     model.toast_len = 0;
     main.update(&model, main.Msg{ .follow_person = 1 }, &fx);
     try testing.expect(main.isFollowedByMe(stranger));
@@ -17126,6 +17325,11 @@ fn muteFixture(
 ) !nostr.keys.KeyPair {
     const secret = [_]u8{0x81} ** 32;
     const kp = try signer.keyPairFromSecretKey(secret);
+    // Through the keyholder, like everything else. These tests are about
+    // reading the ENCRYPTED half of a NIP-51 list, which used to happen inline
+    // against a secret key in this process. There is no secret key here now, so
+    // the half is opened by asking Notary, and the fixture that predicted this
+    // is where the change landed.
     main.setIdentityForTest(secret);
     main.setStoreForTest(store);
     const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10000, tags, content, null);
@@ -17937,207 +18141,6 @@ test "one picture still fills the column, so nothing about a plain note moved" {
 
     const tree = try buildTree(arena, &model);
     try testing.expectEqual(@as(usize, 1), countByLabel(tree.root, "Attached image, press to enlarge"));
-}
-
-// -- Signing for other apps ---------------------------------------------------
-
-test "the signing screen mirrors the daemon, and a revoked client leaves it" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    // Off, with nothing to show.
-    try testing.expect(!main.bunkerOn());
-    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
-
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1",
-        \\ "pending":{"id":7,"client":"aa11"},
-        \\ "clients":[{"pubkey":"bb22"},{"pubkey":"cc33"}]}
-    );
-    try testing.expect(main.bunkerOn());
-    try testing.expectEqualStrings("bunker://abc?relay=wss%3A%2F%2Fa.example&secret=s1", main.bunkerUrl());
-    try testing.expectEqualStrings("aa11", main.bunkerPendingClient());
-    try testing.expectEqual(@as(usize, 2), main.bunkerClientCount());
-
-    // The daemon is the source of truth and every answer REPLACES the mirror.
-    // Merging would let a client that had just been disconnected linger in the
-    // list, which is the one thing this list exists to show truthfully.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://abc","pending":null,"clients":[{"pubkey":"cc33"}]}
-    );
-    try testing.expectEqual(@as(usize, 1), main.bunkerClientCount());
-    try testing.expectEqualStrings("cc33", main.bunkerClientAt(0)[0..4]);
-    // And the prompt goes when the daemon says it is gone, rather than sticking
-    // around for somebody to answer a question nobody is asking any more.
-    try testing.expectEqual(@as(usize, 0), main.bunkerPendingClient().len);
-}
-
-test "switching the bunker off empties what the screen shows" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"bb22"}]}
-    );
-    try testing.expect(main.bunkerUrl().len > 0);
-
-    // The daemon drops every session when it is switched off, and the screen
-    // has to follow. A URL still on screen for a bunker that is off is a link
-    // somebody would paste into another app and then wonder about.
-    main.applyBunkerStateForTest(
-        \\{"enabled":false,"url":"","pending":null,"clients":[]}
-    );
-    try testing.expect(!main.bunkerOn());
-    try testing.expectEqual(@as(usize, 0), main.bunkerUrl().len);
-    try testing.expectEqual(@as(usize, 0), main.bunkerClientCount());
-}
-
-test "the settings screen carries the signing section" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0x91} ** 32);
-    defer main.clearIdentityForTest();
-    var model = main.initialModel();
-    model.stage = .settings;
-
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "SIGNING") != null);
-        try testing.expect(findByLabel(tree.root, "Sign for other apps") != null);
-        // Off: no link, because there is nothing to hand anybody yet.
-        try testing.expect(findAnyText(tree.root, "Copy link") == null);
-    }
-
-    // A waiting client puts the question on the screen, with both answers.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":{"id":3,"client":"dd44"},"clients":[]}
-    );
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "Copy link") != null);
-        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") != null);
-        try testing.expect(findAnyText(tree.root, "Approve") != null);
-        try testing.expect(findAnyText(tree.root, "Deny") != null);
-    }
-
-    // And a connected one can be disconnected from the same place.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://abc?secret=s1","pending":null,"clients":[{"pubkey":"ee55"}]}
-    );
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyText(tree.root, "An app wants to sign as you") == null);
-        try testing.expect(findAnyText(tree.root, "Disconnect") != null);
-    }
-}
-
-test "the signing card's text stays inside the window" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0x93} ** 32);
-    defer main.clearIdentityForTest();
-    var model = main.initialModel();
-    model.stage = .settings;
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://3e294d2fd339bb16a5403a86e3664947dd408c4d87a0066524f8a573ae53ca8e?relay=wss%3A%2F%2Fnostr.oxtr.dev&relay=wss%3A%2F%2Ftheforest.nostr1.com&relay=wss%3A%2F%2Frelay.primal.net&secret=9f4184c6ddbdf3f185f7d32839457b72","pending":null,"clients":[]}
-    );
-
-    const p = try painted.Painted.render(arena, &model);
-    const hint = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.";
-    const frame = frameOfText(p, hint) orelse return error.HintNotDrawn;
-
-    // The reported bug, as a number. A wrapping paragraph with nothing bounding
-    // its width lays out at its natural width, so `wrap` is obeyed and useless:
-    // this sentence ran off the right edge of the card and out of the window.
-    // The window is the outer bound and the one a reader actually sees broken.
-    const window_right = main.window_width;
-    try testing.expect(frame.x + frame.width <= window_right);
-
-    // And the link itself, which is longer and would go first.
-    const url_frame = frameOfTextContaining(p, "bunker://3e294d2f") orelse return error.UrlNotDrawn;
-    try testing.expect(url_frame.x + url_frame.width <= window_right);
-}
-
-test "the prompt says what is being asked, in words a person can act on" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // A connect is the client asking to be let in, which is a different
-    // question from being allowed to do something.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":1,"client":"aa","ask":"","kind":-1},"clients":[]}
-    );
-    try testing.expect(main.bunkerAskIsConnect());
-    try testing.expectEqualStrings("wants to sign as you", main.bunkerAskLine(arena));
-
-    // A signature names what it would DO. "Sign a kind 3" and "change who you
-    // follow" are the same thing to a signer and very different to a person,
-    // and this app's own history is why: a bad kind:3 empties a follow list.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":2,"client":"aa","ask":"sign_event","kind":3},"clients":[]}
-    );
-    try testing.expect(!main.bunkerAskIsConnect());
-    try testing.expectEqualStrings("wants to change who you follow", main.bunkerAskLine(arena));
-
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":3,"client":"aa","ask":"sign_event","kind":1},"clients":[]}
-    );
-    try testing.expectEqualStrings("wants to post a note as you", main.bunkerAskLine(arena));
-
-    // An unnamed kind is honest about being a number rather than pretending to
-    // know what it is.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":4,"client":"aa","ask":"sign_event","kind":31337},"clients":[]}
-    );
-    try testing.expect(std.mem.indexOf(u8, main.bunkerAskLine(arena), "31337") != null);
-
-    // And decryption is named for what it exposes, not for its method.
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":5,"client":"aa","ask":"nip44_decrypt","kind":-1},"clients":[]}
-    );
-    try testing.expectEqualStrings("wants to read an encrypted message of yours", main.bunkerAskLine(arena));
-}
-
-test "the prompt offers a duration, not just yes and no" {
-    main.resetBunkerForTest();
-    defer main.resetBunkerForTest();
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    main.setIdentityForTest([_]u8{0x95} ** 32);
-    defer main.clearIdentityForTest();
-    var model = main.initialModel();
-    model.stage = .ready;
-    main.applyBunkerStateForTest(
-        \\{"enabled":true,"url":"bunker://a","pending":{"id":9,"client":"bb","ask":"sign_event","kind":1},"clients":[]}
-    );
-
-    const tree = try buildTree(arena, &model);
-    // A prompt with only yes and no is one people learn to hit yes on. All
-    // four of Amber's positions have to be one press away.
-    try testing.expect(findAnyText(tree.root, "Allow once") != null);
-    try testing.expect(findAnyText(tree.root, "Allow for a day") != null);
-    try testing.expect(findAnyText(tree.root, "Always") != null);
-    try testing.expect(findAnyText(tree.root, "Deny") != null);
-    // And it appears over the FEED, not only in Settings: the reader is not in
-    // Settings when another app asks.
-    try testing.expect(findAnyTextContaining(tree.root, "wants to post a note as you"));
 }
 
 test "a picture bigger than one response body is assembled from its slices" {
@@ -19821,4 +19824,334 @@ test "a paste that does not fit says so instead of vanishing" {
     // Clearing the box clears the warning with it.
     main.update(&model, .close_compose, &fx);
     try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+}
+
+test "a test identity signs the way the app does, through the keyholder" {
+    // The suite's ~400 "be somebody" tests used to hold a secret key in this
+    // process and sign inline. Plaza does not do that any more, so neither do
+    // they: the shim knows a pubkey and asks a keyholder, and the keyholder in
+    // a test is a stand-in that answers the way the daemon does.
+    //
+    // Worth pinning, because the suite passes either way. Nothing else asserts
+    // WHICH path produced a signature, so without this a change could quietly
+    // put four hundred tests back on a code path the app no longer has.
+    const secret = [_]u8{0x77} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    // Asking a keyholder, with no secret key in this process, and the account
+    // is still ours.
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+    try testing.expect(!main.holdsKeyInProcessForTest());
+    try testing.expectEqualSlices(u8, &kp.public_key, &main.activePubkeyForTest().?);
+
+    var fx: main.EffectsForTest = undefined;
+    main.signAndPublishForTest(&fx, 1_800_000_000, 1, &.{}, "through the keyholder");
+
+    const published = main.lastPublishedForTest() orelse return error.NothingPublished;
+    // A real signature over the real content, by the account we said we were.
+    try testing.expectEqualSlices(u8, &kp.public_key, &published.pubkey);
+    try testing.expect(try nostr.event.verify(testing.allocator, signer, published));
+}
+
+test "the keyholder's secret is minted fresh and never written down" {
+    // The whole local security model is this one property. Plaza used to hand
+    // its signer a token through a 0600 file, which is the shape every local
+    // signing agent uses and the shape none of them defends: file permissions
+    // separate USERS, not apps, so every app you run could read it and sign as
+    // you. Measured on this machine, along with the other two places a secret
+    // leaks: a process's argv (`ps` prints it) and its environment (`ps -Eww`
+    // prints it). A pipe to a child has no name and no path, so there is
+    // nothing to open.
+    const io = testing.io;
+    main.mintHelperSecretForTest(io);
+    const first = try testing.allocator.dupe(u8, main.helperSecretForTest());
+    defer testing.allocator.free(first);
+
+    try testing.expect(first.len >= 32);
+    // Newline-terminated, because the daemon's read needs something to stop on.
+    try testing.expectEqual(@as(u8, '\n'), first[first.len - 1]);
+    // The header presents it without the terminator.
+    try testing.expectEqualStrings(first[0 .. first.len - 1], main.helperTokenForTest());
+
+    // Fresh per launch. Two runs sharing a secret would mean a secret that
+    // outlives the process that minted it, which is a secret worth stealing.
+    main.mintHelperSecretForTest(io);
+    try testing.expect(!std.mem.eql(u8, first, main.helperSecretForTest()));
+}
+
+test "nothing is sent to the keyholder before it says where it is" {
+    // The daemon takes a kernel-chosen port and reports it on stdout, so
+    // between the spawn and that line there is no address at all. Sending to
+    // port zero would be a request nobody could answer, and the caller would
+    // read the failure as a signer that is not working.
+    // The daemon is answering AND holding a key, so the only thing standing
+    // between Plaza and a request is not knowing the address. Without that
+    // being the only difference this test passes for the wrong reason, which is
+    // how it passed with the guard removed.
+    main.setHelperReadyForTest();
+    main.setHelperPortForTest(0);
+    defer main.setHelperPortForTest(0);
+    try testing.expect(!main.helperReachableForTest());
+
+    // Told the port, and now it is reachable.
+    main.setHelperPortForTest(51234);
+    try testing.expect(main.helperReachableForTest());
+
+    // And a port it has NOT heard is not one it invents. This is the constant
+    // that used to be here.
+    main.setHelperPortForTest(8790);
+    try testing.expectEqual(@as(u16, 8790), main.helperPortForTest());
+}
+
+test "an event signed by somebody else is not published under your name" {
+    // The keyholder is a separate product now. Its key can be changed, removed
+    // or replaced between the moment Plaza asked whose key it was and the
+    // moment an answer comes back, so what it returns is checked rather than
+    // trusted. The old comment here said "it came from our own daemon over
+    // authenticated loopback", which was true when Plaza built and shipped that
+    // daemon and stopped being true when it did not.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x21} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    // A perfectly valid event, signed by a real key, that is not the reader's.
+    var other = nostr.keys.Signer.init();
+    defer other.deinit();
+    const other_kp = try other.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const theirs = try nostr.event.create(arena, other, other_kp, 1_800_000_000, 1, &.{}, "under your name", null);
+    const theirs_json = try nostr.event.toJson(arena, theirs);
+    const body = try (nostr.signer_ipc.SignEvent{ .event = theirs_json }).toJson(arena);
+
+    main.deliverHelperSignedForTest(body);
+
+    // Nothing was published. A signature proves the event was signed by the key
+    // it names; it says nothing about WHOSE key that is, and publishing on that
+    // alone puts a note on relays under an account nobody is signed in to.
+    if (main.lastPublishedForTest()) |ev| {
+        std.debug.print("\npublished an event by {x} while signed in as somebody else\n", .{ev.pubkey});
+        return error.PublishedSomebodyElsesEvent;
+    }
+}
+
+test "an event whose signature does not check is not published either" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const secret = [_]u8{0x23} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    var ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "tampered", null);
+    // The right author, and a signature that is not one. Whoever is answering
+    // could be anything; the account is only as safe as what is checked.
+    ev.sig[0] ^= 0xff;
+    const json = try nostr.event.toJson(arena, ev);
+    const body = try (nostr.signer_ipc.SignEvent{ .event = json }).toJson(arena);
+
+    main.deliverHelperSignedForTest(body);
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+test "the note's deadline and the wire's are one number" {
+    // They were two, and they disagreed. The fetch carried no timeout at all,
+    // so the SDK's thirty-second default applied while the app-side backstop
+    // fired at ten.
+    //
+    // The gap is worse than a slow note. At ten seconds Plaza restores the
+    // draft and says the sign failed, while the request is still live; an
+    // answer at twenty then publishes an event the reader was just told had
+    // failed. For those twenty seconds `signerReady` reports true because the
+    // slot is clear, while the effect key is still held, so the next sign is
+    // rejected by the SDK and silently does nothing.
+    //
+    // Latent while the keyholder answered in a millisecond and could do nothing
+    // else. Notary can refuse and ask a person, and that answer comes back on a
+    // human timescale.
+    try testing.expectEqual(
+        @as(u32, @intCast(main.helperSignTimeoutSecondsForTest() * 1000)),
+        main.helperSignTimeoutMillisForTest(),
+    );
+    // And long enough to be worth having: a person has to see the prompt and
+    // reach for it.
+    try testing.expect(main.helperSignTimeoutSecondsForTest() >= 20);
+}
+
+test "a locked keyholder is not an empty one" {
+    // Plaza tested only for "ready" and read every other answer as "reachable,
+    // no key here". So a Notary holding a key it cannot use yet looked like a
+    // Notary holding nothing.
+    //
+    // The library's contract names this as the mistake worth designing the
+    // vocabulary against: a client that believes a keyholder is empty offers to
+    // make a key over the top of an identity somebody already has, and a nostr
+    // key cannot be replaced. Nothing was destroyed, because Notary refuses a
+    // second setup, but the reader pressed "Create your identity", got a toast,
+    // and was never offered the one thing that would have worked.
+    var model = main.initialModel();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    const pk = "ab" ** 32;
+    var buf: [256]u8 = undefined;
+    const locked = try std.fmt.bufPrint(&buf, "{{\"state\":\"locked\",\"pubkey\":\"{s}\"}}", .{pk});
+    main.deliverHelperPubkeyForTest(&model, locked);
+
+    try testing.expectEqual(main.HelperState.locked, main.helperStateForTest());
+    // And the screen says which of the two it is, because they want opposite
+    // things from the reader: one wants a key, the other wants a passphrase.
+    try testing.expectEqualStrings("Notary is locked", main.signerStatusLabelForTest());
+    // Holding a key is not signing.
+    try testing.expect(!main.signerIsHealthy());
+
+    // An answer this app does not recognise counts as "cannot sign", never as
+    // "no key yet", which is the rule stated beside the constants.
+    var other: [128]u8 = undefined;
+    const future = try std.fmt.bufPrint(&other, "{{\"state\":\"something-new\",\"pubkey\":\"{s}\"}}", .{pk});
+    main.deliverHelperPubkeyForTest(&model, future);
+    try testing.expect(main.helperStateForTest() != .empty);
+    try testing.expect(!main.signerIsHealthy());
+
+    // Empty really is empty, and says so.
+    main.deliverHelperPubkeyForTest(&model, "{\"state\":\"uninitialized\",\"pubkey\":\"\"}");
+    try testing.expectEqual(main.HelperState.empty, main.helperStateForTest());
+    try testing.expectEqualStrings("Notary has no key", main.signerStatusLabelForTest());
+}
+
+test "a queued setup never fires at a keyholder that already holds a key" {
+    // Offering to create a key over the top of an existing identity is the one
+    // mistake the protocol's state vocabulary exists to prevent, because a
+    // nostr key cannot be replaced. Notary refuses a second setup, so nothing
+    // is destroyed, but the reader presses "Create your identity" and gets a
+    // toast instead of the passphrase box that would have worked.
+    try testing.expect(main.helperSetupMayFireForTest(true, .empty));
+
+    try testing.expect(!main.helperSetupMayFireForTest(true, .locked));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .ready));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .starting));
+    try testing.expect(!main.helperSetupMayFireForTest(true, .unreachable_));
+
+    // And nothing goes out when nothing was asked for.
+    try testing.expect(!main.helperSetupMayFireForTest(false, .empty));
+}
+
+test "a private half Notary has not opened yet is unreadable, not empty" {
+    // The distinction this whole cache exists for. Plaza used to open the
+    // private half of a NIP-51 list inline against a secret key in this
+    // process; there is no secret here now, so it asks the keyholder, and an
+    // answer that has not arrived yet must not read as "the half is empty".
+    //
+    // Treating them alike is how a client publishes a list back with every
+    // private entry deleted. Jumble does exactly that, which is why the guard
+    // this feeds was written in the first place.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+
+    // No keyholder has opened anything, and nothing can: there is no identity,
+    // so the stand-in cannot answer either.
+    const ciphertext = "AqRcpq0Cw2h2Vd5Tk1Fk5w==?iv=notarealciphertext";
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), main.privateMutesForTest(ciphertext, &out));
+    // Zero mutes AND unreadable, which is not the same as zero mutes and empty.
+    try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
+}
+
+test "an opened private half is read without asking again" {
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    const ciphertext = "whatever-the-keyholder-was-given";
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{[_]u8{0x5a} ** 32});
+    const plain = try std.fmt.allocPrint(testing.allocator, "[[\"p\",\"{s}\"]]", .{hex});
+    defer testing.allocator.free(plain);
+
+    main.openPrivateHalfForTest(ciphertext, plain);
+    try testing.expect(main.privateHalfIsReadableForTest(ciphertext));
+
+    var out: [8][32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), main.privateMutesForTest(ciphertext, &out));
+    try testing.expectEqualSlices(u8, &[_]u8{0x5a} ** 32, &out[0]);
+}
+
+test "a keyholder that refuses to open a private half leaves it unreadable" {
+    // The other half of the same distinction, and the one an app meets in
+    // practice: Notary answering 403 because nobody approved the decrypt, or
+    // 409 because the key is locked, or not answering at all.
+    //
+    // None of those means the list is empty. Recording them as "open with no
+    // content" would publish the list back with every private entry deleted,
+    // which is the bug this whole cache is shaped around.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+
+    const ciphertext = "a-half-the-keyholder-will-not-open";
+
+    for ([_]u16{ 403, 409, 500, 0 }) |status| {
+        main.askPrivateHalfForTest(ciphertext);
+        main.deliverPrivateHalfForTest(status, "{\"error\":\"refused\"}");
+        if (main.privateHalfIsReadableForTest(ciphertext)) {
+            std.debug.print("\nstatus {d} was treated as a readable half\n", .{status});
+            return error.RefusalReadAsEmpty;
+        }
+    }
+
+    // And an answer carrying no items is not an empty list either.
+    main.askPrivateHalfForTest(ciphertext);
+    main.deliverPrivateHalfForTest(200, "{\"items\":[]}");
+    try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
+}
+
+test "no secret key can live in this process" {
+    // The property the whole consolidation exists for, asserted rather than
+    // described. Plaza held its identity in `g_identity_kp` and wrote it to
+    // `~/.plaza/identity.key` at mode 0600, which sounds protective and is not:
+    // file permissions separate USERS, not apps, so every app on the machine
+    // could read it. A nostr identity is the one thing that cannot be replaced
+    // after it leaks.
+    //
+    // There is now no field in this program that can hold one, so this is a
+    // constant. It is here to fail the day somebody adds one back.
+    const secret = [_]u8{0x31} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+
+    try testing.expect(!main.holdsKeyInProcessForTest());
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+
+    // Signed in all the same: the account is known by its pubkey, and the
+    // signatures come from the keyholder.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    try testing.expectEqualSlices(u8, &kp.public_key, &main.activePubkeyForTest().?);
+}
+
+test "a pasted secret key is refused and pointed at Notary" {
+    // A client that accepts an nsec is a client holding the one thing that
+    // cannot be replaced if it leaks. So the field still RECOGNISES one, which
+    // is the point: recognising it is how the reader gets told where it goes
+    // instead of "that does not look like a signer".
+    try testing.expectEqual(main.LoginTarget.nsec, main.classifyLogin("nsec1abcdef"));
+    try testing.expectEqual(main.LoginTarget.bunker, main.classifyLogin("bunker://abc?relay=wss://r"));
+    try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("npub1abcdef"));
 }

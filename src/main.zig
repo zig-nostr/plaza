@@ -3093,7 +3093,6 @@ else
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nevent_key: u64 = 103;
-const copy_bunker_key: u64 = 104;
 const copy_note_text_key: u64 = 104;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
@@ -3319,11 +3318,6 @@ const compose_sheet_width: f32 = 560;
 /// widths on purpose: the sheet holds three choices and has to lay them out as
 /// cards; the name card holds one field and one question, and a card that wide
 /// around a single input reads as a form.
-/// The requester's key in the approval card: 64 hex characters that have to fit
-/// one line inside a 440pt card, because a key broken across a line break is a
-/// key nobody checks.
-const bunker_key_scale: f32 = 10.0 / 14.5;
-
 /// The join sheet's one width, for the dialog AND for every card inside it.
 ///
 /// They used to differ (a 420 dialog around a 372 card) and the 48pt band
@@ -4314,16 +4308,22 @@ fn clearFeedArrivals() void {
 // zero-config local signer; connecting an external signer (Notary, over NIP-46,
 // so the key never touches the client) is the next onboarding option, and swaps
 // in at `signAndPublish` below.
-var g_identity_signer: ?nostr.keys.Signer = null;
-var g_identity_kp: ?nostr.keys.KeyPair = null;
 var g_identity_npub_buf: [24]u8 = undefined;
 var g_identity_npub_len: usize = 0;
 
 // How composed notes are signed: with the local key, or remotely over NIP-46 by
 // an external signer (Notary) so the secret key never enters Plaza. `submitPost`
 // branches on this; it is set once during onboarding.
-const SignerKind = enum { local, remote, helper };
-var g_signer_kind: SignerKind = .local;
+/// Where the signature comes from. There is no third answer any more.
+///
+/// `local` used to mean a secret key in THIS process. Plaza does not hold one:
+/// file permissions separate users, not apps, so a key this app wrote down was
+/// readable by every app on the machine, and the one thing a nostr identity
+/// cannot survive is being copied.
+///
+/// The default is `helper` with no identity adopted, which is what a guest is.
+const SignerKind = enum { remote, helper };
+var g_signer_kind: SignerKind = .helper;
 
 // Remote-signer (NIP-46) connection state, set at connect time and read by the
 // background threads. The ephemeral client keypair is Plaza's transport identity
@@ -4341,38 +4341,117 @@ var g_remote_status = std.atomic.Value(u8).init(0);
 
 // ------------------------------------------------- the isolated signer helper
 //
-// plaza-signer holds the key in a separate PROCESS, reached over loopback HTTP.
+// Notary's daemon holds the key in a separate PROCESS, reached over loopback.
 // Plaza spawns it at launch, writes it a 0600 bearer token, and (for now)
 // health-checks it; routing the actual signing through it comes next. The port
 // is Plaza-specific (not notary's 8787), so a standalone Notary and the
 // built-in one never collide.
-const helper_port: u16 = 8790;
+/// The port Plaza's own daemon landed on, learned from its stdout.
+///
+/// Zero until it says so. It used to be a constant, chosen to avoid colliding
+/// with a standalone Notary on 8787, and a constant is exactly what something
+/// else can sit on first.
+var g_helper_port: u16 = 0;
+
+/// The one line of the daemon's stdout Plaza reads. Must match
+/// `approval_http.port_line_prefix` in Notary.
+const helper_port_prefix = "notary-approval-port";
 const helper_spawn_key: u64 = 40;
 const helper_poll_key: u64 = 41;
 // The daemon binary (a sibling of Plaza's own executable) and the shared token,
 // resolved once in main and read by boot/tick.
 var g_helper_bin_buf: [1024]u8 = undefined;
 var g_helper_bin_len: usize = 0;
-var g_helper_token_buf: [64]u8 = undefined;
-var g_helper_token_len: usize = 0;
-var g_helper_state_dir_buf: [512]u8 = undefined;
-var g_helper_state_dir_len: usize = 0;
-var g_helper_token_path_buf: [512]u8 = undefined;
-var g_helper_token_path_len: usize = 0;
-// 0 starting, 1 uninitialized (reachable, no key yet), 2 ready (holds a key),
-// 3 unreachable. Reachable at all (1 or 2) is what proves the loopback IPC.
+var g_helper_secret_buf: [64]u8 = undefined;
+var g_helper_secret_len: usize = 0;
+/// What the keyholder last said about itself.
+///
+/// Four values, and the fourth is the one that was missing: LOCKED, meaning it
+/// holds a key it cannot use yet. Plaza tested only for "ready" and read
+/// everything else as "reachable, no key here", so a locked Notary read as an
+/// empty one. The library's own contract names that as the mistake worth
+/// designing against: a client that believes a keyholder is empty offers to
+/// make a key over the top of an identity somebody already has, and a nostr key
+/// cannot be replaced.
+///
+/// Nothing was destroyed, because Notary refuses a second setup. But the reader
+/// pressed "Create your identity", got a toast, and was never offered the one
+/// thing that would have worked, which is to unlock.
+pub const HelperState = enum(u8) {
+    starting = 0,
+    /// Reachable, holds no key. Ready to be set up.
+    empty = 1,
+    /// Reachable, holds a key, signing.
+    ready = 2,
+    /// Not answering.
+    unreachable_ = 3,
+    /// Reachable, holds a key it cannot use until somebody unlocks it.
+    locked = 4,
+};
 var g_helper_state = std.atomic.Value(u8).init(0);
+
+fn helperState() HelperState {
+    return @enumFromInt(g_helper_state.load(.acquire));
+}
+
+/// Delivers one /pubkey answer the way the runtime would.
+pub fn deliverHelperPubkeyForTest(model: *Model, body: []const u8) void {
+    handleHelperPubkey(model, .{ .key = helper_poll_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+pub fn helperSetupPendingForTest() bool {
+    return g_helper_setup != .none;
+}
+
+pub fn helperStateForTest() HelperState {
+    return helperState();
+}
 /// When the signed-in health check last ran, and how often it may run. The
 /// signed-out poll is every tick (it is waiting for a key to appear); this is the
 /// quieter beat that keeps the status bar honest afterwards.
 var g_helper_polled_at: i64 = 0;
 const helper_health_interval_s: i64 = 5;
 
+pub fn helperTokenForTest() []const u8 {
+    return helperToken();
+}
+
+/// Puts the daemon into the "answering and holding a key" state, so a test can
+/// ask what the OTHER conditions do.
+pub fn setHelperReadyForTest() void {
+    g_helper_state.store(2, .release);
+}
+
+pub fn helperReachableForTest() bool {
+    return helperReachable();
+}
+
+pub fn helperPortForTest() u16 {
+    return g_helper_port;
+}
+
+pub fn setHelperPortForTest(port: u16) void {
+    g_helper_port = port;
+}
+
+pub fn helperSecretForTest() []const u8 {
+    return g_helper_secret_buf[0..g_helper_secret_len];
+}
+
+pub fn mintHelperSecretForTest(io: std.Io) void {
+    var raw: [24]u8 = undefined;
+    io.randomSecure(&raw) catch return;
+    const written = std.fmt.bufPrint(&g_helper_secret_buf, "{x}\n", .{raw}) catch return;
+    g_helper_secret_len = written.len;
+}
+
 fn helperBin() []const u8 {
     return g_helper_bin_buf[0..g_helper_bin_len];
 }
+/// The secret, without the newline the pipe carries, for the auth header.
 fn helperToken() []const u8 {
-    return g_helper_token_buf[0..g_helper_token_len];
+    if (g_helper_secret_len == 0) return "";
+    return g_helper_secret_buf[0 .. g_helper_secret_len - 1];
 }
 
 /// Whether the launch probe found the keyholder daemon beside Plaza.
@@ -4454,12 +4533,35 @@ pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
 
 /// Adopts the Notary signer kind for the active test identity, so the status
 /// line can be asked what it says about a daemon that is not there.
+/// Says that this test drives the keyholder's answers itself.
+///
+/// A test that reaches for this one is asking about what happens WHILE a
+/// signature is out, or when the answer is a 401, or when none comes at all.
+/// The stand-in keyholder that answers every other test instantly would give
+/// it a success before it could look, so switching kind here silences it.
 pub fn setSignerKindHelperForTest() void {
     g_signer_kind = .helper;
+    g_test_signer_silent = true;
 }
 
+/// Hands the keyholder back to the stand-in, for a test that took it.
 pub fn setSignerKindLocalForTest() void {
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
+    g_test_signer_silent = false;
+}
+
+/// Which kind of signer this app is using, by name.
+pub fn signerKindNameForTest() []const u8 {
+    return @tagName(g_signer_kind);
+}
+
+/// Whether a secret key is sitting in THIS process.
+///
+/// A constant false, and that is the assertion rather than a stub: there is no
+/// longer a variable in this program that can hold one. The test that reads
+/// this is what keeps that true, by failing the day somebody adds one back.
+pub fn holdsKeyInProcessForTest() bool {
+    return false;
 }
 
 pub fn signerStatusLabelForTest() []const u8 {
@@ -4467,7 +4569,7 @@ pub fn signerStatusLabelForTest() []const u8 {
 }
 
 /// Resolves the daemon (a sibling of Plaza's own executable, so it works both
-/// from the dev tree and a packaged bundle), mints a fresh bearer token, and
+/// from the dev tree and a packaged bundle) and mints the secret it is handed
 /// writes it 0600 under ~/.plaza.
 ///
 /// When the daemon is not there, this returns having set NOTHING: no path, no
@@ -4476,35 +4578,38 @@ pub fn signerStatusLabelForTest() []const u8 {
 /// layer and a said-out-loud one in the join ladder, rather than a spawn of a
 /// path that does not exist.
 fn resolveHelper(init: std.process.Init) void {
-    // The daemon lives beside Plaza's own executable.
+    // The daemon lives beside Plaza's own executable. It is Notary's, not a
+    // second signer of Plaza's own: one keyholder, built and audited once.
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return markKeyholderMissing();
-    g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "plaza-signer");
+    g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "signer");
+    if (g_helper_bin_len == 0) {
+        // Dev tree: Notary's checkout beside this one. Plaza's build does not
+        // produce a keyholder any more, so without this a developer run has no
+        // signer at all and every sign silently dead-ends.
+        g_helper_bin_len = resolveSibling(init.io, &g_helper_bin_buf, dir, "../../../notary/daemon/zig-out/bin/signer");
+    }
     if (g_helper_bin_len == 0) return markKeyholderMissing();
     g_keyholder = .found;
 
-    const home = init.environ_map.get("HOME") orelse ".";
-    const state_dir = std.fmt.bufPrint(&g_helper_state_dir_buf, "{s}/.plaza", .{home}) catch return;
-    g_helper_state_dir_len = state_dir.len;
-    const token_path = std.fmt.bufPrint(&g_helper_token_path_buf, "{s}/.plaza/signer.token", .{home}) catch return;
-    g_helper_token_path_len = token_path.len;
-
-    // A fresh 32-byte token, hex-encoded, so a stray process on the machine
-    // cannot drive the signer even if it guesses the port.
-    var raw: [32]u8 = undefined;
+    // The secret Plaza hands its daemon, minted here and written NOWHERE.
+    //
+    // It used to be a token in a 0600 file, which is the shape every local
+    // signing agent uses and the shape none of them defends. File permissions
+    // separate USERS, not apps: every app you run could read that file and
+    // sign as you. Measured on this machine, along with the two other places a
+    // secret leaks: a process's argv (`ps` prints it) and its environment
+    // (`ps -Eww` prints it).
+    //
+    // A pipe to a child has none of those properties. It has no name and no
+    // path, so there is nothing for another program to open, and holding it is
+    // the whole of the proof. That is why Plaza starts its own daemon rather
+    // than looking for a shared one: a keyholder anything can reach has to
+    // decide who may reach it, and nobody has solved that on the desktop.
+    var raw: [24]u8 = undefined;
     init.io.randomSecure(&raw) catch return;
-    var hexbuf: [64]u8 = undefined;
-    _ = hexLower(&hexbuf, raw);
-    @memcpy(g_helper_token_buf[0..64], &hexbuf);
-    g_helper_token_len = 64;
-
-    var d = plazaDir(init.io, init.environ_map) catch return;
-    defer d.close(init.io);
-    d.writeFile(init.io, .{
-        .sub_path = "signer.token",
-        .data = &hexbuf,
-        .flags = .{ .permissions = secret_file_permissions },
-    }) catch return;
+    const written = std.fmt.bufPrint(&g_helper_secret_buf, "{x}\n", .{raw}) catch return;
+    g_helper_secret_len = written.len;
 }
 
 // The Notary ceremony window binary. In a packaged app it sits beside Plaza in
@@ -4512,43 +4617,37 @@ fn resolveHelper(init: std.process.Init) void {
 var g_notary_win_buf: [1024]u8 = undefined;
 var g_notary_win_len: usize = 0;
 const notary_spawn_key: u64 = 44;
-const helper_reset_key: u64 = 45;
-// Set on logout, so the health-check does not re-adopt the daemon's key before
-// the async /reset lands. Cleared when the user explicitly signs in again.
+// Set on logout, so the health-check does not hand the key straight back.
+// Cleared when the reader explicitly signs in again.
 var g_logged_out: bool = false;
 
-/// WHICH key signed out, held until the daemon confirms it no longer has it.
+/// WHICH key signed out.
 ///
-/// The bare latch above was the only thing keeping a signed-out key out, and
-/// `beginCreate` clears it before any new key exists. `helperReset` is
-/// fire-and-forget with no response handler, and the SDK drops a rejected effect
-/// with no trace when every slot is busy, which Plaza can reach on a frame that
-/// is also fetching avatars, NIP-05 checks and media. So: reset lost, latch
-/// dropped by pressing Create, and one second later the poll re-adopted the key
-/// the reader had just left. Their create fails with AlreadyInitialized, nothing
-/// says so, and the next note goes out under the old identity.
+/// The bare latch above was not enough on its own: `beginCreate` clears it, and
+/// one second later the poll re-adopted the account the reader had just left,
+/// their create failed as already-initialized with nothing on screen saying so,
+/// and the next note went out under the old identity.
 ///
-/// A pubkey is the precise version of that latch. It is cleared the moment the
-/// daemon reports itself uninitialized, which is the only honest evidence the
-/// reset actually landed, so re-importing the SAME key deliberately still works.
+/// It matters more now, not less. Signing out of Plaza leaves the key in
+/// Notary, so `/pubkey` reports that key on every poll for as long as it is
+/// there. "Signed out" is a fact this app has to remember for itself rather
+/// than something the keyholder will ever confirm, and a pubkey is the precise
+/// version of it: re-importing the SAME key deliberately still signs in.
 var g_logged_out_pk: ?[32]u8 = null;
-/// How many times a lost reset is re-sent before giving up and staying signed
-/// out. Bounded because a daemon that refuses forever must not be asked forever.
-const logout_reset_retries = 5;
-var g_logout_reset_tries: u8 = 0;
-/// A lost reset waiting to be re-sent from the tick, which is where `Effects`
-/// is reachable. The health-check that notices only has the response.
-var g_logout_reset_due: bool = false;
 
 fn resolveNotaryWindow(init: std.process.Init) void {
     var dir_buf: [1024]u8 = undefined;
     const dir = exeDir(init.io, &dir_buf) orelse return;
-    // Packaged: a sibling. Dev: the sub-project's own zig-out, because unlike
-    // the daemon it is built by a separate build.zig and never lands in Plaza's
-    // bin directory. Sibling first, that being the shipped layout.
-    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "notary-window");
+    // Notary's OWN window, not a second one of Plaza's. Bringing a key is the
+    // one thing Plaza deliberately cannot do: the key never touches this
+    // process, so the screen that receives it belongs to the app that holds it.
+    //
+    // Packaged: a sibling. Dev: Notary's checkout beside this one, because it
+    // is built by a separate build.zig and never lands in Plaza's bin
+    // directory. Sibling first, that being the shipped layout.
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "notary");
     if (g_notary_win_len != 0) return;
-    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "../../notary-window/zig-out/bin/notary-window");
+    g_notary_win_len = resolveSibling(init.io, &g_notary_win_buf, dir, "../../../notary/gui/zig-out/bin/notary");
 }
 
 /// Whether there is a Notary holding this account's key AND a window to show it
@@ -4596,18 +4695,13 @@ pub fn deliverNip46ResponseForTest(
 }
 
 pub fn setSignerKindForTest(kind: []const u8) void {
-    g_signer_kind = if (std.mem.eql(u8, kind, "helper"))
-        .helper
-    else if (std.mem.eql(u8, kind, "remote"))
-        .remote
-    else
-        .local;
+    g_signer_kind = if (std.mem.eql(u8, kind, "remote")) .remote else .helper;
 }
 
 /// Pretends the ceremony window was (or was not) found beside Plaza.
 pub fn setNotaryWindowFoundForTest(found: bool) void {
-    g_notary_win_len = if (found) "/nonexistent/notary-window".len else 0;
-    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary-window".len], "/nonexistent/notary-window");
+    g_notary_win_len = if (found) "/nonexistent/notary".len else 0;
+    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary".len], "/nonexistent/notary");
 }
 
 /// Whether a helper setup is sitting queued, waiting for the daemon to answer.
@@ -4742,42 +4836,24 @@ var g_ceremony_adopted = false;
 /// The window's exit code when, and only when, it minted a key.
 const ceremony_created_code: i32 = 9;
 
-/// Tells the daemon to forget the key (wipe memory + delete the file), so a
-/// logout is not undone when the health-check next reads /pubkey. Fire and
-/// forget; the g_logged_out latch covers the window until it lands.
-fn helperReset(fx: *Effects) void {
-    if (g_helper_token_len == 0) return;
-    var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reset", .{helper_port}) catch return;
-    var auth_buf: [96]u8 = undefined;
-    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
-    fx.fetch(.{
-        .key = helper_reset_key,
-        .url = url,
-        .method = .POST,
-        .headers = &.{.{ .name = "Authorization", .value = auth }},
-    });
-}
-
-/// Spawns the keyholder daemon: keyless, it idles serving /pubkey and /setup.
-/// The parent-pid is Plaza's, so the daemon exits when Plaza does.
+/// Starts Plaza's own keyholder: keyless at first, idling on /pubkey and
+/// /setup until somebody brings a key.
+///
+/// Port ZERO. There is no shared address, so there is nothing for anything else
+/// to be sitting on and nothing for Plaza to be tricked into talking to; the
+/// daemon says on stdout where it landed. The secret goes down the pipe, which
+/// is the only channel another program running as this user cannot read.
+///
+/// The daemon is Plaza's CHILD and dies with it. That is not a limitation: a
+/// keyholder that outlives its app is a keyholder something else can find.
 fn spawnHelper(fx: *Effects) void {
-    if (g_helper_bin_len == 0 or g_helper_token_len == 0) return;
-    var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{helper_port}) catch return;
-    var pid_buf: [16]u8 = undefined;
-    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()}) catch return;
+    if (g_helper_bin_len == 0 or g_helper_secret_len == 0) return;
     fx.spawn(.{
         .key = helper_spawn_key,
-        .argv = &.{
-            helperBin(),    "--serve",
-            "--port",       port_str,
-            "--state-dir",  g_helper_state_dir_buf[0..g_helper_state_dir_len],
-            "--token-file", g_helper_token_path_buf[0..g_helper_token_path_len],
-            "--parent-pid", pid_str,
-        },
+        .argv = &.{ helperBin(), "--approval-http", "127.0.0.1:0" },
+        .stdin = g_helper_secret_buf[0..g_helper_secret_len],
+        .on_line = Effects.lineMsg(.helper_line),
         .on_exit = Effects.exitMsg(.helper_exited),
-        .output = .collect,
     });
 }
 
@@ -4785,7 +4861,7 @@ fn spawnHelper(fx: *Effects) void {
 /// state) proves the loopback IPC works; a connection error keeps it at
 /// unreachable and the tick tries again.
 fn pollHelper(fx: *Effects) void {
-    if (g_helper_token_len == 0) return;
+    if (g_helper_secret_len == 0) return;
     // Signed OUT, this proves the IPC at startup and catches a key appearing
     // later (a terminal or window import), so Plaza adopts it live: poll every
     // tick. Signed IN, the status bar now reports whether Notary can actually
@@ -4799,7 +4875,7 @@ fn pollHelper(fx: *Effects) void {
         g_helper_polled_at = now;
     }
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/pubkey", .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{
@@ -4820,13 +4896,30 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.Pubkey, gpa, response.body) catch return;
     defer parsed.deinit();
-    const ready = std.mem.eql(u8, parsed.value.state, nostr.signer_ipc.state_ready);
-    g_helper_state.store(if (ready) 2 else 1, .release);
-    if (!ready) {
+    const ipc = nostr.signer_ipc;
+    // Three states, told apart. Anything this app does not recognise counts as
+    // "cannot sign", never as "no key yet", which is the rule the contract
+    // states beside the constants.
+    const state: HelperState = if (std.mem.eql(u8, parsed.value.state, ipc.state_ready))
+        .ready
+    else if (std.mem.eql(u8, parsed.value.state, ipc.state_locked))
+        .locked
+    else if (std.mem.eql(u8, parsed.value.state, ipc.state_uninitialized))
+        .empty
+    else
+        .locked;
+    g_helper_state.store(@intFromEnum(state), .release);
+
+    if (state == .locked) {
+        // It HOLDS a key. Saying nothing here is what made a locked keyholder
+        // look like an empty one: the latch below is cleared only by evidence
+        // that the key is really gone, and this is not that evidence.
+        return;
+    }
+    if (state != .ready) {
         // The daemon says it holds nothing, which is the only real evidence the
         // logout's reset landed. Whatever key appears next is a new one.
         g_logged_out_pk = null;
-        g_logout_reset_tries = 0;
         return;
     }
 
@@ -4843,12 +4936,11 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
         var still: [32]u8 = undefined;
         if (std.fmt.hexToBytes(&still, parsed.value.pubkey)) |_| {
             if (std.mem.eql(u8, &still, &left)) {
-                // The reset did not land. Ask again on the tick, which is where
-                // the effects live, a bounded number of times.
-                if (g_logout_reset_tries < logout_reset_retries) {
-                    g_logout_reset_tries += 1;
-                    g_logout_reset_due = true;
-                }
+                // Still the key this reader signed out of, and it will BE that
+                // key until they remove it in Notary. Signing out of a client
+                // does not take an identity off the machine, so this is the
+                // expected answer rather than a reset that failed to land, and
+                // the latch simply holds.
                 return;
             }
         } else |_| {}
@@ -4875,9 +4967,8 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     replayPending(model);
 }
 
-// The signed-in helper identity: its pubkey lives here (the SECRET lives only in
-// the daemon). `.helper` is the built-in local key now; `g_identity_kp` stays
-// null for it, so the key is never in this process.
+// The signed-in identity: its PUBKEY lives here and the secret lives only in
+// the keyholder. There is no field in this program that can hold a secret key.
 var g_helper_identity_pk: [32]u8 = undefined;
 var g_helper_has_identity = false;
 
@@ -4892,7 +4983,7 @@ const helper_setup_key: u64 = 42;
 const helper_sign_key: u64 = 43;
 
 fn helperReachable() bool {
-    return g_helper_state.load(.acquire) >= 1;
+    return g_helper_port != 0 and g_helper_state.load(.acquire) >= 1;
 }
 
 /// Queues a helper setup and fires it now if the daemon is already up (else the
@@ -4906,8 +4997,27 @@ fn queueHelperSetup(fx: *Effects, kind: HelperSetup, secret: ?[32]u8) void {
 
 /// Fires a queued setup once the daemon is reachable. Called on the tick and
 /// right after queueing.
+/// Whether a queued setup may go out.
+///
+/// A LOCKED keyholder already holds a key, so firing a setup at it offers to
+/// make one over the top of an identity somebody already has, and a nostr key
+/// cannot be replaced. Notary refuses, so nothing is destroyed, but the reader
+/// gets a toast where they should be getting a passphrase box.
+///
+/// A predicate rather than a line inside the sender, because the sender needs
+/// an effects channel and a test has none.
+fn helperSetupMayFire(queued: bool, state: HelperState) bool {
+    if (!queued) return false;
+    return state == .empty;
+}
+
+pub fn helperSetupMayFireForTest(queued: bool, state: HelperState) bool {
+    return helperSetupMayFire(queued, state);
+}
+
 fn driveHelperSetup(fx: *Effects) void {
-    if (g_helper_setup == .none or !helperReachable()) return;
+    if (!helperReachable()) return;
+    if (!helperSetupMayFire(g_helper_setup != .none, helperState())) return;
     const gpa = std.heap.page_allocator;
     switch (g_helper_setup) {
         .none => {},
@@ -4931,8 +5041,18 @@ var g_helper_pending_in_flight: HelperSetup = .none;
 /// A POST to the daemon with the bearer token. The body is copied by the effect,
 /// so a stack buffer is fine.
 fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup))) void {
+    helperFetchTimeout(fx, key, path, body, on_response, helper_sign_timeout_ms);
+}
+
+/// The same, with the wire deadline stated rather than inherited.
+fn helperFetchTimeout(fx: *Effects, key: u64, comptime path: []const u8, body: []const u8, on_response: @TypeOf(Effects.responseMsg(.helper_setup)), timeout_ms: u32) void {
+    // Nowhere to send it yet. The daemon takes a kernel-chosen port and says
+    // which one on stdout, so between the spawn and that line there is no
+    // address: sending to port zero would be a request nobody could answer and
+    // a failure the caller would read as a signer that is not working.
+    if (g_helper_port == 0) return;
     var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}" ++ path, .{helper_port}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}" ++ path, .{g_helper_port}) catch return;
     var auth_buf: [96]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
     fx.fetch(.{
@@ -4941,6 +5061,7 @@ fn helperFetch(fx: *Effects, key: u64, comptime path: []const u8, body: []const 
         .method = .POST,
         .headers = &.{.{ .name = "Authorization", .value = auth }},
         .body = body,
+        .timeout_ms = timeout_ms,
         .on_response = on_response,
     });
 }
@@ -4975,10 +5096,32 @@ var g_helper_sign: HelperSign = .{};
 /// which have no other view of the event that actually goes out.
 var g_last_published_tags: []const nostr.event.Tag = &.{};
 
-/// How long a helper sign may be out before the note is handed back. The daemon
-/// is on loopback and answers in about a millisecond, so this is not a latency
-/// budget: it is the backstop for a response that never arrives at all.
-const helper_sign_timeout_s: i64 = 10;
+/// How long a sign may be out before the note is handed back.
+///
+/// Ten seconds was safe while the keyholder answered in about a millisecond and
+/// could not do anything else. Notary can refuse and ask a person, and the
+/// answer to that arrives on a human timescale. The app-side backstop and the
+/// wire timeout must agree, and they did not: the fetch carried no timeout at
+/// all, so the SDK's default of thirty seconds applied while this fired at ten.
+///
+/// What that gap does is worse than a slow note. At ten seconds Plaza restores
+/// the draft and says the sign failed, while the request is still live; an
+/// answer at twenty then publishes an event the reader was told had failed. For
+/// those twenty seconds `signerReady` reports true because this slot is clear,
+/// while the effect key is still held, so the NEXT sign is rejected by the SDK
+/// and silently does nothing.
+///
+/// So the two are one number now, stated in both places from here.
+const helper_sign_timeout_s: i64 = 30;
+const helper_sign_timeout_ms: u32 = @intCast(helper_sign_timeout_s * 1000);
+
+pub fn helperSignTimeoutSecondsForTest() i64 {
+    return helper_sign_timeout_s;
+}
+
+pub fn helperSignTimeoutMillisForTest() u32 {
+    return helper_sign_timeout_ms;
+}
 
 /// Remembers a note handed to the daemon, so a failure has something to give
 /// back. Called BEFORE the request is built, because building it can fail too
@@ -5087,6 +5230,18 @@ pub fn lastPublishedTagsForTest() []const nostr.event.Tag {
     return g_last_published_tags;
 }
 
+/// The last event this app actually published, so a test can check the
+/// SIGNATURE rather than only the tags.
+var g_last_published: ?nostr.event.Event = null;
+
+pub fn lastPublishedForTest() ?nostr.event.Event {
+    return g_last_published;
+}
+
+pub fn forgetLastPublishedForTest() void {
+    g_last_published = null;
+}
+
 pub fn clearLastPublishedTagsForTest() void {
     g_last_published_tags = &.{};
 }
@@ -5142,7 +5297,7 @@ fn signerReady() bool {
         // One key, one sign. The bunker's table has eight slots keyed by request
         // id, so it does not collide, and a local key signs inline.
         .helper => !g_helper_sign.active,
-        .remote, .local => true,
+        .remote => true,
     };
 }
 
@@ -5164,6 +5319,19 @@ pub fn signInFlight() bool {
 
 /// Puts the built-in signer in the state it is in while a signature is out, so
 /// a test can drive the press that lands during one.
+/// Stops the test keyholder from answering, so a test can look at a note while
+/// it is still out being signed.
+///
+/// The stand-in daemon answers instantly, which is right for the tests that
+/// only want to be somebody and publish something. The ones about what happens
+/// while a signature is in flight, or when it never comes back, need the answer
+/// held.
+var g_test_signer_silent: bool = false;
+
+pub fn silenceTestSignerForTest(silent: bool) void {
+    g_test_signer_silent = silent;
+}
+
 pub fn holdHelperSignForTest() void {
     g_signer_kind = .helper;
     g_helper_sign.active = true;
@@ -5207,20 +5375,21 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
         return;
     };
     defer gpa.free(body);
-    // A test drives what happens to the NOTE, which is everything above and
-    // everything the response handler does. It cannot drive the loopback: an
-    // `Effects` is not constructible outside a running app, so this call would
-    // fault on undefined memory. Comptime, so the shipped binary has no branch.
-    if (builtin.is_test) return;
+    // A test cannot drive the loopback: an `Effects` is not constructible
+    // outside a running app, so the fetch below would fault on undefined
+    // memory. It stands in for the daemon instead, and answers the way the
+    // daemon does, so the response handler is exercised rather than skipped.
+    // Comptime, so the shipped binary has no branch.
+    if (builtin.is_test) {
+        if (!g_test_signer_silent) answerHelperSignForTest(gpa, unsigned_json);
+        return;
+    }
     helperFetch(fx, helper_sign_key, "/sign", body, Effects.responseMsg(.helper_signed));
 }
 
 /// Adopts a helper-held identity: only the pubkey lives here, never the secret
 /// (that stays in the daemon). Clears any in-UI local key.
 fn adoptHelperIdentity(pk: [32]u8) void {
-    if (g_identity_signer) |*sig| sig.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_helper_identity_pk = pk;
     g_helper_has_identity = true;
     g_signer_kind = .helper;
@@ -5348,6 +5517,34 @@ fn deleteIdentityKeyFile() void {
 /// Ingests and publishes a signed event returned by the daemon. Trusted: it
 /// came from our own daemon over authenticated loopback. A kind:0 seeds the
 /// profile cache so the name shows at once.
+/// The keyholder a test has: signs what was asked for and answers exactly as
+/// the daemon would, so `handleHelperSigned` runs for real.
+///
+/// Only compiled into a test binary. It exists so that the four hundred tests
+/// that "are somebody" drive the path that ships rather than one that does not,
+/// which is worth more than the shortcut it replaces.
+fn answerHelperSignForTest(gpa: std.mem.Allocator, unsigned_json: []const u8) void {
+    const secret = g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    var parsed = nostr.event.fromJson(gpa, unsigned_json) catch return;
+    defer parsed.deinit();
+    const ev = parsed.value;
+    const signed = nostr.event.create(gpa, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
+    const signed_json = nostr.event.toJson(gpa, signed) catch return;
+    defer gpa.free(signed_json);
+    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+/// Delivers one signed-event answer the way the runtime would, so a test can
+/// hand the app an event it did NOT ask for.
+pub fn deliverHelperSignedForTest(body: []const u8) void {
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+
 fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // A refusal, a timeout, a rejected effect, or a daemon that is not there.
     // The tick hands the note back; this line used to be where it was dropped.
@@ -5384,6 +5581,38 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
         failHelperSign();
         return;
     };
+    // Checked, not trusted, and that is a change of mind rather than an
+    // oversight. The old reasoning was written down here: "it came from our own
+    // daemon over authenticated loopback". It was true when the daemon was a
+    // binary Plaza built and shipped. It is not now: the keyholder is a
+    // separate product whose key can be changed, removed or replaced between
+    // the moment Plaza asked whose key it was and the moment an answer arrives.
+    //
+    // Two things, and the second is the one that matters. A signature proves
+    // the event was signed by the key it names. It says nothing about WHOSE key
+    // that is, so publishing without the second check would put a note on
+    // relays under an account the reader is not signed in to, over their name,
+    // with nothing on screen to say so.
+    var verifier = nostr.keys.Signer.init();
+    defer verifier.deinit();
+    const mine = activePubkey() orelse {
+        failHelperSign();
+        return;
+    };
+    if (!std.mem.eql(u8, &out.pubkey, &mine)) {
+        failHelperSign();
+        return;
+    }
+    if (nostr.event.verify(gpa, verifier, out)) |ok| {
+        if (!ok) {
+            failHelperSign();
+            return;
+        }
+    } else |_| {
+        failHelperSign();
+        return;
+    }
+
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -5543,14 +5772,20 @@ fn clearPending() void {
 // A synchronous error from the unified login field (nsec / bunker), shown under
 // it. `.none` while idle or when the async bunker path is in charge (its state
 // comes from `g_remote_status`). See `LoginError` and `Model.login_status`.
-const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2 };
+const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2, key_goes_to_notary = 3 };
 var g_login_error = std.atomic.Value(u8).init(0);
 
-/// What the pasted login text is: a secret key to import, a signer to connect,
-/// or neither.
+/// What the pasted login text is: a signer to connect, a secret key that
+/// belongs somewhere else, or neither.
 pub const LoginTarget = enum { nsec, bunker, invalid };
 
 /// Classifies pasted login text by its prefix. Pure, so it is unit-tested.
+///
+/// `nsec` is still recognised, and that is the point of keeping it. Plaza no
+/// longer takes a secret key ANYWHERE: it does not hold one, so a field that
+/// swallowed one would be asking for the most dangerous thing a person owns and
+/// then handing it straight on. Recognising it is how the reader gets told
+/// where it goes instead of "that does not look like a signer".
 pub fn classifyLogin(text: []const u8) LoginTarget {
     const t = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, t, "nsec1")) return .nsec;
@@ -5655,6 +5890,9 @@ pub fn mediaProxyOn() bool {
 
 pub fn setMediaProxyOn(on: bool) void {
     g_media_proxy_on = on;
+    // A proxy that has just been switched on has refused nothing yet, and one
+    // switched off has no policy to remember.
+    forgetProxyRefusals();
 }
 
 pub fn mediaDirectFallback() bool {
@@ -5670,6 +5908,10 @@ pub fn setMediaProxy(url: []const u8) void {
     const n = @min(trimmed.len, g_media_proxy_buf.len);
     @memcpy(g_media_proxy_buf[0..n], trimmed[0..n]);
     g_media_proxy_len = n;
+    // A different proxy answers for itself rather than inheriting the last
+    // one's policy. The per-face flag already followed this rule; the hosts
+    // now follow it too, in one place instead of three.
+    forgetProxyRefusals();
 }
 
 /// Whether the host serves its own resized variants via `?w=`, letting us skip
@@ -8685,7 +8927,6 @@ fn nowSeconds() i64 {
 /// show alongside the follows you read.
 fn activePubkey() ?[32]u8 {
     return switch (g_signer_kind) {
-        .local => if (g_identity_kp) |kp| kp.public_key else null,
         .remote => g_remote_pubkey,
         .helper => if (g_helper_has_identity) g_helper_identity_pk else null,
     };
@@ -9490,8 +9731,11 @@ pub const Model = struct {
     pub fn login_status(self: *const Model) []const u8 {
         _ = self;
         switch (@as(LoginError, @enumFromInt(g_login_error.load(.acquire)))) {
-            .format => return "Paste an nsec or a bunker link.",
+            .format => return "Paste a bunker link, or bring your key in Notary.",
             .bad_key => return "That doesn't look like a valid key.",
+            // Not an error the reader made. Their key is fine; it belongs in
+            // the app that holds keys, and that app is opening.
+            .key_goes_to_notary => return "Your key goes in Notary, not here. Opening it now.",
             .none => {},
         }
         return switch (g_remote_status.load(.acquire)) {
@@ -9512,7 +9756,6 @@ pub const Model = struct {
     pub fn identity_kind_label(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "Local key",
             .remote => "Remote signer",
             .helper => "Notary",
         };
@@ -9538,26 +9781,18 @@ pub const Model = struct {
             return "A note you just posted has not been signed yet. Signing out now will lose it.";
         }
         return switch (g_signer_kind) {
-            // Followable: the reveal-and-copy card in Settings is right there,
-            // and it is gated on exactly this kind.
-            .local => "Your secret key will be removed from this device. Copy it first if you want to keep this identity.",
             .remote => "You'll be signed out and returned to the welcome screen. Your signer keeps your key.",
-            // Notary held it, and Notary is asked to forget it. The two cases
-            // are not the same thing and used to share one sentence that was
-            // false for both.
+            // Nothing is deleted, and that is the change worth stating plainly.
             //
-            // The old text said "Back it up first if you want to keep this
-            // identity", pointing at a control that does not exist: the reveal
-            // card is local-key only, the daemon's route table has no export and
-            // its own module doc says no endpoint returns the secret, and the
-            // ceremony window tells the reader there is nothing to write down.
-            // A key minted here therefore ends here, and since `createLocalIdentity`
-            // has no callers, minted here is what every new identity is. Saying
-            // so is the least this can do until there is a real way to save one.
-            .helper => if (g_identity_minted_here)
-                "Notary made this key and it exists nowhere else. Signing out deletes it for good: your notes stay on relays, but nothing will ever be able to post, reply or edit your profile as this account again."
-            else
-                "Your key will be removed from Notary on this device. You can sign in again with the same key.",
+            // Signing out of Plaza used to ask Notary to forget the key, which
+            // conflated two different acts: leaving a client, and taking your
+            // identity off the machine. One press in one app should not destroy
+            // an identity every other app was using. So Plaza stops using the
+            // key and Notary keeps holding it.
+            //
+            // Which means the reader has to be told where it went, or "signed
+            // out" reads as "gone" and they go looking for a key that is fine.
+            .helper => "You'll be signed out of Plaza and returned to the welcome screen. Your key stays in Notary, so you can sign back in. To remove it from this Mac, open Notary.",
         };
     }
     /// The media-proxy field's text (what `text="{proxy_draft}"` binds).
@@ -9573,7 +9808,6 @@ pub const Model = struct {
     pub fn signer_line(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "Signing with a local key",
             .remote => "Signing via a remote signer",
             .helper => "Signing via Notary",
         };
@@ -9591,7 +9825,6 @@ pub const Model = struct {
     pub fn signer_sub(self: *const Model) []const u8 {
         _ = self;
         return switch (g_signer_kind) {
-            .local => "The key is on this Mac, in this app.",
             .remote => "The key never leaves your signer. Plaza asks it to sign.",
             .helper => "The key is held by Notary on this Mac, not by Plaza.",
         };
@@ -10374,23 +10607,33 @@ fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
 /// Adopts `secret` as the active local identity. For tests: the feed scopes
 /// its queries to the follow set plus the signed-in user, so a test that
 /// stores its own events needs to BE somebody.
+/// The key a test's stand-in daemon signs with.
+///
+/// Plaza does not hold a secret key any more, so a test cannot be somebody by
+/// being given one. It is somebody the way the shipped app is: it knows a
+/// pubkey and asks a keyholder for signatures. The keyholder in a test is the
+/// few lines at the end of `requestHelperSign`, and this is the key it uses.
+///
+/// The point is not the convenience. Four hundred tests call the shim below,
+/// and pointing them at the helper path means four hundred tests now exercise
+/// the path that ships, instead of a local-key arm that no longer exists
+/// outside them.
+var g_test_secret: ?[32]u8 = null;
+
 pub fn setIdentityForTest(secret: [32]u8) void {
     var signer = nostr.keys.Signer.init();
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        return;
-    };
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    g_test_secret = secret;
+    adoptHelperIdentity(kp.public_key);
 }
 
 /// Clears the active identity again. For tests.
 pub fn clearIdentityForTest() void {
-    if (g_identity_signer) |*sgn| sgn.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_identity_npub_len = 0;
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
+    g_test_secret = null;
+    g_helper_has_identity = false;
 }
 
 /// Forces the next reconcile to do the full work rather than take the
@@ -11206,6 +11449,10 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !p.avatar_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            // Written down for the whole host, not just this face: the refusal
+            // is a fact about where the picture lives, and every other picture
+            // there can skip the round trip that discovers it.
+            rememberProxyRefusal(p.picture());
             p.avatar_direct = true;
             p.avatar_state = .idle;
             return;
@@ -11431,7 +11678,7 @@ fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
 /// lives, so those faces never arrive at all without this. The picture is
 /// still resized by us afterwards, the same as a feed image fetched direct.
 fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct) return src;
+    if (direct or proxyRefusesHost(src)) return src;
     return mediaUrl(buf, src, avatar_target_px, .square);
 }
 
@@ -11441,7 +11688,7 @@ fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
 /// anything over the registry's budget. What a direct fetch costs is the bytes
 /// on the way in, since the proxy would have shrunk them first.
 fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct) return src;
+    if (direct or proxyRefusesHost(src)) return src;
     return if (isGifUrl(src))
         mediaUrl(buf, src, gif_target_px, .animation)
     else
@@ -11632,6 +11879,12 @@ const MediaSlot = struct {
     /// The resolved URL this image is fetched from, which is also its cache key.
     url_buf: [1024]u8 = [_]u8{0} ** 1024,
     url_len: u16 = 0,
+    /// The host the picture actually lives on, which is NOT the host of
+    /// `url_buf` while the proxy is in the way. Kept because a refusal is a
+    /// fact about this host and has to be written down under it, and the
+    /// response handler has nothing else to learn it from.
+    host_buf: [96]u8 = [_]u8{0} ** 96,
+    host_len: u8 = 0,
     /// Ask this picture's own host next time, skipping the proxy.
     ///
     /// Set when a proxied fetch came back unusable, so the retry goes to the
@@ -11657,6 +11910,9 @@ const MediaSlot = struct {
 
     fn url(self: *const MediaSlot) []const u8 {
         return self.url_buf[0..self.url_len];
+    }
+    fn host(self: *const MediaSlot) []const u8 {
+        return self.host_buf[0..self.host_len];
     }
     fn animated(self: *const MediaSlot) bool {
         return self.frames != null and self.frame_count > 1;
@@ -11813,9 +12069,26 @@ pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
     return m.attempts;
 }
 
+/// The host a slot's picture lives on, which `fireMediaAt` normally sets from
+/// the note. A test that drives the response handler directly never went
+/// through it.
+pub fn setMediaSlotHostForTest(note_id: i64, host: []const u8) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    const n = @min(host.len, m.host_buf.len);
+    @memcpy(m.host_buf[0..n], host[0..n]);
+    m.host_len = @intCast(n);
+}
+
 pub fn mediaIdleForTest(note_id: i64) bool {
     const m = mediaSlotFor(note_id) orelse return false;
     return m.state == .idle;
+}
+
+/// Whether this note's picture is now pinned to its own host rather than the
+/// proxy, and whether it will be asked for again.
+pub fn mediaFallbackStateForTest(note_id: i64) ?struct { idle: bool, direct: bool } {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return .{ .idle = m.state == .idle, .direct = m.direct };
 }
 
 /// Delivers one picture-fetch response for `note_id` the way the runtime would,
@@ -12174,6 +12447,10 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
+    const host = hostOf(link);
+    const hn = @min(host.len, slot.host_buf.len);
+    @memcpy(slot.host_buf[0..hn], host[0..hn]);
+    slot.host_len = @intCast(hn);
 
     // Local-first: a picture we already have appears with the note, with no
     // network round-trip at all.
@@ -12318,6 +12595,87 @@ pub fn classifyImageFailure(outcome: native_sdk.EffectFetchOutcome, status: u16)
     return .retry;
 }
 
+/// The hosts this proxy has refused, so the refusal outlives one picture.
+///
+/// A slot is not a place to keep this. The proxy's refusal is a fact about the
+/// HOST, and it was being remembered on an evictable media slot: the fallback
+/// sets the slot idle, an idle slot is exactly what `claimMediaSlot` evicts,
+/// and the flag went with it. Scroll a `.pub` picture off screen and back and
+/// it asked the proxy again, was refused again, and was evicted again, so it
+/// could loop without ever once reaching the host that would have served it.
+///
+/// A face never had that problem, because its flag lives on the profile, which
+/// is keyed by pubkey and outlives any amount of scrolling. That is the whole
+/// of why faces on those hosts came back and pictures did not.
+///
+/// By host rather than by URL, because that is the granularity the refusal has:
+/// wsrv.nl blocks whole TLDs by policy, so one refused picture is enough to
+/// know about every other picture on that host, and the rest never spend the
+/// wasted round trip at all.
+const proxy_refused_hosts_cap = 16;
+var g_proxy_refused: [proxy_refused_hosts_cap][96]u8 = undefined;
+var g_proxy_refused_len: [proxy_refused_hosts_cap]u8 = [_]u8{0} ** proxy_refused_hosts_cap;
+var g_proxy_refused_count: usize = 0;
+
+/// The host part of `url`, empty if it does not look like one.
+fn hostOf(url: []const u8) []const u8 {
+    const scheme = std.mem.indexOf(u8, url, "://") orelse return "";
+    const rest = url[scheme + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..end];
+    // Userinfo and a port are not part of what the proxy refused.
+    const after_at = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| authority[i + 1 ..] else authority;
+    if (std.mem.indexOfScalar(u8, after_at, ']') != null) return after_at; // an IPv6 literal, taken whole
+    return if (std.mem.indexOfScalar(u8, after_at, ':')) |i| after_at[0..i] else after_at;
+}
+
+/// Whether the proxy has already refused this URL's host.
+pub fn proxyRefusesHost(url: []const u8) bool {
+    const host = hostOf(url);
+    if (host.len == 0) return false;
+    for (0..g_proxy_refused_count) |i| {
+        if (std.ascii.eqlIgnoreCase(g_proxy_refused[i][0..g_proxy_refused_len[i]], host)) return true;
+    }
+    return false;
+}
+
+/// Writes down that the proxy refused this URL's host.
+///
+/// Full is full: sixteen refused hosts in one session is far past the point
+/// where the reader has noticed, and dropping the seventeenth costs one wasted
+/// round trip per picture on it rather than anything a reader could see.
+fn rememberProxyRefusal(url: []const u8) void {
+    rememberHostRefusal(hostOf(url));
+}
+
+/// The same, for a caller that already has the host rather than a URL.
+fn rememberHostRefusal(host: []const u8) void {
+    if (host.len == 0 or host.len > g_proxy_refused[0].len) return;
+    for (0..g_proxy_refused_count) |i| {
+        if (std.ascii.eqlIgnoreCase(g_proxy_refused[i][0..g_proxy_refused_len[i]], host)) return;
+    }
+    if (g_proxy_refused_count >= proxy_refused_hosts_cap) return;
+    const i = g_proxy_refused_count;
+    @memcpy(g_proxy_refused[i][0..host.len], host);
+    g_proxy_refused_len[i] = @intCast(host.len);
+    g_proxy_refused_count += 1;
+}
+
+/// Forgets every refusal. A different proxy gets to answer for itself rather
+/// than inheriting the last one's policy, which is the same rule the per-face
+/// flag already follows.
+pub fn forgetProxyRefusals() void {
+    g_proxy_refused_count = 0;
+}
+
+pub fn proxyRefusedCountForTest() usize {
+    return g_proxy_refused_count;
+}
+
+pub fn hostOfForTest(url: []const u8) []const u8 {
+    return hostOf(url);
+}
+
 /// Whether this answer is the proxy refusing the HOST, rather than telling us
 /// something about the picture.
 ///
@@ -12405,6 +12763,13 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !slot.direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            // Under the HOST, because this slot is not a place to keep it: the
+            // line below sets the slot idle, an idle slot is exactly what
+            // eviction takes, and the flag went with it. A picture scrolled off
+            // and back asked the proxy again, was refused again, and was
+            // evicted again, so it could loop without ever once reaching the
+            // host that would have served it.
+            rememberHostRefusal(slot.host());
             slot.direct = true;
             slot.state = .idle;
             return;
@@ -13552,16 +13917,14 @@ pub const Msg = union(enum) {
     /// Confirm logout: wipe the session (and a local key) and return to onboarding.
     logout_confirm,
     /// The signer daemon exited (logged; the watchdog and respawn are later).
+    /// One line of the daemon's stdout. Only one matters: the port it bound.
+    /// Notary opened a NIP-51 list's private half.
+    private_half: native_sdk.EffectResponse,
+    helper_line: native_sdk.EffectLine,
     helper_exited: native_sdk.EffectExit,
     notary_exited: native_sdk.EffectExit,
     /// The signer daemon's /pubkey health-check answered.
     helper_pubkey: native_sdk.EffectResponse,
-    /// The daemon's answer to the bunker poll, and the reader's three actions.
-    bunker_state: native_sdk.EffectResponse,
-    bunker_toggle,
-    bunker_decide: struct { id: u64, allow: bool, remember: BunkerRemember = .once },
-    bunker_revoke: u8,
-    copy_bunker_url,
     /// A /setup (create) answered: adopt the new helper identity.
     helper_setup: native_sdk.EffectResponse,
     /// A /sign answered: ingest and publish the signed event.
@@ -13643,7 +14006,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "bunker_state", "bunker_toggle", "bunker_decide", "bunker_revoke", "copy_bunker_url", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -13671,8 +14034,9 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // Exactly the number of `sections[n] =` lines below. It was full when this
-    // screen grew a section, and the bounds check is what said so.
-    var sections: [8]AppUi.Node = undefined;
+    // screen grew a section, and the bounds check is what said so. Seven since
+    // the signing section left; an oversize array is legal and a lie.
+    var sections: [7]AppUi.Node = undefined;
     var n: usize = 0;
 
     sections[n] = identitySection(ui, model);
@@ -13689,8 +14053,6 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
     n += 1;
     sections[n] = settingsSection(ui, "NOTES", "what each one shows · what the feed stops asking for", notesCard(ui, model));
-    n += 1;
-    sections[n] = settingsSection(ui, "SIGNING", "let other apps sign with your key · NIP-46", signingCard(ui, model));
     n += 1;
     sections[n] = logoutSection(ui, model);
     n += 1;
@@ -13946,138 +14308,6 @@ fn themeRadio(ui: *AppUi, label: []const u8, selected: bool) AppUi.Node {
             &.{.{ .text = label, .scale = menu_scale }},
         ),
     });
-}
-
-/// Signing for other apps: the switch, the link, whoever is waiting, and
-/// whoever is already connected.
-///
-/// Four things in one card because they are one decision. A switch with the
-/// consequences on another screen is a switch people flip without reading, and
-/// the whole argument for this over a browser extension is that you can see what
-/// it is doing.
-fn signingCard(ui: *AppUi, model: *const Model) AppUi.Node {
-    _ = model;
-    const p = theme.palette;
-    var kids: [10]AppUi.Node = undefined;
-    var n: usize = 0;
-
-    kids[n] = ui.el(.checkbox, .{
-        .size = .sm,
-        .checked = bunkerOn(),
-        .text = "Sign for other apps",
-        .on_toggle = Msg.bunker_toggle,
-        .style = .{
-            .accent = p.surface_control_solid,
-            .accent_foreground = p.on_accent,
-            .border = p.border_radio,
-            .radius = 4,
-            .stroke_width = 1.5,
-        },
-        .semantics = .{ .label = "Sign for other apps", .focusable = true },
-    }, .{});
-    n += 1;
-    kids[n] = vgap(ui, 7);
-    n += 1;
-    kids[n] = ui.paragraph(
-        .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-        &.{.{ .text = "Off unless you turn it on. While it is on, Plaza connects to relays and other apps can ask it to sign as you. Each one has to be approved here first, and approving it approves everything it will ever ask for.", .scale = mono_hint_scale }},
-    );
-    n += 1;
-
-    if (bunkerOn()) {
-        kids[n] = cardDivider(ui);
-        n += 1;
-        kids[n] = bunkerLinkRow(ui);
-        n += 1;
-    }
-
-    if (bunkerPendingClient().len > 0) {
-        kids[n] = cardDivider(ui);
-        n += 1;
-        kids[n] = bunkerAskRow(ui);
-        n += 1;
-    }
-
-    if (bunkerClientCount() > 0) {
-        kids[n] = cardDivider(ui);
-        n += 1;
-        kids[n] = bunkerClientRows(ui);
-        n += 1;
-    }
-
-    return settingsCard(ui, .{kids[0..n]});
-}
-
-/// The link, and the one button that matters: copy.
-///
-/// Shown in full rather than truncated. It carries a secret, and a reader who
-/// cannot see the whole thing cannot tell whether what they pasted is what this
-/// screen is showing.
-fn bunkerLinkRow(ui: *AppUi) AppUi.Node {
-    const p = theme.palette;
-    return ui.column(.{ .gap = 0 }, .{
-        ui.paragraph(
-            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
-            &.{.{ .text = bunkerUrl(), .monospace = true, .scale = mono_meta_scale }},
-        ),
-        vgap(ui, 7),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .on_press = Msg.copy_bunker_url }, "Copy link"),
-            ui.paragraph(
-                // `grow` as well as `wrap`: a wrapping paragraph with no width to
-                // wrap INTO lays out at its natural width and runs off the card,
-                // which is what this did.
-                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_faint } },
-                &.{.{ .text = "Paste it into the other app. Anyone holding this link can ask to connect, so treat it like a password.", .scale = mono_hint_scale }},
-            ),
-        }),
-    });
-}
-
-/// Somebody is waiting. Named by pubkey, because that is the only thing about a
-/// client this app actually knows: a name in a connection token is a string a
-/// stranger chose.
-fn bunkerAskRow(ui: *AppUi) AppUi.Node {
-    const p = theme.palette;
-    return ui.column(.{ .gap = 0 }, .{
-        ui.paragraph(
-            .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
-            &.{.{ .text = "An app wants to sign as you", .scale = meta_scale }},
-        ),
-        vgap(ui, 5),
-        ui.paragraph(
-            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-            &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = mono_hint_scale }},
-        ),
-        vgap(ui, 7),
-        ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Approve"),
-            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
-        }),
-    });
-}
-
-/// Who is connected, and the button that ends it.
-fn bunkerClientRows(ui: *AppUi) AppUi.Node {
-    const p = theme.palette;
-    var kids: [8 * 2]AppUi.Node = undefined;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < bunkerClientCount()) : (i += 1) {
-        if (n > 0) {
-            kids[n] = vgap(ui, 7);
-            n += 1;
-        }
-        kids[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
-            ui.paragraph(
-                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_secondary } },
-                &.{.{ .text = bunkerClientAt(i), .monospace = true, .scale = mono_hint_scale }},
-            ),
-            ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_revoke = @intCast(i) } }, "Disconnect"),
-        });
-        n += 1;
-    }
-    return ui.column(.{ .gap = 0 }, .{kids[0..n]});
 }
 
 /// What the reader can take away, and what is gone right now.
@@ -14605,19 +14835,6 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
 /// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
     const view = appViewLayers(ui, model);
-    // An app asking to sign as you goes on TOP of whatever was built, rather
-    // than instead of it.
-    //
-    // Not because it outranks reading, but because it is the only thing here
-    // with somebody waiting on the other end: a relay thread is parked on the
-    // answer and the client gives up long before Plaza's own two-minute window
-    // closes. A question buried under whatever screen happens to be open is a
-    // question that times out, which is exactly how this failed the first time
-    // it met a real client. An earlier version of this returned early and threw
-    // away the screen underneath, which is why it is a layer and not a branch.
-    if (bunkerPendingClient().len > 0) {
-        return ui.stack(.{ .grow = 1 }, .{ view, bunkerAskSheet(ui) });
-    }
     return view;
 }
 
@@ -15205,80 +15422,6 @@ fn toastOverlay(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-/// The first-intent sheet: the join ladder over the dimmed feed. Three ways in,
-/// most confident first, and always the way back to reading. When the guest
-/// reached for the composer, the sheet says the note is waiting.
-/// An app asking to sign as you, over whatever the reader was doing.
-///
-/// No dismiss and no press-to-close, unlike every other sheet here. The two
-/// buttons ARE the answer, and a scrim that closes on a stray click would leave
-/// a client hanging on a question the reader thinks they dealt with. Denying is
-/// one press away and costs nothing: the app can ask again.
-fn bunkerAskSheet(ui: *AppUi) AppUi.Node {
-    const p = theme.palette;
-    // No dismiss and no backdrop press, deliberately: an app is asking to sign as
-    // this person and the only ways out are the four answers on the card. The
-    // scrim is still here to dim what is behind it and to swallow presses that
-    // would otherwise land on the feed.
-    return ui.el(.panel, .{
-        .grow = 1,
-        .on_press = Msg.absorb_press,
-        .style_tokens = .{ .background = .scrim },
-        .semantics = .{ .label = "An app wants to sign as you" },
-    }, .{
-        ui.el(.dialog, .{
-            .width = settings_column_width,
-            .semantics = .{ .label = "An app wants to sign as you" },
-        }, .{
-            // `modalCard`, not `settingsCard`. The settings card wraps its
-            // children in a column of its own that grows, and this content
-            // wraps: three paragraphs each asking to grow inside a column that
-            // also grew made them compete for a height none of them could have,
-            // and they were painted over each other. The requester's key
-            // printed through the sentence under it and the four answers
-            // printed through that.
-            //
-            // Nothing here grows. Each paragraph is as tall as its own wrapped
-            // text, and the card is as tall as the lot.
-            modalCard(ui, settings_column_width, ui.column(.{ .gap = 8 }, .{
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_body_strong } },
-                    &.{.{ .text = ui.fmt("An app {s}", .{bunkerAskLine(ui.arena)}), .scale = 1.1 }},
-                ),
-                // 64 hex characters, at a size that fits them on one line. At
-                // the usual hint scale the last character wrapped alone onto a
-                // second line, which reads as a rendering fault on the one
-                // string in this card that has to be read carefully.
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                    &.{.{ .text = bunkerPendingClient(), .monospace = true, .scale = bunker_key_scale }},
-                ),
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                    &.{.{
-                        .text = if (bunkerAskIsConnect())
-                            "Approving does not let it sign yet: it is asked again the first time it wants to, and this answer is remembered."
-                        else
-                            "This answer covers this one thing. Anything else it asks for is a separate question, and you can take any of it back in Settings.",
-                        .scale = mono_hint_scale,
-                    }},
-                ),
-                vgap(ui, 4),
-                // Four answers rather than two. Amber's shape: "not now",
-                // "for a while" and "stop asking" all reachable in one press,
-                // because a prompt with only yes and no is one people learn to
-                // hit yes on.
-                ui.row(.{ .gap = 8, .cross = .center }, .{
-                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .once } } }, "Allow once"),
-                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .day } } }, "Allow for a day"),
-                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = true, .remember = .always } } }, "Always"),
-                    ui.button(.{ .size = .sm, .on_press = Msg{ .bunker_decide = .{ .id = g_bunker_pending_id, .allow = false, .remember = .hour } } }, "Deny"),
-                }),
-            })),
-        }),
-    });
-}
-
 fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     return modalScrim(ui, "Join", .close_join, ui.el(.dialog, .{
         .width = join_sheet_width,
@@ -15577,17 +15720,21 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
         }),
         ui.column(.{ .gap = 8 }, .{
             joinLabel(ui, "ALREADY ON NOSTR"),
-            // Bringing a key still works with no keyholder: the paste lands in
-            // this process instead (see `.open_notary_import`). It is a weaker
-            // promise than the one this line normally makes, so the line
-            // changes with it. Selling Notary's isolation and then taking the
-            // nsec into a Plaza text field would be the copy lying about where
-            // the key went.
+            // With no keyholder there is nowhere for a key to go, and this rung
+            // says so instead of offering a field.
+            //
+            // It used to fall back to pasting into Plaza, and the subtitle said
+            // so honestly. That fallback is gone: Plaza has no field that can
+            // hold a secret key, so the rung led to a screen that refuses every
+            // key it is given. A dead end with an encouraging label on it is
+            // worse than a disabled rung.
             if (keyholderMissing())
-                joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_notary_import, false)
+                joinCard(ui, "download", false, "Bring your key", "Not possible in this copy of Plaza.", null, false)
             else
-                joinCard(ui, "download", false, "Bring your key", "Goes into Notary. Plaza itself never sees it.", .open_notary_import, false),
-            joinCard(ui, "notary", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+                joinCard(ui, "download", false, "Bring your key", "Opens Notary. Plaza itself never sees it.", .open_notary_import, false),
+            // The other answer to the same question, and the one that stays
+            // here: your key is somewhere else already, so nothing has to move.
+            joinCard(ui, "notary", true, "Use your own signer", "Already have one? Paste its bunker link.", .open_bunker, false),
         }),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             ui.el(.list_item, .{
@@ -17685,12 +17832,224 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
 /// the name says "readable" rather than "empty" on purpose: a reader glancing at
 /// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
 /// opposite of what the guard is for.
-fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
-    const kp = g_identity_kp orelse return false;
-    const signer = g_identity_signer orelse return false;
-    const me = activePubkey() orelse return false;
-    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return false;
+/// The decrypted private half of a NIP-51 list, once Notary has opened it.
+///
+/// NIP-51 puts the private half of a list in `content`, encrypted to yourself.
+/// Plaza used to open it inline, against a secret key in this process. There is
+/// no secret key in this process any more, and asking the keyholder is a round
+/// trip, while every caller here answers a question that has to be answered NOW:
+/// is this account muted, and may this list be written back.
+///
+/// So the round trip happens once and the answer is kept. A caller reads this
+/// cache and gets a synchronous answer or nothing; nothing queues the ask and
+/// stays "cannot read", which is the same fail-safe as before and the one that
+/// matters: content that is present and unreadable means the list is NOT
+/// written back. Publishing a list whose private half you could not read
+/// deletes every private entry in it, which is a real bug in a real client and
+/// is why the guard exists.
+const PrivateHalf = struct {
+    used: bool = false,
+    state: enum { idle, asking, open, refused } = .idle,
+    /// The ciphertext this entry is about, by hash: the ciphertext itself runs
+    /// to kilobytes and this only has to tell two of them apart.
+    id: [32]u8 = [_]u8{0} ** 32,
+    plain_buf: [4096]u8 = undefined,
+    plain_len: u16 = 0,
+
+    fn plain(self: *const PrivateHalf) []const u8 {
+        return self.plain_buf[0..self.plain_len];
+    }
+};
+
+/// One per list a reader can have a private half in: mutes, bookmarks, and room
+/// for two more before anything has to be evicted.
+var g_private_halves: [4]PrivateHalf = [_]PrivateHalf{.{}} ** 4;
+
+/// The ciphertext each slot is about, held because the ask happens on a later
+/// tick than the read that noticed it was needed.
+const PrivateCiphertext = struct {
+    buf: [4096]u8 = undefined,
+    len: u16 = 0,
+    fn slice(self: *const PrivateCiphertext) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+var g_private_ciphertext: [4]PrivateCiphertext = [_]PrivateCiphertext{.{}} ** 4;
+
+/// Effect keys for the decrypts, one per slot.
+const private_half_key_base: u64 = 48;
+
+fn privateHalfId(content: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &out, .{});
+    return out;
+}
+
+fn privateHalfFor(content: []const u8) ?*PrivateHalf {
+    const id = privateHalfId(content);
+    for (&g_private_halves) |*h| {
+        if (h.used and std.mem.eql(u8, &h.id, &id)) return h;
+    }
+    return null;
+}
+
+/// The plaintext, or null with the ask queued.
+fn privateHalfOpened(content: []const u8) ?[]const u8 {
+    if (content.len == 0) return null;
+    if (privateHalfFor(content)) |h| {
+        return if (h.state == .open) h.plain() else null;
+    }
+    // Never seen. Claim a slot so the tick asks Notary for it. The oldest
+    // unopened one goes first; an opened one is worth more than a pending ask.
+    const id = privateHalfId(content);
+    for (&g_private_halves, 0..) |*h, i| {
+        if (!h.used) return claimPrivateHalf(i, id, content);
+    }
+    for (&g_private_halves, 0..) |*h, i| {
+        if (h.state != .open) return claimPrivateHalf(i, id, content);
+    }
+    return null;
+}
+
+/// Takes slot `i` for this ciphertext and keeps a copy of it, because the ask
+/// goes out on a later tick than the read that noticed it was needed.
+fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
+    if (content.len > g_private_ciphertext[i].buf.len) return null;
+    g_private_halves[i] = .{ .used = true, .state = .idle, .id = id };
+    @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
+    g_private_ciphertext[i].len = @intCast(content.len);
+    // A test has no tick to fire the ask on, so its stand-in keyholder answers
+    // here. In the app this returns null and the answer arrives a tick later,
+    // which is the whole reason this is a cache and not a call.
+    if (builtin.is_test) {
+        answerPrivateHalfForTest(std.heap.page_allocator, i, content);
+        if (g_private_halves[i].state == .open) return g_private_halves[i].plain();
+    }
+    return null;
+}
+
+pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
+    const id = privateHalfId(content);
+    for (&g_private_halves) |*h| {
+        if (!h.used or std.mem.eql(u8, &h.id, &id)) {
+            h.* = .{ .used = true, .state = .open, .id = id };
+            const n = @min(plain.len, h.plain_buf.len);
+            @memcpy(h.plain_buf[0..n], plain[0..n]);
+            h.plain_len = @intCast(n);
+            return;
+        }
+    }
+}
+
+/// Asks Notary to open one private half, if any is waiting and the keyholder
+/// can answer. One at a time: these are rare, and a batch would need the
+/// ciphertexts held somewhere while the answer travels.
+fn scanPrivateHalves(fx: *Effects) void {
+    if (!signerIsHealthy()) return;
+    const me = activePubkey() orelse return;
+    for (&g_private_halves, 0..) |*h, i| {
+        if (!h.used or h.state != .idle) continue;
+        const content = g_private_ciphertext[i].slice();
+        if (content.len == 0) {
+            h.state = .refused;
+            continue;
+        }
+        const gpa = std.heap.page_allocator;
+        var peer_hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch return;
+        // To yourself: both sides of the conversation key are this account's,
+        // which is what NIP-51 means by a half encrypted to yourself.
+        const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{content} }).toJson(gpa) catch return;
+        defer gpa.free(body);
+        h.state = .asking;
+        if (builtin.is_test) {
+            answerPrivateHalfForTest(gpa, i, content);
+            return;
+        }
+        helperFetch(fx, private_half_key_base + @as(u64, @intCast(i)), "/nip44/decrypt", body, Effects.responseMsg(.private_half));
+        return;
+    }
+}
+
+/// Notary's answer: the plaintext, or a refusal this reader has to live with.
+fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
+    if (response.key < private_half_key_base) return;
+    const i = response.key - private_half_key_base;
+    if (i >= g_private_halves.len) return;
+    const h = &g_private_halves[@intCast(i)];
+    if (!h.used) return;
+    if (response.outcome != .ok or response.status != 200) {
+        // Refused, or the keyholder is not there. NOT "the half is empty": the
+        // whole point of this cache is that unreadable and empty are different
+        // answers, and treating them alike is what deletes somebody's list.
+        h.state = .refused;
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
+        h.state = .refused;
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.items.len == 0) {
+        h.state = .refused;
+        return;
+    }
+    const plain = parsed.value.items[0];
+    const n = @min(plain.len, h.plain_buf.len);
+    @memcpy(h.plain_buf[0..n], plain[0..n]);
+    h.plain_len = @intCast(n);
+    h.state = .open;
+    // The mute set was read with this half closed, so it is short by whatever
+    // was in it. Read it again now that it can be.
+    loadMutesFromStore();
+    invalidateFeed();
+}
+
+/// The keyholder a test has, for the decrypt path. Only in a test binary.
+fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []const u8) void {
+    const secret = g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, kp.public_key, content) catch {
+        g_private_halves[i].state = .refused;
+        return;
+    };
     defer gpa.free(plain);
+    const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handlePrivateHalf(.{ .key = private_half_key_base + @as(u64, @intCast(i)), .outcome = .ok, .status = 200, .body = body });
+}
+
+/// Delivers one decrypt answer for slot zero the way the runtime would, so a
+/// test can drive a keyholder that refuses.
+pub fn deliverPrivateHalfForTest(status: u16, body: []const u8) void {
+    handlePrivateHalf(.{ .key = private_half_key_base, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
+}
+
+/// Puts slot zero in the "asked, waiting" state for a given ciphertext.
+pub fn askPrivateHalfForTest(content: []const u8) void {
+    g_private_halves[0] = .{ .used = true, .state = .asking, .id = privateHalfId(content) };
+    const n = @min(content.len, g_private_ciphertext[0].buf.len);
+    @memcpy(g_private_ciphertext[0].buf[0..n], content[0..n]);
+    g_private_ciphertext[0].len = @intCast(n);
+}
+
+pub fn privateMutesForTest(content: []const u8, out: [][32]u8) usize {
+    return privateMutes(std.heap.page_allocator, content, out);
+}
+
+pub fn privateHalfIsReadableForTest(content: []const u8) bool {
+    return privateHalfIsReadable(std.heap.page_allocator, content);
+}
+
+pub fn forgetPrivateHalvesForTest() void {
+    g_private_halves = [_]PrivateHalf{.{}} ** 4;
+}
+
+fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
+    const plain = privateHalfOpened(content) orelse return false;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
     defer parsed.deinit();
     // It decrypted and parsed. Whatever is in it, this app understood the half it
@@ -17747,12 +18106,10 @@ fn ingestMuteList(ev: nostr.event.Event) void {
 /// away every private mute the reader had.
 fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
     if (content.len == 0 or out.len == 0) return 0;
-    const kp = g_identity_kp orelse return 0;
-    const signer = g_identity_signer orelse return 0;
-    const me = activePubkey() orelse return 0;
-    // To yourself, so both sides of the conversation key are this account's.
-    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, me, content) catch return 0;
-    defer gpa.free(plain);
+    // From the cache Notary fills, not from a secret key here. A miss queues
+    // the ask and reads as "cannot read", which is the fail-safe every caller
+    // already handles.
+    const plain = privateHalfOpened(content) orelse return 0;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
     defer parsed.deinit();
     var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
@@ -19247,6 +19604,11 @@ var g_banner_asked_for: ?[32]u8 = null;
 var g_banner_state: enum { idle, fetching, loaded, failed } = .idle;
 var g_banner_url_buf: [1024]u8 = undefined;
 var g_banner_url_len: u16 = 0;
+/// The host the banner actually lives on, kept for the same reason a picture
+/// slot keeps one: while the proxy is in the way, the fetch URL's host is the
+/// proxy's, and a refusal has to be written down under the real one.
+var g_banner_host_buf: [96]u8 = undefined;
+var g_banner_host_len: u8 = 0;
 /// Ask the banner's own host rather than the proxy, for the same reason a face
 /// does. Cleared whenever the banner is started for somebody else.
 var g_banner_direct: bool = false;
@@ -19293,7 +19655,11 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     const raw = personBanner(pubkey);
     if (raw.len == 0) return;
     var url_buf: [1024]u8 = undefined;
-    const url = if (g_banner_direct) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const url = if (g_banner_direct or proxyRefusesHost(raw)) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const bhost = hostOf(raw);
+    const bn = @min(bhost.len, g_banner_host_buf.len);
+    @memcpy(g_banner_host_buf[0..bn], bhost[0..bn]);
+    g_banner_host_len = @intCast(bn);
     const n = @min(url.len, g_banner_url_buf.len);
     @memcpy(g_banner_url_buf[0..n], url[0..n]);
     g_banner_url_len = @intCast(n);
@@ -19369,6 +19735,7 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !g_banner_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            rememberHostRefusal(g_banner_host_buf[0..g_banner_host_len]);
             g_banner_direct = true;
             g_banner_state = .idle;
             return;
@@ -21761,9 +22128,8 @@ const SignerStatus = struct { label: []const u8, glyph: []const u8, color: canva
 /// carries this as a colour; the identity card needs it as a fact.
 pub fn signerIsHealthy() bool {
     return switch (g_signer_kind) {
-        .helper => g_helper_state.load(.monotonic) == 2,
+        .helper => helperState() == .ready,
         .remote => !g_remote_sign_notice.load(.acquire),
-        .local => true,
     };
 }
 
@@ -21779,11 +22145,15 @@ fn signerStatus() SignerStatus {
         // coming up; the install is short a file.
         .helper => if (keyholderMissing())
             .{ .label = "Notary is not installed", .glyph = "notary", .color = p.status_warning }
-        else switch (g_helper_state.load(.monotonic)) {
-            2 => .{ .label = "Notary ready", .glyph = "notary", .color = p.status_success },
-            1 => .{ .label = "Notary has no key", .glyph = "notary", .color = p.status_warning },
-            3 => .{ .label = "Notary unreachable", .glyph = "notary", .color = p.text_faint_alt },
-            else => .{ .label = "Notary starting", .glyph = "notary", .color = p.status_warning },
+        else switch (helperState()) {
+            .ready => .{ .label = "Notary ready", .glyph = "notary", .color = p.status_success },
+            // It HOLDS your key. Saying "has no key" here was the bug: it reads
+            // as an empty keyholder waiting to be set up, when what it wants is
+            // a passphrase.
+            .locked => .{ .label = "Notary is locked", .glyph = "notary", .color = p.status_warning },
+            .empty => .{ .label = "Notary has no key", .glyph = "notary", .color = p.status_warning },
+            .unreachable_ => .{ .label = "Notary unreachable", .glyph = "notary", .color = p.text_faint_alt },
+            .starting => .{ .label = "Notary starting", .glyph = "notary", .color = p.status_warning },
         },
         // A remote bunker: reachable is the whole question, and the remote path
         // already tracks a failed round trip.
@@ -21791,8 +22161,6 @@ fn signerStatus() SignerStatus {
             .{ .label = "Signer unreachable", .glyph = "notary", .color = p.status_warning }
         else
             .{ .label = "Signer connected", .glyph = "notary", .color = p.status_success },
-        // A key in this process: always able to sign, and honest about being local.
-        .local => .{ .label = "Local key", .glyph = "notary", .color = p.status_success },
     };
 }
 
@@ -21941,16 +22309,27 @@ fn metaTextIn(ui: *AppUi, text: []const u8, color: canvas.Color, width: f32) App
 /// NIP-05 both fit the buffers that receive them, which is to say both will
 /// arrive eventually.
 ///
-/// 136, not the 124 it was. The budget was set against "4h via Amethyst" and the
-/// real longest is "11h via Damus Notedeck": a client name may be fourteen
-/// characters and an age may be three, and at 124 that string was one character
-/// too wide. It did not elide, it WRAPPED, onto a second line the row had
-/// reserved no height for, so it painted over the handle beneath it and was
-/// clipped away again depending on what else was on screen. That is the flicker
-/// somebody sees scrolling past it. The line is single-line now (see the
-/// paragraph that draws it), and this is the width that keeps the longest thing
-/// it can honestly say inside its own box rather than leaning on the ellipsis.
-const time_column_width: f32 = 136;
+/// 148, and it has been wrong twice in opposite directions.
+///
+/// It was 124, set against "4h via Amethyst" while the real longest is
+/// "11h via Damus Notedeck": a client name may be fourteen characters and an
+/// age may be three. That string did not elide, it WRAPPED, onto a second line
+/// the row had reserved no height for, so it painted over the handle beneath
+/// and was clipped away again depending on what else was on screen. That was
+/// the flicker somebody saw scrolling past it.
+///
+/// 136 stopped the wrap and was still too narrow: it was measured against
+/// "11h" and "35m" is wider, so the same client name overflowed by eight
+/// points. It did not show, because the box was definite and the engine elided
+/// the tail. Now that the box hugs its text (see the paragraph that draws it),
+/// an overflow has nowhere to hide, so this is measured against the widest AGE
+/// as well as the longest NAME.
+///
+/// It cannot cover a name of fourteen wide glyphs; that would want two hundred
+/// points and eat the column the name and handle live in. Such a name overflows
+/// a little rather than eliding, which is the one thing this arrangement gives
+/// up, and it is a `client` tag nobody ships against a row that still reads.
+const time_column_width: f32 = 148;
 const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
 
 /// How long a stranger's string may be where something sits BESIDE it.
@@ -23071,15 +23450,17 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                             // same metrics it paints with, so a name that does
                             // not fit ends in an ellipsis instead of moving the
                             // furniture.
-                            ui.paragraph(
-                                .{
-                                    .width = time_column_width,
-                                    .wrap = false,
-                                    .text_alignment = .end,
-                                    .style = .{ .foreground = theme.palette.text_faint_alt },
-                                },
-                                timeSpans(ui, note, meta_scale),
-                            ),
+                            ui.row(.{ .gap = 0, .width = time_column_width }, .{
+                                ui.spacer(1),
+                                ui.paragraph(
+                                    .{
+                                        .wrap = false,
+                                        .text_alignment = .end,
+                                        .style = .{ .foreground = theme.palette.text_faint_alt },
+                                    },
+                                    timeSpans(ui, note, meta_scale),
+                                ),
+                            }),
                         }),
                         vgap(ui, 5),
                         // What this answers, above the answer. Feed only: in a
@@ -24767,10 +25148,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // A logout's reset that never reached the daemon, re-sent. Left
                 // undone, the daemon keeps the key the reader just left and the
                 // health-check would sign them back into it.
-                if (g_logout_reset_due) {
-                    g_logout_reset_due = false;
-                    helperReset(fx);
-                }
                 // Their published relay list, taken on this thread so no ingest
                 // thread ever swaps the pool out from under the others.
                 _ = adoptRelayList();
@@ -24817,10 +25194,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
                 scanNip05Fetches(fx);
-                // What the signer is doing as a bunker, while the screen showing
-                // it is open. A connect request waits two minutes for an answer,
-                // so this is what puts it in front of somebody in time.
-                pollBunker(fx, model, nowMillis() orelse 0);
+                // A list whose private half Notary has not opened yet. Reading
+                // it needs the keyholder now that no secret lives here.
+                scanPrivateHalves(fx);
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
                 drivePendingIntent(model, fx);
@@ -24857,6 +25233,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 requestWantedQuotes();
             }
         },
+        .private_half => |response| handlePrivateHalf(response),
+
+        .helper_line => |line| {
+            // The daemon says where it landed, and until it does there is
+            // nowhere to send anything. Everything else it prints is for a
+            // human reading a terminal.
+            const text = std.mem.trim(u8, line.line, " \t\r\n");
+            if (!std.mem.startsWith(u8, text, helper_port_prefix)) return;
+            const rest = std.mem.trim(u8, text[helper_port_prefix.len..], " \t");
+            const port = std.fmt.parseInt(u16, rest, 10) catch return;
+            if (port == 0) return;
+            g_helper_port = port;
+        },
+
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
         },
@@ -24932,8 +25322,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // appear on the next tick.
             model.composing = false;
             setToast(model, if (g_signer_kind == .remote) "Sent to your signer" else "Posted");
-            // The first local post is the calm moment to suggest a backup.
-            if (g_signer_kind == .local and !model.backup_nudge_dismissed)
+            // The first post is the calm moment to suggest a backup, and the
+            // backup lives in Notary now: this app has nothing to back up.
+            if (g_identity_minted_here and !model.backup_nudge_dismissed)
                 model.backup_nudge = true;
         },
         .open_compose => {
@@ -25184,7 +25575,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // out first. The pubkey latch below it is what still keeps the key
             // that just LEFT from walking back in.
             g_logged_out = false;
-            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else model.stage = .onboarding;
+            // No fallback to a Plaza field. There is no field in this app that
+            // can take a key, so dropping to one would be offering a screen
+            // that refuses whatever is typed into it.
+            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else setToast(model, "Notary is missing from this install.");
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -25333,17 +25727,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
             const raw = std.mem.trim(u8, model.login_buffer.text(), " \t\r\n");
             switch (classifyLogin(raw)) {
-                // Import an existing key: it lands on disk (0600) as the local
-                // identity. A bad nsec keeps us on onboarding with an error.
+                // A secret key, pasted into a client. Plaza does not take it,
+                // and does not take it INTO MEMORY either: the text stays in
+                // the field the reader typed it in, and the reader is sent to
+                // the app that holds keys.
+                //
+                // Refusing rather than accepting is the whole shape of this
+                // change. A client that accepts an nsec is a client holding the
+                // one thing that cannot be replaced if it leaks, and every
+                // other app on the machine can read what this one writes down.
                 .nsec => {
-                    if (!importNsec(raw)) return;
-                    persistSession();
-                    // Tolerate an nsec pasted into the bunker step: close the
-                    // sheet the same way the bunker success path does.
-                    model.joining = false;
-                    model.bunker_mode = false;
-                    enterFeed(model);
-                    replayPending(model);
+                    g_login_error.store(@intFromEnum(LoginError.key_goes_to_notary), .release);
+                    spawnNotaryWindow(fx, .import_key);
                 },
                 // Pair with the external signer from the bunker URL; on success
                 // the feed comes up and posts route through it. A bad URL keeps
@@ -25418,36 +25813,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // browser; see `mention_link_tag`.
         .open_url => |url| {
             if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
-        },
-        .bunker_state => |response| {
-            if (response.outcome == .ok and response.status == 200) applyBunkerState(response.body);
-        },
-        .bunker_toggle => {
-            // The reader's press goes to the daemon and the answer comes back as
-            // a fresh state, rather than being applied here and hoped for. The
-            // daemon owns whether the bunker is on; it holds the key and it is
-            // the thing relays talk to.
-            var body_buf: [32]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "{{\"on\":{s}}}", .{if (g_bunker_on) "false" else "true"}) catch return;
-            helperFetch(fx, bunker_toggle_key, "/bunker", body, Effects.responseMsg(.bunker_state));
-        },
-        .bunker_decide => |what| {
-            var body_buf: [64]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"allow\":{s},\"remember\":\"{s}\"}}", .{ what.id, if (what.allow) "true" else "false", @tagName(what.remember) }) catch return;
-            helperFetch(fx, bunker_decide_key, "/bunker/decide", body, Effects.responseMsg(.bunker_state));
-        },
-        .copy_bunker_url => {
-            const url = bunkerUrl();
-            if (url.len == 0) return;
-            fx.writeClipboard(.{ .key = copy_bunker_key, .text = url });
-            setToast(model, "Link copied");
-        },
-        .bunker_revoke => |index| {
-            const pubkey = bunkerClientAt(index);
-            if (pubkey.len == 0) return;
-            var body_buf: [128]u8 = undefined;
-            const body = std.fmt.bufPrint(&body_buf, "{{\"pubkey\":\"{s}\"}}", .{pubkey}) catch return;
-            helperFetch(fx, bunker_revoke_key, "/bunker/revoke", body, Effects.responseMsg(.bunker_state));
         },
         .expand_image => |note_id| {
             model.expanded_note = note_id;
@@ -26063,6 +26428,14 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = obj }, .{}) catch null;
 }
 
+/// Publishes one event the way any press does, so a test can ask what actually
+/// went out rather than what a helper built.
+pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const owned = gpa.dupe(u8, content) catch return;
+    signAndPublish(fx, gpa, created, kind, tags, owned, false);
+}
+
 pub fn activePubkeyForTest() ?[32]u8 {
     return activePubkey();
 }
@@ -26309,7 +26682,7 @@ pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectRespo
 /// 3 unreachable) plus a remote identity, so the presentation is testable
 /// without a live bunker. For tests.
 pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
-    g_signer_kind = if (status == 0) .local else .remote;
+    g_signer_kind = if (status == 0) .helper else .remote;
     g_remote_status.store(status, .release);
     g_remote_sign_notice.store(false, .release);
     if (npub_len > 0) {
@@ -26412,12 +26785,6 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
     // and every other seam in this file stops short of the event itself.
     g_last_published_tags = tags;
     switch (g_signer_kind) {
-        .local => {
-            const signer = g_identity_signer orelse return;
-            const kp = g_identity_kp orelse return;
-            const ev = nostr.event.create(gpa, signer, kp, created, kind, tags, content_owned, null) catch return;
-            ingestAndPublish(gpa, ev, null);
-        },
         .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
         .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable),
     }
@@ -27263,6 +27630,7 @@ fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nost
 /// process-lifetime allocation, since the detached publisher reads it after
 /// this returns.
 fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer) void {
+    if (builtin.is_test) g_last_published = ev;
     if (g_store == null) return;
     if (verify) |signer| {
         // A note we did not produce: verification is the gate into the store
@@ -29634,105 +30002,29 @@ fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
     return std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
 }
 
-/// Loads the identity from `identity.key` if present, adopting it and returning
-/// true. Never generates a key, that is the onboarding action's job.
-fn loadIdentityIfPresent(io: std.Io, environ: *const std.process.Environ.Map) bool {
-    var dir = plazaDir(io, environ) catch return false;
+/// Whether a key from an older Plaza is still sitting on this disk.
+///
+/// Plaza used to keep the raw secret at `$HOME/.plaza/identity.key`, mode 0600.
+/// It does not read it any more, and it does not move it either: importing it
+/// would mean this process holding a secret key, which is the whole thing that
+/// stopped.
+///
+/// So the file is LEFT ALONE and the reader is told it is there. Deleting
+/// somebody's only copy of an identity because an app was rewritten is not a
+/// migration, and silently orphaning it is worse: they would land on the
+/// welcome screen as a guest with their account still on the disk and nothing
+/// on screen connecting the two.
+var g_legacy_key_found = false;
+
+pub fn legacyKeyOnDisk() bool {
+    return g_legacy_key_found;
+}
+
+fn noticeLegacyKey(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
-
-    const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "identity.key", gpa, std.Io.Limit.limited(64)) catch return false;
-    defer gpa.free(raw);
-    if (raw.len != 32) return false;
-
-    var signer = nostr.keys.Signer.init();
-    var secret: [32]u8 = undefined;
-    @memcpy(&secret, raw[0..32]);
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        return false;
-    };
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    // Queue a silent, background upgrade: move this in-process key into the
-    // isolated daemon. The tick fires it once the daemon is reachable; on
-    // success the identity becomes helper-held and identity.key is deleted. If
-    // it never lands, the key keeps working in-process, no loss.
-    g_helper_setup_secret = secret;
-    g_helper_setup = .migrate;
-    return true;
-}
-
-/// Generates a fresh identity, persists it (mode 0600), and adopts it. Backs the
-/// onboarding "create identity" action, using the io and environment stashed in
-/// `main`. Returns true on success.
-fn createLocalIdentity() bool {
-    const io = g_io orelse return false;
-    const environ = g_environ orelse return false;
-
-    var signer = nostr.keys.Signer.init();
-    const kp = signer.generateKeyPair(io) catch {
-        signer.deinit();
-        return false;
-    };
-
-    persistIdentityKey(io, environ, kp.secret_key);
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    return true;
-}
-
-/// Imports an existing key from a bech32 `nsec`, persists it (mode 0600), and
-/// adopts it as the local identity. Backs the onboarding "paste your nsec" path.
-/// On a malformed key sets the login error and returns false.
-fn importNsec(nsec: []const u8) bool {
-    const io = g_io orelse return false;
-    const environ = g_environ orelse return false;
-    const gpa = std.heap.page_allocator;
-
-    const secret = nostr.nip19.decodeNsec(gpa, nsec) catch {
-        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
-        return false;
-    };
-    var signer = nostr.keys.Signer.init();
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        signer.deinit();
-        g_login_error.store(@intFromEnum(LoginError.bad_key), .release);
-        return false;
-    };
-
-    persistIdentityKey(io, environ, secret);
-    g_signer_kind = .local;
-    setIdentity(signer, kp);
-    return true;
-}
-
-/// Writes the raw 32-byte secret to `$HOME/.plaza/identity.key` at mode 0600,
-/// replacing any existing file. A failure to persist is non-fatal: the session
-/// still runs with the in-memory key (it just will not survive a relaunch).
-fn persistIdentityKey(io: std.Io, environ: *const std.process.Environ.Map, secret: [32]u8) void {
-    var dir = plazaDir(io, environ) catch |err| {
-        std.debug.print("plaza: could not open key dir: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer dir.close(io);
-    // Replace any prior key (a logout deletes it, so normally there is none).
-    dir.deleteFile(io, "identity.key") catch {};
-    dir.writeFile(io, .{
-        .sub_path = "identity.key",
-        .data = &secret,
-        .flags = .{ .permissions = secret_file_permissions },
-    }) catch |err| std.debug.print("plaza: could not persist identity: {s}\n", .{@errorName(err)});
-}
-
-/// Sets the identity globals: the signer, the keypair, and the abbreviated npub
-/// the composer shows. The signer's secp256k1 context is used only on the UI
-/// thread.
-fn setIdentity(signer: nostr.keys.Signer, kp: nostr.keys.KeyPair) void {
-    g_identity_signer = signer;
-    g_identity_kp = kp;
-    const npub = abbreviateNpub(&g_identity_npub_buf, kp.public_key);
-    g_identity_npub_len = npub.len;
+    const st = dir.statFile(io, "identity.key", .{}) catch return;
+    g_legacy_key_found = st.size == 32;
 }
 
 // ------------------------------------------------------------------- session
@@ -29755,7 +30047,6 @@ fn persistSession() void {
 
     var buf: [1024]u8 = undefined;
     const data = switch (g_signer_kind) {
-        .local => std.fmt.bufPrint(&buf, "kind=local\nminted={d}\n", .{@intFromBool(g_identity_minted_here)}) catch return,
         .helper => blk: {
             if (!g_helper_has_identity) return;
             var pk_hex: [64]u8 = undefined;
@@ -29793,11 +30084,9 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
     const gpa = std.heap.page_allocator;
 
     const raw = dir.readFileAlloc(io, "session", gpa, std.Io.Limit.limited(2048)) catch {
-        // No session file: adopt a legacy local key if one is on disk.
-        if (loadIdentityIfPresent(io, environ)) {
-            persistSession();
-            return true;
-        }
+        // No session file. An older Plaza kept its key here; it is not read
+        // and not moved, only noticed, so the reader can be told where it is.
+        noticeLegacyKey(io, environ);
         return false;
     };
     defer gpa.free(raw);
@@ -29825,7 +30114,13 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
     }
 
     if (std.mem.eql(u8, kind, "helper")) return restoreHelperIdentity(f_pubkey);
-    if (std.mem.eql(u8, kind, "local")) return loadIdentityIfPresent(io, environ);
+    // A session written by a Plaza that held its own key. There is no such
+    // identity any more, so this lands on the welcome screen; the notice says
+    // where the key it was pointing at still is.
+    if (std.mem.eql(u8, kind, "local")) {
+        noticeLegacyKey(io, environ);
+        return false;
+    }
     if (std.mem.eql(u8, kind, "remote")) return restoreRemoteSigner(gpa, f_pubkey, f_relay, f_client_secret, f_secret);
     return false;
 }
@@ -30117,27 +30412,28 @@ pub fn loggedOutPubkeyForTest() ?[32]u8 {
 }
 
 fn performLogout(model: *Model, fx: *Effects) void {
-    // Forget the key in the daemon's MEMORY, not just on disk: without this the
-    // health-check reads /pubkey, still sees the key, and re-adopts within a
-    // tick. The latch holds until the async reset lands.
-    if (g_signer_kind == .helper) helperReset(fx);
+    // Notary is NOT touched. Signing out of a client is not the same act as
+    // taking your key off the machine, and conflating them means one press in
+    // one app destroys an identity every other app was using. The key stays
+    // where it lives; this app stops using it.
+    //
+    // Which makes the latch below the whole mechanism rather than a backstop.
+    // The keyholder still holds the key and will keep saying so on every
+    // health check, so "signed out" is a fact Plaza has to remember for itself.
+    _ = fx;
     g_logged_out = true;
     // WHICH key left, so the health-check can refuse to hand it back even after
     // an explicit sign-in drops the latch above.
     g_logged_out_pk = activePubkey();
-    g_logout_reset_tries = 0;
-    g_logout_reset_due = false;
     if (g_io) |io| if (g_environ) |environ| {
         if (plazaDir(io, environ)) |dir_const| {
             var dir = dir_const;
             defer dir.close(io);
+            // The session, and nothing else. No key file is removed, by
+            // either name: `identity.key` belongs to a Plaza that held its own
+            // key and is left where its owner can find it, and the keyholder's
+            // file is the keyholder's.
             dir.deleteFile(io, "session") catch {};
-            if (g_signer_kind == .local) dir.deleteFile(io, "identity.key") catch {};
-            // The helper's key lives in the daemon's file; remove it too, so a
-            // logout leaves no key on disk. (The running daemon keeps its copy
-            // in memory until it exits with Plaza; recreating an identity in the
-            // same session needs a restart.)
-            if (g_signer_kind == .helper) dir.deleteFile(io, "signer.key") catch {};
         } else |_| {}
     };
 
@@ -30152,12 +30448,9 @@ fn performLogout(model: *Model, fx: *Effects) void {
     releaseHelperSign();
     g_helper_sign_notice.store(false, .release);
 
-    if (g_identity_signer) |*s| s.deinit();
-    g_identity_signer = null;
-    g_identity_kp = null;
     g_identity_npub_len = 0;
     g_helper_has_identity = false;
-    g_signer_kind = .local;
+    g_signer_kind = .helper;
     g_remote_client_kp = null;
     g_remote_relay_len = 0;
     g_remote_secret_len = 0;
@@ -31271,204 +31564,4 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
 test {
     _ = @import("tests.zig");
-}
-
-// ---------------------------------------------------------------- the bunker
-//
-// Plaza signing for OTHER apps. The work is all in `plaza-signer` (see
-// src/signer/bunker.zig); this is the screen for it.
-//
-// The state here is a MIRROR of the daemon's, refreshed by polling, never the
-// source of truth. The daemon owns whether the bunker is on, who is connected
-// and who is waiting, because it is the process holding the key and answering
-// relays. A UI that kept its own copy would eventually disagree with the thing
-// actually signing, and the disagreement would be invisible.
-
-/// How long an approval lasts, mirroring the daemon's own four.
-pub const BunkerRemember = enum { once, hour, day, always };
-
-const bunker_state_key: u64 = 44;
-const bunker_toggle_key: u64 = 45;
-const bunker_decide_key: u64 = 46;
-const bunker_revoke_key: u64 = 47;
-
-/// How often the screen asks the daemon what it is doing.
-///
-/// Only while Settings is open. A connect request waits two minutes for an
-/// answer, so a second is quick enough that a reader watching the screen sees it
-/// appear, and idle enough to cost nothing when nobody is looking.
-const bunker_poll_ms: i64 = 1000;
-
-var g_bunker_on: bool = false;
-var g_bunker_url_buf: [512]u8 = undefined;
-var g_bunker_url_len: usize = 0;
-var g_bunker_pending_id: u64 = 0;
-var g_bunker_pending_client: [64]u8 = undefined;
-var g_bunker_pending_len: usize = 0;
-/// What the waiting client wants. Empty means it is asking to CONNECT, which
-/// the screen words differently: being let in at all is a different question
-/// from being allowed to sign something.
-var g_bunker_pending_ask: [24]u8 = undefined;
-var g_bunker_pending_ask_len: usize = 0;
-var g_bunker_pending_kind: i32 = -1;
-var g_bunker_clients: [8][64]u8 = undefined;
-var g_bunker_client_count: usize = 0;
-var g_bunker_polled_at: i64 = 0;
-
-pub fn bunkerOn() bool {
-    return g_bunker_on;
-}
-
-pub fn bunkerUrl() []const u8 {
-    return g_bunker_url_buf[0..g_bunker_url_len];
-}
-
-pub fn bunkerPendingClient() []const u8 {
-    return g_bunker_pending_client[0..g_bunker_pending_len];
-}
-
-pub fn bunkerClientCount() usize {
-    return g_bunker_client_count;
-}
-
-/// What the waiting client is asking for, in the reader's words.
-///
-/// A kind number is in there for a signature, because "sign a note" and "change
-/// who you follow" are the same sentence to a signer and very different things
-/// to a person. Only the kinds worth naming are named; the rest are honest about
-/// being a number nobody can read at a glance.
-/// Puts a waiting client on the approval card, for tests and for driving the
-/// card in a running app without a second client to hand.
-pub fn setBunkerPendingForTest(client: []const u8) void {
-    const n = @min(client.len, g_bunker_pending_client.len);
-    @memcpy(g_bunker_pending_client[0..n], client[0..n]);
-    g_bunker_pending_len = n;
-    g_bunker_pending_id = 1;
-    g_bunker_pending_ask_len = 0;
-    g_bunker_pending_kind = -1;
-}
-
-pub fn bunkerAskLine(arena: std.mem.Allocator) []const u8 {
-    const ask = g_bunker_pending_ask[0..g_bunker_pending_ask_len];
-    if (ask.len == 0) return "wants to sign as you";
-    if (std.mem.eql(u8, ask, "nip44_encrypt")) return "wants to encrypt a message as you";
-    if (std.mem.eql(u8, ask, "nip44_decrypt")) return "wants to read an encrypted message of yours";
-    return switch (g_bunker_pending_kind) {
-        1 => "wants to post a note as you",
-        3 => "wants to change who you follow",
-        5 => "wants to delete something of yours",
-        6, 16 => "wants to repost as you",
-        7 => "wants to react as you",
-        0 => "wants to change your profile",
-        10000 => "wants to change who you have muted",
-        10002 => "wants to change your relay list",
-        else => std.fmt.allocPrint(arena, "wants to sign a kind {d} event as you", .{g_bunker_pending_kind}) catch "wants to sign something as you",
-    };
-}
-
-/// Whether the waiting request is a connect rather than an action.
-pub fn bunkerAskIsConnect() bool {
-    return g_bunker_pending_ask_len == 0;
-}
-
-/// Reads the daemon's answer into the mirror above.
-///
-/// Everything is replaced, never merged: this is a snapshot of what the daemon
-/// believes, and merging would let a stale client linger in the list after it
-/// had been revoked, which is the one thing this list exists to show truthfully.
-pub fn applyBunkerState(json: []const u8) void {
-    const gpa = std.heap.page_allocator;
-    const Client = struct { pubkey: []const u8 = "" };
-    const Pending = struct { id: u64 = 0, client: []const u8 = "", ask: []const u8 = "", kind: i32 = -1 };
-    const Body = struct {
-        enabled: bool = false,
-        url: []const u8 = "",
-        pending: ?Pending = null,
-        clients: []const Client = &.{},
-    };
-    const parsed = std.json.parseFromSlice(Body, gpa, json, .{ .ignore_unknown_fields = true }) catch return;
-    defer parsed.deinit();
-
-    g_bunker_on = parsed.value.enabled;
-    const n = @min(parsed.value.url.len, g_bunker_url_buf.len);
-    @memcpy(g_bunker_url_buf[0..n], parsed.value.url[0..n]);
-    g_bunker_url_len = n;
-
-    if (parsed.value.pending) |p| {
-        g_bunker_pending_id = p.id;
-        const c = @min(p.client.len, g_bunker_pending_client.len);
-        @memcpy(g_bunker_pending_client[0..c], p.client[0..c]);
-        g_bunker_pending_len = c;
-        const a = @min(p.ask.len, g_bunker_pending_ask.len);
-        @memcpy(g_bunker_pending_ask[0..a], p.ask[0..a]);
-        g_bunker_pending_ask_len = a;
-        g_bunker_pending_kind = p.kind;
-    } else {
-        g_bunker_pending_id = 0;
-        g_bunker_pending_len = 0;
-        g_bunker_pending_ask_len = 0;
-        g_bunker_pending_kind = -1;
-    }
-
-    g_bunker_client_count = 0;
-    for (parsed.value.clients) |c| {
-        if (g_bunker_client_count >= g_bunker_clients.len) break;
-        const len = @min(c.pubkey.len, g_bunker_clients[0].len);
-        @memcpy(g_bunker_clients[g_bunker_client_count][0..len], c.pubkey[0..len]);
-        g_bunker_client_count += 1;
-    }
-}
-
-pub fn bunkerClientAt(i: usize) []const u8 {
-    if (i >= g_bunker_client_count) return "";
-    return &g_bunker_clients[i];
-}
-
-pub fn applyBunkerStateForTest(json: []const u8) void {
-    applyBunkerState(json);
-}
-
-pub fn resetBunkerForTest() void {
-    g_bunker_on = false;
-    g_bunker_url_len = 0;
-    g_bunker_pending_id = 0;
-    g_bunker_pending_len = 0;
-    g_bunker_client_count = 0;
-}
-
-/// Asks the daemon what it is doing, at most once a second and only while the
-/// screen that shows it is open.
-fn pollBunker(fx: *Effects, model: *const Model, now_ms: i64) void {
-    // NOT gated on the settings screen, and that was the bug that made this
-    // feature not work at all.
-    //
-    // The reader copies the link in Settings, switches to a browser, and pastes
-    // it into another app. Plaza is in the BACKGROUND at the moment the client
-    // connects, which is the only moment that matters: the relay thread is
-    // parked waiting for an approval, and if nothing is polling, nothing ever
-    // asks. The client waits, gets nothing, and times out. That is exactly what
-    // happened the first time this was tried against a real client.
-    //
-    // So it polls whenever the bunker is on, wherever the reader is, and the
-    // approval is a sheet rather than a row on one screen.
-    // The FIRST poll is unconditional, because "is it on" is exactly what this
-    // does not know yet. The signer puts itself back the way it was left, so a
-    // reader who turned it on last week starts with it serving; if Plaza waited
-    // to be told before asking, it would only find out when they next opened
-    // Settings, and until then a client connecting to that URL would park on an
-    // approval nobody was fetching.
-    if (g_bunker_polled_at != 0 and !g_bunker_on and model.stage != .settings) return;
-    if (g_bunker_polled_at != 0 and now_ms - g_bunker_polled_at < bunker_poll_ms) return;
-    g_bunker_polled_at = now_ms;
-    var url_buf: [48]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bunker", .{helper_port}) catch return;
-    var auth_buf: [96]u8 = undefined;
-    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{helperToken()}) catch return;
-    fx.fetch(.{
-        .key = bunker_state_key,
-        .url = url,
-        .method = .GET,
-        .headers = &.{.{ .name = "Authorization", .value = auth }},
-        .on_response = Effects.responseMsg(.bunker_state),
-    });
 }

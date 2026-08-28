@@ -86,15 +86,15 @@ cleanup() {
   # window and the keyholder daemon are children, and a killed parent does not
   # take them with it.
   pkill -f "$ROOT/zig-out/bin/plaza" 2>/dev/null || true
-  pkill -f "notary-window/zig-out/bin/notary-window" 2>/dev/null || true
+  pkill -f "notary/gui/zig-out/bin/notary" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # Launches the automation build against a home of our own. The isolated HOME is
 # not tidiness: Plaza keeps the reader's key, session and store under $HOME, and
 # a journey that signs out would sign THEM out.
-launch() { # home-dir
-  local home="$1"
+launch() { # home-dir [KEY=VALUE ...]
+  local home="$1"; shift
   # Anything still running from THIS build path is a leak from an earlier run,
   # and leaving it costs more than a stray process: every app started in this
   # directory publishes to the same automation snapshot, so two of them take
@@ -114,7 +114,10 @@ launch() { # home-dir
   # the pattern above matches a COMMAND LINE. Launched as ./zig-out/bin/plaza it
   # reads as a relative path and no absolute pattern will ever match it, so the
   # cleanup that exists to prevent all this would have quietly matched nothing.
-  (cd "$ROOT" && exec env HOME="$home" "$ROOT/zig-out/bin/plaza") >"$WORK/app.log" 2>&1 &
+  # Extra environment goes to Plaza AND to the keyholder it starts, because a
+  # spawned child inherits it. That is how a journey gets a signed-in machine:
+  # Plaza holds no key to seed any more, so the key is seeded into the daemon.
+  (cd "$ROOT" && exec env HOME="$home" "$@" "$ROOT/zig-out/bin/plaza") >"$WORK/app.log" 2>&1 &
   APP_PID=$!
   (cd "$ROOT" && native automate wait --timeout 90 >/dev/null 2>&1) \
     || die "the app never published a snapshot. See $WORK/app.log"
@@ -261,8 +264,8 @@ build() {
 # has already shipped broken once in this project's sibling: tests green, app
 # dead on first launch, because a Finder launch hands a process a minimal
 # environment that a shell launch does not. So the launch here goes through
-# LaunchServices, exactly as double-clicking does, and the assertion is that all
-# three processes are alive a few seconds later.
+# LaunchServices, exactly as double-clicking does, and the assertion is that
+# the app and the keyholder it starts are both alive a few seconds later.
 #
 # It runs LAST in a full pass. Packaging clears zig-out on purpose, so that
 # nothing instrumented can be signed and shipped, which also means it destroys
@@ -287,12 +290,12 @@ journey_bundle() {
   # `set -e` would exit the run at the exact moment the check found something.
   local alive=0
   pgrep -f "$app/Contents/MacOS/plaza$" >/dev/null 2>&1 && alive=$((alive + 1)) || true
-  pgrep -f "$app/Contents/MacOS/plaza-signer" >/dev/null 2>&1 && alive=$((alive + 1)) || true
+  pgrep -f "$app/Contents/MacOS/signer" >/dev/null 2>&1 && alive=$((alive + 1)) || true
 
   if [ "$alive" -eq 2 ]; then
     pass "the app and its keyholder daemon are both running"
   else
-    fail "expected the app and plaza-signer to be running, found $alive of 2"
+    fail "expected the app and its signer to be running, found $alive of 2"
   fi
 
   # It wrote a store under the disposable home rather than anywhere else.
@@ -401,21 +404,21 @@ journey_follows() {
     return
   fi
 
-  # Seeded rather than typed. The key ceremony is a second process with a window
-  # of its own and no automation server in it, by design: the secret is not
-  # supposed to be reachable from the app, which also puts it out of reach here.
-  # So this journey starts from a signed-in machine and tests what happens next.
+  # Seeded rather than typed, and seeded into the KEYHOLDER rather than into
+  # Plaza. Plaza holds no secret key any more: there is no field in it that can,
+  # which is the whole point of the split. So the key goes to the daemon through
+  # its own dev-only environment variable, and Plaza's session says only which
+  # account it is signed in as.
+  #
+  # The window where a key is really brought is a second process with no
+  # automation server in it, by design, which is why this is seeded at all.
   local home="$WORK/follows-home"
   rm -rf "$home"; mkdir -p "$home/.plaza"
-  python3 -c "
-import binascii, sys
-open(sys.argv[2], 'wb').write(binascii.unhexlify(sys.argv[1]))
-" "$secret" "$home/.plaza/identity.key"
-  chmod 600 "$home/.plaza/identity.key"
-  printf 'kind=local\nminted=0\n' >"$home/.plaza/session"
-  chmod 600 "$home/.plaza/session"
-
-  launch "$home"
+  # No session file: Plaza adopts whatever key the keyholder reports on its
+  # first health poll. That path exists so a key brought in from a terminal
+  # signs you in without a restart, and it is exactly what a seeded daemon
+  # looks like from here.
+  launch "$home" "SIGNER_SECRET_KEY=$secret"
   # The feed scope is the app's own answer to "have I got your list yet": it
   # reads "Starter pack" until the account's own contact list is adopted, and
   # "Following" after. Waiting on notes instead is what broke this: cards from

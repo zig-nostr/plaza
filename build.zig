@@ -80,11 +80,12 @@ pub fn build(b: *std.Build) void {
         app.exe.root_module.linkFramework("AppKit", .{});
     }
 
-    // plaza-signer: the isolated keyholder daemon. A SEPARATE binary from the
-    // SDK app, built from the nostr library ALONE (no SDK), so the process that
-    // holds the key links none of the UI's image or JSON parsers. Plaza spawns
-    // it at launch and talks to it over loopback.
-    addSigner(b, app.exe.root_module.resolved_target.?, app.exe.root_module.optimize.?);
+    // The keyholder is NOT built here. It is Notary's daemon, built from
+    // Notary's own checkout and injected by scripts/package-macos.sh, so the
+    // most dangerous code in the project has one implementation rather than
+    // two. That means zig-out/bin holds only `plaza`, and the packaging script
+    // asserts the bundle's contents BY NAME instead of deriving them from what
+    // this file installs.
     addSeedFeed(b, app.exe.root_module.resolved_target.?);
 }
 
@@ -121,53 +122,6 @@ fn addSeedFeed(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     b.step("test-seed-feed", "Run the seed-feed tests").dependOn(&run_tests.step);
-}
-
-/// Builds the plaza-signer daemon and its test step. Library-only: it imports
-/// nostr (secp256k1 + LMDB, hence libc) and nothing else.
-fn addSigner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/signer/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    linkNostr(b, mod);
-
-    // The Keychain shim, and the frameworks behind it. Only the daemon links
-    // this: it is the process that holds the key, and the render process has no
-    // business being able to read it.
-    // The SDK's framework directory, asked for rather than assumed. This module
-    // is built plainly, without the `--sysroot` the app build passes, so Zig has
-    // nowhere to look for Security.framework and says so ("searched paths:
-    // none"). `xcrun` is how every other tool on this machine answers the same
-    // question, and hardcoding a versioned SDK path would break on the next
-    // Xcode update.
-    if (target.result.os.tag == .macos) {
-        // The whole shim is macOS-only, C file included. There is no Keychain
-        // elsewhere, and the Zig side compiles its calls out on other targets
-        // and falls back to the key file, which is what those platforms had
-        // anyway. Adding the C unconditionally is what broke the Linux build:
-        // `Security/Security.h` is not a header that exists there.
-        mod.addCSourceFile(.{ .file = b.path("src/keychain.c"), .flags = &.{"-O2"} });
-        mod.addIncludePath(b.path("src"));
-        const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
-        mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
-        // And the SDK's headers: Security.framework's own headers include
-        // `libDER/DERItem.h`, which lives in usr/include rather than inside the
-        // framework. The app build gets this from `-isysroot`.
-        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
-        mod.linkFramework("Security", .{});
-        mod.linkFramework("CoreFoundation", .{});
-    }
-
-    const exe = b.addExecutable(.{ .name = "plaza-signer", .root_module = mod });
-    b.installArtifact(exe);
-
-    const tests = b.addTest(.{ .root_module = mod });
-    const run_tests = b.addRunArtifact(tests);
-    const step = b.step("test-signer", "Run the plaza-signer daemon tests");
-    step.dependOn(&run_tests.step);
 }
 
 /// Adds the `nostr` import to `mod`, compiling the library (and its bundled
