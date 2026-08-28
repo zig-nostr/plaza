@@ -5655,6 +5655,9 @@ pub fn mediaProxyOn() bool {
 
 pub fn setMediaProxyOn(on: bool) void {
     g_media_proxy_on = on;
+    // A proxy that has just been switched on has refused nothing yet, and one
+    // switched off has no policy to remember.
+    forgetProxyRefusals();
 }
 
 pub fn mediaDirectFallback() bool {
@@ -5670,6 +5673,10 @@ pub fn setMediaProxy(url: []const u8) void {
     const n = @min(trimmed.len, g_media_proxy_buf.len);
     @memcpy(g_media_proxy_buf[0..n], trimmed[0..n]);
     g_media_proxy_len = n;
+    // A different proxy answers for itself rather than inheriting the last
+    // one's policy. The per-face flag already followed this rule; the hosts
+    // now follow it too, in one place instead of three.
+    forgetProxyRefusals();
 }
 
 /// Whether the host serves its own resized variants via `?w=`, letting us skip
@@ -11206,6 +11213,10 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !p.avatar_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            // Written down for the whole host, not just this face: the refusal
+            // is a fact about where the picture lives, and every other picture
+            // there can skip the round trip that discovers it.
+            rememberProxyRefusal(p.picture());
             p.avatar_direct = true;
             p.avatar_state = .idle;
             return;
@@ -11431,7 +11442,7 @@ fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
 /// lives, so those faces never arrive at all without this. The picture is
 /// still resized by us afterwards, the same as a feed image fetched direct.
 fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct) return src;
+    if (direct or proxyRefusesHost(src)) return src;
     return mediaUrl(buf, src, avatar_target_px, .square);
 }
 
@@ -11441,7 +11452,7 @@ fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
 /// anything over the registry's budget. What a direct fetch costs is the bytes
 /// on the way in, since the proxy would have shrunk them first.
 fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct) return src;
+    if (direct or proxyRefusesHost(src)) return src;
     return if (isGifUrl(src))
         mediaUrl(buf, src, gif_target_px, .animation)
     else
@@ -11632,6 +11643,12 @@ const MediaSlot = struct {
     /// The resolved URL this image is fetched from, which is also its cache key.
     url_buf: [1024]u8 = [_]u8{0} ** 1024,
     url_len: u16 = 0,
+    /// The host the picture actually lives on, which is NOT the host of
+    /// `url_buf` while the proxy is in the way. Kept because a refusal is a
+    /// fact about this host and has to be written down under it, and the
+    /// response handler has nothing else to learn it from.
+    host_buf: [96]u8 = [_]u8{0} ** 96,
+    host_len: u8 = 0,
     /// Ask this picture's own host next time, skipping the proxy.
     ///
     /// Set when a proxied fetch came back unusable, so the retry goes to the
@@ -11657,6 +11674,9 @@ const MediaSlot = struct {
 
     fn url(self: *const MediaSlot) []const u8 {
         return self.url_buf[0..self.url_len];
+    }
+    fn host(self: *const MediaSlot) []const u8 {
+        return self.host_buf[0..self.host_len];
     }
     fn animated(self: *const MediaSlot) bool {
         return self.frames != null and self.frame_count > 1;
@@ -11811,6 +11831,16 @@ pub fn markMediaFailedForTest(slot: *MediaSlot) void {
 pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
     const m = mediaSlotFor(note_id) orelse return null;
     return m.attempts;
+}
+
+/// The host a slot's picture lives on, which `fireMediaAt` normally sets from
+/// the note. A test that drives the response handler directly never went
+/// through it.
+pub fn setMediaSlotHostForTest(note_id: i64, host: []const u8) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    const n = @min(host.len, m.host_buf.len);
+    @memcpy(m.host_buf[0..n], host[0..n]);
+    m.host_len = @intCast(n);
 }
 
 pub fn mediaIdleForTest(note_id: i64) bool {
@@ -12181,6 +12211,10 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     const n = @min(url.len, slot.url_buf.len);
     @memcpy(slot.url_buf[0..n], url[0..n]);
     slot.url_len = @intCast(n);
+    const host = hostOf(link);
+    const hn = @min(host.len, slot.host_buf.len);
+    @memcpy(slot.host_buf[0..hn], host[0..hn]);
+    slot.host_len = @intCast(hn);
 
     // Local-first: a picture we already have appears with the note, with no
     // network round-trip at all.
@@ -12325,6 +12359,87 @@ pub fn classifyImageFailure(outcome: native_sdk.EffectFetchOutcome, status: u16)
     return .retry;
 }
 
+/// The hosts this proxy has refused, so the refusal outlives one picture.
+///
+/// A slot is not a place to keep this. The proxy's refusal is a fact about the
+/// HOST, and it was being remembered on an evictable media slot: the fallback
+/// sets the slot idle, an idle slot is exactly what `claimMediaSlot` evicts,
+/// and the flag went with it. Scroll a `.pub` picture off screen and back and
+/// it asked the proxy again, was refused again, and was evicted again, so it
+/// could loop without ever once reaching the host that would have served it.
+///
+/// A face never had that problem, because its flag lives on the profile, which
+/// is keyed by pubkey and outlives any amount of scrolling. That is the whole
+/// of why faces on those hosts came back and pictures did not.
+///
+/// By host rather than by URL, because that is the granularity the refusal has:
+/// wsrv.nl blocks whole TLDs by policy, so one refused picture is enough to
+/// know about every other picture on that host, and the rest never spend the
+/// wasted round trip at all.
+const proxy_refused_hosts_cap = 16;
+var g_proxy_refused: [proxy_refused_hosts_cap][96]u8 = undefined;
+var g_proxy_refused_len: [proxy_refused_hosts_cap]u8 = [_]u8{0} ** proxy_refused_hosts_cap;
+var g_proxy_refused_count: usize = 0;
+
+/// The host part of `url`, empty if it does not look like one.
+fn hostOf(url: []const u8) []const u8 {
+    const scheme = std.mem.indexOf(u8, url, "://") orelse return "";
+    const rest = url[scheme + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..end];
+    // Userinfo and a port are not part of what the proxy refused.
+    const after_at = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| authority[i + 1 ..] else authority;
+    if (std.mem.indexOfScalar(u8, after_at, ']') != null) return after_at; // an IPv6 literal, taken whole
+    return if (std.mem.indexOfScalar(u8, after_at, ':')) |i| after_at[0..i] else after_at;
+}
+
+/// Whether the proxy has already refused this URL's host.
+pub fn proxyRefusesHost(url: []const u8) bool {
+    const host = hostOf(url);
+    if (host.len == 0) return false;
+    for (0..g_proxy_refused_count) |i| {
+        if (std.ascii.eqlIgnoreCase(g_proxy_refused[i][0..g_proxy_refused_len[i]], host)) return true;
+    }
+    return false;
+}
+
+/// Writes down that the proxy refused this URL's host.
+///
+/// Full is full: sixteen refused hosts in one session is far past the point
+/// where the reader has noticed, and dropping the seventeenth costs one wasted
+/// round trip per picture on it rather than anything a reader could see.
+fn rememberProxyRefusal(url: []const u8) void {
+    rememberHostRefusal(hostOf(url));
+}
+
+/// The same, for a caller that already has the host rather than a URL.
+fn rememberHostRefusal(host: []const u8) void {
+    if (host.len == 0 or host.len > g_proxy_refused[0].len) return;
+    for (0..g_proxy_refused_count) |i| {
+        if (std.ascii.eqlIgnoreCase(g_proxy_refused[i][0..g_proxy_refused_len[i]], host)) return;
+    }
+    if (g_proxy_refused_count >= proxy_refused_hosts_cap) return;
+    const i = g_proxy_refused_count;
+    @memcpy(g_proxy_refused[i][0..host.len], host);
+    g_proxy_refused_len[i] = @intCast(host.len);
+    g_proxy_refused_count += 1;
+}
+
+/// Forgets every refusal. A different proxy gets to answer for itself rather
+/// than inheriting the last one's policy, which is the same rule the per-face
+/// flag already follows.
+pub fn forgetProxyRefusals() void {
+    g_proxy_refused_count = 0;
+}
+
+pub fn proxyRefusedCountForTest() usize {
+    return g_proxy_refused_count;
+}
+
+pub fn hostOfForTest(url: []const u8) []const u8 {
+    return hostOf(url);
+}
+
 /// Whether this answer is the proxy refusing the HOST, rather than telling us
 /// something about the picture.
 ///
@@ -12412,6 +12527,13 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !slot.direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            // Under the HOST, because this slot is not a place to keep it: the
+            // line below sets the slot idle, an idle slot is exactly what
+            // eviction takes, and the flag went with it. A picture scrolled off
+            // and back asked the proxy again, was refused again, and was
+            // evicted again, so it could loop without ever once reaching the
+            // host that would have served it.
+            rememberHostRefusal(slot.host());
             slot.direct = true;
             slot.state = .idle;
             return;
@@ -19254,6 +19376,11 @@ var g_banner_asked_for: ?[32]u8 = null;
 var g_banner_state: enum { idle, fetching, loaded, failed } = .idle;
 var g_banner_url_buf: [1024]u8 = undefined;
 var g_banner_url_len: u16 = 0;
+/// The host the banner actually lives on, kept for the same reason a picture
+/// slot keeps one: while the proxy is in the way, the fetch URL's host is the
+/// proxy's, and a refusal has to be written down under the real one.
+var g_banner_host_buf: [96]u8 = undefined;
+var g_banner_host_len: u8 = 0;
 /// Ask the banner's own host rather than the proxy, for the same reason a face
 /// does. Cleared whenever the banner is started for somebody else.
 var g_banner_direct: bool = false;
@@ -19300,7 +19427,11 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     const raw = personBanner(pubkey);
     if (raw.len == 0) return;
     var url_buf: [1024]u8 = undefined;
-    const url = if (g_banner_direct) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const url = if (g_banner_direct or proxyRefusesHost(raw)) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const bhost = hostOf(raw);
+    const bn = @min(bhost.len, g_banner_host_buf.len);
+    @memcpy(g_banner_host_buf[0..bn], bhost[0..bn]);
+    g_banner_host_len = @intCast(bn);
     const n = @min(url.len, g_banner_url_buf.len);
     @memcpy(g_banner_url_buf[0..n], url[0..n]);
     g_banner_url_len = @intCast(n);
@@ -19376,6 +19507,7 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         if (g_media_direct_fallback and g_media_proxy_on and !g_banner_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
+            rememberHostRefusal(g_banner_host_buf[0..g_banner_host_len]);
             g_banner_direct = true;
             g_banner_state = .idle;
             return;

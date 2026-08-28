@@ -12425,6 +12425,80 @@ test "a picture the proxy refuses by host is asked of the host itself" {
     try testing.expect(!main.mediaFallbackStateForTest(note_id).?.idle);
 }
 
+test "a refused host is remembered past the slot that discovered it" {
+    // The bug a reader saw as "pictures on that host still do not load, even
+    // though faces on it do".
+    //
+    // The refusal was remembered on the media SLOT. The fallback sets the slot
+    // idle so it will be asked again, and an idle slot is exactly what
+    // `claimMediaSlot` evicts, so the flag went out with it: scroll the picture
+    // off screen and back and it asked the proxy again, was refused again, and
+    // was evicted again. It could loop forever without ever once reaching the
+    // host that would have served it.
+    //
+    // A face never had this problem, because its flag lives on the profile,
+    // which is keyed by pubkey and outlives any amount of scrolling. That is
+    // the whole of why one came back and the other did not.
+    const saved_on = main.mediaProxyOn();
+    const saved_fb = main.mediaDirectFallback();
+    defer {
+        main.setMediaProxyOn(saved_on);
+        main.setMediaDirectFallback(saved_fb);
+        main.forgetProxyRefusals();
+    }
+    main.forgetProxyRefusals();
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+
+    const src = "https://blossom.ditto.pub/deadbeef.jpg";
+    var buf: [1024]u8 = undefined;
+
+    // Before anything is known, the picture goes through the proxy. A test
+    // process never loads the settings file, so the proxy is set here.
+    main.setMediaProxy("https://wsrv.nl/");
+    main.forgetProxyRefusals();
+    try testing.expect(!std.mem.eql(u8, main.feedImageUrlForTest(&buf, src), src));
+
+    var fx: main.EffectsForTest = undefined;
+    const note_id: i64 = 77_020;
+    _ = main.claimMediaSlotForTest(&fx, note_id) orelse return error.NoSlot;
+    main.setMediaSlotHostForTest(note_id, "blossom.ditto.pub");
+    main.deliverMediaResponseForTest(&fx, note_id, .ok, 400, "");
+    try testing.expect(main.mediaFallbackStateForTest(note_id).?.direct);
+
+    // The refusal now outlives the slot. This is the assertion the old code
+    // could not make: it is about the HOST, not about one picture.
+    try testing.expect(main.proxyRefusesHost(src));
+    try testing.expectEqualStrings(src, main.feedImageUrlForTest(&buf, src));
+
+    // Including a DIFFERENT picture on the same host, which never has to spend
+    // the round trip that discovers the refusal.
+    try testing.expectEqualStrings(
+        "https://blossom.ditto.pub/other.png",
+        main.feedImageUrlForTest(&buf, "https://blossom.ditto.pub/other.png"),
+    );
+
+    // And not a picture somewhere else.
+    const elsewhere = "https://i.nostr.build/abc.jpg";
+    try testing.expect(!main.proxyRefusesHost(elsewhere));
+
+    // A different proxy answers for itself rather than inheriting this one's
+    // policy.
+    main.setMediaProxy("https://images.example.test/");
+    try testing.expect(!main.proxyRefusesHost(src));
+}
+
+test "a host is read out of a URL the way the refusal is filed" {
+    try testing.expectEqualStrings("blossom.ditto.pub", main.hostOfForTest("https://blossom.ditto.pub/a.jpg"));
+    // A port is not part of what the proxy refused.
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://example.test:8443/a.jpg"));
+    // Userinfo is not the host, and taking it as one would file the refusal
+    // under a string an author chose.
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://user@example.test/a.jpg"));
+    try testing.expectEqualStrings("example.test", main.hostOfForTest("https://example.test"));
+    try testing.expectEqualStrings("", main.hostOfForTest("not a url"));
+}
+
 test "a picture missing at the proxy is missing at the host too" {
     const saved_on = main.mediaProxyOn();
     const saved_fb = main.mediaDirectFallback();
