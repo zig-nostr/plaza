@@ -16862,6 +16862,94 @@ test "a kind:10000 arriving names who this reader has muted" {
     try testing.expectEqual(@as(usize, 1), main.muteCount());
 }
 
+test "a mute the keyholder never signed is put back, stamp and all" {
+    // The worst of the family. A mute that is not published means the reader
+    // goes on seeing somebody they asked never to see again, while the app says
+    // "Muted"; and the press stamps the list forward, so `ingestMuteList` then
+    // drops their REAL kind:10000 for the rest of the session and the truth
+    // cannot get back on screen.
+    main.forgetMutesForTest();
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setSignerKindLocalForTest();
+        main.silenceTestSignerForTest(false);
+    }
+    main.setSignerKindHelperForTest();
+    main.silenceTestSignerForTest(true);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/muteundo.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const noisy = [_]u8{0x52} ** 32;
+    var noisy_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&noisy_hex, "{x}", .{noisy});
+    const tags = [_]nostr.event.Tag{&.{ "p", &noisy_hex }};
+    const ev = try muteListEvent(arena, &signer, [_]u8{0x51} ** 32, 1_800_000_000, &tags, "");
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.ingestMuteListForTest(ev);
+    try testing.expect(main.isMuted(noisy));
+
+    // Unmute them. The set moves at once, which is the part worth keeping.
+    const quiet = [_]u8{0x53} ** 32;
+    _ = quiet;
+    var fx: main.EffectsForTest = undefined;
+    _ = main.writeMuteForTest(&fx, noisy, false);
+    try testing.expect(!main.isMuted(noisy));
+
+    // And the keyholder refuses.
+    main.handleHelperSignedForTest(.{ .key = 0, .outcome = .ok, .status = 403, .body = "" });
+    var model = main.initialModel();
+    main.scanHelperSignForTest(&model);
+
+    // Back to muted, and told.
+    try testing.expect(main.isMuted(noisy));
+    try testing.expect(model.toast_text().len > 0);
+
+    // And the stamp went back with it, so their real list is not locked out.
+    // Re-ingesting the list they actually have must take.
+    main.forgetMutesForTest();
+    main.ingestMuteListForTest(ev);
+    try testing.expect(main.isMuted(noisy));
+}
+
+test "an un-like nobody signed keeps the reaction it was going to delete" {
+    // `unlike` drops the reaction id BEFORE signing, so a refusal used to empty
+    // the heart while the kind:7 stayed on every relay, and the next press took
+    // the `like` branch and published a SECOND reaction.
+    main.setIdentityForTest([_]u8{0x61} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+
+    const note_id: i64 = 4242;
+    const reaction_id = [_]u8{0x77} ** 32;
+    main.rememberLikeForTest(note_id, reaction_id);
+    try testing.expect(main.isLikedForTest(note_id));
+
+    main.armUnlikeUndoForTest(note_id, reaction_id);
+    var model = main.initialModel();
+    main.applyUndoForTest(&model);
+
+    // The id is back, so the next press deletes the reaction instead of adding
+    // a second one.
+    try testing.expect(main.isLikedForTest(note_id));
+    try testing.expect(model.toast_text().len > 0);
+}
+
 test "somebody else's mute list is not this reader's" {
     main.forgetMutesForTest();
     main.setIdentityForTest([_]u8{0x54} ** 32);
