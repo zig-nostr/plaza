@@ -15720,17 +15720,21 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
         }),
         ui.column(.{ .gap = 8 }, .{
             joinLabel(ui, "ALREADY ON NOSTR"),
-            // Bringing a key still works with no keyholder: the paste lands in
-            // this process instead (see `.open_notary_import`). It is a weaker
-            // promise than the one this line normally makes, so the line
-            // changes with it. Selling Notary's isolation and then taking the
-            // nsec into a Plaza text field would be the copy lying about where
-            // the key went.
+            // With no keyholder there is nowhere for a key to go, and this rung
+            // says so instead of offering a field.
+            //
+            // It used to fall back to pasting into Plaza, and the subtitle said
+            // so honestly. That fallback is gone: Plaza has no field that can
+            // hold a secret key, so the rung led to a screen that refuses every
+            // key it is given. A dead end with an encouraging label on it is
+            // worse than a disabled rung.
             if (keyholderMissing())
-                joinCard(ui, "download", false, "Bring your key", "Pasted here, and kept on this device.", .open_notary_import, false)
+                joinCard(ui, "download", false, "Bring your key", "Not possible in this copy of Plaza.", null, false)
             else
-                joinCard(ui, "download", false, "Bring your key", "Goes into Notary. Plaza itself never sees it.", .open_notary_import, false),
-            joinCard(ui, "notary", true, "Use your own signer", "Paste the bunker link it gives you.", .open_bunker, false),
+                joinCard(ui, "download", false, "Bring your key", "Opens Notary. Plaza itself never sees it.", .open_notary_import, false),
+            // The other answer to the same question, and the one that stays
+            // here: your key is somewhere else already, so nothing has to move.
+            joinCard(ui, "notary", true, "Use your own signer", "Already have one? Paste its bunker link.", .open_bunker, false),
         }),
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             ui.el(.list_item, .{
@@ -25571,7 +25575,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // out first. The pubkey latch below it is what still keeps the key
             // that just LEFT from walking back in.
             g_logged_out = false;
-            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else model.stage = .onboarding;
+            // No fallback to a Plaza field. There is no field in this app that
+            // can take a key, so dropping to one would be offering a screen
+            // that refuses whatever is typed into it.
+            if (ceremonyCanTakeKey()) spawnNotaryWindow(fx, .import_key) else setToast(model, "Notary is missing from this install.");
         },
         .keep_browsing => {
             model.stage = .ready;

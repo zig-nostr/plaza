@@ -2864,13 +2864,18 @@ test "bringing a key through the Notary window signs you in after a sign-out" {
     main.setIdentityForTest([_]u8{0xe3} ** 32);
     main.performLogoutForTest(&model, &fx);
     try testing.expect(main.loggedOutForTest());
-    // The real message, through the real handler. With no Notary window found,
-    // `ceremonyCanTakeKey` is false and the arm takes its fallback rung without
-    // touching `Effects`, which is why the latch clear sits above the branch.
+    // The real message, through the real handler. With no Notary window found
+    // the arm cannot open one and says so, without touching `Effects`, which is
+    // why the latch clear sits ABOVE the branch rather than inside it.
+    //
+    // The latch is the point of this test, not where the press lands. A
+    // sign-out earlier in the run turns adopt-on-appear off, and a "Bring your
+    // key" that leaves it off swallows the whole import: the key reaches the
+    // keyholder, the poll refuses it once a second, and the reader sits in
+    // guest mode until they quit and reopen.
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
     main.update(&model, .open_notary_import, &fx);
     try testing.expect(!main.loggedOutForTest());
-    try testing.expectEqual(main.Stage.onboarding, model.stage);
 }
 
 test "the reader's own face goes in the rail seat, not their initials" {
@@ -9387,14 +9392,20 @@ test "with no keyholder the create rung says why and stops being a button" {
     // it from drifting back INTO the card, where it paints outside the border.
     try testing.expect(findAnyTextContaining(tree.root, "is missing from this install"));
 
-    // The two rungs that still work are untouched, and bringing a key gives up
-    // its Notary promise, because with no daemon the paste lands in this
-    // process. Copy that sells isolation over a field that does not have it is
-    // the lie this app can least afford.
-    try testing.expect(pressableByLabel(tree, tree.root, "Bring your key"));
+    // Bringing a key goes the same way, and for the same reason: there is
+    // nowhere for a key to go. It used to fall back to a field in this process,
+    // and that fallback is gone with the field. A rung that leads to a screen
+    // refusing every key it is given is worse than one that says it cannot.
+    try testing.expect(findAnyText(tree.root, "Bring your key") != null);
+    try testing.expectEqual(@as(?Msg, null), pressMsgByLabel(tree, "Bring your key"));
+
+    // The rung that still works is the one that needs nothing from this
+    // machine: your key is already in a signer somewhere else.
     try testing.expect(pressableByLabel(tree, tree.root, "Use your own signer"));
-    try testing.expect(findAnyText(tree.root, "Goes into Notary. Plaza itself never sees it.") == null);
-    try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") != null);
+    try testing.expect(findAnyText(tree.root, "Opens Notary. Plaza itself never sees it.") == null);
+    // And nothing anywhere still offers to keep a key in this app, which is a
+    // promise it can no longer make about anything.
+    try testing.expect(findAnyText(tree.root, "Pasted here, and kept on this device.") == null);
 }
 
 test "with no keyholder nothing queues a mint that can never fire" {
@@ -9416,7 +9427,7 @@ test "with no keyholder nothing queues a mint that can never fire" {
     try testing.expect(!main.helperSetupQueuedForTest());
 }
 
-test "with no keyholder a pasted key goes to the field, not to a window that cannot take it" {
+test "with no keyholder there is nowhere for a key to go, and the app says so" {
     main.clearIdentityForTest();
     defer main.setNotaryWindowFoundForTest(false);
 
@@ -9432,8 +9443,10 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
     main.setKeyholderMissingForTest(false);
     try testing.expect(!main.ceremonyCanTakeKeyForTest());
 
-    // And the branch that reads it lands somewhere the reader can actually
-    // finish: window present, keyholder absent, so the paste goes to the field.
+    // And the branch that reads it says so, rather than opening a screen that
+    // refuses every key it is given. There is no field in this app that can
+    // hold one, so "somewhere the reader can finish" is nowhere: the honest
+    // move is to name what is missing.
     main.setNotaryWindowFoundForTest(true);
     main.setKeyholderMissingForTest(true);
     defer main.setKeyholderMissingForTest(false);
@@ -9442,7 +9455,8 @@ test "with no keyholder a pasted key goes to the field, not to a window that can
     model.joining = true;
     var fx: main.EffectsForTest = undefined;
     main.update(&model, .open_notary_import, &fx);
-    try testing.expect(model.stage == .onboarding);
+    try testing.expect(model.stage != .onboarding);
+    try testing.expect(std.mem.indexOf(u8, model.toast_buf[0..model.toast_len], "missing") != null);
 }
 
 /// Every line of text INSIDE one of the join ladder's rungs has to end inside it.
