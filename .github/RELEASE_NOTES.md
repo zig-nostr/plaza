@@ -1,11 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.13.3
+### What's new in v0.13.4
 
-**Fixed: bringing your key left the app in guest mode.** Plaza starts its own keyholder and asks it to sign. The key window it opened was told none of that, so it went looking for a keyholder of its own and, inside the packaged app, started a second one beside the first. You typed your passphrase, that window said it was unlocked, and Plaza was still sitting there with your key locked and no way to say so. Restarting did the same thing again.
+**Fixed: a locked keyholder now asks for its passphrase.** Opening Plaza with a key you had already brought showed "Notary is locked" and nothing to press, which reads as being signed out when in fact your key is right there. The key window now opens on it, and closes itself once you have unlocked it.
 
-The key window now opens on the keyholder Plaza is already using. One keyholder, shared, instead of two that cannot see each other.
+**Fixed: signing out works, and Plaza recovers from it.** A keyholder that ended stayed ended, so Plaza was left unable to sign anything until it was restarted. It starts a new one now, which comes up locked and asks for your passphrase.
 
-If Plaza's keyholder has not started yet, the press says so rather than opening a window that would start a second one. There is no fallback here on purpose: the fallback was the bug.
-
-**The suite that opens a real window now runs on every change.** Every unit test passed while v0.13.0 could not write to a relay, and while the app window was laid out taller than its own canvas. Neither is visible to a test that never opens a window. That suite now runs in CI: a cold start on a real profile, and the packaged bundle launched with its keyholder beside it.
+**Also fixed in the keyholder** (Notary v0.10.6): signing out and backing up your key had disappeared from its window whenever an app started it, leaving key deletion as the only control; the terminal command for importing a key named an app you may not have installed; a keyholder answering no relays offered a connection link that went nowhere; and removing a key could start a second keyholder on real relays.

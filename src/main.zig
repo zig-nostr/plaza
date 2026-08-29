@@ -4795,6 +4795,10 @@ fn spawnNotaryWindow(fx: *Effects, ceremony: Ceremony) bool {
 fn handleNotaryExited(model: *Model, e: native_sdk.EffectExit) void {
     const was_running = g_ceremony;
     g_ceremony = .none;
+    // The window is gone, so a keyholder that is locked AGAIN later may ask for
+    // its passphrase again. Without this the prompt is a once-per-launch offer,
+    // and a reader who signs out would never be asked a second time.
+    g_unlock_prompt_open = false;
 
     if (e.reason == .rejected) {
         // A window is already open. Say so, whatever was being opened: a
@@ -4874,6 +4878,46 @@ const ceremony_created_code: i32 = 9;
 ///
 /// The daemon is Plaza's CHILD and dies with it. That is not a limitation: a
 /// keyholder that outlives its app is a keyholder something else can find.
+/// Whether the keyholder is holding a key nobody has unlocked, and the reader
+/// has not been asked about it yet this episode.
+///
+/// Set from the health poll, spent on the tick where an `Effects` is in hand.
+/// Latched so the window opens ONCE: the poll runs every tick, and opening on
+/// each one would stack windows the reader never asked for.
+var g_want_unlock_prompt: bool = false;
+var g_unlock_prompt_open: bool = false;
+
+/// Opens the key window on a locked keyholder so the passphrase can be given.
+///
+/// Not while another ceremony is up: a reader who pressed "Bring your key" is
+/// already looking at the window this would open a second copy of.
+fn driveUnlockPrompt(fx: *Effects) void {
+    if (!g_want_unlock_prompt or g_unlock_prompt_open) return;
+    if (g_ceremony != .none) return;
+    if (helperState() != .locked) {
+        g_want_unlock_prompt = false;
+        return;
+    }
+    // A refusal means the keyholder has not reported its port yet. Leave the
+    // want set so the next poll tries again rather than losing the prompt.
+    if (!spawnNotaryWindow(fx, .status)) return;
+    g_unlock_prompt_open = true;
+    g_want_unlock_prompt = false;
+}
+
+/// How many times this app will start its keyholder again after it goes.
+///
+/// A keyholder that ends is not always a failure: signing out from the key
+/// window ends the process on purpose, because relay threads were handed the
+/// key by value and only ending them takes it back. Before this, that left this
+/// app with a dead keyholder and no way back until it was restarted, so the
+/// window's own sign-out button had to be disabled to avoid causing it.
+///
+/// Bounded, because a keyholder that cannot start at all would otherwise be
+/// started forever. Reset whenever one stays up long enough to answer.
+const helper_restart_limit: u8 = 3;
+var g_helper_restarts: u8 = 0;
+
 fn spawnHelper(fx: *Effects) void {
     if (g_helper_bin_len == 0 or g_helper_secret_len == 0) return;
     fx.spawn(.{
@@ -4939,6 +4983,11 @@ fn handleHelperPubkey(model: *Model, response: native_sdk.EffectResponse) void {
     g_helper_state.store(@intFromEnum(state), .release);
 
     if (state == .locked) {
+        // A locked keyholder is proof there IS a key on this Mac: it was set up
+        // once and needs its passphrase again. Saying "Notary is locked" and
+        // stopping there left the reader with a key they could not reach and
+        // nothing to press, which reads as being signed out with extra steps.
+        g_want_unlock_prompt = true;
         // It HOLDS a key. Saying nothing here is what made a locked keyholder
         // look like an empty one: the latch below is cleared only by evidence
         // that the key is really gone, and this is not that evidence.
@@ -25472,16 +25521,40 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const port = std.fmt.parseInt(u16, rest, 10) catch return;
             if (port == 0) return;
             g_helper_port = port;
+            // It came up and said where it is, so the budget for starting it
+            // again is whole. Without this, three sign-outs across one long
+            // session would spend it and the fourth would be refused.
+            g_helper_restarts = 0;
         },
 
         .helper_exited => |e| {
             if (e.reason != .exited) std.debug.print("plaza: [helper] exited\n", .{});
+            // Start it again. Signing out from the key window ends the process
+            // deliberately, and a crash ends it accidentally; either way this
+            // app used to be left holding a port number for something that was
+            // gone, unable to sign anything until it was restarted.
+            //
+            // The port and the identity go with it. The new one comes up
+            // locked, which is the truthful state and the one the reader is
+            // then asked to leave.
+            g_helper_port = 0;
+            g_helper_state.store(@intFromEnum(HelperState.starting), .release);
+            if (g_helper_restarts < helper_restart_limit) {
+                g_helper_restarts += 1;
+                spawnHelper(fx);
+            } else {
+                g_helper_state.store(@intFromEnum(HelperState.unreachable_), .release);
+                setToast(model, "Your keyholder keeps stopping. Reopen the app.");
+            }
         },
         .notary_exited => |e| handleNotaryExited(model, e),
         .helper_pubkey => |response| {
             handleHelperPubkey(model, response);
             // A queued setup fires the moment the daemon is reachable.
             driveHelperSetup(fx);
+            // And a locked keyholder asks for its passphrase rather than just
+            // reporting that it is locked.
+            driveUnlockPrompt(fx);
         },
         .helper_setup => |response| handleHelperSetup(model, response),
         .helper_signed => |response| handleHelperSigned(response),

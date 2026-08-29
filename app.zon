@@ -3,7 +3,7 @@
     .name = "plaza",
     .display_name = "Plaza",
     .description = "A fast, local-first Nostr client, built natively in Zig.",
-    .version = "0.13.3",
+    .version = "0.13.4",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "clipboard" },
