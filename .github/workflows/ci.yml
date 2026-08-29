@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `main`, and the branches the Notary-bump job pushes. A pull request opened
+    # with the default token does not start a workflow, so its checks would
+    # never run and branch protection would never be satisfiable. Checks attach
+    # to a COMMIT, so running them on the push covers the pull request that
+    # carries the same commit.
+    branches: [main, "notary-bump/**"]
   pull_request:
     branches: [main]
 

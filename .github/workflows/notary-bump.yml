@@ -1,0 +1,96 @@
+name: Notary bump
+
+# Watches for a new Notary release and opens the PR that would carry it.
+#
+# Plaza pins a Notary TAG and builds it from source, which is what makes a given
+# Plaza version mean one thing: the same version always contains the same
+# keyholder. Tracking a branch instead would mean rebuilding a release tomorrow
+# gives a different app, and the one time a pin resolved to something other than
+# what it named, a release shipped with the wrong keyholder and the version
+# number could not tell anybody.
+#
+# So the pin stays and the CHORE goes. Bumping it was a manual step after every
+# Notary release, which meant it depended on somebody remembering, and a
+# keyholder fix that nobody remembered to carry reaches no reader at all.
+#
+# This opens a PR. It does not merge one: what changed and whether it should go
+# out is a judgement, and this only removes the part that was never a judgement.
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, off the hour so it is not queued with everything else
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the branch
+  pull-requests: write # open the PR
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open a bump PR if Notary is ahead
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          current="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' .github/workflows/release.yml | head -1)"
+          [ -n "$current" ] || { echo "could not read NOTARY_REF" >&2; exit 1; }
+
+          # The latest RELEASE, not the latest tag: a tag with no release behind
+          # it is one whose build failed or has not finished, and shipping
+          # against that is how this went wrong the first time.
+          latest="$(gh release view --repo zig-nostr/notary --json tagName -q .tagName)"
+          [ -n "$latest" ] || { echo "no notary release found" >&2; exit 1; }
+
+          echo "plaza pins $current; notary's latest release is $latest"
+          if [ "$current" = "$latest" ]; then
+            echo "already current; nothing to do"
+            exit 0
+          fi
+
+          branch="notary-bump/$latest"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "$branch already exists; a PR is already open for this one"
+            exit 0
+          fi
+
+          # Plaza's own next patch version. The artifact changes when the
+          # keyholder inside it changes, so it needs a version of its own:
+          # publishing different bytes under one version is precisely the
+          # failure this whole workflow exists to stop repeating.
+          version="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' app.zon | head -1)"
+          major="${version%%.*}"; rest="${version#*.}"; minor="${rest%%.*}"; patch="${rest#*.}"
+          case "$major$minor$patch" in *[!0-9]*) echo "unexpected version $version" >&2; exit 1;; esac
+          next="$major.$minor.$((patch + 1))"
+          echo "plaza $version -> $next"
+
+          git config user.name "sepehr-safari"
+          git config user.email "safari.sepehr@gmail.com"
+          git switch -c "$branch"
+
+          sed -i "s|^  NOTARY_REF: .*$|  NOTARY_REF: $latest|" .github/workflows/release.yml
+          sed -i "0,/\.version = \"$version\"/s||.version = \"$next\"|" app.zon
+
+          notes="$(gh release view "$latest" --repo zig-nostr/notary --json body -q .body)"
+          {
+            head -1 .github/RELEASE_NOTES.md
+            printf '\n### What'"'"'s new in v%s\n\n' "$next"
+            printf 'The keyholder Plaza ships is now Notary %s.\n\n' "$latest"
+            printf '%s\n' "$notes"
+          } > /tmp/notes.md
+          mv /tmp/notes.md .github/RELEASE_NOTES.md
+
+          git add -A
+          git commit -q -m "Carry Notary $latest" -m "Plaza builds its keyholder from a pinned tag, so a Notary release only reaches anybody through a Plaza release. Opened by CI so that no longer depends on somebody remembering."
+          git push -u origin "$branch"
+
+          {
+            printf 'Notary released **%s**. Plaza pins the keyholder by tag and builds it from source, so it only reaches a reader through a Plaza release.\n\n' "$latest"
+            printf '`NOTARY_REF` moves to `%s` and Plaza goes to **%s**, because the artifact changes when the keyholder inside it changes and different bytes must not share a version.\n\n' "$latest" "$next"
+            printf 'The notes below are Notary'"'"'s own, copied across. Edit them before merging: this is opened by CI, but what goes out is still a judgement.\n\n---\n\n'
+            printf '%s\n' "$notes"
+          } > /tmp/pr-body.md
+
+          gh pr create --title "Carry Notary $latest" --body-file /tmp/pr-body.md
