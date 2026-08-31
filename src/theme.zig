@@ -33,7 +33,16 @@
 //! gives it one working job: `accent_identity` marks IDENTITY and CONTENT, which
 //! is to say @handles, @mentions and in-text links. Chrome stays porcelain, so a
 //! violet run in the interface always means "a person, or something they wrote".
+//!
+//! ONE EXCEPTION, and it is a narrow one: inside a PLACE, both accents become
+//! the community's own colour (see `PlaceColor` and `place_color_fn`). The rule
+//! above is not suspended, it is applied. A place is an identity, and the room
+//! you are standing in is exactly the sort of thing colour is reserved for here.
+//! What does NOT move is anything meaning a STATE: the status colours, the
+//! unread dot, the disabled ramp. A yellow room must never make an error look
+//! like weather. Out of a place the palette is porcelain and violet again.
 
+const std = @import("std");
 const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const Color = canvas.Color;
@@ -232,6 +241,111 @@ pub const palette = struct {
     };
 };
 
+/// Hallway's `defaultPrimaryColor`, transcribed EXACTLY.
+///
+/// THE NAMES AND THE VALUES ARE HALLWAY'S, for the same reason the place
+/// document's field names are: fiatjaf's deployer offers eighteen NAMED colours
+/// rather than a free hex, and a place that picks VIOLET has to mean the same
+/// violet in both clients or the document stops meaning one thing.
+///
+/// Each name resolves in Hallway to an HSL triple per colour scheme. These are
+/// the DARK rows converted to sRGB, because Plaza is dark-only: the primary,
+/// its hover step, and the ink Hallway knocks out of it
+/// (`primary-foreground`).
+///
+/// THE FILLS ARE HALLWAY'S EXACTLY. The INK is not, and that is the one place
+/// this table knowingly departs from the source.
+///
+/// Hallway's dark `primary-foreground` is the same near-black for every row but
+/// DEFAULT, and on six fills it loses to the near-white DEFAULT already uses.
+/// Two of those are not a shade to argue about but a button whose label is
+/// invisible (VIOLET at 2.08:1, INDIGO at 2.39:1), and two more are plainly
+/// under (BLUE 3.16:1, PURPLE 3.22:1). CYAN (3.92:1) and RED (4.01:1) are
+/// marginal rather than broken, and flip for consistency: the rule is "whichever
+/// ink reads better on this fill", applied to all eighteen, not a list of
+/// exceptions somebody has to maintain. Worst case afterwards is 4.16:1.
+///
+/// The colour a community CHOSE is untouched. The fill is still exactly the
+/// hex their Hallway deploy paints, so a place still looks like itself in both
+/// clients. Only what is written ON it changes, and only where the alternative
+/// is unreadable. Copying a legibility bug is not compatibility.
+///
+/// One thing transcribed rather than corrected: DEFAULT is a magenta, not a
+/// neutral. A place that STATES it is asking for that magenta, so it is treated
+/// like any other name; only an ABSENT key leaves Plaza's porcelain accent
+/// alone.
+pub const PlaceColor = struct {
+    name: []const u8,
+    primary: Color,
+    hover: Color,
+    on_primary: Color,
+    /// The same colour as READABLE TEXT on this app's near-black window, which
+    /// is Plaza's own derivation and not a column Hallway has.
+    ///
+    /// Hallway's `primary` is a FILL: it is painted as a background with
+    /// `primary-foreground` knocked out of it, and the web app never sets it as
+    /// body text on a dark page. Used that way here it fails: INDIGO (#193ce6)
+    /// on #0a0a0b is about 2.5:1, which is not text, it is a rumour of text.
+    ///
+    /// So the hue and saturation are Hallway's and only the LIGHTNESS is ours,
+    /// raised to a floor of 66%. That floor is not a taste: it is the lowest one
+    /// at which all eighteen clear 4.5:1 against the window (VIOLET is the
+    /// worst at 4.57:1, and 62% would drop it to 3.77:1). The community's hue
+    /// still reads as itself; only its brightness is negotiated with the
+    /// background it has to survive.
+    on_dark: Color,
+};
+
+pub const place_colors = [_]PlaceColor{
+    .{ .name = "DEFAULT", .primary = hex("#e32b6f"), .hover = hex("#e9538a"), .on_primary = hex("#fafafa"), .on_dark = hex("#eb6696") },
+    .{ .name = "RED", .primary = hex("#d74242"), .hover = hex("#e06c6c"), .on_primary = hex("#fafafa"), .on_dark = hex("#e17070") },
+    .{ .name = "ORANGE", .primary = hex("#ff8000"), .hover = hex("#ff9933"), .on_primary = hex("#18181b"), .on_dark = hex("#ffa852") },
+    .{ .name = "AMBER", .primary = hex("#ffb200"), .hover = hex("#ffc233"), .on_primary = hex("#18181b"), .on_dark = hex("#ffcb52") },
+    .{ .name = "YELLOW", .primary = hex("#ffe500"), .hover = hex("#ffeb33"), .on_primary = hex("#18181b"), .on_dark = hex("#ffee52") },
+    .{ .name = "LIME", .primary = hex("#80cc33"), .hover = hex("#99d65c"), .on_primary = hex("#18181b"), .on_dark = hex("#a8dc74") },
+    .{ .name = "GREEN", .primary = hex("#29a352"), .hover = hex("#33cc66"), .on_primary = hex("#18181b"), .on_dark = hex("#74dc97") },
+    .{ .name = "EMERALD", .primary = hex("#1fad7e"), .hover = hex("#26d99d"), .on_primary = hex("#18181b"), .on_dark = hex("#6ce5bd") },
+    .{ .name = "TEAL", .primary = hex("#1fadad"), .hover = hex("#26d9d9"), .on_primary = hex("#18181b"), .on_dark = hex("#6ce5e5") },
+    .{ .name = "CYAN", .primary = hex("#1f7ead"), .hover = hex("#269dd9"), .on_primary = hex("#fafafa"), .on_dark = hex("#6cbde5") },
+    .{ .name = "SKY", .primary = hex("#267fd9"), .hover = hex("#5299e0"), .on_primary = hex("#18181b"), .on_dark = hex("#6ca8e5") },
+    .{ .name = "BLUE", .primary = hex("#195de6"), .hover = hex("#477eeb"), .on_primary = hex("#fafafa"), .on_dark = hex("#6391ee") },
+    .{ .name = "INDIGO", .primary = hex("#193ce6"), .hover = hex("#4763eb"), .on_primary = hex("#fafafa"), .on_dark = hex("#637aee") },
+    .{ .name = "VIOLET", .primary = hex("#3b19e6"), .hover = hex("#6347eb"), .on_primary = hex("#fafafa"), .on_dark = hex("#7a63ee") },
+    .{ .name = "PURPLE", .primary = hex("#a219e6"), .hover = hex("#b447eb"), .on_primary = hex("#fafafa"), .on_dark = hex("#bf63ee") },
+    .{ .name = "FUCHSIA", .primary = hex("#e619c3"), .hover = hex("#eb47cf"), .on_primary = hex("#18181b"), .on_dark = hex("#ee63d7") },
+    .{ .name = "PINK", .primary = hex("#eb4799"), .hover = hex("#f075b3"), .on_primary = hex("#18181b"), .on_dark = hex("#ee63a8") },
+    .{ .name = "ROSE", .primary = hex("#eb4763"), .hover = hex("#f0758a"), .on_primary = hex("#18181b"), .on_dark = hex("#ee637a") },
+};
+
+/// The colour a `defaultPrimaryColor` names, or null when it names none.
+///
+/// Case-insensitive: the deployer writes upper case, but a place document is a
+/// stranger's JSON and a hand-written one may not. An unknown name is null
+/// rather than a guess, which is what keeps a typo from silently repainting the
+/// app in whatever colour sorted first.
+pub fn placeColor(name: []const u8) ?PlaceColor {
+    for (place_colors) |c| {
+        if (std.ascii.eqlIgnoreCase(name, c.name)) return c;
+    }
+    return null;
+}
+
+/// What the open place's colour is, asked of the app rather than remembered
+/// here.
+///
+/// A function pointer and not a `pub var` colour, because a cached copy is a
+/// copy that can go stale: `g_place` moves on a link, on a rail press, on
+/// leaving, on resuming a visit and on boot, and a theme that has to be TOLD
+/// about each one is a theme that eventually paints the last room's colour over
+/// this one. main.zig installs this once at boot and the answer is read fresh
+/// every rebuild.
+pub var place_color_fn: ?*const fn () ?PlaceColor = null;
+
+fn activePlaceColor() ?PlaceColor {
+    const f = place_color_fn orelse return null;
+    return f();
+}
+
 /// The theme, consulted every rebuild through `Options.tokens_fn`. It starts
 /// from the SDK dark house register (so control tables, motion, and pixel
 /// snapping come for free) and overrides the palette, the accent, and the type
@@ -315,6 +429,48 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             // A touch larger than the house 14 for a more readable feed body,
             // matching the redesign.
             t.typography.body_size = 14.5;
+
+            // The place's own colour, while the reader is standing in one.
+            //
+            // This is the ONE deliberate exception to the rule at the top of
+            // this file that the chrome carries no coloured primary. The rule's
+            // REASON is that a colour in this interface must mean something
+            // rather than decorate: violet means a person, amber means a zap.
+            // A place is an identity too, somebody's room with their name on
+            // it, so the accent saying which room you are standing in is the
+            // same job `accent_identity` does for a person, not a brand splash.
+            // Out of a place it is porcelain again, and a place that states no
+            // colour never reaches here at all.
+            //
+            // No invalidation of its own: `tokens_fn` is consulted every
+            // rebuild, so the first frame after the place moves is already the
+            // frame that reads the new colour.
+            if (activePlaceColor()) |c| {
+                t.colors.accent = c.primary;
+                t.colors.accent_text = c.on_primary;
+                // The IDENTITY channel, and this is the one that actually makes
+                // a room feel like somebody's. The accent reaches a couple of
+                // buttons; `info` is what every @handle, @mention and in-text
+                // URL in the feed is inked with, so it is the difference
+                // between one coloured control and a room that reads as the
+                // community's. The violet is Plaza's, and inside a place it has
+                // no business overruling the people who live there.
+                //
+                // `on_dark`, not `primary`: this is TEXT on the near-black
+                // window, and Hallway's value is a fill.
+                t.colors.info = c.on_dark;
+                // And the CONTROL table, which is not redundant with the two
+                // lines above: a filled primary resolves its fill from
+                // `controls.button_primary` FIRST and only falls through to
+                // `colors.accent` when that table's channel is null. The house
+                // dark pack fills it, so setting the colour alone would repaint
+                // everything except the one control the reader actually presses.
+                t.controls.button_primary.background = c.primary;
+                t.controls.button_primary.hover_background = c.hover;
+                t.controls.button_primary.active_background = c.hover;
+                t.controls.button_primary.pressed_background = c.hover;
+                t.controls.button_primary.foreground = c.on_primary;
+            }
 
             return t;
         }
