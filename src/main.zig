@@ -10163,6 +10163,25 @@ pub const Model = struct {
         return "Public proxies refuse whole domains by policy, and those pictures simply never appear. " ++
             "On, Plaza asks that one host itself, which lets that host see you. Off, the picture stays blank and nobody new learns anything.";
     }
+    /// What the pause is set to, on its own button.
+    pub fn post_delay_label(self: *const Model) []const u8 {
+        _ = self;
+        return switch (g_post_delay_s) {
+            0 => "Off",
+            5 => "5s",
+            10 => "10s",
+            else => "5s",
+        };
+    }
+
+    pub fn post_delay_explainer(self: *const Model) []const u8 {
+        _ = self;
+        return if (g_post_delay_s == 0)
+            "A note is signed and sent the moment you press Post."
+        else
+            "Post waits, and becomes Undo. Nothing is signed until it runs out, so taking it back leaves nothing behind. Once a note is out, it cannot be recalled.";
+    }
+
     pub fn previews_state(self: *const Model) []const u8 {
         _ = self;
         return if (g_media_previews) "On" else "Off. Press a picture to load that one.";
@@ -14168,6 +14187,7 @@ pub const Msg = union(enum) {
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
     proxy_toggle,
+    post_delay_cycle,
     direct_fallback_toggle,
     /// Index into `hideables`.
     hide_toggle: u8,
@@ -14227,7 +14247,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -14626,6 +14646,19 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
             &.{.{ .text = model.client_tag_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
+        ui.row(.{ .cross = .center, .gap = 8 }, .{
+            ui.paragraph(
+                .{ .grow = 1, .wrap = true },
+                &.{.{ .text = "Hold notes and replies before sending", .scale = 1.0 }},
+            ),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .post_delay_cycle }, model.post_delay_label()),
+        }),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.post_delay_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
         ui.el(.checkbox, .{
@@ -16112,7 +16145,16 @@ fn composeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             &.{.{ .text = "New note", .weight = .medium, .scale = settings_title_scale }},
         ),
         ui.spacer(1),
-        ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+        if (g_post_due_s != 0)
+            // Both shapes the request asked for, in one control: it counts, and
+            // pressing it takes the note back. Never disabled while it counts,
+            // because the whole value of the pause is being able to press it.
+            ui.button(
+                .{ .size = .sm, .variant = .secondary, .on_press = .post },
+                std.fmt.allocPrint(ui.arena, "Undo · {d}", .{postSecondsLeft(g_post_due_s, nowSeconds())}) catch "Undo",
+            )
+        else
+            ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
         hgap(ui, 10),
     });
 }
@@ -19942,7 +19984,10 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
             ui.row(.{
                 .cross = .center,
                 .gap = 0,
-                .on_press = if (ready) Msg.reply_submit else null,
+                // Pressable while it counts even though the field is now empty of
+                // intent: taking it back is the whole point, so `ready` must not
+                // gate the press once something is held.
+                .on_press = if (ready or g_reply_due_s != 0) Msg.reply_submit else null,
                 .style = .{ .quiet_hover = true },
                 // A button that is currently unavailable, said in the words the
                 // platform has for it. `disabled` empties the widget's advertised
@@ -19951,15 +19996,22 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
                 // reader, "Reply, dimmed", rather than a button that is silent
                 // about why pressing it does nothing.
                 .disabled = !ready,
-                .semantics = .{ .role = .button, .label = "Reply", .focusable = ready },
+                .semantics = .{ .role = .button, .label = if (g_reply_due_s != 0) "Undo" else "Reply", .focusable = ready or g_reply_due_s != 0 },
             }, .{
-                ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = if (ready) roomVerbFill() else p.surface_rail_tile, .radius = 8, .stroke_width = 0 } }, .{
+                ui.el(.panel, .{ .padding = 0.01, .style = .{ .background = if (ready or g_reply_due_s != 0) roomVerbFill() else p.surface_rail_tile, .radius = 8, .stroke_width = 0 } }, .{
                     ui.row(.{ .cross = .center, .gap = 0 }, .{
                         hgap(ui, 14),
                         vgap(ui, 30),
                         ui.paragraph(
-                            .{ .style = .{ .foreground = if (ready) roomVerbInk() else p.text_muted } },
-                            &.{.{ .text = "Reply", .weight = .medium, .scale = stat_scale }},
+                            .{ .style = .{ .foreground = if (ready or g_reply_due_s != 0) roomVerbInk() else p.text_muted } },
+                            &.{.{
+                                .text = if (g_reply_due_s != 0)
+                                    std.fmt.allocPrint(ui.arena, "Undo · {d}", .{postSecondsLeft(g_reply_due_s, nowSeconds())}) catch "Undo"
+                                else
+                                    "Reply",
+                                .weight = .medium,
+                                .scale = stat_scale,
+                            }},
                         ),
                         hgap(ui, 14),
                     }),
@@ -25929,6 +25981,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Complete a like a guest reached for, now that they have signed
                 // in and the feed above has rebuilt.
                 drivePendingIntent(model, fx);
+                // A held note whose clock has run out. This is the only place a
+                // note is signed without a press, and the press it stands in for
+                // already happened: the reader asked, and then did not take it
+                // back.
+                if (postIsDue(g_post_due_s, nowSeconds())) _ = firePost(model, fx);
+                if (postIsDue(g_reply_due_s, nowSeconds())) fireReply(model, fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -26060,25 +26118,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // signer. It used to run regardless: the composer emptied, the draft
             // file was deleted and the toast said "Posted" for a sign that had
             // been refused before it left the process.
-            if (!submitPost(model, fx)) {
-                setToast(model, if (!outboxHasRoom())
-                    "Still trying to send your last notes. This one is kept here."
-                else
-                    "Notary is busy for a moment. Try again.");
+            // Held, not sent. Nothing is signed until the clock runs out, and
+            // pressing again takes it back while that is still true.
+            if (g_post_due_s != 0) {
+                g_post_due_s = 0;
+                setToast(model, "Kept here.");
                 return;
             }
-            // The slot is emptied the moment its contents go to a signer.
-            // Leaving it would restore an already-published note into the next
-            // launch's composer, one keystroke from being posted twice.
-            saveDraft("");
-            // Posting closes the sheet; the note is already local and will
-            // appear on the next tick.
-            model.composing = false;
-            setToast(model, if (g_signer_kind == .remote) "Sent to your signer" else "Posted");
-            // The first post is the calm moment to suggest a backup, and the
-            // backup lives in Notary now: this app has nothing to back up.
-            if (g_identity_minted_here and !model.backup_nudge_dismissed)
-                model.backup_nudge = true;
+            if (g_post_delay_s > 0) {
+                g_post_due_s = nowSeconds() + g_post_delay_s;
+                return;
+            }
+            _ = firePost(model, fx);
         },
         .open_compose => {
             // The keyboard reaches past the sheet: this is a declared shortcut,
@@ -26219,6 +26270,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .insert_mention => |pubkey| insertMention(model, pubkey),
         .close_compose => {
+            // A held note goes with the sheet. Leaving it armed would publish,
+            // seconds later, the note whose composer the reader had just
+            // dismissed, and the draft below would be the text of something
+            // already on its way out.
+            g_post_due_s = 0;
             model.composing = false;
             model.draft_dropped = 0;
             // Closing the sheet stashes what is in it. The words survived a
@@ -26545,6 +26601,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             setClientTag(!clientTag());
             saveSettings();
         },
+        .post_delay_cycle => {
+            // Off, five, ten, and round. A cycle rather than a field: there are
+            // only a few useful answers and none of them is worth a keyboard.
+            g_post_delay_s = switch (g_post_delay_s) {
+                0 => 5,
+                5 => 10,
+                else => 0,
+            };
+            // Turning it off must not strand a note that is already waiting on
+            // a clock nothing will read again.
+            if (g_post_delay_s == 0) g_post_due_s = 0;
+            saveSettings();
+        },
         .proxy_toggle => {
             setMediaProxyOn(!mediaProxyOn());
             saveSettings();
@@ -26619,6 +26688,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             openEvent(model, id);
         },
         .close_thread => {
+            // A held reply belongs to the thread being left. Leaving it armed
+            // would publish it into a conversation the reader had walked away
+            // from, seconds later.
+            g_reply_due_s = 0;
             closeThread(model);
         },
         .go_home => goHome(model),
@@ -26633,7 +26706,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.joining = true;
                 return;
             }
-            publishReply(model, fx);
+            // The same pause a note gets, for the same reason: a reply is exactly
+            // as final, and the setting says notes without meaning only notes.
+            if (g_reply_due_s != 0) {
+                g_reply_due_s = 0;
+                setToast(model, "Kept here.");
+                return;
+            }
+            if (g_post_delay_s > 0) {
+                g_reply_due_s = nowSeconds() + g_post_delay_s;
+                return;
+            }
+            fireReply(model, fx);
         },
         .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
@@ -27509,6 +27593,112 @@ pub fn initialModel() Model {
 /// Posts the current draft: sign a kind:1 note, store it locally at once, and
 /// publish it to the pool in the background. A blank draft or a not-yet-ready
 /// identity is a no-op.
+/// Signs and publishes what is in the composer, and everything that follows a
+/// note actually leaving.
+///
+/// Its own function because there are two ways in now: the press, when the
+/// pause is off, and the clock, when it is on. Leaving this inline under the
+/// press meant a held note that finally went would clear no draft, close no
+/// sheet and say nothing.
+fn firePost(model: *Model, fx: *Effects) bool {
+    g_post_due_s = 0;
+    // Nothing below runs unless the note actually went to a signer. It used to
+    // run regardless: the composer emptied, the draft file was deleted and the
+    // toast said "Posted" for a sign that had been refused before it left the
+    // process.
+    if (!submitPost(model, fx)) {
+        setToast(model, if (!outboxHasRoom())
+            "Still trying to send your last notes. This one is kept here."
+        else
+            "Notary is busy for a moment. Try again.");
+        return false;
+    }
+    // The slot is emptied the moment its contents go to a signer. Leaving it
+    // would restore an already-published note into the next launch's composer,
+    // one keystroke from being posted twice.
+    saveDraft("");
+    // Posting closes the sheet; the note is already local and will appear on the
+    // next tick.
+    model.composing = false;
+    setToast(model, if (g_signer_kind == .remote) "Sent to your signer" else "Posted");
+    // The first post is the calm moment to suggest a backup, and the backup
+    // lives in Notary now: this app has nothing to back up.
+    if (g_identity_minted_here and !model.backup_nudge_dismissed)
+        model.backup_nudge = true;
+    return true;
+}
+
+/// How long a note waits in the composer before it is signed, in seconds.
+///
+/// Zero is off and is not the default. The point of the pause is the one thing
+/// nostr cannot give back: once a note is signed and out, a kind:5 is a REQUEST.
+/// A relay may ignore it and everyone already holding the event keeps it. So an
+/// "undo" that runs after publishing would be a button that cannot do what it
+/// says, and this waits on the near side of the signature instead, where taking
+/// it back means nothing ever existed.
+///
+/// The composer stays open and editable while it counts. That is the point
+/// rather than a side effect: what this is for is catching the typo you see the
+/// instant after you press the button.
+///
+/// Off by default. Turning it on for everybody would make a note that suddenly
+/// does not post read as a fault before it reads as a safeguard, and nobody
+/// asked for their existing habit to change. The cost is honest: a pause nobody
+/// finds helps nobody, so it sits in Settings where it can be found.
+var g_post_delay_s: i64 = 0;
+
+/// When the held note is due, or 0 when nothing is held.
+var g_post_due_s: i64 = 0;
+
+/// And the same for a reply, on its own clock.
+///
+/// Separate rather than shared because the two surfaces are independent: the
+/// composer is a sheet, a reply belongs to a thread, and one held while the
+/// other is armed must not cancel or fire it. `postIsDue` and `postSecondsLeft`
+/// take the clock as an argument precisely so both can use them.
+var g_reply_due_s: i64 = 0;
+
+pub fn replyHeldForTest() bool {
+    return g_reply_due_s != 0;
+}
+
+pub fn holdReplyForTest(now_s: i64) void {
+    g_reply_due_s = now_s + (if (g_post_delay_s == 0) @as(i64, 5) else g_post_delay_s);
+}
+
+pub fn postDelayForTest() i64 {
+    return g_post_delay_s;
+}
+
+pub fn setPostDelayForTest(seconds: i64) void {
+    g_post_delay_s = seconds;
+}
+
+pub fn postHeldForTest() bool {
+    return g_post_due_s != 0;
+}
+
+pub fn holdPostForTest(now_s: i64) void {
+    g_post_due_s = now_s + g_post_delay_s;
+}
+
+/// Whether a held note is due to be signed now.
+///
+/// A function of its inputs, so a test can say what it must decide without
+/// waiting five seconds for it.
+pub fn postIsDue(due_s: i64, now_s: i64) bool {
+    if (due_s == 0) return false;
+    return now_s >= due_s;
+}
+
+/// Seconds still on the clock, for the button. Never negative, and never zero
+/// while something is held: a button reading "Undo 0" has already gone.
+pub fn postSecondsLeft(due_s: i64, now_s: i64) i64 {
+    if (due_s == 0) return 0;
+    const left = due_s - now_s;
+    return if (left < 1) 1 else left;
+}
+
 fn submitPost(model: *Model, fx: *Effects) bool {
     const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
     if (text.len == 0) return false;
@@ -27686,6 +27876,12 @@ fn clipToChars(s: []const u8, max_chars: usize, max_bytes: usize) []const u8 {
 /// note: a kind:1 e-tagging the root (marked "root") and p-tagging its author,
 /// signed and stored local-first so it joins the thread at once. A guest cannot
 /// sign, so a reply attempt routes to the join sheet.
+/// Sends the held reply, or sends one straight away when the pause is off.
+fn fireReply(model: *Model, fx: *Effects) void {
+    g_reply_due_s = 0;
+    publishReply(model, fx);
+}
+
 fn publishReply(model: *Model, fx: *Effects) void {
     if (model.viewing_thread == 0) return;
     if (model.is_guest()) {
@@ -31027,6 +31223,15 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "post_delay")) {
+            // Anything unreadable keeps the default rather than turning the
+            // pause off: a corrupt line should not quietly remove a safeguard.
+            const n = std.fmt.parseInt(i64, line[eq + 1 ..], 10) catch continue;
+            g_post_delay_s = switch (n) {
+                0, 5, 10 => n,
+                else => g_post_delay_s,
+            };
+        }
         // An empty value is meaningful here too: it is your own Plaza.
         if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
     }
@@ -31232,7 +31437,7 @@ fn saveSettings() void {
     var place_buf: [160]u8 = undefined;
     const place = activePlaceLine(&place_buf);
     var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
@@ -31241,6 +31446,7 @@ fn saveSettings() void {
         if (g_media_direct_fallback) "on" else "off",
         if (g_rail_open) "on" else "off",
         place,
+        g_post_delay_s,
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
@@ -31373,6 +31579,11 @@ fn performLogout(model: *Model, fx: *Effects) void {
     forgetMutes();
     resetInbox();
     forgetPlaces();
+    // And a note this account was about to sign. It is held on the near side of
+    // the signature precisely so it can still be taken back, and a session
+    // ending is the clearest possible instance of taking it back.
+    g_post_due_s = 0;
+    g_reply_due_s = 0;
     model.notifications_open = false;
     model.editing_profile = false;
     model.profile_seeded = false;

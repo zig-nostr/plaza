@@ -6222,6 +6222,57 @@ test "unfollowing removes exactly one name" {
     try testing.expect(!saw_bob);
 }
 
+test "a note waits before it is signed, and pressing again takes it back" {
+    // plaza#330. The pause is on the NEAR side of the signature on purpose:
+    // once a note is signed and out, a kind:5 is a request a relay may ignore
+    // and everyone already holding the event keeps it. An undo that ran after
+    // publishing would be a button that cannot do what it says.
+    // Off unless asked for. Turning it on for everybody would make a note that
+    // suddenly does not post read as a fault before it reads as a safeguard.
+    try testing.expectEqual(@as(i64, 0), main.postDelayForTest());
+
+    // Nothing held, nothing due.
+    try testing.expect(!main.postIsDue(0, 1_800_000_000));
+
+    // Held, and not due until the clock runs out.
+    const due: i64 = 1_800_000_005;
+    try testing.expect(!main.postIsDue(due, 1_800_000_000));
+    try testing.expect(!main.postIsDue(due, 1_800_000_004));
+    try testing.expect(main.postIsDue(due, due));
+    try testing.expect(main.postIsDue(due, due + 60));
+
+    // What the button counts down. Never zero while something is held: a button
+    // reading "Undo 0" has already gone.
+    try testing.expectEqual(@as(i64, 5), main.postSecondsLeft(due, 1_800_000_000));
+    try testing.expectEqual(@as(i64, 1), main.postSecondsLeft(due, 1_800_000_004));
+    try testing.expectEqual(@as(i64, 1), main.postSecondsLeft(due, due + 10));
+    try testing.expectEqual(@as(i64, 0), main.postSecondsLeft(0, 1_800_000_000));
+}
+
+test "the ways out of the composer all take a held note back" {
+    // Both found by asking what happens on the paths that are not the happy
+    // one. Pressing Post and then Cancel used to publish, seconds later, the
+    // note whose composer had just been dismissed.
+    main.setIdentityForTest([_]u8{0x7a} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+
+    main.holdPostForTest(1_800_000_000);
+    try testing.expect(main.postHeldForTest());
+    main.update(&model, .close_compose, &fx);
+    try testing.expect(!main.postHeldForTest());
+
+    // A reply is exactly as final as a note, and it belongs to the thread being
+    // left. Leaving it armed would publish it into a conversation the reader
+    // had walked away from.
+    main.holdReplyForTest(1_800_000_000);
+    try testing.expect(main.replyHeldForTest());
+    main.update(&model, .close_thread, &fx);
+    try testing.expect(!main.replyHeldForTest());
+}
+
 test "an unfollow the keyholder never signed is put back" {
     // Plaza v0.13.0 shipped unable to sign anything: Notary refused every local
     // request until somebody answered a question no window could reach. The app
@@ -20677,7 +20728,16 @@ test "logging out takes your places with you" {
     main.goToOwnPlazaForTest();
     try testing.expect(main.visitingPlaceForTest() != null);
 
+    // A note held on the near side of its signature goes too (plaza#330). It
+    // waits there precisely so it can still be taken back, and a session ending
+    // is the clearest instance of taking it back. Asserted here rather than in
+    // its own test because `performLogout` resets a great deal of process-wide
+    // state that later tests read, and this test already accounts for that.
+    main.holdPostForTest(1_800_000_000);
+    try testing.expect(main.postHeldForTest());
+
     main.performLogoutForTest(&model, &fx);
+    try testing.expect(!main.postHeldForTest());
 
     if (main.keptPlaceCount() != 0) {
         std.debug.print("the next account inherits {d} places\n", .{main.keptPlaceCount()});
