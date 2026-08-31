@@ -11680,7 +11680,10 @@ test "no post carries a bookmark or an ellipsis" {
     // And what the ellipsis used to reach is still reachable, by the door that
     // was always there.
     const menu = noteContext(p) orelse return error.NoContextMenu;
-    for ([_][]const u8{ "Copy note address", "Quote", "Copy text", "Open on the web" }) |want| {
+    // "Open on njump.me" rather than "Open on the web": the row names the
+    // host it will open, because inside a place that host is whatever the
+    // community set and a reader should see it before pressing, not after.
+    for ([_][]const u8{ "Copy note address", "Quote", "Copy text", "Open on njump.me" }) |want| {
         if (menu.label(want) == null) {
             std.debug.print("a right-click offers no \"{s}\"\n", .{want});
             return error.MissingContextItem;
@@ -11749,7 +11752,7 @@ test "every post answers a right-click with the same actions as its menu" {
             return error.NoContextMenu;
         }
         // The same actions, by name, as the menu behind the last verb.
-        for ([_][]const u8{ "Open thread", "Copy note address", "Copy text", "Open on the web" }) |want| {
+        for ([_][]const u8{ "Open thread", "Copy note address", "Copy text", "Open on njump.me" }) |want| {
             for (items) |item| {
                 if (std.mem.eql(u8, item.label, want)) break;
             } else {
@@ -18960,8 +18963,11 @@ test "a place is read out of a stranger's event, using Hallway's own field names
     try testing.expectEqualStrings("Spatia-Arcana", m.feeds[0].name());
     try testing.expectEqualStrings("wss://spatia-arcana.com", m.feeds[0].relay());
 
-    // The other 38 keys are ignored rather than refused, so a place carrying the
-    // whole object still applies the three this version reads.
+    // The other 36 keys are ignored rather than refused, so a place carrying the
+    // whole object still applies the five this version reads. `feedKinds`,
+    // `kindGroups`, `indexerUrls` and `dearrowYoutube` below are among the
+    // ignored; `defaultPrimaryColor` used to be and is now read, which is what
+    // the assertion under this block pins.
     const full =
         \\{"appName":"Later","defaultPrimaryColor":"CYAN","feedKinds":[1,6,20],
         \\ "kindGroups":[{"kinds":[1,6],"label":"Notes"}],
@@ -18974,6 +18980,9 @@ test "a place is read out of a stranger's event, using Hallway's own field names
     // A feed with no name of its own is labelled by its host: Hallway's own
     // data has one like this, so it is a real case and not a hypothetical.
     try testing.expectEqualStrings("a.example", n.feeds[0].name());
+    // And the colour, which this version does read.
+    const cyan = n.color orelse return error.NoColour;
+    try testing.expectEqualStrings("CYAN", cyan.name);
 
     // Not a place at all. kind:30078 is shared by every app that stores
     // settings, so an empty document must not be applied as one.
@@ -19034,6 +19043,734 @@ test "an overlong place field is cut on a character boundary" {
         std.debug.print("the cut name is not valid UTF-8: {any}\n", .{m.name()});
         return error.CutMidCharacter;
     }
+}
+
+test "a place brings its own colour, and only a name Hallway knows" {
+    // `defaultPrimaryColor` is an ENUM NAME, not a hex: fiatjaf's deployer
+    // offers eighteen and writes one of them. Resolving it here rather than in
+    // a view means a stranger's string is checked at the boundary like every
+    // other field, and a name nobody knows changes nothing rather than picking
+    // whatever sorted first.
+    const gpa = testing.allocator;
+
+    const yellow = main.parsePlace(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW"}
+    ) orelse return error.NoPlace;
+    const c = yellow.color orelse return error.NoColour;
+    try testing.expectEqualStrings("YELLOW", c.name);
+    // Hallway's own dark row for YELLOW, so a place published once looks the
+    // same in both clients.
+    try testing.expectEqual(canvas.Color.rgb8(0xff, 0xe5, 0x00), c.primary);
+
+    // The deployer writes upper case; a hand-written document may not.
+    const lower = main.parsePlace(gpa,
+        \\{"appName":"Quiet","defaultPrimaryColor":"teal"}
+    ) orelse return error.NoPlace;
+    const t = lower.color orelse return error.NoColour;
+    try testing.expectEqualStrings("TEAL", t.name);
+
+    // A name this version does not know and an absent key are the SAME state,
+    // and it is the safe one: leave Plaza's own accent alone.
+    const unknown = main.parsePlace(gpa,
+        \\{"appName":"Odd","defaultPrimaryColor":"CHARTREUSE"}
+    ) orelse return error.NoPlace;
+    try testing.expect(unknown.color == null);
+    const absent = main.parsePlace(gpa,
+        \\{"appName":"Plain"}
+    ) orelse return error.NoPlace;
+    try testing.expect(absent.color == null);
+
+    // And a colour alone is not a place. kind:30078 is shared by every app that
+    // stores settings, so a document with nothing to SAY stays refused.
+    try testing.expect(main.parsePlace(gpa,
+        \\{"defaultPrimaryColor":"ROSE"}
+    ) == null);
+}
+
+test "the app wears the place's colour, and takes it off on the way out" {
+    // The character was in the document and nowhere on screen. This is the seam
+    // that fixes it: `tokens_fn` is consulted every rebuild and was ignoring its
+    // argument, so a place colour costs no invalidation of its own.
+    const gpa = testing.allocator;
+    const model = main.initialModel();
+    main.resetPlacesForTest();
+    main.installThemeHooks();
+    defer main.resetPlacesForTest();
+
+    // Out of a place the chrome is porcelain, which is the locked M10 decision
+    // and must not move just because places exist.
+    const own = theme.tokens(Model)(&model);
+    try testing.expectEqual(theme.palette.accent, own.colors.accent);
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW",
+        \\ "hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    )) return error.NoPlace;
+
+    const inside = theme.tokens(Model)(&model);
+    const yellow = theme.placeColor("YELLOW") orelse return error.NoColour;
+    try testing.expectEqual(yellow.primary, inside.colors.accent);
+    try testing.expectEqual(yellow.on_primary, inside.colors.accent_text);
+    // The CONTROL table too, and this is the half that is easy to miss: a
+    // filled primary reads `controls.button_primary` FIRST and only falls
+    // through to `colors.accent` when that channel is null. The house pack
+    // fills it, so setting the colour alone would repaint everything except the
+    // one control the reader presses to enter.
+    if (inside.controls.button_primary.background) |bg| {
+        try testing.expectEqual(yellow.primary, bg);
+    } else {
+        std.debug.print("the Enter button kept the house accent inside a place\n", .{});
+        return error.ButtonKeptHouseAccent;
+    }
+
+    // A place that states no colour leaves the chrome alone rather than
+    // reaching for a default, because DEFAULT is a magenta and nobody asked.
+    main.clearActivePlaceForTest();
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Plain","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    try testing.expectEqual(theme.palette.accent, theme.tokens(Model)(&model).colors.accent);
+
+    // And walking out puts it back.
+    main.clearActivePlaceForTest();
+    try testing.expectEqual(theme.palette.accent, theme.tokens(Model)(&model).colors.accent);
+
+    // Tokens are not pixels. This is the same claim at the paint layer: the
+    // Enter button in a visited place is FILLED with the place's colour, which
+    // is what a reader actually sees on the way in.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var painted_model = main.initialModel();
+    painted_model.stage = .ready;
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW",
+        \\ "hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    )) return error.NoPlace;
+    const p = try painted.Painted.render(arena_state.allocator(), &painted_model);
+    // By its TEXT: the frame under the word is the button's own fill, which is
+    // what `fillAt` reports (text draws are not fills).
+    const enter = frameOfText(p, "Enter") orelse return error.NoEnterButton;
+    const fill = p.fillAt(enter.x + enter.width / 2, enter.y + enter.height / 2) orelse
+        return error.EnterNeverPainted;
+    if (!painted.sameColor(fill, yellow.primary)) {
+        std.debug.print("the Enter button did not paint the place's colour\n", .{});
+        return error.AccentNeverPainted;
+    }
+}
+
+test "two places with no branding still do not look like each other" {
+    // Tier 0 of the character work, and the half that needs no configuration at
+    // all: the rail used to draw every place on one flat `surface_link_tile`,
+    // so a column of them was identical grey squares distinguished only by the
+    // letter inside. Most places will never state a colour, so the fallback is
+    // the case that matters most.
+    const gpa = testing.allocator;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Alpha","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    var alpha = (main.activePlace() orelse return error.NoPlace).*;
+    var beta = alpha;
+    // Only the host differs, which is the whole point: the tile is keyed off
+    // the pubkey the way a face is.
+    alpha.author = @splat(0x01);
+    beta.author = @splat(0x02);
+
+    const a = main.placeTileColorsForTest(&alpha);
+    const b = main.placeTileColorsForTest(&beta);
+    if (painted.sameColor(a.bg, b.bg)) {
+        std.debug.print("two hosts, one tile colour\n", .{});
+        return error.TilesIdentical;
+    }
+    // And neither is the flat fill they all used to share.
+    try testing.expect(!painted.sameColor(a.bg, theme.palette.surface_link_tile));
+
+    // A stated colour wins over the rotation, so branding is never overridden
+    // by a hash of somebody's key.
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW",
+        \\ "hardcodedFeeds":[{"relays":["wss://basspistol.org"]}]}
+    )) return error.NoPlace;
+    const branded = main.placeTileColorsForTest(main.activePlace() orelse return error.NoPlace);
+    const yellow = theme.placeColor("YELLOW") orelse return error.NoColour;
+    try testing.expect(painted.sameColor(branded.bg, yellow.primary));
+}
+
+test "a feed asks for the kinds it named, not for notes it does not carry" {
+    // Hallway's own Livestreams feed is `kinds:[1,30311]`, and the room
+    // subscribed to kind 1 no matter what the place said. A community that
+    // publishes streams got a socket that worked, a relay that answered, and an
+    // empty room forever, which reads as a broken relay rather than as a
+    // client that was not listening.
+    const gpa = testing.allocator;
+
+    const streams = main.parsePlace(gpa,
+        \\{"appName":"Livelier","hardcodedFeeds":[
+        \\ {"name":"Livestreams","relays":["wss://livestream.livelier.live"],"kinds":[1,30311]}]}
+    ) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 1), streams.feeds_len);
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 30311 }, streams.feeds[0].kinds());
+
+    // A feed that names none stays EMPTY here rather than being filled in with
+    // a 1: the fallback lives at the subscription, so "said nothing" and "said
+    // notes" remain different facts.
+    const quiet = main.parsePlace(gpa,
+        \\{"appName":"Quiet","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    ) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 0), quiet.feeds[0].kinds_len);
+
+    // Bounded like every other field a stranger fills: too many keeps the first
+    // few rather than refusing the feed.
+    const greedy = main.parsePlace(gpa,
+        \\{"appName":"Greedy","hardcodedFeeds":[
+        \\ {"relays":["wss://a.example"],"kinds":[1,2,3,4,5,6,7,8,9,10,11,12]}]}
+    ) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 8), greedy.feeds[0].kinds_len);
+    try testing.expectEqual(@as(u16, 1), greedy.feeds[0].kinds()[0]);
+}
+
+test "a place that asks for square faces gets them, and only in its own room" {
+    // `avatarStyleDefault`. One field, and the shape belongs to the ROOM:
+    // walking out has to restore the disc without touching a single note.
+    const gpa = testing.allocator;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const round = main.avatarRadiusForTest(32);
+    try testing.expectEqual(@as(f32, 16), round);
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Squares","avatarStyleDefault":"square",
+        \\ "hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    const square = main.avatarRadiusForTest(32);
+    if (square >= round) {
+        std.debug.print("a square place still draws discs: radius {d}\n", .{square});
+        return error.StillRound;
+    }
+    // Rounded, not a hard corner: at 32px against a 1px rule a true zero reads
+    // as a rendering fault.
+    try testing.expect(square > 0);
+
+    // "circle" is the app's own shape, and so is saying nothing.
+    main.clearActivePlaceForTest();
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Circles","avatarStyleDefault":"circle",
+        \\ "hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    try testing.expectEqual(round, main.avatarRadiusForTest(32));
+
+    main.clearActivePlaceForTest();
+    try testing.expectEqual(round, main.avatarRadiusForTest(32));
+}
+
+test "arriving in a place opens the host's welcome, coming back does not" {
+    // Two decisions collided here and running it settled them. `homeMarkdown`
+    // behind the Info button is character nobody sees on the way in. The same
+    // text OVER the feed is worse: the only verb on screen is Enter, and Enter
+    // dismisses it, so there is no way to READ a welcome at all.
+    //
+    // The card is the surface built for it. Opened for you on arrival, whole
+    // and scrollable, with Enter and Close both in reach, and the markdown
+    // still never sits over the feed, which is the older decision this nearly
+    // walked back.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x7d} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/welcome.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const talkative = [_]nostr.event.Tag{&.{ "d", "talkative" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &talkative,
+        \\{"appName":"BASSPISTOL","homeMarkdown":"# House rules\n\n- turn it up","defaultPrimaryColor":"YELLOW","hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    main.armPlaceFetchForTest(kp.public_key, "talkative");
+    main.refreshPlaceFetchForTest();
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqual(main.PlaceInfo.open, main.placeInfo());
+    // The whole text, not an excerpt: this is the surface a reader came to for
+    // the rest, so there is no "rest" to send them anywhere else for.
+    const p = try painted.Painted.renderAt(arena, &model, main.window_width, main.window_height);
+    try testing.expect(paintsText(p, "turn it up"));
+
+    // Closing it leaves you standing in the room, not back on your own feed.
+    main.update(&model, .close_place_info, &fx);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
+    try testing.expect(main.activePlace() != null);
+
+    // Coming back from the rail is not a first impression. A card in the way
+    // every time you switch rooms is the banner problem in a different hat.
+    main.update(&model, .place_enter, &fx);
+    try testing.expectEqual(@as(usize, 1), main.keptPlaceCount());
+    main.openKeptPlaceForTest(0);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
+
+    // And a place with nothing to say does not open a card to say it.
+    main.resetPlacesForTest();
+    const quiet = [_]nostr.event.Tag{&.{ "d", "quiet" }};
+    const ev2 = try nostr.event.create(arena, signer, kp, 1000, 30078, &quiet,
+        \\{"appName":"Quiet","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev2);
+    main.armPlaceFetchForTest(kp.public_key, "quiet");
+    main.refreshPlaceFetchForTest();
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqual(main.PlaceInfo.closed, main.placeInfo());
+}
+
+test "a long welcome does not push Leave off the bottom of the Info card" {
+    // Found by running it: BASSPISTOL's real `homeMarkdown` is two headings and
+    // two lists, and the card had no height bound at all, so the dialog grew
+    // taller than the window and took its own footer off the bottom edge. The
+    // reader who most wants Close and Leave is the one standing in a place they
+    // are trying to get out of.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    // The real shape: headings, prose and lists, not one long paragraph.
+    var home: std.ArrayList(u8) = .empty;
+    defer home.deinit(testing.allocator);
+    try home.appendSlice(testing.allocator, "# BASSPISTOL\n\nOne relay, seven rigs.\n\n## House rules\n\n");
+    var i: usize = 0;
+    while (i < 24) : (i += 1) try home.print(testing.allocator, "- rule number {d}, stated at length\n", .{i});
+
+    main.visitPlaceWithFeedForTest([_]u8{0x82} ** 32, "bass", "BASSPISTOL", "The Dance");
+    main.setPlaceHomeForTest(home.items);
+    main.update(&model, .place_enter, &fx);
+    main.update(&model, .open_place_info, &fx);
+
+    const p = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    const close = frameOfText(p, "Close") orelse return error.NoCloseButton;
+    if (close.y + close.height > main.window_height) {
+        std.debug.print("Close sits {d} past the bottom of a {d} window\n", .{ close.y + close.height - main.window_height, main.window_height });
+        return error.FooterOffScreen;
+    }
+    const leave = frameOfText(p, "Leave") orelse return error.NoLeaveButton;
+    if (leave.y + leave.height > main.window_height) return error.LeaveOffScreen;
+
+    // Still the WHOLE text in there, not an excerpt: cutting is the welcome's
+    // job, and Info is where a reader goes for the rest.
+    if (!paintsText(p, "rule number 0, stated at length")) return error.HomeTextMissing;
+}
+
+/// WCAG relative luminance, for the one question a colour table cannot answer
+/// by inspection: is this readable on the window it has to survive?
+fn relativeLuminance(c: canvas.Color) f64 {
+    const ch = struct {
+        fn lin(v: f32) f64 {
+            const x: f64 = @floatCast(v);
+            return if (x <= 0.04045) x / 12.92 else std.math.pow(f64, (x + 0.055) / 1.055, 2.4);
+        }
+    };
+    return 0.2126 * ch.lin(c.r) + 0.7152 * ch.lin(c.g) + 0.0722 * ch.lin(c.b);
+}
+
+fn contrastRatio(a: canvas.Color, b: canvas.Color) f64 {
+    const la = relativeLuminance(a);
+    const lb = relativeLuminance(b);
+    const hi = @max(la, lb);
+    const lo = @min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+}
+
+test "inside a place the purples are the community's, not Plaza's" {
+    // The complaint this came from: one tinted button does not feel like a
+    // community. It was right. The accent reached two controls, while every
+    // @handle, @mention and in-text URL in the feed, which is most of what a
+    // feed IS, stayed Plaza's violet. Those runs are where a room either reads
+    // as somebody's or does not.
+    const gpa = testing.allocator;
+    const model = main.initialModel();
+    main.resetPlacesForTest();
+    main.installThemeHooks();
+    defer main.resetPlacesForTest();
+
+    // Out of a place: the violet. The M10 rule stands where no community has
+    // asked for anything.
+    try testing.expectEqual(theme.palette.accent_identity, main.identityInkForTest());
+    try testing.expectEqual(theme.palette.accent_identity, theme.tokens(Model)(&model).colors.info);
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW",
+        \\ "hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    )) return error.NoPlace;
+    const yellow = theme.placeColor("YELLOW") orelse return error.NoColour;
+
+    // Both halves, because they are different mechanisms and either one left
+    // behind puts a violet run back in a yellow room: element foregrounds go
+    // through the helper, and TextSpans name the `info` token.
+    try testing.expectEqual(yellow.on_dark, main.identityInkForTest());
+    try testing.expectEqual(yellow.on_dark, theme.tokens(Model)(&model).colors.info);
+
+    // Text takes `on_dark`, never the fill. Hallway's `primary` is a background
+    // value with near-black knocked out of it; set as text on this window it is
+    // a rumour of text.
+    try testing.expect(!painted.sameColor(yellow.primary, main.identityInkForTest()));
+
+    // The room's bright verb DOES take the fill, which is what it is for.
+    try testing.expect(painted.sameColor(yellow.primary, main.roomVerbFillForTest()));
+
+    // A place that states no colour is left alone entirely.
+    main.clearActivePlaceForTest();
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Plain","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    try testing.expectEqual(theme.palette.accent_identity, main.identityInkForTest());
+
+    main.clearActivePlaceForTest();
+    try testing.expectEqual(theme.palette.accent_identity, main.identityInkForTest());
+}
+
+test "every community colour is readable as text on this window" {
+    // `on_dark` is the one column in the table that is OURS rather than
+    // Hallway's, and it exists for exactly one reason: Hallway's `primary` is a
+    // fill, and several of the eighteen are unreadable as text on #0a0a0b
+    // (INDIGO is about 2.5:1). The lightness floor that fixes that is not a
+    // taste, it is the lowest one at which all eighteen clear 4.5:1, so it is
+    // pinned here rather than left to whoever next edits a hex.
+    const window = theme.palette.surface_window;
+    var worst: f64 = 1000;
+    var worst_name: []const u8 = "";
+    for (theme.place_colors) |c| {
+        const ratio = contrastRatio(c.on_dark, window);
+        if (ratio < worst) {
+            worst = ratio;
+            worst_name = c.name;
+        }
+        if (ratio < 4.5) {
+            std.debug.print("{s} reads at {d:.2}:1 on the window, under 4.5:1\n", .{ c.name, ratio });
+            return error.UnreadableCommunityColour;
+        }
+        // And the ink has to survive the fill it is knocked out of. This is the
+        // assertion that caught six rows where Hallway's own near-black ink is
+        // unreadable on its own colour (VIOLET at 2.08:1). 4.0 rather than 4.5
+        // because the floor is DEFAULT at 4.16:1, and lifting that would mean
+        // altering the FILL -- the community's actual colour, which is theirs
+        // and not ours to correct.
+        const on_fill = contrastRatio(c.on_primary, c.primary);
+        if (on_fill < 4.0) {
+            std.debug.print("{s}: label reads at {d:.2}:1 on its own fill\n", .{ c.name, on_fill });
+            return error.UnreadableLabelOnFill;
+        }
+    }
+    // Worth knowing which one is closest to the edge when this next moves.
+    try testing.expect(worst >= 4.5);
+}
+
+test "a place edited since your last visit does not show you the old one" {
+    // A place is a REPLACEABLE event, and the copy sitting in the local store
+    // when a link is followed is LAST SESSION'S. It was read on the first tick,
+    // applied instantly, and the fetch window was then closed, so the host's
+    // current document, still in flight from their relay, arrived a moment
+    // later, was ingested, and never reached the room.
+    //
+    // Found the hard way: the BASSPISTOL place was republished with real
+    // Hallway keys, and a client that had visited the earlier version kept
+    // showing it (no colour, round faces) while the store underneath already
+    // held the new one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x8f} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/places.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "d", "outernational-dancehall" }};
+
+    const old = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags,
+        \\{"appName":"BASSPISTOL","homeMarkdown":"one relay","hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, old);
+
+    main.armPlaceFetchForTest(kp.public_key, "outernational-dancehall");
+    main.refreshPlaceFetchForTest();
+    const first = main.activePlace() orelse return error.NoPlace;
+    try testing.expectEqualStrings("BASSPISTOL", first.name());
+    try testing.expect(first.color == null);
+
+    // The host's current document lands from their relay a beat later.
+    const current = try nostr.event.create(arena, signer, kp, 2000, 30078, &tags,
+        \\{"appName":"BASSPISTOL","homeMarkdown":"one relay","defaultPrimaryColor":"YELLOW","avatarStyleDefault":"square","hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, current);
+
+    main.refreshPlaceFetchForTest();
+    const upgraded = main.activePlace() orelse return error.NoPlace;
+    const c = upgraded.color orelse return error.ColourNeverArrived;
+    try testing.expectEqualStrings("YELLOW", c.name);
+    try testing.expect(upgraded.square_avatars);
+
+    // An OLDER copy arriving late (a slow relay with a stale replica) must not
+    // walk the room backwards.
+    const stale = try nostr.event.create(arena, signer, kp, 500, 30078, &tags,
+        \\{"appName":"BASSPISTOL","homeMarkdown":"one relay","hardcodedFeeds":[{"relays":["wss://basspistol.org"]}]}
+    , null);
+    _ = main.plazaIngestForTest(arena, stale) catch {};
+    main.refreshPlaceFetchForTest();
+    const still = main.activePlace() orelse return error.NoPlace;
+    try testing.expect(still.color != null);
+}
+
+test "a place carries all of its feeds, and you can change which one you read" {
+    // `place_feeds_cap` was 1. Hallway's OWN default document lists five, so
+    // that was not a simplification of the format, it was four fifths of a
+    // community discarded at the parser: a room with "Basically Global",
+    // "Kinda Trending" and "Livestreams" showed one of them and no way to say
+    // where the others went.
+    const gpa = testing.allocator;
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","defaultPrimaryColor":"YELLOW","hardcodedFeeds":[
+        \\ {"name":"The Dance","relays":["wss://basspistol.org"]},
+        \\ {"name":"Outernational","relays":["wss://nos.lol"],"kinds":[1,30311]},
+        \\ {"relays":["wss://offchain.pub"]}]}
+    )) return error.NoPlace;
+    const m = main.activePlace() orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 3), m.feeds_len);
+
+    // The room opens on the one its host listed FIRST.
+    try testing.expectEqual(@as(u8, 0), main.placeFeedIndexForTest());
+    try testing.expectEqualStrings("The Dance", model.scope_name());
+
+    // Changing feed changes what the room IS, so the name follows it.
+    main.update(&model, main.Msg{ .place_feed = 1 }, &fx);
+    try testing.expectEqual(@as(u8, 1), main.placeFeedIndexForTest());
+    try testing.expectEqualStrings("Outernational", model.scope_name());
+    // And the subscription follows it too, kinds and all.
+    const now = main.activePlace() orelse return error.NoPlace;
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 30311 }, now.feeds[1].kinds());
+
+    // A feed with no name of its own is its relay's host, the same substitution
+    // the parser and the header already make.
+    main.update(&model, main.Msg{ .place_feed = 2 }, &fx);
+    try testing.expectEqualStrings("offchain.pub", model.scope_name());
+
+    // An index the place does not have is refused rather than clamped: a menu
+    // cannot produce one, so anything that does is a bug and should not be
+    // quietly rounded into a different room.
+    main.update(&model, main.Msg{ .place_feed = 9 }, &fx);
+    try testing.expectEqual(@as(u8, 2), main.placeFeedIndexForTest());
+
+    // Bounded like every other field a stranger fills.
+    main.clearActivePlaceForTest();
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Greedy","hardcodedFeeds":[
+        \\ {"name":"a","relays":["wss://a.example"]},{"name":"b","relays":["wss://b.example"]},
+        \\ {"name":"c","relays":["wss://c.example"]},{"name":"d","relays":["wss://d.example"]},
+        \\ {"name":"e","relays":["wss://e.example"]},{"name":"f","relays":["wss://f.example"]},
+        \\ {"name":"g","relays":["wss://g.example"]}]}
+    )) return error.NoPlace;
+    try testing.expectEqual(@as(u8, 5), (main.activePlace() orelse return error.NoPlace).feeds_len);
+}
+
+test "the feed name is a switcher only when there is somewhere to go" {
+    // A chevron beside a name that opens nothing is a promise the room cannot
+    // keep.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    main.resetProfilesForTest();
+    defer main.resetPlacesForTest();
+    defer main.resetProfilesForTest();
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"One","hardcodedFeeds":[{"name":"Only","relays":["wss://a.example"]}]}
+    )) return error.NoPlace;
+    const single = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (single.frameOf("Choose feed") != null) return error.ChevronOnASingleFeed;
+
+    main.clearActivePlaceForTest();
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"Two","hardcodedFeeds":[
+        \\ {"name":"First","relays":["wss://a.example"]},{"name":"Second","relays":["wss://b.example"]}]}
+    )) return error.NoPlace;
+    const several = try painted.Painted.renderAt(arena_state.allocator(), &model, main.window_width, main.window_height);
+    if (several.frameOf("Choose feed") == null) return error.NoSwitcherWithSeveralFeeds;
+}
+
+test "a community's share gateway is checked before a reader is sent to it" {
+    // This key is sharper than the relay URL beside it. A relay decides who the
+    // app TALKS to; `baseShareURL` decides where the READER is sent, and a
+    // place that set it to a convincing copy of njump would be a phishing page
+    // one press away from any note.
+    const gpa = testing.allocator;
+
+    try testing.expect(main.isSafeShareUrl("https://njump.me/"));
+    try testing.expect(main.isSafeShareUrl("https://basspistol.org/n/"));
+    const refused = [_][]const u8{
+        "http://njump.me/", // cleartext for a web page is a downgrade
+        "https://", // nothing after the scheme
+        "https://user:pass@evil.example/", // familiar-looking authority
+        "https://njump.me/?to=evil.example", // a redirect smuggled in a query
+        "https://njump.me/#evil", // or in a fragment
+        "https://has space.example/",
+        "https://has\nnewline.example/",
+        "javascript:alert(1)",
+    };
+    for (refused) |url| {
+        if (main.isSafeShareUrl(url)) {
+            std.debug.print("accepted a share base it should refuse: {s}\n", .{url});
+            return error.UnsafeShareUrlAccepted;
+        }
+    }
+
+    // A refused one leaves the app's own gateway in place rather than half-
+    // applying: "named nothing" and "named something unusable" are the same
+    // outcome, which is the safe one.
+    const bad = main.parsePlace(gpa,
+        \\{"appName":"Sketchy","baseShareURL":"http://evil.example/","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    ) orelse return error.NoPlace;
+    try testing.expectEqual(@as(u8, 0), bad.share_len);
+
+    const good = main.parsePlace(gpa,
+        \\{"appName":"BASSPISTOL","baseShareURL":"https://njump.me/","hardcodedFeeds":[{"relays":["wss://basspistol.org"]}]}
+    ) orelse return error.NoPlace;
+    try testing.expectEqualStrings("https://njump.me/", good.share());
+
+    // The host is what the menu row says, so the reader sees the destination
+    // before the press. That naming is the mitigation parsing cannot provide.
+    try testing.expectEqualStrings("njump.me", main.shareHost("https://njump.me/"));
+    try testing.expectEqualStrings("basspistol.org", main.shareHost("https://basspistol.org/n/"));
+}
+
+test "a feed's remembered notes do not leak into the feed beside it" {
+    // Found reviewing the multi-feed work, not by a report, because it only
+    // shows on the second feed of a place. `seen` is not the PLACE's notes, it
+    // is that FEED's notes. Seeded blind, switching to "Outernational" paints
+    // "The Dance"'s notes under its name until the relay answers, and the next
+    // save writes that mixture down as if it belonged there.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    const gpa = testing.allocator;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    if (!main.visitParsedPlaceForTest(gpa,
+        \\{"appName":"BASSPISTOL","hardcodedFeeds":[
+        \\ {"name":"The Dance","relays":["wss://basspistol.org"]},
+        \\ {"name":"Outernational","relays":["wss://nos.lol"]}]}
+    )) return error.NoPlace;
+    main.update(&model, .place_enter, &fx);
+
+    // Notes arrive on the first feed and are remembered against it.
+    var ids: [3][32]u8 = .{ @splat(1), @splat(2), @splat(3) };
+    main.seedPlaceFeedForTest(&ids);
+    main.savePlacesForTest();
+    try testing.expectEqual(@as(u16, 3), main.keptPlaceSeenLenForTest(0));
+
+    // Switching feeds must NOT bring them along.
+    main.update(&model, main.Msg{ .place_feed = 1 }, &fx);
+    if (main.placeFeedCount() != 0) {
+        std.debug.print("the second feed opened holding {d} of the first feed's notes\n", .{main.placeFeedCount()});
+        return error.RoomLeaked;
+    }
+
+    // Within a session the live list is the source of truth and a feed refills
+    // from its own relay, so switching back does not replay them; `seen` is for
+    // the RE-OPEN path. That path is where the leak would have been permanent,
+    // so it is the one worth proving: re-entering from the rail seeds feed 0
+    // with feed 0's notes.
+    main.openKeptPlaceForTest(0);
+    try testing.expectEqual(@as(u8, 0), main.placeFeedIndexForTest());
+    if (main.placeFeedCount() != 3) {
+        std.debug.print("re-opening the place lost its remembered room: {d} ids\n", .{main.placeFeedCount()});
+        return error.RoomNotRemembered;
+    }
+}
+
+test "a place keeps its character across a restart" {
+    // The places file IS Hallway's document, one per line, so what is written
+    // has to come back through the same parser meaning the same thing. Colour
+    // and avatar shape were the fields most likely to be written and then
+    // silently dropped, because nothing on screen would have said so until the
+    // next launch.
+    const gpa = testing.allocator;
+
+    const original = main.parsePlace(gpa,
+        \\{"appName":"BASSPISTOL","homeMarkdown":"# Rules\n\n- turn it up",
+        \\ "defaultPrimaryColor":"YELLOW","avatarStyleDefault":"square",
+        \\ "baseShareURL":"https://njump.me/",
+        \\ "hardcodedFeeds":[{"name":"The Dance","relays":["wss://basspistol.org"],"kinds":[1,30311]},
+        \\ {"name":"Outernational","relays":["wss://nos.lol"]}]}
+    ) orelse return error.NoPlace;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try main.writePlaceDocumentForTest(gpa, &out, &original);
+
+    const back = main.parsePlace(gpa, out.items) orelse return error.NoPlaceBack;
+    try testing.expectEqualStrings(original.name(), back.name());
+    try testing.expectEqualStrings(original.home(), back.home());
+    const c = back.color orelse return error.ColourLost;
+    try testing.expectEqualStrings("YELLOW", c.name);
+    try testing.expect(back.square_avatars);
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 30311 }, back.feeds[0].kinds());
+    try testing.expectEqualStrings("wss://basspistol.org", back.feeds[0].relay());
+    // EVERY feed, not just the one the file used to write. A room that had two
+    // came back with one, and nothing on screen would have said so.
+    try testing.expectEqual(@as(u8, 2), back.feeds_len);
+    try testing.expectEqualStrings("Outernational", back.feeds[1].name());
+    try testing.expectEqualStrings("wss://nos.lol", back.feeds[1].relay());
+    try testing.expectEqualStrings("https://njump.me/", back.share());
+    try testing.expectEqual(original.seen_feed, back.seen_feed);
+
+    // And a place with no character written down stays that way rather than
+    // gaining a colour on the way through the file.
+    const plain = main.parsePlace(gpa,
+        \\{"appName":"Plain","hardcodedFeeds":[{"relays":["wss://a.example"]}]}
+    ) orelse return error.NoPlace;
+    var plain_out: std.ArrayList(u8) = .empty;
+    defer plain_out.deinit(gpa);
+    try main.writePlaceDocumentForTest(gpa, &plain_out, &plain);
+    const plain_back = main.parsePlace(gpa, plain_out.items) orelse return error.NoPlaceBack;
+    try testing.expect(plain_back.color == null);
+    try testing.expect(!plain_back.square_avatars);
+    try testing.expectEqual(@as(u8, 0), plain_back.feeds[0].kinds_len);
 }
 
 test "a plaza:// link names what to fetch and nothing else" {

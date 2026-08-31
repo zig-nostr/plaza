@@ -121,18 +121,30 @@ counts in the feed and you will still hear when somebody likes your note.
 
 ## Places
 
-A place is somebody's corner of Nostr: their relay, and what that relay serves.
-A `plaza://place/` link opens the one it names, and while you are in it you are
-reading that rather than your own feed. Your own relays are left alone, and
-leaving puts you back where you were.
+A place is somebody's corner of Nostr: their relays, and what those relays
+serve. A `plaza://place/` link opens the one it names, and while you are in it
+you are reading that rather than your own feed. Your own relays are left alone,
+and leaving puts you back where you were.
 
 You arrive as a visitor and can read and post straight away. Entering keeps the
 place on a rail down the side of the window, one press away from then on, and
 leaving takes it off again. Nothing is gated on entering, posting included:
 whether a post lands is between you and that place's relays.
 
-The format is fiatjaf's Hallway universe object, read exactly as it is written,
-so a place published once means the same thing in both.
+A community can carry several feeds. The one you are reading names itself in the
+header, and where there is more than one that name is the switcher. A place that
+states a colour wears it: the accent, and the handles, mentions and links in its
+feed, in the colour that community chose rather than Plaza's own violet. What
+does not move is anything that means a state: a warning, a zap, an unread
+mark. A yellow room should not make an error look like weather.
+
+Arriving opens the host's own text once, in a card you can close and find again
+under Info.
+
+The format is fiatjaf's Hallway universe object and the field names are his
+exactly, so a document written for one is read the same way by the other. The
+two do not yet share a publishing path: Hallway's deployer ships a site, and
+Plaza reads a `kind:30078` carrying that same object.
 
 ## Performance
 
