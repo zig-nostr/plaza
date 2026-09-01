@@ -2816,6 +2816,9 @@ pub const Place = struct {
     /// Where this community reads each kind, from `clientHandlers`.
     handlers: [place_handlers_cap]PlaceHandler = @splat(.{}),
     handlers_len: u8 = 0,
+    /// The community's own mark, from `logoUrl`.
+    logo_buf: [place_handler_url_cap]u8 = @splat(0),
+    logo_len: u8 = 0,
     /// The three lines a room says about itself, when the place rewrites them.
     ///
     /// From Hallway's `translations`, which is a map of its OWN English strings
@@ -2861,6 +2864,9 @@ pub const Place = struct {
         return self.write_relays[i][0..self.write_relay_lens[i]];
     }
     /// The handler this place names for `kind`, if it names one.
+    pub fn logo(self: *const Place) []const u8 {
+        return self.logo_buf[0..self.logo_len];
+    }
     pub fn emptyLine(self: *const Place) []const u8 {
         return self.empty_line_buf[0..self.empty_line_len];
     }
@@ -2929,6 +2935,10 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         /// raw value because the keys are kind NUMBERS written as strings, so
         /// there is no struct to parse it into; it is walked below.
         clientHandlers: std.json.Value = .null,
+        /// The community's own mark. Absolute https only: a relative path is
+        /// relative to a website this app has never heard of, and there is
+        /// nothing to resolve it against.
+        logoUrl: []const u8 = "",
         /// Hallway's own English mapped to replacements. Taken raw: the keys
         /// are sentences, so there is no struct for it either.
         translations: std.json.Value = .null,
@@ -3064,6 +3074,12 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
             }
         }
     }
+
+    // The community's mark. `isSafeShareUrl` is the right gate: this is an
+    // address the app will FETCH, and a logo has no business carrying a query.
+    // A relative path is refused rather than guessed at, since the document
+    // says nothing about which website it came from.
+    if (isSafeShareUrl(w.logoUrl)) m.logo_len = @intCast(copyBounded(&m.logo_buf, w.logoUrl));
 
     // The three lines a room says about itself.
     //
@@ -10514,7 +10530,7 @@ pub const Model = struct {
         if (g_place != null) {
             // What the place calls it, when it says. Only these three lines,
             // and only inside the room: see `Place.empty_line_buf`.
-            const p = visitingPlace();
+            const p = activePlace();
             return switch (placeLink()) {
                 .idle, .connecting => if (p) |m| (if (m.loadingLine().len > 0) m.loadingLine() else "Connecting to this place…") else "Connecting to this place…",
                 .unreachable_relay => if (p) |m| (if (m.lostLine().len > 0) m.lostLine() else "Can't reach this place. Retrying…") else "Can't reach this place. Retrying…",
@@ -11587,6 +11603,11 @@ const IdOwner = union(enum) {
     free,
     avatar: *Profile,
     banner,
+    /// The open place's mark. It has to be an owner like any other: a slot this
+    /// app holds but the pool does not know about reads as FREE, so the next
+    /// face that arrives is handed the id the Info card is drawing. The reader
+    /// sees the community's logo turn into somebody's avatar.
+    place_logo,
     media: *MediaSlot,
 };
 
@@ -11596,6 +11617,9 @@ fn imageIdOwners() [image_registry_slots + 1]IdOwner {
     var owners = [_]IdOwner{.free} ** (image_registry_slots + 1);
     if (g_banner_image_id >= 1 and g_banner_image_id <= image_registry_slots) {
         owners[@intCast(g_banner_image_id)] = .banner;
+    }
+    if (g_place_logo_id >= 1 and g_place_logo_id <= image_registry_slots) {
+        owners[@intCast(g_place_logo_id)] = .place_logo;
     }
     for (&g_profiles) |*p| {
         if (p.used and p.image_id >= 1 and p.image_id <= image_registry_slots) {
@@ -11623,6 +11647,7 @@ fn imageIdSeen(owner: IdOwner) ?u64 {
         .avatar => |p| if (p.avatar_clock == g_image_clock or p.avatar_state == .fetching) null else p.avatar_clock,
         .media => |m| if (m.last_used == g_image_clock or m.state == .fetching) null else m.last_used,
         .banner => if (g_banner_seen == g_image_clock) null else g_banner_seen,
+        .place_logo => if (g_place_logo_seen == g_image_clock or g_place_logo_state == .fetching) null else g_place_logo_seen,
     };
 }
 
@@ -11645,6 +11670,10 @@ fn releaseImageId(fx: *Effects, owner: IdOwner, id: u64) void {
         .banner => {
             g_banner_image_id = 0;
             g_banner_state = .idle;
+        },
+        .place_logo => {
+            g_place_logo_id = 0;
+            g_place_logo_state = .idle;
         },
     }
 }
@@ -12688,6 +12717,30 @@ pub fn touchMediaClockForTest() u64 {
 
 pub fn acquireImageIdForTest(fx: *Effects) ?u64 {
     return acquireImageId(fx);
+}
+
+/// What the pool thinks holds an id. The bug this guards against is a slot the
+/// app holds and the pool calls `free`.
+pub fn imageIdOwnerNameForTest(id: u64) []const u8 {
+    if (id < 1 or id > image_registry_slots) return "out-of-range";
+    const owners = imageIdOwners();
+    return @tagName(owners[@intCast(id)]);
+}
+
+pub fn placeLogoUntouchableForTest() bool {
+    return imageIdSeen(.place_logo) == null;
+}
+
+pub fn setPlaceLogoIdForTest(id: u64) void {
+    g_place_logo_id = id;
+}
+
+pub fn markPlaceLogoSeenForTest() void {
+    g_place_logo_seen = g_image_clock;
+}
+
+pub fn agePlaceLogoForTest() void {
+    g_image_clock +%= 1;
 }
 
 /// The id the pool would hand out next, without taking it. Lets a test ask what
@@ -14401,6 +14454,7 @@ pub const Msg = union(enum) {
     /// Open a note on the web (njump), for sharing it outside nostr.
     open_web: i64,
     open_place_handler: i64,
+    place_logo_fetched: native_sdk.EffectResponse,
     /// A text edit in the name beat's field.
     name_edit: canvas.TextInputEvent,
     /// Publish the chosen name as the account's kind:0 and move on.
@@ -14522,7 +14576,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -22079,6 +22133,102 @@ const place_info_card_width: f32 = 620;
 /// The most of a host's welcome that is shown before it scrolls.
 const place_info_home_max: f32 = 380;
 
+/// The place's own mark, drawn in its Info card.
+///
+/// A much smaller pipeline than the profile banner's, on purpose. That one
+/// slices a body too big for one response, falls back off the proxy when a host
+/// refuses it, and buffers the pieces. A logo is a small square from a site the
+/// community chose: if it does not arrive whole, first time, there is no logo
+/// and the card is fine without one.
+var g_place_logo_id: u64 = 0;
+/// Which place's logo is loaded, so walking into another room does not leave
+/// the last community's mark on screen.
+var g_place_logo_for: [32]u8 = @splat(0);
+var g_place_logo_state: enum { idle, fetching, loaded, failed } = .idle;
+/// The pass this logo was last on screen. The pool may not take a slot that is
+/// being looked at, and it only knows that because this is stamped every pass a
+/// place is open.
+var g_place_logo_seen: u64 = 0;
+
+const place_logo_fetch_key: u64 = 5200;
+const place_logo_px: u32 = 96;
+
+/// Fetches the place's mark once, and forgets it when the reader leaves.
+fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
+    _ = model;
+    const place = activePlace() orelse {
+        // Out of every room: the slot goes back to the pool rather than holding
+        // a picture nobody can see. The feed underneath is what wants it.
+        if (g_place_logo_id != 0) {
+            _ = fx.unregisterImage(g_place_logo_id);
+            g_place_logo_id = 0;
+        }
+        g_place_logo_for = @splat(0);
+        g_place_logo_state = .idle;
+        return;
+    };
+    // On screen this pass, so the allocator will not take the slot out from
+    // under the reader. Stamped before any early return below: a logo that is
+    // loaded and simply not being re-fetched still needs its slot kept.
+    g_place_logo_seen = g_image_clock;
+    if (!g_media_previews) return;
+    const logo = place.logo();
+    if (logo.len == 0) return;
+
+    // A different community is a different mark. Compared by the place's author
+    // rather than by the URL: two places may ship the same logo and still be
+    // different rooms.
+    if (!std.mem.eql(u8, &g_place_logo_for, &place.author)) {
+        g_place_logo_for = place.author;
+        g_place_logo_state = .idle;
+    }
+    if (g_place_logo_state != .idle) return;
+
+    if (g_place_logo_id == 0) {
+        g_place_logo_id = acquireImageId(fx) orelse return;
+    }
+    if (loadCachedImage(fx, g_place_logo_id, logo, place_logo_px)) |_| {
+        g_place_logo_state = .loaded;
+        return;
+    }
+    g_place_logo_state = .fetching;
+    fetchSlice(fx, place_logo_fetch_key, logo, 0, Effects.responseMsg(.place_logo_fetched));
+}
+
+fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key != place_logo_fetch_key) return;
+    // Every effect slot was busy: ask again next tick.
+    if (response.outcome == .rejected) {
+        g_place_logo_state = .idle;
+        return;
+    }
+    // 206 as well as 200. The fetch asks for a RANGE, so a server that honours
+    // it answers Partial Content even when what came back is the whole file,
+    // which is the usual case for something this small. Accepting only 200
+    // threw a perfectly good logo away.
+    //
+    // No accumulator behind this: if a logo really is too big for one response,
+    // the decode below fails and there is no logo, which is what this pipeline
+    // promises. See `g_place_logo_id`.
+    const usable = response.outcome == .ok and (response.status == 200 or response.status == 206);
+    if (!usable or response.truncated or
+        response.body.len == 0 or response.body.len > max_image_bytes)
+    {
+        g_place_logo_state = .failed;
+        return;
+    }
+    const place = activePlace() orelse {
+        g_place_logo_state = .idle;
+        return;
+    };
+    if (decodeAndRegister(fx, g_place_logo_id, response.body, place_logo_px)) |_| {
+        g_place_logo_state = .loaded;
+        storeCachedImage(place.logo(), response.body);
+    } else {
+        g_place_logo_state = .failed;
+    }
+}
+
 /// How wide the welcome may be inside the card.
 ///
 /// The card is 620 and the welcome was laid out at 580, which put its left edge
@@ -22227,7 +22377,16 @@ fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
         .semantics = .{ .label = "About this place" },
     }, .{
         modalCard(ui, place_info_card_width, ui.column(.{ .grow = 1, .gap = 0, .padding = 20 }, .{
-            ui.paragraph(
+            // The mark beside the name when the community ships one and it has
+            // arrived. Nothing reserved for it otherwise: a gap where a logo
+            // might have been is worse than a title on its own.
+            if (g_place_logo_state == .loaded and g_place_logo_id != 0) ui.row(.{ .cross = .center, .gap = 10 }, .{
+                ui.image(.{ .image = g_place_logo_id, .width = 28, .height = 28, .semantics = .{ .label = "Place logo" } }),
+                ui.paragraph(
+                    .{ .grow = 1, .wrap = true, .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = join_title_scale }},
+                ),
+            }) else ui.paragraph(
                 .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = if (m.name_len > 0) m.name() else "A place", .weight = .bold, .scale = join_title_scale }},
             ),
@@ -22550,7 +22709,7 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
     // And where THIS community reads its notes, when it says. Beside the app's
     // own row rather than instead of it: a place naming a handler is telling
     // the reader where it lives, not taking njump away from them.
-    if (visitingPlace()) |place| {
+    if (activePlace()) |place| {
         if (place.handlerFor(1)) |h| {
             if (n < items.len) {
                 items[n] = .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } };
@@ -26413,6 +26572,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 assignAvatarSlots(fx, model);
                 scanAvatarFetches(fx);
                 scanBannerFetch(fx, model);
+                scanPlaceLogo(fx, model);
                 scanMediaFetches(fx, model);
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
@@ -26893,9 +27053,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         // njump renders any nostr event as a web page, which is how a note is
         // shared with someone who is not on nostr yet.
+        .place_logo_fetched => |response| handlePlaceLogoFetched(fx, response),
         .open_place_handler => |id| {
             const note = model.noteById(id) orelse return;
-            const place = visitingPlace() orelse return;
+            const place = activePlace() orelse return;
             const h = place.handlerFor(1) orelse return;
             // The pattern was checked at parse time and carries exactly one
             // `{e}`. What goes in its place is written here as hex from the id
@@ -30017,6 +30178,11 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     // The place being read, if any, sent to FIRST and separately from the
     // reader's own pool.
     //
+    // `activePlace`, not `visitingPlace`. The second one means a place being
+    // looked at and NOT yet entered, so every one of these would have gone
+    // quiet the moment somebody actually joined the community: exactly
+    // backwards.
+    //
     // A note written inside a community used to walk only the reader's write
     // slots, so it went everywhere except the community it was written in. The
     // place names where it lives; this is that promise kept.
@@ -30026,7 +30192,7 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     // in the same sense the room itself is, and the note is still tracked
     // against the reader's own relays below.
     var place_only = false;
-    if (visitingPlace()) |place| {
+    if (activePlace()) |place| {
         for (0..place.write_relays_len) |i| {
             const url = place.writeRelay(i);
             var relay = nostr.relay.dial(gpa, io, url) catch continue;
@@ -31854,10 +32020,61 @@ fn writePlaceDocument(gpa: std.mem.Allocator, out: *std.ArrayList(u8), m: *const
             if (i > 0) try out.append(gpa, ',');
             try out.print(gpa, "{d}", .{k});
         }
+        // And who the feed is about. Dropping these turned a feed about people
+        // back into a feed about nothing on the next save, which is the same
+        // "came back with less than it had" the kinds above exist to prevent.
+        try out.appendSlice(gpa, "],\"pubkeys\":[");
+        for (f.people(), 0..) |pk, i| {
+            if (i > 0) try out.append(gpa, ',');
+            try out.print(gpa, "{f}", .{std.json.fmt(&std.fmt.bytesToHex(pk, .lower), .{})});
+        }
         try out.appendSlice(gpa, "]}");
     }
+    try out.appendSlice(gpa, "]");
+
+    // Everything else this app reads out of a place. Written back because this
+    // file is what a restart reads: a field the parser understands and the
+    // writer forgets is a field that works once and is gone by morning. That is
+    // exactly what happened to the logo, the community's relays, its handlers
+    // and its own words for a room.
+    try out.print(gpa, ",\"logoUrl\":{f}", .{std.json.fmt(m.logo(), .{})});
+    try out.appendSlice(gpa, ",\"readRepliesFrom\":[");
+    for (0..m.read_relays_len) |i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.print(gpa, "{f}", .{std.json.fmt(m.readRelay(i), .{})});
+    }
+    try out.appendSlice(gpa, "],\"publishTargets\":[");
+    for (0..m.write_relays_len) |i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.print(gpa, "{f}", .{std.json.fmt(m.writeRelay(i), .{})});
+    }
+    try out.print(gpa, "],\"readRepliesFromExclusive\":{s},\"publishTargetsExclusive\":{s}", .{
+        if (m.read_exclusive) "true" else "false",
+        if (m.write_exclusive) "true" else "false",
+    });
+
+    // Back in Hallway's own shape, keyed by kind, so this file stays a document
+    // that client could read rather than a private encoding of one.
+    try out.appendSlice(gpa, ",\"clientHandlers\":{\"byKind\":{");
+    for (m.handlers[0..m.handlers_len], 0..) |*h, i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.print(gpa, "\"{d}\":[{{\"name\":{f},\"urlPattern\":{f}}}]", .{
+            h.kind,
+            std.json.fmt(h.name(), .{}),
+            std.json.fmt(h.pattern(), .{}),
+        });
+    }
+    try out.appendSlice(gpa, "}}");
+
+    // The three room lines, under the Hallway keys they were read from.
+    try out.print(gpa, ",\"translations\":{{\"Empty list.\":{f},\"Loading\":{f},\"Lost in the void\":{f}}}", .{
+        std.json.fmt(m.emptyLine(), .{}),
+        std.json.fmt(m.loadingLine(), .{}),
+        std.json.fmt(m.lostLine(), .{}),
+    });
+
     try out.print(gpa,
-        \\],"host":{f},"d":{f}
+        \\,"host":{f},"d":{f}
     , .{
         std.json.fmt(&std.fmt.bytesToHex(m.author, .lower), .{}),
         std.json.fmt(m.ident(), .{}),

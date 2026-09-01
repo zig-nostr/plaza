@@ -6310,6 +6310,76 @@ test "measuring a markdown line counts what is drawn, not what is written" {
     try testing.expectEqual(@as(usize, 5), main.visibleLenForTest("hello"));
 }
 
+test "the place's logo is not a slot the pool can hand to a face" {
+    // Reported: the logo appeared, then turned into somebody's avatar as the
+    // feed loaded behind it. Image ids come from a shared pool, and a slot this
+    // app holds but the pool does not KNOW about reads as free, so the next face
+    // to arrive was handed the id the Info card was drawing.
+    // A slot nothing else in this process holds: these tests share the pool.
+    var slot: u64 = 0;
+    var i: u64 = 1;
+    while (i <= 16) : (i += 1) {
+        if (std.mem.eql(u8, main.imageIdOwnerNameForTest(i), "free")) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == 0) return error.NoFreeSlot;
+
+    main.setPlaceLogoIdForTest(slot);
+    defer main.setPlaceLogoIdForTest(0);
+
+    // The pool has to name it. "free" here is the whole bug: a slot this app
+    // holds and the pool calls free is one it will hand to the next face.
+    try testing.expectEqualStrings("place_logo", main.imageIdOwnerNameForTest(slot));
+
+    // On screen this pass: untouchable, like a banner or a face being looked at.
+    main.markPlaceLogoSeenForTest();
+    try testing.expect(main.placeLogoUntouchableForTest());
+
+    // A later pass with the place gone: the slot goes back rather than being
+    // held forever.
+    main.agePlaceLogoForTest();
+    try testing.expect(!main.placeLogoUntouchableForTest());
+}
+
+test "saving a place keeps everything the parser understood" {
+    // The places file is what a restart reads, so a field the parser
+    // understands and the writer forgets is a field that works once and is gone
+    // by morning. That is exactly what happened: the logo, the community's
+    // relays, its handlers, its own words for a room and a feed's people were
+    // all read correctly and then dropped on the next save.
+    const doc =
+        \\{"appName":"Monero Hallway",
+        \\ "logoUrl":"https://example.test/logo.png",
+        \\ "readRepliesFrom":["wss://a.example"],
+        \\ "publishTargets":["wss://b.example"],
+        \\ "clientHandlers":{"byKind":{"1":[{"name":"Nosmero","urlPattern":"https://nosmero.com/?thread={e}"}]}},
+        \\ "translations":{"Empty list.":"Private, and proud of it.","Loading":"Mixing…","Lost in the void":"Unlinkable."},
+        \\ "hardcodedFeeds":[{"name":"People","pubkeys":["35d38fa2efb7c9f4b1bf20a4d2cded731b152ed871a0aac9d72347265c9b42d8"]}]}
+    ;
+    const first = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try main.writePlaceDocumentForTest(testing.allocator, &out, &first);
+
+    // Read back what was written: the round trip is the property, not the bytes.
+    const again = main.parsePlace(testing.allocator, out.items) orelse return error.RoundTripRefused;
+    try testing.expectEqualStrings("https://example.test/logo.png", again.logo());
+    try testing.expectEqual(@as(u8, 1), again.read_relays_len);
+    try testing.expectEqualStrings("wss://a.example", again.readRelay(0));
+    try testing.expectEqual(@as(u8, 1), again.write_relays_len);
+    try testing.expectEqualStrings("wss://b.example", again.writeRelay(0));
+    const h = again.handlerFor(1) orelse return error.NoHandler;
+    try testing.expectEqualStrings("Nosmero", h.name());
+    try testing.expectEqualStrings("Mixing…", again.loadingLine());
+    try testing.expectEqualStrings("Private, and proud of it.", again.emptyLine());
+    // And the feed is still about people.
+    try testing.expectEqual(@as(u8, 1), again.feeds_len);
+    try testing.expectEqual(@as(usize, 1), again.feeds[0].people().len);
+}
+
 test "an image with no alt text leaves nothing behind" {
     // The renderer draws an image as its ALT text, which is right for a client
     // that spends its image budget on faces. `![](url)` has no alt, so the
