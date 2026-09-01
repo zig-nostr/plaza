@@ -6222,6 +6222,69 @@ test "unfollowing removes exactly one name" {
     try testing.expect(!saw_bob);
 }
 
+test "a place brings its own relays, and a feed can be about people" {
+    // The document is fiatjaf's Monero Hallway instance, trimmed. Its "People"
+    // feed names twenty pubkeys and NO relay, and Plaza used to drop any feed
+    // without one: the room simply never appeared, with nothing said about why.
+    const doc =
+        \\{"appName": "Monero Hallway",
+        \\ "readRepliesFrom": ["wss://xmr.usenostr.org", "wss://nostr.xmr.rocks"],
+        \\ "publishTargets": ["wss://xmr.usenostr.org", "wss://nostr.xmr.rocks"],
+        \\ "hardcodedFeeds": [
+        \\   {"name": "Monero Topic", "relays": ["wss://topic.relays.land/monero"]},
+        \\   {"name": "People", "pubkeys": [
+        \\     "35d38fa2efb7c9f4b1bf20a4d2cded731b152ed871a0aac9d72347265c9b42d8",
+        \\     "5f17d7be02ab98c11360c241556017377fa0f00127cd0a912f128e288c8c4dca",
+        \\     "0c45d7d45edb0fadda4215d36ca0d9aba0c771b85d3717764b8a128d5e443e4d"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+
+    // Both feeds, not one.
+    try testing.expectEqual(@as(u8, 2), place.feeds_len);
+    try testing.expectEqualStrings("Monero Topic", place.feeds[0].name());
+    try testing.expectEqualStrings("People", place.feeds[1].name());
+
+    // The relay feed keeps its relay and names nobody.
+    try testing.expectEqualStrings("wss://topic.relays.land/monero", place.feeds[0].relay());
+    try testing.expectEqual(@as(usize, 0), place.feeds[0].people().len);
+
+    // The people feed names its people and no relay, so it has to ask the
+    // place's own.
+    try testing.expectEqual(@as(usize, 3), place.feeds[1].people().len);
+    try testing.expectEqual(@as(usize, 0), place.feeds[1].relay().len);
+
+    try testing.expectEqual(@as(u8, 2), place.read_relays_len);
+    try testing.expectEqualStrings("wss://xmr.usenostr.org", place.readRelay(0));
+    try testing.expectEqual(@as(u8, 2), place.write_relays_len);
+    try testing.expectEqualStrings("wss://xmr.usenostr.org", place.writeRelay(0));
+
+    // Absent means additive, never "only mine". A place that says nothing must
+    // not be read as taking the reader's own relays away.
+    try testing.expect(!place.read_exclusive);
+    try testing.expect(!place.write_exclusive);
+}
+
+test "a place cannot point the reader at something that is not a relay" {
+    // Every address a stranger fills in goes through the same gate. A place
+    // naming http, or a credential, or nothing at all, keeps none of it.
+    const doc =
+        \\{"appName": "Nowhere",
+        \\ "readRepliesFrom": ["http://insecure.example", "wss://ok.example"],
+        \\ "publishTargets": ["not a url"],
+        \\ "publishTargetsExclusive": true,
+        \\ "hardcodedFeeds": [{"name": "x", "relays": ["wss://ok.example"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+
+    try testing.expectEqual(@as(u8, 1), place.read_relays_len);
+    try testing.expectEqualStrings("wss://ok.example", place.readRelay(0));
+
+    // And exclusivity over an empty list is refused. A place claiming "only
+    // mine" while naming none would otherwise silence the reader completely.
+    try testing.expectEqual(@as(u8, 0), place.write_relays_len);
+    try testing.expect(!place.write_exclusive);
+}
+
 test "a note waits before it is signed, and pressing again takes it back" {
     // plaza#330. The pause is on the NEAR side of the signature on purpose:
     // once a note is signed and out, a kind:5 is a request a relay may ignore

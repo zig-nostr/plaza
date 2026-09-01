@@ -2675,11 +2675,27 @@ const place_feeds_cap = 5;
 /// is that the room is not empty on arrival, not that it is complete.
 const place_seed_cap = 60;
 
+/// How many relays a place may name for reading or writing. Hallway's own
+/// documents name two; a place asking for more than four is asking the reader
+/// to open sockets they did not choose.
+const place_relays_cap = 4;
+/// How many people one feed may name. Hallway's Monero instance names twenty in
+/// a single feed, so this is not a shape that stays small on its own.
+const place_feed_pubkeys_cap = 24;
+
 const PlaceFeed = struct {
     name_buf: [place_feed_name_cap]u8 = @splat(0),
     name_len: u8 = 0,
     relay_buf: [place_relay_cap]u8 = @splat(0),
     relay_len: u8 = 0,
+    /// Who this feed is about, when it is about people rather than a relay.
+    ///
+    /// Hallway's "People" feed names twenty pubkeys and NO relay, and a feed
+    /// with no relay used to be dropped at the parser: the room simply did not
+    /// appear, with nothing said. A feed like this asks the PLACE's own read
+    /// relays, which is what `read_relays` below is for.
+    pubkeys: [place_feed_pubkeys_cap][32]u8 = undefined,
+    pubkeys_len: u8 = 0,
     /// What this feed asks the relay for. Empty means Hallway said nothing,
     /// which is notes: the fallback lives at the subscription rather than here
     /// so an empty list stays distinguishable from a stated `[1]`.
@@ -2694,6 +2710,9 @@ const PlaceFeed = struct {
     }
     pub fn kinds(self: *const PlaceFeed) []const u16 {
         return self.kinds_buf[0..self.kinds_len];
+    }
+    pub fn people(self: *const PlaceFeed) []const [32]u8 {
+        return self.pubkeys[0..self.pubkeys_len];
     }
 };
 
@@ -2737,6 +2756,29 @@ pub const Place = struct {
     /// mixture down. Which is the same "you are looking at the wrong room" bug
     /// the rebuild flag exists to prevent, in miniature.
     seen_feed: u8 = 0,
+    /// The relays this community reads from and writes to, from Hallway's
+    /// `readRepliesFrom` and `publishTargets`.
+    ///
+    /// Plaza had relays and had places and never joined them, which cost two
+    /// things at once. A feed naming people and no relay had nothing to ask, so
+    /// it was dropped and the room never appeared. And a note written inside a
+    /// place walked the READER's write slots, so it went everywhere except the
+    /// community it was written in.
+    read_relays: [place_relays_cap][place_relay_cap]u8 = @splat(@splat(0)),
+    read_relay_lens: [place_relays_cap]u8 = @splat(0),
+    read_relays_len: u8 = 0,
+    write_relays: [place_relays_cap][place_relay_cap]u8 = @splat(@splat(0)),
+    write_relay_lens: [place_relays_cap]u8 = @splat(0),
+    write_relays_len: u8 = 0,
+    /// Whether those relays are the ONLY ones.
+    ///
+    /// Read from `readRepliesFromExclusive` and `publishTargetsExclusive`. The
+    /// permissive reading is the one implemented: false means "these as well as
+    /// mine", true means "only these". That is what the names say, and I have
+    /// not read Hallway's own code to confirm it, so the default when the key is
+    /// absent is the additive one, which cannot take a reader's relays away.
+    read_exclusive: bool = false,
+    write_exclusive: bool = false,
     /// The `created_at` of the event this was read from, so a newer copy of a
     /// REPLACEABLE document can tell itself apart from the one on screen. Zero
     /// for a place that did not come from an event (a test, a restored line),
@@ -2754,6 +2796,12 @@ pub const Place = struct {
     }
     pub fn share(self: *const Place) []const u8 {
         return self.share_buf[0..self.share_len];
+    }
+    pub fn readRelay(self: *const Place, i: usize) []const u8 {
+        return self.read_relays[i][0..self.read_relay_lens[i]];
+    }
+    pub fn writeRelay(self: *const Place, i: usize) []const u8 {
+        return self.write_relays[i][0..self.write_relay_lens[i]];
     }
 };
 
@@ -2797,6 +2845,13 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         /// The community's web gateway, e.g. "https://njump.me/". Checked
         /// before it is kept: this one sends the READER somewhere.
         baseShareURL: []const u8 = "",
+        /// The community's own relays. `readRepliesFrom` is what its feeds ask;
+        /// `publishTargets` is where a note written here belongs.
+        readRepliesFrom: []const []const u8 = &.{},
+        publishTargets: []const []const u8 = &.{},
+        /// Whether those are the only ones. See `Place.read_exclusive`.
+        readRepliesFromExclusive: bool = false,
+        publishTargetsExclusive: bool = false,
         hardcodedFeeds: []const struct {
             /// Optional in Hallway's own data: one feed on the site I read
             /// carries only `relays`, so a feed with no name falls back to its
@@ -2842,11 +2897,25 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
                 break;
             }
         }
-        if (chosen.len == 0) continue;
 
         var out = PlaceFeed{};
-        out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
-        const label = if (f.name.len > 0) f.name else relayHost(chosen);
+        // People, when it names any. A feed may be about a relay or about a
+        // set of people, and Hallway's own Monero instance ships one of each.
+        for (f.pubkeys) |hex| {
+            if (out.pubkeys_len == out.pubkeys.len) break;
+            if (hex.len != 64) continue;
+            var pk: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&pk, hex) catch continue;
+            out.pubkeys[out.pubkeys_len] = pk;
+            out.pubkeys_len += 1;
+        }
+        // A feed with neither a relay to dial nor a person to ask about is not
+        // a feed. One with people and no relay asks the PLACE's relays, which
+        // is why it is no longer dropped here.
+        if (chosen.len == 0 and out.pubkeys_len == 0) continue;
+
+        if (chosen.len > 0) out.relay_len = @intCast(copyBounded(&out.relay_buf, chosen));
+        const label = if (f.name.len > 0) f.name else if (chosen.len > 0) relayHost(chosen) else "People";
         out.name_len = @intCast(copyBounded(&out.name_buf, label));
         // Bounded like every other field a stranger fills. A feed naming more
         // kinds than fit keeps the first few rather than being refused: a place
@@ -2859,6 +2928,26 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         m.feeds[m.feeds_len] = out;
         m.feeds_len += 1;
     }
+
+    // The community's own relays, checked like every other address a stranger
+    // fills in: `isSafeRelayUrl` is what stops a place pointing the reader's
+    // socket at something that is not a relay.
+    for (w.readRepliesFrom) |r| {
+        if (m.read_relays_len == place_relays_cap) break;
+        if (!isSafeRelayUrl(r)) continue;
+        m.read_relay_lens[m.read_relays_len] = @intCast(copyBounded(&m.read_relays[m.read_relays_len], r));
+        m.read_relays_len += 1;
+    }
+    for (w.publishTargets) |r| {
+        if (m.write_relays_len == place_relays_cap) break;
+        if (!isSafeRelayUrl(r)) continue;
+        m.write_relay_lens[m.write_relays_len] = @intCast(copyBounded(&m.write_relays[m.write_relays_len], r));
+        m.write_relays_len += 1;
+    }
+    // Only meaningful when there is a list to be exclusive about. A place
+    // claiming "only mine" and naming none would otherwise silence the reader.
+    m.read_exclusive = w.readRepliesFromExclusive and m.read_relays_len > 0;
+    m.write_exclusive = w.publishTargetsExclusive and m.write_relays_len > 0;
 
     // A place with nothing to say is not a place. This is what stops any random
     // kind:30078 (the kind is shared by every app that stores settings) from
@@ -25047,11 +25136,22 @@ fn startPlaceFeed(m: *const Place) void {
     const feed = currentPlaceFeed(m) orelse return;
     const gen = g_place_gen.load(.monotonic);
     var url_buf: [place_relay_cap]u8 = undefined;
-    const len = copyBounded(&url_buf, feed.relay());
+    // A feed about people names no relay of its own, so it asks the PLACE's,
+    // which is the whole reason a place carries them. Falling back to the
+    // reader's own pool would ask the wrong relays a question about a community
+    // they have never heard of.
+    const url = if (feed.relay().len > 0)
+        feed.relay()
+    else if (m.read_relays_len > 0)
+        m.readRelay(0)
+    else
+        "";
+    if (url.len == 0) return;
+    const len = copyBounded(&url_buf, url);
     // BY VALUE, like the url: the worker outlives this frame's borrow of the
     // place, and the reader may have walked out of it by the time the socket
     // opens.
-    const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, feed.kinds_buf, feed.kinds_len, gen }) catch return;
+    const t = std.Thread.spawn(.{}, placeFeedWorker, .{ url_buf, len, feed.kinds_buf, feed.kinds_len, gen, feed.pubkeys, feed.pubkeys_len }) catch return;
     t.detach();
 }
 
@@ -25059,7 +25159,7 @@ fn startPlaceFeed(m: *const Place) void {
 /// feed but one, and every one of those is notes.
 const place_feed_default_kinds = [_]u16{1};
 
-fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [place_feed_kinds_cap]u16, kinds_len: u8, gen: u32) void {
+fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [place_feed_kinds_cap]u16, kinds_len: u8, gen: u32, authors: [place_feed_pubkeys_cap][32]u8, authors_len: u8) void {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -25082,7 +25182,14 @@ fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [pla
     // kind 1 and an empty room that never filled, which reads as a broken relay
     // rather than as a client that was not listening.
     const kinds: []const u16 = if (kinds_len > 0) kinds_buf[0..kinds_len] else &place_feed_default_kinds;
-    const filters = [_]nostr.filter.Filter{.{ .kinds = kinds, .limit = place_feed_cap }};
+    // A feed about PEOPLE asks for those people; one about a relay asks that
+    // relay for everything of the kinds it names. Both by value, like the url:
+    // this thread outlives the frame that borrowed the place.
+    const filters = if (authors_len > 0) [_]nostr.filter.Filter{.{
+        .authors = authors[0..authors_len],
+        .kinds = kinds,
+        .limit = place_feed_cap,
+    }} else [_]nostr.filter.Filter{.{ .kinds = kinds, .limit = place_feed_cap }};
     relay.subscribe("plaza-place", &filters) catch return;
 
     while (g_place_gen.load(.monotonic) == gen) {
@@ -29551,6 +29658,34 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+
+    // The place being read, if any, sent to FIRST and separately from the
+    // reader's own pool.
+    //
+    // A note written inside a community used to walk only the reader's write
+    // slots, so it went everywhere except the community it was written in. The
+    // place names where it lives; this is that promise kept.
+    //
+    // Not recorded in the outbox: a slot index is what an acknowledgement is
+    // filed against, and these relays hold no slot. So they are a best effort
+    // in the same sense the room itself is, and the note is still tracked
+    // against the reader's own relays below.
+    var place_only = false;
+    if (visitingPlace()) |place| {
+        for (0..place.write_relays_len) |i| {
+            const url = place.writeRelay(i);
+            var relay = nostr.relay.dial(gpa, io, url) catch continue;
+            defer relay.deinit();
+            const watched = watchOneShot(io, relay, one_shot_budget_ms);
+            defer releaseOneShot(watched);
+            relay.publish(ev) catch continue;
+        }
+        // "Only these" is the place's to say, and it is only honoured when it
+        // named some: a place claiming exclusivity and naming none would
+        // otherwise silence the reader entirely.
+        place_only = place.write_exclusive;
+    }
+    if (place_only) return;
 
     for (0..relaySlots()) |i| {
         var url_buf: [96]u8 = undefined;
