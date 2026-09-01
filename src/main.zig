@@ -22076,7 +22076,88 @@ const place_info_card_width: f32 = 620;
 ///
 /// A scroll region rather than a shorter excerpt, because Info is the surface
 /// where the WHOLE text belongs; cutting it is the welcome's job, not this one.
-const place_info_home_height: f32 = 380;
+/// The most of a host's welcome that is shown before it scrolls.
+const place_info_home_max: f32 = 380;
+
+/// How tall the welcome needs to be, so a short one does not leave a void.
+///
+/// This was a fixed 380 and a two-line welcome sat above three hundred points
+/// of nothing, with the Close button stranded at the bottom of an empty box.
+/// There is no `max_height` on a canvas node, so the height has to be worked
+/// out rather than declared.
+///
+/// An ESTIMATE, deliberately generous. Over-guessing costs a little scroll at
+/// the end; under-guessing cuts the host's last line off, and of the two only
+/// one loses somebody's words.
+fn placeHomeHeight(text: []const u8) f32 {
+    // At 580 points and this body size, about 90 characters fit on a line.
+    // Measured off a real render rather than guessed: the welcome that prompted
+    // this wraps after 82 and its second paragraph fits 165 in two lines.
+    const per_line: usize = 90;
+    const line_height: f32 = 21;
+    // Lines of text and gaps BETWEEN blocks are charged separately: the
+    // renderer puts 12 points between blocks, not a blank line's worth, and
+    // several blank lines in a row are still one break.
+    const block_gap: f32 = 12;
+    var lines: usize = 0;
+    var breaks: usize = 0;
+    var in_gap = true; // leading blanks are not a break
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const shown = visibleLen(line);
+        if (shown == 0) {
+            if (!in_gap) breaks += 1;
+            in_gap = true;
+            continue;
+        }
+        in_gap = false;
+        lines += (shown + per_line - 1) / per_line;
+    }
+    // No slack on the end. This is a SCROLL, so guessing low costs a little
+    // scrolling and guessing high leaves a void with the buttons stranded below
+    // it, which is the bug this function exists for. I had that backwards once.
+    const wanted = @as(f32, @floatFromInt(lines)) * line_height +
+        @as(f32, @floatFromInt(breaks)) * block_gap;
+    return @min(wanted, place_info_home_max);
+}
+
+/// How much of a markdown line a reader actually sees.
+///
+/// Counting raw bytes is what made the first estimate useless: one paragraph of
+/// this welcome carries `[experimental customizeable client](/nevent1q…)`, and
+/// that address is two hundred characters that are never drawn. The line looked
+/// four times longer than it reads.
+fn visibleLen(line: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    // Leading heading markers and quote marks are syntax, not text.
+    while (i < line.len and (line[i] == '#' or line[i] == '>' or line[i] == ' ')) i += 1;
+    while (i < line.len) {
+        // `](url)` is an address. Skip to its closing paren.
+        if (line[i] == ']' and i + 1 < line.len and line[i + 1] == '(') {
+            if (std.mem.indexOfScalarPos(u8, line, i + 2, ')')) |end| {
+                i = end + 1;
+                continue;
+            }
+        }
+        // The brackets and emphasis marks themselves are not drawn either.
+        if (line[i] == '[' or line[i] == ']' or line[i] == '*' or line[i] == '`') {
+            i += 1;
+            continue;
+        }
+        n += 1;
+        i += 1;
+    }
+    return n;
+}
+
+pub fn visibleLenForTest(line: []const u8) usize {
+    return visibleLen(line);
+}
+
+pub fn placeHomeHeightForTest(text: []const u8) f32 {
+    return placeHomeHeight(text);
+}
 
 /// What a place is, who hosts it, where it reads from, and the way out.
 ///
@@ -22155,7 +22236,7 @@ fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
             // and wrong enough to lose a word every line. The markdown renderer
             // never sets `.wrap` on its paragraphs, so the width it is handed is
             // the only thing deciding where a line ends.
-            if (m.home_len > 0) ui.scroll(.{ .width = place_info_card_width - 40, .height = place_info_home_height }, .{
+            if (m.home_len > 0) ui.scroll(.{ .width = place_info_card_width - 40, .height = placeHomeHeight(placeHome(ui, m)) }, .{
                 ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
                     canvas.markdown.Markdown(Msg).view(ui, placeHome(ui, m), .{}),
                 }),

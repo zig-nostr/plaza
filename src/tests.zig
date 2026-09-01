@@ -6281,6 +6281,35 @@ test "a place says where it reads a kind, and a pattern is checked before it is 
     try testing.expect(place.handlerFor(30023) == null);
 }
 
+test "a short welcome does not reserve a tall empty card" {
+    // The card used to reserve a fixed 380 points whatever the host wrote, so a
+    // two-line welcome sat above three hundred points of nothing with the Close
+    // button stranded at the bottom of an empty box.
+    const short = "## Welcome!\n\nTwo lines, that is all.";
+    const tall = main.placeHomeHeightForTest(short);
+    try testing.expect(tall > 0);
+    try testing.expect(tall < 140);
+
+    // And a long one is still capped, so a host cannot push the buttons off the
+    // screen with an essay.
+    var long_buf: [2000]u8 = undefined;
+    @memset(&long_buf, 'x');
+    try testing.expectEqual(@as(f32, 380), main.placeHomeHeightForTest(&long_buf));
+}
+
+test "measuring a markdown line counts what is drawn, not what is written" {
+    // This is what made the first estimate useless. One paragraph of the Monero
+    // welcome carries a link whose address is two hundred characters that are
+    // never drawn, so the line measured four times longer than it reads.
+    const link = "See [the client](/nevent1qvzqqqqqqypzqwlsccluhy6xxsr6l9a9uhhxf75g85g8a709tprjcn4e42h053va) here";
+    try testing.expectEqual(@as(usize, "See the client here".len), main.visibleLenForTest(link));
+
+    // Heading markers are syntax, not text.
+    try testing.expectEqual(@as(usize, "Welcome!".len), main.visibleLenForTest("## Welcome!"));
+    // Plain text is itself.
+    try testing.expectEqual(@as(usize, 5), main.visibleLenForTest("hello"));
+}
+
 test "an image with no alt text leaves nothing behind" {
     // The renderer draws an image as its ALT text, which is right for a client
     // that spends its image budget on faces. `![](url)` has no alt, so the
