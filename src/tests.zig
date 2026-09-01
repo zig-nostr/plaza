@@ -6264,6 +6264,45 @@ test "a place brings its own relays, and a feed can be about people" {
     try testing.expect(!place.write_exclusive);
 }
 
+test "a place says where it reads a kind, and a pattern is checked before it is offered" {
+    // fiatjaf's Monero instance names Nosmero for kind 1. The pattern needs a
+    // QUERY, which is exactly what `isSafeShareUrl` refuses, so handlers get
+    // their own gate rather than a loosened version of that one.
+    const doc =
+        \\{"appName": "Monero Hallway",
+        \\ "clientHandlers": {"byKind": {"1": [{"name": "Nosmero", "urlPattern": "https://nosmero.com/?thread={e}"}]}, "fallback": null},
+        \\ "hardcodedFeeds": [{"name": "x", "relays": ["wss://ok.example"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+    const h = place.handlerFor(1) orelse return error.NoHandler;
+    try testing.expectEqualStrings("Nosmero", h.name());
+    try testing.expectEqualStrings("https://nosmero.com/?thread={e}", h.pattern());
+    // And nothing is claimed for a kind the place said nothing about.
+    try testing.expect(place.handlerFor(30023) == null);
+}
+
+test "a handler pattern this app will not open" {
+    // Each of these is a way of sending the reader somewhere other than where
+    // the row says. The row names the host, so the host is the thing that must
+    // not be up for grabs.
+    try testing.expect(main.isSafeHandlerUrl("https://nosmero.com/?thread={e}"));
+    try testing.expect(main.isSafeHandlerUrl("https://n.example/e/{e}"));
+
+    // Not https.
+    try testing.expect(!main.isSafeHandlerUrl("http://nosmero.com/?thread={e}"));
+    // Credentials in the authority: the row would name the wrong host.
+    try testing.expect(!main.isSafeHandlerUrl("https://evil.example@real.example/{e}"));
+    // A placeholder in the HOST, which would let a note id choose the server.
+    try testing.expect(!main.isSafeHandlerUrl("https://{e}.example/x"));
+    // No placeholder is a fixed link that ignores which note was pressed.
+    try testing.expect(!main.isSafeHandlerUrl("https://nosmero.com/"));
+    // Several is an ambiguity not worth resolving.
+    try testing.expect(!main.isSafeHandlerUrl("https://n.example/{e}/{e}"));
+    // A backslash, and a control character.
+    try testing.expect(!main.isSafeHandlerUrl("https://n.example\\@x/{e}"));
+    try testing.expect(!main.isSafeHandlerUrl("https://n.example/\x01{e}"));
+}
+
 test "a place cannot point the reader at something that is not a relay" {
     // Every address a stranger fills in goes through the same gate. A place
     // naming http, or a credential, or nothing at all, keeps none of it.
