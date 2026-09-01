@@ -22085,6 +22085,44 @@ const place_info_home_height: f32 = 380;
 /// destructive verb in a place and it was sitting a few pixels from Enter, and
 /// a reader who is about to leave is exactly the reader who should be looking
 /// at what this place is.
+/// The host's own words, with image syntax carrying no alt text removed.
+///
+/// The renderer draws an image as its ALT TEXT, which is the right call for a
+/// client that spends its whole image budget on faces. `![alt](url)` therefore
+/// reads as "alt". But `![](url)`, which is valid markdown and what Hallway's
+/// Monero instance writes, has no alt to draw: the renderer does not take it as
+/// an image at all, so the reader gets a literal `![]` followed by the raw URL
+/// as a link.
+///
+/// An image with no alt text says nothing that can be written down, so nothing
+/// is what it should leave behind.
+fn placeHome(ui: *AppUi, m: *const Place) []const u8 {
+    return stripEmptyImages(ui.arena, m.home());
+}
+
+pub fn stripEmptyImagesForTest(arena: std.mem.Allocator, src: []const u8) []const u8 {
+    return stripEmptyImages(arena, src);
+}
+
+fn stripEmptyImages(arena: std.mem.Allocator, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "![](") == null) return src;
+    var out = std.ArrayList(u8).initCapacity(arena, src.len) catch return src;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (std.mem.startsWith(u8, src[i..], "![](")) {
+            // To the closing paren of the URL. An unclosed one is not image
+            // syntax, so it is left exactly as the host wrote it.
+            if (std.mem.indexOfScalarPos(u8, src, i + 4, ')')) |end| {
+                i = end + 1;
+                continue;
+            }
+        }
+        out.append(arena, src[i]) catch return src;
+        i += 1;
+    }
+    return out.items;
+}
+
 fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
     const p = theme.palette;
     const leaving = g_place_info == .leaving;
@@ -22109,9 +22147,17 @@ fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
             if (m.home_len > 0) vgap(ui, 12) else ui.spacer(0),
             if (m.home_len > 0) ui.separator(.{ .style = .{ .foreground = p.divider_card, .background = p.divider_card } }) else ui.spacer(0),
             if (m.home_len > 0) vgap(ui, 4) else ui.spacer(0),
-            if (m.home_len > 0) ui.scroll(.{ .height = place_info_home_height }, .{
+            // The scroll is given the width too, not only the column inside it.
+            //
+            // Without it the host's paragraphs laid out wider than the card and
+            // the overflow was cut, mid-word, with the rest of the sentence
+            // continuing on the next line: readable enough to look deliberate
+            // and wrong enough to lose a word every line. The markdown renderer
+            // never sets `.wrap` on its paragraphs, so the width it is handed is
+            // the only thing deciding where a line ends.
+            if (m.home_len > 0) ui.scroll(.{ .width = place_info_card_width - 40, .height = place_info_home_height }, .{
                 ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
-                    canvas.markdown.Markdown(Msg).view(ui, m.home(), .{}),
+                    canvas.markdown.Markdown(Msg).view(ui, placeHome(ui, m), .{}),
                 }),
             }) else ui.spacer(0),
             vgap(ui, 14),
