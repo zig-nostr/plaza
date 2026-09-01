@@ -2666,6 +2666,14 @@ const place_share_cap = 96;
 /// (`[1, 30311]`), and a place that wants more than eight in a single feed is
 /// asking for a subscription no relay wants to serve.
 const place_feed_kinds_cap = 8;
+/// How many "open this in that app" handlers a place may carry, and how long
+/// one may be. Hallway's Monero instance ships one; four is room for a place
+/// that handles notes, articles and streams differently without becoming a menu
+/// nobody can read.
+const place_handlers_cap = 4;
+const place_handler_name_cap = 24;
+const place_handler_url_cap = 120;
+
 /// How many feeds a place may carry. Hallway's OWN default document ships five
 /// ("Basically Global", "Kinda Trending", "Livestreams", and two more), so one
 /// was not a simplification of the format, it was four fifths of a community
@@ -2682,6 +2690,29 @@ const place_relays_cap = 4;
 /// How many people one feed may name. Hallway's Monero instance names twenty in
 /// a single feed, so this is not a shape that stays small on its own.
 const place_feed_pubkeys_cap = 24;
+
+/// One of a place's `clientHandlers`: the web app this community reads a kind
+/// in, e.g. kind 1 in Nosmero.
+///
+/// Plaza already had the one-URL version of this idea in `baseShareURL`. This is
+/// the same promise per kind, so a community that reads its notes somewhere
+/// specific can say so.
+const PlaceHandler = struct {
+    kind: u16 = 0,
+    name_buf: [place_handler_name_cap]u8 = @splat(0),
+    name_len: u8 = 0,
+    /// The pattern with `{e}` still in it. Substituted at the press, not here,
+    /// because what goes in is the id of whichever note was pressed.
+    url_buf: [place_handler_url_cap]u8 = @splat(0),
+    url_len: u8 = 0,
+
+    pub fn name(self: *const PlaceHandler) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn pattern(self: *const PlaceHandler) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
 
 const PlaceFeed = struct {
     name_buf: [place_feed_name_cap]u8 = @splat(0),
@@ -2779,6 +2810,9 @@ pub const Place = struct {
     /// absent is the additive one, which cannot take a reader's relays away.
     read_exclusive: bool = false,
     write_exclusive: bool = false,
+    /// Where this community reads each kind, from `clientHandlers`.
+    handlers: [place_handlers_cap]PlaceHandler = @splat(.{}),
+    handlers_len: u8 = 0,
     /// The `created_at` of the event this was read from, so a newer copy of a
     /// REPLACEABLE document can tell itself apart from the one on screen. Zero
     /// for a place that did not come from an event (a test, a restored line),
@@ -2802,6 +2836,13 @@ pub const Place = struct {
     }
     pub fn writeRelay(self: *const Place, i: usize) []const u8 {
         return self.write_relays[i][0..self.write_relay_lens[i]];
+    }
+    /// The handler this place names for `kind`, if it names one.
+    pub fn handlerFor(self: *const Place, kind: u16) ?*const PlaceHandler {
+        for (self.handlers[0..self.handlers_len]) |*h| {
+            if (h.kind == kind) return h;
+        }
+        return null;
     }
 };
 
@@ -2852,6 +2893,10 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         /// Whether those are the only ones. See `Place.read_exclusive`.
         readRepliesFromExclusive: bool = false,
         publishTargetsExclusive: bool = false,
+        /// `{"byKind": {"1": [{"name": .., "urlPattern": ..}]}}`. Taken as a
+        /// raw value because the keys are kind NUMBERS written as strings, so
+        /// there is no struct to parse it into; it is walked below.
+        clientHandlers: std.json.Value = .null,
         hardcodedFeeds: []const struct {
             /// Optional in Hallway's own data: one feed on the site I read
             /// carries only `relays`, so a feed with no name falls back to its
@@ -2949,6 +2994,42 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
     m.read_exclusive = w.readRepliesFromExclusive and m.read_relays_len > 0;
     m.write_exclusive = w.publishTargetsExclusive and m.write_relays_len > 0;
 
+    // Where this community reads each kind. Walked by hand because the keys are
+    // kind numbers written as strings, which is an object no struct describes.
+    if (w.clientHandlers == .object) {
+        if (w.clientHandlers.object.get("byKind")) |by_kind| {
+            if (by_kind == .object) {
+                var it = by_kind.object.iterator();
+                while (it.next()) |entry| {
+                    if (m.handlers_len == place_handlers_cap) break;
+                    const kind = std.fmt.parseInt(u16, entry.key_ptr.*, 10) catch continue;
+                    if (entry.value_ptr.* != .array) continue;
+                    // The first one this app will open. A place may list
+                    // several and the reader is offered one row, so a handler
+                    // that fails the gate is skipped rather than ending the
+                    // list: the next may be fine.
+                    for (entry.value_ptr.array.items) |item| {
+                        if (item != .object) continue;
+                        const url_v = item.object.get("urlPattern") orelse continue;
+                        if (url_v != .string) continue;
+                        if (!isSafeHandlerUrl(url_v.string)) continue;
+                        var h = PlaceHandler{ .kind = kind };
+                        h.url_len = @intCast(copyBounded(&h.url_buf, url_v.string));
+                        const name_v = item.object.get("name");
+                        const label = if (name_v) |n| (if (n == .string) n.string else "") else "";
+                        // Named by its host when it names itself nothing: a row
+                        // reading "Open in" and then nothing is worse than one
+                        // naming the site it will open.
+                        h.name_len = @intCast(copyBounded(&h.name_buf, if (label.len > 0) label else shareHost(url_v.string)));
+                        m.handlers[m.handlers_len] = h;
+                        m.handlers_len += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // A place with nothing to say is not a place. This is what stops any random
     // kind:30078 (the kind is shared by every app that stores settings) from
     // being applied as one.
@@ -3020,6 +3101,45 @@ pub fn isSafeShareUrl(url: []const u8) bool {
     if (authority.len == 0) return false;
     if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
     return true;
+}
+
+/// Whether a place's `clientHandlers` pattern is one this app will open.
+///
+/// A SEPARATE gate from `isSafeShareUrl`, deliberately. That one refuses `?`
+/// and `#` outright, because a share base has no business carrying a query and
+/// one that does is usually carrying a redirect. A handler pattern is the case
+/// where a query IS the mechanism: `https://nosmero.com/?thread={e}`. So the
+/// query is allowed and everything else is tightened instead.
+///
+/// Exactly one `{e}`, which is what makes this a pattern rather than a fixed
+/// address. What replaces it is an event id, and the caller writes it as hex,
+/// so nothing a stranger typed reaches the URL.
+pub fn isSafeHandlerUrl(url: []const u8) bool {
+    const scheme = "https://";
+    if (!std.mem.startsWith(u8, url, scheme)) return false;
+    if (url.len <= scheme.len or url.len > place_handler_url_cap) return false;
+    for (url) |c| {
+        // Printable ASCII only, and no backslash: everything else is either a
+        // control character or a way of writing a host that does not read as
+        // one.
+        if (c <= 0x20 or c >= 0x7f) return false;
+        if (c == '\\') return false;
+    }
+    const rest = url[scheme.len..];
+    const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..authority_end];
+    if (authority.len == 0) return false;
+    // No credentials, and no placeholder in the HOST: `{e}` belongs in the path
+    // or the query, and one in the authority would let a note id choose which
+    // server this opens.
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    if (std.mem.indexOfScalar(u8, authority, '{') != null) return false;
+    // Exactly one placeholder. None is a fixed link that ignores the note;
+    // several is an ambiguity not worth resolving.
+    var seen: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, url, i, "{e}")) |at| : (i = at + 3) seen += 1;
+    return seen == 1;
 }
 
 /// The host a share URL will open, for saying so on the row that opens it.
@@ -14215,6 +14335,7 @@ pub const Msg = union(enum) {
     copy_nevent: i64,
     /// Open a note on the web (njump), for sharing it outside nostr.
     open_web: i64,
+    open_place_handler: i64,
     /// A text edit in the name beat's field.
     name_edit: canvas.TextInputEvent,
     /// Publish the chosen name as the account's kind:0 and move on.
@@ -22223,6 +22344,17 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
     n += 1;
     items[n] = .{ .label = ui.fmt("Open on {s}", .{shareHost(shareBase())}), .msg = Msg{ .open_web = note.id } };
     n += 1;
+    // And where THIS community reads its notes, when it says. Beside the app's
+    // own row rather than instead of it: a place naming a handler is telling
+    // the reader where it lives, not taking njump away from them.
+    if (visitingPlace()) |place| {
+        if (place.handlerFor(1)) |h| {
+            if (n < items.len) {
+                items[n] = .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } };
+                n += 1;
+            }
+        }
+    }
     items[n] = .{ .separator = true };
     n += 1;
     items[n] = followContextItem(note.pubkey);
@@ -26558,6 +26690,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         // njump renders any nostr event as a web page, which is how a note is
         // shared with someone who is not on nostr yet.
+        .open_place_handler => |id| {
+            const note = model.noteById(id) orelse return;
+            const place = visitingPlace() orelse return;
+            const h = place.handlerFor(1) orelse return;
+            // The pattern was checked at parse time and carries exactly one
+            // `{e}`. What goes in its place is written here as hex from the id
+            // this app already holds, so nothing a stranger typed reaches the
+            // address.
+            var id_hex: [64]u8 = undefined;
+            hexLower(&id_hex, note.event_id);
+            const pattern = h.pattern();
+            const at = std.mem.indexOf(u8, pattern, "{e}") orelse return;
+            var url_buf: [place_handler_url_cap + 64]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "{s}{s}{s}", .{
+                pattern[0..at],
+                &id_hex,
+                pattern[at + 3 ..],
+            }) catch return;
+            openExternally(fx, url);
+        },
         .open_web => |id| {
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
