@@ -6281,6 +6281,36 @@ test "a place says where it reads a kind, and a pattern is checked before it is 
     try testing.expect(place.handlerFor(30023) == null);
 }
 
+test "a place may name what its own room says, and nothing else" {
+    // Hallway's `translations` maps its OWN English to replacements, and
+    // Plaza's wording is different, so nothing matches by accident. Three keys
+    // are picked for what they mean in a room. Everything else in the map is
+    // read and ignored on purpose: a place may name its room, not rename
+    // Settings.
+    const doc =
+        \\{"appName": "Monero Hallway",
+        \\ "translations": {
+        \\   "Empty list.": "Empty list. Private, and proud of it.",
+        \\   "Loading": "Mixing…",
+        \\   "Lost in the void": "Lost in the void, unlinkable and untraceable",
+        \\   "Not following anyone": "Fungible, and free."},
+        \\ "hardcodedFeeds": [{"name": "x", "relays": ["wss://ok.example"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+    try testing.expectEqualStrings("Empty list. Private, and proud of it.", place.emptyLine());
+    try testing.expectEqualStrings("Mixing…", place.loadingLine());
+    try testing.expectEqualStrings("Lost in the void, unlinkable and untraceable", place.lostLine());
+
+    // A place that rewrites nothing leaves the app's own words alone, which is
+    // what an absent key has to mean or every silent place would blank its room.
+    const plain =
+        \\{"appName": "Plain", "hardcodedFeeds": [{"name": "x", "relays": ["wss://ok.example"]}]}
+    ;
+    const p2 = main.parsePlace(testing.allocator, plain) orelse return error.PlaceRefused;
+    try testing.expectEqual(@as(usize, 0), p2.emptyLine().len);
+    try testing.expectEqual(@as(usize, 0), p2.loadingLine().len);
+}
+
 test "a handler pattern this app will not open" {
     // Each of these is a way of sending the reader somewhere other than where
     // the row says. The row names the host, so the host is the thing that must

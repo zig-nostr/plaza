@@ -2671,6 +2671,9 @@ const place_feed_kinds_cap = 8;
 /// that handles notes, articles and streams differently without becoming a menu
 /// nobody can read.
 const place_handlers_cap = 4;
+/// How long one of a place's own room lines may be. A sentence, not an essay:
+/// this is drawn centred in an empty room.
+const place_room_line_cap = 96;
 const place_handler_name_cap = 24;
 const place_handler_url_cap = 120;
 
@@ -2813,6 +2816,26 @@ pub const Place = struct {
     /// Where this community reads each kind, from `clientHandlers`.
     handlers: [place_handlers_cap]PlaceHandler = @splat(.{}),
     handlers_len: u8 = 0,
+    /// The three lines a room says about itself, when the place rewrites them.
+    ///
+    /// From Hallway's `translations`, which is a map of its OWN English strings
+    /// to replacements. Plaza's wording is different, so nothing matches by
+    /// accident: the three keys below are picked deliberately as the ones that
+    /// mean the same thing in a room, and the mapping is a judgement written
+    /// down here rather than a lookup that happens to hit.
+    ///
+    /// Scoped to the room ON PURPOSE. Supporting the whole map would mean
+    /// routing every literal in this file through a lookup, and a place
+    /// rewriting the app's own vocabulary is the same overreach as a place
+    /// collapsing the reader's rail. A community may name what its own room
+    /// says while it is empty, connecting or unreachable. It may not rename
+    /// Settings.
+    empty_line_buf: [place_room_line_cap]u8 = @splat(0),
+    empty_line_len: u8 = 0,
+    loading_line_buf: [place_room_line_cap]u8 = @splat(0),
+    loading_line_len: u8 = 0,
+    lost_line_buf: [place_room_line_cap]u8 = @splat(0),
+    lost_line_len: u8 = 0,
     /// The `created_at` of the event this was read from, so a newer copy of a
     /// REPLACEABLE document can tell itself apart from the one on screen. Zero
     /// for a place that did not come from an event (a test, a restored line),
@@ -2838,6 +2861,15 @@ pub const Place = struct {
         return self.write_relays[i][0..self.write_relay_lens[i]];
     }
     /// The handler this place names for `kind`, if it names one.
+    pub fn emptyLine(self: *const Place) []const u8 {
+        return self.empty_line_buf[0..self.empty_line_len];
+    }
+    pub fn loadingLine(self: *const Place) []const u8 {
+        return self.loading_line_buf[0..self.loading_line_len];
+    }
+    pub fn lostLine(self: *const Place) []const u8 {
+        return self.lost_line_buf[0..self.lost_line_len];
+    }
     pub fn handlerFor(self: *const Place, kind: u16) ?*const PlaceHandler {
         for (self.handlers[0..self.handlers_len]) |*h| {
             if (h.kind == kind) return h;
@@ -2897,6 +2929,9 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         /// raw value because the keys are kind NUMBERS written as strings, so
         /// there is no struct to parse it into; it is walked below.
         clientHandlers: std.json.Value = .null,
+        /// Hallway's own English mapped to replacements. Taken raw: the keys
+        /// are sentences, so there is no struct for it either.
+        translations: std.json.Value = .null,
         hardcodedFeeds: []const struct {
             /// Optional in Hallway's own data: one feed on the site I read
             /// carries only `relays`, so a feed with no name falls back to its
@@ -3027,6 +3062,31 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
                     }
                 }
             }
+        }
+    }
+
+    // The three lines a room says about itself.
+    //
+    // Hallway's keys, chosen for what they MEAN rather than matched by text:
+    // Plaza's own wording is different, so nothing here lines up by accident
+    // and each of these three is a decision.
+    if (w.translations == .object) {
+        const t = w.translations.object;
+        // "Empty list." is what Hallway calls a list with nothing in it, which
+        // is this app's "Nothing here yet."
+        if (t.get("Empty list.")) |v| {
+            if (v == .string) m.empty_line_len = @intCast(copyBounded(&m.empty_line_buf, v.string));
+        }
+        // "Loading" for the wait. Hallway also ships "Loading..." and
+        // "loading..." as separate keys; the bare one is the label, the others
+        // are the same word mid-sentence, so the label is what a room uses.
+        if (t.get("Loading")) |v| {
+            if (v == .string) m.loading_line_len = @intCast(copyBounded(&m.loading_line_buf, v.string));
+        }
+        // "Lost in the void" is Hallway's not-found, which in a room is the
+        // relay this place lives on not answering.
+        if (t.get("Lost in the void")) |v| {
+            if (v == .string) m.lost_line_len = @intCast(copyBounded(&m.lost_line_buf, v.string));
         }
     }
 
@@ -10451,11 +10511,16 @@ pub const Model = struct {
         // under a place header describes a connection that has nothing to do
         // with the empty screen it is explaining, and says "connecting" about a
         // socket that may have failed a minute ago.
-        if (g_place != null) return switch (placeLink()) {
-            .idle, .connecting => "Connecting to this place…",
-            .unreachable_relay => "Can't reach this place. Retrying…",
-            .connected => "Nothing here yet.",
-        };
+        if (g_place != null) {
+            // What the place calls it, when it says. Only these three lines,
+            // and only inside the room: see `Place.empty_line_buf`.
+            const p = visitingPlace();
+            return switch (placeLink()) {
+                .idle, .connecting => if (p) |m| (if (m.loadingLine().len > 0) m.loadingLine() else "Connecting to this place…") else "Connecting to this place…",
+                .unreachable_relay => if (p) |m| (if (m.lostLine().len > 0) m.lostLine() else "Can't reach this place. Retrying…") else "Can't reach this place. Retrying…",
+                .connected => if (p) |m| (if (m.emptyLine().len > 0) m.emptyLine() else "Nothing here yet.") else "Nothing here yet.",
+            };
+        }
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
         return "Connecting to the relay pool…";
     }
