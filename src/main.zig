@@ -22408,7 +22408,13 @@ fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
             // the only thing deciding where a line ends.
             if (m.home_len > 0) ui.scroll(.{ .width = place_info_home_width, .height = placeHomeHeight(placeHome(ui, m)) }, .{
                 ui.column(.{ .width = place_info_home_width, .gap = 0 }, .{
-                    canvas.markdown.Markdown(Msg).view(ui, placeHome(ui, m), .{}),
+                    // With its links live. Passing no options renders them
+                    // styled and inert, which is worse than not styling them:
+                    // the reader is shown something that looks pressable and
+                    // does nothing. They go through `open_url` like every other
+                    // link in the app, so the same host checks apply to a
+                    // stranger's welcome as to a stranger's note.
+                    canvas.markdown.Markdown(Msg).view(ui, placeHome(ui, m), .{ .on_link = AppUi.linkMsg(.open_url) }),
                 }),
             }) else ui.spacer(0),
             vgap(ui, 14),
