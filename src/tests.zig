@@ -6281,6 +6281,34 @@ test "a place says where it reads a kind, and a pattern is checked before it is 
     try testing.expect(place.handlerFor(30023) == null);
 }
 
+test "an image with no alt text leaves nothing behind" {
+    // The renderer draws an image as its ALT text, which is right for a client
+    // that spends its image budget on faces. `![](url)` has no alt, so the
+    // renderer does not take it as an image at all and the reader gets a
+    // literal `![]` and the raw URL as a link. Seen in fiatjaf's Monero
+    // welcome, which is written exactly that way.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const src =
+        "Welcome!\n\n![](https://example.test/sticker.png)\n\nRead on.";
+    const out = main.stripEmptyImagesForTest(arena_state.allocator(), src);
+    try testing.expect(std.mem.indexOf(u8, out, "![]") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://example.test") == null);
+    // And the host's actual words are untouched.
+    try testing.expect(std.mem.indexOf(u8, out, "Welcome!") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Read on.") != null);
+
+    // An image that DOES name itself is left alone: the renderer draws that alt
+    // text, which is the whole point of the format.
+    const kept = "see ![a sticker](https://example.test/s.png) here";
+    try testing.expectEqualStrings(kept, main.stripEmptyImagesForTest(arena_state.allocator(), kept));
+
+    // And syntax that is not an image is not touched either.
+    const unclosed = "![](broken";
+    try testing.expectEqualStrings(unclosed, main.stripEmptyImagesForTest(arena_state.allocator(), unclosed));
+}
+
 test "a place may name what its own room says, and nothing else" {
     // Hallway's `translations` maps its OWN English to replacements, and
     // Plaza's wording is different, so nothing matches by accident. Three keys
