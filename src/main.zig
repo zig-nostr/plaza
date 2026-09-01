@@ -22079,6 +22079,15 @@ const place_info_card_width: f32 = 620;
 /// The most of a host's welcome that is shown before it scrolls.
 const place_info_home_max: f32 = 380;
 
+/// How wide the welcome may be inside the card.
+///
+/// The card is 620 and the welcome was laid out at 580, which put its left edge
+/// where the padding says and ran its right edge onto the card's border. The
+/// inset is 40 a side, not 20. Measured off what is drawn rather than derived
+/// from the padding value, because what the reader sees is the thing that was
+/// wrong.
+const place_info_home_width: f32 = place_info_card_width - 80;
+
 /// How tall the welcome needs to be, so a short one does not leave a void.
 ///
 /// This was a fixed 380 and a two-line welcome sat above three hundred points
@@ -22090,10 +22099,12 @@ const place_info_home_max: f32 = 380;
 /// the end; under-guessing cuts the host's last line off, and of the two only
 /// one loses somebody's words.
 fn placeHomeHeight(text: []const u8) f32 {
-    // At 580 points and this body size, about 90 characters fit on a line.
+    // At 540 points and this body size, about 72 characters fit on a line.
+    // Read off a render at that width: the second paragraph of the welcome that
+    // prompted all this wraps after 73.
     // Measured off a real render rather than guessed: the welcome that prompted
     // this wraps after 82 and its second paragraph fits 165 in two lines.
-    const per_line: usize = 90;
+    const per_line: usize = 72;
     const line_height: f32 = 21;
     // Lines of text and gaps BETWEEN blocks are charged separately: the
     // renderer puts 12 points between blocks, not a blank line's worth, and
@@ -22236,8 +22247,8 @@ fn placeInfoCard(ui: *AppUi, m: *const Place) AppUi.Node {
             // and wrong enough to lose a word every line. The markdown renderer
             // never sets `.wrap` on its paragraphs, so the width it is handed is
             // the only thing deciding where a line ends.
-            if (m.home_len > 0) ui.scroll(.{ .width = place_info_card_width - 40, .height = placeHomeHeight(placeHome(ui, m)) }, .{
-                ui.column(.{ .width = place_info_card_width - 40, .gap = 0 }, .{
+            if (m.home_len > 0) ui.scroll(.{ .width = place_info_home_width, .height = placeHomeHeight(placeHome(ui, m)) }, .{
+                ui.column(.{ .width = place_info_home_width, .gap = 0 }, .{
                     canvas.markdown.Markdown(Msg).view(ui, placeHome(ui, m), .{}),
                 }),
             }) else ui.spacer(0),
