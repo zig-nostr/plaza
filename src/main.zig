@@ -1793,7 +1793,7 @@ fn publishRelayListReporting(fx: *Effects) bool {
     const content = gpa.dupe(u8, if (previous) |prev| prev.json else "") catch return false;
     // `heldRelayListStamp()` is still the OLD stamp here: `setRelayListStamp`
     // runs below, after the handoff.
-    signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false, .{ .relay_list = heldRelayListStamp() });
+    signAndPublish(fx, gpa, created, relay_list_kind, owned, content, false, .{ .relay_list = heldRelayListStamp() }, null);
     // What the pool now represents. Without this the app's own event would come
     // back from a relay and be adopted over the pool that produced it, and worse,
     // a list the reader signed BEFORE this one would still be newer than the
@@ -5577,6 +5577,10 @@ fn helperFetchTimeout(fx: *Effects, key: u64, comptime path: []const u8, body: [
 const HelperSign = struct {
     active: bool = false,
     restorable: bool = false,
+    /// Where the write was submitted from, carried across the round trip: the
+    /// keyholder can ask a person, and the reader can walk into another room
+    /// while it waits.
+    route: PlaceRoute = .none,
     failed: bool = false,
     deadline_s: i64 = 0,
     content: ?[]u8 = null,
@@ -5617,11 +5621,12 @@ pub fn helperSignTimeoutMillisForTest() u32 {
 /// Remembers a note handed to the daemon, so a failure has something to give
 /// back. Called BEFORE the request is built, because building it can fail too
 /// and those paths used to lose the note just as quietly.
-fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool) void {
+fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool, route: PlaceRoute) void {
     releaseHelperSign();
     g_helper_sign = .{
         .active = true,
         .restorable = restorable,
+        .route = route,
         .failed = false,
         .deadline_s = nowSeconds() + helper_sign_timeout_s,
         .content = if (restorable) gpa.dupe(u8, content) catch null else null,
@@ -5684,7 +5689,7 @@ var g_helper_sign_notice = std.atomic.Value(bool).init(false);
 /// bunker and dropped it on the way to the built-in signer, so the flag arriving
 /// intact is not something a test of `requestHelperSign` alone can see.
 pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
-    return submitPost(model, fx);
+    return submitPost(model, fx, null);
 }
 
 /// The tags a body of text implies, for tests. Deliberately takes the finished
@@ -5751,7 +5756,7 @@ pub fn helperSignRestorableForTest() bool {
 }
 
 pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
-    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable);
+    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none);
 }
 
 pub fn handleHelperSignedForTest(response: native_sdk.EffectResponse) void {
@@ -5847,11 +5852,11 @@ pub fn helperSignPendingForTest() bool {
 /// event, ingested and published like any other. `content_owned` and `tags` are
 /// process-lifetime (the local and remote paths reference them too), so this
 /// does not free them.
-fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
     const pk = activePubkey() orelse return;
     // Recorded first. Every `catch return` below is a path that used to end with
     // the note gone and the app saying "Posted".
-    rememberHelperSign(gpa, content_owned, restorable);
+    rememberHelperSign(gpa, content_owned, restorable, route);
     const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
         failHelperSign();
         return;
@@ -6126,7 +6131,9 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // would otherwise leave the record armed and let a LATER unrelated failure
     // revert a press that really was published.
     releaseUndo();
-    ingestAndPublish(gpa, out, null);
+    // The room this write was submitted FROM, not the one on screen now: the
+    // keyholder can ask a person, and the reader can walk out while it waits.
+    ingestAndPublish(gpa, out, null, g_helper_sign.route);
 }
 // The listener runs for one connection generation. A logout or a reconnect
 // bumps this; the detached listener and the in-flight workers see the change
@@ -6164,6 +6171,10 @@ const PendingRemote = struct {
     // Whether `content` is a composer draft worth restoring on failure. A
     // reaction (kind:7 "+") is not, so its failure is silent, not a stray "+".
     restorable: bool = false,
+    // Where the write was submitted from. A bunker asks a person, so this comes
+    // back on a human timescale, by which time the reader may be standing in a
+    // different room entirely.
+    route: PlaceRoute = .none,
 
     fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -6183,7 +6194,7 @@ fn pendingUnlock() void {
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool) bool {
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -6197,6 +6208,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
             .generation = g_remote_generation.load(.acquire),
             .content = content,
             .restorable = restorable,
+            .route = route,
         };
         @memcpy(slot.id_buf[0..req_id.len], req_id);
         return true;
@@ -6240,7 +6252,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null);
+    return registerPending(req_id, method, content, content != null, .none);
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -18427,7 +18439,7 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     const undo_stamp = g_mute_created_at;
     _ = setMutes(next[0..n], created);
 
-    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false, .{ .mute = .{ .pubkey = pubkey, .added = muting, .created_at = undo_stamp } });
+    signAndPublish(fx, gpa, created, mute_list_kind, owned_tags, content, false, .{ .mute = .{ .pubkey = pubkey, .added = muting, .created_at = undo_stamp } }, null);
     return .published;
 }
 
@@ -19333,7 +19345,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // Remembered as the base for the next press BEFORE the write seam is handed
     // the originals, since it owns them from here and the remote path frees them.
     setPendingFollowBase(owned_tags, content, created);
-    signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false, .{ .follow = .{ .pubkey = pubkey, .added = following, .created_at = undo_stamp } });
+    signAndPublish(fx, gpa, created, contact_list_kind, owned_tags, content, false, .{ .follow = .{ .pubkey = pubkey, .added = following, .created_at = undo_stamp } }, null);
     return .published;
 }
 
@@ -26929,8 +26941,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // note is signed without a press, and the press it stands in for
                 // already happened: the reader asked, and then did not take it
                 // back.
-                if (postIsDue(g_post_due_s, nowSeconds())) _ = firePost(model, fx);
-                if (postIsDue(g_reply_due_s, nowSeconds())) fireReply(model, fx);
+                if (postIsDue(g_post_due_s, nowSeconds())) _ = firePost(model, fx, g_held_route);
+                if (postIsDue(g_reply_due_s, nowSeconds())) fireReply(model, fx, g_held_route);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model);
@@ -27070,10 +27082,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             if (g_post_delay_s > 0) {
+                // The room it is being written in, taken NOW. The pause exists
+                // so the reader can change their mind, and they are free to walk
+                // somewhere else while it counts.
+                g_held_route = routeForOpenPlace();
                 g_post_due_s = nowSeconds() + g_post_delay_s;
                 return;
             }
-            _ = firePost(model, fx);
+            _ = firePost(model, fx, null);
         },
         .open_compose => {
             // The keyboard reaches past the sheet: this is a declared shortcut,
@@ -27685,10 +27701,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             if (g_post_delay_s > 0) {
+                g_held_route = routeForOpenPlace();
                 g_reply_due_s = nowSeconds() + g_post_delay_s;
                 return;
             }
-            fireReply(model, fx);
+            fireReply(model, fx, null);
         },
         .toggle_expand => |note_id| toggleExpanded(note_id),
         .feed_scrolled => |scroll| {
@@ -28175,7 +28192,7 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // signature never comes back, that seeding is what has to be contradicted:
     // "Saved here and sent to your relays" is otherwise the last word on an
     // edit that reached nobody.
-    signAndPublish(fx, gpa, created, 0, tags, merged, false, .profile);
+    signAndPublish(fx, gpa, created, 0, tags, merged, false, .profile, null);
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
     // that reaches no relay is not retried. What IS true is that the edit is
@@ -28264,7 +28281,7 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
 pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
     const gpa = std.heap.page_allocator;
     const owned = gpa.dupe(u8, content) catch return;
-    signAndPublish(fx, gpa, created, kind, tags, owned, false, .none);
+    signAndPublish(fx, gpa, created, kind, tags, owned, false, .none, null);
 }
 
 pub fn activePubkeyForTest() ?[32]u8 {
@@ -28431,7 +28448,7 @@ fn publishName(model: *Model, fx: *Effects) void {
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
     const tags = dupeTags(gpa, prev_tags) orelse return;
-    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false, .profile);
+    signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false, .profile, null);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
         if (upsertProfile(pk)) |prof| parseMetadataInto(prof, json);
@@ -28571,13 +28588,19 @@ pub fn initialModel() Model {
 /// pause is off, and the clock, when it is on. Leaving this inline under the
 /// press meant a held note that finally went would clear no draft, close no
 /// sheet and say nothing.
-fn firePost(model: *Model, fx: *Effects) bool {
+/// The room a held note was written in, captured when the reader pressed Post
+/// rather than when the pause runs out. That gap is the whole feature: the
+/// reader is free to walk somewhere else while it counts, and the note still
+/// belongs where it was written.
+var g_held_route: PlaceRoute = .none;
+
+fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     g_post_due_s = 0;
     // Nothing below runs unless the note actually went to a signer. It used to
     // run regardless: the composer emptied, the draft file was deleted and the
     // toast said "Posted" for a sign that had been refused before it left the
     // process.
-    if (!submitPost(model, fx)) {
+    if (!submitPost(model, fx, route)) {
         setToast(model, if (!outboxHasRoom())
             "Still trying to send your last notes. This one is kept here."
         else
@@ -28641,6 +28664,16 @@ pub fn postDelayForTest() i64 {
     return g_post_delay_s;
 }
 
+/// Gives the open place one write relay of its own, the way a parsed document
+/// would. The routing tests are about WHEN the relay list is read, not about
+/// parsing it.
+pub fn setPlaceWriteRelayForTest(url: []const u8) void {
+    if (g_place == null) return;
+    const m = &g_place.?;
+    m.write_relay_lens[0] = @intCast(copyBounded(&m.write_relays[0], url));
+    m.write_relays_len = 1;
+}
+
 pub fn setPostDelayForTest(seconds: i64) void {
     g_post_delay_s = seconds;
 }
@@ -28670,7 +28703,7 @@ pub fn postSecondsLeft(due_s: i64, now_s: i64) i64 {
     return if (left < 1) 1 else left;
 }
 
-fn submitPost(model: *Model, fx: *Effects) bool {
+fn submitPost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     const text = std.mem.trim(u8, model.draft_buffer.text(), " \t\r\n");
     if (text.len == 0) return false;
     // The composer is cleared and the draft file deleted right after this
@@ -28700,7 +28733,7 @@ fn submitPost(model: *Model, fx: *Effects) bool {
     // restorable to the composer if a remote signer never answers.
     // `.none` on purpose: this is the one write that IS `restorable`, so the
     // draft it came from is what gets handed back.
-    signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true, .none);
+    signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true, .none, route);
     model.draft_buffer.clear();
     model.draft_dropped = 0;
     return true;
@@ -28712,7 +28745,7 @@ fn submitPost(model: *Model, fx: *Effects) bool {
 /// remote paths reference them after this returns, and the write seam intends
 /// them to outlive the detached publish). `restorable` marks a composer draft,
 /// so only a lost post is put back in the composer, never a reaction.
-fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags_in: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, undo: PendingUndo) void {
+fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags_in: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, undo: PendingUndo, route_in: ?PlaceRoute) void {
     // What to take back if this signature never arrives, taken as an ARGUMENT
     // rather than armed by the caller beforehand.
     //
@@ -28735,9 +28768,17 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
     // correct and never called is the regression worth guarding against here,
     // and every other seam in this file stops short of the event itself.
     g_last_published_tags = tags;
+    // Decided HERE, on the UI thread, at the moment the reader asked, and then
+    // carried. Every path past this point runs later and somewhere else: a
+    // signer that asks a person, a queue that retries, a detached publish
+    // thread. `null` means "whatever room is open right now", which is the
+    // answer for every write that is submitted the instant it is pressed; a
+    // note held for the undo pause passes the room it was WRITTEN in, because
+    // by the time it fires the reader may be standing somewhere else.
+    const route = route_in orelse routeForOpenPlace();
     switch (g_signer_kind) {
-        .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable),
-        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable),
+        .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable, route),
+        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable, route),
     }
 }
 
@@ -28848,12 +28889,12 @@ fn clipToChars(s: []const u8, max_chars: usize, max_bytes: usize) []const u8 {
 /// signed and stored local-first so it joins the thread at once. A guest cannot
 /// sign, so a reply attempt routes to the join sheet.
 /// Sends the held reply, or sends one straight away when the pause is off.
-fn fireReply(model: *Model, fx: *Effects) void {
+fn fireReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     g_reply_due_s = 0;
-    publishReply(model, fx);
+    publishReply(model, fx, route);
 }
 
-fn publishReply(model: *Model, fx: *Effects) void {
+fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     if (model.viewing_thread == 0) return;
     if (model.is_guest()) {
         model.joining = true;
@@ -28913,7 +28954,7 @@ fn publishReply(model: *Model, fx: *Effects) void {
     // reply is not `restorable`: the composer's restore path holds one draft and
     // hands it to the composer, which is the wrong box for this text.
     const kept: PendingUndo = if (std.heap.page_allocator.dupe(u8, text)) |c| .{ .reply = c } else |_| .none;
-    signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false, kept);
+    signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false, kept, route);
     model.reply_buffer.clear();
 }
 
@@ -29445,7 +29486,7 @@ fn like(model: *const Model, fx: *Effects, note_id: i64) void {
     const content = gpa.dupe(u8, "+") catch return;
     const id = nostr.event.computeId(gpa, pk, created, 7, tags, content) catch return;
     rememberLike(note_id, id);
-    signAndPublish(fx, gpa, created, 7, tags, content, false, .{ .like = note_id });
+    signAndPublish(fx, gpa, created, 7, tags, content, false, .{ .like = note_id }, null);
 }
 
 /// Publishes a kind:6 repost, and fills the icon at once.
@@ -29471,7 +29512,7 @@ fn repost(model: *Model, fx: *Effects, note_id: i64) void {
     // kind:6 arrives through the engagement subscription a moment later and sets
     // the same flag from the crowd, so this only covers the gap.
     markRepostedByMe(note_id);
-    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false, .{ .repost = note_id });
+    signAndPublish(fx, gpa, nowSeconds(), 6, tags, content, false, .{ .repost = note_id }, null);
 }
 
 /// Sets the "ours" flag on a note's row before the crowd confirms it.
@@ -29515,7 +29556,7 @@ fn unlike(fx: *Effects, note_id: i64) void {
     // The id is already gone from the table by here, so the undo carries it:
     // without it a refused un-like empties the heart, leaves the kind:7 on
     // every relay, and the next press publishes a second reaction.
-    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
+    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } }, null);
 }
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.
@@ -29606,7 +29647,7 @@ fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nost
 /// store rejects the write (a duplicate). `ev.content` must be a
 /// process-lifetime allocation, since the detached publisher reads it after
 /// this returns.
-fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer) void {
+fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer, route: PlaceRoute) void {
     if (builtin.is_test) g_last_published = ev;
     if (g_store == null) return;
     if (verify) |signer| {
@@ -29623,7 +29664,7 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     // publishing anyway would be a note nobody is tracking while the banner
     // promises that anything written is kept.
     if (isReaderNote(ev.kind)) {
-        if (!enqueueOutbox(ev.id, ev.pubkey, nowSeconds())) {
+        if (!enqueueOutbox(ev.id, ev.pubkey, nowSeconds(), route)) {
             g_outbox_overflow.store(true, .monotonic);
             return;
         }
@@ -29638,7 +29679,7 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
         // full would turn a full queue into silently dropped writes, which is
         // worse than an untracked publish and is a failure this app did not
         // have before.
-        _ = enqueueOutbox(ev.id, ev.pubkey, nowSeconds());
+        _ = enqueueOutbox(ev.id, ev.pubkey, nowSeconds(), route);
     }
     // A test drives the write path, not the network. Its pool names hosts that
     // do not resolve, and a detached dial thread for one of those outlives the
@@ -29646,7 +29687,7 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
     // reads as a failing suite with no failing assertion. Comptime, so the
     // shipped binary has no branch here at all.
     if (builtin.is_test) return;
-    const thread = std.Thread.spawn(.{}, publishWorker, .{ gpa, ev }) catch {
+    const thread = std.Thread.spawn(.{}, publishWorker, .{ gpa, ev, route }) catch {
         // No thread: the note stays queued and the next drain will carry it.
         return;
     };
@@ -29654,9 +29695,9 @@ fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nost
 }
 
 /// One publish walk for `ev`, with the queue updated around it.
-fn publishWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+fn publishWorker(gpa: std.mem.Allocator, ev: nostr.event.Event, route: PlaceRoute) void {
     markOutboxSending(ev.id, true);
-    publishEvent(gpa, ev);
+    publishEvent(gpa, ev, route);
     markOutboxSending(ev.id, false);
 }
 
@@ -29692,6 +29733,12 @@ fn markOutboxSending(id: [32]u8, sending: bool) void {
 pub const OutboxEntry = struct {
     used: bool = false,
     id: [32]u8 = [_]u8{0} ** 32,
+    /// Where this note was written, kept so a retry minutes later still goes to
+    /// the room it was written in and not to whichever one the reader has since
+    /// walked into. Not persisted: a queue reloaded from disk has lost the room,
+    /// and falls back to the reader's own relays, which is the safe direction to
+    /// be wrong in.
+    route: PlaceRoute = .none,
     /// Who signed the note this entry owes. A queue entry is a promise to ONE
     /// account, and the publisher, the counts and the popover all filter on it.
     ///
@@ -29824,13 +29871,13 @@ fn outboxEntryFor(id: [32]u8) ?*OutboxEntry {
 /// Queues a note we have just signed and stored. Returns false when the queue is
 /// full of notes that have not been acknowledged, which is a state the reader can
 /// see rather than one the app hides.
-fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64) bool {
+fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64, route: PlaceRoute) bool {
     outboxLock();
     defer outboxUnlock();
     if (outboxEntryFor(id) != null) return true;
     for (&g_outbox) |*e| {
         if (!e.used) {
-            e.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
+            e.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s, .route = route };
             _ = g_outbox_rev.fetchAdd(1, .monotonic);
             return true;
         }
@@ -29843,7 +29890,7 @@ fn enqueueOutbox(id: [32]u8, author: [32]u8, now_s: i64) bool {
         if (victim == null or e.queued_at < victim.?.queued_at) victim = e;
     }
     const slot = victim orelse return false;
-    slot.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s };
+    slot.* = .{ .used = true, .id = id, .author = author, .queued_at = now_s, .route = route };
     _ = g_outbox_rev.fetchAdd(1, .monotonic);
     return true;
 }
@@ -29987,7 +30034,7 @@ pub fn outboxRoundsForTest(id: [32]u8) ?u8 {
 }
 
 pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
-    return enqueueOutbox(id, author, now_s);
+    return enqueueOutbox(id, author, now_s, .none);
 }
 
 pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
@@ -30322,12 +30369,21 @@ fn syncOutboxOwner() void {
 }
 
 /// Offers every note that nobody has taken to the relays again. Called when a
+/// Where a queued note was written, for the retry that carries it.
+fn outboxRouteFor(id: [32]u8) PlaceRoute {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return .none;
+    return e.route;
+}
+
 /// relay comes back, which is the moment the answer might have changed.
 fn drainOutbox(gpa: std.mem.Allocator) void {
     const store = g_store orelse return;
     var ids: [outbox_cap][32]u8 = undefined;
     const n = collectOutboxDue(&ids, nowSeconds());
     for (ids[0..n]) |id| {
+        const route = outboxRouteFor(id);
         var se = (store.getEvent(gpa, id) catch continue) orelse continue;
         defer se.deinit();
         // COPIED, not borrowed. `StoredEvent.deinit` tears down the arena that
@@ -30336,7 +30392,7 @@ fn drainOutbox(gpa: std.mem.Allocator) void {
         // `ingestAndPublish` states the same rule for its own path: what the
         // publisher reads has to outlive the call that spawned it.
         const owned = dupeEventForPublish(se.event) orelse continue;
-        const thread = std.Thread.spawn(.{}, publishOwnedWorker, .{ gpa, owned }) catch {
+        const thread = std.Thread.spawn(.{}, publishOwnedWorker, .{ gpa, owned, route }) catch {
             freePublishedEvent(owned);
             continue;
         };
@@ -30394,9 +30450,9 @@ fn freePublishedEvent(ev: nostr.event.Event) void {
 
 /// The drain's worker: publishes a copy it owns, and frees it when the walk is
 /// over rather than leaving it to a caller that has already moved on.
-fn publishOwnedWorker(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+fn publishOwnedWorker(gpa: std.mem.Allocator, ev: nostr.event.Event, route: PlaceRoute) void {
     defer freePublishedEvent(ev);
-    publishWorker(gpa, ev);
+    publishWorker(gpa, ev, route);
 }
 
 /// Publishes `ev` to every relay in the pool, each on a throwaway connection,
@@ -30518,7 +30574,68 @@ fn poolHasRelay(url: []const u8) bool {
     return false;
 }
 
-fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+/// Where a write goes, decided when the reader asked for it.
+///
+/// A VALUE, and copied, for two reasons. `activePlace()` hands back a pointer
+/// into a global the UI thread assigns a whole new `Place` over, and this is
+/// read on a detached publish thread across a dial: one walk could see half of
+/// one room's relay list and half of another's. And the room is read LATE
+/// otherwise. A note held for the undo pause, a note waiting on a remote
+/// signer's approval, and a note the outbox retries minutes later are all
+/// published long after the reader pressed Post, so asking then answers about
+/// whichever room they have since walked into, not the one they wrote in.
+const PlaceRoute = struct {
+    urls: [place_relays_cap][place_relay_cap]u8 = @splat(@splat(0)),
+    lens: [place_relays_cap]u8 = @splat(0),
+    len: u8 = 0,
+    /// The place said "only these". Honoured only when it named some, because a
+    /// place claiming exclusivity and naming none would silence the reader.
+    exclusive: bool = false,
+
+    /// No room: the reader's own relays, and nothing else.
+    const none: PlaceRoute = .{};
+
+    fn url(self: *const PlaceRoute, i: usize) []const u8 {
+        return self.urls[i][0..self.lens[i]];
+    }
+};
+
+/// What the route a held note is carrying names, for the test: the relay list a
+/// publish walk would actually dial, taken from the value and not from whatever
+/// room happens to be open when it is read.
+pub fn heldRouteRelaysForTest(out: [][]const u8) usize {
+    var n: usize = 0;
+    while (n < g_held_route.len and n < out.len) : (n += 1) out[n] = g_held_route.url(n);
+    return n;
+}
+
+pub fn routeForOpenPlaceRelaysForTest(out: [][]const u8) usize {
+    const r = routeForOpenPlace();
+    g_route_probe = r;
+    var n: usize = 0;
+    while (n < g_route_probe.len and n < out.len) : (n += 1) out[n] = g_route_probe.url(n);
+    return n;
+}
+var g_route_probe: PlaceRoute = .none;
+
+/// The room open right now, as something that can be carried away from it.
+fn routeForOpenPlace() PlaceRoute {
+    var out: PlaceRoute = .{};
+    // `activePlace`, not `visitingPlace`. The second one means a place being
+    // looked at and NOT yet entered, so this would go quiet the moment somebody
+    // actually joined the community: exactly backwards.
+    const place = activePlace() orelse return out;
+    for (0..place.write_relays_len) |i| {
+        if (out.len == out.urls.len) break;
+        const u = place.writeRelay(i);
+        out.lens[out.len] = @intCast(copyBounded(&out.urls[out.len], u));
+        out.len += 1;
+    }
+    out.exclusive = place.write_exclusive;
+    return out;
+}
+
+fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event, route: PlaceRoute) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -30539,22 +30656,14 @@ fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     // filed against, and these relays hold no slot. So they are a best effort
     // in the same sense the room itself is, and the note is still tracked
     // against the reader's own relays below.
-    var place_only = false;
-    if (activePlace()) |place| {
-        for (0..place.write_relays_len) |i| {
-            const url = place.writeRelay(i);
-            var relay = nostr.relay.dial(gpa, io, url) catch continue;
-            defer relay.deinit();
-            const watched = watchOneShot(io, relay, one_shot_budget_ms);
-            defer releaseOneShot(watched);
-            relay.publish(ev) catch continue;
-        }
-        // "Only these" is the place's to say, and it is only honoured when it
-        // named some: a place claiming exclusivity and naming none would
-        // otherwise silence the reader entirely.
-        place_only = place.write_exclusive;
+    for (0..route.len) |i| {
+        var relay = nostr.relay.dial(gpa, io, route.url(i)) catch continue;
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.publish(ev) catch continue;
     }
-    if (place_only) return;
+    if (route.exclusive and route.len > 0) return;
 
     for (0..relaySlots()) |i| {
         var url_buf: [96]u8 = undefined;
@@ -31503,7 +31612,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false)) return;
+    if (!registerPending(req_id, .connect, null, false, .none)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -31512,7 +31621,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
 /// `created_at`) and send a `sign_event` request. The signed event returns to
 /// the listener, which stores and publishes it. `restorable` is true only for a
 /// composer draft, so a failed reaction never lands "+"-text in the composer.
-fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool) void {
+fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
     // `content_owned` is handed to the pending slot (so a timeout can restore
     // it to the composer); it is freed here only on an early return.
     // A canonical unsigned event (the bunker fills in the signature). The id is
@@ -31543,7 +31652,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable)) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable, route)) {
         gpa.free(content_owned);
         return;
     }
@@ -31722,7 +31831,7 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             // Signed, so there is nothing to take back. Same reasoning as the
             // built-in signer's: released on the signature, not on the ingest.
             releaseUndo();
-            ingestAndPublish(gpa, out, signer);
+            ingestAndPublish(gpa, out, signer, pending.route);
         },
     }
 }
