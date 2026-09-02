@@ -22150,6 +22150,12 @@ var g_place_logo_id: u64 = 0;
 var g_place_logo_for: [32]u8 = @splat(0);
 var g_place_logo_for_ident_buf: [64]u8 = @splat(0);
 var g_place_logo_for_ident_len: u8 = 0;
+/// Which place the in-flight fetch was started FOR, which is not always the
+/// place on screen by the time it lands. `g_banner_asked_for` carries this for
+/// faces, for the same reason and with the same consequence if it is missing.
+var g_place_logo_asked_for: [32]u8 = @splat(0);
+var g_place_logo_asked_ident_buf: [64]u8 = @splat(0);
+var g_place_logo_asked_ident_len: u8 = 0;
 var g_place_logo_state: enum { idle, fetching, loaded, failed } = .idle;
 /// The pass this logo was last on screen. The pool may not take a slot that is
 /// being looked at, and it only knows that because this is stamped every pass a
@@ -22206,6 +22212,27 @@ pub fn scanPlaceLogoForTest(fx: *Effects, model: *const Model) void {
     scanPlaceLogo(fx, model);
 }
 
+/// A fetch in flight, started by a given place.
+pub fn setPlaceLogoAskedForTest(pubkey: [32]u8, ident: []const u8) void {
+    g_place_logo_asked_for = pubkey;
+    g_place_logo_asked_ident_len = @intCast(copyBounded(&g_place_logo_asked_ident_buf, ident));
+    g_place_logo_state = .fetching;
+}
+
+pub fn placeLogoStateNameForTest() []const u8 {
+    return @tagName(g_place_logo_state);
+}
+
+/// Hands the logo pipeline a fetched body, the way the effect loop does.
+pub fn deliverPlaceLogoBodyForTest(fx: *Effects, body: []const u8) void {
+    handlePlaceLogoFetched(fx, .{
+        .key = place_logo_fetch_key,
+        .outcome = .ok,
+        .status = 200,
+        .body = body,
+    });
+}
+
 /// Fetches the place's mark once, and forgets it when the reader leaves.
 fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
     _ = model;
@@ -22252,11 +22279,30 @@ fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
         return;
     }
     g_place_logo_state = .fetching;
+    // Stamped with the asker, next to the ask.
+    g_place_logo_asked_for = place.author;
+    g_place_logo_asked_ident_len = @intCast(copyBounded(&g_place_logo_asked_ident_buf, place.ident()));
     fetchSlice(fx, place_logo_fetch_key, logo, 0, Effects.responseMsg(.place_logo_fetched));
 }
 
 fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.key != place_logo_fetch_key) return;
+    const arrived_for = activePlace() orelse {
+        g_place_logo_state = .idle;
+        return;
+    };
+    // The body was asked for by a ROOM, and the reader can walk into a different
+    // one while it is in flight. Painting it now would put one community's mark
+    // on another community's card and, worse, cache it under the NEW room's URL
+    // (`storeCachedImage` below keys on `place.logo()`), so the wrong logo would
+    // come back on every later visit and every later launch. Set idle rather
+    // than failed: this body is wrong, the room's own logo has not been tried.
+    if (!std.mem.eql(u8, &g_place_logo_asked_for, &arrived_for.author) or
+        !std.mem.eql(u8, g_place_logo_asked_ident_buf[0..g_place_logo_asked_ident_len], arrived_for.ident()))
+    {
+        g_place_logo_state = .idle;
+        return;
+    }
     // Every effect slot was busy: ask again next tick.
     if (response.outcome == .rejected) {
         g_place_logo_state = .idle;
@@ -22277,13 +22323,9 @@ fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse) voi
         g_place_logo_state = .failed;
         return;
     }
-    const place = activePlace() orelse {
-        g_place_logo_state = .idle;
-        return;
-    };
     if (decodeAndRegister(fx, g_place_logo_id, response.body, place_logo_px)) |_| {
         g_place_logo_state = .loaded;
-        storeCachedImage(place.logo(), response.body);
+        storeCachedImage(arrived_for.logo(), response.body);
     } else {
         g_place_logo_state = .failed;
     }
@@ -25989,6 +26031,18 @@ pub fn armPlaceFetchForTest(pubkey: [32]u8, ident: []const u8) void {
 pub fn refreshPlaceFetchForTest() void {
     refreshPlaceFetch();
 }
+
+/// The link has been followed and a copy shown, which is the state the fetch
+/// window is in while it watches for a newer one.
+pub fn markPlaceFetchAppliedForTest() void {
+    if (g_place_want) |*w| w.applied = true;
+}
+
+/// Whether the window is still watching. Closed is what walking away must
+/// produce: an open window re-applies its place over the room on screen.
+pub fn placeFetchArmedForTest() bool {
+    return g_place_want != null;
+}
 pub fn savePlacesForTest() void {
     savePlaces();
 }
@@ -26412,7 +26466,15 @@ fn refreshPlaceFetch() void {
     const want = g_place_want orelse return;
     // Shown once and the reader has since walked out. The window closes rather
     // than dragging them back into a room they left on the next tick.
-    if (want.applied and g_place == null) {
+    //
+    // Walking out is not only going home. Reading this as `g_place == null` left
+    // the window open when the reader stepped SIDEWAYS into another room, and
+    // the next tick then re-applied the linked place over the one they had just
+    // picked: for the fifteen ticks this window lasts, clicking a row on the
+    // rail did not stick. That is the very thing the line above says it
+    // prevents, and it is the same "some room" for "this room" slip that
+    // `adoptOpenRoom` was carrying.
+    if (want.applied and !samePlace(want)) {
         g_place_want = null;
         return;
     }
