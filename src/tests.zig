@@ -20810,6 +20810,47 @@ test "a link into another room closes the card and records where you are" {
     try testing.expect(main.settingsWritesForTest() > wrote_before);
 }
 
+test "a held note goes to the room it was written in" {
+    // The pause before a note is sent exists so the reader can change their
+    // mind, which means they are free to walk somewhere else while it counts.
+    // The publish walk asked which room was open when it finally ran, on a
+    // detached thread, so a note written in one community was published to
+    // whichever one the reader had wandered into. With that place marked
+    // "only these", the note reached nobody else at all.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.setIdentityForTest([_]u8{0x5a} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    main.setPostDelayForTest(10);
+    defer main.setPostDelayForTest(0);
+
+    // Written inside a place that names its own relay.
+    main.visitPlaceWithFeedForTest([_]u8{0xa9} ** 32, "loud", "Loud Room", "The Dance");
+    main.setPlaceWriteRelayForTest("wss://loud.example.test");
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "written here" } }, &fx);
+    main.update(&model, .post, &fx);
+
+    // Pressed, held, and the reader walks into a different room while it counts.
+    main.visitPlaceWithFeedForTest([_]u8{0xaa} ** 32, "quiet", "Quiet Room", "The Other");
+    main.setPlaceWriteRelayForTest("wss://quiet.example.test");
+
+    var held: [4][]const u8 = undefined;
+    const n = main.heldRouteRelaysForTest(&held);
+    if (n == 0) return error.TheHeldNoteForgotWhereItWasWritten;
+    try testing.expectEqualStrings("wss://loud.example.test", held[0]);
+
+    // And the room on screen now is a different answer, which is the whole
+    // point: asking late gets you this one.
+    var now: [4][]const u8 = undefined;
+    const m = main.routeForOpenPlaceRelaysForTest(&now);
+    try testing.expectEqual(@as(usize, 1), m);
+    try testing.expectEqualStrings("wss://quiet.example.test", now[0]);
+}
+
 test "a visit keeps its seat when you step onto the rail" {
     // The rail holds ONE seat for the place being visited, because a visit is
     // deliberately not in the list and the seat is the only way back to it.
