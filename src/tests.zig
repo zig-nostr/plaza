@@ -6928,8 +6928,54 @@ test "a guest pressing follow is offered the join sheet, not a silent failure" {
     main.clearIdentityForTest();
 
     var fx: main.EffectsForTest = undefined;
-    main.update(&model, Msg{ .follow_author = 0 }, &fx);
+    main.update(&model, Msg{ .follow_author = .{ .who = [_]u8{0x77} ** 32, .direction = 0 } }, &fx);
     try testing.expect(model.joining);
+}
+
+test "the note menu follows the person it named, in the feed as well as in a thread" {
+    // Reported as \"the follow button doesn't work\".
+    //
+    // Every other row in the note menu carries the note it was opened on. This
+    // one carried only a direction, so the handler had to find the person
+    // itself, and what it reached for was the open thread's ROOT. In the feed
+    // there is no open thread, so the row returned before doing anything:
+    // enabled, correctly labelled, and silent. Inside a thread it acted on the
+    // root's author while the label beside it had been computed from the note
+    // actually right-clicked, so the menu could offer to follow one person and
+    // follow another.
+    //
+    // Driven down the guest path because that is the half that needs no signer
+    // and no store: it remembers WHO the press was for, and that is the same
+    // person the write half is handed.
+    var fx: main.EffectsForTest = undefined;
+    const clicked = [_]u8{0x5c} ** 32;
+
+    // In the FEED: no thread is open, which is where the row did nothing.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 0;
+    main.clearIdentityForTest();
+    main.update(&model, Msg{ .follow_author = .{ .who = clicked, .direction = 1 } }, &fx);
+    try testing.expect(model.joining);
+    switch (model.pending) {
+        .follow => |who| try testing.expectEqualSlices(u8, &clicked, &who),
+        else => return error.TheFeedPressWasForgotten,
+    }
+
+    // In a THREAD, on somebody who is not the root: the person clicked, not the
+    // person whose thread it is.
+    var deep = main.initialModel();
+    deep.stage = .ready;
+    deep.viewing_thread = 1;
+    deep.thread_root = threadNote(0xAA, 100, 0);
+    deep.thread_root.id = 1;
+    deep.thread_root.pubkey = [_]u8{0x77} ** 32;
+    main.clearIdentityForTest();
+    main.update(&deep, Msg{ .follow_author = .{ .who = clicked, .direction = 1 } }, &fx);
+    switch (deep.pending) {
+        .follow => |who| try testing.expectEqualSlices(u8, &clicked, &who),
+        else => return error.ThreadPressWasForgotten,
+    }
 }
 
 test "a contact list arriving from a relay becomes the feed's scope" {
@@ -12235,7 +12281,13 @@ test "a new account is offered Follow on the starter pack, not Unfollow" {
         return error.NoFollowOffer;
     };
     switch (msg) {
-        .follow_author => |direction| try testing.expectEqual(@as(u8, 1), direction),
+        .follow_author => |press| {
+            try testing.expectEqual(@as(u8, 1), press.direction);
+            // And it names the author of the note the menu was opened on. The
+            // label is computed from that person, so the message has to be too,
+            // or the row offers to follow one person and follows another.
+            try testing.expectEqualSlices(u8, &packed_in, &press.who);
+        },
         else => return error.WrongMessage,
     }
 
