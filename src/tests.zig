@@ -20456,6 +20456,41 @@ test "reopening lands on the place that was open, not the last one entered" {
     try testing.expectEqual(@as(usize, 1), shifted);
 }
 
+test "a link into another place does not inherit the room you are standing in" {
+    // Reported as two places that could not be told apart: entering BASSPISTOL
+    // and then following a link to Monero Hallway left the second room showing
+    // the first one's notes, from the rail, across restarts.
+    //
+    // The arrival path asked "is a place open?" where it meant "is THIS place
+    // open?", so a document for a different place was treated as a new edition
+    // of the room being left. It took that room's remembered ids with it, and
+    // they are saved, which is why it survived a quit.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+
+    // Stand in the first place with a room worth inheriting.
+    main.openKeptPlaceForTest(0);
+    const ids = [_][32]u8{ @splat(0xb1), @splat(0xb2), @splat(0xb3) };
+    main.seedPlaceFeedForTest(&ids);
+    main.savePlacesForTest();
+    main.openKeptPlaceForTest(0);
+    try testing.expectEqual(@as(u16, ids.len), main.keptPlaceSeenLenForTest(0));
+
+    // A link to a DIFFERENT place: same host, and only `d` tells them apart.
+    try testing.expectEqual(@as(u16, 0), main.arrivalInheritsRoomForTest([_]u8{0xa1} ** 32, "two"));
+    // And a different host under the same `d`.
+    try testing.expectEqual(@as(u16, 0), main.arrivalInheritsRoomForTest([_]u8{0xa2} ** 32, "one"));
+
+    // A re-fetch of the place you ARE in still keeps the room, which is the
+    // whole reason the carry-over exists: a fresh parse has an empty `seen`,
+    // and re-seeding from it would blank the room mid-read.
+    try testing.expectEqual(@as(u16, ids.len), main.arrivalInheritsRoomForTest([_]u8{0xa1} ** 32, "one"));
+}
+
 test "walking the places goes both ways and wraps" {
     var fx: main.EffectsForTest = undefined;
     var model = main.initialModel();
