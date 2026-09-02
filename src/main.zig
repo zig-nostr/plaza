@@ -22143,7 +22143,13 @@ const place_info_home_max: f32 = 380;
 var g_place_logo_id: u64 = 0;
 /// Which place's logo is loaded, so walking into another room does not leave
 /// the last community's mark on screen.
+///
+/// Host AND `d`, the pair that identifies a place everywhere else in this file.
+/// The host alone is not a place: one community can run several rooms, and they
+/// do not share a mark.
 var g_place_logo_for: [32]u8 = @splat(0);
+var g_place_logo_for_ident_buf: [64]u8 = @splat(0);
+var g_place_logo_for_ident_len: u8 = 0;
 var g_place_logo_state: enum { idle, fetching, loaded, failed } = .idle;
 /// The pass this logo was last on screen. The pool may not take a slot that is
 /// being looked at, and it only knows that because this is stamped every pass a
@@ -22153,35 +22159,89 @@ var g_place_logo_seen: u64 = 0;
 const place_logo_fetch_key: u64 = 5200;
 const place_logo_px: u32 = 96;
 
+/// Drops the mark on screen and hands its slot back to the pool.
+///
+/// Every exit from a room goes through here: leaving for your own feed, and
+/// walking straight into a different room. The second one is the one that was
+/// missing, and a logo is not the kind of state that can be left to be
+/// overwritten later, because the next room may have nothing to overwrite it
+/// with.
+fn forgetPlaceLogo(fx: *Effects) void {
+    if (g_place_logo_id != 0) {
+        _ = fx.unregisterImage(g_place_logo_id);
+        g_place_logo_id = 0;
+    }
+    g_place_logo_for = @splat(0);
+    g_place_logo_for_ident_len = 0;
+    g_place_logo_state = .idle;
+}
+
+/// Whether the mark on screen belongs to the room on screen, for the test.
+pub fn placeLogoShownForTest() bool {
+    return g_place_logo_state == .loaded and g_place_logo_id != 0;
+}
+
+/// An `Effects` bound to nothing, so every effect asked of it is refused. The
+/// tests below drive a DECISION, not an effect, and the alternative is passing
+/// `undefined` and hoping the path taken never reads it.
+pub fn inertEffectsForTest() Effects {
+    var fx: Effects = undefined;
+    // The one binding the logo path reads. Unbound means `unregisterImage`
+    // refuses and returns, which is exactly the behaviour a test wants: the
+    // slot bookkeeping is the pool's, and this is not a test about the pool.
+    fx.images = null;
+    return fx;
+}
+
+/// A mark loaded and on screen for a given place, the way a finished fetch
+/// leaves it, so a test can walk out of that room and see what stays behind.
+pub fn setPlaceLogoLoadedForTest(id: u64, pubkey: [32]u8, ident: []const u8) void {
+    g_place_logo_id = id;
+    g_place_logo_for = pubkey;
+    g_place_logo_for_ident_len = @intCast(copyBounded(&g_place_logo_for_ident_buf, ident));
+    g_place_logo_state = .loaded;
+}
+
+pub fn scanPlaceLogoForTest(fx: *Effects, model: *const Model) void {
+    scanPlaceLogo(fx, model);
+}
+
 /// Fetches the place's mark once, and forgets it when the reader leaves.
 fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
     _ = model;
     const place = activePlace() orelse {
         // Out of every room: the slot goes back to the pool rather than holding
         // a picture nobody can see. The feed underneath is what wants it.
-        if (g_place_logo_id != 0) {
-            _ = fx.unregisterImage(g_place_logo_id);
-            g_place_logo_id = 0;
-        }
-        g_place_logo_for = @splat(0);
-        g_place_logo_state = .idle;
+        forgetPlaceLogo(fx);
         return;
     };
     // On screen this pass, so the allocator will not take the slot out from
     // under the reader. Stamped before any early return below: a logo that is
     // loaded and simply not being re-fetched still needs its slot kept.
     g_place_logo_seen = g_image_clock;
+
+    // A different community is a different mark, and this is decided BEFORE any
+    // return below can skip it. It used to sit under the two guards that follow,
+    // so a room with no logo of its own took the early return and left the last
+    // room's mark loaded and on screen: one community's logo on another
+    // community's card, which is what was reported. Walking OUT of a room
+    // already cleared it, so only walking room to room could show it.
+    //
+    // Compared by identity rather than by the URL: two places may ship the same
+    // logo and still be different rooms.
+    if (!std.mem.eql(u8, &g_place_logo_for, &place.author) or
+        !std.mem.eql(u8, g_place_logo_for_ident_buf[0..g_place_logo_for_ident_len], place.ident()))
+    {
+        forgetPlaceLogo(fx);
+        g_place_logo_for = place.author;
+        g_place_logo_for_ident_len = @intCast(copyBounded(&g_place_logo_for_ident_buf, place.ident()));
+        // Cleared above, so this pass is the new room's first: stamp it again or
+        // the pool may take the slot this is about to ask for.
+        g_place_logo_seen = g_image_clock;
+    }
     if (!g_media_previews) return;
     const logo = place.logo();
     if (logo.len == 0) return;
-
-    // A different community is a different mark. Compared by the place's author
-    // rather than by the URL: two places may ship the same logo and still be
-    // different rooms.
-    if (!std.mem.eql(u8, &g_place_logo_for, &place.author)) {
-        g_place_logo_for = place.author;
-        g_place_logo_state = .idle;
-    }
     if (g_place_logo_state != .idle) return;
 
     if (g_place_logo_id == 0) {
@@ -31985,9 +32045,19 @@ const places_file = "places";
 /// home text is counted at twice its cap because it is JSON-escaped on the way
 /// out (a document of newlines doubles), and the feeds and the share base are
 /// counted because this used to know about neither.
+/// Every field the writer can emit is counted here, and a field added to
+/// `writePlaceDocument` without a term added here shortens this silently. That
+/// is what makes it dangerous rather than merely wrong: the reader does not
+/// truncate the overflow, it abandons the whole file, so the cost of missing a
+/// term is the reader's entire list of places disappearing at launch. The
+/// people feed alone (twenty-four keys of sixty-six characters) is larger than
+/// everything this used to count.
 const place_line_cap = place_home_cap * 2 +
-    place_feeds_cap * (place_feed_name_cap + place_relay_cap + place_feed_kinds_cap * 8 + 64) +
-    place_share_cap + place_seed_cap * 70 + 1024;
+    place_feeds_cap * (place_feed_name_cap + place_relay_cap + place_feed_kinds_cap * 8 +
+        place_feed_pubkeys_cap * 70 + 64) +
+    place_handlers_cap * (place_handler_name_cap + place_handler_url_cap + 32) +
+    place_relays_cap * 2 * (place_relay_cap + 4) +
+    place_share_cap + place_handler_url_cap + place_seed_cap * 70 + 2048;
 
 /// Copies what the live place has seen back onto its entry in the list, so the
 /// file records the room as it was left.

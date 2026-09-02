@@ -6310,6 +6310,49 @@ test "measuring a markdown line counts what is drawn, not what is written" {
     try testing.expectEqual(@as(usize, 5), main.visibleLenForTest("hello"));
 }
 
+test "walking into a room with no logo does not leave the last room's mark behind" {
+    // Reported: entered Monero Hallway, then opened the BASSPISTOL link, and
+    // Monero's logo was sitting on BASSPISTOL's Info card.
+    //
+    // The identity check sat BELOW the "this place ships no logo" early return,
+    // so a room with nothing of its own never reached the line that drops the
+    // last room's mark. Walking OUT to your own feed cleared it, which is why
+    // only room-to-room could show it.
+    var fx = main.inertEffectsForTest();
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    defer main.setPlaceLogoIdForTest(0);
+
+    // A slot nothing else in this process holds: these tests share the pool.
+    var slot: u64 = 0;
+    var i: u64 = 1;
+    while (i <= 16) : (i += 1) {
+        if (std.mem.eql(u8, main.imageIdOwnerNameForTest(i), "free")) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == 0) return error.NoFreeSlot;
+
+    // Standing in a room whose mark is loaded and on screen.
+    main.setPlaceLogoLoadedForTest(slot, [_]u8{0xa1} ** 32, "moneroh");
+    try testing.expect(main.placeLogoShownForTest());
+
+    // Straight into a different room, one that ships no logo at all.
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "outernational-dancehall", "BASSPISTOL");
+    main.scanPlaceLogoForTest(&fx, &model);
+    try testing.expect(!main.placeLogoShownForTest());
+
+    // And one host running two rooms: the host alone is not a place, so the
+    // second room does not inherit the first one's mark either.
+    main.setPlaceLogoLoadedForTest(slot, [_]u8{0xa3} ** 32, "room-one");
+    try testing.expect(main.placeLogoShownForTest());
+    main.visitPlaceForTest([_]u8{0xa3} ** 32, "room-two", "Second Room");
+    main.scanPlaceLogoForTest(&fx, &model);
+    try testing.expect(!main.placeLogoShownForTest());
+}
+
 test "the place's logo is not a slot the pool can hand to a face" {
     // Reported: the logo appeared, then turned into somebody's avatar as the
     // feed loaded behind it. Image ids come from a shared pool, and a slot this
