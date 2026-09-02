@@ -7081,6 +7081,129 @@ test "the scope line states how many accounts the feed reads" {
     try testing.expect(std.mem.indexOf(u8, small, " of ") == null);
 }
 
+test "following someone from the starter pack on a new key actually publishes" {
+    // Reported: made a key, pressed Follow on people in the feed on the first
+    // launch, and nothing happened. Both from a profile and from a note's menu,
+    // because both end up here.
+    //
+    // The feed on that first screen IS the starter pack, so everyone pressed is
+    // a pack member. Two different questions were both called "already
+    // following": `isFollowedByMe` asks whether they are in a list the reader
+    // OWNS, and answers no for the pack, so the button offers Follow. The write
+    // scanned the same set with no ownership test, decided there was nothing to
+    // do, and returned a status `sayFollowWrite` deliberately renders as
+    // silence. A press that changes nothing and says nothing.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{104} ** 32);
+    main.setIdentityForTest([_]u8{104} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    // A key MINTED here: it provably has no history, which is what allows a
+    // first list to be written without reading one back.
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/pack.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    var fx: main.EffectsForTest = undefined;
+    const packed_in = main.followSetForTest()[0];
+
+    // The button offers Follow, because the pack is not a list they own.
+    try testing.expect(!main.isFollowedByMe(packed_in));
+    try testing.expect(main.canWriteFollows());
+
+    // So pressing it has to publish. This returned false: nothing written,
+    // nothing said.
+    try testing.expect(main.writeFollowForTest(&fx, packed_in, true));
+
+    // And what was published is the pack, with that person in it, as the
+    // reader's own list.
+    const kinds = [_]u16{3};
+    const authors = [_][32]u8{kp.public_key};
+    var result = try store.query(arena, .{ .authors = &authors, .kinds = &kinds, .limit = 1 });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.events.len);
+    var named = false;
+    var people: usize = 0;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{&packed_in});
+    for (result.events[0].tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p")) {
+            people += 1;
+            if (std.ascii.eqlIgnoreCase(tag[1], &hex)) named = true;
+        }
+    }
+    try testing.expect(named);
+    // ONE person: the one pressed. The first list used to be seeded with the
+    // whole starter pack, so a single press signed for nine accounts the reader
+    // never chose and every face in the feed turned to Following at once.
+    try testing.expectEqual(@as(usize, 1), people);
+
+    // The list is theirs now, so the button says so, and a second press is the
+    // genuine no-op the first one was pretending to be.
+    try testing.expect(main.isFollowedByMe(packed_in));
+}
+
+test "a new key keeps reading the starter pack after its first follow" {
+    // Reported alongside the follow bug: following one person must not cost the
+    // reader everything they were reading. Their own list on day one is one
+    // name, and a feed of one account is not a feed, so Home stays on the pack
+    // until they say otherwise, and says which one it is on.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{105} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    var model = main.initialModel();
+
+    // Before any follow there is only one feed, so the header is a label.
+    try testing.expect(main.homeReadsPack());
+    try testing.expect(!main.homeScopeSwitchable());
+    try testing.expectEqualStrings("Starter pack", model.scope_name());
+
+    // They follow one person. A key made here starts on the pack, and stays.
+    main.setHomeScopeForTest(.starter_pack);
+    const one = [_][32]u8{[_]u8{0xc1} ** 32};
+    _ = main.setFollowsForTest(&one, 1_800_000_000);
+    try testing.expect(main.homeReadsPack());
+    try testing.expectEqualStrings("Starter pack", model.scope_name());
+    try testing.expectEqual(main.starterPackLenForTest(), main.followSet().len);
+    try testing.expect(std.mem.indexOf(u8, model.scope_voices(arena), "hand-picked") != null);
+
+    // And now there IS somewhere to go, so the label becomes a switcher.
+    try testing.expect(main.homeScopeSwitchable());
+
+    // Choosing Following moves the feed to their own list, all one of it.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .choose_home_scope = 1 }, &fx);
+    try testing.expect(!main.homeReadsPack());
+    try testing.expectEqualStrings("Following", model.scope_name());
+    try testing.expectEqual(@as(usize, 1), main.followSet().len);
+    try testing.expect(std.mem.indexOf(u8, model.scope_voices(arena), "1 account · yours") != null);
+
+    // And back, because a switcher that only goes one way is a trapdoor.
+    main.update(&model, Msg{ .choose_home_scope = 0 }, &fx);
+    try testing.expect(main.homeReadsPack());
+    try testing.expectEqual(main.starterPackLenForTest(), main.followSet().len);
+}
+
 test "one relay's silence never authorizes replacing a contact list" {
     // The failure this whole feature is built to avoid, and the one my first
     // gate let through. EOSE means "that is all I have", not "you have none".
