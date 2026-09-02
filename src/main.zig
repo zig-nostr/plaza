@@ -25848,6 +25848,70 @@ var g_place_want: ?struct {
     applied: bool = false,
 } = null;
 
+/// Whether the place on screen is the one this fetch is for.
+///
+/// Identity is host plus `d`, the same pair the rail, the file and
+/// `placeIndexOf` use to tell two places apart, because a title is not an
+/// identity and two communities may share one.
+fn samePlace(want: @TypeOf(g_place_want.?)) bool {
+    const cur = if (g_place) |*c| c else return false;
+    return std.mem.eql(u8, &cur.author, &want.pubkey) and
+        std.mem.eql(u8, cur.ident(), want.ident_buf[0..want.ident_len]);
+}
+
+/// The predicate above, for the test: the arrival path it guards needs a store,
+/// a relay and a link, and the decision it makes does not.
+pub fn samePlaceForTest(pubkey: [32]u8, ident: []const u8) bool {
+    var w: @TypeOf(g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
+    return samePlace(w);
+}
+
+/// Hands the open room to an arriving document, when it is the same room.
+///
+/// An UPGRADE keeps the room: the notes on screen belong to this place
+/// whichever version of the document describes it, and a fresh parse has an
+/// empty `seen`, so re-seeding from it would blank a room mid-read. A document
+/// for a DIFFERENT place is not an upgrade and gets none of it. It arrives with
+/// an empty room and a fresh subscription, which is what walking into a
+/// different room means.
+fn adoptOpenRoom(want: @TypeOf(g_place_want.?), m: *Place) struct { upgrade: bool, refeed: bool } {
+    if (!samePlace(want)) return .{ .upgrade = false, .refeed = true };
+    const cur = &g_place.?;
+    m.seen = cur.seen;
+    m.seen_len = cur.seen_len;
+    // The feed being READ, not the first one: an edit that adds a feed above
+    // the one you are in must not silently move you.
+    if (m.feeds_len > 0 and g_place_feed >= m.feeds_len) g_place_feed = m.feeds_len - 1;
+    const old_feed = currentPlaceFeed(cur);
+    const new_feed = currentPlaceFeed(m);
+    const old_relay = if (old_feed) |f| f.relay() else "";
+    const new_relay = if (new_feed) |f| f.relay() else "";
+    const old_kinds = if (old_feed) |f| f.kinds() else &[_]u16{};
+    const new_kinds = if (new_feed) |f| f.kinds() else &[_]u16{};
+    // Only what the SUBSCRIPTION is made of. An edit that changes a name, a
+    // colour or the home text must not drop a working socket and empty the
+    // room to say so.
+    return .{
+        .upgrade = true,
+        .refeed = !std.mem.eql(u8, old_relay, new_relay) or !std.mem.eql(u16, old_kinds, new_kinds),
+    };
+}
+
+/// How many remembered notes a place ARRIVING from a link inherits from the
+/// room already open. The consequence, not the predicate: those ids are saved
+/// onto the arriving place's row, so a room that inherits the wrong ones shows
+/// another place's notes on every later visit, from the rail, forever.
+pub fn arrivalInheritsRoomForTest(pubkey: [32]u8, ident: []const u8) u16 {
+    var m = Place{};
+    m.author = pubkey;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    var w: @TypeOf(g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
+    _ = adoptOpenRoom(w, &m);
+    return m.seen_len;
+}
+
 /// Drives the REAL entry path. It spawns a worker that dials and fails without
 /// a relay, which is harmless: the seeding this asserts happens before it.
 pub fn startPlaceFeedForTest(i: usize) void {
@@ -26319,8 +26383,14 @@ fn refreshPlaceFetch() void {
     // still in flight from their relay, used to arrive a moment later, get
     // ingested, and never reach the room. A community that had edited its
     // place since your last visit showed you the old one until you quit.
-    if (g_place) |*cur| {
-        if (cur.applied_at >= ev.created_at) {
+    // Only against the place already on screen. `g_place` can be a DIFFERENT
+    // place: following a link out of one room and into another leaves the old
+    // one open until this lands, and then every comparison here is between two
+    // unrelated documents. Comparing their timestamps is comparing nothing, and
+    // the room the reader asked for lost whenever the room they were standing
+    // in happened to have been edited more recently.
+    if (samePlace(want)) {
+        if (g_place.?.applied_at >= ev.created_at) {
             g_place_want.?.waited +|= 1;
             if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
             return;
@@ -26339,25 +26409,18 @@ fn refreshPlaceFetch() void {
     // An UPGRADE keeps the room. The notes on screen belong to this place
     // whichever version of the document describes it, and a fresh parse has an
     // empty `seen`, so re-seeding from it would blank a room mid-read.
-    const upgrade = g_place != null;
-    var refeed = true;
-    if (g_place) |*cur| {
-        m.seen = cur.seen;
-        m.seen_len = cur.seen_len;
-        // The feed being READ, not the first one: an edit that adds a feed
-        // above the one you are in must not silently move you.
-        if (m.feeds_len > 0 and g_place_feed >= m.feeds_len) g_place_feed = m.feeds_len - 1;
-        const old_feed = currentPlaceFeed(cur);
-        const new_feed = currentPlaceFeed(&m);
-        const old_relay = if (old_feed) |f| f.relay() else "";
-        const new_relay = if (new_feed) |f| f.relay() else "";
-        const old_kinds = if (old_feed) |f| f.kinds() else &[_]u16{};
-        const new_kinds = if (new_feed) |f| f.kinds() else &[_]u16{};
-        // Only what the SUBSCRIPTION is made of. An edit that changes a name, a
-        // colour or the home text must not drop a working socket and empty the
-        // room to say so.
-        refeed = !std.mem.eql(u8, old_relay, new_relay) or !std.mem.eql(u16, old_kinds, new_kinds);
-    }
+    //
+    // The SAME place, not merely SOME place. This read `g_place != null`, which
+    // is true of a reader who is standing in one room and following a link into
+    // a different one: the arrival was then treated as a new edition of the
+    // room they were leaving. It kept that room's socket, skipped its welcome,
+    // held its feed index, and handed the incoming place the OTHER place's
+    // remembered ids two lines below. Those ids are saved, so the wrong room's
+    // notes came back on every later visit and the two places could not be told
+    // apart from the rail.
+    const adopted = adoptOpenRoom(want, &m);
+    const upgrade = adopted.upgrade;
+    const refeed = adopted.refeed;
     // Straight in, visiting. No sheet: the destination of following a link is
     // the place, not a question about it.
     g_place = m;
@@ -32018,10 +32081,13 @@ fn writePlaceDocument(gpa: std.mem.Allocator, out: *std.ArrayList(u8), m: *const
     // of numbers has no struct formatter here.
     for (m.feeds[0..m.feeds_len], 0..) |*f, fi| {
         if (fi > 0) try out.append(gpa, ',');
-        try out.print(gpa, "{{\"name\":{f},\"relays\":[{f}],\"kinds\":[", .{
-            std.json.fmt(f.name(), .{}),
-            std.json.fmt(f.relay(), .{}),
-        });
+        // An empty relay list, not a list holding an empty string. A feed about
+        // people names no relay, and `[""]` says it names one that is nothing:
+        // the parser throws it away either way, but the file is Hallway's
+        // document and should stay one somebody else could read.
+        try out.print(gpa, "{{\"name\":{f},\"relays\":[", .{std.json.fmt(f.name(), .{})});
+        if (f.relay().len > 0) try out.print(gpa, "{f}", .{std.json.fmt(f.relay(), .{})});
+        try out.appendSlice(gpa, "],\"kinds\":[");
         for (f.kinds(), 0..) |k, i| {
             if (i > 0) try out.append(gpa, ',');
             try out.print(gpa, "{d}", .{k});
