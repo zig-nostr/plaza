@@ -14407,9 +14407,16 @@ pub const Msg = union(enum) {
     close_notifications,
     notifications_tab: u8,
     notifications_read_all,
-    /// The one action behind the note menu. The payload says which way: 0 means
+    /// The one action behind the note menu. `direction` says which way: 0 means
     /// a guest reached for it, 1 follow, 2 unfollow.
-    follow_author: u8,
+    ///
+    /// It carries WHO, like every other row in that menu carries the note it was
+    /// opened on. Carrying only a direction meant the handler had to find the
+    /// person itself, and what it reached for was the open thread's root: so the
+    /// row did nothing at all in the feed, where there is no open thread, and
+    /// followed the wrong person inside one, since the label beside it was
+    /// computed from the note actually clicked.
+    follow_author: struct { who: [32]u8, direction: u8 },
     /// Opens a person as a level of their own.
     repost: i64,
     open_person: [32]u8,
@@ -22843,10 +22850,10 @@ fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
     const me = activePubkey();
     if (me) |pk| {
         if (std.mem.eql(u8, &pk, &author)) return .{ .label = "This is you", .enabled = false };
-    } else return .{ .label = "Follow", .msg = Msg{ .follow_author = 0 } };
+    } else return .{ .label = "Follow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 0 } } };
     if (followBlockedReason()) |reason| return .{ .label = reason, .enabled = false };
-    if (isFollowedByMe(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = 2 } };
-    return .{ .label = "Follow", .msg = Msg{ .follow_author = 1 } };
+    if (isFollowedByMe(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 2 } } };
+    return .{ .label = "Follow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 1 } } };
 }
 
 /// A rule between groups of menu items.
@@ -26985,19 +26992,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             inboxMarkAllRead();
             markInboxDirty();
         },
-        .follow_author => |direction| {
+        .follow_author => |press| {
             // A guest reaching for Follow is first intent, the same as reaching
             // for the composer: the sheet rises rather than the press failing.
-            if (direction == 0 or model.is_guest()) {
-                if (model.is_guest() and model.viewing_thread != 0)
-                    model.pending = .{ .follow = model.thread_root.pubkey };
+            // Remembered for whoever the menu was opened on, in the feed as well
+            // as in a thread: it used to be kept only inside a thread, and then
+            // for the thread's root rather than for the person clicked.
+            if (press.direction == 0 or model.is_guest()) {
+                model.pending = .{ .follow = press.who };
                 model.joining = true;
                 return;
             }
-            // The menu hangs off the focal note, so its author is the thread's
-            // root: the person whose note is being read.
-            if (model.viewing_thread == 0) return;
-            sayFollowWrite(model, writeFollow(fx, model.thread_root.pubkey, direction == 1), direction == 1);
+            sayFollowWrite(model, writeFollow(fx, press.who, press.direction == 1), press.direction == 1);
         },
         .open_profile_edit => openProfileEdit(model),
         .close_profile_edit => model.editing_profile = false,
