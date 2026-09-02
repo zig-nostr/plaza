@@ -1,15 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.16.0
+### What's new in v0.17.0
 
-**A place brings its own relays.** A community says where it reads and where it writes, and Plaza now listens to both. Two things follow.
+All of this came from people telling me it was broken. Every fix has a test that fails without it.
 
-A feed can be about **people** rather than a relay. Hallway's Monero instance has one: twenty names and no relay of its own. Plaza used to drop a feed like that at the parser, so the room never appeared and nothing said why. It asks the place's own relays now.
+**Switching between places works.** With two places entered, opening one kept showing the other's feed, and it stayed wrong after a restart. Following a link out of one room and into another was treated as an update to the room you were already in, so the second place inherited the first one's notes and then remembered them as its own. There was a second way in too: for a few seconds after following a link, pressing a row on the places rail did not stick.
 
-And **a note written inside a place reaches that place.** It used to go to your relays and not to the community's, which is the opposite of what writing somewhere means.
+**A room shows its own mark, or none.** Walking from a place that has a logo into one that does not left the first community's logo sitting on the second one's info card. A logo that arrives after you have moved on is no longer painted onto the room you moved to, or saved as belonging to it.
 
-**A place shows its own logo and can say where it reads a kind.** The Monero instance reads notes in Nosmero, so a note there offers to open in Nosmero, beside the app's own link rather than instead of it. Every address is checked before it is offered or fetched: https only, no credentials, and the menu row names the site it will open before you press it.
+**Follow works.** On a new key it did nothing at all: the button offered Follow, and pressing it published nothing and said nothing. From a note's menu it did nothing in the feed, and inside a thread it followed the wrong person, whoever started the thread rather than whoever you clicked.
 
-**A place can name what its own room says.** While a room is empty, connecting, or unreachable, the community's own words are used if it wrote any. Only those three lines: a place can name its room and cannot rename your Settings.
+**Following one person follows one person.** Your first follow used to publish the whole starter pack as your contact list, so a single press signed for nine accounts you never chose and every face in the feed turned to Following at once. It names only the person you pressed.
 
-**Fixed: the welcome in a place's info card.** It was laid out wider than the card, so the right edge of every line ran onto the frame; it reserved a fixed height, so a short welcome sat above a tall empty box; an image written without alt text left its markdown on screen; and its links were drawn as links but could not be pressed.
+**Your feed is yours to choose.** A new key keeps reading the starter pack after following a few people, instead of dropping to a feed of one account as payment for one press. The feed name at the top of the window switches between the starter pack and the people you follow, and remembers which one you picked.
