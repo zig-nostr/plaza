@@ -20499,6 +20499,61 @@ test "reopening lands on the place that was open, not the last one entered" {
     try testing.expectEqual(@as(usize, 1), shifted);
 }
 
+test "stepping sideways out of a linked room closes its fetch window" {
+    // The window stays open past the first copy so a place edited since your
+    // last visit still reaches the room. It has to close when the reader walks
+    // away, or the next tick drags them back into the room they just left.
+    //
+    // It read "walked out" as `g_place == null`, which is only the walk HOME.
+    // Stepping sideways onto another rail row left it armed, and for the
+    // fifteen ticks it lasts the linked place was re-applied over whatever the
+    // reader picked: clicking a row on the rail did not stick.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // In the linked room, a copy already shown.
+    main.visitPlaceForTest([_]u8{0xa1} ** 32, "moneroh", "Monero Hallway");
+    main.armPlaceFetchForTest([_]u8{0xa1} ** 32, "moneroh");
+    main.markPlaceFetchAppliedForTest();
+    main.refreshPlaceFetchForTest();
+    try testing.expect(main.placeFetchArmedForTest());
+
+    // Sideways onto another room: the window has nothing left to watch.
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "outernational-dancehall", "BASSPISTOL");
+    main.refreshPlaceFetchForTest();
+    try testing.expect(!main.placeFetchArmedForTest());
+
+    // And going home still closes it, which is the case that always worked.
+    main.visitPlaceForTest([_]u8{0xa1} ** 32, "moneroh", "Monero Hallway");
+    main.armPlaceFetchForTest([_]u8{0xa1} ** 32, "moneroh");
+    main.markPlaceFetchAppliedForTest();
+    main.clearActivePlaceForTest();
+    main.refreshPlaceFetchForTest();
+    try testing.expect(!main.placeFetchArmedForTest());
+}
+
+test "a logo body that arrives after you walk out is not painted on the new room" {
+    // The fetch is keyed by a constant, so the answer carries no clue which room
+    // asked. Taking `activePlace()` at delivery meant a body fetched for room A
+    // and landing after a walk into room B was decoded into B's slot AND cached
+    // under B's logo URL, so the wrong mark came back on every later visit and
+    // every later launch. `handleBannerFetched` has carried this guard for
+    // faces all along.
+    var fx = main.inertEffectsForTest();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    // Asked for by Monero, delivered while standing in BASSPISTOL.
+    main.visitPlaceForTest([_]u8{0xa2} ** 32, "outernational-dancehall", "BASSPISTOL");
+    main.setPlaceLogoAskedForTest([_]u8{0xa1} ** 32, "moneroh");
+    main.deliverPlaceLogoBodyForTest(&fx, "a body that is not this room's");
+
+    // Dropped, and left idle so this room's own mark is still asked for. Not
+    // `failed`: nothing about THIS room's logo has been tried yet.
+    try testing.expectEqualStrings("idle", main.placeLogoStateNameForTest());
+    try testing.expect(!main.placeLogoShownForTest());
+}
+
 test "a link into another place does not inherit the room you are standing in" {
     // Reported as two places that could not be told apart: entering BASSPISTOL
     // and then following a link to Monero Hallway left the second room showing
