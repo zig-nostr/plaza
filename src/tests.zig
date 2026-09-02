@@ -20764,6 +20764,100 @@ test "a link into another place does not inherit the room you are standing in" {
     try testing.expectEqual(@as(u16, ids.len), main.arrivalInheritsRoomForTest([_]u8{0xa1} ** 32, "one"));
 }
 
+test "a link into another room closes the card and records where you are" {
+    // The same two omissions on the path a reader actually takes: a plaza://
+    // link followed while already standing in a room.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6c} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/doors.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    const there = [_]nostr.event.Tag{&.{ "d", "there" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &there,
+        \\{"appName":"There","homeMarkdown":"# There"}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    // Standing in another room, with the Leave confirmation armed on it.
+    main.visitPlaceForTest([_]u8{0xf1} ** 32, "here", "Here");
+    main.setPlaceInfoForTest(.leaving);
+    const wrote_before = main.settingsWritesForTest();
+
+    main.armPlaceFetchForTest(kp.public_key, "there");
+    main.refreshPlaceFetchForTest();
+
+    const now = main.activePlace() orelse return error.TheLinkOpenedNothing;
+    try testing.expectEqualStrings("There", now.name());
+    // Not still armed on a room the reader never asked to leave.
+    if (main.placeInfo() == .leaving) return error.TheConfirmationFollowedTheLink;
+    // The room left behind takes the rail's seat rather than vanishing.
+    const seat = main.visitingPlaceForTest() orelse return error.NoSeat;
+    try testing.expectEqualStrings("There", seat.name());
+    // And where the reader is now is written down, so the next launch opens it.
+    try testing.expect(main.settingsWritesForTest() > wrote_before);
+}
+
+test "a visit keeps its seat when you step onto the rail" {
+    // The rail holds ONE seat for the place being visited, because a visit is
+    // deliberately not in the list and the seat is the only way back to it.
+    // Only Home ever filled it. Stepping onto a rail row, or following a link
+    // out of a visit, dropped the visit on the floor: nothing named it and no
+    // list held it, so it was gone, which is the trap the seat exists to
+    // prevent.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    seedPlacesForRail(&model, &fx);
+
+    // Visiting a place that is NOT in the list, then stepping onto one that is.
+    main.visitPlaceForTest([_]u8{0xd1} ** 32, "dropped", "Dropped Room");
+    main.openKeptPlaceForTest(0);
+    const seat = main.visitingPlaceForTest() orelse return error.TheVisitWasDropped;
+    try testing.expectEqualStrings("Dropped Room", seat.name());
+
+    // And it is still somewhere to go back to, which is the whole point of it.
+    main.resumeVisitForTest();
+    const back = main.activePlace() orelse return error.ResumedNowhere;
+    try testing.expectEqualStrings("Dropped Room", back.name());
+}
+
+test "an armed Leave does not follow you into the next room" {
+    // `g_place_info` is the info card, and `.leaving` is its red "Leave this
+    // place?" confirmation. The card renders whichever place is active, so an
+    // armed confirmation left standing retargets whatever arrives under it, and
+    // the press that follows takes the WRONG room off the rail along with the
+    // notes it remembered. Home and the rail both closed it; resuming a visit
+    // did not.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.visitPlaceForTest([_]u8{0xe1} ** 32, "first", "First Room");
+    main.goToOwnPlazaForTest();
+    main.visitPlaceForTest([_]u8{0xe2} ** 32, "second", "Second Room");
+    main.setPlaceInfoForTest(.leaving);
+
+    // Back into the seated visit: a different room arrives under the card.
+    main.resumeVisitForTest();
+    const now = main.activePlace() orelse return error.ResumedNowhere;
+    try testing.expectEqualStrings("First Room", now.name());
+    if (main.placeInfo() == .leaving) return error.TheConfirmationFollowedTheReader;
+}
+
 test "walking the places goes both ways and wraps" {
     var fx: main.EffectsForTest = undefined;
     var model = main.initialModel();

@@ -26309,7 +26309,7 @@ var g_place_last: usize = 0;
 fn openKeptPlace(i: usize) void {
     if (i >= g_places_len) return;
     g_place_info = .closed;
-    if (g_place != null and g_place_kept) savePlaces();
+    partWithOpenPlace();
     g_place_last = i;
     g_place = g_places[i];
     g_place_feed = 0;
@@ -26342,15 +26342,34 @@ fn visitingPlace() ?*const Place {
 
 /// Back into the visit that Home closed.
 fn resumeVisit() void {
-    if (g_visited == null) return;
-    if (g_place != null and g_place_kept) savePlaces();
-    g_place = g_visited;
+    // Read BEFORE parting with the room on screen, because parting with an
+    // unkept one WRITES this seat: taking the target afterwards would resume
+    // the room just left, forever.
+    const target = g_visited orelse return;
+    partWithOpenPlace();
+    // The card belongs to the room it was opened on. Left up, an armed "Leave
+    // this place?" points at whichever room arrives under it.
+    g_place_info = .closed;
+    g_place = target;
     g_place_feed = 0;
     g_place_kept = false;
     showPlacesRail();
     startPlaceFeed(&g_place.?);
     g_feed_rebuild_all.store(true, .release);
     saveSettings();
+}
+
+/// Everything leaving the room on screen owes it, wherever the reader is going.
+///
+/// A kept place is written down; an unkept one is a VISIT, and a visit is not in
+/// the list, so the rail's seat is the only way back to it. Only Home used to do
+/// this pair, and every other way out did half of it: stepping onto a rail row
+/// or following a link out of a visit dropped that visit on the floor. There was
+/// nothing on the rail naming it and no list holding it, so it was simply gone,
+/// which is the trap the seat exists to prevent.
+fn partWithOpenPlace() void {
+    if (g_place == null) return;
+    if (g_place_kept) savePlaces() else g_visited = g_place;
 }
 
 /// Back to your own feed, without leaving the place.
@@ -26361,7 +26380,7 @@ fn resumeVisit() void {
 fn goToOwnPlaza() void {
     if (g_place == null) return;
     g_place_info = .closed;
-    if (g_place_kept) savePlaces() else g_visited = g_place;
+    partWithOpenPlace();
     g_place = null;
     g_place_feed = 0;
     g_place_kept = false;
@@ -26652,6 +26671,17 @@ fn refreshPlaceFetch() void {
     const refeed = adopted.refeed;
     // Straight in, visiting. No sheet: the destination of following a link is
     // the place, not a question about it.
+    //
+    // A DIFFERENT place, so the room on screen is being left, with everything
+    // that owes: an unkept one takes the rail's seat, and the info card closes
+    // because it belongs to the room it was opened on. An armed "Leave this
+    // place?" left standing here retargets whatever arrives under it, and the
+    // press that follows takes the wrong room off the rail with the ids it
+    // remembered. The card reopens two lines below when this is a first visit.
+    if (!upgrade) {
+        partWithOpenPlace();
+        g_place_info = .closed;
+    }
     g_place = m;
     // ARRIVAL only. On an upgrade the reader is already somewhere in this
     // place's feeds, and resetting would move them off whatever they are
@@ -26680,6 +26710,12 @@ fn refreshPlaceFetch() void {
     // already on screen. Without this the reader enters a place and keeps
     // looking at their own follows, which is exactly what was reported.
     g_feed_rebuild_all.store(true, .release);
+    // Which room is open is written down on every other way into one, and was
+    // not on this one. A reader who opened a room from the rail and then
+    // followed a link into another quit with the file still naming the first,
+    // and the next launch opened it. There is no quit hook: this file is only
+    // ever written as it changes.
+    saveSettings();
 
     // And the window runs out on its own, so a copy landing after this one is
     // still picked up, and the watching stops when the fetch would have.
@@ -32459,7 +32495,15 @@ fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
 }
 
 /// Persists app-wide settings. Best-effort, like the session file.
+/// Counts what `saveSettings` was ASKED to do, before it needs a filesystem to
+/// do it. The bug it exists for is a transition that never asked at all.
+var g_settings_writes: usize = 0;
+pub fn settingsWritesForTest() usize {
+    return g_settings_writes;
+}
+
 fn saveSettings() void {
+    g_settings_writes += 1;
     const io = g_io orelse return;
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
