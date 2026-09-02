@@ -5231,6 +5231,9 @@ fn handleNotaryExited(model: *Model, e: native_sdk.EffectExit) void {
     // back first is set HERE, on the confirmation, and never on the press: a key
     // that was never made cannot have provably no history.
     g_identity_minted_here = true;
+    // Their own list is about to be one name long. The pack is what they have
+    // been reading, so it stays what they read until they choose otherwise.
+    g_home_scope = .starter_pack;
     if (g_ceremony_adopted) {
         // The poll already signed the reader in, so the beat is owed now.
         g_ceremony_adopted = false;
@@ -5950,6 +5953,7 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
             // confirmed on its exit: the daemon has answered, so a key exists and
             // it is this one.
             g_identity_minted_here = true;
+            g_home_scope = .starter_pack;
             // Persisted AGAIN, because the write above happened before the flag
             // was set and therefore recorded `minted=0`. A restart then read
             // this key back as an imported one, which is a weaker claim about a
@@ -10593,7 +10597,7 @@ pub const Model = struct {
             }
             return "This place";
         }
-        return if (followsAreOwned()) "Following" else "Starter pack";
+        return if (homeReadsPack()) "Starter pack" else "Following";
     }
 
     /// The feed's scope line: how many voices it is scoped to, and whose choice
@@ -10601,7 +10605,7 @@ pub const Model = struct {
     pub fn scope_voices(self: *const Model, arena: std.mem.Allocator) []const u8 {
         _ = self;
         const shown = followSet().len;
-        if (!followsAreOwned()) {
+        if (homeReadsPack()) {
             return std.fmt.allocPrint(arena, "{d} voices · hand-picked", .{shown}) catch "hand-picked";
         }
         // One number, because the feed reads the whole list. This used to state
@@ -11158,6 +11162,7 @@ pub fn setIdentityForTest(secret: [32]u8) void {
 
 /// Clears the active identity again. For tests.
 pub fn clearIdentityForTest() void {
+    g_home_scope = .following;
     g_identity_npub_len = 0;
     g_signer_kind = .helper;
     g_test_secret = null;
@@ -14420,6 +14425,8 @@ pub const Msg = union(enum) {
     /// Opens a person as a level of their own.
     repost: i64,
     open_person: [32]u8,
+    /// Which feed Home reads: 0 the starter pack, 1 the reader's follows.
+    choose_home_scope: u8,
     /// Follow or unfollow the person whose profile is open: 1 follow, 2 unfollow.
     follow_person: u8,
     /// 1 mutes the open profile, 2 unmutes.
@@ -18719,18 +18726,75 @@ fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usiz
     return mutesFromTags(tags, out);
 }
 
-/// Who the FEED reads: a bounded slice of the follow list, or the starter pack
-/// until one is known.
+/// Which of the two feeds Home is reading.
+///
+/// A key made here starts on the pack and STAYS there until the reader says
+/// otherwise. Their own list on the first day is the one or two people they have
+/// pressed Follow on, and a feed that narrow is not a feed: dropping them into
+/// it the moment they follow somebody takes away everything they were reading as
+/// payment for one press. An imported key defaults to `following`, because they
+/// arrived with a list and it is the reason they signed in.
+pub const HomeScope = enum { starter_pack, following };
+var g_home_scope: HomeScope = .following;
+
+/// Whether Home is reading the pack right now.
+///
+/// Owning no list of their own is not a CHOICE, so it outranks the setting: the
+/// pack is the only feed there is until they have followed somebody.
+pub fn homeReadsPack() bool {
+    if (!followsAreOwned()) return true;
+    return g_home_scope == .starter_pack;
+}
+
+/// Whether the reader has a list of their own to switch TO. Until they do, the
+/// scope is a label rather than a switcher, which is the same rule the place
+/// header follows.
+pub fn homeScopeSwitchable() bool {
+    return followsAreOwned();
+}
+
+pub fn homeScope() HomeScope {
+    return g_home_scope;
+}
+
+/// How many people are on the reader's OWN list, whichever feed is being read.
+/// The menu names both feeds at once, so it cannot ask `followTotal`: that one
+/// answers for the feed in front of you.
+pub fn setHomeScopeForTest(next: HomeScope) void {
+    setHomeScope(next);
+}
+
+pub fn starterPackLenForTest() usize {
+    return starter_pack.len;
+}
+
+pub fn followTotalOwned() usize {
+    return if (followsAreOwned()) g_follow_count else 0;
+}
+
+/// Moves Home between the two feeds. Everything scoped to the author set is
+/// stale afterwards, exactly as it is when the follow list itself changes, so
+/// this says so the same way `setFollows` does.
+pub fn setHomeScope(next: HomeScope) void {
+    if (g_home_scope == next) return;
+    g_home_scope = next;
+    _ = g_follow_gen.fetchAdd(1, .monotonic);
+    resetFeedEnd();
+    invalidateFeed();
+    g_relay_ranks_dirty.store(true, .release);
+}
+
+/// Who the FEED reads: a bounded slice of the follow list, or the starter pack.
 pub fn followSet() []const [32]u8 {
-    if (followsAreOwned()) return g_follows[0..@min(g_follow_count, max_follows)];
-    return &starter_pack;
+    if (homeReadsPack()) return &starter_pack;
+    return g_follows[0..@min(g_follow_count, max_follows)];
 }
 
 /// How many accounts this reader follows, all of them, whether or not the feed
 /// reads them all.
 pub fn followTotal() usize {
-    if (followsAreOwned()) return g_follow_count;
-    return starter_pack.len;
+    if (homeReadsPack()) return starter_pack.len;
+    return g_follow_count;
 }
 
 /// Copies the feed's author set for a caller on another thread. `followSet`
@@ -18739,7 +18803,7 @@ pub fn followTotal() usize {
 pub fn followSnapshot(out: *[max_follows][32]u8) usize {
     lockFollows();
     defer unlockFollows();
-    if (!followsAreOwned()) {
+    if (homeReadsPack()) {
         const n = @min(starter_pack.len, out.len);
         @memcpy(out[0..n], starter_pack[0..n]);
         return n;
@@ -19191,34 +19255,44 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
             for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
             tags.append(gpa, copy) catch return .failed;
         }
-    } else {
-        // No list of their own, and this app minted the key, so there provably
-        // is none anywhere. The pack they have been reading becomes the list
-        // they publish, so the feed they know travels with them to every other
-        // client.
-        //
-        // This branch is the dangerous one, and the gate above is what makes it
-        // safe: reaching here on a guess, or on a store read that merely
-        // failed, would replace a real contact list with nine accounts this app
-        // chose.
-        for (followSet()) |f| {
-            if (std.mem.eql(u8, &f, &pubkey)) found = true;
-            if (!following and std.mem.eql(u8, &f, &pubkey)) continue;
-            var fhex: [64]u8 = undefined;
-            hexLower(&fhex, f);
-            const copy = gpa.alloc([]const u8, 2) catch return .failed;
-            copy[0] = gpa.dupe(u8, "p") catch return .failed;
-            copy[1] = gpa.dupe(u8, &fhex) catch return .failed;
-            tags.append(gpa, copy) catch return .failed;
-        }
     }
+    // No list of their own, and this app minted the key, so there provably is
+    // none anywhere: the list starts EMPTY and gains exactly the person pressed.
+    //
+    // It used to start as the STARTER PACK, so that the feed they arrived
+    // reading travelled with them to every other client. What that did on the
+    // first press was publish nine accounts the reader never chose: one press,
+    // nine follows, every face in the feed flipping to Following at once. The
+    // pack is something to READ, and reading it is not a claim about anybody, so
+    // it must not be signed on their behalf. Home goes on offering it as a feed
+    // for as long as they want it (see `g_home_scope`), which is the half of
+    // that idea worth keeping.
+    //
+    // The branch above is the dangerous one, and the gate before it is what
+    // makes it safe: reaching it on a guess, or on a store read that merely
+    // failed, would replace a real contact list with almost nothing.
 
     if (following) {
-        if (found) return .nothing_to_do; // already followed: nothing to write
-        const copy = gpa.alloc([]const u8, 2) catch return .failed;
-        copy[0] = gpa.dupe(u8, "p") catch return .failed;
-        copy[1] = gpa.dupe(u8, &hex) catch return .failed;
-        tags.append(gpa, copy) catch return .failed;
+        // Already among the tags. What that MEANS depends on whose tags they
+        // are, and reading it as "already followed" is what made Follow do
+        // nothing on a new account's first screen.
+        //
+        // With a base, they are the reader's own list and there is nothing to
+        // write. Without one, they are the STARTER PACK: `isFollowedByMe` says
+        // false for everyone in it, because the pack is not a list the reader
+        // owns, so the button correctly offers Follow. Returning here made that
+        // press silent, and publishing is exactly what it should do: the pack
+        // becomes their list, this person already in it. Until that happens the
+        // reader has no list at all, so every later press on a pack member was
+        // silent too.
+        if (found) {
+            return .nothing_to_do; // already on their list: nothing to write
+        } else {
+            const copy = gpa.alloc([]const u8, 2) catch return .failed;
+            copy[0] = gpa.dupe(u8, "p") catch return .failed;
+            copy[1] = gpa.dupe(u8, &hex) catch return .failed;
+            tags.append(gpa, copy) catch return .failed;
+        }
     } else if (!found) {
         return .nothing_to_do; // not followed: nothing to write
     }
@@ -19628,6 +19702,7 @@ pub fn setFollowsForTest(list: []const [32]u8, created_at: i64) bool {
 }
 
 pub fn forgetFollowsForTest() void {
+    g_home_scope = .following;
     forgetFollows();
 }
 
@@ -22739,10 +22814,35 @@ fn statusBar(ui: *AppUi, model: *const Model) AppUi.Node {
 /// say what the chevron means rather than to offer a choice: the reader learns
 /// where scopes live before there is a second one to pick.
 fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
-    const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
-    rows[0] = menuRow(ui, scope, "check", null, .close_menu);
+    // One feed is a LABEL, several is a switcher: the same rule the place header
+    // follows. Until the reader has followed somebody there is only the pack,
+    // and a menu offering a feed with nobody in it is a promise Home cannot
+    // keep.
+    if (!homeScopeSwitchable()) {
+        const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
+        rows[0] = menuRow(ui, scope, "check", null, .close_menu);
+        return menuSurfacePlaced(ui, 200, .below, .start, rows);
+    }
+    const rows = ui.arena.alloc(AppUi.Node, 2) catch return ui.spacer(0);
+    const on_pack = homeReadsPack();
+    // The pack first, because it is where a new key starts and the row they are
+    // looking for is the one they are leaving.
+    rows[0] = menuRow(
+        ui,
+        "Starter pack",
+        if (on_pack) "check" else null,
+        "hand-picked",
+        Msg{ .choose_home_scope = 0 },
+    );
+    rows[1] = menuRow(
+        ui,
+        "Following",
+        if (on_pack) null else "check",
+        if (followTotalOwned() == 1) "1 account" else ui.fmt("{d} accounts", .{followTotalOwned()}),
+        Msg{ .choose_home_scope = 1 },
+    );
     // The scope line sits at the top of the window, so its menu drops down.
-    return menuSurfacePlaced(ui, 200, .below, .start, rows);
+    return menuSurfacePlaced(ui, 240, .below, .start, rows);
 }
 
 /// The place's feeds, with the one being read checked.
@@ -26970,6 +27070,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             const who = model.viewing_profile orelse return;
             sayMuteWrite(model, writeMute(fx, who, direction == 1), direction == 1);
+        },
+        .choose_home_scope => |which| {
+            model.menu = .none;
+            setHomeScope(if (which == 0) .starter_pack else .following);
+            // Remembered, or the choice lasts until the next launch and the
+            // reader has to make it again every morning.
+            saveSettings();
         },
         .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
         .toggle_notifications => {
@@ -32076,6 +32183,14 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        // Only a name this app wrote. Anything else keeps the default, which
+        // for a key made here is set at the mint and for every other key is
+        // their own follows.
+        if (std.mem.eql(u8, line[0..eq], "home_scope")) {
+            const val = line[eq + 1 ..];
+            if (std.mem.eql(u8, val, "starter_pack")) g_home_scope = .starter_pack;
+            if (std.mem.eql(u8, val, "following")) g_home_scope = .following;
+        }
         if (std.mem.eql(u8, line[0..eq], "post_delay")) {
             // Anything unreadable keeps the default rather than turning the
             // pause off: a corrupt line should not quietly remove a safeguard.
@@ -32354,7 +32469,7 @@ fn saveSettings() void {
     var place_buf: [160]u8 = undefined;
     const place = activePlaceLine(&place_buf);
     var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
@@ -32364,6 +32479,7 @@ fn saveSettings() void {
         if (g_rail_open) "on" else "off",
         place,
         g_post_delay_s,
+        @tagName(g_home_scope),
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
@@ -32512,6 +32628,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // identity imported afterwards inherited permission to publish nine
     // starter-pack names over a real eight-hundred-follow list.
     g_identity_minted_here = false;
+    // And Home reads follows again. The pack is where a key MADE here starts,
+    // which is a fact about that account and not about this app: left set, the
+    // next reader signed in with eight hundred follows and got nine strangers.
+    g_home_scope = .following;
 
     model.login_buffer.clear();
     model.draft_buffer.clear();
