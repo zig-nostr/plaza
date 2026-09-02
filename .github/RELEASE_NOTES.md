@@ -1,15 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.17.0
+### What's new in v0.17.1
 
-All of this came from people telling me it was broken. Every fix has a test that fails without it.
+Five fixes, none of them reported. After the last release I went looking for the shape of the bugs in it rather than waiting to be told about the rest, and these are what turned up. Every one has a test that fails without the fix.
 
-**Switching between places works.** With two places entered, opening one kept showing the other's feed, and it stayed wrong after a restart. Following a link out of one room and into another was treated as an update to the room you were already in, so the second place inherited the first one's notes and then remembered them as its own. There was a second way in too: for a few seconds after following a link, pressing a row on the places rail did not stick.
+**"Leave this place?" asked about the room you meant.** The confirmation stayed armed while a link carried you into a different community, and the card then showed that one with the confirmation still up. Confirming took the wrong room off your rail, along with the notes it remembered.
 
-**A room shows its own mark, or none.** Walking from a place that has a logo into one that does not left the first community's logo sitting on the second one's info card. A logo that arrives after you have moved on is no longer painted onto the room you moved to, or saved as belonging to it.
+**A place you were visiting stops disappearing.** A visit is not in your list, so the rail keeps a seat for it. Only going Home ever filled that seat: stepping onto another room from the rail, or following a link out of a visit, left nothing naming the place you had been in and no way back to it.
 
-**Follow works.** On a new key it did nothing at all: the button offered Follow, and pressing it published nothing and said nothing. From a note's menu it did nothing in the feed, and inside a thread it followed the wrong person, whoever started the thread rather than whoever you clicked.
+**The room you are in is remembered when you got there by a link.** Every other way in wrote it down. Open a room from the rail, follow a link into another, quit, and Plaza reopened the first one.
 
-**Following one person follows one person.** Your first follow used to publish the whole starter pack as your contact list, so a single press signed for nine accounts you never chose and every face in the feed turned to Following at once. It names only the person you pressed.
+**Your own feed keeps loading older notes.** A place's feed has a bottom, and reaching it told Plaza the feed had ended. That answer was about the room, but it stuck to everything: going Home afterwards left your own feed unable to load anything older until you restarted.
 
-**Your feed is yours to choose.** A new key keeps reading the starter pack after following a few people, instead of dropping to a feed of one account as payment for one press. The feed name at the top of the window switches between the starter pack and the people you follow, and remembers which one you picked.
+**A note goes to the room it was written in.** If you use the undo pause, or a remote signer, or a note is retried later, it was published to whichever community you had wandered into by then rather than the one you wrote it in. Where a place says "only these relays", that meant the note reached nobody at all.
