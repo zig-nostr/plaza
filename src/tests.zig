@@ -21458,6 +21458,21 @@ test "changing who the feed asks about un-ends it" {
     main.setFeedEndForTest();
     _ = main.addRelayForTest("wss://relay.example.test", true, false);
     if (main.feedEndReached()) return error.TheFeedStayedEndedAfterANewRelay;
+
+    // A ROOM is the same change and was the one nobody said it about. Its feed
+    // is capped, so reaching the bottom of one latched the end, and going Home
+    // afterwards left the reader's own feed unable to load anything older for
+    // the rest of the process.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    main.setFeedEndForTest();
+    main.visitPlaceForTest([_]u8{0xb7} ** 32, "roomy", "Roomy");
+    main.startPlaceFeedForTest(0);
+    if (main.feedEndReached()) return error.TheFeedStayedEndedInsideARoom;
+
+    main.setFeedEndForTest();
+    main.goToOwnPlazaForTest();
+    if (main.feedEndReached()) return error.TheFeedStayedEndedAfterLeavingARoom;
 }
 
 test "a paste that does not fit says so instead of vanishing" {

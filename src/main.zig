@@ -25812,6 +25812,14 @@ fn setPlaceLink(state: PlaceLink) void {
 }
 
 fn clearPlaceFeed() void {
+    // Walking into a room, out of one, or between two replaces the feed's
+    // question outright, and the end of history is an ANSWER about a question.
+    // A place's feed is capped, so scrolling to the bottom of one latched the
+    // end, and the latch is for the life of the process: going Home afterwards
+    // left the reader's own feed unable to ask for anything older, silently,
+    // for as long as the app stayed open. Changing the follow set and the relay
+    // pool already say this; the rooms did not.
+    resetFeedEnd();
     _ = g_place_gen.fetchAdd(1, .monotonic);
     setPlaceLink(.idle);
     lockPlaceIds();
