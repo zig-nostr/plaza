@@ -3518,7 +3518,6 @@ const link_fetch_key_base: u64 = 4000;
 // written to the disk cache without claiming a registry id. See `warmAhead`.
 const avatar_warm_key_base: u64 = 6000;
 const media_warm_key_base: u64 = 7000;
-const open_url_key: u64 = 102;
 
 // The profile cache holds display names and avatars keyed by pubkey. It must be
 // larger than the biggest on-screen author set marked in a single avatar pass
@@ -13415,7 +13414,14 @@ fn openExternally(fx: *Effects, url: []const u8) void {
     // The link slice lives in the view arena, so copy it before the effect runs.
     @memcpy(g_open_url_buf[0..url.len], url);
     const owned = g_open_url_buf[0..url.len];
-    fx.spawn(.{ .key = open_url_key, .argv = &.{ "/usr/bin/open", owned }, .output = .collect });
+    // The host's own opener, not `/usr/bin/open`. That path is a macOS binary
+    // and nothing else, so every link in this app was a silent no-op anywhere
+    // else: the spawn registered no `on_exit` either, so not even the rejection
+    // came back. The toolkit has always had this seam and routes it to
+    // `NSWorkspace` on macOS and `gtk_uri_launcher` on Linux, which is the same
+    // behaviour on the platform that used to work and working behaviour on the
+    // one that did not.
+    fx.hostSend("native-sdk.os.openUrl", owned);
 }
 
 /// Lets everything that failed to load try again, after the media proxy changed.
@@ -32011,7 +32017,19 @@ pub fn main(init: std.process.Init) !void {
         .js_window_api = false,
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
+            .navigation = .{
+                .allowed_origins = &.{ "zero://inline", "zero://app" },
+                // The toolkit refuses `openUrl` unless the policy says a link may
+                // reach the system browser, so the seam above needs this to be
+                // anything but the default `.deny`. Scoped to exactly what
+                // `isSafeExternalUrl` already accepts rather than to `*`: this is
+                // the second gate, and a second gate wider than the first is not
+                // a gate.
+                .external_links = .{
+                    .action = .open_system_browser,
+                    .allowed_urls = &.{ "https://*", "http://*" },
+                },
+            },
         },
     }, init);
 }

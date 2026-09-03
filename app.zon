@@ -54,7 +54,7 @@
     .security = .{
         .navigation = .{
             .allowed_origins = .{ "zero://app", "zero://inline" },
-            .external_links = .{ .action = "deny" },
+            .external_links = .{ .action = "open_system_browser", .allowed_urls = .{ "https://*", "http://*" } },
         },
     },
     .web_engine = "system",
