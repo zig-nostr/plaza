@@ -24744,7 +24744,7 @@ fn absoluteNoteTime(arena: std.mem.Allocator, created_at: i64) []const u8 {
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     const month_name = months[@intCast(@min(@max(m - 1, 0), 11))];
     return std.fmt.allocPrint(arena, "{d}:{d:0>2} {s}{s} · {s} {d}, {d}", .{
-        hour12, minute, if (pm) "PM" else "AM", if (comptime builtin.os.tag == .macos) "" else " UTC", month_name, d, year,
+        hour12, minute, if (pm) "PM" else "AM", if (comptime builtin.os.tag == .windows) " UTC" else "", month_name, d, year,
     }) catch "";
 }
 
@@ -24752,7 +24752,13 @@ fn absoluteNoteTime(arena: std.mem.Allocator, created_at: i64) []const u8 {
 /// own zone handling (so daylight saving is right, and right for the DATE in
 /// question rather than for today).
 fn localOffsetSeconds(unix_seconds: i64) i64 {
-    if (comptime builtin.os.tag != .macos) return 0;
+    // Not macOS-only. `c_tm` below is laid out for the BSD and glibc `struct
+    // tm` (it carries `tm_gmtoff` and `tm_zone`), and `localtime_r` is in glibc
+    // as well, so a Linux build reads the reader's real zone and their real
+    // daylight saving. Gated on Windows instead, which has `localtime_s` and a
+    // different struct, and where this would be a link error rather than a
+    // wrong answer.
+    if (comptime builtin.os.tag == .windows) return 0;
     var tm: c_tm = std.mem.zeroes(c_tm);
     const t: i64 = unix_seconds;
     if (localtime_r(&t, &tm) == null) return 0;
