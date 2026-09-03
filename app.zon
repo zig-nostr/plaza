@@ -5,7 +5,7 @@
     .description = "A fast, local-first Nostr client, built natively in Zig.",
     .version = "0.17.1",
     .icons = .{"assets/icon.png"},
-    .platforms = .{"macos"},
+    .platforms = .{ "macos", "linux" },
     .permissions = .{ "view", "command", "clipboard" },
     .capabilities = .{ "native_views", "gpu_surfaces" },
     // `plaza://` links, so a mode can be shared in a note and opened from
