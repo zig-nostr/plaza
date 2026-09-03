@@ -25700,12 +25700,65 @@ const has_url_scheme = builtin.os.tag == .macos and !builtin.is_test;
 extern fn plaza_url_scheme_install() void;
 extern fn plaza_url_scheme_take(out: [*]u8, cap: usize) usize;
 
-/// The link macOS handed us since the last tick, if any.
+/// A `plaza://` link this process was STARTED with, held until the tick takes it.
+///
+/// macOS delivers links as an Apple Event (`src/urlscheme.m`), which is the only
+/// inbound path the toolkit's macOS host has. Everywhere else the desktop
+/// entry's `%u` puts the link in argv and nothing delivers it at all, so this is
+/// the whole of cold start there. Without it, following a link on Linux launches
+/// Plaza and drops the link on the floor, and a place has no other door.
+///
+/// Cold start only. A link clicked while Plaza is ALREADY running is handed to
+/// the running process by the desktop environment, and the toolkit's GTK host
+/// discards it before any app code runs: it builds the application with
+/// `G_APPLICATION_DEFAULT_FLAGS` and calls `g_application_run` with no argv at
+/// all, so there is nothing this side can read. Filed upstream as
+/// vercel-labs/native#422.
+var g_argv_link_buf: [2048]u8 = undefined;
+var g_argv_link_len: usize = 0;
+
+/// Reads the command line once, at startup, before any window exists.
+fn captureArgvLink(args: std.process.Args) void {
+    var it = std.process.Args.Iterator.init(args);
+    defer it.deinit();
+    // Past argv[0]: the executable's own path is not a link.
+    _ = it.next();
+    while (it.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "plaza://")) continue;
+        if (arg.len > g_argv_link_buf.len) continue;
+        @memcpy(g_argv_link_buf[0..arg.len], arg);
+        g_argv_link_len = arg.len;
+        // The first one wins. A launcher passing two is not a case worth
+        // guessing about, and opening two rooms in one tick is worse than
+        // opening the one that was asked for first.
+        return;
+    }
+}
+
+/// The link handed to us since the last tick, if any.
 fn takePendingLink(buf: []u8) ?[]const u8 {
+    // Taken ONCE, whichever way it arrived: the tick polls this every second
+    // and a link that stayed would reopen its place forever.
+    if (g_argv_link_len > 0) {
+        const n = @min(g_argv_link_len, buf.len);
+        @memcpy(buf[0..n], g_argv_link_buf[0..n]);
+        g_argv_link_len = 0;
+        return buf[0..n];
+    }
     if (!has_url_scheme) return null;
     const n = plaza_url_scheme_take(buf.ptr, buf.len);
     if (n == 0) return null;
     return buf[0..n];
+}
+
+pub fn captureArgvLinkForTest(link: []const u8) void {
+    if (link.len > g_argv_link_buf.len) return;
+    @memcpy(g_argv_link_buf[0..link.len], link);
+    g_argv_link_len = link.len;
+}
+
+pub fn takePendingLinkForTest(buf: []u8) ?[]const u8 {
+    return takePendingLink(buf);
 }
 
 /// What a `plaza://` link asks for.
@@ -31965,6 +32018,9 @@ fn registerFontFaces() void {
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     g_environ = init.environ_map;
+    // Before anything else reads it: a link is why this process exists when the
+    // reader followed one, and the ceremony below can take a while.
+    captureArgvLink(init.minimal.args);
 
     // The bundled Geist faces, registered with CoreText before the platform
     // host exists, so every later font lookup resolves them (see theme.zig).

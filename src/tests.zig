@@ -20851,6 +20851,24 @@ test "a held note goes to the room it was written in" {
     try testing.expectEqualStrings("wss://quiet.example.test", now[0]);
 }
 
+test "a link on the command line is delivered once" {
+    // On macOS a plaza:// link arrives as an Apple Event. Nowhere else: the
+    // desktop entry's %u puts it in argv, and the toolkit's Linux host drops
+    // argv before any app code runs, so reading it ourselves at startup is the
+    // whole of cold start there. A place has no other door, so without this a
+    // Linux reader cannot enter one at all.
+    var buf: [2048]u8 = undefined;
+    // Nothing pending: the tick polls this every second and must not invent one.
+    try testing.expect(main.takePendingLinkForTest(&buf) == null);
+
+    main.captureArgvLinkForTest("plaza://place/naddr1abc");
+    const got = main.takePendingLinkForTest(&buf) orelse return error.TheLinkWasDropped;
+    try testing.expectEqualStrings("plaza://place/naddr1abc", got);
+
+    // ONCE. A link that stayed would reopen its place on every tick, forever.
+    if (main.takePendingLinkForTest(&buf) != null) return error.TheLinkCameBackASecondTime;
+}
+
 test "a visit keeps its seat when you step onto the rail" {
     // The rail holds ONE seat for the place being visited, because a visit is
     // deliberately not in the list and the seat is the only way back to it.
