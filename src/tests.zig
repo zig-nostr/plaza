@@ -20851,6 +20851,50 @@ test "a held note goes to the room it was written in" {
     try testing.expectEqualStrings("wss://quiet.example.test", now[0]);
 }
 
+test "a link followed while Plaza is open reaches the window that is already there" {
+    // Following a plaza:// link from a browser starts a NEW process every time,
+    // running or not. On a second launch GTK hands the launch to the window
+    // already open and that process exits, so a link it read in its own argv
+    // dies with it and the reader watches Plaza come to the front and do
+    // nothing. Our code runs before the toolkit's, so the link goes to a file
+    // and whichever process owns the window picks it up.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
+    defer dir.close(io);
+
+    var buf: [2048]u8 = undefined;
+    // Nothing written: nothing to open.
+    try testing.expect(main.takeWrittenLinkForTest(io, &dir, &buf, 1000) == null);
+
+    main.writePendingLinkForTest(io, &dir, "plaza://place/naddr1handoff", 1000);
+    const got = main.takeWrittenLinkForTest(io, &dir, &buf, 1002) orelse
+        return error.TheHandoffLostTheLink;
+    try testing.expectEqualStrings("plaza://place/naddr1handoff", got);
+
+    // ONCE: the tick reads this every second, so a link that stayed would
+    // reopen its room forever.
+    if (main.takeWrittenLinkForTest(io, &dir, &buf, 1003) != null) {
+        return error.TheHandoffKeptTheLink;
+    }
+
+    // And a link left by a crash is not one the reader just clicked.
+    main.writePendingLinkForTest(io, &dir, "plaza://place/naddr1stale", 1000);
+    if (main.takeWrittenLinkForTest(io, &dir, &buf, 1000 + 600) != null) {
+        return error.AStaleLinkOpenedARoom;
+    }
+    // Taken off disk even so, or it would be retried every second forever.
+    if (main.takeWrittenLinkForTest(io, &dir, &buf, 1001) != null) {
+        return error.TheStaleLinkWasLeftBehind;
+    }
+}
+
 test "a link on the command line is delivered once" {
     // On macOS a plaza:// link arrives as an Apple Event. Nowhere else: the
     // desktop entry's %u puts it in argv, and the toolkit's Linux host drops
