@@ -25717,6 +25717,25 @@ extern fn plaza_url_scheme_take(out: [*]u8, cap: usize) usize;
 var g_argv_link_buf: [2048]u8 = undefined;
 var g_argv_link_len: usize = 0;
 
+/// Where a link waits for the window that will open it.
+///
+/// Following a `plaza://` link from a browser starts a NEW process every time,
+/// running or not. On a first launch that process is the app and reads its own
+/// argv. On a second, GTK's single-instance machinery hands the launch to the
+/// window already open and this process exits, so whatever it read dies with it
+/// and the reader watches Plaza come to the front and do nothing.
+///
+/// Our code runs before the toolkit's does, which is the whole of the fix: the
+/// link goes to a file, and whichever process owns the window picks it up on its
+/// next tick. One path serves both cases, so there is no "am I the first one"
+/// guess to get wrong.
+const pending_link_file = "pending-link";
+
+/// How long a link on disk is still worth opening. A file left by a crash is
+/// not something the reader just clicked, and opening a room they asked for
+/// yesterday is worse than doing nothing.
+const pending_link_stale_s: i64 = 120;
+
 /// Reads the command line once, at startup, before any window exists.
 fn captureArgvLink(args: std.process.Args) void {
     var it = std.process.Args.Iterator.init(args);
@@ -25728,11 +25747,57 @@ fn captureArgvLink(args: std.process.Args) void {
         if (arg.len > g_argv_link_buf.len) continue;
         @memcpy(g_argv_link_buf[0..arg.len], arg);
         g_argv_link_len = arg.len;
+        writePendingLink(arg);
         // The first one wins. A launcher passing two is not a case worth
         // guessing about, and opening two rooms in one tick is worse than
         // opening the one that was asked for first.
         return;
     }
+}
+
+/// Hands the link to whichever process owns the window. Best effort: a link
+/// that cannot be written is one the reader will click again.
+fn writePendingLink(link: []const u8) void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    writePendingLinkIn(io, &dir, link, nowSeconds());
+}
+
+fn writePendingLinkIn(io: std.Io, dir: *std.Io.Dir, link: []const u8, now_s: i64) void {
+    var buf: [2176]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{d}\n{s}", .{ now_s, link }) catch return;
+    dir.writeFile(io, .{
+        .sub_path = pending_link_file,
+        .data = body,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch {};
+}
+
+/// Takes the link off disk, once. Deleted on the way out whether or not it was
+/// still fresh, so a stale one cannot be re-read every second forever.
+fn takeWrittenLink(buf: []u8) ?[]const u8 {
+    const io = g_io orelse return null;
+    const environ = g_environ orelse return null;
+    var dir = plazaDir(io, environ) catch return null;
+    defer dir.close(io);
+    return takeWrittenLinkIn(io, &dir, buf, nowSeconds());
+}
+
+fn takeWrittenLinkIn(io: std.Io, dir: *std.Io.Dir, buf: []u8, now_s: i64) ?[]const u8 {
+    const gpa = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, pending_link_file, gpa, std.Io.Limit.limited(4096)) catch return null;
+    defer gpa.free(raw);
+    dir.deleteFile(io, pending_link_file) catch {};
+    const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
+    const stamp = std.fmt.parseInt(i64, raw[0..nl], 10) catch return null;
+    if (now_s - stamp > pending_link_stale_s) return null;
+    const link = raw[nl + 1 ..];
+    if (link.len == 0 or link.len > buf.len) return null;
+    if (!std.mem.startsWith(u8, link, "plaza://")) return null;
+    @memcpy(buf[0..link.len], link);
+    return buf[0..link.len];
 }
 
 /// The link handed to us since the last tick, if any.
@@ -25743,12 +25808,32 @@ fn takePendingLink(buf: []u8) ?[]const u8 {
         const n = @min(g_argv_link_len, buf.len);
         @memcpy(buf[0..n], g_argv_link_buf[0..n]);
         g_argv_link_len = 0;
+        // Ours, and already in hand: drop the copy on disk so the tick after
+        // this one does not open the same room a second time.
+        clearPendingLink();
         return buf[0..n];
     }
+    if (takeWrittenLink(buf)) |link| return link;
     if (!has_url_scheme) return null;
     const n = plaza_url_scheme_take(buf.ptr, buf.len);
     if (n == 0) return null;
     return buf[0..n];
+}
+
+fn clearPendingLink() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    dir.deleteFile(io, pending_link_file) catch {};
+}
+
+pub fn writePendingLinkForTest(io: std.Io, dir: *std.Io.Dir, link: []const u8, now_s: i64) void {
+    writePendingLinkIn(io, dir, link, now_s);
+}
+
+pub fn takeWrittenLinkForTest(io: std.Io, dir: *std.Io.Dir, buf: []u8, now_s: i64) ?[]const u8 {
+    return takeWrittenLinkIn(io, dir, buf, now_s);
 }
 
 pub fn captureArgvLinkForTest(link: []const u8) void {
