@@ -55,6 +55,23 @@ KEEP = {"cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "post", 
 JOINERS = {0x200D, 0xFE0E, 0xFE0F, 0x20E3}
 SKIN_TONES = range(0x1F3FB, 0x1F400)
 
+# The toolkit's outline budgets (canvas.font_ttf). Registration reads `maxp`,
+# which declares the MAXIMUM over the whole face, so a single glyph past the
+# budget refuses the entire font rather than degrading that one picture. Three
+# of Noto Emoji's most detailed glyphs are over it, and keeping them costs every
+# other emoji in the file.
+MAX_POINTS = 1024
+MAX_CONTOURS = 128
+
+
+def within_budget(glyf, name):
+    """Points and contours after composites are flattened, as the toolkit counts them."""
+    try:
+        coords, end_points, _ = glyf[name].getCoordinates(glyf)
+    except Exception:
+        return False
+    return len(coords) <= MAX_POINTS and len(end_points) <= MAX_CONTOURS
+
 
 def substitutable(cp, geist_cmap):
     if cp < 0x2000:
@@ -106,11 +123,39 @@ def main():
     scale_upem(f, TTFont(geist)["head"].unitsPerEm)
 
     geist_cmap = set(TTFont(geist).getBestCmap().keys())
-    emoji = sorted((cp, g) for cp, g in f.getBestCmap().items() if substitutable(cp, geist_cmap))
+    glyf = f["glyf"]
+    emoji = sorted(
+        (cp, g)
+        for cp, g in f.getBestCmap().items()
+        if substitutable(cp, geist_cmap) and within_budget(glyf, g)
+    )
+    dropped = sum(
+        1
+        for cp, g in f.getBestCmap().items()
+        if substitutable(cp, geist_cmap) and not within_budget(glyf, g)
+    )
+    if dropped:
+        print(f"dropped {dropped} emoji whose outlines are past the toolkit's budget")
     if not emoji:
         die("the emoji font has no cmap")
     if PUA_FIRST + len(emoji) - 1 > PUA_LAST:
         die(f"{len(emoji)} emoji do not fit in the private use area")
+
+    # Subset BEFORE remapping. Dropping a codepoint from the cmap leaves its
+    # outline in `glyf`, and `maxp` declares the maximum over every glyph in the
+    # file, so the face would still be refused for a picture nothing can reach.
+    # Subsetting removes the glyphs outright and recomputes `maxp`.
+    from fontTools import subset
+
+    keep = [cp for cp, _ in emoji]
+    subsetter = subset.Subsetter(options=subset.Options(notdef_outline=True, glyph_names=True))
+    subsetter.populate(unicodes=keep)
+    subsetter.subset(f)
+
+    # The glyph names may have moved, so the mapping is rebuilt from the subset
+    # rather than carried over from before it.
+    after = f.getBestCmap()
+    emoji = sorted((cp, after[cp]) for cp in keep if cp in after)
 
     pua = {}
     remapped = {}

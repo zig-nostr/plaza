@@ -20895,6 +20895,29 @@ test "a link followed while Plaza is open reaches the window that is already the
     }
 }
 
+test "the merged face the Linux build registers actually parses" {
+    // The toolkit refuses a face whose `maxp` declares ANY glyph past its
+    // outline budgets, and refuses the whole file rather than the one picture,
+    // so a single over-detailed emoji costs every other one in it.
+    //
+    // This shipped that way once and I only found it by running the app on
+    // Linux and reading the log: three of Noto Emoji's glyphs are past the
+    // 1024-point budget, registration refused the face, text silently fell back
+    // to plain Geist, and every substituted codepoint drew as a solid block.
+    // The screenshot looked fine because nothing in view had an emoji in it.
+    //
+    // Embedded HERE rather than read through theme.zig on purpose: the app does
+    // not embed this face on macOS (it has CoreText and does not need it), so
+    // reading it from there would make this test check an empty string on the
+    // platform most of the work happens on.
+    const merged = @embedFile("fonts/Geist-Emoji.ttf");
+    const font_ttf = native_sdk.canvas.font_ttf;
+    _ = font_ttf.Face.parse(merged) catch {
+        if (font_ttf.parseFailureReason(merged)) |why| std.debug.print("\nthe merged face was refused: {s}\n", .{why});
+        return error.TheMergedFaceIsPastTheToolkitsBudget;
+    };
+}
+
 test "the emoji table maps pictures and leaves text alone" {
     // Off macOS the toolkit inks every glyph from one face and returns nothing
     // for any codepoint above U+FFFF, so an emoji is painted as a solid block.
