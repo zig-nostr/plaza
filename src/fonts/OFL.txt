@@ -91,3 +91,11 @@ INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
 DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
+---
+
+Copyright 2013 Google LLC (https://github.com/google/fonts/tree/main/ofl/notoemoji)
+
+Noto Emoji is licensed under the SIL Open Font License, Version 1.1, the same
+licence and text as above. Geist-Emoji.ttf is Geist with Noto Emoji's monochrome
+outlines merged in, built by scripts/build-emoji-font.py, and is covered by both
+notices.

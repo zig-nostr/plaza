@@ -28,6 +28,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
+const emoji_pua = @import("emoji_pua.zig");
 const plaza_icons = @import("plaza_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -14209,6 +14210,26 @@ pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, m
         }
         const seq_len = std.unicode.utf8ByteSequenceLength(src[i]) catch 1;
         const take = @min(seq_len, src.len - i);
+        // An emoji, on a platform that cannot draw one where it lives. Swapped
+        // for the private-use codepoint carrying the same picture in the merged
+        // face. Never shorter than what it replaces is not something to rely on
+        // here: the private-use form is always three bytes and an emoji is three
+        // or four, so this only ever shrinks.
+        //
+        // Display only. `dst` is the note's render buffer; the event this came
+        // from is signed and is not touched, and nothing composed goes through
+        // here.
+        if (emojiPua(src[i..][0..take])) |pua| {
+            var enc: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(pua, &enc) catch 0;
+            if (n > 0) {
+                if (out + n > dst.len) break;
+                @memcpy(dst[out..][0..n], enc[0..n]);
+                out += n;
+                i += take;
+                continue;
+            }
+        }
         if (out + take > dst.len) break;
         @memcpy(dst[out..][0..take], src[i..][0..take]);
         out += take;
@@ -14222,6 +14243,53 @@ pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, m
         return trimmed.len;
     }
     return out;
+}
+
+/// The private-use codepoint whose glyph is `seq`'s picture, or null.
+///
+/// macOS draws emoji through CoreText, which finds the real colour font, so
+/// there is nothing to substitute and this compiles away. Everywhere else the
+/// toolkit inks glyphs itself from one face and returns nothing at all for a
+/// codepoint above U+FFFF, which is most emoji, and paints a solid block. The
+/// merged face carries those pictures in the private use area, which is inside
+/// the range the renderer will still look at.
+fn emojiPua(seq: []const u8) ?u21 {
+    if (comptime builtin.os.tag == .macos) return null;
+    // Every emoji in the table is three bytes or more encoded, so a one or two
+    // byte sequence cannot be one and does not need decoding to find out.
+    if (seq.len < 3) return null;
+    const cp = std.unicode.utf8Decode(seq) catch return null;
+    return emojiPuaLookup(cp);
+}
+
+/// The slot for one codepoint, without the platform question.
+///
+/// The table is sorted, and a codepoint's slot is its INDEX plus the base, which
+/// is what `scripts/build-emoji-font.py` assigned when it built the face. One
+/// table rather than a table of pairs, so there is no second half to fall out of
+/// step with the font.
+fn emojiPuaLookup(cp: u21) ?u21 {
+    var lo: usize = 0;
+    var hi: usize = emoji_pua.sources.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const at = emoji_pua.sources[mid];
+        if (at == cp) return emoji_pua.pua_first + @as(u21, @intCast(mid));
+        if (at < cp) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+pub fn emojiPuaLookupForTest(cp: u21) ?u21 {
+    return emojiPuaLookup(cp);
+}
+
+pub fn emojiTableLenForTest() usize {
+    return emoji_pua.sources.len;
+}
+
+pub fn emojiTableAtForTest(i: usize) u21 {
+    return emoji_pua.sources[i];
 }
 
 /// A parsed `nostr:` mention at `src[i]`: the byte just past its token, and the
@@ -32100,6 +32168,13 @@ fn registerFontFaces() void {
     }
 }
 
+/// The one registration off macOS, and none on it. A slice rather than an
+/// optional because that is the shape `Options.fonts` takes.
+const merged_fonts: []const PlazaApp.FontRegistration = if (builtin.os.tag == .macos)
+    &.{}
+else
+    &.{.{ .id = theme.merged_font_id, .name = "Geist-Emoji.ttf", .ttf = theme.merged_ttf }};
+
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     g_environ = init.environ_map;
@@ -32136,11 +32211,18 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .view = appView,
         .on_command = onCommand,
-        // No canvas-registered fonts: the typography tokens sit on the
-        // BUILT-IN ids (the SDK's default sans IS Geist), which is the only
-        // routing that gives span weights real medium/bold faces; a
-        // custom-registered id pins every span to its one face. The faces are
-        // registered with CoreText in `registerFontFaces` instead (theme.zig).
+        // On macOS: none. The typography tokens sit on the BUILT-IN ids (the
+        // toolkit's default sans IS Geist), which is the only routing that
+        // gives span weights real medium and bold faces, and `registerFontFaces`
+        // hands the faces to CoreText, which then cascades to the system for
+        // anything Geist lacks.
+        //
+        // Everywhere else: the merged face, because none of that exists there.
+        // The toolkit inks every glyph itself from one face, so a glyph Geist
+        // does not have is a solid block rather than a fallback, and the
+        // reserved weight ids already resolve to the regular face regardless.
+        // See `theme.merged_ttf`.
+        .fonts = merged_fonts,
         // The dark, cool-grey, white-accent look (see theme.zig).
         .tokens_fn = theme.tokens(Model),
     });
