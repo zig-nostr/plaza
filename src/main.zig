@@ -24530,6 +24530,12 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         ui.row(.{ .gap = 10, .cross = .start }, .{
             avatarDisc(ui, note, avatar_size),
             identityBlock(ui, note),
+            // The same grow every other row that carries a time has. Without it
+            // the time sat wherever the name left it, so it was LEFT aligned in
+            // a card whose every other row is right aligned, and its right edge
+            // moved with the width of the text: "1d" and "12h" ended seven
+            // points apart.
+            ui.spacer(1),
             ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, &.{.{ .text = note.time(), .scale = meta_scale }}),
         }),
         // Four lines of the quoted note, and no more: a quote is an aside, and

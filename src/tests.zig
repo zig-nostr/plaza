@@ -3788,6 +3788,54 @@ test "a row's own frame holds everything it draws" {
     try testing.expect(rows[1].y >= rows[0].y + rows[0].height - 0.5);
 }
 
+test "a quoted note's time is right aligned like every other" {
+    // Spotted in a screenshot: the "1d" in a quote card sat well short of the
+    // card's right edge. The card's header row had no grow between the name and
+    // the time, so the time was placed wherever the name left it. That is LEFT
+    // alignment, and it shows because the right edge then moves with the width
+    // of the text: two cards an hour apart ended seven points apart.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two quotes whose times render at different widths ("2h" and "12h"), which
+    // is what tells left alignment from right.
+    // The app's clock reads 0 without an `io`, which a test has none of, so an
+    // age is simply `-created_at`. Negative stamps are what make the two cards
+    // render "2h" and "12h" here.
+    const now: i64 = 0;
+    const short_id = [_]u8{0x5e} ** 32;
+    const long_id = [_]u8{0x5f} ** 32;
+    main.seedQuoteForTest(short_id, [_]u8{0x7a} ** 32, now - 2 * 3600, "Two hours ago.");
+    main.seedQuoteForTest(long_id, [_]u8{0x7b} ** 32, now - 12 * 3600, "Twelve hours ago.");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    for ([_]struct { i: usize, id: [32]u8 }{ .{ .i = 0, .id = short_id }, .{ .i = 1, .id = long_id } }) |q| {
+        model.notes[q.i] = threadNote(@intCast(0xA1 + q.i), now - 5 * 3600, 0);
+        model.notes[q.i].id = @intCast(7 + q.i);
+        const body = "Look at this.";
+        @memcpy(model.notes[q.i].content_buf[0..body.len], body);
+        model.notes[q.i].content_len = @intCast(body.len);
+        model.notes[q.i].quote = .{ .kind = .event, .id = q.id, .off = 0, .len = 0 };
+    }
+    model.notes_len = 2;
+
+    const p = try painted.Painted.render(arena, &model);
+    const short_f = frameOfText(p, "2h") orelse return error.NoShortTime;
+    const long_f = frameOfText(p, "12h") orelse return error.NoLongTime;
+
+    const short_right = short_f.x + short_f.width;
+    const long_right = long_f.x + long_f.width;
+    // Right aligned: the two share an edge however wide the text is. Left
+    // aligned they would share an x instead, and these edges would differ by
+    // exactly the width of one digit.
+    if (@abs(short_right - long_right) > 1.0) {
+        std.debug.print("\nquote times are not right aligned: 2h ends at {d}, 12h at {d}\n", .{ short_right, long_right });
+        return error.TheQuoteTimeIsNotRightAligned;
+    }
+}
+
 test "a note that quotes another is priced with the quote in it" {
     // The bordered card this replaces was never priced at all, so a feed of
     // quoting notes reported less than it drew and the scrollbar lied. The
