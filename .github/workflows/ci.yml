@@ -159,6 +159,75 @@ jobs:
   # Not `frames`: it is a p90 against a budget, and a shared runner only ever
   # reads slow, so it would fail for reasons that are nothing to do with the
   # change under test. Not `follows`: it publishes signed events and needs a key.
+  # Runs the Linux packaging script for real, on every push.
+  #
+  # `scripts/package-linux.sh` cannot be run on the machine it was written on: a
+  # Mac has no Linux gtk4 to link against, so the build inside it dies before the
+  # script gets anywhere near the parts worth checking. Untested packaging shell
+  # is how a release goes out missing a helper, and this project has done that
+  # once already, so the script runs here instead of being read and hoped over.
+  #
+  # It asserts what a working install needs by name (plaza, signer, notary), that
+  # nothing else rode along, and that the desktop entry actually claims
+  # `plaza://` links and carries a field code, which is the whole of how a link
+  # reaches the app on Linux.
+  linux-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.9.2
+
+      # gtk4 only. Plaza draws on a canvas and declares no web use, so the host
+      # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing
+      # else. Installing the WebKit development package here would hide a
+      # regression that made it a real dependency.
+      - name: Install the Linux host dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      # Read out of the RELEASE workflow rather than pinned again here. The
+      # helpers are Notary's, and "whatever notary's main happened to be that
+      # afternoon" is not something a package should be built against; a second
+      # copy of the pin is just a second thing to forget when it moves. The
+      # acceptance journey reads it the same way.
+      - name: Read the pinned Notary ref
+        id: notary-ref
+        run: |
+          ref="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' .github/workflows/release.yml | head -1)"
+          [ -n "$ref" ] || { echo "could not read NOTARY_REF from the release workflow"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Notary
+        uses: actions/checkout@v4
+        with:
+          repository: zig-nostr/notary
+          ref: ${{ steps.notary-ref.outputs.ref }}
+          path: .notary
+
+      - name: Package
+        run: scripts/package-linux.sh --notary .notary
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plaza-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   acceptance:
     runs-on: macos-latest
     steps:
