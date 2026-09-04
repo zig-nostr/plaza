@@ -17,6 +17,13 @@
 #
 set -euo pipefail
 
+# Script scope, not `main`'s. The EXIT trap runs after `main` returns, and a
+# `local` is gone by then: under `set -u` the cleanup then dies on its own
+# variable, which is a confusing failure at the end of a successful install.
+workdir=""
+cleanup() { [ -n "$workdir" ] && rm -rf "$workdir"; }
+trap cleanup EXIT
+
 say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33mnote:\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
@@ -27,8 +34,21 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 # an install.
 main() {
   local repo="zig-nostr/plaza"
+  # A tarball already on disk, instead of the latest published release. For
+  # installing without a network, and for trying a build before it is a release,
+  # which is how this script was first tested at all.
+  local archive=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --archive) archive="${2:?--archive needs a path}"; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
 
-  for tool in curl sha256sum tar; do
+  # Only what the chosen path actually uses. `curl` belongs to the download,
+  # and demanding it for `--archive` refuses an offline install for a tool that
+  # install would never call.
+  for tool in sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and is not on PATH."
   done
 
@@ -36,8 +56,17 @@ main() {
   # window fails to open is worse than being told now. Checked by loader rather
   # than by package name, because the package is called libgtk-4-1 on Debian and
   # Ubuntu, gtk4 on Fedora and Arch, and something else again elsewhere.
+  #
+  # `grep -c ... || true`, NOT `grep -q`. Under `set -o pipefail` a matching
+  # `grep -q` exits at once, `ldconfig` dies of SIGPIPE, and the pipeline reports
+  # THAT rather than the match, so the guard fires on a machine that has GTK. It
+  # fires on one that does not either, because grep exits 1 there, which makes it
+  # a check that can never pass. `package-linux.sh` carries a comment about this
+  # exact trap and I wrote it here anyway.
   if command -v ldconfig >/dev/null 2>&1; then
-    ldconfig -p 2>/dev/null | grep -q "libgtk-4\.so" || die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4."
+    local gtk
+    gtk="$(ldconfig -p 2>/dev/null | grep -c "libgtk-4\.so" || true)"
+    [ "$gtk" != "0" ] || die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4."
   fi
 
   local arch
@@ -47,8 +76,25 @@ main() {
     *) die "no build for $arch. Plaza publishes x86_64 and aarch64; build from source for anything else." ;;
   esac
 
+  local tmp
+  tmp="$(mktemp -d)"
+  workdir="$tmp"
+
+  local tag asset
+  if [ -n "$archive" ]; then
+    [ -f "$archive" ] || die "$archive does not exist."
+    asset="$(basename "$archive")"
+    tag="local"
+    say "Installing from $archive"
+    cp "$archive" "$tmp/$asset"
+    installFrom "$tmp" "$asset" "$tag"
+    return
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "curl is required to download a release (or pass --archive <file>)."
+
   say "Looking up the latest release..."
-  local api resp code json tag url
+  local api resp code json url
   api="https://api.github.com/repos/$repo/releases/latest"
   # Not `curl -f`: -f collapses every HTTP answer into one exit code, so a rate
   # limit and a network failure become the same unhelpful message. The status
@@ -65,12 +111,8 @@ main() {
 
   tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   [ -n "$tag" ] || die "could not read the release tag."
-  local asset="plaza-${tag#v}-linux-$arch.tar.gz"
+  asset="plaza-${tag#v}-linux-$arch.tar.gz"
   url="https://github.com/$repo/releases/download/$tag/$asset"
-
-  local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
 
   say "Downloading $asset..."
   curl -fSL --progress-bar -o "$tmp/$asset" "$url" || die "download failed. There may be no $arch build for $tag."
@@ -88,6 +130,13 @@ main() {
     warn "no published SHA-256 for this release, so the download could not be verified."
   fi
 
+  installFrom "$tmp" "$asset" "$tag"
+}
+
+# Unpacks an archive and installs it. Shared by the download path and by
+# `--archive`, so a local install and a released one are the same install.
+installFrom() {
+  local tmp="$1" asset="$2" tag="$3"
   say "Unpacking..."
   tar -C "$tmp" -xzf "$tmp/$asset"
   local src
@@ -123,8 +172,12 @@ main() {
   # Exec must be absolute. The entry ships with a bare executable name, which
   # only resolves if ~/.local/bin is on PATH, and the desktop environment that
   # launches a link handler does not necessarily have the PATH a shell does.
-  sed -e "s|^Exec=.*plaza|Exec=$prefix/bin/plaza|" \
-      -e "s|^Icon=app-icon$|Icon=plaza|" \
+  # The packager writes the executable QUOTED (`Exec="plaza" %U`), so the
+  # replacement has to swallow the quotes rather than the name alone: matching
+  # `.*plaza` leaves the closing quote stranded and the entry is then malformed.
+  # The result is quoted too, because a home directory may contain a space.
+  sed -E -e "s|^Exec=\"?[^\" ]*\"?|Exec=\"$prefix/bin/plaza\"|" \
+         -e "s|^Icon=app-icon$|Icon=plaza|" \
       "$src/share/applications/plaza.desktop" > "$prefix/share/applications/plaza.desktop"
   chmod 0644 "$prefix/share/applications/plaza.desktop"
 
