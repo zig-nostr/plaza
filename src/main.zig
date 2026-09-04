@@ -14264,9 +14264,40 @@ fn emojiPuaLookup(cp: u21) ?u21 {
     return null;
 }
 
+/// Codepoints that are INVISIBLE by definition and must never reach a renderer
+/// that draws a block for what it cannot find.
+///
+/// A variation selector is the one that shows: "\u{2620}\u{FE0F}" is a skull
+/// followed by U+FE0F, which asks for the colour presentation and inks nothing
+/// at all. The skull is in the merged face and draws; the selector is in no
+/// face, so it came out as a solid rectangle sitting next to it. Joiners, the
+/// bidi marks and the skin tone modifiers are the same story: meaningful to
+/// text, never ink of their own.
+///
+/// macOS is unaffected. CoreText reads these as the presentation and joining
+/// instructions they are, so dropping them there would turn a colour emoji into
+/// a monochrome one and split families into their parts.
+fn invisibleForDisplay(cp: u21) bool {
+    return switch (cp) {
+        0x200B...0x200F => true, // zero-width space, joiners, bidi marks
+        0x202A...0x202E => true, // bidi embedding and overrides
+        0x2060...0x2064 => true, // word joiner and the invisible operators
+        0xFE00...0xFE0F => true, // variation selectors
+        0x20E3 => true, // combining enclosing keycap
+        0x1F3FB...0x1F3FF => true, // skin tone modifiers
+        else => false,
+    };
+}
+
 /// Writes one UTF-8 sequence into `dst`, as the private-use codepoint carrying
-/// its picture when it is an emoji. Null when it would not fit.
+/// its picture when it is an emoji. Null when it would not fit, zero when the
+/// sequence is invisible and is dropped.
 fn writeDisplaySeq(dst: []u8, seq: []const u8) ?usize {
+    if (comptime builtin.os.tag != .macos) {
+        if (std.unicode.utf8Decode(seq)) |cp| {
+            if (invisibleForDisplay(cp)) return 0;
+        } else |_| {}
+    }
     if (emojiPua(seq)) |pua| {
         var enc: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(pua, &enc) catch 0;
@@ -14302,6 +14333,10 @@ fn copyDisplayText(dst: []u8, src: []const u8) usize {
         i += take;
     }
     return out;
+}
+
+pub fn invisibleForDisplayForTest(cp: u21) bool {
+    return invisibleForDisplay(cp);
 }
 
 pub fn copyDisplayTextForTest(dst: []u8, src: []const u8) usize {
