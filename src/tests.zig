@@ -20918,6 +20918,32 @@ test "the merged face the Linux build registers actually parses" {
     };
 }
 
+test "a display name keeps its emoji drawable" {
+    // A name is not note content and never went through the content path, so an
+    // emoji in one stayed a codepoint no face off macOS can draw and painted as
+    // a solid block. Found on a real note: the author "Dr. The Daniel" with a
+    // raised hand after it, rendered as a bar in the reply line.
+    var buf: [128]u8 = undefined;
+    const src = "Dr. The Daniel \u{1F596}";
+    const n = main.copyDisplayTextForTest(&buf, src);
+    const out = buf[0..n];
+
+    // The name itself survives on both platforms.
+    try testing.expect(std.mem.startsWith(u8, out, "Dr. The Daniel "));
+
+    if (builtin.os.tag == .macos) {
+        // CoreText draws the real emoji, in colour, so nothing is substituted.
+        try testing.expectEqualStrings(src, out);
+    } else {
+        // Everywhere else it becomes the private-use codepoint whose glyph the
+        // merged face carries.
+        const slot = main.emojiPuaLookupForTest(0x1F596) orelse return error.TheEmojiHasNoSlot;
+        var enc: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(slot, &enc);
+        try testing.expect(std.mem.endsWith(u8, out, enc[0..len]));
+    }
+}
+
 test "the emoji table maps pictures and leaves text alone" {
     // Off macOS the toolkit inks every glyph from one face and returns nothing
     // for any codepoint above U+FFFF, so an emoji is painted as a solid block.

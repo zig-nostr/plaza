@@ -9361,9 +9361,7 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
         const raw = candidate orelse continue;
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0) continue;
-        const n = utf8SafeLen(trimmed, profile.name_buf.len);
-        @memcpy(profile.name_buf[0..n], trimmed[0..n]);
-        profile.name_len = @intCast(n);
+        profile.name_len = @intCast(copyDisplayText(&profile.name_buf, trimmed));
         break;
     }
     // The username is kept separately: it is the handle line under a display
@@ -9372,9 +9370,7 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
     if (md.name) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len > 0) {
-            const n = utf8SafeLen(trimmed, profile.username_buf.len);
-            @memcpy(profile.username_buf[0..n], trimmed[0..n]);
-            profile.username_len = @intCast(n);
+            profile.username_len = @intCast(copyDisplayText(&profile.username_buf, trimmed));
         }
     }
     if (md.picture) |pic| {
@@ -14219,20 +14215,8 @@ pub fn renderContentInto(dst: []u8, src: []const u8, omit: []const []const u8, m
         // Display only. `dst` is the note's render buffer; the event this came
         // from is signed and is not touched, and nothing composed goes through
         // here.
-        if (emojiPua(src[i..][0..take])) |pua| {
-            var enc: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(pua, &enc) catch 0;
-            if (n > 0) {
-                if (out + n > dst.len) break;
-                @memcpy(dst[out..][0..n], enc[0..n]);
-                out += n;
-                i += take;
-                continue;
-            }
-        }
-        if (out + take > dst.len) break;
-        @memcpy(dst[out..][0..take], src[i..][0..take]);
-        out += take;
+        const wrote = writeDisplaySeq(dst[out..], src[i..][0..take]) orelse break;
+        out += wrote;
         i += take;
     }
     // Lifting a URL out can leave whitespace stranded at either edge.
@@ -14278,6 +14262,50 @@ fn emojiPuaLookup(cp: u21) ?u21 {
         if (at < cp) lo = mid + 1 else hi = mid;
     }
     return null;
+}
+
+/// Writes one UTF-8 sequence into `dst`, as the private-use codepoint carrying
+/// its picture when it is an emoji. Null when it would not fit.
+fn writeDisplaySeq(dst: []u8, seq: []const u8) ?usize {
+    if (emojiPua(seq)) |pua| {
+        var enc: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(pua, &enc) catch 0;
+        if (n > 0) {
+            if (n > dst.len) return null;
+            @memcpy(dst[0..n], enc[0..n]);
+            return n;
+        }
+    }
+    if (seq.len > dst.len) return null;
+    @memcpy(dst[0..seq.len], seq);
+    return seq.len;
+}
+
+/// Copies text this app DRAWS into a fixed buffer, emoji and all.
+///
+/// A display name is not note content and never went through
+/// `renderContentInto`, so an emoji in somebody's name stayed as a codepoint no
+/// face off macOS can draw, and painted as a solid block. "Dr. The Daniel" with
+/// a raised hand after it is what this was found on.
+///
+/// Display buffers ONLY. The profile editor seeds itself from the raw JSON
+/// rather than from this cache, so nothing substituted here is ever published
+/// back into somebody's profile.
+fn copyDisplayText(dst: []u8, src: []const u8) usize {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(src[i]) catch 1;
+        const take = @min(seq_len, src.len - i);
+        const wrote = writeDisplaySeq(dst[out..], src[i..][0..take]) orelse break;
+        out += wrote;
+        i += take;
+    }
+    return out;
+}
+
+pub fn copyDisplayTextForTest(dst: []u8, src: []const u8) usize {
+    return copyDisplayText(dst, src);
 }
 
 pub fn emojiPuaLookupForTest(cp: u21) ?u21 {
