@@ -20944,6 +20944,39 @@ test "a display name keeps its emoji drawable" {
     }
 }
 
+test "an invisible codepoint is not drawn as a block" {
+    // Reported from a real note: "oh right web clients" followed by a skull and
+    // then a solid rectangle. The skull is U+2620 and the merged face has it, so
+    // it drew. What followed was U+FE0F, the variation selector asking for the
+    // colour presentation, which inks nothing anywhere and is in no font, so the
+    // renderer drew its block fallback for it.
+    //
+    // Every codepoint here is invisible by definition, so drawing anything at
+    // all for one is wrong.
+    for ([_]u21{ 0xFE0F, 0xFE0E, 0x200D, 0x200B, 0x20E3, 0x1F3FB, 0x1F3FF, 0x2060 }) |cp| {
+        if (!main.invisibleForDisplayForTest(cp)) return error.AnInvisibleCodepointWouldBeDrawn;
+    }
+    // And nothing that carries ink is swept up with them.
+    for ([_]u21{ 'a', '0', 0x2620, 0x1F600, 0x0416, 0x2026 }) |cp| {
+        if (main.invisibleForDisplayForTest(cp)) return error.AVisibleCodepointWasDropped;
+    }
+
+    var buf: [64]u8 = undefined;
+    const n = main.copyDisplayTextForTest(&buf, "web clients \u{2620}\u{FE0F}");
+    const out = buf[0..n];
+    if (builtin.os.tag == .macos) {
+        // CoreText wants the selector: it is what makes the emoji render in
+        // colour rather than as a monochrome dingbat.
+        try testing.expectEqualStrings("web clients \u{2620}\u{FE0F}", out);
+    } else {
+        // The skull survives as its slot; the selector is gone rather than drawn.
+        const slot = main.emojiPuaLookupForTest(0x2620) orelse return error.TheSkullHasNoSlot;
+        var enc: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(slot, &enc);
+        try testing.expect(std.mem.endsWith(u8, out, enc[0..len]));
+    }
+}
+
 test "the emoji table maps pictures and leaves text alone" {
     // Off macOS the toolkit inks every glyph from one face and returns nothing
     // for any codepoint above U+FFFF, so an emoji is painted as a solid block.
