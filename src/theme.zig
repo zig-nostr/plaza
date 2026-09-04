@@ -462,6 +462,25 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             // matching the redesign.
             t.typography.body_size = 14.5;
 
+            // One wheel click should move the feed and stop, not launch it.
+            //
+            // The toolkit's defaults are tuned for a trackpad: a wheel delta
+            // becomes velocity times 60, and velocity decays to 86% PER SECOND.
+            // On a trackpad the deltas are small and continuous and it reads as
+            // momentum. Off macOS a wheel click arrives multiplied by 40 by the
+            // GTK host first, so one click is 2400 points per second and takes
+            // about forty seconds to fall under the stop threshold. Reported as
+            // a feed that cannot be stopped, only reversed, which is exactly
+            // what adding opposite velocity does.
+            //
+            // macOS is left alone: its scrolling is a trackpad's and feels
+            // right as it is.
+            if (builtin.os.tag != .macos) {
+                t.scroll.wheel_velocity_scale = 8;
+                t.scroll.deceleration_per_second = 0.002;
+                t.scroll.stop_velocity = 20;
+            }
+
             // The place's own colour, while the reader is standing in one.
             //
             // This is the ONE deliberate exception to the rule at the top of
