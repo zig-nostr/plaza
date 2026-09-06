@@ -23,9 +23,13 @@
         // from an SDK upgrade. Filed upstream as vercel-labs/native#421; when
         // it lands this goes back to vercel-labs/native and the fork is
         // deleted. See PATCHES.md in the fork.
+        // Also reachable as the tag `plaza-colour-emoji-1`, so the commit this
+        // fetches does not depend on one branch surviving. A branch deleted or
+        // force-pushed past it takes the dependency down for every cold
+        // checkout while a warm Zig cache hides it locally.
         .native_sdk = .{
-            .url = "git+https://github.com/zig-nostr/native.git#5889503d7e436ba209ab237e510ffca7e46158d7",
-            .hash = "native_sdk-0.1.0-hzDzQtlkqQIkX_hTI_Udj05p5c058Sc0VkoDC2CQADZw",
+            .url = "git+https://github.com/zig-nostr/native.git#21f372e0643d4799ca3c8613f817d73664207061",
+            .hash = "native_sdk-0.1.0-hzDzQsJ6qQIvJ-DK4nttt97osLkrwuuAC8bWPmV_-YbS",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the
