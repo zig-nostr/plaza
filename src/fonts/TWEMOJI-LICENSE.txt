@@ -1,0 +1,11 @@
+Twemoji.ttf is Twemoji Mozilla v0.7.0
+(https://github.com/mozilla/twemoji-colr), a COLR/CPAL colour build of Twemoji.
+
+Twemoji graphics are copyright 2020 Twitter, Inc and other contributors,
+licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+
+The twemoji-colr build tooling is licensed under the Apache License 2.0.
+
+Plaza embeds this face only where the platform has no colour emoji of its own.
+On macOS CoreText draws emoji from the system face and this file is not
+compiled in.

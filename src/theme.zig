@@ -53,23 +53,26 @@ const Color = canvas.Color;
 /// bold are the matching v1.4.01 statics. Registered with CoreText by
 /// `main.zig` at startup; never registered with the canvas font registry
 /// (that would pin spans to one face and kill weight routing).
-/// The face Plaza draws with where the platform has no text layer of its own.
+/// The emoji face Plaza draws with where the platform has no colour emoji of
+/// its own: Twemoji Mozilla, a COLR/CPAL build (attribution in
+/// fonts/TWEMOJI-LICENSE.txt).
 ///
-/// Geist with monochrome emoji merged in and parked in the private use area,
-/// built by `scripts/build-emoji-font.py`. Off macOS the toolkit inks every
-/// glyph itself from ONE face with no fallback, and refuses any codepoint above
-/// U+FFFF outright, so an emoji is painted as a solid filled rectangle. Merging
-/// puts the pictures inside the same face as the text, and the private use area
-/// puts them where the renderer will still look.
+/// Off macOS the toolkit inks every glyph itself, and it reaches this face
+/// through the renderer's own fallback: the text face is asked first and keeps
+/// every glyph it has, and only a codepoint it does not carry falls through to
+/// a registered COLOUR face. So registering this changes nothing about how text
+/// is drawn, and turns the solid blocks emoji used to paint as into pictures.
 ///
-/// Embedded only where it is used: on macOS CoreText draws the text and cascades
-/// to the system's own faces, so this would be 862 KB of a binary that never
-/// reads it.
-pub const merged_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/Geist-Emoji.ttf");
+/// Embedded only where it is used: on macOS CoreText draws the text and
+/// cascades to the system's own Apple Color Emoji, so this would be 1.4 MB of a
+/// binary that never reads it.
+pub const emoji_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/Twemoji.ttf");
 
-/// The id `merged_ttf` is registered under. Above `min_registered_font_id`,
+/// The id `emoji_ttf` is registered under. Above `min_registered_font_id`,
 /// which is 64: everything below is reserved for the toolkit's built-in faces.
-pub const merged_font_id: canvas.FontId = 64;
+/// Nothing ever asks to be DRAWN in this id; it exists so the face is
+/// registered and the renderer's colour fallback can find it.
+pub const emoji_font_id: canvas.FontId = 64;
 
 pub const geist_ttf = @embedFile("fonts/Geist-Regular.ttf");
 pub const geist_medium_ttf = @embedFile("fonts/Geist-Medium.ttf");
@@ -441,22 +444,16 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
 
             // Geist for prose, Geist Mono for the metadata voice, on the
             // BUILT-IN ids, which is what keeps span weights routing to the
-            // reserved medium/bold ids (see the module doc). The faces are
-            // registered with CoreText from the embedded bytes at startup.
-            // On macOS the built-in ids, which is what routes span weights to
-            // the reserved medium and bold faces (see the module doc).
+            // reserved medium/bold ids (see the module doc). On macOS the
+            // faces are registered with CoreText from the embedded bytes at
+            // startup.
             //
-            // Everywhere else the MERGED face, because there is no system text
-            // layer off macOS: the toolkit inks every glyph from one face with
-            // no fallback, so anything Geist lacks is painted as a solid block.
-            // `Geist-Emoji.ttf` is Geist with monochrome emoji merged in, and
-            // taking it costs the weight routing (a custom id pins every span
-            // to its one face), which off macOS was already lost: the reserved
-            // weight ids resolve to the regular face there regardless.
-            t.typography.font_id = if (builtin.os.tag == .macos)
-                canvas.default_sans_font_id
-            else
-                merged_font_id;
+            // The same ids off macOS. Emoji there do not need an id of their
+            // own: the renderer asks the text face first and falls through to
+            // the registered COLOUR face only for a codepoint Geist does not
+            // carry, so the typography slot stays on Geist and keeps its
+            // weight routing (see `emoji_ttf`).
+            t.typography.font_id = canvas.default_sans_font_id;
             t.typography.mono_font_id = canvas.default_mono_font_id;
             // A touch larger than the house 14 for a more readable feed body,
             // matching the redesign.
