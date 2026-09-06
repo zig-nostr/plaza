@@ -20991,6 +20991,38 @@ test "the emoji face the Linux build registers parses, and carries colour emoji"
     }
 }
 
+test "the weight faces the Linux build registers parse, and differ from regular" {
+    // Off macOS the toolkit maps a span's weight onto reserved font ids and
+    // bundles no face for any of them, so medium and bold ink REGULAR outlines
+    // unless the app fills those ids. Plaza fills them from the same two files
+    // CoreText is handed on macOS (main.zig `registered_fonts`).
+    //
+    // The failure this guards is silent: registration refuses a face whole if
+    // its `maxp` is past the outline budgets, and the app then falls back to
+    // regular and simply looks flat. Nothing crashes and no test would notice.
+    const font_ttf = native_sdk.canvas.font_ttf;
+    inline for (.{
+        .{ "Geist-Medium.ttf", theme.geist_medium_ttf },
+        .{ "Geist-Bold.ttf", theme.geist_bold_ttf },
+    }) |entry| {
+        const face = font_ttf.Face.parse(entry[1]) catch {
+            if (font_ttf.parseFailureReason(entry[1])) |why| std.debug.print("\n{s} was refused: {s}\n", .{ entry[0], why });
+            return error.AWeightFaceIsPastTheToolkitsBudget;
+        };
+
+        // A weight that draws the same outlines as regular is the defect, not
+        // the fix. `M` is the widest Latin glyph, so a real weight step shows
+        // in its advance; identical advances would mean the same face twice.
+        const glyph = face.glyphIndex('M');
+        if (glyph == 0) return error.AWeightFaceIsMissingTheLatinAlphabet;
+        const regular = font_ttf.Face.parse(theme.geist_ttf) catch return error.TheRegularFaceIsRefused;
+        const regular_m = regular.glyphIndex('M');
+        const width = face.advance(glyph) * regular.units_per_em;
+        const regular_width = regular.advance(regular_m) * face.units_per_em;
+        if (width <= regular_width) return error.AWeightFaceIsNoHeavierThanRegular;
+    }
+}
+
 test "a display name keeps its emoji drawable" {
     // A name is not note content and never went through the content path, so an
     // emoji in one stayed a codepoint no face off macOS could draw and painted

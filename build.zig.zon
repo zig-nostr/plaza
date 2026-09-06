@@ -14,22 +14,38 @@
         // CLI and the framework speak different protocol versions, and moving
         // one alone does not fail the build: it silently breaks every live test.
         //
-        // A fork rather than vercel-labs/native, for one patch: the renderer
-        // Linux presents with inks every glyph from one face and stops at
-        // U+FFFF, so an emoji is a solid block there and no app can fix it from
-        // above. The fork reads cmap format 12 and COLR/CPAL, which is what
-        // lets a registered colour face draw real emoji. It is 8d0da34 plus
-        // that one commit and nothing else, so the emoji fix stays separable
-        // from an SDK upgrade. Filed upstream as vercel-labs/native#421; when
-        // it lands this goes back to vercel-labs/native and the fork is
-        // deleted. See PATCHES.md in the fork.
-        // Also reachable as the tag `plaza-colour-emoji-1`, so the commit this
+        // A fork rather than vercel-labs/native, for two patches, both in the
+        // renderer Linux presents with and neither fixable from up here:
+        //
+        //   1. It inks every glyph from one face and stops at U+FFFF, so an
+        //      emoji is a solid block. The fork reads cmap format 12 and
+        //      COLR/CPAL, so a registered colour face draws real emoji.
+        //      Upstream vercel-labs/native#421.
+        //   2. It bundles no face for the weight ids it maps spans onto, so
+        //      medium and bold ink regular outlines and there is no
+        //      typographic hierarchy at all. The fork lets an app fill those
+        //      four ids, which is what `registered_fonts` in main.zig does.
+        //      Upstream vercel-labs/native#423.
+        //
+        // It is 8d0da34 plus those two commits and nothing else, so both stay
+        // separable from an SDK upgrade. When one lands upstream its patch is
+        // dropped on the next rebase; when both have, this points back at
+        // vercel-labs/native and the fork is deleted. TWO IS THE CAP: the
+        // fork's exit depends on everything it carries landing, and it is
+        // already pinned to a tree older than upstream's current release. See
+        // PATCHES.md in the fork.
+        //
+        // Note the revert is not one line. src/tests.zig calls hasColorGlyphs()
+        // and colorLayerCount(), which are the fork's own API, so Plaza does
+        // not compile against vercel-labs/native until those go too.
+        //
+        // Also reachable as the tag `plaza-colour-emoji-2`, so the commit this
         // fetches does not depend on one branch surviving. A branch deleted or
         // force-pushed past it takes the dependency down for every cold
         // checkout while a warm Zig cache hides it locally.
         .native_sdk = .{
-            .url = "git+https://github.com/zig-nostr/native.git#21f372e0643d4799ca3c8613f817d73664207061",
-            .hash = "native_sdk-0.1.0-hzDzQsJ6qQIvJ-DK4nttt97osLkrwuuAC8bWPmV_-YbS",
+            .url = "git+https://github.com/zig-nostr/native.git#8029415c833ae76ec547fcfb4ea0b3ecaf377c0c",
+            .hash = "native_sdk-0.1.0-hzDzQpOOqQJh9Udc9wYfVFxLjqVguw6YtHncVzRGUpP3",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the

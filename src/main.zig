@@ -32182,12 +32182,24 @@ fn registerFontFaces() void {
     }
 }
 
-/// The one registration off macOS, and none on it. A slice rather than an
+/// The faces registered off macOS, and none on it. A slice rather than an
 /// optional because that is the shape `Options.fonts` takes.
-const emoji_fonts: []const PlazaApp.FontRegistration = if (builtin.os.tag == .macos)
+///
+/// The emoji face is for the renderer's colour fallback; nothing asks to be
+/// drawn in its id. The two weights are the opposite: the toolkit maps a span's
+/// weight onto reserved ids of its own and bundles no face for any of them, so
+/// off macOS medium and bold ink REGULAR outlines and the app has no
+/// typographic hierarchy at all. Filling those ids is the only way to get the
+/// weights, and it is the same two files CoreText is handed on macOS, already
+/// embedded, so it costs no binary.
+const registered_fonts: []const PlazaApp.FontRegistration = if (builtin.os.tag == .macos)
     &.{}
 else
-    &.{.{ .id = theme.emoji_font_id, .name = "Twemoji.ttf", .ttf = theme.emoji_ttf }};
+    &.{
+        .{ .id = theme.emoji_font_id, .name = "Twemoji.ttf", .ttf = theme.emoji_ttf },
+        .{ .id = canvas.default_sans_medium_font_id, .name = "Geist-Medium.ttf", .ttf = theme.geist_medium_ttf },
+        .{ .id = canvas.default_sans_bold_font_id, .name = "Geist-Bold.ttf", .ttf = theme.geist_bold_ttf },
+    };
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
@@ -32231,11 +32243,9 @@ pub fn main(init: std.process.Init) !void {
         // hands the faces to CoreText, which then cascades to the system for
         // anything Geist lacks.
         //
-        // Everywhere else: the colour emoji face, because none of that exists
-        // there. Nothing asks to be drawn in its id; registering it is what
-        // lets the renderer reach it for a codepoint Geist does not carry, which
-        // used to be a solid block. See `theme.emoji_ttf`.
-        .fonts = emoji_fonts,
+        // Everywhere else: the colour emoji face and the two Geist weights,
+        // because none of that exists there. See `registered_fonts`.
+        .fonts = registered_fonts,
         // The dark, cool-grey, white-accent look (see theme.zig).
         .tokens_fn = theme.tokens(Model),
     });
