@@ -13395,6 +13395,17 @@ fn finishMedia(fx: *Effects, slot: *MediaSlot, bytes: []const u8) void {
 var g_open_url_buf: [1024]u8 = undefined;
 
 /// Whether `url` is safe to hand to the system opener.
+/// The toolkit's own gate on `openUrl`, declared where the test can reach it.
+///
+/// `*` is deliberate and is explained at the call site: the toolkit's pattern
+/// language cannot express "any https URL", so a narrower-looking pattern here
+/// is a pattern that matches nothing and denies every link. `isSafeExternalUrl`
+/// is the gate that actually narrows, and it runs first.
+pub const external_link_policy: native_sdk.ExternalLinkPolicy = .{
+    .action = .open_system_browser,
+    .allowed_urls = &.{"*"},
+};
+
 pub fn isSafeExternalUrl(url: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://")) return false;
     if (url.len > g_open_url_buf.len) return false;
@@ -32271,16 +32282,25 @@ pub fn main(init: std.process.Init) !void {
             .permissions = &app_permissions,
             .navigation = .{
                 .allowed_origins = &.{ "zero://inline", "zero://app" },
-                // The toolkit refuses `openUrl` unless the policy says a link may
-                // reach the system browser, so the seam above needs this to be
-                // anything but the default `.deny`. Scoped to exactly what
-                // `isSafeExternalUrl` already accepts rather than to `*`: this is
-                // the second gate, and a second gate wider than the first is not
-                // a gate.
-                .external_links = .{
-                    .action = .open_system_browser,
-                    .allowed_urls = &.{ "https://*", "http://*" },
-                },
+                // The toolkit refuses `openUrl` unless the policy says a link
+                // may reach the system browser, so this has to be anything but
+                // the default `.deny`.
+                //
+                // `*` and not `"https://*"`, which is what this said until a
+                // reader reported that no link opened anywhere. The toolkit's
+                // pattern language cannot express a scheme-wide wildcard:
+                // `security.externalWildcardPrefixValid` requires a host AND a
+                // path slash after the scheme, so `"https://*"` leaves an empty
+                // rest, finds no `/`, and is discarded as malformed. A policy
+                // of two discarded patterns matches nothing and denies
+                // everything, silently, because the refusal is an error nobody
+                // surfaces.
+                //
+                // So the real gate is `isSafeExternalUrl`, which runs FIRST and
+                // already refuses anything that is not http(s) with no control
+                // characters. This one is the toolkit's own, and the honest
+                // way to say "whatever the first gate passed" is `*`.
+                .external_links = external_link_policy,
             },
         },
     }, init);

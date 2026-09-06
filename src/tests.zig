@@ -21069,6 +21069,39 @@ test "an invisible codepoint is not drawn as a block" {
     }
 }
 
+test "every link the app will open is one the toolkit's policy permits" {
+    // Both gates, checked against each other. Plaza refuses a URL with
+    // `isSafeExternalUrl`, then the toolkit refuses it again against the
+    // navigation policy, and NOTHING reports the second refusal: `hostSend`
+    // is fire-and-forget and the error is swallowed. A policy that denies
+    // everything therefore looks exactly like a link that does nothing.
+    //
+    // That shipped. The policy said `"https://*"`, which reads like a
+    // scheme-wide wildcard and is not one: the toolkit's validator wants a
+    // host AND a path slash after the scheme, so the pattern was discarded as
+    // malformed and every link in the app was silently denied, on every
+    // platform. It went unnoticed because the previous implementation spawned
+    // `/usr/bin/open` and never consulted the policy at all.
+    const allows = native_sdk.security.allowsExternalUrl;
+
+    // Real links from real notes. Anything the first gate passes, the second
+    // must pass too, or the reader clicks and nothing happens.
+    for ([_][]const u8{
+        "https://github.com/damus-io/notedeck",
+        "http://example.com",
+        "https://npub1lrnvvs6z78s9yjqxxr38uyqkmn34lsaxznnqgd877j4z2qej3j5s09qnw5.blossom.band/e4170a9023d80ba82b8a520bed88606ab6f12c196973772a61635f7141dae8ee.jpg",
+        "https://zignostr.com",
+        "https://a.b",
+    }) |url| {
+        if (!main.isSafeExternalUrl(url)) return error.TheFirstGateRefusedARealLink;
+        if (!allows(main.external_link_policy, url)) return error.TheToolkitWouldDenyALinkThisAppAccepts;
+    }
+
+    // And the action is the one that reaches a browser at all. `.deny` is the
+    // default, and defaulting here is the same silent failure by another route.
+    try testing.expect(main.external_link_policy.action == .open_system_browser);
+}
+
 test "a link on the command line is delivered once" {
     // On macOS a plaza:// link arrives as an Apple Event. Nowhere else: the
     // desktop entry's %u puts it in argv, and the toolkit's Linux host drops
