@@ -20943,58 +20943,73 @@ test "a link followed while Plaza is open reaches the window that is already the
     }
 }
 
-test "the merged face the Linux build registers actually parses" {
+test "the emoji face the Linux build registers parses, and carries colour emoji" {
     // The toolkit refuses a face whose `maxp` declares ANY glyph past its
     // outline budgets, and refuses the whole file rather than the one picture,
     // so a single over-detailed emoji costs every other one in it.
     //
     // This shipped that way once and I only found it by running the app on
-    // Linux and reading the log: three of Noto Emoji's glyphs are past the
-    // 1024-point budget, registration refused the face, text silently fell back
-    // to plain Geist, and every substituted codepoint drew as a solid block.
+    // Linux and reading the log: three glyphs of the face I was building then
+    // were past the 1024-point budget, registration refused the face, text
+    // silently fell back to plain Geist, and every emoji drew as a solid block.
     // The screenshot looked fine because nothing in view had an emoji in it.
     //
     // Embedded HERE rather than read through theme.zig on purpose: the app does
     // not embed this face on macOS (it has CoreText and does not need it), so
     // reading it from there would make this test check an empty string on the
     // platform most of the work happens on.
-    const merged = @embedFile("fonts/Geist-Emoji.ttf");
+    const emoji = @embedFile("fonts/Twemoji.ttf");
     const font_ttf = native_sdk.canvas.font_ttf;
-    _ = font_ttf.Face.parse(merged) catch {
-        if (font_ttf.parseFailureReason(merged)) |why| std.debug.print("\nthe merged face was refused: {s}\n", .{why});
-        return error.TheMergedFaceIsPastTheToolkitsBudget;
+    const face = font_ttf.Face.parse(emoji) catch {
+        if (font_ttf.parseFailureReason(emoji)) |why| std.debug.print("\nthe emoji face was refused: {s}\n", .{why});
+        return error.TheEmojiFaceIsPastTheToolkitsBudget;
     };
+
+    // Registering it is only half of it. The renderer falls back to a
+    // registered face for a glyph the text face lacks ONLY when that face
+    // carries colour, so a build that quietly swapped in a monochrome emoji
+    // font would register fine and still draw blocks.
+    if (!face.hasColorGlyphs()) return error.TheEmojiFaceIsNotAColourFace;
+
+    // The pictures a note actually carries, including the ones above U+FFFF
+    // that need a format-12 cmap to reach at all.
+    for ([_]u21{ 0x1F600, 0x1F525, 0x1F389, 0x2764, 0x1F596, 0x2620, 0x1F44D }) |cp| {
+        const glyph = face.glyphIndex(cp);
+        if (glyph == 0) return error.AnEmojiIsMissingFromTheFace;
+        if (face.colorLayerCount(glyph) == 0) return error.AnEmojiWouldDrawInOneColour;
+    }
+
+    // And it never shadows plain text. An emoji face claims the keycap bases
+    // (the digits, `#`, `*`) because a keycap is built from one, so "2" IS in
+    // this face as a picture. What keeps a digit a digit is that the renderer
+    // asks the text face FIRST and only falls through for a codepoint it has
+    // no glyph for, so the guarantee to check is Geist's coverage, not
+    // Twemoji's.
+    const geist = font_ttf.geist_regular;
+    for ([_]u21{ 'A', 'z', '0', '9', '#', '*' }) |cp| {
+        if (geist.glyphIndex(cp) == 0) return error.TheTextFaceWouldYieldPlainTextToTheEmojiFace;
+    }
 }
 
 test "a display name keeps its emoji drawable" {
     // A name is not note content and never went through the content path, so an
-    // emoji in one stayed a codepoint no face off macOS can draw and painted as
-    // a solid block. Found on a real note: the author "Dr. The Daniel" with a
+    // emoji in one stayed a codepoint no face off macOS could draw and painted
+    // as a solid block. Found on a real note: the author "Dr. The Daniel" with a
     // raised hand after it, rendered as a bar in the reply line.
+    //
+    // The emoji survives the copy verbatim on every platform now. What draws it
+    // is the renderer reaching the registered colour face, which is the
+    // previous test's business; here the only question is that nothing on the
+    // way to the render buffer eats it.
     var buf: [128]u8 = undefined;
     const src = "Dr. The Daniel \u{1F596}";
     const n = main.copyDisplayTextForTest(&buf, src);
-    const out = buf[0..n];
-
-    // The name itself survives on both platforms.
-    try testing.expect(std.mem.startsWith(u8, out, "Dr. The Daniel "));
-
-    if (builtin.os.tag == .macos) {
-        // CoreText draws the real emoji, in colour, so nothing is substituted.
-        try testing.expectEqualStrings(src, out);
-    } else {
-        // Everywhere else it becomes the private-use codepoint whose glyph the
-        // merged face carries.
-        const slot = main.emojiPuaLookupForTest(0x1F596) orelse return error.TheEmojiHasNoSlot;
-        var enc: [4]u8 = undefined;
-        const len = try std.unicode.utf8Encode(slot, &enc);
-        try testing.expect(std.mem.endsWith(u8, out, enc[0..len]));
-    }
+    try testing.expectEqualStrings(src, buf[0..n]);
 }
 
 test "an invisible codepoint is not drawn as a block" {
     // Reported from a real note: "oh right web clients" followed by a skull and
-    // then a solid rectangle. The skull is U+2620 and the merged face has it, so
+    // then a solid rectangle. The skull is U+2620 and the emoji face has it, so
     // it drew. What followed was U+FE0F, the variation selector asking for the
     // colour presentation, which inks nothing anywhere and is in no font, so the
     // renderer drew its block fallback for it.
@@ -21017,42 +21032,8 @@ test "an invisible codepoint is not drawn as a block" {
         // colour rather than as a monochrome dingbat.
         try testing.expectEqualStrings("web clients \u{2620}\u{FE0F}", out);
     } else {
-        // The skull survives as its slot; the selector is gone rather than drawn.
-        const slot = main.emojiPuaLookupForTest(0x2620) orelse return error.TheSkullHasNoSlot;
-        var enc: [4]u8 = undefined;
-        const len = try std.unicode.utf8Encode(slot, &enc);
-        try testing.expect(std.mem.endsWith(u8, out, enc[0..len]));
-    }
-}
-
-test "the emoji table maps pictures and leaves text alone" {
-    // Off macOS the toolkit inks every glyph from one face and returns nothing
-    // for any codepoint above U+FFFF, so an emoji is painted as a solid block.
-    // The merged face carries those pictures in the private use area, which is
-    // low enough for the renderer to look at, and this table is how a note's
-    // text gets pointed at them.
-    //
-    // Generated by scripts/build-emoji-font.py alongside the font itself, so
-    // what this really guards is that the two halves still agree.
-
-    // Sorted, because the lookup is a binary search over it.
-    var i: usize = 1;
-    while (i < main.emojiTableLenForTest()) : (i += 1) {
-        if (main.emojiTableAtForTest(i - 1) >= main.emojiTableAtForTest(i)) {
-            return error.TheEmojiTableIsNotSorted;
-        }
-    }
-
-    // Pictures map, and land inside the private use area.
-    for ([_]u21{ 0x1F600, 0x1F525, 0x1F389, 0x2764, 0x2705 }) |cp| {
-        const slot = main.emojiPuaLookupForTest(cp) orelse return error.AnEmojiHasNoGlyph;
-        if (slot < 0xE000 or slot > 0xF8FF) return error.TheSlotIsOutsideThePrivateUseArea;
-    }
-
-    // Text does not. Substituting any of these would replace a letter, a digit,
-    // a newline or an invisible joiner with a picture.
-    for ([_]u21{ 'A', 'z', '0', '#', '*', '\n', '\r', 0x0000, 0x200D, 0xFE0F, 0x20E3 }) |cp| {
-        if (main.emojiPuaLookupForTest(cp) != null) return error.TextWasTreatedAsAnEmoji;
+        // The skull survives; the selector is gone rather than drawn.
+        try testing.expectEqualStrings("web clients \u{2620}", out);
     }
 }
 

@@ -243,8 +243,9 @@ and I have not built it on one.
 
 Worth knowing before you judge it by that build: off macOS the toolkit renders
 through a software rasteriser and there is no platform text provider, so it is
-slower than the packaged app and emoji come out as tofu. That is why there is no
-Linux release yet rather than a rough one.
+slower than the packaged app. Emoji are drawn from a colour face Plaza bundles
+there rather than from the system, which is why the Linux build carries a font
+the macOS one does not.
 
 Windows is not in the matrix at all: the relay transport resolves hostnames
 through libc `getaddrinfo`, which Zig's standard library does not declare for
