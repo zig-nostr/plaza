@@ -2394,13 +2394,6 @@ pub fn relayStatusConnectedForTest(i: usize) bool {
     return connHolds(@enumFromInt(g_relay_status[i].load(.monotonic)));
 }
 
-/// What the keeper would do for a connection this idle, last pinged this long
-/// ago. Null for either means "no measurement".
-pub fn keeperActionForTest(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
-    return keeperAction(idle_ms, since_ping_ms);
-}
-pub const KeeperActionForTest = KeeperAction;
-
 pub fn setRelayQuietForTest(i: usize) void {
     setRelayStatus(i, .quiet);
 }
@@ -2439,9 +2432,6 @@ pub const oneShotSlotsForTest = one_shot_slots;
 pub const oneShotBudgetMsForTest = one_shot_budget_ms;
 pub const bunkerWatchSlotForTest = bunker_watch_slot;
 pub const maxRelaysForTest = max_relays;
-
-pub const relayPingAfterMsForTest = relay_ping_after_ms;
-pub const relayDeadAfterMsForTest = relay_dead_after_ms;
 
 pub fn isReaderNoteForTest(kind: u16) bool {
     return isReaderNote(kind);
@@ -4230,19 +4220,22 @@ fn setRelayStatus(index: usize, state: Conn) void {
 // separate one watches the pool: it sends the ping, and it is the one that can
 // still act when no answer comes.
 //
-// The numbers are Amethyst's, who surveyed 122 relays and found idle timeouts
-// clustered at roughly 60, 120, 240, 300 and 600 seconds, and who report that a
-// ping only reliably holds a connection open when its interval is at most about
-// half the timeout. Thirty seconds sits under half of the shortest tier. Ninety
-// is three missed answers, which is the point at which a socket that has not
-// said a word to three pings is not coming back.
-const relay_ping_after_ms: i64 = 30_000;
-const relay_dead_after_ms: i64 = 90_000;
-/// How often the keeper looks. Short enough that ninety seconds means ninety,
-/// long enough to cost nothing.
-const relay_keeper_tick_ms: u64 = 5_000;
+// When to ping and when to give up is `nostr.liveness`, which is where those
+// numbers belong: they were the same numbers in this app and in Notary, written
+// down in neither. They are Amethyst's, from their survey of 122 relays.
+//
+// The table below and the thread that ticks stay here. What "give up" means
+// differs between a client and a signer, and only the policy is shared.
 
-/// The live connection for each slot, for the keeper and nothing else.
+//// How often an ingest thread comes up for air to re-read its own slot.
+///
+/// This is not a keepalive and has nothing to do with the numbers above: it is
+/// how long a relay the reader just removed, repointed or set write-only can go
+/// on feeding the store. A second is under the time it takes to notice, and
+/// costs one readiness check per socket per second.
+const ingest_wake: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1_000), .clock = .awake } };
+
+// The live connection for each slot, for the keeper and nothing else.
 ///
 /// Published by the thread that dialled it and cleared by that same thread
 /// before the connection is freed, both under the slot's lock, and the keeper
@@ -4291,26 +4284,6 @@ fn offerLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
     defer unlockLiveRelay(index);
     g_relay_live[index] = relay;
     g_relay_pinged_ms[index] = 0;
-}
-
-/// What the keeper decides for one slot, given how long that connection has
-/// been silent and when it was last pinged. Pulled out so it can be asserted
-/// without a socket, a thread or a clock.
-const KeeperAction = enum { leave_it, ping, give_up };
-
-fn keeperAction(idle_ms: ?i64, since_ping_ms: ?i64) KeeperAction {
-    // Nothing has ever arrived on this connection. That is the window between
-    // the handshake and the relay's first word, not a stall, and treating a
-    // missing measurement as an infinite one would cut off every relay that
-    // took a moment to answer.
-    const idle = idle_ms orelse return .leave_it;
-    if (idle >= relay_dead_after_ms) return .give_up;
-    if (idle < relay_ping_after_ms) return .leave_it;
-    // Silent past the interval. Ping, but only once per interval: at a five
-    // second tick a socket that has stopped answering would otherwise be pinged
-    // twelve more times on its way to being declared dead.
-    const since = since_ping_ms orelse return .ping;
-    return if (since >= relay_ping_after_ms) .ping else .leave_it;
 }
 
 // -- A question that cannot be asked forever ---------------------------------
@@ -4417,7 +4390,7 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
     const io = threaded.io();
 
     while (true) {
-        io.sleep(std.Io.Duration.fromMilliseconds(relay_keeper_tick_ms), .awake) catch {};
+        io.sleep(std.Io.Duration.fromMilliseconds(nostr.liveness.tick_ms), .awake) catch {};
         const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         for (0..relay_watch_slots) |i| {
             lockLiveRelay(i);
@@ -4425,7 +4398,7 @@ fn relayKeeper(gpa: std.mem.Allocator) void {
             const relay = g_relay_live[i] orelse continue;
             const idle = relay.idleMs(io);
             const since_ping: ?i64 = if (g_relay_pinged_ms[i] == 0) null else now - g_relay_pinged_ms[i];
-            switch (keeperAction(idle, since_ping)) {
+            switch (nostr.liveness.action(idle, since_ping)) {
                 .leave_it => {},
                 .ping => {
                     // A failed write is not a verdict on its own; the silence
@@ -23194,7 +23167,7 @@ fn relayPopover(ui: *AppUi, model: *const Model) AppUi.Node {
 fn relayRow(ui: *AppUi, url: []const u8, index: usize, badge: []const u8, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const state: Conn = @enumFromInt(g_relay_status[index].load(.monotonic));
-    // A relay leaves at its next message, so during a pause some rows are still
+    // A relay leaves within a wake, so during a pause some rows are still
     // genuinely connected. Each row reports ITSELF: claiming the whole list is
     // paused while notes are still arriving on it is the dishonesty this is for.
     // Holding a socket, whichever way. The row still reads as a working relay
@@ -33931,11 +33904,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     var engagement_gen: u32 = 0;
 
     while (true) {
-        // A pause takes effect at the next message this relay sends: the thread
-        // returns, `defer relay.deinit()` closes the socket, and the reconnect
-        // loop parks. A silent relay therefore holds its socket until it speaks,
-        // which is why the chip says "pausing" until every thread has actually
-        // left rather than claiming a pause it has not achieved.
+        // A pause takes effect within a wake: the thread returns, `defer
+        // relay.deinit()` closes the socket, and the reconnect loop parks. The
+        // chip still says "pausing" until every thread has actually left rather
+        // than claiming a pause it has not achieved, because a thread mid-frame
+        // finishes the frame first.
         if (relaysPaused()) return;
         // The same for an edit. Removing a relay, or clearing its read marker,
         // must end THIS connection: leaving the socket up until the next
@@ -33996,12 +33969,27 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             inbox_gen = identityGeneration();
             subscribeInbox(relay);
         }
-        var msg = (try relay.receive()) orelse break;
+        // With a deadline, so the checks above actually run on a quiet relay.
+        //
+        // Without one this loop only advances when the relay speaks, so a relay
+        // the reader removed, repointed or set write-only kept its socket and
+        // kept feeding the store until it happened to say something. A relay
+        // that says nothing for an hour held one for an hour. `nostr#64`.
+        //
+        // A timeout consumes nothing, so `continue` here resumes on the same
+        // connection rather than resynchronising: the wait is a readiness check
+        // on the socket, not a read. Cutting the socket to achieve the same
+        // thing would not do: `shutdown` over TLS poisons the session, and this
+        // one is also carrying the inbox and engagement subscriptions.
+        var msg = (relay.receiveTimeout(ingest_wake) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => |e| return e,
+        }) orelse break;
         defer msg.deinit();
 
-        // Time to re-probe? `receive()` blocks with no deadline, so the probe
-        // rides the next message rather than a timer; a relay too quiet to carry
-        // one is also a relay whose latency nobody is waiting on.
+        // Time to re-probe? The probe rides the next message rather than a
+        // timer; a relay too quiet to carry one is also a relay whose latency
+        // nobody is waiting on.
         //
         // A write-only relay is probed too: a question about one id that does
         // not exist, which says nothing about who this reader follows or reads,

@@ -1,5 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.2
+
+**A relay you remove stops reading within a second.** A relay's reader waited for that relay to say something before it looked at anything else, so removing one, pointing it somewhere else, or setting it write-only left its connection up and still filling your store until it happened to speak. Pausing the pool had the same shape: the button worked, and the relays took as long to leave as they took to talk. On a quiet relay that could be indefinitely.
+
+Measured on the same four relays, pausing the pool: ten seconds before, two now.
+
+**Fixed: a leak on every reconnect.** Closing a relay connection freed everything it had allocated except the connection itself. A pool that reconnects on a dropped socket left one behind each time, for as long as the app ran.
+
+Also carries the current keyholder.
+
 ### What's new in v0.18.1
 
 **Fixed: the Linux build would not start.** It died the instant you ran it, with `Illegal instruction` and nothing else, on any machine whose processor was not the one that built it. Every Linux VM on an Apple computer was that case, which is most of the people who would have tried it first.

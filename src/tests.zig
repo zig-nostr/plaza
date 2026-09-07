@@ -15539,63 +15539,8 @@ test "a note that fills a gap below the window arrives when the reader pages dow
 // apart from a quiet night. The keeper is a separate thread precisely because
 // the waiting one cannot notice anything.
 //
-// Its decision is a pure function of two numbers, so it is asserted here
-// without a socket, a thread or a clock.
-
-test "a connection that has never spoken is not a stalled one" {
-    // The window between the handshake and the relay's first word. Treating a
-    // missing measurement as an infinite one would cut off every relay that
-    // took a moment to answer, which is every relay on a slow network.
-    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, null));
-    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(null, 999_999));
-}
-
-test "a talking relay is left alone" {
-    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(0, null));
-    try testing.expectEqual(
-        main.KeeperActionForTest.leave_it,
-        main.keeperActionForTest(main.relayPingAfterMsForTest - 1, null),
-    );
-}
-
-test "a relay that has gone quiet is asked whether it is still there" {
-    try testing.expectEqual(
-        main.KeeperActionForTest.ping,
-        main.keeperActionForTest(main.relayPingAfterMsForTest, null),
-    );
-}
-
-test "a quiet relay is asked once per interval, not once per look" {
-    // The keeper looks every few seconds and the interval is half a minute. A
-    // socket that has stopped answering would otherwise collect a dozen pings
-    // on its way to being declared dead.
-    const idle = main.relayPingAfterMsForTest + 5_000;
-    try testing.expectEqual(main.KeeperActionForTest.leave_it, main.keeperActionForTest(idle, 5_000));
-    try testing.expectEqual(
-        main.KeeperActionForTest.ping,
-        main.keeperActionForTest(idle, main.relayPingAfterMsForTest),
-    );
-}
-
-test "a relay that answers none of three pings is given up on" {
-    try testing.expectEqual(
-        main.KeeperActionForTest.give_up,
-        main.keeperActionForTest(main.relayDeadAfterMsForTest, 0),
-    );
-    // And the deadline wins over the ping interval: a socket this far gone is
-    // not asked again, it is closed.
-    try testing.expectEqual(
-        main.KeeperActionForTest.give_up,
-        main.keeperActionForTest(main.relayDeadAfterMsForTest + 60_000, main.relayDeadAfterMsForTest),
-    );
-}
-
-test "the deadline is a multiple of the interval, so silence is answered before it is fatal" {
-    // Not decoration: if the deadline were under the interval, the keeper would
-    // declare a relay dead without ever having asked it anything, and every
-    // quiet connection in the pool would be recycled on a timer.
-    try testing.expect(main.relayDeadAfterMsForTest >= main.relayPingAfterMsForTest * 2);
-}
+// When it pings and when it gives up is `nostr.liveness`, tested there. What
+// is asserted here is what this app does with that decision.
 
 test "a quiet relay still counts as a relay" {
     // The pool summary drives an "offline, reconnecting" banner over the whole
@@ -15719,7 +15664,7 @@ test "a one-shot budget is shorter than the connection deadline it borrows" {
     // conversation. Bounding the fetch by the connection's ninety seconds would
     // leave a wedged profile lookup sitting for a minute and a half, and there
     // is nothing to wait for: the relay was asked one thing.
-    try testing.expect(main.oneShotBudgetMsForTest < main.relayDeadAfterMsForTest);
+    try testing.expect(main.oneShotBudgetMsForTest < nostr.liveness.dead_after_ms);
 }
 
 // -- Reading where your follows actually write -------------------------------
