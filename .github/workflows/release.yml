@@ -172,26 +172,30 @@ jobs:
           ref: ${{ env.NOTARY_REF }}
           path: .notary
 
-      # Retried, and only here. The first aarch64 run of this recipe died in
-      # `zig build` with "unable to discover remote git server capabilities:
-      # ProtocolError" fetching a dependency, and passed unchanged on a re-run.
-      # In ci.yml that is a red X somebody re-runs; here it would leave a
-      # PUBLISHED release carrying macOS and no Linux, which is the exact state
-      # this job exists to end. Zig keeps what it already fetched in the global
-      # cache, so a second attempt resumes rather than starting over.
+      # Fetching, on its own and retried, because that is the part that fails.
+      # Two of three aarch64 runs died in `zig build` with "unable to discover
+      # remote git server capabilities: ProtocolError" pulling secp256k1, which
+      # the nostr library pins by git URL rather than by tarball. Zig's git
+      # client is what is unreliable on this runner; the compile that follows
+      # never failed once.
       #
-      # Deliberately NOT added to ci.yml: a retry there would hide an
-      # intermittent failure that is worth seeing on a pull request.
-      - name: Package
+      # `zig build --fetch` populates the cache and exits in seconds, so five
+      # attempts cost less than one failed package run, and the build after it
+      # needs no network at all.
+      - name: Fetch the dependency tree
         run: |
-          for attempt in 1 2 3; do
-            if scripts/package-linux.sh --notary .notary; then exit 0; fi
-            echo "attempt $attempt failed" >&2
-            [ "$attempt" = 3 ] && break
-            sleep $((attempt * 15))
+          for attempt in 1 2 3 4 5; do
+            if zig build --fetch; then exit 0; fi
+            echo "fetch attempt $attempt failed" >&2
+            sleep $((attempt * 10))
           done
-          echo "packaging failed three times; not a flake" >&2
+          echo "could not fetch dependencies in five attempts" >&2
           exit 1
+
+      # Packaging itself is not retried: with the cache warm it needs no
+      # network, and a failure here is a real one worth seeing.
+      - name: Package
+        run: scripts/package-linux.sh --notary .notary
 
       # The installer derives the file name from the release tag and `uname -m`,
       # so a tarball named for the wrong architecture is a 404 for whoever the
