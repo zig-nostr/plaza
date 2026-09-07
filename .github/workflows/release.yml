@@ -52,6 +52,28 @@ jobs:
       # commit, and a release is the one artifact nobody gets to re-check. So the
       # suite runs again here and the release does not exist if it fails. Both
       # halves, because the bundle carries more than one binary.
+      # Fetching, on its own and retried, because that is the part that fails.
+      # `zig build` dies with "unable to discover remote git server
+      # capabilities: ProtocolError" pulling secp256k1, which the nostr library
+      # pins by git URL rather than by tarball. It has now happened on
+      # ubuntu-24.04-arm twice and on macos-latest once, the last of those
+      # failing the v0.18.0 release build outright, so it is the git fetch that
+      # is unreliable and not any one runner. The compile after it has never
+      # failed.
+      #
+      # `zig build --fetch` populates the cache and exits in seconds, so five
+      # attempts cost less than one failed build, and everything after needs no
+      # network.
+      - name: Fetch the dependency tree
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if zig build --fetch; then exit 0; fi
+            echo "fetch attempt $attempt failed" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not fetch dependencies in five attempts" >&2
+          exit 1
+
       - name: Test
         run: native test
 
@@ -173,15 +195,17 @@ jobs:
           path: .notary
 
       # Fetching, on its own and retried, because that is the part that fails.
-      # Two of three aarch64 runs died in `zig build` with "unable to discover
-      # remote git server capabilities: ProtocolError" pulling secp256k1, which
-      # the nostr library pins by git URL rather than by tarball. Zig's git
-      # client is what is unreliable on this runner; the compile that follows
-      # never failed once.
+      # `zig build` dies with "unable to discover remote git server
+      # capabilities: ProtocolError" pulling secp256k1, which the nostr library
+      # pins by git URL rather than by tarball. It has now happened on
+      # ubuntu-24.04-arm twice and on macos-latest once, the last of those
+      # failing the v0.18.0 release build outright, so it is the git fetch that
+      # is unreliable and not any one runner. The compile after it has never
+      # failed.
       #
       # `zig build --fetch` populates the cache and exits in seconds, so five
-      # attempts cost less than one failed package run, and the build after it
-      # needs no network at all.
+      # attempts cost less than one failed build, and everything after needs no
+      # network.
       - name: Fetch the dependency tree
         run: |
           for attempt in 1 2 3 4 5; do
