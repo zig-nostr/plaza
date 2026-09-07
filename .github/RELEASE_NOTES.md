@@ -1,5 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.5
+
+**The toolkit underneath is a version newer.** Most of what that brings is invisible, but one thing is not: text on Linux was blurry on a screen with fractional scaling, which is most laptops, because the window was drawn at a whole-number scale and then stretched. It is drawn at the real scale now.
+
 ### What's new in v0.18.4
 
 **Japanese, Chinese, Korean and Greek are text on Linux now.** They were solid grey blocks. Off macOS Plaza draws every glyph from the fonts it carries, and those covered Latin and Cyrillic, so anyone reading Nostr in another script saw rows of rectangles. Plaza carries Noto for those scripts now, and the renderer reaches for it when its own font has no glyph. This adds about 13 MB to the Linux download and nothing to the macOS one, which does not need it.

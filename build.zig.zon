@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // The Native SDK framework, pinned to the tree matching the `native`
-        // CLI (0.9.2 -> commit 8d0da34e). `native eject` writes a machine-local
+        // CLI (0.10.1 -> tag v0.10.1). `native eject` writes a machine-local
         // `.path` into the npm install here; this git pin is committable and
         // reproducible instead, CI fetches the exact framework by hash.
         //
@@ -39,7 +39,7 @@
         //      The fork uses it, which is upstream's own Windows code one
         //      platform over.
         //
-        // It is 8d0da34 plus those four commits and nothing else, one commit
+        // It is v0.10.1 plus those four commits and nothing else, one commit
         // each, so any of them can be dropped on its own when it lands
         // upstream. PATCHES.md in the fork is the tracker: one row per patch
         // with its upstream issue and how to remove it. Nothing watches those
@@ -49,13 +49,13 @@
         // and colorLayerCount(), which are the fork's own API, so Plaza does
         // not compile against vercel-labs/native until those go too.
         //
-        // Also reachable as the tag `plaza-linux-gaps-1`, so the commit this
+        // Also reachable as the tag `plaza-linux-gaps-2`, so the commit this
         // fetches does not depend on one branch surviving. A branch deleted or
         // force-pushed past it takes the dependency down for every cold
         // checkout while a warm Zig cache hides it locally.
         .native_sdk = .{
-            .url = "git+https://github.com/zig-nostr/native.git#959a0a3892f0381579d0599760bc3f5faddb92f8",
-            .hash = "native_sdk-0.1.0-hzDzQgyfqQLw6JkSGwgzXXEuf_vwHsiv6Q-HvRjdW9NX",
+            .url = "git+https://github.com/zig-nostr/native.git#a90ee35d7813dfd5e4d55a053e29067e704c4e7a",
+            .hash = "native_sdk-0.1.0-hzDzQkVysQJeCEkO1f6kfnZt7cQ0YNriPiqOdn_CAYXg",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the
