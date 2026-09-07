@@ -12,6 +12,13 @@
 # gtk4 and libdl, and the WebKit layer is compiled out because Plaza draws on a
 # canvas rather than in a browser.
 #
+# It does need a RECENT distribution, though. The toolkit's Linux host declares a
+# GTK floor of 4.10 (its own source: "This host's GTK floor is 4.10"), and the
+# release binaries are built on Ubuntu 24.04, so they want glibc 2.38 or newer.
+# Both land on the same generation: Ubuntu 23.10+, Debian 13+, Fedora 39+.
+# Ubuntu 22.04 and Debian 12 cannot run this, and are checked for below rather
+# than left to fail with a loader error after a successful-looking install.
+#
 # Read this script, and build from source
 # (https://github.com/zig-nostr/plaza#install) if you would rather.
 #
@@ -67,6 +74,29 @@ main() {
     local gtk
     gtk="$(ldconfig -p 2>/dev/null | grep -c "libgtk-4\.so" || true)"
     [ "$gtk" != "0" ] || die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4."
+  fi
+
+  # The distribution floor, checked BEFORE downloading 20 MB and writing files.
+  # Without this an Ubuntu 22.04 user gets a clean install, a cheerful
+  # "Installed Plaza", and then `version GLIBC_2.38 not found` the first time
+  # they open it, which reads as a broken app rather than an old system.
+  #
+  # glibc is the proxy for both floors. The real constraints are glibc 2.38 (the
+  # binaries are built on Ubuntu 24.04) and GTK 4.10 (the toolkit's own declared
+  # floor), and every distribution that has one has the other, so one check
+  # answers both and needs no -dev package to run.
+  local glibc
+  glibc="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || true)"
+  if [ -n "$glibc" ]; then
+    local major minor
+    major="${glibc%%.*}"
+    minor="${glibc##*.}"
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 38 ]; }; then
+      die "this build needs glibc 2.38 or newer and GTK 4.10 or newer; you have glibc $glibc.
+       That means Ubuntu 23.10+, Debian 13+, or Fedora 39+. Ubuntu 22.04 and
+       Debian 12 are too old for it. Building from source on your own system
+       works if its GTK is 4.10 or newer: https://github.com/zig-nostr/plaza#building-on-linux"
+    fi
   fi
 
   local arch
