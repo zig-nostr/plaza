@@ -1,5 +1,9 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.6
+
+**The keyholder Plaza carries can be read in any language too.** Plaza ships Notary as its keyholder, and the window that asks you to approve a signature had the same problem Plaza's feed had: anything outside Latin and Cyrillic was a grey block. That included the preview of the note you were being asked to sign. This carries the fixed keyholder.
+
 ### What's new in v0.18.5
 
 **The toolkit underneath is a version newer.** Most of what that brings is invisible, but one thing is not: text on Linux was blurry on a screen with fractional scaling, which is most laptops, because the window was drawn at a whole-number scale and then stretched. It is drawn at the real scale now.
