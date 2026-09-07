@@ -226,6 +226,26 @@ jobs:
           ref: ${{ steps.notary-ref.outputs.ref }}
           path: .notary
 
+      # Fetching, on its own and retried, because that is the part that fails.
+      # Two of three aarch64 runs died in `zig build` with "unable to discover
+      # remote git server capabilities: ProtocolError" pulling secp256k1, which
+      # the nostr library pins by git URL rather than by tarball. Zig's git
+      # client is what is unreliable on this runner; the compile that follows
+      # never failed once.
+      #
+      # `zig build --fetch` populates the cache and exits in seconds, so five
+      # attempts cost less than one failed package run, and the build after it
+      # needs no network at all.
+      - name: Fetch the dependency tree
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if zig build --fetch; then exit 0; fi
+            echo "fetch attempt $attempt failed" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not fetch dependencies in five attempts" >&2
+          exit 1
+
       - name: Package
         run: scripts/package-linux.sh --notary .notary
 
