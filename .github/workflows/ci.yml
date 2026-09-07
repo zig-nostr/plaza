@@ -117,7 +117,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+          # gtk4 only. The WebKit layer is compiled out (Plaza draws on a
+          # canvas, not in a browser) and the release job has always built the
+          # shipped tarballs with just this, so installing the webkit headers
+          # here only made the README ask users for a package nothing needs.
+          sudo apt-get install -y libgtk-4-dev
 
       - name: Build
         run: zig build

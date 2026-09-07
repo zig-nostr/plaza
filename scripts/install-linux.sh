@@ -28,12 +28,53 @@ set -euo pipefail
 # `local` is gone by then: under `set -u` the cleanup then dies on its own
 # variable, which is a confusing failure at the end of a successful install.
 workdir=""
-cleanup() { [ -n "$workdir" ] && rm -rf "$workdir"; }
+# `return 0` on purpose. Without it the trap's last command is the failed
+# `[ -n "$workdir" ]` of a run that never made a temp directory, and bash exits
+# with THAT: `--help` reported failure, and so would any early exit that had not
+# reached the download yet.
+cleanup() {
+  [ -n "$workdir" ] && rm -rf "$workdir"
+  return 0
+}
 trap cleanup EXIT
 
 say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33mnote:\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+# Whether GTK 4 is on this machine: `present`, `missing`, or `unknown`.
+#
+# `ldconfig` is the reliable answer and it lives in /usr/sbin, which Debian does
+# NOT put on a normal user's PATH. Gating the whole check on
+# `command -v ldconfig` therefore skipped it entirely on one of the three
+# distributions this script names as supported: a Debian user without GTK 4 got
+# a verified download, a cheerful "Installed Plaza", and an app that dies on
+# `libgtk-4.so.1` with the launch output thrown away. So it is looked for by
+# absolute path too, and if there is no ldconfig at all the library directories
+# are searched directly.
+#
+# `grep -c ... || true`, NOT `grep -q`. Under `set -o pipefail` a matching
+# `grep -q` exits at once, `ldconfig` dies of SIGPIPE, and the pipeline reports
+# THAT rather than the match, so the guard fires on a machine that HAS GTK. It
+# fires on one that does not either, because grep exits 1 there, which makes it
+# a check that can never pass. `grep -c` drains its input instead.
+gtkStatus() {
+  local ldc hits d
+  for ldc in ldconfig /usr/sbin/ldconfig /sbin/ldconfig; do
+    command -v "$ldc" >/dev/null 2>&1 || [ -x "$ldc" ] || continue
+    hits="$("$ldc" -p 2>/dev/null | grep -c 'libgtk-4\.so' || true)"
+    if [ "$hits" = "0" ]; then printf 'missing\n'; else printf 'present\n'; fi
+    return
+  done
+  for d in /usr/lib /usr/lib64 /lib /lib64 /usr/local/lib /usr/lib/*-linux-gnu*; do
+    [ -d "$d" ] || continue
+    if compgen -G "$d/libgtk-4.so*" >/dev/null 2>&1; then printf 'present\n'; return; fi
+  done
+  # No ldconfig and nothing in the usual places. Refusing here would turn an
+  # unusual layout into a refused install, so this reports that it cannot tell
+  # and the caller warns rather than dies.
+  printf 'unknown\n'
+}
 
 # All work happens inside main(), invoked on the very last line, so bash runs
 # nothing until the whole script has been read. A truncated `curl | bash` (a
@@ -48,7 +89,12 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --archive) archive="${2:?--archive needs a path}"; shift 2 ;;
-      *) die "unknown argument: $1" ;;
+      -h | --help)
+        printf 'usage: install-linux.sh [--archive <file>]\n\n'
+        printf '  --archive <file>  install this tarball instead of the latest release\n'
+        exit 0
+        ;;
+      *) die "unknown argument: $1 (try --help)" ;;
     esac
   done
 
@@ -58,23 +104,6 @@ main() {
   for tool in sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and is not on PATH."
   done
-
-  # GTK 4 is the one runtime dependency, and finding out it is missing when the
-  # window fails to open is worse than being told now. Checked by loader rather
-  # than by package name, because the package is called libgtk-4-1 on Debian and
-  # Ubuntu, gtk4 on Fedora and Arch, and something else again elsewhere.
-  #
-  # `grep -c ... || true`, NOT `grep -q`. Under `set -o pipefail` a matching
-  # `grep -q` exits at once, `ldconfig` dies of SIGPIPE, and the pipeline reports
-  # THAT rather than the match, so the guard fires on a machine that has GTK. It
-  # fires on one that does not either, because grep exits 1 there, which makes it
-  # a check that can never pass. `package-linux.sh` carries a comment about this
-  # exact trap and I wrote it here anyway.
-  if command -v ldconfig >/dev/null 2>&1; then
-    local gtk
-    gtk="$(ldconfig -p 2>/dev/null | grep -c "libgtk-4\.so" || true)"
-    [ "$gtk" != "0" ] || die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4."
-  fi
 
   # The distribution floor, checked BEFORE downloading 20 MB and writing files.
   # Without this an Ubuntu 22.04 user gets a clean install, a cheerful
@@ -98,6 +127,17 @@ main() {
        works if its GTK is 4.10 or newer: https://github.com/zig-nostr/plaza#building-on-linux"
     fi
   fi
+
+  # GTK 4 itself, AFTER the floor above. The order matters: an Ubuntu 22.04 user
+  # has GTK 4.6, so a GTK-presence check passes and then tells them nothing,
+  # while the floor tells them the true reason their machine cannot run this.
+  # Checked by loader rather than by package name, because the package is called
+  # libgtk-4-1 on Debian and Ubuntu, gtk4 on Fedora and Arch, and something else
+  # again elsewhere.
+  case "$(gtkStatus)" in
+    missing) die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4." ;;
+    unknown) warn "could not tell whether GTK 4 is installed on this system. If Plaza does not open, that is the first thing to check." ;;
+  esac
 
   local arch
   arch="$(uname -m)"
@@ -150,15 +190,23 @@ main() {
   # The digest is published beside the tarball rather than read out of the API
   # body, so a release whose notes were edited cannot change what this compares
   # against.
-  if curl -fsSL -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null; then
-    local want got
-    want="$(awk '{print $1}' "$tmp/$asset.sha256")"
-    got="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "the download does not match its published SHA-256. Not installing it."
-    say "SHA-256 verified."
-  else
-    warn "no published SHA-256 for this release, so the download could not be verified."
-  fi
+  # Required, not best-effort. It used to warn and install anyway when the
+  # sidecar could not be fetched, which is a verification step that any
+  # transient failure switches off, and a checksum you skip on a bad day is not
+  # a checksum. Every published release has one.
+  curl -fsSL --retry 2 --retry-all-errors -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null ||
+    die "could not fetch the published SHA-256 for $asset, so the download cannot be verified. Not installing it.
+       Try again, or download the tarball and its .sha256 by hand and pass --archive."
+  local want got
+  want="$(awk '{print $1}' "$tmp/$asset.sha256")"
+  # An empty expected digest compares equal to an empty computed one, and the
+  # whole check then reports success over nothing at all. Both sides are
+  # required to exist before either is trusted.
+  [ -n "$want" ] || die "the published SHA-256 for $asset is empty. Not installing it."
+  got="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  [ -n "$got" ] || die "could not compute the SHA-256 of the download. Not installing it."
+  [ "$want" = "$got" ] || die "the download does not match its published SHA-256. Not installing it."
+  say "SHA-256 verified."
 
   installFrom "$tmp" "$asset" "$tag"
 }
@@ -168,7 +216,8 @@ main() {
 installFrom() {
   local tmp="$1" asset="$2" tag="$3"
   say "Unpacking..."
-  tar -C "$tmp" -xzf "$tmp/$asset"
+  tar -C "$tmp" -xzf "$tmp/$asset" 2>/dev/null ||
+    die "the archive could not be unpacked. The download may be incomplete, or the file passed to --archive may not be a Plaza tarball."
   local src
   src="$(find "$tmp" -maxdepth 1 -type d -name 'plaza-*-linux-*' | head -1)"
   [ -n "$src" ] || die "the archive did not contain what was expected."
@@ -228,10 +277,27 @@ installFrom() {
     *) warn "$prefix/bin is not on your PATH. Add it to run 'plaza' from a terminal; the desktop entry works either way." ;;
   esac
 
-  say "Installed Plaza $tag."
+  if [ "$tag" = "local" ]; then
+    say "Installed Plaza from $asset."
+  else
+    say "Installed Plaza $tag."
+  fi
+
+  # Started with its output kept, briefly. It used to go to /dev/null, so a
+  # first run that died on a missing library was indistinguishable from a
+  # working install: the script said "Starting it...", nothing appeared, and
+  # there was nothing anywhere to say why. If it is still alive a moment later
+  # the log is dropped and it is left to run.
   say "Starting it..."
-  "$prefix/bin/plaza" >/dev/null 2>&1 &
+  local log pid
+  log="$tmp/first-run.log"
+  "$prefix/bin/plaza" >"$log" 2>&1 &
+  pid=$!
   disown 2>/dev/null || true
+  sleep 2
+  kill -0 "$pid" 2>/dev/null && return
+  warn "Plaza exited immediately. It is installed at $prefix/bin/plaza. This is what it said:"
+  sed 's/^/       /' "$log" >&2 || true
 }
 
 main "$@"
