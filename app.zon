@@ -54,7 +54,14 @@
     .security = .{
         .navigation = .{
             .allowed_origins = .{ "zero://app", "zero://inline" },
-            .external_links = .{ .action = "open_system_browser", .allowed_urls = .{ "https://*", "http://*" } },
+            // `*`, not `"https://*"`. A scheme-wide wildcard is not
+            // expressible: the toolkit wants a host AND a path slash after the
+            // scheme, so `"https://*"` is malformed and an allow-list of two
+            // malformed patterns denies every link. `native check` refuses it
+            // here; the RUNTIME does not, it just silently denies, which is how
+            // it shipped in the first place. Kept identical to
+            // `main.external_link_policy`, which is what the runtime reads.
+            .external_links = .{ .action = "open_system_browser", .allowed_urls = .{"*"} },
         },
     },
     .web_engine = "system",
