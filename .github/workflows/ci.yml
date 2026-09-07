@@ -39,21 +39,6 @@ jobs:
       - name: Check markup and manifest
         run: native check
 
-      # Same retried fetch as everywhere else: `zig build` dies with "unable to
-      # discover remote git server capabilities: ProtocolError" pulling
-      # secp256k1, which the nostr library pins by git URL rather than by
-      # tarball. Seen on arm, on macOS, and on a release build. Seconds when it
-      # works, and everything after it needs no network.
-      - name: Fetch the dependency tree
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if zig build --fetch; then exit 0; fi
-            echo "fetch attempt $attempt failed" >&2
-            sleep $((attempt * 10))
-          done
-          echo "could not fetch dependencies in five attempts" >&2
-          exit 1
-
       - name: Test
         run: native test
 
@@ -133,21 +118,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
-
-      # Same retried fetch as everywhere else: `zig build` dies with "unable to
-      # discover remote git server capabilities: ProtocolError" pulling
-      # secp256k1, which the nostr library pins by git URL rather than by
-      # tarball. Seen on arm, on macOS, and on a release build. Seconds when it
-      # works, and everything after it needs no network.
-      - name: Fetch the dependency tree
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if zig build --fetch; then exit 0; fi
-            echo "fetch attempt $attempt failed" >&2
-            sleep $((attempt * 10))
-          done
-          echo "could not fetch dependencies in five attempts" >&2
-          exit 1
 
       - name: Build
         run: zig build
@@ -256,28 +226,6 @@ jobs:
           ref: ${{ steps.notary-ref.outputs.ref }}
           path: .notary
 
-      # Fetching, on its own and retried, because that is the part that fails.
-      # `zig build` dies with "unable to discover remote git server
-      # capabilities: ProtocolError" pulling secp256k1, which the nostr library
-      # pins by git URL rather than by tarball. It has now happened on
-      # ubuntu-24.04-arm twice and on macos-latest once, the last of those
-      # failing the v0.18.0 release build outright, so it is the git fetch that
-      # is unreliable and not any one runner. The compile after it has never
-      # failed.
-      #
-      # `zig build --fetch` populates the cache and exits in seconds, so five
-      # attempts cost less than one failed build, and everything after needs no
-      # network.
-      - name: Fetch the dependency tree
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if zig build --fetch; then exit 0; fi
-            echo "fetch attempt $attempt failed" >&2
-            sleep $((attempt * 10))
-          done
-          echo "could not fetch dependencies in five attempts" >&2
-          exit 1
-
       - name: Package
         run: scripts/package-linux.sh --notary .notary
 
@@ -316,21 +264,6 @@ jobs:
 
       - name: Install the Native SDK CLI
         run: npm install -g @native-sdk/cli@0.9.2
-
-      # Same retried fetch as everywhere else: `zig build` dies with "unable to
-      # discover remote git server capabilities: ProtocolError" pulling
-      # secp256k1, which the nostr library pins by git URL rather than by
-      # tarball. Seen on arm, on macOS, and on a release build. Seconds when it
-      # works, and everything after it needs no network.
-      - name: Fetch the dependency tree
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if zig build --fetch; then exit 0; fi
-            echo "fetch attempt $attempt failed" >&2
-            sleep $((attempt * 10))
-          done
-          echo "could not fetch dependencies in five attempts" >&2
-          exit 1
 
       - name: A cold start, in a real window
         env:
