@@ -1,5 +1,13 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.4
+
+**Japanese, Chinese, Korean and Greek are text on Linux now.** They were solid grey blocks. Off macOS Plaza draws every glyph from the fonts it carries, and those covered Latin and Cyrillic, so anyone reading Nostr in another script saw rows of rectangles. Plaza carries Noto for those scripts now, and the renderer reaches for it when its own font has no glyph. This adds about 13 MB to the Linux download and nothing to the macOS one, which does not need it.
+
+Still not right, and a font would not fix them: Arabic, Hebrew, Thai and Devanagari. Those need letters to join and reorder, which is a different piece of machinery that does not exist yet. Nothing is bundled for them, because a wrong rendering is not clearly better than a missing one.
+
+**Linux draws less per frame.** The toolkit works out which part of the window changed, and the Linux code was throwing that away and converting the whole window every frame. It uses it now.
+
 ### What's new in v0.18.3
 
 **Fixed: on Debian the installer never checked for GTK 4.** The check that stops you downloading an app your machine cannot run was gated on finding `ldconfig` on your PATH, and Debian keeps it in `/usr/sbin`, which it does not put on a normal user's PATH. So on Debian the check silently did not happen. In practice almost nobody hit this, because every Debian 13 desktop already has GTK 4, but the safety net was not there.
