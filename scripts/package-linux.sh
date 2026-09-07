@@ -118,6 +118,30 @@ desktop="$stage/share/applications/plaza.desktop"
 grep -q "x-scheme-handler/plaza" "$desktop" || die "the desktop entry does not claim plaza:// links."
 grep -qE "%[uU]" "$desktop" || die "the desktop entry has no %u or %U, so a link would never reach argv."
 
+# The toolkit's packager leaves a placeholder README.txt saying "AppImage,
+# Flatpak, and tarball generation are future work", which then ships inside the
+# tarball it says does not exist yet. It is the first file somebody opens after
+# extracting, so it says something true instead.
+cat > "$stage/README.txt" <<TXT
+Plaza $version for Linux ($arch)
+
+  bin/plaza    the app
+  bin/notary   the window where a key is created, brought or unlocked
+  bin/signer   the daemon that holds the key; Plaza starts it and never sees it
+
+All three must stay in one directory: plaza finds the other two beside its own
+executable.
+
+Needs GTK 4.10 or newer, which means Ubuntu 23.10+, Debian 13+ or Fedora 39+.
+Built against glibc 2.38.
+
+Run bin/plaza, or install it properly with
+scripts/install-linux.sh --archive <this tarball>, which puts it in ~/.local and
+registers plaza:// links.
+
+Source and releases: https://github.com/zig-nostr/plaza
+TXT
+
 say "Compressing..."
 tar -C "$outdir" -czf "$outdir/plaza-$version-linux-$arch.tar.gz" "plaza-$version-linux-$arch"
 ( cd "$outdir" && sha256sum "plaza-$version-linux-$arch.tar.gz" > "plaza-$version-linux-$arch.tar.gz.sha256" )

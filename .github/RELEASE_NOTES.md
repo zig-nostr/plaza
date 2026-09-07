@@ -1,5 +1,19 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.3
+
+**Fixed: on Debian the installer never checked for GTK 4.** The check that stops you downloading an app your machine cannot run was gated on finding `ldconfig` on your PATH, and Debian keeps it in `/usr/sbin`, which it does not put on a normal user's PATH. So on Debian the check silently did not happen. In practice almost nobody hit this, because every Debian 13 desktop already has GTK 4, but the safety net was not there.
+
+**A first start that fails now says so.** Plaza was launched at the end of the install with its output thrown away, so a window that died on a missing library was indistinguishable from one that opened behind something.
+
+**The download is verified, or not installed.** If the published SHA-256 could not be fetched, the installer used to warn and install anyway.
+
+**The distribution floor is checked before GTK.** An Ubuntu 22.04 machine has GTK 4.6, so a presence check passed there and told the reader nothing, while the floor is the real reason it cannot run this.
+
+**Two things this page should have said all along.** These downloads need **Ubuntu 23.10+, Debian 13+, or Fedora 39+**; Ubuntu 22.04 and Debian 12 are too old. And on Linux Plaza draws every glyph from the faces it carries, which cover Latin and Cyrillic, so Greek, CJK, Japanese, Korean, Arabic, Hebrew, Thai and Devanagari are drawn as solid blocks rather than as text. If you read Nostr in one of those scripts, the macOS build is the one to use today.
+
+Also carries the current keyholder.
+
 ### What's new in v0.18.2
 
 **A relay you remove stops reading within a second.** A relay's reader waited for that relay to say something before it looked at anything else, so removing one, pointing it somewhere else, or setting it write-only left its connection up and still filling your store until it happened to speak. Pausing the pool had the same shape: the button worked, and the relays took as long to leave as they took to talk. On a quiet relay that could be indefinitely.
