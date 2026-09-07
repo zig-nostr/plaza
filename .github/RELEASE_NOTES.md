@@ -1,4 +1,30 @@
-**Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
+**Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
+
+### What's new in v0.18.0
+
+**Plaza runs on Linux.** One line, no root, nothing outside your home directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/install-linux.sh | bash
+```
+
+GTK 4 is the one runtime dependency and the installer says so before it downloads anything. It verifies the SHA-256, installs into `~/.local`, registers the desktop entry so `plaza://` links open Plaza, and launches it. Pass `--archive <file>` to install a tarball you already have, which needs no network at all.
+
+It is the same app, not a port with pieces missing: the feed, places, the keyholder, images, mentions, threads. What differs is underneath. macOS hands text to the system to draw; on Linux there is nothing to hand it to, so Plaza draws every glyph itself, and the fixes below are what that turned up.
+
+**Emoji are drawn, in colour.** Off macOS there is no system emoji font to fall back to, so every emoji was a solid grey block, and a name with one in it came out with a bar through it. Plaza carries its own colour emoji face there now.
+
+**Headings, names and bold text are actually bold.** Every weight resolved to the regular face, so an author's name rendered as plain text one step smaller than the note beneath it, which is worse than flat.
+
+**One wheel click scrolls the feed and stops.** It used to launch it: a single notch travelled for about forty seconds, and scrolling back was the only thing that stopped it.
+
+**A `plaza://` link opens the place it names**, whether Plaza is already running or not. Nothing carried the link to the app before, so following one did nothing.
+
+**The clock reads local time.** Every timestamp was UTC.
+
+**Invisible characters stay invisible.** The one that marks an emoji as coloured has no shape of its own and was being drawn as a solid block beside it, so a skull came out as a skull and a grey rectangle.
+
+**A quoted note's time is flush right** like every other timestamp, on both platforms. It sat short of the card's edge.
 
 ### What's new in v0.17.1
 
