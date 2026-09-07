@@ -24,7 +24,7 @@ env:
   # and "whatever notary's main happened to be that afternoon" is not something
   # anybody could reproduce later. Bump it deliberately, with the Plaza release
   # that needs it.
-  NOTARY_REF: v0.10.6
+  NOTARY_REF: v0.10.7
 
 jobs:
   macos-app:
@@ -117,3 +117,79 @@ jobs:
               --title "Plaza $GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
           fi
+
+  # The Linux tarballs, which the release has never carried. `install-linux.sh`
+  # has been fetching `plaza-<version>-linux-<arch>.tar.gz` and its `.sha256`
+  # from the latest release since it was written, and no release has ever had
+  # either, so the documented one-line install could only ever have 404ed. The
+  # recipe is not new: it is the `linux-package` job from ci.yml, which has been
+  # building these on every pull request and uploading them to workflow
+  # artifacts where nobody could install them from.
+  #
+  # `needs: macos-app` so the release exists before this uploads into it, and so
+  # a Linux artifact is never published beside a macOS build that failed. That
+  # job also owns the tag-versus-app.zon check, so nothing here can ship under a
+  # tag whose name and contents disagree.
+  linux-tarball:
+    name: package · publish (${{ matrix.arch }})
+    needs: macos-app
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.9.2
+
+      # gtk4 only, for the same reason ci.yml gives: Plaza declares no web use,
+      # so installing WebKit here would hide a regression that made it real.
+      - name: Install the Linux host dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      - name: Check out Notary
+        uses: actions/checkout@v4
+        with:
+          repository: zig-nostr/notary
+          ref: ${{ env.NOTARY_REF }}
+          path: .notary
+
+      - name: Package
+        run: scripts/package-linux.sh --notary .notary
+
+      # The installer derives the file name from the release tag and `uname -m`,
+      # so a tarball named for the wrong architecture is a 404 for whoever the
+      # runner was not. Checked here rather than trusted.
+      - name: The tarball matches the tag and this architecture
+        run: |
+          want="plaza-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}.tar.gz"
+          [ -f "dist/$want" ] || { echo "expected dist/$want, got: $(ls dist)" >&2; exit 1; }
+          [ -f "dist/$want.sha256" ] || { echo "no published digest beside $want" >&2; exit 1; }
+          echo "$want"
+
+      # Always `--clobber`: macos-app created the release, and a re-run of a
+      # half-finished publish is exactly what somebody reaches for.
+      - name: Publish the tarball and its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          want="plaza-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}.tar.gz"
+          gh release upload "$GITHUB_REF_NAME" "dist/$want" "dist/$want.sha256" --clobber

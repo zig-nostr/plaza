@@ -172,7 +172,14 @@ jobs:
   # `plaza://` links and carries a field code, which is the whole of how a link
   # reaches the app on Linux.
   linux-package:
-    runs-on: ubuntu-latest
+    name: linux-package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -222,9 +229,19 @@ jobs:
       - name: Package
         run: scripts/package-linux.sh --notary .notary
 
+      # The tarball is named by `uname -m`, so the two runners produce
+      # different files and the artifact names have to differ too.
+      - name: The tarball is for the architecture this runner actually is
+        run: |
+          got="$(ls dist/plaza-*-linux-*.tar.gz | head -1)"
+          case "$got" in
+            *-linux-${{ matrix.arch }}.tar.gz) echo "$got" ;;
+            *) echo "expected a ${{ matrix.arch }} tarball, packaged $got" >&2; exit 1 ;;
+          esac
+
       - uses: actions/upload-artifact@v4
         with:
-          name: plaza-linux-x86_64
+          name: plaza-linux-${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
