@@ -67,12 +67,20 @@ scripts/package-macos.sh   # -> dist/Plaza.app, ad-hoc signed
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/install-linux.sh | bash
 ```
 
-x86_64 and aarch64. GTK 4 is the one runtime dependency, and the installer says
-so before it downloads anything rather than after the window fails to open. It
-verifies the SHA-256, installs into `~/.local` so nothing needs root and nothing
-lands outside your home directory, registers the desktop entry so `plaza://`
-links open Plaza, and launches it. Pass `--archive <file>` to install a tarball
-you already have, which needs no network.
+x86_64 and aarch64, on a reasonably recent distribution: **Ubuntu 23.10+, Debian
+13+, or Fedora 39+**. The toolkit's Linux host declares a GTK floor of 4.10 and
+the binaries are built against glibc 2.38, which land on the same generation, so
+Ubuntu 22.04 and Debian 12 are too old. The installer checks that before it
+downloads anything, rather than leaving you with a loader error after a
+successful-looking install. Building from source on an older system works if its
+GTK is 4.10 or newer.
+
+GTK 4 is the one runtime dependency, and the installer says so before it
+downloads anything rather than after the window fails to open. It verifies the
+SHA-256, installs into `~/.local` so nothing needs root and nothing lands
+outside your home directory, registers the desktop entry so `plaza://` links
+open Plaza, and launches it. Pass `--archive <file>` to install a tarball you
+already have, which needs no network.
 
 Off macOS there is no system text layer, so Plaza draws every glyph itself and
 carries its own colour emoji face. That is the visible difference; the app is
