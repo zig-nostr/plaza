@@ -172,8 +172,26 @@ jobs:
           ref: ${{ env.NOTARY_REF }}
           path: .notary
 
+      # Retried, and only here. The first aarch64 run of this recipe died in
+      # `zig build` with "unable to discover remote git server capabilities:
+      # ProtocolError" fetching a dependency, and passed unchanged on a re-run.
+      # In ci.yml that is a red X somebody re-runs; here it would leave a
+      # PUBLISHED release carrying macOS and no Linux, which is the exact state
+      # this job exists to end. Zig keeps what it already fetched in the global
+      # cache, so a second attempt resumes rather than starting over.
+      #
+      # Deliberately NOT added to ci.yml: a retry there would hide an
+      # intermittent failure that is worth seeing on a pull request.
       - name: Package
-        run: scripts/package-linux.sh --notary .notary
+        run: |
+          for attempt in 1 2 3; do
+            if scripts/package-linux.sh --notary .notary; then exit 0; fi
+            echo "attempt $attempt failed" >&2
+            [ "$attempt" = 3 ] && break
+            sleep $((attempt * 15))
+          done
+          echo "packaging failed three times; not a flake" >&2
+          exit 1
 
       # The installer derives the file name from the release tag and `uname -m`,
       # so a tarball named for the wrong architecture is a 404 for whoever the
