@@ -61,6 +61,27 @@ signature you cannot inspect. Read the
 scripts/package-macos.sh   # -> dist/Plaza.app, ad-hoc signed
 ```
 
+### Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/plaza/main/scripts/install-linux.sh | bash
+```
+
+x86_64 and aarch64. GTK 4 is the one runtime dependency, and the installer says
+so before it downloads anything rather than after the window fails to open. It
+verifies the SHA-256, installs into `~/.local` so nothing needs root and nothing
+lands outside your home directory, registers the desktop entry so `plaza://`
+links open Plaza, and launches it. Pass `--archive <file>` to install a tarball
+you already have, which needs no network.
+
+Off macOS there is no system text layer, so Plaza draws every glyph itself and
+carries its own colour emoji face. That is the visible difference; the app is
+the same one.
+
+```sh
+scripts/package-linux.sh --notary <path>   # -> dist/plaza-<version>-linux-<arch>.tar.gz
+```
+
 ## Where the feed comes from
 
 Following somebody on Nostr does not mean you will see them. If they publish
@@ -220,9 +241,9 @@ the static screens, rendered natively, no browser, no Electron.
 
 ### Building on Linux
 
-There is no Linux release to install, but it builds and runs the full suite in
-CI on every change, so you can build it yourself. Zig and two system libraries,
-nothing else:
+There is a Linux release now, above. If you would rather build it, that is Zig
+and two system libraries and nothing else, and CI builds and runs the full suite
+on every change:
 
 ```sh
 sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
