@@ -1,5 +1,13 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.18.1
+
+**Fixed: the Linux build would not start.** It died the instant you ran it, with `Illegal instruction` and nothing else, on any machine whose processor was not the one that built it. Every Linux VM on an Apple computer was that case, which is most of the people who would have tried it first.
+
+The binaries are built for a baseline processor now rather than for whichever machine happened to compile them. v0.18.0's Linux downloads have been removed; there was no version of them that worked.
+
+Nothing else changed. Everything in v0.18.0 below is in this release too.
+
 ### What's new in v0.18.0
 
 **Plaza runs on Linux.** One line, no root, nothing outside your home directory:
