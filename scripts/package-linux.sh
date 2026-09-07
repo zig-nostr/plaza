@@ -50,8 +50,16 @@ stage="$outdir/plaza-$version-linux-$arch"
 say "Clearing zig-out so nothing stale or instrumented can be picked up..."
 rm -rf zig-out "$stage" "$outdir/plaza-$version-linux-$arch.tar.gz"
 
-say "Building (ReleaseFast, no automation)..."
-native build .
+# `-Dcpu=baseline`, and this is not optional for a release. Zig defaults to the
+# BUILD machine's CPU, so a binary built on a CI runner carries whatever that
+# runner's processor happened to support. v0.18.0's aarch64 tarball was built on
+# a Neoverse-class runner and died with SIGILL, immediately and with no output,
+# on Apple Silicon under UTM. Every Linux VM on an Apple machine is that target.
+#
+# Baseline is the portable ARMv8-A / x86-64 feature set. It costs some
+# instruction selection; a binary that will not start costs everything.
+say "Building (ReleaseFast, baseline CPU, no automation)..."
+native build . -Dcpu=baseline
 
 # Belt and braces, and `grep -c ... || true` rather than `grep -q` on purpose:
 # under `set -o pipefail` a matching `grep -q` exits early, `strings` dies of
@@ -67,8 +75,8 @@ hits="$(strings zig-out/bin/plaza | grep -c "native-sdk-automation" || true)"
 # SIBLINGS of argv[0], so all three land in the same directory here exactly as
 # they share Contents/MacOS in the bundle.
 say "Building Notary's daemon and window..."
-(cd "$notary_dir/daemon" && zig build -Doptimize=ReleaseFast)
-(cd "$notary_dir/gui" && rm -rf zig-out && native build .)
+(cd "$notary_dir/daemon" && zig build -Doptimize=ReleaseFast -Dcpu=baseline)
+(cd "$notary_dir/gui" && rm -rf zig-out && native build . -Dcpu=baseline)
 
 say "Packaging..."
 native package --target linux --output "$stage"
