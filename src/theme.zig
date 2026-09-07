@@ -60,8 +60,8 @@ const Color = canvas.Color;
 /// Off macOS the toolkit inks every glyph itself, and it reaches this face
 /// through the renderer's own fallback: the text face is asked first and keeps
 /// every glyph it has, and only a codepoint it does not carry falls through to
-/// a registered COLOUR face. So registering this changes nothing about how text
-/// is drawn, and turns the solid blocks emoji used to paint as into pictures.
+/// a registered face. Registered first, so an emoji a text face also happens to
+/// carry is still drawn in colour.
 ///
 /// Embedded only where it is used: on macOS CoreText draws the text and
 /// cascades to the system's own Apple Color Emoji, so this would be 1.4 MB of a
@@ -73,6 +73,45 @@ pub const emoji_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/Tw
 /// Nothing ever asks to be DRAWN in this id; it exists so the face is
 /// registered and the renderer's colour fallback can find it.
 pub const emoji_font_id: canvas.FontId = 64;
+
+/// The scripts the Geist faces do not carry.
+///
+/// Off macOS the bundled faces are the only glyph source, and Geist covers
+/// Latin and Cyrillic. Greek is four codepoints in it, the maths picks (ohm,
+/// capital lambda, lambda, pi), not the alphabet. Everything else, Greek, CJK,
+/// Japanese, Korean, was painted as a solid filled rectangle: not a placeholder
+/// outline, a block of text-coloured ink. On a network where a large share of
+/// the writing is Japanese, that is not an edge case.
+///
+/// Three faces rather than one, because no single parseable file covers it.
+/// The toolkit's `Face.parse` reads `glyf` outlines only, so the usual answer,
+/// Noto Sans CJK, is out twice over: it ships as a `.ttc` collection and its
+/// outlines are CFF. These are the per-language Noto variable fonts pinned to
+/// weight 400, stripped to the seven tables the renderer actually reads, and in
+/// the Korean case subsetted to hangul, since SC already carries the ideographs
+/// and the kana.
+///
+///   `noto_ttf`     Latin, Greek, Cyrillic and the rest of Noto Sans's range
+///   `noto_sc_ttf`  hiragana, katakana, and 20,976 ideographs
+///   `noto_kr_ttf`  11,172 hangul syllables and the jamo
+///
+/// What this does NOT fix: shaping. `Face.parse` reads no GSUB or GPOS and
+/// there is no bidi, so Arabic comes out unjoined and left to right, and
+/// Devanagari and Thai unreordered. Those want a shaper, not a font, so no face
+/// is bundled for them and the docs say so.
+///
+/// Embedded only where they are used. On macOS CoreText cascades to the
+/// system's own faces, so this would be 13 MB of a binary that never opens it.
+pub const noto_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/NotoSans-Regular.ttf");
+pub const noto_sc_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/NotoSansSC-Regular.ttf");
+pub const noto_kr_ttf = if (builtin.os.tag == .macos) "" else @embedFile("fonts/NotoSansKR-Hangul.ttf");
+
+/// Ids for the three above, in the registered range. Like `emoji_font_id`,
+/// nothing ever asks to be DRAWN in one of these: they exist so the faces are
+/// registered and the renderer's fallback can reach them.
+pub const noto_font_id: canvas.FontId = 65;
+pub const noto_sc_font_id: canvas.FontId = 66;
+pub const noto_kr_font_id: canvas.FontId = 67;
 
 pub const geist_ttf = @embedFile("fonts/Geist-Regular.ttf");
 pub const geist_medium_ttf = @embedFile("fonts/Geist-Medium.ttf");

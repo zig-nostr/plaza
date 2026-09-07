@@ -20936,6 +20936,59 @@ test "the emoji face the Linux build registers parses, and carries colour emoji"
     }
 }
 
+test "the scripts Geist cannot draw are covered by a face the Linux build registers" {
+    // Off macOS there is no platform text provider, so the registered faces are
+    // the only glyph source and a codepoint none of them carries is painted as
+    // a SOLID FILLED RECTANGLE, not a placeholder outline. Geist covers Latin
+    // and Cyrillic; its Greek is four maths symbols. Everything below used to
+    // be blocks.
+    //
+    // Embedded here rather than read through theme.zig for the same reason the
+    // emoji test does it: the app does not embed these on macOS, so reading
+    // them from there would check empty strings on the platform this runs on.
+    const font_ttf = native_sdk.canvas.font_ttf;
+    const latin = font_ttf.Face.parse(@embedFile("fonts/NotoSans-Regular.ttf")) catch
+        return error.TheNotoSansFaceIsRefused;
+    const sc = font_ttf.Face.parse(@embedFile("fonts/NotoSansSC-Regular.ttf")) catch
+        return error.TheNotoSansSCFaceIsRefused;
+    const kr = font_ttf.Face.parse(@embedFile("fonts/NotoSansKR-Hangul.ttf")) catch
+        return error.TheNotoSansKRFaceIsRefused;
+
+    const geist = font_ttf.geist_regular;
+    // One real word per script, not one character: a face can carry a stray
+    // codepoint from a block it does not otherwise cover.
+    const cases = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "Greek", .text = "Ελληνικά" },
+        .{ .name = "Japanese hiragana", .text = "こんにちは" },
+        .{ .name = "Japanese katakana", .text = "ナカムラ" },
+        .{ .name = "Japanese kanji", .text = "日本語" },
+        .{ .name = "Chinese", .text = "你好世界" },
+        .{ .name = "Korean", .text = "안녕하세요" },
+        .{ .name = "Cyrillic", .text = "Привет" },
+    };
+    for (cases) |case| {
+        var i: usize = 0;
+        while (i < case.text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(case.text[i]) catch return error.BadFixture;
+            const cp = std.unicode.utf8Decode(case.text[i .. i + len]) catch return error.BadFixture;
+            i += len;
+            if (geist.glyphIndex(cp) != 0) continue; // the text face draws it
+            if (latin.glyphIndex(cp) != 0) continue;
+            if (sc.glyphIndex(cp) != 0) continue;
+            if (kr.glyphIndex(cp) != 0) continue;
+            std.debug.print("\nno registered face carries U+{X:0>4} ({s})\n", .{ cp, case.name });
+            return error.AScriptWouldStillDrawAsSolidBlocks;
+        }
+    }
+
+    // The other half: these faces must not TAKE anything from Geist. The
+    // renderer asks the text face first, so Latin stays Geist whatever else is
+    // registered, and this pins the premise that makes that true.
+    for ("The quick brown fox 0123456789") |ch| {
+        if (geist.glyphIndex(ch) == 0) return error.TheTextFaceWouldYieldLatinToANotoFace;
+    }
+}
+
 test "the weight faces the Linux build registers parse, and differ from regular" {
     // Off macOS the toolkit maps a span's weight onto reserved font ids and
     // bundles no face for any of them, so medium and bold ink REGULAR outlines

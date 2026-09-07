@@ -82,11 +82,11 @@ outside your home directory, registers the desktop entry so `plaza://` links
 open Plaza, and launches it. Pass `--archive <file>` to install a tarball you
 already have, which needs no network.
 
-Off macOS there is no system text layer, so Plaza draws every glyph itself and
-carries its own colour emoji face. That also means no font fallback: the bundled
-faces cover Latin and Cyrillic, and anything outside them, Greek, CJK, Japanese,
-Korean, Arabic, Hebrew, Thai and Devanagari, is painted as a solid block rather
-than as text. If you read Nostr in one of those, use the macOS build for now.
+Off macOS there is no system text layer, so Plaza draws every glyph itself, from
+faces it carries: Geist for Latin and Cyrillic, a colour emoji face, and Noto
+for Greek, Japanese, Chinese and Korean. Arabic, Hebrew, Thai and Devanagari are
+still not right, and a font would not fix them: they need letters to join and
+reorder, and the renderer has no shaping.
 
 ```sh
 scripts/package-linux.sh --notary <path>   # -> dist/plaza-<version>-linux-<arch>.tar.gz
@@ -286,13 +286,20 @@ slower than the packaged app. Emoji are drawn from a colour face Plaza bundles
 there rather than from the system, which is why the Linux build carries a font
 the macOS one does not.
 
-No platform text provider also means no font fallback. macOS asks CoreText for a
-glyph its face does not have and gets one; off macOS there is nobody to ask, so
-a codepoint outside the bundled faces is painted as a solid block. Those faces
-cover Latin and Cyrillic, so Greek, CJK, Japanese, Korean, Arabic, Hebrew, Thai
-and Devanagari do not render as text on Linux today. A broader face would fix
-the coverage but not the shaping: the reference rasteriser reads no GSUB or
-GPOS, so Arabic would still come out unjoined and the Indic scripts unreordered.
+No platform text provider also means no font fallback for free. macOS asks
+CoreText for a glyph its face does not have and gets one; off macOS there is
+nobody to ask, so a codepoint outside the bundled faces is painted as a solid
+block. Geist covers Latin and Cyrillic (its Greek is four maths symbols), so
+everything else used to be blocks. Plaza now carries Noto Sans, Noto Sans SC and
+the hangul of Noto Sans KR, and the renderer asks them for a codepoint Geist
+does not have. That is 13 MB of font in the Linux build and none in the macOS
+one, which is most of the size difference between them.
+
+Coverage was one of two problems. The other is shaping, and no font fixes it:
+the reference rasteriser reads no GSUB or GPOS and there is no bidi, so Arabic
+comes out unjoined and left to right, and Devanagari and Thai unreordered. No
+face is bundled for those, because a wrong rendering is not obviously better
+than a missing one.
 
 Windows is not in the matrix at all: the relay transport resolves hostnames
 through libc `getaddrinfo`, which Zig's standard library does not declare for

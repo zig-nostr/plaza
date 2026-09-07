@@ -32180,9 +32180,19 @@ const registered_fonts: []const PlazaApp.FontRegistration = if (builtin.os.tag =
     &.{}
 else
     &.{
+        // Twemoji FIRST. The renderer's fallback walks these in order, so a
+        // codepoint two faces both carry goes to the one registered earlier,
+        // and an emoji should be drawn as a picture rather than as whichever
+        // text face happens to have a monochrome glyph for it.
         .{ .id = theme.emoji_font_id, .name = "Twemoji.ttf", .ttf = theme.emoji_ttf },
         .{ .id = canvas.default_sans_medium_font_id, .name = "Geist-Medium.ttf", .ttf = theme.geist_medium_ttf },
         .{ .id = canvas.default_sans_bold_font_id, .name = "Geist-Bold.ttf", .ttf = theme.geist_bold_ttf },
+        // The scripts Geist does not carry. Nothing is ever drawn IN these ids;
+        // they are here so the faces exist for the fallback to find. See
+        // `theme.noto_ttf`.
+        .{ .id = theme.noto_font_id, .name = "NotoSans-Regular.ttf", .ttf = theme.noto_ttf },
+        .{ .id = theme.noto_sc_font_id, .name = "NotoSansSC-Regular.ttf", .ttf = theme.noto_sc_ttf },
+        .{ .id = theme.noto_kr_font_id, .name = "NotoSansKR-Hangul.ttf", .ttf = theme.noto_kr_ttf },
     };
 
 pub fn main(init: std.process.Init) !void {
