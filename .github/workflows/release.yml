@@ -135,7 +135,13 @@ jobs:
             echo "release exists; replacing its artifact with the one built here"
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
           else
+            # A DRAFT. The Linux tarballs are built by another job that takes
+            # minutes longer, and a release published before they arrive offers
+            # a Linux install that 404s for exactly that long. v0.18.0 was live
+            # with macOS only for eight minutes, which somebody noticed. The
+            # `publish` job below lifts the draft once every artifact is up.
             gh release create "$GITHUB_REF_NAME" "$asset" \
+              --draft \
               --title "Plaza $GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
           fi
@@ -239,3 +245,20 @@ jobs:
         run: |
           want="plaza-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}.tar.gz"
           gh release upload "$GITHUB_REF_NAME" "dist/$want" "dist/$want.sha256" --clobber
+
+  # Lifts the draft, once and only once every artifact is up. Until this runs
+  # the release is invisible, so there is no window in which the page offers a
+  # download that is not there yet.
+  publish:
+    needs: [macos-app, linux-tarball]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          echo "published $GITHUB_REF_NAME with:"
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'

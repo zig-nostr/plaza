@@ -26,7 +26,7 @@ client.
 > relay, and whatever it serves, without disturbing your own.
 >
 > Not there yet: putting a picture in a note, setting an avatar, sending a zap,
-> search, and private messages. macOS first.
+> search, and private messages.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
@@ -256,7 +256,7 @@ Everything else comes from the build: the dependencies are fetched on the first
 run, and the C pieces (secp256k1, LMDB, the stb image codecs) are compiled from
 source by the Zig toolchain, so there is no separate C compiler, no cmake and
 nothing to install from npm. The `native` commands above are the packaging CLI
-and are only needed to produce a macOS bundle.
+and are only needed to produce a macOS bundle or a Linux tarball.
 
 Those two packages are what CI adds on top of the `ubuntu-latest` runner image,
 which already carries a good deal. A minimal or non-Debian system may want more,
