@@ -14235,6 +14235,67 @@ fn invisibleForDisplay(cp: u21) bool {
     };
 }
 
+/// The ASCII letter or digit a Mathematical Alphanumeric codepoint is a styled
+/// copy of, or null for anything outside that block.
+///
+/// U+1D400 to U+1D7FF is where the "fancy text" generators live: 𝐁𝐨𝐛, 𝕊𝕒𝕥,
+/// 𝓐𝓵𝓲, 𝕾𝖊𝖗. Unicode put thirteen complete styled alphabets and five styled
+/// digit runs there for MATHEMATICS, where the style carries meaning (a bold R
+/// and a double-struck R are different objects), and social display names have
+/// used it as a font picker ever since.
+///
+/// It is 996 codepoints and NOTHING Plaza ships covers one of them, so off
+/// macOS a name written this way had no glyph anywhere and the renderer filled
+/// a solid rectangle per word. That is the whole of what a reader saw: two
+/// blocks where a name should be. This was reported against a real account
+/// whose `display_name` is 𝕾𝖊𝖗 𝕾𝖑𝖊𝖊𝖕𝖞, Mathematical Bold Fraktur, ten
+/// codepoints, none of them drawable.
+///
+/// A font would not fix it either, or not cheaply: covering the block properly
+/// means carrying thirteen more alphabets for a decorative effect. Folding is
+/// the better trade. The characters ARE the Latin letters, styled, so folding
+/// gives the reader the name back rather than a substitute, and it costs
+/// nothing to download.
+///
+/// Pure arithmetic over the runs. Each alphabet is 52 codepoints, A to Z then
+/// a to z; each digit run is 10. The block has holes where the character
+/// already existed in Letterlike Symbols (italic h is U+210E, not U+1D455), and
+/// mapping a hole is harmless because an unassigned codepoint cannot appear in
+/// real text.
+///
+/// The Greek runs (U+1D6A8 to U+1D7CB) are deliberately NOT folded. They would
+/// need a u21 result and a re-encode, the bundled Noto face already draws base
+/// Greek so the payoff is a rarer name still, and this is a bug fix rather than
+/// a Unicode project.
+fn foldMathAlnum(cp: u21) ?u8 {
+    const alphabets = [_]u21{
+        0x1D400, // bold
+        0x1D434, // italic
+        0x1D468, // bold italic
+        0x1D49C, // script
+        0x1D4D0, // bold script
+        0x1D504, // fraktur
+        0x1D538, // double-struck
+        0x1D56C, // bold fraktur
+        0x1D5A0, // sans-serif
+        0x1D5D4, // sans-serif bold
+        0x1D608, // sans-serif italic
+        0x1D63C, // sans-serif bold italic
+        0x1D670, // monospace
+    };
+    for (alphabets) |start| {
+        if (cp >= start and cp < start + 52) {
+            const offset: u8 = @intCast(cp - start);
+            return if (offset < 26) 'A' + offset else 'a' + (offset - 26);
+        }
+    }
+    const digits = [_]u21{ 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6 };
+    for (digits) |start| {
+        if (cp >= start and cp < start + 10) return '0' + @as(u8, @intCast(cp - start));
+    }
+    return null;
+}
+
 /// Writes one UTF-8 sequence into `dst`. Null when it would not fit, zero when
 /// the sequence is invisible and is dropped.
 ///
@@ -14269,6 +14330,23 @@ fn copyDisplayText(dst: []u8, src: []const u8) usize {
     while (i < src.len) {
         const seq_len = std.unicode.utf8ByteSequenceLength(src[i]) catch 1;
         const take = @min(seq_len, src.len - i);
+        // Folded here rather than in `writeDisplaySeq`, which note bodies also
+        // go through. A fold changes the byte count, and `renderContentInto`
+        // records mention offsets into the buffer it is filling, so moving text
+        // under them would point every mention at the wrong span. Display names
+        // carry no offsets, so they are the safe place for it, and they are
+        // where the bug was reported.
+        if (comptime builtin.os.tag != .macos) {
+            if (std.unicode.utf8Decode(src[i..][0..take])) |cp| {
+                if (foldMathAlnum(cp)) |ascii| {
+                    if (out >= dst.len) break;
+                    dst[out] = ascii;
+                    out += 1;
+                    i += take;
+                    continue;
+                }
+            } else |_| {}
+        }
         const wrote = writeDisplaySeq(dst[out..], src[i..][0..take]) orelse break;
         out += wrote;
         i += take;
@@ -14282,6 +14360,10 @@ pub fn invisibleForDisplayForTest(cp: u21) bool {
 
 pub fn copyDisplayTextForTest(dst: []u8, src: []const u8) usize {
     return copyDisplayText(dst, src);
+}
+
+pub fn foldMathAlnumForTest(cp: u21) ?u8 {
+    return foldMathAlnum(cp);
 }
 
 /// A parsed `nostr:` mention at `src[i]`: the byte just past its token, and the
@@ -15528,7 +15610,7 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
             // Layered OVER the feed rather than replacing it, so the scroll
             // region stays mounted and holds its offset. Swapping the tree out
             // unmounts it, and closing would drop the reader back at the top.
-            return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note) });
+            return ui.stack(.{ .grow = 1 }, .{ base, imageViewer(ui, note, model.expanded_image) });
         }
     }
     if (model.stage == .ready and model.joining) {
@@ -16887,8 +16969,18 @@ fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
 /// blur, this shows it as large as it honestly goes and offers the
 /// full-resolution original in the browser. Pressing the backdrop closes it,
 /// which also stops presses reaching the feed underneath.
-fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
-    const image_id = note.media_id();
+fn imageViewer(ui: *AppUi, note: *const Note, index: u8) AppUi.Node {
+    // WHICH picture, which the viewer used to have no opinion about. The
+    // gallery cell dispatches the index it was drawn for and the update stores
+    // it, and then this function was called with the note alone, so the index
+    // was written twice and read nowhere. `media_id()` and `imageUrl()` are
+    // both index 0, so every cell in a gallery opened the first picture.
+    //
+    // Clamped rather than trusted: the model outlives a rebuild, so a note that
+    // came back from a relay with fewer pictures than the one that was pressed
+    // would index past the end.
+    const i: u8 = if (index < note.imageCount()) index else 0;
+    const image_id = note.mediaIdAt(i);
     // A dialog, not a bare column: modal surfaces paint their own opaque
     // surface and always claim their own input, so the feed underneath neither
     // shows through nor scrolls, and Escape or a click outside closes it.
@@ -16924,7 +17016,7 @@ fn imageViewer(ui: *AppUi, note: *const Note) AppUi.Node {
             ui.row(.{ .gap = 8, .cross = .center }, .{
                 ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .close_image }, "Close"),
                 ui.spacer(1),
-                ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageUrl() } }, "Open original"),
+                ui.button(.{ .size = .sm, .on_press = Msg{ .open_url = note.imageAt(i).url() } }, "Open original"),
             }),
         }),
     });

@@ -11493,6 +11493,89 @@ test "the expanded picture closes on a press anywhere it is not a control" {
     }
 }
 
+test "the viewer opens the picture that was pressed, not the first one" {
+    // The gallery cell dispatched the right index and the update stored it, and
+    // then the viewer was called with the note alone and read picture zero. So
+    // this is not "the second image opens the first": EVERY cell opened the
+    // first, and a one-picture note hid it because zero was the only answer.
+    //
+    // Asserted through "Open original", because that is the one place the
+    // choice reaches something a test can read: an image node carries a
+    // registered id, and nothing in a headless render registers one, so the
+    // picture itself is "Still loading…" either way.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 1;
+    _ = model.notes[0].setImageForTest(0, "https://example.com/first.jpg");
+    _ = model.notes[0].setImageForTest(1, "https://example.com/second.jpg");
+    model.notes_len = 1;
+    model.expanded_note = 1;
+    model.expanded_image = 1;
+
+    const p = try painted.Painted.render(arena, &model);
+    const viewer = modalSurfaceIndex(p, "Expanded image") orelse return error.NoViewer;
+    const original = controlNode(p, viewer, "Open original") orelse return error.NoSuchControl;
+    const msg = pressMsgById(p, original.id) orelse return error.ControlNotWired;
+    switch (msg) {
+        .open_url => |u| try testing.expectEqualStrings("https://example.com/second.jpg", u),
+        else => {
+            std.debug.print("\"Open original\" dispatches {s}, not open_url\n", .{@tagName(msg)});
+            return error.WrongMessage;
+        },
+    }
+}
+
+test "a name written in Mathematical Alphanumeric letters is readable" {
+    // 996 codepoints that nothing Plaza ships carries a glyph for, so off macOS
+    // a name written in them was a solid rectangle per word. The reported one
+    // was Mathematical Bold Fraktur.
+    // The fold itself is pure and is asserted on every platform, so a macOS run
+    // still catches a broken table. Only the two buffer assertions are gated,
+    // because `copyDisplayText` leaves macOS alone on purpose: CoreText cascades
+    // to a system face and draws the styled letters properly there, so folding
+    // would replace working text with a plainer copy of itself.
+    var buf: [64]u8 = undefined;
+    if (comptime builtin.os.tag != .macos) {
+        const written = main.copyDisplayTextForTest(&buf, "\u{1D57E}\u{1D58A}\u{1D597} \u{1D57E}\u{1D591}\u{1D58A}\u{1D58A}\u{1D595}\u{1D59E}");
+        try testing.expectEqualStrings("Ser Sleepy", buf[0..written]);
+    }
+
+    // Every run, so a style nobody thought about is not a bar. Each alphabet is
+    // A-Z then a-z, so the first, the twenty-sixth and the last of each pin the
+    // arithmetic at both ends and across the case boundary.
+    const alphabets = [_]u21{
+        0x1D400, 0x1D434, 0x1D468, 0x1D49C, 0x1D4D0, 0x1D504, 0x1D538,
+        0x1D56C, 0x1D5A0, 0x1D5D4, 0x1D608, 0x1D63C, 0x1D670,
+    };
+    for (alphabets) |start| {
+        try testing.expectEqual(@as(?u8, 'A'), main.foldMathAlnumForTest(start));
+        try testing.expectEqual(@as(?u8, 'Z'), main.foldMathAlnumForTest(start + 25));
+        try testing.expectEqual(@as(?u8, 'a'), main.foldMathAlnumForTest(start + 26));
+        try testing.expectEqual(@as(?u8, 'z'), main.foldMathAlnumForTest(start + 51));
+    }
+    for ([_]u21{ 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6 }) |start| {
+        try testing.expectEqual(@as(?u8, '0'), main.foldMathAlnumForTest(start));
+        try testing.expectEqual(@as(?u8, '9'), main.foldMathAlnumForTest(start + 9));
+    }
+
+    // And nothing outside the block moves. Letterlike Symbols sits just below
+    // it and already inks, the Greek runs are deliberately left alone, and
+    // ordinary text must be untouched.
+    for ([_]u21{ 0x2103, 0x2116, 0x2122, 0x212C, 0x1D6A8, 0x1D7CB, 'A', 'z', '7', 0x00E9, 0x4E00 }) |cp| {
+        try testing.expectEqual(@as(?u8, null), main.foldMathAlnumForTest(cp));
+    }
+
+    // A name that is already readable stays byte-identical, on every platform.
+    const plain = "Ser Sleepy";
+    const kept = main.copyDisplayTextForTest(&buf, plain);
+    try testing.expectEqualStrings(plain, buf[0..kept]);
+}
+
 test "the join sheet's dialog and card are the same box" {
     // The hole this closes was invisible in the tree and only in the frames:
     // both elements were present, correctly nested, and 48pt different in
