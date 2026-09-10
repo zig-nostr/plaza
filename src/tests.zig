@@ -12341,6 +12341,76 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
     try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
 }
 
+test "delete is offered on my own note and refuses anything but a kind 1 of mine" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const mine = try signer.keyPairFromSecretKey([_]u8{31} ** 32);
+    const theirs = try signer.keyPairFromSecretKey([_]u8{32} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/del.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.setIdentityForTest([_]u8{31} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Three events: my note, my relay list, and somebody else's note.
+    const my_note = try nostr.event.create(arena, signer, mine, 1_800_000_000, 1, &.{}, "mine", null);
+    _ = try main.plazaIngestForTest(arena, my_note);
+    const my_list = try nostr.event.create(arena, signer, mine, 1_800_000_001, 10002, &.{&.{ "r", "wss://a.example" }}, "", null);
+    _ = try main.plazaIngestForTest(arena, my_list);
+    const their_note = try nostr.event.create(arena, signer, theirs, 1_800_000_002, 1, &.{}, "theirs", null);
+    _ = try main.plazaIngestForTest(arena, their_note);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    inline for (.{ .{ 1, my_note, mine }, .{ 2, my_list, mine }, .{ 3, their_note, theirs } }, 0..) |row, i| {
+        model.notes[i] = main.Note{ .created_at = 1_800_000_000 };
+        model.notes[i].id = row[0];
+        model.notes[i].event_id = row[1].id;
+        model.notes[i].pubkey = row[2].public_key;
+    }
+    model.notes_len = 3;
+
+    // My kind 1: yes, and the kind comes back from the store rather than the card.
+    if (main.deletableTargetKindForTest(&model, 1) == null) {
+        std.debug.print("my own kind:1 was refused; identity or store lookup did not line up\n", .{});
+        return error.OwnNoteRefused;
+    }
+    try testing.expectEqual(@as(?u16, 1), main.deletableTargetKindForTest(&model, 1));
+    // My relay list: NO. A replaceable event is superseded, never deleted, and
+    // a kind:5 aimed at one asks every relay to drop it with no way back. This
+    // is the assertion that matters most in this test.
+    try testing.expectEqual(@as(?u16, null), main.deletableTargetKindForTest(&model, 2));
+    // Somebody else's note: no.
+    try testing.expectEqual(@as(?u16, null), main.deletableTargetKindForTest(&model, 3));
+
+    // And the row is offered on mine, absent on theirs.
+    for ([_]struct { id: i64, want: bool }{ .{ .id = 1, .want = true }, .{ .id = 3, .want = false } }) |case| {
+        var one = main.initialModel();
+        one.stage = .ready;
+        one.notes[0] = model.notes[if (case.id == 1) 0 else 2];
+        one.notes_len = 1;
+        const p = try painted.Painted.render(arena, &one);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        var found = false;
+        for (menu.items) |item| {
+            if (std.mem.eql(u8, item.label, "Delete")) found = true;
+        }
+        if (found != case.want) {
+            std.debug.print("note {d}: Delete offered={}, wanted {}\n", .{ case.id, found, case.want });
+            return error.WrongDeleteRow;
+        }
+    }
+}
+
 test "a right-click in a place keeps every row it wrote" {
     // The overrun this pins: `noteContextItems` allocated seven items and, in
     // the feed inside a place declaring a handler for kind 1, wrote eight. One

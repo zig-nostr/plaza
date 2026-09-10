@@ -9991,6 +9991,9 @@ pub const Model = struct {
     /// Which of that note's pictures the viewer is showing. Zero for a note with
     /// one, which is every note the viewer could open before galleries existed.
     expanded_image: u8 = 0,
+    /// The note this reader has asked to delete, while the confirmation is up.
+    /// The one action here with no undo, so it is asked rather than done.
+    deleting_note: ?i64 = null,
     /// Whether the mention picker has been dismissed for the query now in the
     /// draft. It has no open flag of its own: it shows whenever the draft ends
     /// in a `@word`, so Escape and a press outside had nothing to clear and it
@@ -14565,6 +14568,11 @@ pub const Msg = union(enum) {
     /// Ask to leave, and back out of asking.
     place_leave_request,
     place_leave_cancel,
+    /// Ask to delete a note of my own, then answer. A deletion cannot be taken
+    /// back, so the press opens a question rather than publishing one.
+    delete_note_request: i64,
+    delete_note_confirm,
+    delete_note_cancel,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
     /// Back into the visit Home closed.
@@ -15627,6 +15635,9 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
         .settings => feedView(ui, model, false),
         .ready => feedView(ui, model, true),
     };
+    if (model.deleting_note) |_| {
+        return ui.stack(.{ .grow = 1 }, .{ base, deleteConfirm(ui) });
+    }
     if (model.expanded_note) |note_id| {
         if (model.noteById(note_id)) |note| {
             // Layered OVER the feed rather than replacing it, so the scroll
@@ -16984,6 +16995,35 @@ fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
     const live = liveRelayCount();
     if (live == 0) return "no relay is answering · it will wait in the outbox";
     return ui.fmt("posts to {d} {s}", .{ live, if (live == 1) "relay" else "relays" });
+}
+
+/// The one question this app asks before doing something it cannot undo.
+///
+/// The wording is the part worth getting right. A deletion is a REQUEST: relays
+/// may honour it or ignore it, and the note may already sit on relays that will
+/// never see the request. Saying "deleted" would be a promise Nostr cannot
+/// keep, so this says what actually happens and lets the reader decide with
+/// that in front of them.
+fn deleteConfirm(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dialog, .{
+        .padding = 20,
+        .on_press = .delete_note_cancel,
+        .semantics = .{ .label = "Delete this note?" },
+    }, .{
+        ui.column(.{ .gap = 12, .cross = .stretch }, .{
+            ui.text(.{}, "Delete this note?"),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = "This asks the relays you publish to drop it. Most will. Any that already passed it on, or that ignore the request, may keep serving it, so this cannot be undone and cannot be guaranteed." }},
+            ),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .delete_note_cancel }, "Cancel"),
+                ui.spacer(1),
+                ui.button(.{ .size = .sm, .variant = .destructive, .on_press = .delete_note_confirm }, "Delete"),
+            }),
+        }),
+    });
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes
@@ -23202,8 +23242,20 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
         }
     }
     push(items, &n, .{ .separator = true });
+    if (isMine(note.pubkey)) {
+        push(items, &n, .{ .label = "Delete", .msg = Msg{ .delete_note_request = note.id } });
+    }
     push(items, &n, followContextItem(note.pubkey));
     return items[0..n];
+}
+
+/// Whether this account wrote it. Absent rather than disabled is the right
+/// treatment for Delete on somebody else's note: a greyed row offers a thing
+/// that is not on offer, where a greyed Follow explains a state the reader is
+/// actually in.
+fn isMine(author: [32]u8) bool {
+    const me = activePubkey() orelse return false;
+    return std.mem.eql(u8, &me, &author);
 }
 
 /// The follow entry for a right-click, in whatever state it is honestly in.
@@ -27699,6 +27751,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_places_rail => togglePlacesRail(),
         .open_place_info => g_place_info = .open,
         .close_place_info => g_place_info = .closed,
+        .delete_note_request => |id| model.deleting_note = id,
+        .delete_note_cancel => model.deleting_note = null,
+        .delete_note_confirm => {
+            const id = model.deleting_note;
+            model.deleting_note = null;
+            if (id) |note_id| deleteNote(model, fx, note_id);
+        },
         .place_leave_request => g_place_info = .leaving,
         .place_leave_cancel => g_place_info = .open,
         .place_resume => resumeVisit(),
@@ -29853,10 +29912,19 @@ pub fn repostContent(gpa: std.mem.Allocator, note: *const Note) []const u8 {
 }
 
 /// The NIP-09 deletion tags to un-like: `["e", reaction_id]`, `["k", "7"]`.
-fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.event.Tag {
-    const id_hex = hexAlloc(gpa, reaction_id) orelse return null;
+/// The tags of a NIP-09 deletion: the event it asks relays to drop, and the
+/// kind that event was. This was `buildUnlikeTags` with the 7 written in, which
+/// is the same builder with one number decided in advance.
+///
+/// The `k` tag is what lets a relay refuse a request to delete something of a
+/// kind the sender should not be deleting, without fetching the target first.
+fn buildDeleteTags(gpa: std.mem.Allocator, target_id: [32]u8, target_kind: u16) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, target_id) orelse return null;
+    var kind_buf: [8]u8 = undefined;
+    const kind_text = std.fmt.bufPrint(&kind_buf, "{d}", .{target_kind}) catch return null;
+    const kind_owned = gpa.dupe(u8, kind_text) catch return null;
     const e = gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null;
-    const k = gpa.dupe([]const u8, &.{ "k", "7" }) catch return null;
+    const k = gpa.dupe([]const u8, &.{ "k", kind_owned }) catch return null;
     const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
     tags[0] = e;
     tags[1] = k;
@@ -29956,12 +30024,70 @@ fn clearRepostedByMe(note_id: i64) void {
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
     const reaction_id = forgetLike(note_id) orelse return;
-    const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
+    const tags = buildDeleteTags(gpa, reaction_id, 7) orelse return;
     const content = gpa.dupe(u8, "") catch return;
     // The id is already gone from the table by here, so the undo carries it:
     // without it a refused un-like empties the heart, leaves the kind:7 on
     // every relay, and the next press publishes a second reaction.
     signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } }, null);
+}
+
+/// Asks the relays to drop a note this reader wrote.
+///
+/// The local half needs no code: the store tombstones and removes on ingest of
+/// a kind:5, scoped to the same author, the signed event reaches it through the
+/// one door every write goes through, and a kind:5 landing already invalidates
+/// the feed. So the note leaves the feed on the next rebuild with nothing added
+/// here.
+///
+/// Kind 1 only, and that is a rule rather than a simplification. A replaceable
+/// event is superseded, never deleted: `capturePrevious` and `keepReplaced`
+/// exist so a list can be walked back, and a kind:5 aimed at one would ask
+/// relays to drop the reader's follow list or their relay list with no way
+/// back. Amethyst does delete lists this way. This will not.
+fn deleteNote(model: *Model, fx: *Effects, note_id: i64) void {
+    const target = deletableTarget(model, note_id) orelse return;
+    if (!signerReady()) return;
+    const gpa = std.heap.page_allocator;
+    const tags = buildDeleteTags(gpa, target.event_id, target.kind) orelse return;
+    const content = gpa.dupe(u8, "") catch return;
+    // A thread level is a snapshot, so reading the note you just deleted would
+    // leave a level showing an event the store no longer holds.
+    if (model.viewing_thread == note_id) closeThread(model);
+    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .none, null);
+}
+
+/// What a deletion may target, or null when the answer is no.
+///
+/// Separated from the publish because these gates are the whole safety of the
+/// feature and a test has to be able to ask them without signing anything.
+fn deletableTarget(model: *Model, note_id: i64) ?struct { event_id: [32]u8, kind: u16 } {
+    const note = model.noteById(note_id) orelse return null;
+    const me = activePubkey() orelse return null;
+    if (!std.mem.eql(u8, &note.pubkey, &me)) return null;
+    // The kind comes from the STORE, not from the card. A `Note` carries no
+    // kind: the feed builds one from whatever it drew, and an event of a kind
+    // this app cannot render is still drawn as a note today (#268). Reading the
+    // stored event is the only way to know what is actually being asked for,
+    // and it is worth a disk read on the one action with no undo.
+    const store = g_store orelse return null;
+    var stored = (store.getEvent(std.heap.page_allocator, note.event_id) catch return null) orelse return null;
+    defer stored.deinit();
+    // Kind 1 only, and that is a rule rather than a simplification. A
+    // replaceable event is superseded, never deleted: `capturePrevious` and
+    // `keepReplaced` exist so a list can be walked back, and a kind:5 aimed at
+    // one would ask relays to drop this reader's follow list or their relay
+    // list with no way back. Amethyst deletes lists this way. This will not.
+    if (stored.event.kind != 1) return null;
+    // The card said it was theirs; the stored event has to agree. A card is
+    // built by the feed and a signature is not.
+    if (!std.mem.eql(u8, &stored.event.pubkey, &me)) return null;
+    return .{ .event_id = note.event_id, .kind = stored.event.kind };
+}
+
+pub fn deletableTargetKindForTest(model: *Model, note_id: i64) ?u16 {
+    const t = deletableTarget(model, note_id) orelse return null;
+    return t.kind;
 }
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.
