@@ -4,7 +4,7 @@
 
 **The dead controls work now.** Three things under every note were drawn and did nothing. A bookmark you could press that saved nothing, a hashtag painted like a link that went nowhere, and no way at all to delete your own note. Each one is now a real verb.
 
-**Bookmarks.** Saved as a NIP-51 list on your own relays, so they follow you to any other client, and bookmarks you saved privately somewhere else show up here filled in. Find them again from the account menu, which carries the count. Plaza reads the whole list before it writes one, and refuses to publish at all rather than write over a private half it could not open, because publishing without those bytes is how a client erases everything you saved privately.
+**Bookmarks, public or private.** Saved as a NIP-51 list on your own relays, so they follow you to any other client. "Bookmark privately" seals the entry to your own key, so the relay holds it and cannot read it, and private bookmarks you made in another client show up here too. Find them again from the account menu, which carries the count. Plaza reads the whole list before it writes one, and refuses to publish at all rather than write over a private half it could not open, because publishing without those bytes is how a client erases everything you saved privately.
 
 **Hashtags go somewhere.** Pressing one opens the notes carrying that tag, read from this machine first, so what you already have is on screen before any relay is asked. It also stops being painted in the same violet as a person and a web link, because it is neither.
 
