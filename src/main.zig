@@ -9545,6 +9545,43 @@ const note_max_mentions = 8;
 /// The cap, for a test that has to build a note carrying more than it.
 pub const noteMaxMentionsForTest = note_max_mentions;
 
+/// Where a topic span's payload lives.
+///
+/// A mention's sits in `MentionRef.link_buf`, part of the model-owned `Note`,
+/// precisely because `ui.arena` is reset every frame and a press is dispatched
+/// after the frame that built it. A topic has no `Note` field to live in, so it
+/// gets a small ring: written while the spans are built, reused each frame, and
+/// stable for as long as any press can still be delivered.
+const topic_ring_slots = 16;
+var g_topic_ring: [topic_ring_slots][topic_link_tag.len + max_topic_bytes]u8 = undefined;
+var g_topic_ring_len: [topic_ring_slots]u8 = [_]u8{0} ** topic_ring_slots;
+var g_topic_ring_next: usize = 0;
+
+/// Stores `word` (a hashtag without its `#`) and returns the payload to hang on
+/// the span, lowercased so `#Nostr` and `#nostr` are one topic. `contentTags`
+/// lowercases on the way out too, so the two halves agree.
+fn topicLinkFor(word: []const u8) ?[]const u8 {
+    if (word.len == 0 or word.len > max_topic_bytes) return null;
+    const slot = g_topic_ring_next % topic_ring_slots;
+    g_topic_ring_next +%= 1;
+    const buf = &g_topic_ring[slot];
+    @memcpy(buf[0..topic_link_tag.len], topic_link_tag);
+    for (word, 0..) |c, i| buf[topic_link_tag.len + i] = std.ascii.toLower(c);
+    g_topic_ring_len[slot] = @intCast(topic_link_tag.len + word.len);
+    return buf[0..g_topic_ring_len[slot]];
+}
+
+/// The topic inside a payload, or null when this link is not one.
+fn topicLinkValue(link: []const u8) ?[]const u8 {
+    if (link.len <= topic_link_tag.len) return null;
+    if (!std.mem.startsWith(u8, link, topic_link_tag)) return null;
+    return link[topic_link_tag.len..];
+}
+
+pub fn topicLinkValueForTest(link: []const u8) ?[]const u8 {
+    return topicLinkValue(link);
+}
+
 /// The link payload a mention span carries: `mention_link_tag` followed by the
 /// raw 32-byte pubkey.
 ///
@@ -9558,6 +9595,10 @@ pub const noteMaxMentionsForTest = note_max_mentions;
 /// what keeps this cheap: the text form is 69 bytes per mention in every note
 /// the feed holds, and would then have to be decoded again on the press.
 const mention_link_tag = "p\x00";
+/// A topic's payload rides the same channel a mention's does: a sentinel whose
+/// second byte is zero, which no URL contains, so `open_url` can tell the three
+/// apart without a new message or a new field on a span.
+const topic_link_tag = "t\x00";
 const mention_link_len = mention_link_tag.len + 32;
 
 /// One rendered NIP-27 mention: where its `@name` landed, and who it names.
@@ -10071,6 +10112,11 @@ pub const Model = struct {
     /// profile are the same kind of thing to the back stack, so Back walks out
     /// of either without knowing which it is leaving.
     viewing_profile: ?[32]u8 = null,
+    /// The topic being read, lowercased and without its `#`. A fixed buffer
+    /// rather than a slice: a level sits on the back stack across rebuilds, and
+    /// the arena the span was built from is reset every frame.
+    topic_buf: [max_topic_bytes]u8 = undefined,
+    topic_len: u8 = 0,
     /// Which of the profile's tabs is showing.
     profile_tab: ProfileTab = .notes,
     // Whether the first reply fetch is still out with nothing in hand, so the
@@ -10655,6 +10701,42 @@ pub const Model = struct {
     /// The open profile's notes, newest first, read from the local store. The
     /// same shape as the thread's refresh: the store is the app, so the screen
     /// fills from disk before any relay answers and the backfill only widens it.
+    /// Whether ANY level is stacked over the feed. Was asked as
+    /// `viewing_profile != null or viewing_thread != 0` in four places, which is
+    /// a question that has to be updated in four places every time a third kind
+    /// of level exists.
+    pub fn levelOpen(self: *const Model) bool {
+        return self.viewing_profile != null or self.viewing_thread != 0 or self.topic_len > 0;
+    }
+
+    pub fn viewingTopic(self: *const Model) ?[]const u8 {
+        return if (self.topic_len == 0) null else self.topic_buf[0..self.topic_len];
+    }
+
+    /// Everything this reader already holds carrying that `t` tag, newest
+    /// first. The store indexes tags, so this is one disk read and it answers
+    /// before any relay is asked, which is the whole point of keeping a store.
+    fn refreshTopicNotes(self: *Model, now_s: i64) void {
+        const topic = self.viewingTopic() orelse return;
+        const store = g_store orelse return;
+        const kinds = [_]u16{1};
+        const values = [_][]const u8{topic};
+        const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
+        var result = store.query(std.heap.page_allocator, .{
+            .kinds = &kinds,
+            .tags = &tags,
+            .limit = thread_reply_cap,
+        }) catch return;
+        defer result.deinit();
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= self.thread_notes.len) break;
+            self.thread_notes[n] = noteFrom(ev, now_s);
+            n += 1;
+        }
+        self.thread_notes_len = n;
+    }
+
     fn refreshProfileNotes(self: *Model, now_s: i64) void {
         const pk = self.viewing_profile orelse return;
         const store = g_store orelse return;
@@ -11515,7 +11597,7 @@ fn wantProfilesAhead(model: *const Model) void {
     // The notifications page registers its own authors as rows are admitted,
     // which catches likers and zappers who are in no other set.
     if (model.notifications_open) return;
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.levelOpen()) {
         const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
         for (set.authors[0..set.author_count]) |pk| wantProfile(pk);
         return;
@@ -11572,7 +11654,7 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         if (last > first) {
             for (shown[first..last]) |item| push(&onscreen, &n, item.author);
         }
-    } else if (model.viewing_profile != null or model.viewing_thread != 0) {
+    } else if (model.levelOpen()) {
         // A level occludes the feed, so its authors own the ids while it is up,
         // and only the ones ON SCREEN in it. Walking every note in the level
         // instead meant the first nine authors of a long thread took every id
@@ -11751,7 +11833,7 @@ fn warmAhead(fx: *Effects, model: *const Model) void {
     // Only the feed. A thread or a profile is a bounded level whose rows are all
     // fetched by the pass that owns it, and widening those would spend bandwidth
     // on rows that do not exist.
-    if (model.viewing_profile != null or model.viewing_thread != 0) return;
+    if (model.levelOpen()) return;
 
     const warm = model.prefetchRange();
     const seen = model.visibleRange();
@@ -12936,7 +13018,7 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     // ahead of every face, so the allocator would read faces as permanently
     // older and evict them first, forever.
 
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.levelOpen()) {
         // A level occludes the feed, so the picture budget goes to the level,
         // and only to the rows ON SCREEN in it. Marking every note in the level
         // wanted meant the first six pictures held all six slots and nothing
@@ -18175,14 +18257,24 @@ pub const Screen = struct {
     note: Note = .{},
     /// Whose profile this level shows, when it is one.
     profile: ?[32]u8 = null,
+    /// The topic this level shows, when it is one. A VALUE rather than a slice:
+    /// a level sits on the stack across rebuilds, and anything it pointed at in
+    /// the frame arena would be gone by the time Back reached it.
+    topic_buf: [max_topic_bytes]u8 = undefined,
+    topic_len: u8 = 0,
 
     pub fn isProfile(self: Screen) bool {
         return self.profile != null;
     }
 
+    pub fn topic(self: *const Screen) ?[]const u8 {
+        return if (self.topic_len == 0) null else self.topic_buf[0..self.topic_len];
+    }
+
     /// What Back says it goes to: a person's name, or the author of the note
     /// underneath. Back names WHERE it lands, never what it leaves.
     pub fn backLabel(self: *const Screen) []const u8 {
+        if (self.topic()) |t| return t;
         if (self.profile) |pk| {
             if (lookupProfile(pk)) |prof| {
                 if (prof.name_len > 0) return prof.name();
@@ -21644,6 +21736,7 @@ fn profilePanel(
     ui: *AppUi,
     model: *const Model,
     pubkey: [32]u8,
+    topic: ?[]const u8,
     notes: []const Note,
     loading: bool,
     level_key: u64,
@@ -21661,10 +21754,18 @@ fn profilePanel(
     // An occluded level still reports its REAL row count: the retained list keeps
     // its scroll offset from the count and the extents, so claiming two rows here
     // would collapse the person's scroll and Back would land at the top.
-    const shown = model.profileNotesFor(indices, pubkey);
+    // A topic's rows were already chosen by the store query, so every note
+    // handed in belongs. A person's are filtered here because `thread_notes` is
+    // one buffer shared with the thread screen.
+    const shown = if (topic != null) blk: {
+        var n: usize = 0;
+        while (n < notes.len and n < indices.len) : (n += 1) indices[n] = n;
+        break :blk indices[0..n];
+    } else model.profileNotesFor(indices, pubkey);
     rows_ctx.* = .{
         .model = model,
         .pubkey = pubkey,
+        .topic = topic,
         .notes = notes,
         .shown = shown,
         .loading = loading,
@@ -21712,14 +21813,24 @@ fn profilePanel(
 }
 
 /// The rows a profile level holds: the person, then their notes.
+/// The rows of a stacked LIST level: a person's page, or a topic's.
+///
+/// One struct rather than two because the two differ in exactly one row, the
+/// header, and in which notes they show. A parallel panel would mean a second
+/// retained extent table, a second virtual list id scheme and a second copy of
+/// the occlusion rules, all to draw the same list of notes under a different
+/// first row.
 const ProfileRows = struct {
     model: *const Model,
     pubkey: [32]u8,
+    /// Set when this level is a topic rather than a person. Points into the
+    /// model's own buffer, which outlives the frame.
+    topic: ?[]const u8 = null,
     notes: []const Note,
     shown: []const usize,
     loading: bool,
 
-    const Row = union(enum) { person, note: usize, empty };
+    const Row = union(enum) { person, topic, note: usize, empty };
 
     fn count(self: *const ProfileRows) usize {
         // The person, then a row per note, or one quiet line when there are none.
@@ -21727,7 +21838,7 @@ const ProfileRows = struct {
     }
 
     fn rowAt(self: *const ProfileRows, index: usize) Row {
-        if (index == 0) return .person;
+        if (index == 0) return if (self.topic != null) .topic else .person;
         if (self.shown.len == 0) return .empty;
         const i = index - 1;
         if (i >= self.shown.len) return .empty;
@@ -21740,6 +21851,10 @@ const ProfileRows = struct {
 fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
     return switch (rows.rowAt(index)) {
         .person => profileCardExtent(rows),
+        // The topic header is a title and two wrapped lines. Estimated rather
+        // than measured, like every other row here: the retained table only
+        // needs to be close enough that the scrollbar does not jump.
+        .topic => 96,
         .note => |ni| noteRowEstimate(&rows.notes[ni], feed_row_chrome),
         .empty => quiet_row_extent,
     };
@@ -21748,9 +21863,27 @@ fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
 fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
     return switch (rows.rowAt(index)) {
         .person => profileCard(ui, rows.model, rows.pubkey),
+        .topic => topicCard(ui, rows.topic orelse ""),
         .note => |ni| noteCard(ui, &rows.notes[ni]),
         .empty => profileEmptyRow(ui, rows),
     };
+}
+
+/// The header of a topic level: the tag, and what this list actually is.
+///
+/// Said plainly because it is not the same promise a feed makes. This is what
+/// this reader's own relays have served and this machine has kept, not
+/// everything on Nostr carrying the tag, and a topic view that implied the
+/// latter would be claiming a search Plaza does not do.
+fn topicCard(ui: *AppUi, topic: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .padding = 16, .gap = 6, .cross = .stretch }, .{
+        ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("#{s}", .{topic})),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+            &.{.{ .text = "Notes carrying this tag, from your relays. Read from this machine first, so what is already here is on screen before anything is asked for." }},
+        ),
+    });
 }
 
 /// A stable, collision-free scroll identity for a thread level: the level index
@@ -21760,6 +21893,19 @@ fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
 /// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
 /// top root in place, the new level gets a fresh key and opens at the top rather
 /// than inheriting the dropped thread's offset).
+/// The same scheme `profileLevelKey` uses, over the topic's bytes: a level index
+/// in the high bits so two levels never collide, and a hash of the topic in the
+/// low bits so opening `#zig` twice at the same depth reuses its offset.
+fn topicLevelKey(level: usize, topic: []const u8) u64 {
+    const hi = @as(u64, level) << 59;
+    var hash: u64 = 1469598103934665603;
+    for (topic) |c| {
+        hash ^= c;
+        hash *%= 1099511628211;
+    }
+    return hi | (hash & ((@as(u64, 1) << 59) - 1));
+}
+
 fn threadLevelKey(level: usize, root_id: i64) u64 {
     const hi = @as(u64, level) << 59;
     const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
@@ -21786,7 +21932,7 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // every level keeps its own scroll offset and Back never lands a parent
     // thread at the top.
     const feed = feedContent(ui, model);
-    const content = if (levels and (model.viewing_thread != 0 or model.viewing_profile != null)) blk: {
+    const content = if (levels and model.levelOpen()) blk: {
         // feed + one panel per level: the back-stacked levels (oldest first),
         // then the current one on top. A level is a thread or a person; both
         // spend one virtual window either way, which is why they share a stack.
@@ -21794,18 +21940,28 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
         kids[0] = feed;
         for (0..model.thread_stack_len) |d| {
             const screen = &model.thread_stack[d];
+            if (screen.topic()) |t| {
+                const lk = topicLevelKey(d, t);
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, @splat(0), t, &.{}, false, lk, d, true));
+                continue;
+            }
             if (screen.profile) |pk| {
                 const lk = profileLevelKey(d, pk);
-                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, pk, &.{}, false, lk, d, true));
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, pk, null, &.{}, false, lk, d, true));
                 continue;
             }
             const root = &screen.note;
             const lk = threadLevelKey(d, root.id);
             kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
         }
+        if (model.viewingTopic()) |t| {
+            const lk = topicLevelKey(model.thread_stack_len, t);
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, @splat(0), t, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+            break :blk ui.stack(.{ .grow = 1 }, .{kids});
+        }
         if (model.viewing_profile) |pk| {
             const lk = profileLevelKey(model.thread_stack_len, pk);
-            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, pk, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, pk, null, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
             break :blk ui.stack(.{ .grow = 1 }, .{kids});
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
@@ -21877,7 +22033,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     //
     // The trade is visible and worth naming: those bands either side of a sheet
     // now show the app's background rather than a blurred, dimmed feed.
-    const occluded = model.viewing_thread != 0 or model.viewing_profile != null or
+    const occluded = model.levelOpen() or
         model.stage == .settings or model.composing or model.notifications_open or model.joining;
     if (occluded) options.item_count = 0;
     // A level drawn opaquely over the feed hides every one of these rows, and
@@ -25336,12 +25492,20 @@ pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef
         // `underline` unset stated the intent and got a hairline anyway. SDK
         // 0.9.2 made the flag mean what it says, so the intent and the pixels
         // finally agree. Mentions are marked by weight and colour, not a rule.
+        // A topic is neither a person nor a web link, and it used to be painted
+        // as though it were both: the same identity violet as a mention and a
+        // URL, carrying no payload, so the one run that looked most pressable
+        // was the only one that did nothing. It now reads as its own thing, in
+        // the muted-secondary token rather than the identity colour, and it
+        // carries where it goes.
         spans[n] = if (is_url)
             .{ .text = run, .color = .info, .link = run }
         else if (is_mention)
             .{ .text = run, .color = .info, .weight = .medium }
-        else
-            .{ .text = run, .color = .info };
+        else if (is_hashtag) blk: {
+            const link = topicLinkFor(run[1..]) orelse break :blk canvas.TextSpan{ .text = run, .color = .text_muted };
+            break :blk canvas.TextSpan{ .text = run, .color = .text_muted, .link = link };
+        } else .{ .text = run, .color = .info };
         n += 1;
         i = j;
         plain_start = j;
@@ -28104,7 +28268,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // the ordinary links. Its payload is not a URL and never reaches the
         // browser; see `mention_link_tag`.
         .open_url => |url| {
-            if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
+            // Checked before the mention form and before the browser: all three
+            // ride one message, and only the sentinel tells them apart.
+            if (topicLinkValue(url)) |topic| {
+                openTopic(model, topic);
+            } else if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
         },
         .expand_image => |note_id| {
             model.expanded_note = note_id;
@@ -31311,6 +31479,13 @@ pub fn closeThreadForTest(model: *Model) void {
 /// and a no-op at the depth cap, which is the same rule threads always had.
 fn pushCurrentScreen(model: *Model) void {
     if (model.thread_stack_len >= model.thread_stack.len) return;
+    if (model.viewingTopic()) |topic| {
+        var level = Screen{ .topic_len = @intCast(topic.len) };
+        @memcpy(level.topic_buf[0..topic.len], topic);
+        model.thread_stack[model.thread_stack_len] = level;
+        model.thread_stack_len += 1;
+        return;
+    }
     if (model.viewing_profile) |pk| {
         model.thread_stack[model.thread_stack_len] = .{ .profile = pk };
         model.thread_stack_len += 1;
@@ -31497,6 +31672,42 @@ fn fetchOlderWorker(until: i64) void {
 }
 
 /// Opens a person as a level of their own.
+/// Opens a topic as a level of its own: what this reader already holds carrying
+/// that `t` tag, on the back stack, with the feed left where it was.
+///
+/// Local store first and rendered immediately, then a bounded ask to the read
+/// relays behind it. A topic has no author, so the outbox model has nothing to
+/// say about where to ask: the reader's own read relays are the honest answer,
+/// rather than a search relay nobody chose.
+fn openTopic(model: *Model, topic: []const u8) void {
+    if (topic.len == 0 or topic.len > max_topic_bytes) return;
+    // Already here: pressing `#zig` inside the `#zig` topic would otherwise push
+    // a second copy of it and cost a Back to undo.
+    if (model.viewingTopic()) |current| {
+        if (std.mem.eql(u8, current, topic)) return;
+    }
+    model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+    pushCurrentScreen(model);
+    model.viewing_profile = null;
+    model.viewing_thread = 0;
+    model.thread_notes_len = 0;
+    model.reply_buffer.clear();
+    @memcpy(model.topic_buf[0..topic.len], topic);
+    model.topic_len = @intCast(topic.len);
+    const now = nowSeconds();
+    const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+    model.thread_seq = seq;
+    model.thread_open_at = now;
+    model.refreshTopicNotes(now);
+    model.thread_loading = model.thread_notes_len == 0;
+    fetchTopicNotes(topic, seq);
+}
+
+pub fn openTopicForTest(model: *Model, topic: []const u8) void {
+    openTopic(model, topic);
+}
+
 fn enterProfile(model: *Model, pubkey: [32]u8) void {
     // Already here. Pressing a face on somebody's own page would otherwise push
     // a second copy of the same person and cost a Back to undo.
@@ -31598,13 +31809,23 @@ fn closeThread(model: *Model) void {
         const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
         model.thread_seq = seq;
         model.thread_open_at = now;
-        if (prev.profile) |pk| {
+        if (prev.topic()) |topic| {
+            model.viewing_profile = null;
+            model.viewing_thread = 0;
+            @memcpy(model.topic_buf[0..topic.len], topic);
+            model.topic_len = @intCast(topic.len);
+            model.refreshTopicNotes(now);
+            model.thread_loading = model.thread_notes_len == 0;
+            fetchTopicNotes(topic, seq);
+        } else if (prev.profile) |pk| {
+            model.topic_len = 0;
             model.viewing_profile = pk;
             model.viewing_thread = 0;
             model.refreshProfileNotes(now);
             model.thread_loading = model.thread_notes_len == 0;
             fetchProfileNotes(pk, seq);
         } else {
+            model.topic_len = 0;
             model.viewing_profile = null;
             model.viewing_thread = prev.note.id;
             model.thread_root = prev.note;
@@ -31613,6 +31834,7 @@ fn closeThread(model: *Model) void {
             fetchThreadReplies(prev.note.event_id, seq);
         }
     } else {
+        model.topic_len = 0;
         model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
@@ -31640,6 +31862,72 @@ var g_thread_done_seq = std.atomic.Value(u64).init(0);
 /// read relay, their kind:1s, then on EOSE a second subscription for what those
 /// notes collected, folding into the same engagement table the feed and threads
 /// use. Without the second phase every row on a profile shows zero counts.
+/// Asks this reader's read relays for a topic, once. A topic has no author, so
+/// there is no outbox question to answer: the relays this reader already reads
+/// are the honest set, rather than a search relay nobody chose.
+fn fetchTopicNotes(topic: []const u8, seq: u64) void {
+    if (g_store == null or topic.len == 0 or topic.len > max_topic_bytes) {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    }
+    var owned: [max_topic_bytes]u8 = undefined;
+    @memcpy(owned[0..topic.len], topic);
+    const thread = std.Thread.spawn(.{}, fetchTopicWorker, .{ owned, @as(u8, @intCast(topic.len)), seq }) catch {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    defer g_thread_done_seq.store(seq, .release);
+
+    const topic = topic_buf[0..topic_len];
+    const kinds = [_]u16{1};
+    const values = [_][]const u8{topic};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
+    const filters = [_]nostr.filter.Filter{
+        .{ .kinds = &kinds, .tags = &tags, .limit = thread_reply_cap },
+    };
+
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have let
+        // go of this pointer before the connection is freed.
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.subscribe("plaza-topic", &filters) catch continue;
+        var seen: usize = 0;
+        // Bounded, for the reason the profile fetch is: `receive` has no
+        // deadline, and a relay that accepts a subscription and then goes quiet
+        // would hold this thread for the life of the process.
+        while (seen < profile_fetch_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    if (e.event.kind != 1) continue;
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                },
+                .eose => break,
+                else => {},
+            }
+        }
+        relay.unsubscribe("plaza-topic") catch {};
+    }
+}
+
 fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
     if (g_store == null) {
         g_thread_done_seq.store(seq, .release);
