@@ -12470,6 +12470,103 @@ test "pressing a hashtag opens what this machine already holds for it" {
     try testing.expect(!model.levelOpen());
 }
 
+fn bookmarkFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.keys.KeyPair {
+    const secret = [_]u8{0x84} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10003, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadBookmarksFromStoreForTest();
+    return kp;
+}
+
+test "a bookmark splices onto the list and never publishes over an unreadable half" {
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bm.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kept = [_]u8{0xa1} ** 32;
+    var kept_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&kept_hex, "{x}", .{kept});
+    // A tag this app does not draw sits beside it. NIP-51 puts addressable
+    // events, hashtags and URLs in this list too, and dropping what is not
+    // understood would delete an article somebody saved in another client.
+    const existing = [_]nostr.event.Tag{
+        &.{ "e", &kept_hex },
+        &.{ "a", "30023:deadbeef:an-article" },
+    };
+    _ = try bookmarkFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isBookmarked(kept));
+
+    const fresh = [_]u8{0xa2} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, fresh, true));
+    // Both, at once: the press fills the icon before any relay answers.
+    try testing.expect(main.isBookmarked(fresh));
+    try testing.expect(main.isBookmarked(kept));
+
+    // Removing one leaves the other. Off a fresh fixture, because a splice
+    // reads the STORE and the store does not hold the list above until its
+    // signature comes back: asking to remove something that is only in memory
+    // would be answered "nothing to do", correctly.
+    main.releaseHelperSignForTest();
+    main.forgetBookmarksForTest();
+    var tmp_rm = testing.tmpDir(.{});
+    defer tmp_rm.cleanup();
+    var pbuf_rm: [128]u8 = undefined;
+    const db_rm = try std.fmt.bufPrintZ(&pbuf_rm, ".zig-cache/tmp/{s}/bmrm.mdb", .{tmp_rm.sub_path});
+    var store_rm = try nostr.store.Store.open(db_rm, .{});
+    defer store_rm.deinit();
+    _ = try bookmarkFixture(arena, &signer, &store_rm, &existing, "");
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, kept, false));
+    try testing.expect(!main.isBookmarked(kept));
+
+    // Now the assertion this whole shape exists for. A list carrying a private
+    // half this app cannot open must not be written over: publishing without
+    // those bytes erases every private bookmark the reader has. This is the bug
+    // Jumble ships on both its mute path and its bookmark path.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateHalvesForTest();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var pbuf2: [128]u8 = undefined;
+    const db2 = try std.fmt.bufPrintZ(&pbuf2, ".zig-cache/tmp/{s}/bm2.mdb", .{tmp2.sub_path});
+    var store2 = try nostr.store.Store.open(db2, .{});
+    defer store2.deinit();
+    main.releaseHelperSignForTest();
+    _ = try bookmarkFixture(arena, &signer, &store2, &existing, "not-openable-ciphertext");
+    try testing.expectEqual(
+        main.BookmarkWrite.private_half_unreadable,
+        main.writeBookmarkForTest(&fx, fresh, true),
+    );
+    // And nothing moved: refusing means refusing, not refusing after changing
+    // the set the icon reads from.
+    try testing.expect(!main.isBookmarked(fresh));
+}
+
 test "a right-click in a place keeps every row it wrote" {
     // The overrun this pins: `noteContextItems` allocated seven items and, in
     // the feed inside a place declaring a handler for kind 1, wrote eight. One
