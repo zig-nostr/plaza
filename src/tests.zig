@@ -1726,8 +1726,9 @@ test "a refused remote sign restores the lost draft to the composer" {
     // The UI sweep restores the draft into the empty composer and raises the
     // notice, so the text is never silently lost on a hung or refused sign.
     var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
     try testing.expect(model.draft_empty());
-    main.scanPendingRemoteForTest(&model);
+    main.scanPendingRemoteForTest(&model, &fx_scan);
     try testing.expectEqualStrings("my precious note", model.draft());
     try testing.expect(main.remoteSignNoticeForTest());
 
@@ -12330,6 +12331,7 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
     // is exactly what it will not publish over. The guard was firing on a
     // question never asked of the right signer.
     var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
     main.setSignerKindForTest("remote");
     defer main.setSignerKindForTest("helper");
     main.forgetPrivateHalvesForTest();
@@ -12341,7 +12343,7 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
 
     // The bunker answers. The listener parks it; the tick applies it.
     main.parkRemoteHalfAnswerForTest(index, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
-    main.scanPendingRemoteForTest(&model);
+    main.scanPendingRemoteForTest(&model, &fx_scan);
     try testing.expectEqualStrings("open", main.privateHalfStateForTest(index));
 
     // And the half that matters more: a refusal or a timeout leaves it
@@ -12350,7 +12352,7 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
     main.forgetPrivateHalvesForTest();
     const second = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
     if (!main.failRemoteHalfForTest(second)) return error.NoPendingSlot;
-    main.scanPendingRemoteForTest(&model);
+    main.scanPendingRemoteForTest(&model, &fx_scan);
     try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
 }
 
@@ -12565,6 +12567,78 @@ test "a bookmark splices onto the list and never publishes over an unreadable ha
     // And nothing moved: refusing means refusing, not refusing after changing
     // the set the icon reads from.
     try testing.expect(!main.isBookmarked(fresh));
+}
+
+test "a private bookmark is sealed, written and read back" {
+    // The whole round trip: the press builds the new private tag array, the
+    // keyholder seals it, the splice publishes it as the content with the
+    // public half untouched, and reading the list back finds it.
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmpriv.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // A public bookmark already there, so the test also proves a private write
+    // does not disturb the public half.
+    const public_one = [_]u8{0xb1} ** 32;
+    var public_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&public_hex, "{x}", .{public_one});
+    const existing = [_]nostr.event.Tag{&.{ "e", &public_hex }};
+    const kp = try bookmarkFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isBookmarked(public_one));
+
+    const secret_one = [_]u8{0xb2} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+
+    // The press. The keyholder seals it inline in a test binary.
+    try testing.expectEqual(
+        main.BookmarkWrite.published,
+        main.writePrivateBookmarkForTest(&fx, secret_one, true),
+    );
+    // Nothing has been written yet: a seal is a round trip, and the set must not
+    // move until the ciphertext exists.
+    try testing.expect(!main.isBookmarked(secret_one));
+
+    // The ciphertext lands and the splice runs.
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expect(main.isBookmarked(secret_one));
+    // The public half is untouched by a private write.
+    try testing.expect(main.isBookmarked(public_one));
+
+    // And it survives a reload from a published record, which is the real
+    // proof: the content that was published decrypts to a list holding it.
+    const sealed = main.lastSealedForTest();
+    try testing.expect(sealed.len > 0);
+    main.forgetBookmarksForTest();
+    main.forgetPrivateHalvesForTest();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var pbuf2: [128]u8 = undefined;
+    const db2 = try std.fmt.bufPrintZ(&pbuf2, ".zig-cache/tmp/{s}/bmpriv2.mdb", .{tmp2.sub_path});
+    var store2 = try nostr.store.Store.open(db2, .{});
+    defer store2.deinit();
+    main.setStoreForTest(&store2);
+    const republished = try nostr.event.create(arena, signer, kp, 1_800_000_100, 10003, &existing, sealed, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, republished, signer);
+    main.loadBookmarksFromStoreForTest();
+    try testing.expect(main.isBookmarked(secret_one));
+    try testing.expect(main.isBookmarked(public_one));
 }
 
 test "a right-click in a place keeps every row it wrote" {

@@ -6128,7 +6128,7 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 // access, across threads that deliberately never share one).
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
-const RemoteMethod = enum { connect, sign_event, nip44_decrypt };
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip44_encrypt };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
@@ -6174,6 +6174,15 @@ const HalfInbox = struct {
     plain_len: u16 = 0,
 };
 var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;
+
+/// The same crossing for a seal, of which only one is ever in flight.
+const SealInbox = struct {
+    used: bool = false,
+    ok: bool = false,
+    buf: [4096]u8 = undefined,
+    len: u16 = 0,
+};
+var g_seal_inbox: SealInbox = .{};
 
 var g_pending_lock = std.atomic.Value(bool).init(false);
 var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
@@ -6263,8 +6272,8 @@ pub fn clearPendingForTest() void {
 pub fn bumpRemoteGenerationForTest() void {
     _ = g_remote_generation.fetchAdd(1, .monotonic);
 }
-pub fn scanPendingRemoteForTest(model: *Model) void {
-    scanPendingRemote(model);
+pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
+    scanPendingRemote(model, fx);
 }
 pub fn remoteSignNoticeForTest() bool {
     return g_remote_sign_notice.load(.acquire);
@@ -14683,6 +14692,9 @@ pub const Msg = union(enum) {
     delete_note_cancel,
     /// Add or remove a bookmark, and open the list of them.
     toggle_bookmark: i64,
+    /// Save it where only this reader can read it. NIP-51's private half, sealed
+    /// to their own key by whoever holds it.
+    bookmark_privately: i64,
     open_bookmarks,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
@@ -14804,6 +14816,8 @@ pub const Msg = union(enum) {
     /// One line of the daemon's stdout. Only one matters: the port it bound.
     /// Notary opened a NIP-51 list's private half.
     private_half: native_sdk.EffectResponse,
+    /// Notary's answer to a seal: the ciphertext for a private bookmark write.
+    private_seal: native_sdk.EffectResponse,
     helper_line: native_sdk.EffectLine,
     helper_exited: native_sdk.EffectExit,
     notary_exited: native_sdk.EffectExit,
@@ -18949,6 +18963,203 @@ fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     return .published;
 }
 
+/// Starts a PRIVATE bookmark write: seals the new private half, and parks.
+///
+/// Every gate the public path applies is applied here first, before anything is
+/// sent to a signer, because a refusal after the ciphertext exists would leave
+/// the reader wondering what happened to it.
+fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    if (!signerReady()) return .signer_busy;
+    if (g_private_seal.active) return .signer_busy;
+    const me = activePubkey() orelse return .failed;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    if (previous == null and !g_identity_minted_here) return .no_list_yet;
+    if (base_content.len > 0 and !privateHalfIsReadable(gpa, base_content)) return .private_half_unreadable;
+
+    const plaintext = privateBookmarkPlaintext(gpa, base_content, event_id, adding) orelse {
+        // Either nothing to do (already private, or not private), or the half
+        // would not open. The readable check above has already ruled the second
+        // out, so this is the first.
+        return .nothing_to_do;
+    };
+    defer gpa.free(plaintext);
+
+    g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding };
+
+    if (g_signer_kind == .remote) {
+        g_private_seal.awaiting_remote = true;
+        if (!requestRemoteEncrypt(gpa, plaintext)) {
+            g_private_seal = .{};
+            return .failed;
+        }
+        return .published;
+    }
+
+    var peer_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch {
+        g_private_seal = .{};
+        return .failed;
+    };
+    // To yourself: NIP-51's private half is encrypted to your own key, so both
+    // sides of the conversation key are this account's.
+    const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{plaintext} }).toJson(gpa) catch {
+        g_private_seal = .{};
+        return .failed;
+    };
+    defer gpa.free(body);
+    if (builtin.is_test) {
+        sealPrivateBookmarkForTest(gpa, plaintext);
+        return .published;
+    }
+    helperFetch(fx, private_seal_key, "/nip44/encrypt", body, Effects.responseMsg(.private_seal));
+    return .published;
+}
+
+/// Notary's answer to a seal. The ciphertext, or a refusal that leaves the list
+/// exactly as it was.
+fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key != private_seal_key) return;
+    if (!g_private_seal.active) return;
+    if (response.outcome != .ok or response.status != 200) {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.items.len == 0) {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    }
+    finishPrivateBookmark(model, fx, parsed.value.items[0]);
+}
+
+/// The splice, once the ciphertext exists.
+///
+/// The record is read AGAIN here rather than carried from the press. A seal goes
+/// through a keyholder and, on a bunker, through a person pressing approve, so
+/// the list can have moved in between, and a splice built against a record that
+/// is no longer current is what the read-before-write rule exists to stop.
+fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) void {
+    const seal = g_private_seal;
+    g_private_seal = .{};
+    if (!seal.active) return;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+    if (previous == null and !g_identity_minted_here) {
+        setToast(model, "Still fetching your bookmarks. Try again in a moment.");
+        return;
+    }
+
+    // The PUBLIC half is carried forward whole and untouched. A private write
+    // changes the content and nothing else.
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    for (base_tags) |tag| {
+        const copy = gpa.alloc([]const u8, tag.len) catch return;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return;
+        tags.append(gpa, copy) catch return;
+    }
+    const owned_tags = tags.toOwnedSlice(gpa) catch return;
+    handed_off = true;
+    const content = gpa.dupe(u8, ciphertext) catch return;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(bookmark_list_kind) + 1), base_created_at + 1);
+
+    // The set moves now, so the row reads right immediately. The new ciphertext
+    // has not been decrypted by anything yet, so the private side is taken from
+    // the press rather than re-read: it is the one thing here that is known.
+    var next: [max_bookmarks][32]u8 = undefined;
+    var n = bookmarksFromTags(owned_tags, &next);
+    if (seal.adding and n < next.len) {
+        next[n] = seal.event_id;
+        n += 1;
+    }
+    // Everything else already private, from the half that was readable before.
+    if (previous) |prev| {
+        var had: [max_bookmarks][32]u8 = undefined;
+        const m = privateBookmarks(gpa, prev.json, &had);
+        for (had[0..m]) |id| {
+            if (n >= next.len) break;
+            if (seal.adding and std.mem.eql(u8, &id, &seal.event_id)) continue;
+            if (!seal.adding and std.mem.eql(u8, &id, &seal.event_id)) continue;
+            var seen = false;
+            for (next[0..n]) |have| {
+                if (std.mem.eql(u8, &have, &id)) seen = true;
+            }
+            if (seen) continue;
+            next[n] = id;
+            n += 1;
+        }
+    }
+    setBookmarks(next[0..n], created);
+
+    signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
+    setToast(model, if (seal.adding) "Bookmarked privately" else "Bookmark removed");
+}
+
+/// The keyholder a test has, for the seal path.
+fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8) void {
+    const secret = g_test_secret orelse {
+        g_private_seal = .{};
+        return;
+    };
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        g_private_seal = .{};
+        return;
+    };
+    // A test binary has no runtime io, so it makes its own. The seal has to be
+    // real: the point of this path is that what gets published decrypts back.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = g_io orelse threaded.io();
+    const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
+        g_private_seal = .{};
+        return;
+    };
+    defer gpa.free(sealed);
+    g_test_sealed_len = @intCast(@min(sealed.len, g_test_sealed.len));
+    @memcpy(g_test_sealed[0..g_test_sealed_len], sealed[0..g_test_sealed_len]);
+}
+var g_test_sealed: [4096]u8 = undefined;
+var g_test_sealed_len: u16 = 0;
+
+pub fn lastSealedForTest() []const u8 {
+    return g_test_sealed[0..g_test_sealed_len];
+}
+
+pub fn finishPrivateBookmarkForTest(model: *Model, fx: *Effects) void {
+    finishPrivateBookmark(model, fx, g_test_sealed[0..g_test_sealed_len]);
+}
+
+pub fn writePrivateBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    return writePrivateBookmark(fx, event_id, adding);
+}
+
 pub fn writeBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     return writeBookmark(fx, event_id, adding);
 }
@@ -18959,6 +19170,63 @@ pub fn loadBookmarksFromStoreForTest() void {
 
 pub fn forgetBookmarksForTest() void {
     forgetBookmarks();
+}
+
+/// The private tag array a bookmark write should seal, as JSON.
+///
+/// Built from the CURRENT private half plus or minus the one entry the press is
+/// about. Returns null when the half is present and could not be opened, which
+/// is the same refusal the public path makes and for the same reason: an array
+/// built without bytes this app could not read is an array missing everything
+/// that was in them.
+fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, event_id: [32]u8, adding: bool) ?[]u8 {
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, event_id);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    out.append(gpa, '[') catch return null;
+    var wrote: usize = 0;
+    var found = false;
+
+    if (base_content.len > 0) {
+        const plain = privateHalfOpened(base_content) orelse return null;
+        const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return null;
+        defer parsed.deinit();
+        for (parsed.value) |tag| {
+            if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e") and hexEqlIgnoreCase(tag[1], &hex)) {
+                found = true;
+                if (!adding) continue;
+            }
+            if (wrote > 0) out.append(gpa, ',') catch return null;
+            out.append(gpa, '[') catch return null;
+            for (tag, 0..) |field, fi| {
+                if (fi > 0) out.append(gpa, ',') catch return null;
+                out.append(gpa, '"') catch return null;
+                // Escaped by hand, and only the two characters that can appear
+                // here: a tag field off a decrypted list is a hex id, a relay
+                // url or a label, and anything else is carried as-is rather
+                // than dropped.
+                for (field) |c| {
+                    if (c == '"' or c == '\\') out.append(gpa, '\\') catch return null;
+                    out.append(gpa, c) catch return null;
+                }
+                out.append(gpa, '"') catch return null;
+            }
+            out.append(gpa, ']') catch return null;
+            wrote += 1;
+        }
+    }
+    if (adding and found) return null; // Already private. Nothing to seal.
+    if (!adding and !found) return null; // Not private. Nothing to seal.
+    if (adding) {
+        if (wrote > 0) out.append(gpa, ',') catch return null;
+        out.appendSlice(gpa, "[\"e\",\"") catch return null;
+        out.appendSlice(gpa, &hex) catch return null;
+        out.appendSlice(gpa, "\"]") catch return null;
+    }
+    out.append(gpa, ']') catch return null;
+    return out.toOwnedSlice(gpa) catch null;
 }
 
 /// Mutes or unmutes `pubkey`, by splicing this reader's own kind:10000.
@@ -19121,6 +19389,32 @@ var g_private_ciphertext: [4]PrivateCiphertext = [_]PrivateCiphertext{.{}} ** 4;
 
 /// Effect keys for the decrypts, one per slot.
 const private_half_key_base: u64 = 48;
+/// And one for the encrypt, of which there is only ever one in flight: it is
+/// driven by a press, and `signerReady` already refuses a second press while a
+/// signature is out.
+const private_seal_key: u64 = 64;
+
+/// A private bookmark write, waiting for its ciphertext.
+///
+/// Writing into an encrypted half cannot be done in one pass. The plaintext has
+/// to be sealed by whoever holds the key, which is Notary over HTTP or a bunker
+/// over a relay, and neither answers in the same call. So the press builds the
+/// new private tag array, asks for it to be sealed, and parks here; the answer
+/// completes the splice.
+///
+/// The splice re-reads the record when the ciphertext lands rather than holding
+/// the one it read at press time. A round trip to a bunker goes through a human
+/// pressing approve, so the list can genuinely have moved in between, and
+/// writing a splice built against a record that is no longer current is exactly
+/// the class of bug the read-before-write rule exists to stop.
+const PrivateSeal = struct {
+    active: bool = false,
+    event_id: [32]u8 = [_]u8{0} ** 32,
+    adding: bool = false,
+    /// Set while a bunker is sealing it, so a refusal can be told from silence.
+    awaiting_remote: bool = false,
+};
+var g_private_seal: PrivateSeal = .{};
 
 fn privateHalfId(content: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -23780,6 +24074,7 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
     }
     push(items, &n, .{ .separator = true });
     push(items, &n, bookmarkContextItem(note));
+    push(items, &n, privateBookmarkContextItem(note));
     if (isMine(note.pubkey)) {
         push(items, &n, .{ .label = "Delete", .msg = Msg{ .delete_note_request = note.id } });
     }
@@ -23802,6 +24097,24 @@ fn bookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
         return .{ .label = "Remove bookmark", .msg = Msg{ .toggle_bookmark = note.id } };
     }
     return .{ .label = "Bookmark", .msg = Msg{ .toggle_bookmark = note.id } };
+}
+
+/// The private-bookmark row.
+///
+/// Only offered for ADDING. Removing one is the same press as removing a public
+/// one: `toggle_bookmark` looks at where the entry actually is, so a reader is
+/// never asked to remember which half they put it in.
+///
+/// Absent once the note is already bookmarked either way, because "bookmark
+/// privately" on something already saved is a question about moving it between
+/// halves, and that is a different feature.
+fn privateBookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
+    if (activePubkey() == null) return .{ .label = "Bookmark privately", .enabled = false };
+    if (!bookmarksAreOwned() and !g_identity_minted_here) {
+        return .{ .label = "Bookmark privately", .enabled = false };
+    }
+    if (isBookmarked(note.event_id)) return .{ .label = "Bookmark privately", .enabled = false };
+    return .{ .label = "Bookmark privately", .msg = Msg{ .bookmark_privately = note.id } };
 }
 
 /// Whether this account wrote it. Absent rather than disabled is the right
@@ -27972,7 +28285,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (postIsDue(g_reply_due_s, nowSeconds())) fireReply(model, fx, g_held_route);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
-                if (g_signer_kind == .remote) scanPendingRemote(model);
+                if (g_signer_kind == .remote) scanPendingRemote(model, fx);
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (g_signer_kind == .helper) scanHelperSign(model);
@@ -28004,6 +28317,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .private_half => |response| handlePrivateHalf(response),
+        .private_seal => |response| handlePrivateSeal(model, fx, response),
 
         .helper_line => |line| {
             // The daemon says where it landed, and until it does there is
@@ -28325,6 +28639,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const note = model.noteById(note_id) orelse return;
             const adding = !isBookmarked(note.event_id);
             sayBookmarkWrite(model, writeBookmark(fx, note.event_id, adding), adding);
+        },
+        .bookmark_privately => |note_id| {
+            const note = model.noteById(note_id) orelse return;
+            // A seal is a round trip, so nothing is said until it lands: the
+            // toast comes from `finishPrivateBookmark`, or from the refusal.
+            switch (writePrivateBookmark(fx, note.event_id, true)) {
+                .published => {},
+                else => |outcome| sayBookmarkWrite(model, outcome, true),
+            }
         },
         .open_bookmarks => openBookmarks(model),
         .delete_note_request => |id| model.deleting_note = id,
@@ -32975,6 +33298,19 @@ fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: [
     return true;
 }
 
+/// Remote path for a seal: ask the bunker to encrypt a private half to this
+/// reader's own key. The answer completes the bookmark write.
+fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
+    var hexbuf: [64]u8 = undefined;
+    hexLower(&hexbuf, g_remote_pubkey);
+    var idbuf: [24]u8 = undefined;
+    const req_id = newRequestId(&idbuf) orelse return false;
+    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0)) return false;
+    const params = [_][]const u8{ &hexbuf, plaintext };
+    sendRequest(gpa, .{ .id = req_id, .method = "nip44_encrypt", .params = &params });
+    return true;
+}
+
 /// Serializes `request` and spawns a one-shot thread to seal and publish it.
 fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
     const req_json = request.toJson(gpa) catch return;
@@ -33124,6 +33460,15 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
         // The plaintext of a private half. Parked for the UI tick rather than
         // written straight into `g_private_halves`, which the view reads every
         // frame and `scanPrivateHalves` writes on the other thread.
+        .nip44_encrypt => {
+            pendingLock();
+            defer pendingUnlock();
+            const n = @min(resp.value.result.len, g_seal_inbox.buf.len);
+            @memcpy(g_seal_inbox.buf[0..n], resp.value.result[0..n]);
+            g_seal_inbox.len = @intCast(n);
+            g_seal_inbox.used = true;
+            g_seal_inbox.ok = n > 0;
+        },
         .nip44_decrypt => {
             pendingLock();
             defer pendingUnlock();
@@ -33171,7 +33516,7 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
 /// an empty composer, so a newer draft is never clobbered) and shows a notice;
 /// a `connect` that never returned fails the connection status. A slot from a
 /// superseded generation (logout/reconnect) is dropped silently.
-fn scanPendingRemote(model: *Model) void {
+fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     const now = nowSeconds();
     const gpa = std.heap.page_allocator;
     const generation = g_remote_generation.load(.acquire);
@@ -33179,6 +33524,7 @@ fn scanPendingRemote(model: *Model) void {
     var sign_failed = false;
     var any_sign_failed = false;
     var connect_failed = false;
+    var seal_failed = false;
 
     pendingLock();
     for (&g_pending) |*slot| {
@@ -33220,6 +33566,13 @@ fn scanPendingRemote(model: *Model) void {
                 if (content) |c| gpa.free(c);
                 if (slot_half < g_private_halves.len) g_private_halves[slot_half].state = .refused;
             },
+            // A seal the bunker refused or never answered. The list is left
+            // exactly as it was, which is the only safe outcome: the reader
+            // still has every private bookmark they had.
+            .nip44_encrypt => {
+                if (content) |c| gpa.free(c);
+                seal_failed = true;
+            },
         }
     }
     // Answers that came back while the listener held them. Applied here so
@@ -33242,7 +33595,23 @@ fn scanPendingRemote(model: *Model) void {
         }
         box.* = .{};
     }
+    // The bunker's ciphertext, if one arrived. Applied here so the splice and
+    // the publish happen on this thread, like every other write.
+    var sealed: ?[]const u8 = null;
+    var sealed_buf: [4096]u8 = undefined;
+    if (g_seal_inbox.used) {
+        if (g_seal_inbox.ok and g_seal_inbox.len > 0) {
+            @memcpy(sealed_buf[0..g_seal_inbox.len], g_seal_inbox.buf[0..g_seal_inbox.len]);
+            sealed = sealed_buf[0..g_seal_inbox.len];
+        } else seal_failed = true;
+        g_seal_inbox = .{};
+    }
     pendingUnlock();
+    if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
+    if (seal_failed) {
+        g_private_seal = .{};
+        setToast(model, "Your signer did not seal that, so nothing was published.");
+    }
     if (opened) {
         // The set was read with this half closed, so it is short by whatever
         // was in it. Read it again now that it can be.
