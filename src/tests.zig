@@ -12308,6 +12308,39 @@ fn oneNoteFeed(model: *Model) void {
     model.notes_len = 1;
 }
 
+test "a bunker can open a private half, and a refusal is not an empty one" {
+    // Before this, `scanPrivateHalves` only knew one way to ask: an HTTP call
+    // to the local keyholder. A reader signed in through an external signer has
+    // no local keyholder holding their key, so the ask came back not-ok and the
+    // half was marked refused forever. `writeMute` then refused every mute
+    // write, correctly, because a private half that is present and unreadable
+    // is exactly what it will not publish over. The guard was firing on a
+    // question never asked of the right signer.
+    var model = main.initialModel();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(index));
+
+    // The bunker answers. The listener parks it; the tick applies it.
+    main.parkRemoteHalfAnswerForTest(index, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
+    main.scanPendingRemoteForTest(&model);
+    try testing.expectEqualStrings("open", main.privateHalfStateForTest(index));
+
+    // And the half that matters more: a refusal or a timeout leaves it
+    // REFUSED, never open-and-empty. An empty answer here is how a client
+    // publishes a list with every private entry stripped out of it.
+    main.forgetPrivateHalvesForTest();
+    const second = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    if (!main.failRemoteHalfForTest(second)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
+}
+
 test "a right-click in a place keeps every row it wrote" {
     // The overrun this pins: `noteContextItems` allocated seven items and, in
     // the feed inside a place declaring a handler for kind 1, wrote eight. One

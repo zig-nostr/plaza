@@ -6126,12 +6126,16 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 // access, across threads that deliberately never share one).
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
-const RemoteMethod = enum { connect, sign_event };
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
     id_len: usize = 0,
     method: RemoteMethod = .connect,
+    /// `nip44_decrypt` only: which `g_private_halves` slot this answers. The
+    /// response arrives with nothing but a request id on it, so the slot has to
+    /// be remembered here or the plaintext has no home.
+    half_index: u8 = 0,
     deadline_s: i64 = 0,
     generation: u64 = 0,
     // The listener flags a failed response here; the UI tick, which owns the
@@ -6152,6 +6156,23 @@ const PendingRemote = struct {
         return self.id_buf[0..self.id_len];
     }
 };
+/// A decrypt answer on its way from the listener thread to the UI tick.
+///
+/// The bunker's replies land on the listener thread, and `g_private_halves` is
+/// read by the view every frame and written by `scanPrivateHalves` on the UI
+/// thread. Rather than add a second writer to that state from another thread,
+/// the listener parks the plaintext here under the pending lock it already
+/// takes, and `scanPendingRemote` applies it where every other private-half
+/// write happens.
+const HalfInbox = struct {
+    used: bool = false,
+    index: u8 = 0,
+    ok: bool = false,
+    plain_buf: [4096]u8 = undefined,
+    plain_len: u16 = 0,
+};
+var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;
+
 var g_pending_lock = std.atomic.Value(bool).init(false);
 var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
 
@@ -6166,7 +6187,7 @@ fn pendingUnlock() void {
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute) bool {
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -6175,6 +6196,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
         slot.* = .{
             .active = true,
             .method = method,
+            .half_index = half_index,
             .id_len = req_id.len,
             .deadline_s = nowSeconds() + remote_sign_timeout_s,
             .generation = g_remote_generation.load(.acquire),
@@ -6224,7 +6246,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null, .none);
+    return registerPending(req_id, method, content, content != null, .none, 0);
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -18706,6 +18728,59 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Claims a private-half slot the way a reader hitting an encrypted list does,
+/// and returns its index, WITHOUT the test keyholder answering it. That is what
+/// a bunker reader's state actually looks like: the half is claimed and waiting
+/// on a signer that answers over the relay rather than over HTTP.
+pub fn claimPrivateHalfPendingForTest(content: []const u8) ?u8 {
+    const id = privateHalfId(content);
+    for (&g_private_halves, 0..) |*h, i| {
+        if (h.used) continue;
+        if (content.len > g_private_ciphertext[i].buf.len) return null;
+        h.* = .{ .used = true, .state = .asking, .id = id };
+        @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
+        g_private_ciphertext[i].len = @intCast(content.len);
+        return @intCast(i);
+    }
+    return null;
+}
+
+/// What the listener thread does when the bunker answers a `nip44_decrypt`.
+pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_half_inbox) |*box| {
+        if (box.used) continue;
+        const n = @min(plain.len, box.plain_buf.len);
+        box.* = .{ .used = true, .index = index, .ok = true, .plain_len = @intCast(n) };
+        @memcpy(box.plain_buf[0..n], plain[0..n]);
+        return;
+    }
+}
+
+/// A `nip44_decrypt` the bunker refused or never answered.
+pub fn failRemoteHalfForTest(index: u8) bool {
+    var idbuf: [24]u8 = undefined;
+    const req_id = std.fmt.bufPrint(&idbuf, "half{d}", .{index}) catch return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index)) return false;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) slot.failed = true;
+    }
+    return true;
+}
+
+pub fn privateHalfStateForTest(index: u8) []const u8 {
+    if (index >= g_private_halves.len) return "none";
+    return switch (g_private_halves[index].state) {
+        .idle => "idle",
+        .asking => "asking",
+        .open => "open",
+        .refused => "refused",
+    };
+}
+
 pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
     const id = privateHalfId(content);
     for (&g_private_halves) |*h| {
@@ -18733,6 +18808,14 @@ fn scanPrivateHalves(fx: *Effects) void {
             continue;
         }
         const gpa = std.heap.page_allocator;
+        // A bunker answers over NIP-46, not over the keyholder's HTTP door.
+        // This used to fall through to `helperFetch` regardless, so a reader on
+        // an external signer asked a daemon that does not hold their key.
+        if (g_signer_kind == .remote) {
+            h.state = .asking;
+            if (!requestRemoteDecrypt(gpa, i, content)) h.state = .refused;
+            return;
+        }
         var peer_hex: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch return;
         // To yourself: both sides of the conversation key are this account's,
@@ -31934,7 +32017,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false, .none)) return;
+    if (!registerPending(req_id, .connect, null, false, .none, 0)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -31974,12 +32057,36 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable, route)) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0)) {
         gpa.free(content_owned);
         return;
     }
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
+}
+
+/// Remote path for a private half: ask the bunker to open it.
+///
+/// Without this a reader signed in through an external signer could never read
+/// their own encrypted list. `scanPrivateHalves` only knew how to ask the LOCAL
+/// keyholder over HTTP, so on a bunker the ask went to a daemon that either is
+/// not running or does not hold the key, came back not-ok, and the half was
+/// marked refused forever. `writeMute` then refused every mute write, because
+/// a private half that is present and unreadable is exactly the case it will
+/// not publish over. So the safety guard was firing correctly on a question
+/// that was never actually asked of the right signer.
+///
+/// The peer is the reader's own pubkey: NIP-51 encrypts a private half to
+/// yourself, so both sides of the conversation key are this account's.
+fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: []const u8) bool {
+    var hexbuf: [64]u8 = undefined;
+    hexLower(&hexbuf, g_remote_pubkey);
+    var idbuf: [24]u8 = undefined;
+    const req_id = newRequestId(&idbuf) orelse return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, @intCast(half_index))) return false;
+    const params = [_][]const u8{ &hexbuf, ciphertext };
+    sendRequest(gpa, .{ .id = req_id, .method = "nip44_decrypt", .params = &params });
+    return true;
 }
 
 /// Serializes `request` and spawns a one-shot thread to seal and publish it.
@@ -32128,6 +32235,20 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
     switch (pending.method) {
         // The connect ack is a plain "ack" string; the status above is the point.
         .connect => {},
+        // The plaintext of a private half. Parked for the UI tick rather than
+        // written straight into `g_private_halves`, which the view reads every
+        // frame and `scanPrivateHalves` writes on the other thread.
+        .nip44_decrypt => {
+            pendingLock();
+            defer pendingUnlock();
+            for (&g_half_inbox) |*box| {
+                if (box.used) continue;
+                const n = @min(resp.value.result.len, box.plain_buf.len);
+                box.* = .{ .used = true, .index = pending.half_index, .ok = true, .plain_len = @intCast(n) };
+                @memcpy(box.plain_buf[0..n], resp.value.result[0..n]);
+                break;
+            }
+        },
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
@@ -32181,6 +32302,7 @@ fn scanPendingRemote(model: *Model) void {
         if (!stale and !due) continue;
         const method = slot.method;
         const content = slot.content;
+        const slot_half = slot.half_index;
         const slot_restorable = slot.restorable;
         slot.* = .{};
         if (stale) {
@@ -32204,9 +32326,43 @@ fn scanPendingRemote(model: *Model) void {
                 if (content) |c| gpa.free(c);
                 connect_failed = true;
             },
+            // Refused or never answered. NOT "the half is empty": that
+            // distinction is the whole reason this cache exists, and collapsing
+            // the two is what publishes an empty content over somebody's
+            // private list.
+            .nip44_decrypt => {
+                if (content) |c| gpa.free(c);
+                if (slot_half < g_private_halves.len) g_private_halves[slot_half].state = .refused;
+            },
         }
     }
+    // Answers that came back while the listener held them. Applied here so
+    // every write to `g_private_halves` happens on this thread.
+    var opened = false;
+    for (&g_half_inbox) |*box| {
+        if (!box.used) continue;
+        const i = box.index;
+        if (i < g_private_halves.len and g_private_halves[i].used) {
+            const h = &g_private_halves[i];
+            if (box.ok and box.plain_len > 0) {
+                const n = @min(box.plain_len, h.plain_buf.len);
+                @memcpy(h.plain_buf[0..n], box.plain_buf[0..n]);
+                h.plain_len = @intCast(n);
+                h.state = .open;
+                opened = true;
+            } else {
+                h.state = .refused;
+            }
+        }
+        box.* = .{};
+    }
     pendingUnlock();
+    if (opened) {
+        // The set was read with this half closed, so it is short by whatever
+        // was in it. Read it again now that it can be.
+        loadMutesFromStore();
+        invalidateFeed();
+    }
 
     if (restore) |c| {
         if (model.draft_empty()) model.draft_buffer.set(c);
