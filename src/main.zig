@@ -23076,36 +23076,50 @@ const default_share_base = "https://njump.me/";
 /// step and a reader finding different things depending on which way they
 /// reached. The runtime presents these as the platform's own menu where there is
 /// one, and as an anchored surface where there is not.
+/// Every row this menu can carry, so the count is stated once instead of being
+/// the sum of the branches below.
+///
+/// It was 7, and eight rows could be written. In the feed (`in_thread` false)
+/// inside a place declaring a handler for kind 1, the tally runs: open thread,
+/// copy address, quote, copy text, open on the web, open in the handler,
+/// separator, follow. The eighth landed at index 7 of a seven-element
+/// allocation and the function then returned `items[0..8]` from it.
+///
+/// One row was bounds-checked, the handler row, and the two written after it
+/// were not, so the guard sat directly above the overrun it did not prevent.
+/// That is the actual lesson and it is why `push` below exists: a rule applied
+/// at one call site is not a rule. Debug catches this as a panic; ReleaseFast,
+/// which is what ships, has no bounds check and writes past the allocation.
+const note_context_capacity = 10;
+
 fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppUi.ContextMenuItem {
-    const items = ui.arena.alloc(AppUi.ContextMenuItem, 7) catch return &.{};
+    const items = ui.arena.alloc(AppUi.ContextMenuItem, note_context_capacity) catch return &.{};
     var n: usize = 0;
-    if (!in_thread) {
-        items[n] = .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } };
-        n += 1;
-    }
-    items[n] = .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } };
-    n += 1;
-    items[n] = .{ .label = "Quote", .msg = Msg{ .quote_note = note.id } };
-    n += 1;
-    items[n] = .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } };
-    n += 1;
-    items[n] = .{ .label = ui.fmt("Open on {s}", .{shareHost(shareBase())}), .msg = Msg{ .open_web = note.id } };
-    n += 1;
+    // The only way a row is written. Adding one is adding a `push`, and a row
+    // too many is a row dropped rather than memory scribbled on.
+    const push = struct {
+        fn f(dst: []AppUi.ContextMenuItem, at: *usize, item: AppUi.ContextMenuItem) void {
+            if (at.* >= dst.len) return;
+            dst[at.*] = item;
+            at.* += 1;
+        }
+    }.f;
+
+    if (!in_thread) push(items, &n, .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } });
+    push(items, &n, .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } });
+    push(items, &n, .{ .label = "Quote", .msg = Msg{ .quote_note = note.id } });
+    push(items, &n, .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } });
+    push(items, &n, .{ .label = ui.fmt("Open on {s}", .{shareHost(shareBase())}), .msg = Msg{ .open_web = note.id } });
     // And where THIS community reads its notes, when it says. Beside the app's
     // own row rather than instead of it: a place naming a handler is telling
     // the reader where it lives, not taking njump away from them.
     if (activePlace()) |place| {
         if (place.handlerFor(1)) |h| {
-            if (n < items.len) {
-                items[n] = .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } };
-                n += 1;
-            }
+            push(items, &n, .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } });
         }
     }
-    items[n] = .{ .separator = true };
-    n += 1;
-    items[n] = followContextItem(note.pubkey);
-    n += 1;
+    push(items, &n, .{ .separator = true });
+    push(items, &n, followContextItem(note.pubkey));
     return items[0..n];
 }
 

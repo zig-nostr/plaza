@@ -12308,6 +12308,57 @@ fn oneNoteFeed(model: *Model) void {
     model.notes_len = 1;
 }
 
+test "a right-click in a place keeps every row it wrote" {
+    // The overrun this pins: `noteContextItems` allocated seven items and, in
+    // the feed inside a place declaring a handler for kind 1, wrote eight. One
+    // row was bounds-checked and the two after it were not, so the guard sat
+    // directly above the write that went past the end.
+    //
+    // In Debug this test PANICS before the fix, which is the assertion: an
+    // out-of-bounds index is not an error a test can catch. In ReleaseFast, the
+    // mode Plaza ships, there is no bounds check at all and the eighth row is
+    // written into memory the arena did not hand out. So the case has to be
+    // built rather than reasoned about, and it has to run in both modes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    if (!main.visitParsedPlaceForTest(arena,
+        \\{"appName":"Alpha","hardcodedFeeds":[{"relays":["wss://a.example"]}],"clientHandlers":{"byKind":{"1":[{"name":"Alphaweb","urlPattern":"https://alpha.example/e/{e}"}]}}}
+    )) return error.NoPlace;
+    const place = main.activePlace() orelse return error.NoPlace;
+    if (place.handlerFor(1) == null) return error.NoHandler;
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+
+    const p = try painted.Painted.render(arena, &model);
+    const menu = noteContext(p) orelse return error.NoContextMenu;
+
+    // Every row the feed case writes, including the two that used to land past
+    // the end. The handler row is what pushes the count over.
+    for ([_][]const u8{ "Open thread", "Copy note address", "Quote", "Copy text", "Open in Alphaweb" }) |want| {
+        for (menu.items) |item| {
+            if (std.mem.eql(u8, item.label, want)) break;
+        } else {
+            std.debug.print("a right-click in a place offers no \"{s}\"\n", .{want});
+            return error.MissingRow;
+        }
+    }
+    // The separator and the follow row were the two written past the end, so
+    // their presence is the receipt rather than a nicety.
+    var separators: usize = 0;
+    for (menu.items) |item| {
+        if (item.separator) separators += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), separators);
+    const last = menu.items[menu.items.len - 1];
+    try testing.expect(!last.separator);
+    try testing.expect(last.label.len > 0);
+}
+
 test "no post carries a bookmark or an ellipsis" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
