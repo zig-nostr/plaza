@@ -764,19 +764,32 @@ test "note text splits into link, mention, and plain runs, colored by the identi
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
 }
 
-test "hashtags are colored at a word boundary, but C# and trailing punctuation are not" {
+test "a hashtag reads as its own thing and carries where it goes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = main.AppUi.init(arena_state.allocator());
 
-    const spans = main.contentSpans(&ui, "gm #nostr build C# code #zig!");
+    const spans = main.contentSpans(&ui, "gm #Nostr build C# code #zig!");
     try testing.expectEqual(@as(usize, 5), spans.len);
-    try testing.expectEqualStrings("#nostr", spans[1].text);
-    try testing.expect(spans[1].color != null and spans[1].color.? == .info);
-    try testing.expectEqual(@as(usize, 0), spans[1].link.len); // styled, not a link
+    try testing.expectEqualStrings("#Nostr", spans[1].text);
+    // NOT the identity violet. That colour means a person or a web link, and a
+    // topic is neither; painting all three alike made the one run that looked
+    // most pressable the only one that did nothing.
+    try testing.expect(spans[1].color != null and spans[1].color.? != .info);
+    // And it goes somewhere now. The payload is lowercased, because
+    // `contentTags` lowercases on the way out, so `#Nostr` and `#nostr` have to
+    // be one topic in both directions.
+    const topic = main.topicLinkValueForTest(spans[1].link) orelse return error.HashtagCarriesNoTopic;
+    try testing.expectEqualStrings("nostr", topic);
+
     try testing.expectEqualStrings(" build C# code ", spans[2].text); // C# is not a tag
     try testing.expectEqualStrings("#zig", spans[3].text);
     try testing.expectEqualStrings("!", spans[4].text); // trailing punctuation stays plain
+
+    // A web link keeps its own payload, so widening the channel did not put a
+    // topic where a URL belongs.
+    const links = main.contentSpans(&ui, "see https://example.com/x");
+    try testing.expectEqual(@as(?[]const u8, null), main.topicLinkValueForTest(links[1].link));
 }
 
 test "findQuoteRef captures the first note/nevent ref and ignores others" {
@@ -1713,8 +1726,9 @@ test "a refused remote sign restores the lost draft to the composer" {
     // The UI sweep restores the draft into the empty composer and raises the
     // notice, so the text is never silently lost on a hung or refused sign.
     var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
     try testing.expect(model.draft_empty());
-    main.scanPendingRemoteForTest(&model);
+    main.scanPendingRemoteForTest(&model, &fx_scan);
     try testing.expectEqualStrings("my precious note", model.draft());
     try testing.expect(main.remoteSignNoticeForTest());
 
@@ -12306,6 +12320,376 @@ fn oneNoteFeed(model: *Model) void {
     @memcpy(model.notes[0].content_buf[0..body.len], body);
     model.notes[0].content_len = @intCast(body.len);
     model.notes_len = 1;
+}
+
+test "a bunker can open a private half, and a refusal is not an empty one" {
+    // Before this, `scanPrivateHalves` only knew one way to ask: an HTTP call
+    // to the local keyholder. A reader signed in through an external signer has
+    // no local keyholder holding their key, so the ask came back not-ok and the
+    // half was marked refused forever. `writeMute` then refused every mute
+    // write, correctly, because a private half that is present and unreadable
+    // is exactly what it will not publish over. The guard was firing on a
+    // question never asked of the right signer.
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(index));
+
+    // The bunker answers. The listener parks it; the tick applies it.
+    main.parkRemoteHalfAnswerForTest(index, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("open", main.privateHalfStateForTest(index));
+
+    // And the half that matters more: a refusal or a timeout leaves it
+    // REFUSED, never open-and-empty. An empty answer here is how a client
+    // publishes a list with every private entry stripped out of it.
+    main.forgetPrivateHalvesForTest();
+    const second = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    if (!main.failRemoteHalfForTest(second)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
+}
+
+test "delete is offered on my own note and refuses anything but a kind 1 of mine" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const mine = try signer.keyPairFromSecretKey([_]u8{31} ** 32);
+    const theirs = try signer.keyPairFromSecretKey([_]u8{32} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/del.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.setIdentityForTest([_]u8{31} ** 32);
+    defer main.clearIdentityForTest();
+
+    // Three events: my note, my relay list, and somebody else's note.
+    const my_note = try nostr.event.create(arena, signer, mine, 1_800_000_000, 1, &.{}, "mine", null);
+    _ = try main.plazaIngestForTest(arena, my_note);
+    const my_list = try nostr.event.create(arena, signer, mine, 1_800_000_001, 10002, &.{&.{ "r", "wss://a.example" }}, "", null);
+    _ = try main.plazaIngestForTest(arena, my_list);
+    const their_note = try nostr.event.create(arena, signer, theirs, 1_800_000_002, 1, &.{}, "theirs", null);
+    _ = try main.plazaIngestForTest(arena, their_note);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    inline for (.{ .{ 1, my_note, mine }, .{ 2, my_list, mine }, .{ 3, their_note, theirs } }, 0..) |row, i| {
+        model.notes[i] = main.Note{ .created_at = 1_800_000_000 };
+        model.notes[i].id = row[0];
+        model.notes[i].event_id = row[1].id;
+        model.notes[i].pubkey = row[2].public_key;
+    }
+    model.notes_len = 3;
+
+    // My kind 1: yes, and the kind comes back from the store rather than the card.
+    if (main.deletableTargetKindForTest(&model, 1) == null) {
+        std.debug.print("my own kind:1 was refused; identity or store lookup did not line up\n", .{});
+        return error.OwnNoteRefused;
+    }
+    try testing.expectEqual(@as(?u16, 1), main.deletableTargetKindForTest(&model, 1));
+    // My relay list: NO. A replaceable event is superseded, never deleted, and
+    // a kind:5 aimed at one asks every relay to drop it with no way back. This
+    // is the assertion that matters most in this test.
+    try testing.expectEqual(@as(?u16, null), main.deletableTargetKindForTest(&model, 2));
+    // Somebody else's note: no.
+    try testing.expectEqual(@as(?u16, null), main.deletableTargetKindForTest(&model, 3));
+
+    // And the row is offered on mine, absent on theirs.
+    for ([_]struct { id: i64, want: bool }{ .{ .id = 1, .want = true }, .{ .id = 3, .want = false } }) |case| {
+        var one = main.initialModel();
+        one.stage = .ready;
+        one.notes[0] = model.notes[if (case.id == 1) 0 else 2];
+        one.notes_len = 1;
+        const p = try painted.Painted.render(arena, &one);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        var found = false;
+        for (menu.items) |item| {
+            if (std.mem.eql(u8, item.label, "Delete")) found = true;
+        }
+        if (found != case.want) {
+            std.debug.print("note {d}: Delete offered={}, wanted {}\n", .{ case.id, found, case.want });
+            return error.WrongDeleteRow;
+        }
+    }
+}
+
+test "pressing a hashtag opens what this machine already holds for it" {
+    // The point of the topic view is that it is a LOCAL query. The store
+    // indexes tags, so the notes are on screen before any relay is asked, and
+    // this test never opens a socket.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{44} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/topic.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    // Two tagged, one not. `contentTags` lowercases on the way out, so the
+    // stored tag is lowercase and the lookup has to be too.
+    const zig_tag = [_]nostr.event.Tag{&.{ "t", "zig" }};
+    const other_tag = [_]nostr.event.Tag{&.{ "t", "bitcoin" }};
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_001, 1, &zig_tag, "comptime is nice", null));
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_002, 1, &zig_tag, "allocators too", null));
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_003, 1, &other_tag, "unrelated", null));
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "zig");
+
+    try testing.expectEqualStrings("zig", model.viewingTopic() orelse return error.NoTopic);
+    try testing.expect(model.levelOpen());
+    // Both tagged notes, and not the third.
+    try testing.expectEqual(@as(usize, 2), model.thread_notes_len);
+    for (model.thread_notes[0..model.thread_notes_len]) |note| {
+        if (std.mem.indexOf(u8, note.content(), "unrelated") != null) return error.WrongNotesInTopic;
+    }
+
+    // Back leaves it, and lands on the feed rather than on a half-open level.
+    main.closeThreadForTest(&model);
+    try testing.expectEqual(@as(?[]const u8, null), model.viewingTopic());
+    try testing.expect(!model.levelOpen());
+}
+
+fn bookmarkFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.keys.KeyPair {
+    const secret = [_]u8{0x84} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10003, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadBookmarksFromStoreForTest();
+    return kp;
+}
+
+test "a bookmark splices onto the list and never publishes over an unreadable half" {
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bm.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const kept = [_]u8{0xa1} ** 32;
+    var kept_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&kept_hex, "{x}", .{kept});
+    // A tag this app does not draw sits beside it. NIP-51 puts addressable
+    // events, hashtags and URLs in this list too, and dropping what is not
+    // understood would delete an article somebody saved in another client.
+    const existing = [_]nostr.event.Tag{
+        &.{ "e", &kept_hex },
+        &.{ "a", "30023:deadbeef:an-article" },
+    };
+    _ = try bookmarkFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isBookmarked(kept));
+
+    const fresh = [_]u8{0xa2} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, fresh, true));
+    // Both, at once: the press fills the icon before any relay answers.
+    try testing.expect(main.isBookmarked(fresh));
+    try testing.expect(main.isBookmarked(kept));
+
+    // Removing one leaves the other. Off a fresh fixture, because a splice
+    // reads the STORE and the store does not hold the list above until its
+    // signature comes back: asking to remove something that is only in memory
+    // would be answered "nothing to do", correctly.
+    main.releaseHelperSignForTest();
+    main.forgetBookmarksForTest();
+    var tmp_rm = testing.tmpDir(.{});
+    defer tmp_rm.cleanup();
+    var pbuf_rm: [128]u8 = undefined;
+    const db_rm = try std.fmt.bufPrintZ(&pbuf_rm, ".zig-cache/tmp/{s}/bmrm.mdb", .{tmp_rm.sub_path});
+    var store_rm = try nostr.store.Store.open(db_rm, .{});
+    defer store_rm.deinit();
+    _ = try bookmarkFixture(arena, &signer, &store_rm, &existing, "");
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, kept, false));
+    try testing.expect(!main.isBookmarked(kept));
+
+    // Now the assertion this whole shape exists for. A list carrying a private
+    // half this app cannot open must not be written over: publishing without
+    // those bytes erases every private bookmark the reader has. This is the bug
+    // Jumble ships on both its mute path and its bookmark path.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateHalvesForTest();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var pbuf2: [128]u8 = undefined;
+    const db2 = try std.fmt.bufPrintZ(&pbuf2, ".zig-cache/tmp/{s}/bm2.mdb", .{tmp2.sub_path});
+    var store2 = try nostr.store.Store.open(db2, .{});
+    defer store2.deinit();
+    main.releaseHelperSignForTest();
+    _ = try bookmarkFixture(arena, &signer, &store2, &existing, "not-openable-ciphertext");
+    try testing.expectEqual(
+        main.BookmarkWrite.private_half_unreadable,
+        main.writeBookmarkForTest(&fx, fresh, true),
+    );
+    // And nothing moved: refusing means refusing, not refusing after changing
+    // the set the icon reads from.
+    try testing.expect(!main.isBookmarked(fresh));
+}
+
+test "a private bookmark is sealed, written and read back" {
+    // The whole round trip: the press builds the new private tag array, the
+    // keyholder seals it, the splice publishes it as the content with the
+    // public half untouched, and reading the list back finds it.
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmpriv.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // A public bookmark already there, so the test also proves a private write
+    // does not disturb the public half.
+    const public_one = [_]u8{0xb1} ** 32;
+    var public_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&public_hex, "{x}", .{public_one});
+    const existing = [_]nostr.event.Tag{&.{ "e", &public_hex }};
+    const kp = try bookmarkFixture(arena, &signer, &store, &existing, "");
+    try testing.expect(main.isBookmarked(public_one));
+
+    const secret_one = [_]u8{0xb2} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+
+    // The press. The keyholder seals it inline in a test binary.
+    try testing.expectEqual(
+        main.BookmarkWrite.published,
+        main.writePrivateBookmarkForTest(&fx, secret_one, true),
+    );
+    // Nothing has been written yet: a seal is a round trip, and the set must not
+    // move until the ciphertext exists.
+    try testing.expect(!main.isBookmarked(secret_one));
+
+    // The ciphertext lands and the splice runs.
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expect(main.isBookmarked(secret_one));
+    // The public half is untouched by a private write.
+    try testing.expect(main.isBookmarked(public_one));
+
+    // And it survives a reload from a published record, which is the real
+    // proof: the content that was published decrypts to a list holding it.
+    const sealed = main.lastSealedForTest();
+    try testing.expect(sealed.len > 0);
+    main.forgetBookmarksForTest();
+    main.forgetPrivateHalvesForTest();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var pbuf2: [128]u8 = undefined;
+    const db2 = try std.fmt.bufPrintZ(&pbuf2, ".zig-cache/tmp/{s}/bmpriv2.mdb", .{tmp2.sub_path});
+    var store2 = try nostr.store.Store.open(db2, .{});
+    defer store2.deinit();
+    main.setStoreForTest(&store2);
+    const republished = try nostr.event.create(arena, signer, kp, 1_800_000_100, 10003, &existing, sealed, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, republished, signer);
+    main.loadBookmarksFromStoreForTest();
+    try testing.expect(main.isBookmarked(secret_one));
+    try testing.expect(main.isBookmarked(public_one));
+}
+
+test "a right-click in a place keeps every row it wrote" {
+    // The overrun this pins: `noteContextItems` allocated seven items and, in
+    // the feed inside a place declaring a handler for kind 1, wrote eight. One
+    // row was bounds-checked and the two after it were not, so the guard sat
+    // directly above the write that went past the end.
+    //
+    // In Debug this test PANICS before the fix, which is the assertion: an
+    // out-of-bounds index is not an error a test can catch. In ReleaseFast, the
+    // mode Plaza ships, there is no bounds check at all and the eighth row is
+    // written into memory the arena did not hand out. So the case has to be
+    // built rather than reasoned about, and it has to run in both modes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    if (!main.visitParsedPlaceForTest(arena,
+        \\{"appName":"Alpha","hardcodedFeeds":[{"relays":["wss://a.example"]}],"clientHandlers":{"byKind":{"1":[{"name":"Alphaweb","urlPattern":"https://alpha.example/e/{e}"}]}}}
+    )) return error.NoPlace;
+    const place = main.activePlace() orelse return error.NoPlace;
+    if (place.handlerFor(1) == null) return error.NoHandler;
+
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+
+    const p = try painted.Painted.render(arena, &model);
+    const menu = noteContext(p) orelse return error.NoContextMenu;
+
+    // Every row the feed case writes, including the two that used to land past
+    // the end. The handler row is what pushes the count over.
+    for ([_][]const u8{ "Open thread", "Copy note address", "Quote", "Copy text", "Open in Alphaweb" }) |want| {
+        for (menu.items) |item| {
+            if (std.mem.eql(u8, item.label, want)) break;
+        } else {
+            std.debug.print("a right-click in a place offers no \"{s}\"\n", .{want});
+            return error.MissingRow;
+        }
+    }
+    // The separator and the follow row were the two written past the end, so
+    // their presence is the receipt rather than a nicety.
+    var separators: usize = 0;
+    for (menu.items) |item| {
+        if (item.separator) separators += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), separators);
+    const last = menu.items[menu.items.len - 1];
+    try testing.expect(!last.separator);
+    try testing.expect(last.label.len > 0);
 }
 
 test "no post carries a bookmark or an ellipsis" {

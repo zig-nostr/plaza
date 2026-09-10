@@ -1842,7 +1842,8 @@ fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
 /// short: a backup for a kind nothing writes is a guess about the future, and
 /// this app writes exactly these.
 fn isOwnList(kind: u16) bool {
-    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind or kind == mute_list_kind;
+    return kind == 0 or kind == relay_list_kind or kind == contact_list_kind or
+        kind == mute_list_kind or kind == bookmark_list_kind;
 }
 
 /// The one door into the store.
@@ -1893,6 +1894,7 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
         // that had nothing to do with it, because their splice could only add.
         5 => if (result != .invalid) invalidateFeed(),
         mute_list_kind => if (result != .invalid) ingestMuteList(ev),
+        bookmark_list_kind => if (result != .invalid) ingestBookmarkList(ev),
         else => {},
     }
     return result;
@@ -6126,12 +6128,16 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 // access, across threads that deliberately never share one).
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
-const RemoteMethod = enum { connect, sign_event };
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip44_encrypt };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
     id_len: usize = 0,
     method: RemoteMethod = .connect,
+    /// `nip44_decrypt` only: which `g_private_halves` slot this answers. The
+    /// response arrives with nothing but a request id on it, so the slot has to
+    /// be remembered here or the plaintext has no home.
+    half_index: u8 = 0,
     deadline_s: i64 = 0,
     generation: u64 = 0,
     // The listener flags a failed response here; the UI tick, which owns the
@@ -6152,6 +6158,32 @@ const PendingRemote = struct {
         return self.id_buf[0..self.id_len];
     }
 };
+/// A decrypt answer on its way from the listener thread to the UI tick.
+///
+/// The bunker's replies land on the listener thread, and `g_private_halves` is
+/// read by the view every frame and written by `scanPrivateHalves` on the UI
+/// thread. Rather than add a second writer to that state from another thread,
+/// the listener parks the plaintext here under the pending lock it already
+/// takes, and `scanPendingRemote` applies it where every other private-half
+/// write happens.
+const HalfInbox = struct {
+    used: bool = false,
+    index: u8 = 0,
+    ok: bool = false,
+    plain_buf: [4096]u8 = undefined,
+    plain_len: u16 = 0,
+};
+var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;
+
+/// The same crossing for a seal, of which only one is ever in flight.
+const SealInbox = struct {
+    used: bool = false,
+    ok: bool = false,
+    buf: [4096]u8 = undefined,
+    len: u16 = 0,
+};
+var g_seal_inbox: SealInbox = .{};
+
 var g_pending_lock = std.atomic.Value(bool).init(false);
 var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
 
@@ -6166,7 +6198,7 @@ fn pendingUnlock() void {
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute) bool {
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -6175,6 +6207,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
         slot.* = .{
             .active = true,
             .method = method,
+            .half_index = half_index,
             .id_len = req_id.len,
             .deadline_s = nowSeconds() + remote_sign_timeout_s,
             .generation = g_remote_generation.load(.acquire),
@@ -6224,7 +6257,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null, .none);
+    return registerPending(req_id, method, content, content != null, .none, 0);
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -6239,8 +6272,8 @@ pub fn clearPendingForTest() void {
 pub fn bumpRemoteGenerationForTest() void {
     _ = g_remote_generation.fetchAdd(1, .monotonic);
 }
-pub fn scanPendingRemoteForTest(model: *Model) void {
-    scanPendingRemote(model);
+pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
+    scanPendingRemote(model, fx);
 }
 pub fn remoteSignNoticeForTest() bool {
     return g_remote_sign_notice.load(.acquire);
@@ -9523,6 +9556,43 @@ const note_max_mentions = 8;
 /// The cap, for a test that has to build a note carrying more than it.
 pub const noteMaxMentionsForTest = note_max_mentions;
 
+/// Where a topic span's payload lives.
+///
+/// A mention's sits in `MentionRef.link_buf`, part of the model-owned `Note`,
+/// precisely because `ui.arena` is reset every frame and a press is dispatched
+/// after the frame that built it. A topic has no `Note` field to live in, so it
+/// gets a small ring: written while the spans are built, reused each frame, and
+/// stable for as long as any press can still be delivered.
+const topic_ring_slots = 16;
+var g_topic_ring: [topic_ring_slots][topic_link_tag.len + max_topic_bytes]u8 = undefined;
+var g_topic_ring_len: [topic_ring_slots]u8 = [_]u8{0} ** topic_ring_slots;
+var g_topic_ring_next: usize = 0;
+
+/// Stores `word` (a hashtag without its `#`) and returns the payload to hang on
+/// the span, lowercased so `#Nostr` and `#nostr` are one topic. `contentTags`
+/// lowercases on the way out too, so the two halves agree.
+fn topicLinkFor(word: []const u8) ?[]const u8 {
+    if (word.len == 0 or word.len > max_topic_bytes) return null;
+    const slot = g_topic_ring_next % topic_ring_slots;
+    g_topic_ring_next +%= 1;
+    const buf = &g_topic_ring[slot];
+    @memcpy(buf[0..topic_link_tag.len], topic_link_tag);
+    for (word, 0..) |c, i| buf[topic_link_tag.len + i] = std.ascii.toLower(c);
+    g_topic_ring_len[slot] = @intCast(topic_link_tag.len + word.len);
+    return buf[0..g_topic_ring_len[slot]];
+}
+
+/// The topic inside a payload, or null when this link is not one.
+fn topicLinkValue(link: []const u8) ?[]const u8 {
+    if (link.len <= topic_link_tag.len) return null;
+    if (!std.mem.startsWith(u8, link, topic_link_tag)) return null;
+    return link[topic_link_tag.len..];
+}
+
+pub fn topicLinkValueForTest(link: []const u8) ?[]const u8 {
+    return topicLinkValue(link);
+}
+
 /// The link payload a mention span carries: `mention_link_tag` followed by the
 /// raw 32-byte pubkey.
 ///
@@ -9536,6 +9606,10 @@ pub const noteMaxMentionsForTest = note_max_mentions;
 /// what keeps this cheap: the text form is 69 bytes per mention in every note
 /// the feed holds, and would then have to be decoded again on the press.
 const mention_link_tag = "p\x00";
+/// A topic's payload rides the same channel a mention's does: a sentinel whose
+/// second byte is zero, which no URL contains, so `open_url` can tell the three
+/// apart without a new message or a new field on a span.
+const topic_link_tag = "t\x00";
 const mention_link_len = mention_link_tag.len + 32;
 
 /// One rendered NIP-27 mention: where its `@name` landed, and who it names.
@@ -9969,6 +10043,9 @@ pub const Model = struct {
     /// Which of that note's pictures the viewer is showing. Zero for a note with
     /// one, which is every note the viewer could open before galleries existed.
     expanded_image: u8 = 0,
+    /// The note this reader has asked to delete, while the confirmation is up.
+    /// The one action here with no undo, so it is asked rather than done.
+    deleting_note: ?i64 = null,
     /// Whether the mention picker has been dismissed for the query now in the
     /// draft. It has no open flag of its own: it shows whenever the draft ends
     /// in a `@word`, so Escape and a press outside had nothing to clear and it
@@ -10046,6 +10123,13 @@ pub const Model = struct {
     /// profile are the same kind of thing to the back stack, so Back walks out
     /// of either without knowing which it is leaving.
     viewing_profile: ?[32]u8 = null,
+    /// Whether the level on top is the bookmark list.
+    viewing_bookmarks: bool = false,
+    /// The topic being read, lowercased and without its `#`. A fixed buffer
+    /// rather than a slice: a level sits on the back stack across rebuilds, and
+    /// the arena the span was built from is reset every frame.
+    topic_buf: [max_topic_bytes]u8 = undefined,
+    topic_len: u8 = 0,
     /// Which of the profile's tabs is showing.
     profile_tab: ProfileTab = .notes,
     // Whether the first reply fetch is still out with nothing in hand, so the
@@ -10630,6 +10714,64 @@ pub const Model = struct {
     /// The open profile's notes, newest first, read from the local store. The
     /// same shape as the thread's refresh: the store is the app, so the screen
     /// fills from disk before any relay answers and the backfill only widens it.
+    /// Whether ANY level is stacked over the feed. Was asked as
+    /// `viewing_profile != null or viewing_thread != 0` in four places, which is
+    /// a question that has to be updated in four places every time a third kind
+    /// of level exists.
+    pub fn levelOpen(self: *const Model) bool {
+        return self.viewing_profile != null or self.viewing_thread != 0 or
+            self.topic_len > 0 or self.viewing_bookmarks;
+    }
+
+    /// The bookmarked notes this machine actually holds, newest first.
+    ///
+    /// A bookmark whose note was never fetched is simply not shown. Drawing a
+    /// row for an id with no event behind it would be a list of things the
+    /// reader cannot read, and the honest answer is the ones that are here.
+    fn refreshBookmarkNotes(self: *Model, now_s: i64) void {
+        const store = g_store orelse return;
+        var n: usize = 0;
+        var i: usize = 0;
+        const total = bookmarkCount();
+        while (i < total and n < self.thread_notes.len) : (i += 1) {
+            const id = bookmarkAt(i) orelse continue;
+            var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
+            defer se.deinit();
+            if (se.event.kind != 1) continue;
+            self.thread_notes[n] = noteFrom(se.event, now_s);
+            n += 1;
+        }
+        self.thread_notes_len = n;
+    }
+
+    pub fn viewingTopic(self: *const Model) ?[]const u8 {
+        return if (self.topic_len == 0) null else self.topic_buf[0..self.topic_len];
+    }
+
+    /// Everything this reader already holds carrying that `t` tag, newest
+    /// first. The store indexes tags, so this is one disk read and it answers
+    /// before any relay is asked, which is the whole point of keeping a store.
+    fn refreshTopicNotes(self: *Model, now_s: i64) void {
+        const topic = self.viewingTopic() orelse return;
+        const store = g_store orelse return;
+        const kinds = [_]u16{1};
+        const values = [_][]const u8{topic};
+        const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
+        var result = store.query(std.heap.page_allocator, .{
+            .kinds = &kinds,
+            .tags = &tags,
+            .limit = thread_reply_cap,
+        }) catch return;
+        defer result.deinit();
+        var n: usize = 0;
+        for (result.events) |ev| {
+            if (n >= self.thread_notes.len) break;
+            self.thread_notes[n] = noteFrom(ev, now_s);
+            n += 1;
+        }
+        self.thread_notes_len = n;
+    }
+
     fn refreshProfileNotes(self: *Model, now_s: i64) void {
         const pk = self.viewing_profile orelse return;
         const store = g_store orelse return;
@@ -11490,7 +11632,7 @@ fn wantProfilesAhead(model: *const Model) void {
     // The notifications page registers its own authors as rows are admitted,
     // which catches likers and zappers who are in no other set.
     if (model.notifications_open) return;
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.levelOpen()) {
         const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
         for (set.authors[0..set.author_count]) |pk| wantProfile(pk);
         return;
@@ -11547,7 +11689,7 @@ fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         if (last > first) {
             for (shown[first..last]) |item| push(&onscreen, &n, item.author);
         }
-    } else if (model.viewing_profile != null or model.viewing_thread != 0) {
+    } else if (model.levelOpen()) {
         // A level occludes the feed, so its authors own the ids while it is up,
         // and only the ones ON SCREEN in it. Walking every note in the level
         // instead meant the first nine authors of a long thread took every id
@@ -11726,7 +11868,7 @@ fn warmAhead(fx: *Effects, model: *const Model) void {
     // Only the feed. A thread or a profile is a bounded level whose rows are all
     // fetched by the pass that owns it, and widening those would spend bandwidth
     // on rows that do not exist.
-    if (model.viewing_profile != null or model.viewing_thread != 0) return;
+    if (model.levelOpen()) return;
 
     const warm = model.prefetchRange();
     const seen = model.visibleRange();
@@ -12911,7 +13053,7 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     // ahead of every face, so the allocator would read faces as permanently
     // older and evict them first, forever.
 
-    if (model.viewing_profile != null or model.viewing_thread != 0) {
+    if (model.levelOpen()) {
         // A level occludes the feed, so the picture budget goes to the level,
         // and only to the rows ON SCREEN in it. Marking every note in the level
         // wanted meant the first six pictures held all six slots and nothing
@@ -14543,6 +14685,17 @@ pub const Msg = union(enum) {
     /// Ask to leave, and back out of asking.
     place_leave_request,
     place_leave_cancel,
+    /// Ask to delete a note of my own, then answer. A deletion cannot be taken
+    /// back, so the press opens a question rather than publishing one.
+    delete_note_request: i64,
+    delete_note_confirm,
+    delete_note_cancel,
+    /// Add or remove a bookmark, and open the list of them.
+    toggle_bookmark: i64,
+    /// Save it where only this reader can read it. NIP-51's private half, sealed
+    /// to their own key by whoever holds it.
+    bookmark_privately: i64,
+    open_bookmarks,
     /// Open one of the places you have entered, by its index in the list.
     place_open: u8,
     /// Back into the visit Home closed.
@@ -14663,6 +14816,8 @@ pub const Msg = union(enum) {
     /// One line of the daemon's stdout. Only one matters: the port it bound.
     /// Notary opened a NIP-51 list's private half.
     private_half: native_sdk.EffectResponse,
+    /// Notary's answer to a seal: the ciphertext for a private bookmark write.
+    private_seal: native_sdk.EffectResponse,
     helper_line: native_sdk.EffectLine,
     helper_exited: native_sdk.EffectExit,
     notary_exited: native_sdk.EffectExit,
@@ -15605,6 +15760,9 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
         .settings => feedView(ui, model, false),
         .ready => feedView(ui, model, true),
     };
+    if (model.deleting_note) |_| {
+        return ui.stack(.{ .grow = 1 }, .{ base, deleteConfirm(ui) });
+    }
     if (model.expanded_note) |note_id| {
         if (model.noteById(note_id)) |note| {
             // Layered OVER the feed rather than replacing it, so the scroll
@@ -16964,6 +17122,35 @@ fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
     return ui.fmt("posts to {d} {s}", .{ live, if (live == 1) "relay" else "relays" });
 }
 
+/// The one question this app asks before doing something it cannot undo.
+///
+/// The wording is the part worth getting right. A deletion is a REQUEST: relays
+/// may honour it or ignore it, and the note may already sit on relays that will
+/// never see the request. Saying "deleted" would be a promise Nostr cannot
+/// keep, so this says what actually happens and lets the reader decide with
+/// that in front of them.
+fn deleteConfirm(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.el(.dialog, .{
+        .padding = 20,
+        .on_press = .delete_note_cancel,
+        .semantics = .{ .label = "Delete this note?" },
+    }, .{
+        ui.column(.{ .gap = 12, .cross = .stretch }, .{
+            ui.text(.{}, "Delete this note?"),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = "This asks the relays you publish to drop it. Most will. Any that already passed it on, or that ignore the request, may keep serving it, so this cannot be undone and cannot be guaranteed." }},
+            ),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .delete_note_cancel }, "Cancel"),
+                ui.spacer(1),
+                ui.button(.{ .size = .sm, .variant = .destructive, .on_press = .delete_note_confirm }, "Delete"),
+            }),
+        }),
+    });
+}
+
 /// The expanded picture, filling the window over the feed. The registry decodes
 /// at most 512 pixels on a side, so rather than upscale a small copy into a
 /// blur, this shows it as large as it honestly goes and offers the
@@ -17427,7 +17614,7 @@ fn recordProfileVisible(rows: *const ProfileRows, level: usize, first: usize, la
     g_visible_level = @min(level, g_level_visible.len - 1);
     // The 72px face is the largest thing on the page, so the subject is first in
     // line whether or not their card is scrolled into view.
-    set.pushAuthor(rows.pubkey);
+    set.pushAuthor(rows.subject());
     var index = first;
     while (index <= last and index < rows.count()) : (index += 1) {
         switch (rows.rowAt(index)) {
@@ -18113,14 +18300,27 @@ pub const Screen = struct {
     note: Note = .{},
     /// Whose profile this level shows, when it is one.
     profile: ?[32]u8 = null,
+    /// Whether this level is the bookmark list.
+    bookmarks: bool = false,
+    /// The topic this level shows, when it is one. A VALUE rather than a slice:
+    /// a level sits on the stack across rebuilds, and anything it pointed at in
+    /// the frame arena would be gone by the time Back reached it.
+    topic_buf: [max_topic_bytes]u8 = undefined,
+    topic_len: u8 = 0,
 
     pub fn isProfile(self: Screen) bool {
         return self.profile != null;
     }
 
+    pub fn topic(self: *const Screen) ?[]const u8 {
+        return if (self.topic_len == 0) null else self.topic_buf[0..self.topic_len];
+    }
+
     /// What Back says it goes to: a person's name, or the author of the note
     /// underneath. Back names WHERE it lands, never what it leaves.
     pub fn backLabel(self: *const Screen) []const u8 {
+        if (self.bookmarks) return "Bookmarks";
+        if (self.topic()) |t| return t;
         if (self.profile) |pk| {
             if (lookupProfile(pk)) |prof| {
                 if (prof.name_len > 0) return prof.name();
@@ -18176,6 +18376,17 @@ const contact_list_kind: u16 = 3;
 /// NIP-51's mute list. Public entries are `p` tags; private ones live in the
 /// content, encrypted to yourself, and are read separately (see `privateMutes`).
 const mute_list_kind: u16 = 10000;
+/// NIP-51's bookmark list. Registered in `isOwnList` so `capturePrevious` and
+/// `keepReplaced` hold a backup ring for it, and in `self_filter_kinds` so this
+/// reader's own arrives on the same one-author subscription as their kind:0 and
+/// their relay list. Both matter before the button does anything: without the
+/// first a bad splice is unrecoverable, and without the second a fresh machine
+/// would write over a list it had never read.
+const bookmark_list_kind: u16 = 10003;
+/// How many bookmarks are held in memory. NIP-51 sets no ceiling; this is what
+/// the screen can show and what a splice can carry without the tag array
+/// growing without bound.
+const max_bookmarks = 512;
 
 /// How many muted accounts are held. Far past any real list: muting is a thing
 /// people do a handful of times, not two thousand.
@@ -18247,7 +18458,7 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
 /// the one where getting that wrong empties somebody's account. It is one
 /// author and three records, so it costs nothing to ask for separately, which
 /// is the entire reason the bulk filter above can stop asking for it.
-const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind };
+const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind, bookmark_list_kind };
 
 /// Backing store for the reader's own author filter. A `Filter` borrows its
 /// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
@@ -18479,6 +18690,160 @@ fn mutesFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
     return n;
 }
 
+// ------------------------------------------------------------- bookmarks
+
+/// The event ids this reader has bookmarked, public half and private half
+/// together, and whose list it is.
+///
+/// Both halves in one set on purpose: a bookmark is a bookmark, and a reader who
+/// saved one privately in another client should still see it filled in here.
+/// Which half a given one lives in only matters when writing, and the write
+/// reads the record again anyway.
+var g_bookmarks: [max_bookmarks][32]u8 = undefined;
+var g_bookmark_count: usize = 0;
+var g_bookmark_owner: ?[32]u8 = null;
+var g_bookmark_created_at: i64 = 0;
+var g_bookmarks_lock = std.atomic.Value(bool).init(false);
+
+fn lockBookmarks() void {
+    while (g_bookmarks_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn unlockBookmarks() void {
+    g_bookmarks_lock.store(false, .release);
+}
+
+/// Whether the set in memory belongs to the account that is signed in. The same
+/// question the mute set answers, and for the same reason: a set left over from
+/// another account would be written back as this one's.
+fn bookmarksAreOwned() bool {
+    const me = activePubkey() orelse return false;
+    const owner = g_bookmark_owner orelse return false;
+    return std.mem.eql(u8, &me, &owner);
+}
+
+pub fn bookmarkCount() usize {
+    lockBookmarks();
+    defer unlockBookmarks();
+    if (!bookmarksAreOwned()) return 0;
+    return g_bookmark_count;
+}
+
+/// Whether this note is in the list. Answered from memory, because the feed asks
+/// it once per card per frame and a store query there would be a disk read per
+/// row.
+pub fn isBookmarked(event_id: [32]u8) bool {
+    lockBookmarks();
+    defer unlockBookmarks();
+    if (!bookmarksAreOwned()) return false;
+    for (g_bookmarks[0..g_bookmark_count]) |id| {
+        if (std.mem.eql(u8, &id, &event_id)) return true;
+    }
+    return false;
+}
+
+pub fn bookmarkAt(i: usize) ?[32]u8 {
+    lockBookmarks();
+    defer unlockBookmarks();
+    if (!bookmarksAreOwned() or i >= g_bookmark_count) return null;
+    return g_bookmarks[i];
+}
+
+fn setBookmarks(list: []const [32]u8, created_at: i64) void {
+    const pk = activePubkey() orelse return;
+    lockBookmarks();
+    const n = @min(list.len, max_bookmarks);
+    @memcpy(g_bookmarks[0..n], list[0..n]);
+    g_bookmark_count = n;
+    g_bookmark_owner = pk;
+    g_bookmark_created_at = created_at;
+    unlockBookmarks();
+}
+
+fn forgetBookmarks() void {
+    lockBookmarks();
+    g_bookmark_owner = null;
+    g_bookmark_count = 0;
+    g_bookmark_created_at = 0;
+    unlockBookmarks();
+}
+
+/// The event ids a bookmark list's `e` tags name, deduped.
+///
+/// Only `e`. NIP-51 also allows `a` (addressable events, so a long-form article
+/// or a place), `t` and `r` in here, and none of those is read yet. They are
+/// CARRIED on write, which is the part that matters: dropping what this app does
+/// not draw would delete an article somebody bookmarked in another client.
+fn bookmarksFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
+    @setRuntimeSafety(true); // Tags off a relay, and `out` is indexed as they are walked.
+    var n: usize = 0;
+    for (tags) |tag| {
+        if (n >= out.len) break;
+        if (tag.len < 2) continue;
+        if (!std.mem.eql(u8, tag[0], "e")) continue;
+        if (tag[1].len != 64) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, tag[1]) catch continue;
+        var seen = false;
+        for (out[0..n]) |had| {
+            if (std.mem.eql(u8, &had, &id)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        out[n] = id;
+        n += 1;
+    }
+    return n;
+}
+
+/// The bookmarks in an encrypted half, read through the same cache the mute
+/// list uses. A miss reads as none AND as unreadable, which the write path
+/// tells apart with `privateHalfIsReadable`.
+fn privateBookmarks(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
+    if (content.len == 0 or out.len == 0) return 0;
+    const plain = privateHalfOpened(content) orelse return 0;
+    const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
+    defer parsed.deinit();
+    var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
+    defer gpa.free(tags);
+    for (parsed.value, 0..) |tag, i| tags[i] = tag;
+    return bookmarksFromTags(tags, out);
+}
+
+fn loadBookmarksFromStore() void {
+    const gpa = std.heap.page_allocator;
+    const own = ownRecordJson(gpa, bookmark_list_kind) orelse return;
+    defer freeOwnProfile(gpa, own);
+    var list: [max_bookmarks][32]u8 = undefined;
+    var n = bookmarksFromTags(own.tags, &list);
+    n += privateBookmarks(gpa, own.json, list[n..]);
+    setBookmarks(list[0..n], own.created_at);
+}
+
+/// A bookmark list arriving from a relay. Newer wins; this reader's own only.
+fn ingestBookmarkList(ev: nostr.event.Event) void {
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    if (ev.created_at < g_bookmark_created_at) return;
+    loadBookmarksFromStore();
+}
+
+pub const BookmarkWrite = enum {
+    published,
+    /// Already bookmarked, or already not.
+    nothing_to_do,
+    /// A signature is already out. One key signs one thing at a time.
+    signer_busy,
+    /// This account's bookmark list has not been read back yet. Publishing one
+    /// now would replace whatever is really out there with a list of one note.
+    no_list_yet,
+    /// The list has a private half this app could not decrypt, so it cannot
+    /// carry it forward and will not write without it.
+    private_half_unreadable,
+    failed,
+};
+
 pub const MuteWrite = enum {
     published,
     /// Already muted, or already not, or the reader themselves.
@@ -18495,6 +18860,374 @@ pub const MuteWrite = enum {
     would_shrink,
     failed,
 };
+
+/// Adds or removes a bookmark, by splicing this reader's own kind:10003.
+///
+/// A near-copy of `writeMute` rather than a generalisation of it, deliberately.
+/// A shared "list writer" would be a second call site reconstructing the write
+/// by hand, and that is exactly how Amethyst ends up with a path that defeats
+/// the guard its own event class enforces. Two instances of one careful shape
+/// are safer than one abstraction with two callers.
+///
+/// The gates, in order, are the whole safety of this:
+///
+///   1. The signer is free. One key signs one thing at a time.
+///   2. The RAW previous record is read, tags and encrypted content whole,
+///      never a parsed cache.
+///   3. No record and no key minted here means REFUSE. LMDB holding no row and
+///      the fetch not having landed are the same observation from in here, and
+///      this is precisely where Jumble goes wrong: its cache stores a null for
+///      "the relay returned nothing", its lookup cannot tell that from "never
+///      fetched", and a toggle then publishes a one-item list with an empty
+///      content over whatever was really out there.
+///   4. A private half that is present and unreadable means no write at all.
+///      Carrying it forward verbatim is the only safe thing to do with bytes
+///      this app did not open, and publishing without them erases every private
+///      bookmark the reader has.
+fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    if (!signerReady()) return .signer_busy;
+    _ = activePubkey() orelse return .failed;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    const have_base = previous != null;
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+
+    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+
+    if (base_content.len > 0 and !privateHalfIsReadable(gpa, base_content)) {
+        return .private_half_unreadable;
+    }
+
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    var found = false;
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, event_id);
+
+    // Every tag carried, `e` and otherwise. NIP-51 also puts addressable events,
+    // hashtags and URLs in here, and this app draws none of those: dropping what
+    // it does not understand would delete an article somebody bookmarked in
+    // another client.
+    for (base_tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e") and hexEqlIgnoreCase(tag[1], &hex)) {
+            found = true;
+            if (!adding) continue;
+        }
+        const copy = gpa.alloc([]const u8, tag.len) catch return .failed;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    }
+
+    if (adding) {
+        // Already there, in the public half or the private one. Removing a
+        // PRIVATE bookmark is not something this can do by splicing public tags,
+        // so a press on one is a no-op rather than a write that would leave the
+        // private entry standing and the button wrong.
+        if (found) return .nothing_to_do;
+        if (isBookmarked(event_id)) return .nothing_to_do;
+        const copy = gpa.alloc([]const u8, 2) catch return .failed;
+        copy[0] = gpa.dupe(u8, "e") catch return .failed;
+        copy[1] = gpa.dupe(u8, &hex) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    } else if (!found) {
+        return .nothing_to_do;
+    }
+
+    const owned_tags = tags.toOwnedSlice(gpa) catch return .failed;
+    handed_off = true;
+    const content = gpa.dupe(u8, base_content) catch return .failed;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(bookmark_list_kind) + 1), base_created_at + 1);
+
+    // The set moves first, so the icon fills on the press rather than a round
+    // trip later. Private entries are re-read from the carried content, so an
+    // add or a remove of a public one never drops them out of the set.
+    var next: [max_bookmarks][32]u8 = undefined;
+    var n = bookmarksFromTags(owned_tags, &next);
+    n += privateBookmarks(gpa, content, next[n..]);
+    setBookmarks(next[0..n], created);
+
+    signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
+    return .published;
+}
+
+/// Starts a PRIVATE bookmark write: seals the new private half, and parks.
+///
+/// Every gate the public path applies is applied here first, before anything is
+/// sent to a signer, because a refusal after the ciphertext exists would leave
+/// the reader wondering what happened to it.
+fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    if (!signerReady()) return .signer_busy;
+    if (g_private_seal.active) return .signer_busy;
+    const me = activePubkey() orelse return .failed;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    if (previous == null and !g_identity_minted_here) return .no_list_yet;
+    if (base_content.len > 0 and !privateHalfIsReadable(gpa, base_content)) return .private_half_unreadable;
+
+    const plaintext = privateBookmarkPlaintext(gpa, base_content, event_id, adding) orelse {
+        // Either nothing to do (already private, or not private), or the half
+        // would not open. The readable check above has already ruled the second
+        // out, so this is the first.
+        return .nothing_to_do;
+    };
+    defer gpa.free(plaintext);
+
+    g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding };
+
+    if (g_signer_kind == .remote) {
+        g_private_seal.awaiting_remote = true;
+        if (!requestRemoteEncrypt(gpa, plaintext)) {
+            g_private_seal = .{};
+            return .failed;
+        }
+        return .published;
+    }
+
+    var peer_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch {
+        g_private_seal = .{};
+        return .failed;
+    };
+    // To yourself: NIP-51's private half is encrypted to your own key, so both
+    // sides of the conversation key are this account's.
+    const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{plaintext} }).toJson(gpa) catch {
+        g_private_seal = .{};
+        return .failed;
+    };
+    defer gpa.free(body);
+    if (builtin.is_test) {
+        sealPrivateBookmarkForTest(gpa, plaintext);
+        return .published;
+    }
+    helperFetch(fx, private_seal_key, "/nip44/encrypt", body, Effects.responseMsg(.private_seal));
+    return .published;
+}
+
+/// Notary's answer to a seal. The ciphertext, or a refusal that leaves the list
+/// exactly as it was.
+fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.EffectResponse) void {
+    if (response.key != private_seal_key) return;
+    if (!g_private_seal.active) return;
+    if (response.outcome != .ok or response.status != 200) {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.items.len == 0) {
+        g_private_seal = .{};
+        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        return;
+    }
+    finishPrivateBookmark(model, fx, parsed.value.items[0]);
+}
+
+/// The splice, once the ciphertext exists.
+///
+/// The record is read AGAIN here rather than carried from the press. A seal goes
+/// through a keyholder and, on a bunker, through a person pressing approve, so
+/// the list can have moved in between, and a splice built against a record that
+/// is no longer current is what the read-before-write rule exists to stop.
+fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) void {
+    const seal = g_private_seal;
+    g_private_seal = .{};
+    if (!seal.active) return;
+    const gpa = std.heap.page_allocator;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+    if (previous == null and !g_identity_minted_here) {
+        setToast(model, "Still fetching your bookmarks. Try again in a moment.");
+        return;
+    }
+
+    // The PUBLIC half is carried forward whole and untouched. A private write
+    // changes the content and nothing else.
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    for (base_tags) |tag| {
+        const copy = gpa.alloc([]const u8, tag.len) catch return;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return;
+        tags.append(gpa, copy) catch return;
+    }
+    const owned_tags = tags.toOwnedSlice(gpa) catch return;
+    handed_off = true;
+    const content = gpa.dupe(u8, ciphertext) catch return;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(bookmark_list_kind) + 1), base_created_at + 1);
+
+    // The set moves now, so the row reads right immediately. The new ciphertext
+    // has not been decrypted by anything yet, so the private side is taken from
+    // the press rather than re-read: it is the one thing here that is known.
+    var next: [max_bookmarks][32]u8 = undefined;
+    var n = bookmarksFromTags(owned_tags, &next);
+    if (seal.adding and n < next.len) {
+        next[n] = seal.event_id;
+        n += 1;
+    }
+    // Everything else already private, from the half that was readable before.
+    if (previous) |prev| {
+        var had: [max_bookmarks][32]u8 = undefined;
+        const m = privateBookmarks(gpa, prev.json, &had);
+        for (had[0..m]) |id| {
+            if (n >= next.len) break;
+            if (seal.adding and std.mem.eql(u8, &id, &seal.event_id)) continue;
+            if (!seal.adding and std.mem.eql(u8, &id, &seal.event_id)) continue;
+            var seen = false;
+            for (next[0..n]) |have| {
+                if (std.mem.eql(u8, &have, &id)) seen = true;
+            }
+            if (seen) continue;
+            next[n] = id;
+            n += 1;
+        }
+    }
+    setBookmarks(next[0..n], created);
+
+    signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
+    setToast(model, if (seal.adding) "Bookmarked privately" else "Bookmark removed");
+}
+
+/// The keyholder a test has, for the seal path.
+fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8) void {
+    const secret = g_test_secret orelse {
+        g_private_seal = .{};
+        return;
+    };
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        g_private_seal = .{};
+        return;
+    };
+    // A test binary has no runtime io, so it makes its own. The seal has to be
+    // real: the point of this path is that what gets published decrypts back.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = g_io orelse threaded.io();
+    const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
+        g_private_seal = .{};
+        return;
+    };
+    defer gpa.free(sealed);
+    g_test_sealed_len = @intCast(@min(sealed.len, g_test_sealed.len));
+    @memcpy(g_test_sealed[0..g_test_sealed_len], sealed[0..g_test_sealed_len]);
+}
+var g_test_sealed: [4096]u8 = undefined;
+var g_test_sealed_len: u16 = 0;
+
+pub fn lastSealedForTest() []const u8 {
+    return g_test_sealed[0..g_test_sealed_len];
+}
+
+pub fn finishPrivateBookmarkForTest(model: *Model, fx: *Effects) void {
+    finishPrivateBookmark(model, fx, g_test_sealed[0..g_test_sealed_len]);
+}
+
+pub fn writePrivateBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    return writePrivateBookmark(fx, event_id, adding);
+}
+
+pub fn writeBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    return writeBookmark(fx, event_id, adding);
+}
+
+pub fn loadBookmarksFromStoreForTest() void {
+    loadBookmarksFromStore();
+}
+
+pub fn forgetBookmarksForTest() void {
+    forgetBookmarks();
+}
+
+/// The private tag array a bookmark write should seal, as JSON.
+///
+/// Built from the CURRENT private half plus or minus the one entry the press is
+/// about. Returns null when the half is present and could not be opened, which
+/// is the same refusal the public path makes and for the same reason: an array
+/// built without bytes this app could not read is an array missing everything
+/// that was in them.
+fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, event_id: [32]u8, adding: bool) ?[]u8 {
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, event_id);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    out.append(gpa, '[') catch return null;
+    var wrote: usize = 0;
+    var found = false;
+
+    if (base_content.len > 0) {
+        const plain = privateHalfOpened(base_content) orelse return null;
+        const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return null;
+        defer parsed.deinit();
+        for (parsed.value) |tag| {
+            if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e") and hexEqlIgnoreCase(tag[1], &hex)) {
+                found = true;
+                if (!adding) continue;
+            }
+            if (wrote > 0) out.append(gpa, ',') catch return null;
+            out.append(gpa, '[') catch return null;
+            for (tag, 0..) |field, fi| {
+                if (fi > 0) out.append(gpa, ',') catch return null;
+                out.append(gpa, '"') catch return null;
+                // Escaped by hand, and only the two characters that can appear
+                // here: a tag field off a decrypted list is a hex id, a relay
+                // url or a label, and anything else is carried as-is rather
+                // than dropped.
+                for (field) |c| {
+                    if (c == '"' or c == '\\') out.append(gpa, '\\') catch return null;
+                    out.append(gpa, c) catch return null;
+                }
+                out.append(gpa, '"') catch return null;
+            }
+            out.append(gpa, ']') catch return null;
+            wrote += 1;
+        }
+    }
+    if (adding and found) return null; // Already private. Nothing to seal.
+    if (!adding and !found) return null; // Not private. Nothing to seal.
+    if (adding) {
+        if (wrote > 0) out.append(gpa, ',') catch return null;
+        out.appendSlice(gpa, "[\"e\",\"") catch return null;
+        out.appendSlice(gpa, &hex) catch return null;
+        out.appendSlice(gpa, "\"]") catch return null;
+    }
+    out.append(gpa, ']') catch return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
 
 /// Mutes or unmutes `pubkey`, by splicing this reader's own kind:10000.
 ///
@@ -18656,6 +19389,32 @@ var g_private_ciphertext: [4]PrivateCiphertext = [_]PrivateCiphertext{.{}} ** 4;
 
 /// Effect keys for the decrypts, one per slot.
 const private_half_key_base: u64 = 48;
+/// And one for the encrypt, of which there is only ever one in flight: it is
+/// driven by a press, and `signerReady` already refuses a second press while a
+/// signature is out.
+const private_seal_key: u64 = 64;
+
+/// A private bookmark write, waiting for its ciphertext.
+///
+/// Writing into an encrypted half cannot be done in one pass. The plaintext has
+/// to be sealed by whoever holds the key, which is Notary over HTTP or a bunker
+/// over a relay, and neither answers in the same call. So the press builds the
+/// new private tag array, asks for it to be sealed, and parks here; the answer
+/// completes the splice.
+///
+/// The splice re-reads the record when the ciphertext lands rather than holding
+/// the one it read at press time. A round trip to a bunker goes through a human
+/// pressing approve, so the list can genuinely have moved in between, and
+/// writing a splice built against a record that is no longer current is exactly
+/// the class of bug the read-before-write rule exists to stop.
+const PrivateSeal = struct {
+    active: bool = false,
+    event_id: [32]u8 = [_]u8{0} ** 32,
+    adding: bool = false,
+    /// Set while a bunker is sealing it, so a refusal can be told from silence.
+    awaiting_remote: bool = false,
+};
+var g_private_seal: PrivateSeal = .{};
 
 fn privateHalfId(content: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -18706,6 +19465,59 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Claims a private-half slot the way a reader hitting an encrypted list does,
+/// and returns its index, WITHOUT the test keyholder answering it. That is what
+/// a bunker reader's state actually looks like: the half is claimed and waiting
+/// on a signer that answers over the relay rather than over HTTP.
+pub fn claimPrivateHalfPendingForTest(content: []const u8) ?u8 {
+    const id = privateHalfId(content);
+    for (&g_private_halves, 0..) |*h, i| {
+        if (h.used) continue;
+        if (content.len > g_private_ciphertext[i].buf.len) return null;
+        h.* = .{ .used = true, .state = .asking, .id = id };
+        @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
+        g_private_ciphertext[i].len = @intCast(content.len);
+        return @intCast(i);
+    }
+    return null;
+}
+
+/// What the listener thread does when the bunker answers a `nip44_decrypt`.
+pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_half_inbox) |*box| {
+        if (box.used) continue;
+        const n = @min(plain.len, box.plain_buf.len);
+        box.* = .{ .used = true, .index = index, .ok = true, .plain_len = @intCast(n) };
+        @memcpy(box.plain_buf[0..n], plain[0..n]);
+        return;
+    }
+}
+
+/// A `nip44_decrypt` the bunker refused or never answered.
+pub fn failRemoteHalfForTest(index: u8) bool {
+    var idbuf: [24]u8 = undefined;
+    const req_id = std.fmt.bufPrint(&idbuf, "half{d}", .{index}) catch return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index)) return false;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) slot.failed = true;
+    }
+    return true;
+}
+
+pub fn privateHalfStateForTest(index: u8) []const u8 {
+    if (index >= g_private_halves.len) return "none";
+    return switch (g_private_halves[index].state) {
+        .idle => "idle",
+        .asking => "asking",
+        .open => "open",
+        .refused => "refused",
+    };
+}
+
 pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
     const id = privateHalfId(content);
     for (&g_private_halves) |*h| {
@@ -18733,6 +19545,14 @@ fn scanPrivateHalves(fx: *Effects) void {
             continue;
         }
         const gpa = std.heap.page_allocator;
+        // A bunker answers over NIP-46, not over the keyholder's HTTP door.
+        // This used to fall through to `helperFetch` regardless, so a reader on
+        // an external signer asked a daemon that does not hold their key.
+        if (g_signer_kind == .remote) {
+            h.state = .asking;
+            if (!requestRemoteDecrypt(gpa, i, content)) h.state = .refused;
+            return;
+        }
         var peer_hex: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch return;
         // To yourself: both sides of the conversation key are this account's,
@@ -18781,6 +19601,7 @@ fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
     // The mute set was read with this half closed, so it is short by whatever
     // was in it. Read it again now that it can be.
     loadMutesFromStore();
+    loadBookmarksFromStore();
     invalidateFeed();
 }
 
@@ -19878,6 +20699,7 @@ pub fn forgetFollowsForTest() void {
 
 pub fn forgetMutesForTest() void {
     forgetMutes();
+    forgetBookmarks();
 }
 
 pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
@@ -19886,6 +20708,7 @@ pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
 
 pub fn loadMutesFromStoreForTest() void {
     loadMutesFromStore();
+    loadBookmarksFromStore();
 }
 
 pub fn ingestMuteListForTest(ev: nostr.event.Event) void {
@@ -21177,13 +22000,13 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
 /// to the wrong place for every row after it.
 fn profileCardExtent(rows: *const ProfileRows) f32 {
     var h: f32 = profile_banner_height + profile_card_chrome;
-    const about = personAbout(rows.pubkey);
+    const about = personAbout(rows.subject());
     if (about.len > 0) {
         // Roughly 62 characters to a line at the body scale, over the 660 column.
         const lines: f32 = @floatFromInt(1 + about.len / 62);
         h += lines * profile_bio_line_height + 9;
     }
-    if (personWebsite(rows.pubkey).len > 0 or personLud16(rows.pubkey).len > 0) h += profile_links_height;
+    if (personWebsite(rows.subject()).len > 0 or personLud16(rows.subject()).len > 0) h += profile_links_height;
     return h;
 }
 
@@ -21489,7 +22312,7 @@ fn profileEmptyRow(ui: *AppUi, rows: *const ProfileRows) AppUi.Node {
     // A key minted a minute ago has written nothing, so this is the ONE screen a
     // new reader is most likely to see first, and "Nothing they have written" is
     // the app talking about them behind their back on their own page.
-    const mine = isMe(rows.pubkey);
+    const mine = isMe(rows.subject());
     const text: []const u8 = if (rows.loading)
         if (mine) "Looking for what you have written…" else "Looking for what they have written…"
     else if (rows.model.profile_tab == .replies)
@@ -21517,10 +22340,19 @@ fn profileLevelKey(level: usize, pubkey: [32]u8) u64 {
 /// with the notes, which is what the design asks for and what a column above a
 /// list cannot do. This is the same heterogeneous-row shape the thread already
 /// uses for its ancestors.
+/// What a stacked list level is showing. One value rather than a pubkey plus an
+/// optional topic plus a flag, because those three encode a choice of one and
+/// nothing stops two of them being set at once.
+const LevelHeader = union(enum) {
+    person: [32]u8,
+    topic: []const u8,
+    bookmarks,
+};
+
 fn profilePanel(
     ui: *AppUi,
     model: *const Model,
-    pubkey: [32]u8,
+    header: LevelHeader,
     notes: []const Note,
     loading: bool,
     level_key: u64,
@@ -21538,10 +22370,24 @@ fn profilePanel(
     // An occluded level still reports its REAL row count: the retained list keeps
     // its scroll offset from the count and the extents, so claiming two rows here
     // would collapse the person's scroll and Back would land at the top.
-    const shown = model.profileNotesFor(indices, pubkey);
+    // A topic's rows were already chosen by the store query, so every note
+    // handed in belongs. A person's are filtered here because `thread_notes` is
+    // one buffer shared with the thread screen.
+    const shown = switch (header) {
+        .person => |pk| model.profileNotesFor(indices, pk),
+        // A topic's rows and a bookmark's were already chosen, by the store
+        // query and by the list itself, so every note handed in belongs. A
+        // person's are filtered here because `thread_notes` is one buffer
+        // shared with the thread screen.
+        else => blk: {
+            var n: usize = 0;
+            while (n < notes.len and n < indices.len) : (n += 1) indices[n] = n;
+            break :blk indices[0..n];
+        },
+    };
     rows_ctx.* = .{
         .model = model,
-        .pubkey = pubkey,
+        .header = header,
         .notes = notes,
         .shown = shown,
         .loading = loading,
@@ -21583,20 +22429,43 @@ fn profilePanel(
         break :blk built;
     };
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        if (occluded) ui.spacer(0) else profileHeaderBand(ui, model, pubkey),
+        // The band only means something over a person: it is their name and
+        // their follow button. A topic and a bookmark list carry their own
+        // header as the first row instead.
+        if (occluded) ui.spacer(0) else switch (header) {
+            .person => |pk| profileHeaderBand(ui, model, pk),
+            else => ui.spacer(0),
+        },
         ui.virtualList(options, window, .{rows}),
     });
 }
 
 /// The rows a profile level holds: the person, then their notes.
+/// The rows of a stacked LIST level: a person's page, or a topic's.
+///
+/// One struct rather than two because the two differ in exactly one row, the
+/// header, and in which notes they show. A parallel panel would mean a second
+/// retained extent table, a second virtual list id scheme and a second copy of
+/// the occlusion rules, all to draw the same list of notes under a different
+/// first row.
 const ProfileRows = struct {
     model: *const Model,
-    pubkey: [32]u8,
+    header: LevelHeader,
     notes: []const Note,
     shown: []const usize,
     loading: bool,
 
-    const Row = union(enum) { person, note: usize, empty };
+    const Row = union(enum) { person, topic, bookmarks, note: usize, empty };
+
+    /// The person this level is about, or all-zero when it is not about one.
+    /// The callers below are all person-only paths reached from a `.person`
+    /// row; the zero keeps them total rather than making each one a switch.
+    fn subject(self: *const ProfileRows) [32]u8 {
+        return switch (self.header) {
+            .person => |pk| pk,
+            else => @splat(0),
+        };
+    }
 
     fn count(self: *const ProfileRows) usize {
         // The person, then a row per note, or one quiet line when there are none.
@@ -21604,7 +22473,11 @@ const ProfileRows = struct {
     }
 
     fn rowAt(self: *const ProfileRows, index: usize) Row {
-        if (index == 0) return .person;
+        if (index == 0) return switch (self.header) {
+            .person => .person,
+            .topic => .topic,
+            .bookmarks => .bookmarks,
+        };
         if (self.shown.len == 0) return .empty;
         const i = index - 1;
         if (i >= self.shown.len) return .empty;
@@ -21617,6 +22490,11 @@ const ProfileRows = struct {
 fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
     return switch (rows.rowAt(index)) {
         .person => profileCardExtent(rows),
+        // The topic header is a title and two wrapped lines. Estimated rather
+        // than measured, like every other row here: the retained table only
+        // needs to be close enough that the scrollbar does not jump.
+        .topic => 96,
+        .bookmarks => 96,
         .note => |ni| noteRowEstimate(&rows.notes[ni], feed_row_chrome),
         .empty => quiet_row_extent,
     };
@@ -21624,10 +22502,49 @@ fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
 
 fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
     return switch (rows.rowAt(index)) {
-        .person => profileCard(ui, rows.model, rows.pubkey),
+        .person => profileCard(ui, rows.model, rows.subject()),
+        .topic => topicCard(ui, switch (rows.header) {
+            .topic => |t| t,
+            else => "",
+        }),
+        .bookmarks => bookmarksCard(ui),
         .note => |ni| noteCard(ui, &rows.notes[ni]),
         .empty => profileEmptyRow(ui, rows),
     };
+}
+
+/// The header of a topic level: the tag, and what this list actually is.
+///
+/// Said plainly because it is not the same promise a feed makes. This is what
+/// this reader's own relays have served and this machine has kept, not
+/// everything on Nostr carrying the tag, and a topic view that implied the
+/// latter would be claiming a search Plaza does not do.
+fn topicCard(ui: *AppUi, topic: []const u8) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .padding = 16, .gap = 6, .cross = .stretch }, .{
+        ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("#{s}", .{topic})),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+            &.{.{ .text = "Notes carrying this tag, from your relays. Read from this machine first, so what is already here is on screen before anything is asked for." }},
+        ),
+    });
+}
+
+/// The header of the bookmark list.
+///
+/// It says where they live, because that is the part a reader cannot see. A
+/// bookmark here is a NIP-51 kind:10003 published to their relays, so it
+/// follows them to any client, and one saved privately elsewhere shows up here
+/// too. Both halves are read; new ones are saved to the public half.
+fn bookmarksCard(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .padding = 16, .gap = 6, .cross = .stretch }, .{
+        ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Bookmarks"),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+            &.{.{ .text = "Saved to your relays, so they follow you to any client. Private ones you saved elsewhere are shown here too. Notes this machine has not fetched are not listed." }},
+        ),
+    });
 }
 
 /// A stable, collision-free scroll identity for a thread level: the level index
@@ -21637,6 +22554,23 @@ fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
 /// the stack is saturated at `thread_depth_max` and `enterThread` replaces the
 /// top root in place, the new level gets a fresh key and opens at the top rather
 /// than inheriting the dropped thread's offset).
+/// The same scheme `profileLevelKey` uses, over the topic's bytes: a level index
+/// in the high bits so two levels never collide, and a hash of the topic in the
+/// low bits so opening `#zig` twice at the same depth reuses its offset.
+/// There is one bookmark list, so it needs no hash: a fixed key plus the level
+/// index is enough to keep two stacked copies apart.
+const bookmarks_level_key: u64 = 0x7000_0000_0000_0000;
+
+fn topicLevelKey(level: usize, topic: []const u8) u64 {
+    const hi = @as(u64, level) << 59;
+    var hash: u64 = 1469598103934665603;
+    for (topic) |c| {
+        hash ^= c;
+        hash *%= 1099511628211;
+    }
+    return hi | (hash & ((@as(u64, 1) << 59) - 1));
+}
+
 fn threadLevelKey(level: usize, root_id: i64) u64 {
     const hi = @as(u64, level) << 59;
     const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
@@ -21663,7 +22597,7 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
     // every level keeps its own scroll offset and Back never lands a parent
     // thread at the top.
     const feed = feedContent(ui, model);
-    const content = if (levels and (model.viewing_thread != 0 or model.viewing_profile != null)) blk: {
+    const content = if (levels and model.levelOpen()) blk: {
         // feed + one panel per level: the back-stacked levels (oldest first),
         // then the current one on top. A level is a thread or a person; both
         // spend one virtual window either way, which is why they share a stack.
@@ -21671,18 +22605,38 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
         kids[0] = feed;
         for (0..model.thread_stack_len) |d| {
             const screen = &model.thread_stack[d];
+            if (screen.bookmarks) {
+                const lk = bookmarks_level_key + d;
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, .bookmarks, &.{}, false, lk, d, true));
+                continue;
+            }
+            if (screen.topic()) |t| {
+                const lk = topicLevelKey(d, t);
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, .{ .topic = t }, &.{}, false, lk, d, true));
+                continue;
+            }
             if (screen.profile) |pk| {
                 const lk = profileLevelKey(d, pk);
-                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, pk, &.{}, false, lk, d, true));
+                kids[1 + d] = threadOccluder(ui, lk, profilePanel(ui, model, .{ .person = pk }, &.{}, false, lk, d, true));
                 continue;
             }
             const root = &screen.note;
             const lk = threadLevelKey(d, root.id);
             kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
         }
+        if (model.viewing_bookmarks) {
+            const lk = bookmarks_level_key + model.thread_stack_len;
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, .bookmarks, model.thread_notes[0..model.thread_notes_len], false, lk, model.thread_stack_len, false));
+            break :blk ui.stack(.{ .grow = 1 }, .{kids});
+        }
+        if (model.viewingTopic()) |t| {
+            const lk = topicLevelKey(model.thread_stack_len, t);
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, .{ .topic = t }, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+            break :blk ui.stack(.{ .grow = 1 }, .{kids});
+        }
         if (model.viewing_profile) |pk| {
             const lk = profileLevelKey(model.thread_stack_len, pk);
-            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, pk, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+            kids[kids.len - 1] = threadOccluder(ui, lk, profilePanel(ui, model, .{ .person = pk }, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
             break :blk ui.stack(.{ .grow = 1 }, .{kids});
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
@@ -21754,7 +22708,7 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
     //
     // The trade is visible and worth naming: those bands either side of a sheet
     // now show the app's background rather than a blurred, dimmed feed.
-    const occluded = model.viewing_thread != 0 or model.viewing_profile != null or
+    const occluded = model.levelOpen() or
         model.stage == .settings or model.composing or model.notifications_open or model.joining;
     if (occluded) options.item_count = 0;
     // A level drawn opaquely over the feed hides every one of these rows, and
@@ -23076,37 +24030,100 @@ const default_share_base = "https://njump.me/";
 /// step and a reader finding different things depending on which way they
 /// reached. The runtime presents these as the platform's own menu where there is
 /// one, and as an anchored surface where there is not.
+/// Every row this menu can carry, so the count is stated once instead of being
+/// the sum of the branches below.
+///
+/// It was 7, and eight rows could be written. In the feed (`in_thread` false)
+/// inside a place declaring a handler for kind 1, the tally runs: open thread,
+/// copy address, quote, copy text, open on the web, open in the handler,
+/// separator, follow. The eighth landed at index 7 of a seven-element
+/// allocation and the function then returned `items[0..8]` from it.
+///
+/// One row was bounds-checked, the handler row, and the two written after it
+/// were not, so the guard sat directly above the overrun it did not prevent.
+/// That is the actual lesson and it is why `push` below exists: a rule applied
+/// at one call site is not a rule. Debug catches this as a panic; ReleaseFast,
+/// which is what ships, has no bounds check and writes past the allocation.
+const note_context_capacity = 10;
+
 fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppUi.ContextMenuItem {
-    const items = ui.arena.alloc(AppUi.ContextMenuItem, 7) catch return &.{};
+    const items = ui.arena.alloc(AppUi.ContextMenuItem, note_context_capacity) catch return &.{};
     var n: usize = 0;
-    if (!in_thread) {
-        items[n] = .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } };
-        n += 1;
-    }
-    items[n] = .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } };
-    n += 1;
-    items[n] = .{ .label = "Quote", .msg = Msg{ .quote_note = note.id } };
-    n += 1;
-    items[n] = .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } };
-    n += 1;
-    items[n] = .{ .label = ui.fmt("Open on {s}", .{shareHost(shareBase())}), .msg = Msg{ .open_web = note.id } };
-    n += 1;
+    // The only way a row is written. Adding one is adding a `push`, and a row
+    // too many is a row dropped rather than memory scribbled on.
+    const push = struct {
+        fn f(dst: []AppUi.ContextMenuItem, at: *usize, item: AppUi.ContextMenuItem) void {
+            if (at.* >= dst.len) return;
+            dst[at.*] = item;
+            at.* += 1;
+        }
+    }.f;
+
+    if (!in_thread) push(items, &n, .{ .label = "Open thread", .msg = Msg{ .open_thread = note.id } });
+    push(items, &n, .{ .label = "Copy note address", .msg = Msg{ .copy_nevent = note.id } });
+    push(items, &n, .{ .label = "Quote", .msg = Msg{ .quote_note = note.id } });
+    push(items, &n, .{ .label = "Copy text", .msg = Msg{ .copy_note_text = note.id } });
+    push(items, &n, .{ .label = ui.fmt("Open on {s}", .{shareHost(shareBase())}), .msg = Msg{ .open_web = note.id } });
     // And where THIS community reads its notes, when it says. Beside the app's
     // own row rather than instead of it: a place naming a handler is telling
     // the reader where it lives, not taking njump away from them.
     if (activePlace()) |place| {
         if (place.handlerFor(1)) |h| {
-            if (n < items.len) {
-                items[n] = .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } };
-                n += 1;
-            }
+            push(items, &n, .{ .label = ui.fmt("Open in {s}", .{h.name()}), .msg = Msg{ .open_place_handler = note.id } });
         }
     }
-    items[n] = .{ .separator = true };
-    n += 1;
-    items[n] = followContextItem(note.pubkey);
-    n += 1;
+    push(items, &n, .{ .separator = true });
+    push(items, &n, bookmarkContextItem(note));
+    push(items, &n, privateBookmarkContextItem(note));
+    if (isMine(note.pubkey)) {
+        push(items, &n, .{ .label = "Delete", .msg = Msg{ .delete_note_request = note.id } });
+    }
+    push(items, &n, followContextItem(note.pubkey));
     return items[0..n];
+}
+
+/// The bookmark row, in whatever state it is honestly in.
+///
+/// Disabled with the reason on it rather than silently dead, the way Follow is.
+/// A reader whose own list has not arrived yet is looking at a button this app
+/// must not press, and saying so is the point: pressing it would publish a list
+/// of one note over everything they had saved.
+fn bookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
+    if (activePubkey() == null) return .{ .label = "Bookmark", .enabled = false };
+    if (!bookmarksAreOwned() and !g_identity_minted_here) {
+        return .{ .label = "Still fetching your bookmarks", .enabled = false };
+    }
+    if (isBookmarked(note.event_id)) {
+        return .{ .label = "Remove bookmark", .msg = Msg{ .toggle_bookmark = note.id } };
+    }
+    return .{ .label = "Bookmark", .msg = Msg{ .toggle_bookmark = note.id } };
+}
+
+/// The private-bookmark row.
+///
+/// Only offered for ADDING. Removing one is the same press as removing a public
+/// one: `toggle_bookmark` looks at where the entry actually is, so a reader is
+/// never asked to remember which half they put it in.
+///
+/// Absent once the note is already bookmarked either way, because "bookmark
+/// privately" on something already saved is a question about moving it between
+/// halves, and that is a different feature.
+fn privateBookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
+    if (activePubkey() == null) return .{ .label = "Bookmark privately", .enabled = false };
+    if (!bookmarksAreOwned() and !g_identity_minted_here) {
+        return .{ .label = "Bookmark privately", .enabled = false };
+    }
+    if (isBookmarked(note.event_id)) return .{ .label = "Bookmark privately", .enabled = false };
+    return .{ .label = "Bookmark privately", .msg = Msg{ .bookmark_privately = note.id } };
+}
+
+/// Whether this account wrote it. Absent rather than disabled is the right
+/// treatment for Delete on somebody else's note: a greyed row offers a thing
+/// that is not on offer, where a greyed Follow explains a state the reader is
+/// actually in.
+fn isMine(author: [32]u8) bool {
+    const me = activePubkey() orelse return false;
+    return std.mem.eql(u8, &me, &author);
 }
 
 /// The follow entry for a right-click, in whatever state it is honestly in.
@@ -23389,6 +24406,13 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // told them about it.
     if (openNotaryAvailable()) {
         rows[n] = menuRow(ui, "Open Notary", null, null, .open_notary_window);
+        n += 1;
+    }
+    // Where a bookmark can be found again, which is the half of the feature that
+    // makes the other half worth having. Signed-in only: a guest cannot have a
+    // list, and a row that opens an empty screen is a worse answer than no row.
+    if (activePubkey() != null) {
+        rows[n] = menuRow(ui, ui.fmt("Bookmarks ({d})", .{bookmarkCount()}), null, null, .open_bookmarks);
         n += 1;
     }
     // No glyph. "Open Notary" carries none either, and one icon among two reads
@@ -25187,12 +26211,20 @@ pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef
         // `underline` unset stated the intent and got a hairline anyway. SDK
         // 0.9.2 made the flag mean what it says, so the intent and the pixels
         // finally agree. Mentions are marked by weight and colour, not a rule.
+        // A topic is neither a person nor a web link, and it used to be painted
+        // as though it were both: the same identity violet as a mention and a
+        // URL, carrying no payload, so the one run that looked most pressable
+        // was the only one that did nothing. It now reads as its own thing, in
+        // the muted-secondary token rather than the identity colour, and it
+        // carries where it goes.
         spans[n] = if (is_url)
             .{ .text = run, .color = .info, .link = run }
         else if (is_mention)
             .{ .text = run, .color = .info, .weight = .medium }
-        else
-            .{ .text = run, .color = .info };
+        else if (is_hashtag) blk: {
+            const link = topicLinkFor(run[1..]) orelse break :blk canvas.TextSpan{ .text = run, .color = .text_muted };
+            break :blk canvas.TextSpan{ .text = run, .color = .text_muted, .link = link };
+        } else .{ .text = run, .color = .info };
         n += 1;
         i = j;
         plain_start = j;
@@ -27253,7 +28285,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (postIsDue(g_reply_due_s, nowSeconds())) fireReply(model, fx, g_held_route);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
-                if (g_signer_kind == .remote) scanPendingRemote(model);
+                if (g_signer_kind == .remote) scanPendingRemote(model, fx);
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (g_signer_kind == .helper) scanHelperSign(model);
@@ -27285,6 +28317,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .private_half => |response| handlePrivateHalf(response),
+        .private_seal => |response| handlePrivateSeal(model, fx, response),
 
         .helper_line => |line| {
             // The daemon says where it landed, and until it does there is
@@ -27602,6 +28635,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_places_rail => togglePlacesRail(),
         .open_place_info => g_place_info = .open,
         .close_place_info => g_place_info = .closed,
+        .toggle_bookmark => |note_id| {
+            const note = model.noteById(note_id) orelse return;
+            const adding = !isBookmarked(note.event_id);
+            sayBookmarkWrite(model, writeBookmark(fx, note.event_id, adding), adding);
+        },
+        .bookmark_privately => |note_id| {
+            const note = model.noteById(note_id) orelse return;
+            // A seal is a round trip, so nothing is said until it lands: the
+            // toast comes from `finishPrivateBookmark`, or from the refusal.
+            switch (writePrivateBookmark(fx, note.event_id, true)) {
+                .published => {},
+                else => |outcome| sayBookmarkWrite(model, outcome, true),
+            }
+        },
+        .open_bookmarks => openBookmarks(model),
+        .delete_note_request => |id| model.deleting_note = id,
+        .delete_note_cancel => model.deleting_note = null,
+        .delete_note_confirm => {
+            const id = model.deleting_note;
+            model.deleting_note = null;
+            if (id) |note_id| deleteNote(model, fx, note_id);
+        },
         .place_leave_request => g_place_info = .leaving,
         .place_leave_cancel => g_place_info = .open,
         .place_resume => resumeVisit(),
@@ -27948,7 +29003,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // the ordinary links. Its payload is not a URL and never reaches the
         // browser; see `mention_link_tag`.
         .open_url => |url| {
-            if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
+            // Checked before the mention form and before the browser: all three
+            // ride one message, and only the sentinel tells them apart.
+            if (topicLinkValue(url)) |topic| {
+                openTopic(model, topic);
+            } else if (mentionLinkPubkey(url)) |pubkey| openPerson(model, pubkey) else openExternally(fx, url);
         },
         .expand_image => |note_id| {
             model.expanded_note = note_id;
@@ -28091,6 +29150,21 @@ fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
         // was not the list it meant to. Saying "try again" would be wrong: the
         // right move is to leave it alone until the real list is back.
         .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .failed => setToast(model, "That did not save, and nothing was published."),
+    }
+}
+
+/// What a bookmark write did, in the reader's terms.
+fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
+    switch (outcome) {
+        .published => setToast(model, if (adding) "Bookmarked" else "Bookmark removed"),
+        .nothing_to_do => {},
+        .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
+        .no_list_yet => setToast(model, "Still fetching your bookmarks. Try again in a moment."),
+        // Not "try again": the right move is to leave the list alone until the
+        // half can be read, because writing without it would erase every
+        // private bookmark in it.
+        .private_half_unreadable => setToast(model, "Part of your bookmark list is encrypted and could not be opened, so nothing was published."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -28866,8 +29940,10 @@ fn enterFeed(model: *Model) void {
     // of the account that is actually signed in.
     forgetFollows();
     forgetMutes();
+    forgetBookmarks();
     loadFollowsFromStore();
     loadMutesFromStore();
+    loadBookmarksFromStore();
     // And what people sent this account while it was away.
     loadInbox();
 }
@@ -29756,10 +30832,19 @@ pub fn repostContent(gpa: std.mem.Allocator, note: *const Note) []const u8 {
 }
 
 /// The NIP-09 deletion tags to un-like: `["e", reaction_id]`, `["k", "7"]`.
-fn buildUnlikeTags(gpa: std.mem.Allocator, reaction_id: [32]u8) ?[]const nostr.event.Tag {
-    const id_hex = hexAlloc(gpa, reaction_id) orelse return null;
+/// The tags of a NIP-09 deletion: the event it asks relays to drop, and the
+/// kind that event was. This was `buildUnlikeTags` with the 7 written in, which
+/// is the same builder with one number decided in advance.
+///
+/// The `k` tag is what lets a relay refuse a request to delete something of a
+/// kind the sender should not be deleting, without fetching the target first.
+fn buildDeleteTags(gpa: std.mem.Allocator, target_id: [32]u8, target_kind: u16) ?[]const nostr.event.Tag {
+    const id_hex = hexAlloc(gpa, target_id) orelse return null;
+    var kind_buf: [8]u8 = undefined;
+    const kind_text = std.fmt.bufPrint(&kind_buf, "{d}", .{target_kind}) catch return null;
+    const kind_owned = gpa.dupe(u8, kind_text) catch return null;
     const e = gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null;
-    const k = gpa.dupe([]const u8, &.{ "k", "7" }) catch return null;
+    const k = gpa.dupe([]const u8, &.{ "k", kind_owned }) catch return null;
     const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
     tags[0] = e;
     tags[1] = k;
@@ -29859,12 +30944,70 @@ fn clearRepostedByMe(note_id: i64) void {
 fn unlike(fx: *Effects, note_id: i64) void {
     const gpa = std.heap.page_allocator;
     const reaction_id = forgetLike(note_id) orelse return;
-    const tags = buildUnlikeTags(gpa, reaction_id) orelse return;
+    const tags = buildDeleteTags(gpa, reaction_id, 7) orelse return;
     const content = gpa.dupe(u8, "") catch return;
     // The id is already gone from the table by here, so the undo carries it:
     // without it a refused un-like empties the heart, leaves the kind:7 on
     // every relay, and the next press publishes a second reaction.
     signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } }, null);
+}
+
+/// Asks the relays to drop a note this reader wrote.
+///
+/// The local half needs no code: the store tombstones and removes on ingest of
+/// a kind:5, scoped to the same author, the signed event reaches it through the
+/// one door every write goes through, and a kind:5 landing already invalidates
+/// the feed. So the note leaves the feed on the next rebuild with nothing added
+/// here.
+///
+/// Kind 1 only, and that is a rule rather than a simplification. A replaceable
+/// event is superseded, never deleted: `capturePrevious` and `keepReplaced`
+/// exist so a list can be walked back, and a kind:5 aimed at one would ask
+/// relays to drop the reader's follow list or their relay list with no way
+/// back. Amethyst does delete lists this way. This will not.
+fn deleteNote(model: *Model, fx: *Effects, note_id: i64) void {
+    const target = deletableTarget(model, note_id) orelse return;
+    if (!signerReady()) return;
+    const gpa = std.heap.page_allocator;
+    const tags = buildDeleteTags(gpa, target.event_id, target.kind) orelse return;
+    const content = gpa.dupe(u8, "") catch return;
+    // A thread level is a snapshot, so reading the note you just deleted would
+    // leave a level showing an event the store no longer holds.
+    if (model.viewing_thread == note_id) closeThread(model);
+    signAndPublish(fx, gpa, nowSeconds(), 5, tags, content, false, .none, null);
+}
+
+/// What a deletion may target, or null when the answer is no.
+///
+/// Separated from the publish because these gates are the whole safety of the
+/// feature and a test has to be able to ask them without signing anything.
+fn deletableTarget(model: *Model, note_id: i64) ?struct { event_id: [32]u8, kind: u16 } {
+    const note = model.noteById(note_id) orelse return null;
+    const me = activePubkey() orelse return null;
+    if (!std.mem.eql(u8, &note.pubkey, &me)) return null;
+    // The kind comes from the STORE, not from the card. A `Note` carries no
+    // kind: the feed builds one from whatever it drew, and an event of a kind
+    // this app cannot render is still drawn as a note today (#268). Reading the
+    // stored event is the only way to know what is actually being asked for,
+    // and it is worth a disk read on the one action with no undo.
+    const store = g_store orelse return null;
+    var stored = (store.getEvent(std.heap.page_allocator, note.event_id) catch return null) orelse return null;
+    defer stored.deinit();
+    // Kind 1 only, and that is a rule rather than a simplification. A
+    // replaceable event is superseded, never deleted: `capturePrevious` and
+    // `keepReplaced` exist so a list can be walked back, and a kind:5 aimed at
+    // one would ask relays to drop this reader's follow list or their relay
+    // list with no way back. Amethyst deletes lists this way. This will not.
+    if (stored.event.kind != 1) return null;
+    // The card said it was theirs; the stored event has to agree. A card is
+    // built by the feed and a signature is not.
+    if (!std.mem.eql(u8, &stored.event.pubkey, &me)) return null;
+    return .{ .event_id = note.event_id, .kind = stored.event.kind };
+}
+
+pub fn deletableTargetKindForTest(model: *Model, note_id: i64) ?u16 {
+    const t = deletableTarget(model, note_id) orelse return null;
+    return t.kind;
 }
 
 /// After sign-in, completes a like a guest reached for: the welcome-in moment.
@@ -31088,6 +32231,18 @@ pub fn closeThreadForTest(model: *Model) void {
 /// and a no-op at the depth cap, which is the same rule threads always had.
 fn pushCurrentScreen(model: *Model) void {
     if (model.thread_stack_len >= model.thread_stack.len) return;
+    if (model.viewing_bookmarks) {
+        model.thread_stack[model.thread_stack_len] = .{ .bookmarks = true };
+        model.thread_stack_len += 1;
+        return;
+    }
+    if (model.viewingTopic()) |topic| {
+        var level = Screen{ .topic_len = @intCast(topic.len) };
+        @memcpy(level.topic_buf[0..topic.len], topic);
+        model.thread_stack[model.thread_stack_len] = level;
+        model.thread_stack_len += 1;
+        return;
+    }
     if (model.viewing_profile) |pk| {
         model.thread_stack[model.thread_stack_len] = .{ .profile = pk };
         model.thread_stack_len += 1;
@@ -31274,6 +32429,69 @@ fn fetchOlderWorker(until: i64) void {
 }
 
 /// Opens a person as a level of their own.
+/// Opens a topic as a level of its own: what this reader already holds carrying
+/// that `t` tag, on the back stack, with the feed left where it was.
+///
+/// Local store first and rendered immediately, then a bounded ask to the read
+/// relays behind it. A topic has no author, so the outbox model has nothing to
+/// say about where to ask: the reader's own read relays are the honest answer,
+/// rather than a search relay nobody chose.
+fn openTopic(model: *Model, topic: []const u8) void {
+    if (topic.len == 0 or topic.len > max_topic_bytes) return;
+    // Already here: pressing `#zig` inside the `#zig` topic would otherwise push
+    // a second copy of it and cost a Back to undo.
+    if (model.viewingTopic()) |current| {
+        if (std.mem.eql(u8, current, topic)) return;
+    }
+    model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+    pushCurrentScreen(model);
+    model.viewing_profile = null;
+    model.viewing_thread = 0;
+    model.thread_notes_len = 0;
+    model.reply_buffer.clear();
+    @memcpy(model.topic_buf[0..topic.len], topic);
+    model.topic_len = @intCast(topic.len);
+    const now = nowSeconds();
+    const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+    model.thread_seq = seq;
+    model.thread_open_at = now;
+    model.refreshTopicNotes(now);
+    model.thread_loading = model.thread_notes_len == 0;
+    fetchTopicNotes(topic, seq);
+}
+
+pub fn openTopicForTest(model: *Model, topic: []const u8) void {
+    openTopic(model, topic);
+}
+
+/// Opens the bookmark list as a level of its own.
+///
+/// The answer to "a bookmark I cannot find again is a button, not a feature".
+fn openBookmarks(model: *Model) void {
+    if (model.viewing_bookmarks) return;
+    model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+    pushCurrentScreen(model);
+    model.viewing_profile = null;
+    model.viewing_thread = 0;
+    model.topic_len = 0;
+    model.thread_notes_len = 0;
+    model.reply_buffer.clear();
+    model.viewing_bookmarks = true;
+    model.thread_seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
+    model.thread_open_at = nowSeconds();
+    // Read from this machine and nothing else. Every bookmarked note was in the
+    // feed when it was saved, so it is already here; there is no relay round
+    // trip to wait on and no skeleton to show.
+    model.refreshBookmarkNotes(nowSeconds());
+    model.thread_loading = false;
+}
+
+pub fn openBookmarksForTest(model: *Model) void {
+    openBookmarks(model);
+}
+
 fn enterProfile(model: *Model, pubkey: [32]u8) void {
     // Already here. Pressing a face on somebody's own page would otherwise push
     // a second copy of the same person and cost a Back to undo.
@@ -31375,13 +32593,33 @@ fn closeThread(model: *Model) void {
         const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
         model.thread_seq = seq;
         model.thread_open_at = now;
-        if (prev.profile) |pk| {
+        if (prev.bookmarks) {
+            model.viewing_profile = null;
+            model.viewing_thread = 0;
+            model.topic_len = 0;
+            model.viewing_bookmarks = true;
+            model.refreshBookmarkNotes(now);
+            model.thread_loading = false;
+        } else if (prev.topic()) |topic| {
+            model.viewing_bookmarks = false;
+            model.viewing_profile = null;
+            model.viewing_thread = 0;
+            @memcpy(model.topic_buf[0..topic.len], topic);
+            model.topic_len = @intCast(topic.len);
+            model.refreshTopicNotes(now);
+            model.thread_loading = model.thread_notes_len == 0;
+            fetchTopicNotes(topic, seq);
+        } else if (prev.profile) |pk| {
+            model.viewing_bookmarks = false;
+            model.topic_len = 0;
             model.viewing_profile = pk;
             model.viewing_thread = 0;
             model.refreshProfileNotes(now);
             model.thread_loading = model.thread_notes_len == 0;
             fetchProfileNotes(pk, seq);
         } else {
+            model.viewing_bookmarks = false;
+            model.topic_len = 0;
             model.viewing_profile = null;
             model.viewing_thread = prev.note.id;
             model.thread_root = prev.note;
@@ -31390,6 +32628,8 @@ fn closeThread(model: *Model) void {
             fetchThreadReplies(prev.note.event_id, seq);
         }
     } else {
+        model.viewing_bookmarks = false;
+        model.topic_len = 0;
         model.viewing_profile = null;
         model.viewing_thread = 0;
         model.thread_loading = false;
@@ -31417,6 +32657,72 @@ var g_thread_done_seq = std.atomic.Value(u64).init(0);
 /// read relay, their kind:1s, then on EOSE a second subscription for what those
 /// notes collected, folding into the same engagement table the feed and threads
 /// use. Without the second phase every row on a profile shows zero counts.
+/// Asks this reader's read relays for a topic, once. A topic has no author, so
+/// there is no outbox question to answer: the relays this reader already reads
+/// are the honest set, rather than a search relay nobody chose.
+fn fetchTopicNotes(topic: []const u8, seq: u64) void {
+    if (g_store == null or topic.len == 0 or topic.len > max_topic_bytes) {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    }
+    var owned: [max_topic_bytes]u8 = undefined;
+    @memcpy(owned[0..topic.len], topic);
+    const thread = std.Thread.spawn(.{}, fetchTopicWorker, .{ owned, @as(u8, @intCast(topic.len)), seq }) catch {
+        g_thread_done_seq.store(seq, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    defer g_thread_done_seq.store(seq, .release);
+
+    const topic = topic_buf[0..topic_len];
+    const kinds = [_]u16{1};
+    const values = [_][]const u8{topic};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
+    const filters = [_]nostr.filter.Filter{
+        .{ .kinds = &kinds, .tags = &tags, .limit = thread_reply_cap },
+    };
+
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have let
+        // go of this pointer before the connection is freed.
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.subscribe("plaza-topic", &filters) catch continue;
+        var seen: usize = 0;
+        // Bounded, for the reason the profile fetch is: `receive` has no
+        // deadline, and a relay that accepts a subscription and then goes quiet
+        // would hold this thread for the life of the process.
+        while (seen < profile_fetch_messages) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    if (e.event.kind != 1) continue;
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                },
+                .eose => break,
+                else => {},
+            }
+        }
+        relay.unsubscribe("plaza-topic") catch {};
+    }
+}
+
 fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
     if (g_store == null) {
         g_thread_done_seq.store(seq, .release);
@@ -31920,7 +33226,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false, .none)) return;
+    if (!registerPending(req_id, .connect, null, false, .none, 0)) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -31960,12 +33266,49 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable, route)) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0)) {
         gpa.free(content_owned);
         return;
     }
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
+}
+
+/// Remote path for a private half: ask the bunker to open it.
+///
+/// Without this a reader signed in through an external signer could never read
+/// their own encrypted list. `scanPrivateHalves` only knew how to ask the LOCAL
+/// keyholder over HTTP, so on a bunker the ask went to a daemon that either is
+/// not running or does not hold the key, came back not-ok, and the half was
+/// marked refused forever. `writeMute` then refused every mute write, because
+/// a private half that is present and unreadable is exactly the case it will
+/// not publish over. So the safety guard was firing correctly on a question
+/// that was never actually asked of the right signer.
+///
+/// The peer is the reader's own pubkey: NIP-51 encrypts a private half to
+/// yourself, so both sides of the conversation key are this account's.
+fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: []const u8) bool {
+    var hexbuf: [64]u8 = undefined;
+    hexLower(&hexbuf, g_remote_pubkey);
+    var idbuf: [24]u8 = undefined;
+    const req_id = newRequestId(&idbuf) orelse return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, @intCast(half_index))) return false;
+    const params = [_][]const u8{ &hexbuf, ciphertext };
+    sendRequest(gpa, .{ .id = req_id, .method = "nip44_decrypt", .params = &params });
+    return true;
+}
+
+/// Remote path for a seal: ask the bunker to encrypt a private half to this
+/// reader's own key. The answer completes the bookmark write.
+fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
+    var hexbuf: [64]u8 = undefined;
+    hexLower(&hexbuf, g_remote_pubkey);
+    var idbuf: [24]u8 = undefined;
+    const req_id = newRequestId(&idbuf) orelse return false;
+    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0)) return false;
+    const params = [_][]const u8{ &hexbuf, plaintext };
+    sendRequest(gpa, .{ .id = req_id, .method = "nip44_encrypt", .params = &params });
+    return true;
 }
 
 /// Serializes `request` and spawns a one-shot thread to seal and publish it.
@@ -32114,6 +33457,29 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
     switch (pending.method) {
         // The connect ack is a plain "ack" string; the status above is the point.
         .connect => {},
+        // The plaintext of a private half. Parked for the UI tick rather than
+        // written straight into `g_private_halves`, which the view reads every
+        // frame and `scanPrivateHalves` writes on the other thread.
+        .nip44_encrypt => {
+            pendingLock();
+            defer pendingUnlock();
+            const n = @min(resp.value.result.len, g_seal_inbox.buf.len);
+            @memcpy(g_seal_inbox.buf[0..n], resp.value.result[0..n]);
+            g_seal_inbox.len = @intCast(n);
+            g_seal_inbox.used = true;
+            g_seal_inbox.ok = n > 0;
+        },
+        .nip44_decrypt => {
+            pendingLock();
+            defer pendingUnlock();
+            for (&g_half_inbox) |*box| {
+                if (box.used) continue;
+                const n = @min(resp.value.result.len, box.plain_buf.len);
+                box.* = .{ .used = true, .index = pending.half_index, .ok = true, .plain_len = @intCast(n) };
+                @memcpy(box.plain_buf[0..n], resp.value.result[0..n]);
+                break;
+            }
+        },
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
@@ -32150,7 +33516,7 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
 /// an empty composer, so a newer draft is never clobbered) and shows a notice;
 /// a `connect` that never returned fails the connection status. A slot from a
 /// superseded generation (logout/reconnect) is dropped silently.
-fn scanPendingRemote(model: *Model) void {
+fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     const now = nowSeconds();
     const gpa = std.heap.page_allocator;
     const generation = g_remote_generation.load(.acquire);
@@ -32158,6 +33524,7 @@ fn scanPendingRemote(model: *Model) void {
     var sign_failed = false;
     var any_sign_failed = false;
     var connect_failed = false;
+    var seal_failed = false;
 
     pendingLock();
     for (&g_pending) |*slot| {
@@ -32167,6 +33534,7 @@ fn scanPendingRemote(model: *Model) void {
         if (!stale and !due) continue;
         const method = slot.method;
         const content = slot.content;
+        const slot_half = slot.half_index;
         const slot_restorable = slot.restorable;
         slot.* = .{};
         if (stale) {
@@ -32190,9 +33558,67 @@ fn scanPendingRemote(model: *Model) void {
                 if (content) |c| gpa.free(c);
                 connect_failed = true;
             },
+            // Refused or never answered. NOT "the half is empty": that
+            // distinction is the whole reason this cache exists, and collapsing
+            // the two is what publishes an empty content over somebody's
+            // private list.
+            .nip44_decrypt => {
+                if (content) |c| gpa.free(c);
+                if (slot_half < g_private_halves.len) g_private_halves[slot_half].state = .refused;
+            },
+            // A seal the bunker refused or never answered. The list is left
+            // exactly as it was, which is the only safe outcome: the reader
+            // still has every private bookmark they had.
+            .nip44_encrypt => {
+                if (content) |c| gpa.free(c);
+                seal_failed = true;
+            },
         }
     }
+    // Answers that came back while the listener held them. Applied here so
+    // every write to `g_private_halves` happens on this thread.
+    var opened = false;
+    for (&g_half_inbox) |*box| {
+        if (!box.used) continue;
+        const i = box.index;
+        if (i < g_private_halves.len and g_private_halves[i].used) {
+            const h = &g_private_halves[i];
+            if (box.ok and box.plain_len > 0) {
+                const n = @min(box.plain_len, h.plain_buf.len);
+                @memcpy(h.plain_buf[0..n], box.plain_buf[0..n]);
+                h.plain_len = @intCast(n);
+                h.state = .open;
+                opened = true;
+            } else {
+                h.state = .refused;
+            }
+        }
+        box.* = .{};
+    }
+    // The bunker's ciphertext, if one arrived. Applied here so the splice and
+    // the publish happen on this thread, like every other write.
+    var sealed: ?[]const u8 = null;
+    var sealed_buf: [4096]u8 = undefined;
+    if (g_seal_inbox.used) {
+        if (g_seal_inbox.ok and g_seal_inbox.len > 0) {
+            @memcpy(sealed_buf[0..g_seal_inbox.len], g_seal_inbox.buf[0..g_seal_inbox.len]);
+            sealed = sealed_buf[0..g_seal_inbox.len];
+        } else seal_failed = true;
+        g_seal_inbox = .{};
+    }
     pendingUnlock();
+    if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
+    if (seal_failed) {
+        g_private_seal = .{};
+        setToast(model, "Your signer did not seal that, so nothing was published.");
+    }
+    if (opened) {
+        // The set was read with this half closed, so it is short by whatever
+        // was in it. Read it again now that it can be.
+        loadMutesFromStore();
+        loadBookmarksFromStore();
+        invalidateFeed();
+    }
 
     if (restore) |c| {
         if (model.draft_empty()) model.draft_buffer.set(c);
@@ -32403,6 +33829,7 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     // than on nine strangers while it waits for a relay.
     loadFollowsFromStore();
     loadMutesFromStore();
+    loadBookmarksFromStore();
     loadInbox();
 
     // The reader's own list, or the one the app was born with. Read before the
@@ -33136,6 +34563,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // feed built from a stranger's list.
     forgetFollows();
     forgetMutes();
+    forgetBookmarks();
     resetInbox();
     forgetPlaces();
     // And a note this account was about to sign. It is held on the near side of

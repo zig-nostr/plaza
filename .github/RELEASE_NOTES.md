@@ -1,5 +1,19 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.19.0
+
+**The dead controls work now.** Three things under every note were drawn and did nothing. A bookmark you could press that saved nothing, a hashtag painted like a link that went nowhere, and no way at all to delete your own note. Each one is now a real verb.
+
+**Bookmarks, public or private.** Saved as a NIP-51 list on your own relays, so they follow you to any other client. "Bookmark privately" seals the entry to your own key, so the relay holds it and cannot read it, and private bookmarks you made in another client show up here too. Find them again from the account menu, which carries the count. Plaza reads the whole list before it writes one, and refuses to publish at all rather than write over a private half it could not open, because publishing without those bytes is how a client erases everything you saved privately.
+
+**Hashtags go somewhere.** Pressing one opens the notes carrying that tag, read from this machine first, so what you already have is on screen before any relay is asked. It also stops being painted in the same violet as a person and a web link, because it is neither.
+
+**Delete your own note.** In the right-click menu, on your own notes only, with a confirmation. The wording says what actually happens: relays are asked to drop it, most will, and anything already passed on may keep being served. Your own notes only, and never a list: a follow list or a relay list is replaced, never deleted, and a deletion aimed at one has no way back.
+
+**An external signer can encrypt and decrypt.** If you sign in through a bunker rather than the built-in keyholder, Plaza can now read the encrypted half of your own lists. Before, it asked the local keyholder, which does not hold your key, so every private mute was unreadable and every mute write was refused.
+
+**A crash that could have happened.** The right-click menu could write one row past the end of its own allocation, inside a place that declares a handler. Debug caught it; the shipping build had no bounds check.
+
 ### What's new in v0.18.7
 
 **A name written in fancy letters is a name again.** Unicode has a block of thirteen styled Latin alphabets meant for mathematics, and the "fancy text" generators use it as a font picker, so plenty of people on Nostr have a display name like 𝕾𝖊𝖗 𝕾𝖑𝖊𝖊𝖕𝖞 or 𝔸𝕝𝕚𝕔𝕖. Off macOS, Plaza had no glyph for a single one of those 996 characters, so the name came out as a solid grey bar per word. Those letters are ordinary Latin letters wearing a style, so Plaza now reads them as what they are and the name shows up.
