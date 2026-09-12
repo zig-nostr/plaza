@@ -63,7 +63,32 @@ main() {
   local tag url digest
   tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   url="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*macos\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/' || true)"
-  digest="$(printf '%s' "$json" | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2 || true)"
+  # The digest OF THE FILE BEING DOWNLOADED, which is not the same thing as the
+  # first digest in the release.
+  #
+  # This used to be `grep -o 'sha256:...' | head -1` over the whole response.
+  # Correct while a release carried one asset, and silently wrong once Linux
+  # tarballs were added: GitHub lists assets in upload order, so the first digest
+  # belongs to whichever packaging job finished first. macOS won that race
+  # through v0.18.x and lost it at v0.19.0, and every macOS install then died
+  # with "checksum mismatch" on a download that was perfectly fine. Nothing in
+  # this script changed between those two releases.
+  #
+  # That is the worst way for a checksum to fail. The bytes were right and the
+  # comparison was against a different file, so the tool told people their
+  # download was corrupt and refused to continue. A check that cries wolf
+  # teaches people to skip checks.
+  #
+  # So the digest is read from the asset that names the file. The response is
+  # pretty-printed, so it is FLATTENED FIRST and only then split on the `{` that
+  # starts each object: without the flatten every field is already on its own
+  # line and the name and the digest can never meet. The segment that names the
+  # macOS zip is bounded by the next asset's `{`, so it cannot reach a
+  # neighbour's digest.
+  #
+  # No jq. This runs before anything is installed and uses only what macOS
+  # already ships.
+  digest="$(printf '%s' "$json" | tr -d '\n' | tr '{' '\n' | grep 'macos\.zip' | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2 || true)"
 
   [ -n "$url" ] || die "release ${tag:-unknown} has no macOS build attached. Try https://github.com/$repo/releases"
   say "Latest release: ${tag:-unknown}"
