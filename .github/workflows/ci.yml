@@ -92,6 +92,20 @@ jobs:
             exit 1
           fi
           echo "release notes are for v$version"
+
+      # The installer verifies the file it downloaded, not whatever is listed
+      # first. This fired for real on v0.19.0: the script took the first
+      # `sha256:` in the release JSON, which was correct while a release carried
+      # one asset and quietly stopped being correct when Linux tarballs were
+      # added. GitHub lists assets in upload order, so the first digest belongs
+      # to whichever packaging job won the race. macOS won through v0.18.x and
+      # lost at v0.19.0, and every macOS install then failed with "checksum
+      # mismatch" on a download that was perfectly fine.
+      #
+      # The checks live in the script so they can be run by hand, and so this
+      # file does not carry shell that only ever runs on a runner.
+      - name: The macOS installer verifies the macOS download
+        run: scripts/check-macos-installer.sh ${{ github.repository }} .
   portability:
     name: portability (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
