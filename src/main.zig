@@ -32661,7 +32661,7 @@ var g_thread_done_seq = std.atomic.Value(u64).init(0);
 /// there is no outbox question to answer: the relays this reader already reads
 /// are the honest set, rather than a search relay nobody chose.
 fn fetchTopicNotes(topic: []const u8, seq: u64) void {
-    if (g_store == null or topic.len == 0 or topic.len > max_topic_bytes) {
+    if (!relayFetchAllowed() or topic.len == 0 or topic.len > max_topic_bytes) {
         g_thread_done_seq.store(seq, .release);
         return;
     }
@@ -32724,7 +32724,7 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
 }
 
 fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
-    if (g_store == null) {
+    if (!relayFetchAllowed()) {
         g_thread_done_seq.store(seq, .release);
         return;
     }
@@ -32993,11 +32993,37 @@ pub fn indexerAskedLenForTest() usize {
 
 /// a throwaway connection keeps the ingest loops untouched, exactly like
 /// publishing. `seq` tags the fetch so its completion is attributable.
+/// Whether a relay fetch may start at all.
+///
+/// Two reasons to refuse, and they used to be one.
+///
+/// No store means nowhere to put what comes back. That check was also RELIED ON
+/// to keep tests off the network, on the reasoning that a test has no store,
+/// and `fetchThreadReplies` said so in a comment. It was true until v0.19.0,
+/// when the topic view arrived: reading a topic is a store query, so its test
+/// has to open one, and the moment it did the guard stopped firing. The
+/// detached worker then dialled real relays from a unit test and kept ingesting
+/// into an LMDB handle the test had already closed, which segfaults. It is a
+/// race, so it passed far more often than it failed, and it failed on an
+/// unrelated test whose only crime was running at the wrong moment.
+///
+/// So the test case is stated rather than inferred. A guard that checks one
+/// thing and is trusted for another holds only until the two answers diverge,
+/// and nothing announces the day they do.
+///
+/// The caller marks the fetch finished, so the UI never waits on a fetch that
+/// was never allowed to start.
+fn relayFetchAllowed() bool {
+    if (comptime builtin.is_test) return false;
+    return g_store != null;
+}
+
+pub fn relayFetchAllowedForTest() bool {
+    return relayFetchAllowed();
+}
+
 fn fetchThreadReplies(root_id: [32]u8, seq: u64) void {
-    // Nowhere to put the replies without a store; the guard also keeps tests,
-    // which have no store, from dialing relays. Mark it done at once so the UI
-    // does not wait on a fetch that never ran.
-    if (g_store == null) {
+    if (!relayFetchAllowed()) {
         g_thread_done_seq.store(seq, .release);
         return;
     }

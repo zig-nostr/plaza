@@ -12641,6 +12641,33 @@ test "a private bookmark is sealed, written and read back" {
     try testing.expect(main.isBookmarked(public_one));
 }
 
+test "a test never dials a relay, even with a store open" {
+    // The condition that segfaulted CI. Three fetch functions spawn detached
+    // threads that dial relays and write into the store, and all three refused
+    // when there was no store. That check was also RELIED ON to keep tests off
+    // the network, on the reasoning that a test has no store.
+    //
+    // The topic view broke that reasoning, because reading a topic IS a store
+    // query, so its test has to open one. The guard stopped firing, the worker
+    // dialled real relays from a unit test, and it kept ingesting into an LMDB
+    // handle the test had already closed. It is a race, so it passed far more
+    // often than it failed, and when it failed it took down an unrelated test
+    // that happened to be running.
+    //
+    // So: with a store OPEN, which is the case that broke, a fetch is still
+    // refused. Reverting the guard to `g_store != null` fails this line.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/nodial.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    try testing.expect(!main.relayFetchAllowedForTest());
+}
+
 test "a right-click in a place keeps every row it wrote" {
     // The overrun this pins: `noteContextItems` allocated seven items and, in
     // the feed inside a place declaring a handler for kind 1, wrote eight. One
