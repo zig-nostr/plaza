@@ -93,6 +93,30 @@ jobs:
           fi
           echo "release notes are for v$version"
 
+      # And the README says the same version.
+      #
+      # It said v0.18.2 while app.zon said 0.19.0, which is the first thing
+      # anybody reads about this project and the one number they have no way to
+      # check. It drifted because nothing failed when it did: the release notes
+      # have had a check since the day one of them described the wrong release,
+      # and the README never got the same treatment.
+      - name: The README says the version that shipped
+        run: |
+          version="$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' app.zon | head -1)"
+          claimed="$(sed -n 's/.*Status: active development (`v\([0-9.]*\)`).*/\1/p' README.md | head -1)"
+          if [ -z "$claimed" ]; then
+            echo "README.md has no \"Status: active development (vX.Y.Z)\" line."
+            echo "If that line was removed on purpose, remove this check with it."
+            exit 1
+          fi
+          if [ "$claimed" != "$version" ]; then
+            echo "app.zon says $version and README.md says v$claimed."
+            echo "The status line is the first thing anybody reads, and the one"
+            echo "number they cannot check for themselves."
+            exit 1
+          fi
+          echo "the README says v$version, which is what app.zon says"
+
       # The installer verifies the file it downloaded, not whatever is listed
       # first. This fired for real on v0.19.0: the script took the first
       # `sha256:` in the release JSON, which was correct while a release carried
