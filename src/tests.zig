@@ -13455,28 +13455,28 @@ test "opening a reply asks about the conversation, not just that reply" {
         &.{ "e", &root_hex, "", "root" },
         &.{ "e", "b" ** 64, "", "reply" },
     };
-    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &marked, &out));
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, 1, &marked, &out));
     try testing.expectEqualSlices(u8, &focal, &out[0]);
     try testing.expectEqualSlices(u8, &root, &out[1]);
 
     // A root post has nothing above it, so there is nothing to add.
-    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &.{}, &out));
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, 1, &.{}, &out));
     try testing.expectEqualSlices(u8, &focal, &out[0]);
 
     // A note that names ITSELF as its root is one id, not the same id twice.
     var focal_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&focal_hex, "{x}", .{focal}) catch unreachable;
     const self_rooted = [_]nostr.event.Tag{&.{ "e", &focal_hex, "", "root" }};
-    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &self_rooted, &out));
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, 1, &self_rooted, &out));
 
     // A quote is not an ancestor: a mention-marked tag must not be taken as the
     // root, or pressing a note that quotes another opens the wrong thread.
     const quoting = [_]nostr.event.Tag{&.{ "e", &root_hex, "", "mention" }};
-    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, &quoting, &out));
+    try testing.expectEqual(@as(usize, 1), main.threadQueryIds(focal, 1, &quoting, &out));
 
     // An old-style positional reply, with no marker at all, still resolves.
     const positional = [_]nostr.event.Tag{&.{ "e", &root_hex }};
-    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, &positional, &out));
+    try testing.expectEqual(@as(usize, 2), main.threadQueryIds(focal, 1, &positional, &out));
     try testing.expectEqualSlices(u8, &root, &out[1]);
 }
 
@@ -14686,7 +14686,7 @@ test "every engagement query asks the same bounded question" {
 
     try testing.expect(f.limit != null);
     try testing.expectEqual(@as(u32, 500), f.limit.?);
-    try testing.expectEqualSlices(u16, &[_]u16{ 1, 6, 7, 9735 }, f.kinds.?);
+    try testing.expectEqualSlices(u16, &[_]u16{ 1, 1111, 6, 7, 9735 }, f.kinds.?);
     try testing.expectEqual(@as(usize, 1), f.tags.?.len);
     try testing.expectEqual(@as(u8, 'e'), f.tags.?[0].letter);
     try testing.expectEqual(@as(usize, 2), f.tags.?[0].values.len);
@@ -18312,20 +18312,20 @@ test "hiding a count stops the app asking relays for it" {
     defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
 
     // Everything on: replies, reposts, reactions, zaps.
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7, 9735 }, main.engagementKindsForTest());
 
     // This is the whole feature. Taking the number away has to take the REQUEST
     // away, or it is a number painted over: the bytes still arrive, still parse,
     // still land in the store, and the app is only pretending to be quieter.
     main.setHidden(.reaction_counts, true);
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 9735 }, main.engagementKindsForTest());
 
     main.setHidden(.zap_totals, true);
-    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6 }, main.engagementKindsForTest());
 
     // And back, so this is a preference rather than a one-way door.
     main.setHidden(.reaction_counts, false);
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7 }, main.engagementKindsForTest());
 }
 
 test "a thread's tallies go away with the counts, rather than reading zero" {
@@ -18461,7 +18461,7 @@ test "hiding repost counts does not claim to stop fetching them" {
     // stream as everybody else's reposts, so dropping it would leave the repost
     // icon unable to say it had already been pressed. The registry says so in
     // the row's own words rather than letting the reader assume otherwise.
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7, 9735 }, main.engagementKindsForTest());
     for (main.hideables) |h| {
         if (!std.mem.eql(u8, h.id, "repost_counts")) continue;
         try testing.expectEqual(@as(usize, 0), h.drops.len);
@@ -18534,7 +18534,7 @@ test "what is hidden survives a restart, and is written by id" {
     try testing.expect(!main.isTakenAway(.repost_counts));
     // And the subscription is narrowed from the first frame, not once somebody
     // opens settings.
-    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6 }, main.engagementKindsForTest());
 }
 
 test "a settings file from a newer Plaza still opens here" {
@@ -18885,7 +18885,7 @@ test "hiding a count narrows the feed's subscription and leaves notifications al
 
     main.setHidden(.reaction_counts, true);
     main.setHidden(.zap_totals, true);
-    try testing.expectEqualSlices(u16, &.{ 1, 6 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6 }, main.engagementKindsForTest());
 
     // And the inbox keeps asking its own question. Hiding how many people liked
     // a note is not asking to stop being told when somebody likes YOURS: two
@@ -18894,7 +18894,10 @@ test "hiding a count narrows the feed's subscription and leaves notifications al
     // This is here because the settings copy said "stops Plaza asking relays for
     // reactions at all", which was false while this array said otherwise. The
     // sentence is fixed; this is what keeps it fixed.
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, &main.inbox_kinds);
+    // The comment kind rides with kind 1 here too: a notification subscription
+    // that asks for replies and not comments is deaf to half the ways a person
+    // can answer you.
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7, 9735 }, &main.inbox_kinds);
 }
 
 test "a muted author's note is dropped on arrival, not just on a full read" {
@@ -18944,20 +18947,20 @@ test "hiding a verb hides its count and stops its fetch too" {
     for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
     defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
 
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7, 9735 }, main.engagementKindsForTest());
 
     // The hierarchy. Hiding the VERB has to take the count with it: an icon
     // that is not drawn has nowhere to put a number, so treating the two as
     // independent would leave a count nobody can see still being downloaded.
     main.setHidden(.reactions, true);
     try testing.expect(main.countHidden(.reactions, .reaction_counts));
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 9735 }, main.engagementKindsForTest());
 
     // And it holds with only the count hidden, which is the other half.
     main.setHidden(.reactions, false);
     main.setHidden(.reaction_counts, true);
     try testing.expect(main.countHidden(.reactions, .reaction_counts));
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 9735 }, main.engagementKindsForTest());
 }
 
 test "reply counts can be hidden, and that stops the feed asking for replies" {
@@ -18985,7 +18988,7 @@ test "reposting is hideable but never claims to stop being fetched" {
     // leave the verb unable to say it had already been pressed.
     main.setHidden(.reposts, true);
     main.setHidden(.repost_counts, true);
-    try testing.expectEqualSlices(u16, &.{ 1, 6, 7, 9735 }, main.engagementKindsForTest());
+    try testing.expectEqualSlices(u16, &.{ 1, 1111, 6, 7, 9735 }, main.engagementKindsForTest());
 
     for (main.hideables) |h| {
         if (!std.mem.eql(u8, h.id, "reposts") and !std.mem.eql(u8, h.id, "repost_counts")) continue;
