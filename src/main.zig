@@ -18197,19 +18197,22 @@ fn focalMeta(ui: *AppUi, note: *const Note) AppUi.Node {
 /// there is nothing left for the band to say either.
 fn focalStats(ui: *AppUi, c: Counts) AppUi.Node {
     const p = theme.palette;
-    const kids = ui.arena.alloc(AppUi.Node, 10) catch return ui.spacer(0);
-    var n: usize = 0;
-    kids[n] = hgap(ui, thread_inset + 2);
-    n += 1;
-    kids[n] = vgap(ui, 33);
-    n += 1;
-    var any = false;
     const stats = [_]struct { hidden: bool, count: u64, one: []const u8, many: []const u8 }{
         .{ .hidden = countHidden(.replies, .reply_counts), .count = c.replies, .one = "reply", .many = "replies" },
         .{ .hidden = countHidden(.reposts, .repost_counts), .count = c.reposts, .one = "repost", .many = "reposts" },
         .{ .hidden = countHidden(.reactions, .reaction_counts), .count = c.likes, .one = "like", .many = "likes" },
         .{ .hidden = countHidden(.zaps, .zap_totals), .count = c.zap_msat / 1000, .one = "sat", .many = "sats" },
     };
+    // Two leading gaps, then at most a tally and its separating gap per stat,
+    // then the trailing spacer. Counted from `stats` rather than written as the
+    // 10 it currently comes to, so a fifth tally cannot outgrow its own row.
+    const kids = ui.arena.alloc(AppUi.Node, 2 + stats.len * 2) catch return ui.spacer(0);
+    var n: usize = 0;
+    kids[n] = hgap(ui, thread_inset + 2);
+    n += 1;
+    kids[n] = vgap(ui, 33);
+    n += 1;
+    var any = false;
     for (stats) |stat| {
         if (stat.hidden) continue;
         // The gap belongs BETWEEN tallies, so it is charged by the one that
@@ -24380,7 +24383,23 @@ fn npubShort() []const u8 {
 /// the PR for review.
 fn accountMenu(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
-    const rows = ui.arena.alloc(AppUi.Node, 4) catch return ui.spacer(0);
+    // Both conditions are read ONCE, here, and the allocation is counted from
+    // the same two booleans that gate the writes below.
+    //
+    // Written as a bare number this was correct three times and wrong once. It
+    // was 5, shrank to 5-1 when a row was removed (right, at the time), and then
+    // "Bookmarks" was added back without it moving, so the ordinary signed-in
+    // menu wrote "Settings..." one node past the end of its own allocation. In
+    // Debug that is a panic; the shipping build is ReleaseFast and has no bounds
+    // check, so it was a silent write into the arena.
+    //
+    // A count that is a separate number from the writes it bounds only agrees
+    // with them by coincidence. This one cannot drift: another conditional row
+    // means another boolean and another term, in the same expression.
+    const show_notary = openNotaryAvailable();
+    const show_bookmarks = activePubkey() != null;
+    const row_count: usize = 3 + @as(usize, @intFromBool(show_notary)) + @as(usize, @intFromBool(show_bookmarks));
+    const rows = ui.arena.alloc(AppUi.Node, row_count) catch return ui.spacer(0);
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
         vgap(ui, 34),
@@ -24404,14 +24423,14 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // belongs here as well as in Settings: this is where a reader looks when
     // they are wondering about their signer, because it is the thing that just
     // told them about it.
-    if (openNotaryAvailable()) {
+    if (show_notary) {
         rows[n] = menuRow(ui, "Open Notary", null, null, .open_notary_window);
         n += 1;
     }
     // Where a bookmark can be found again, which is the half of the feature that
     // makes the other half worth having. Signed-in only: a guest cannot have a
     // list, and a row that opens an empty screen is a worse answer than no row.
-    if (activePubkey() != null) {
+    if (show_bookmarks) {
         rows[n] = menuRow(ui, ui.fmt("Bookmarks ({d})", .{bookmarkCount()}), null, null, .open_bookmarks);
         n += 1;
     }
