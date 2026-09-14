@@ -6932,6 +6932,7 @@ fn requestWantedProfiles() void {
 /// Dials the relays an `nprofile1` named, for the people whose hints are still
 /// untried. Bounded per pass, like the quote half.
 fn askProfileHints() void {
+    if (!relayFetchAllowed()) return;
     var spawned: usize = 0;
     for (&g_wanted) |*w| {
         if (!w.used) continue;
@@ -7809,6 +7810,11 @@ const quote_hint_dials_per_pass = 4;
 
 /// Dials the relays an address named, for quotes whose hints are still untried.
 fn askQuoteHints() void {
+    // Gated HERE and not only in the caller. A function that opens sockets
+    // deciding it is safe because of what its one caller checked is the same
+    // coincidence this gate exists to remove: the day it gains a second caller,
+    // nothing says so.
+    if (!relayFetchAllowed()) return;
     var spawned: usize = 0;
     for (&g_quotes) |*q| {
         if (!q.used or q.state == .loaded) continue;
@@ -27649,6 +27655,10 @@ fn startPlaceFeed(m: *const Place) void {
         "";
     if (url.len == 0) return;
     const len = copyBounded(&url_buf, url);
+    // Here and not at the top of this function: everything above is local, and
+    // the tests that drive `.place_feed` are about the seeding and the feed
+    // list, which must keep running. This is the line that opens a socket.
+    if (!relayFetchAllowed()) return;
     // BY VALUE, like the url: the worker outlives this frame's borrow of the
     // place, and the reader may have walked out of it by the time the socket
     // opens.
@@ -28341,6 +28351,7 @@ fn askPlace(fx: *Effects, hints: []const []const u8) void {
         if (!isSafeRelayUrl(h)) continue;
         var url_buf: [place_relay_cap]u8 = undefined;
         const len = copyBounded(&url_buf, h);
+        if (!relayFetchAllowed()) break;
         const t = std.Thread.spawn(.{}, askPlaceAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
         t.detach();
         n += 1;
@@ -30171,6 +30182,9 @@ fn setOrRemove(obj: *std.json.ObjectMap, a: std.mem.Allocator, key: []const u8, 
 /// Asks every read relay for our own kind:0, once. Until this has finished, "the
 /// store has no profile for me" is not a fact about the account.
 fn startOwnProfileFetch() void {
+    // BEFORE the busy flag, not after: a return that has already swapped the
+    // flag to true latches it, and nothing would ever ask again.
+    if (!relayFetchAllowed()) return;
     if (g_own_profile_asking.swap(true, .acq_rel)) return;
     const pk = activePubkey() orelse {
         g_own_profile_asking.store(false, .release);
@@ -32783,7 +32797,7 @@ pub fn resetFeedEndForTest() void {
 /// Store first, network second, which is Jumble's ordering: `_loadMoreTimeline`
 /// serves from its cached list and only then asks with `{ ...filter, until }`.
 fn fetchOlderNotes(until: i64) void {
-    if (g_store == null) return;
+    if (!relayFetchAllowed()) return;
     // One at a time. Sitting at the bottom of the list fires this on every
     // frame, and each round is a dial per relay.
     if (g_older_busy.swap(true, .acq_rel)) return;
@@ -33393,7 +33407,7 @@ fn collectUnrouted(out: [][32]u8) usize {
 /// Asks the indexers about everyone the pool cannot place. One pass, off the
 /// UI thread, on its own sockets.
 fn sweepRelayLists() void {
-    if (g_store == null) return;
+    if (!relayFetchAllowed()) return;
     if (g_indexer_running.swap(true, .acq_rel)) return; // one sweep at a time
     const t = std.Thread.spawn(.{}, sweepRelayListsWorker, .{}) catch {
         g_indexer_running.store(false, .release);
@@ -33845,6 +33859,11 @@ fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
 
 /// Serializes `request` and spawns a one-shot thread to seal and publish it.
 fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
+    // `networkAllowed` and not `relayFetchAllowed`: the two say different
+    // things. This one asks only "may I touch the network", which is the whole
+    // of the concern here. Signing does not read the store and must not start
+    // depending on one existing.
+    if (!networkAllowed()) return;
     const req_json = request.toJson(gpa) catch return;
     const thread = std.Thread.spawn(.{}, nip46Send, .{ gpa, req_json }) catch {
         gpa.free(req_json);

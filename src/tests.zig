@@ -22918,3 +22918,64 @@ test "a quoted note in a note body keeps the relays its address named" {
     _ = main.findQuoteRefForTest(body);
     try testing.expectEqual(@as(?u8, 1), main.quoteHintCountForTest(id));
 }
+
+test "no thread that dials a relay is spawned without a gate above it" {
+    // The September segfault was a detached worker dialling real relays from a
+    // unit test and writing into a store the test was tearing down. The fix
+    // reached three fetchers. Five more had the same shape, and one of them was
+    // not latent: driving `.place_feed` in this very file opened eight real
+    // sockets a run, to nos.lol and offchain.pub among others.
+    //
+    // So this asserts the RULE rather than those five call sites. It reads the
+    // source, finds every function that reaches `nostr.relay.dial`, finds every
+    // place one of them is spawned, and requires a gate between the start of
+    // the spawning function and the spawn itself. Add a network worker with no
+    // gate and this fails by name, whether or not a test happens to reach it.
+    const src = @embedFile("main.zig");
+    const alloc = testing.allocator;
+
+    // `pub fn` folded into `fn` so one split finds both.
+    const flat = try std.mem.replaceOwned(u8, alloc, src, "\npub fn ", "\nfn ");
+    defer alloc.free(flat);
+
+    // Every function whose body reaches the network. Derived, not listed: a
+    // list here would be the next thing to drift.
+    var dialers: std.ArrayList([]const u8) = .empty;
+    defer dialers.deinit(alloc);
+    var fns = std.mem.splitSequence(u8, flat, "\nfn ");
+    _ = fns.next();
+    while (fns.next()) |chunk| {
+        const paren = std.mem.indexOfScalar(u8, chunk, '(') orelse continue;
+        const name = chunk[0..paren];
+        if (std.mem.indexOfAny(u8, name, " \n\t") != null) continue;
+        if (std.mem.indexOf(u8, chunk, "nostr.relay.dial") != null) {
+            try dialers.append(alloc, name);
+        }
+    }
+    try testing.expect(dialers.items.len > 0);
+
+    for (dialers.items) |worker| {
+        const needle = try std.fmt.allocPrint(alloc, "std.Thread.spawn(.{{}}, {s},", .{worker});
+        defer alloc.free(needle);
+
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, flat, from, needle)) |at| {
+            from = at + needle.len;
+            // The enclosing function: the last `\nfn ` before the spawn.
+            const start = std.mem.lastIndexOf(u8, flat[0..at], "\nfn ") orelse 0;
+            const body = flat[start..at];
+            const gated = std.mem.indexOf(u8, body, "relayFetchAllowed()") != null or
+                std.mem.indexOf(u8, body, "networkAllowed()") != null;
+            if (!gated) {
+                const fn_end = std.mem.indexOfScalar(u8, flat[start + 4 ..], '(') orelse 0;
+                std.debug.print(
+                    "\n  {s} reaches nostr.relay.dial and is spawned by {s} with no" ++
+                        " relayFetchAllowed() or networkAllowed() above it.\n" ++
+                        "  A unit test that reaches this opens a real socket.\n",
+                    .{ worker, flat[start + 4 ..][0..fn_end] },
+                );
+                return error.UngatedNetworkThread;
+            }
+        }
+    }
+}
