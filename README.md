@@ -22,8 +22,11 @@ client.
 > pool of background threads keeps filled, no IPC on the read path, so it is on
 > screen before any relay answers. Composing signs a note (in the keyholder, or
 > by a round-trip to an external signer), stores it at once and publishes it to
-> the pool. A `plaza://place/` link opens somebody else's corner of Nostr: their
-> relay, and whatever it serves, without disturbing your own.
+> the pool. Paste an address (Cmd+L) and Plaza opens what it names: a note, a
+> person, or a place, including one on relays you do not read, because an
+> address that carries relay hints is asked there too. A `plaza://place/` link
+> opens somebody else's corner of Nostr: their relay, and whatever it serves,
+> without disturbing your own.
 >
 > Not there yet: putting a picture in a note, setting an avatar, sending a zap,
 > search, and private messages.

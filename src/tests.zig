@@ -22682,3 +22682,239 @@ test "a pasted secret key is refused and pointed at Notary" {
     try testing.expectEqual(main.LoginTarget.bunker, main.classifyLogin("bunker://abc?relay=wss://r"));
     try testing.expectEqual(main.LoginTarget.invalid, main.classifyLogin("npub1abcdef"));
 }
+
+// --------------------------------------------------------- opening an address
+//
+// Plaza could put an address on the clipboard long before it could take one
+// back, so a note shared out of here opened in every other client and not in
+// this one. These cover the door (`parseAddress` and the field around it) and
+// the relay hints the address carries, which were decoded and dropped.
+
+test "every address form Plaza accepts opens what it names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const id = [_]u8{0x11} ** 32;
+    const pk = [_]u8{0x22} ** 32;
+
+    // note1: an id and nothing else.
+    switch (main.parseAddress(arena, try nostr.nip19.encodeNote(arena, id))) {
+        .ok => |hit| {
+            try testing.expectEqualSlices(u8, &id, &hit.target.event);
+            try testing.expectEqual(@as(usize, 0), hit.hints.len);
+        },
+        else => return error.NoteNotRead,
+    }
+
+    // nevent1: the same id, plus the relays its author named.
+    const relays = [_][]const u8{ "wss://one.example", "wss://two.example" };
+    switch (main.parseAddress(arena, try nostr.nip19.encodeNevent(arena, id, &relays, pk, 1))) {
+        .ok => |hit| {
+            try testing.expectEqualSlices(u8, &id, &hit.target.event);
+            try testing.expectEqual(@as(usize, 2), hit.hints.len);
+            try testing.expectEqualStrings("wss://one.example", hit.hints[0]);
+        },
+        else => return error.NeventNotRead,
+    }
+
+    // npub1 and nprofile1 both land on the person, and only one carries relays.
+    switch (main.parseAddress(arena, try nostr.nip19.encodeNpub(arena, pk))) {
+        .ok => |hit| try testing.expectEqualSlices(u8, &pk, &hit.target.person),
+        else => return error.NpubNotRead,
+    }
+    switch (main.parseAddress(arena, try nostr.nip19.encodeNprofile(arena, pk, &relays))) {
+        .ok => |hit| {
+            try testing.expectEqualSlices(u8, &pk, &hit.target.person);
+            try testing.expectEqual(@as(usize, 2), hit.hints.len);
+        },
+        else => return error.NprofileNotRead,
+    }
+
+    // naddr1 for a place: the pubkey and the identifier both survive, because
+    // the place fetch needs both to build its `d` filter.
+    switch (main.parseAddress(arena, try nostr.nip19.encodeNaddr(arena, "the-room", pk, main.place_kind_for_test, &relays))) {
+        .ok => |hit| {
+            try testing.expectEqualSlices(u8, &pk, &hit.target.place.pubkey);
+            try testing.expectEqualStrings("the-room", hit.target.place.identifier);
+        },
+        else => return error.NaddrNotRead,
+    }
+}
+
+test "an address arrives with whitespace, a nostr prefix or a whole URL around it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const id = [_]u8{0x33} ** 32;
+    const note1 = try nostr.nip19.encodeNote(arena, id);
+
+    // All three of these are what a real paste looks like, and none of them is
+    // a typo: a copy carries whitespace, a NIP-21 link carries `nostr:`, and a
+    // link out of a web viewer is a whole URL ending in the address.
+    const forms = [_][]const u8{
+        try std.fmt.allocPrint(arena, "  {s}\n", .{note1}),
+        try std.fmt.allocPrint(arena, "nostr:{s}", .{note1}),
+        try std.fmt.allocPrint(arena, "https://njump.me/{s}", .{note1}),
+        try std.fmt.allocPrint(arena, " nostr:{s} ", .{note1}),
+    };
+    for (forms) |form| {
+        switch (main.parseAddress(arena, form)) {
+            .ok => |hit| try testing.expectEqualSlices(u8, &id, &hit.target.event),
+            else => {
+                std.debug.print("\n  did not read: \"{s}\"\n", .{form});
+                return error.FormNotRead;
+            },
+        }
+    }
+}
+
+test "an address for a kind Plaza cannot show is not called unreadable" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A perfectly good naddr naming a long-form article. Saying "that is not an
+    // address" here sends somebody looking for a typo that is not there.
+    const article = try nostr.nip19.encodeNaddr(arena, "a-post", [_]u8{0x44} ** 32, 30023, &.{});
+    try testing.expectEqual(main.AddressParse.wrong_kind, main.parseAddress(arena, article));
+
+    // And the things that really are unreadable.
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, ""));
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, "   "));
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, "hello"));
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, "https://example.com/"));
+    // Right prefix, wrong bytes: to a reader this is the same thing as garbage.
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, "note1notactuallybech32"));
+    // A secret key is never a destination.
+    try testing.expectEqual(main.AddressParse.unreadable, main.parseAddress(arena, "nsec1abcdef"));
+}
+
+test "relay hints are gated, deduped and capped before anything dials them" {
+    var h: main.RelayHints = .{};
+    h.fill(&.{
+        "wss://first.example",
+        "wss://first.example", // the same relay twice would spend both slots on one socket
+        "ws://cleartext.example", // not wss, so not dialled
+        "wss://second.example",
+        "wss://third.example", // past the cap
+    });
+    try testing.expectEqual(@as(u8, 2), h.count);
+    try testing.expectEqualStrings("wss://first.example", h.at(0));
+    try testing.expectEqualStrings("wss://second.example", h.at(1));
+    try testing.expect(!h.isEmpty());
+
+    // Nothing usable in, nothing kept: the fetch then asks the pool and only
+    // the pool, which is exactly what it did before hints existed.
+    var none: main.RelayHints = .{};
+    none.fill(&.{ "http://example.com", "not a url", "" });
+    try testing.expectEqual(@as(u8, 0), none.count);
+    try testing.expect(none.isEmpty());
+}
+
+test "an address Plaza cannot read keeps the field open with what was typed in it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg.open_address, &fx);
+    try testing.expect(model.address_open);
+
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "not an address" } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+
+    // Open, with the text still there: the reader is about to fix a character,
+    // and a field that empties itself on a refusal makes them paste again.
+    try testing.expect(model.address_open);
+    try testing.expectEqualStrings("not an address", model.address_draft());
+    try testing.expectEqual(main.AddressError.unreadable, model.address_error);
+
+    // And the sheet says so, rather than still offering the hint.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContainingText(tree.root, "not an address Plaza can read") != null);
+
+    // Typing is the answer to the refusal, so the refusal goes at once.
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "n" } }, &fx);
+    try testing.expectEqual(main.AddressError.none, model.address_error);
+}
+
+test "opening an address puts the field away before it navigates" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const id = [_]u8{0x55} ** 32;
+    const note1 = try nostr.nip19.encodeNote(arena, id);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = note1 } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+
+    // Closed, and emptied. Every destination behind this has an early return in
+    // front of it, so closing on arrival would leave the sheet up in exactly
+    // the cases where the reader has least idea why nothing moved.
+    try testing.expect(!model.address_open);
+    try testing.expectEqualStrings("", model.address_draft());
+
+    // Nothing holds this note, so it was asked for rather than silently dropped.
+    try testing.expect(main.quoteHintCountForTest(id) != null);
+}
+
+test "the relays an address named reach the fetch that goes looking" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+
+    const id = [_]u8{0x66} ** 32;
+    const pk = [_]u8{0x77} ** 32;
+    const relays = [_][]const u8{ "wss://hinted.example", "wss://also.example" };
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNevent(arena, id, &relays, pk, 1) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+
+    // This is the whole of #259 on the event side: without it the fetch asks
+    // only relays the reader already reads, and the card settles on "no relay
+    // has" a note that one of these two is holding.
+    try testing.expectEqual(@as(?u8, 2), main.quoteHintCountForTest(id));
+
+    // An nprofile names a person the same way.
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNprofile(arena, pk, &relays) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expectEqual(@as(?u8, 2), main.profileHintCountForTest(pk));
+}
+
+test "a quoted note in a note body keeps the relays its address named" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+
+    const id = [_]u8{0x88} ** 32;
+    const relays = [_][]const u8{"wss://quoted-lives-here.example"};
+    const body = try std.fmt.allocPrint(arena, "look at this nostr:{s}", .{
+        try nostr.nip19.encodeNevent(arena, id, &relays, [_]u8{0x99} ** 32, 1),
+    });
+
+    // The ordinary path: a note arrives in the feed carrying a quote, and the
+    // scan that finds the quote is where the hints were being dropped.
+    _ = main.findQuoteRefForTest(body);
+    try testing.expectEqual(@as(?u8, 1), main.quoteHintCountForTest(id));
+}

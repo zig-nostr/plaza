@@ -2881,6 +2881,9 @@ pub const Place = struct {
 /// several places apart, and editing one replaces it rather than adding a
 /// second.
 const place_kind: u16 = 30078;
+/// So a test builds an address for the kind Plaza actually looks for, rather
+/// than repeating the number and agreeing with it by coincidence.
+pub const place_kind_for_test = place_kind;
 
 /// Reads a place out of an event's content. Null when it is not one.
 ///
@@ -3139,6 +3142,54 @@ pub fn isSafeRelayUrl(url: []const u8) bool {
     }
     return true;
 }
+
+/// The relays an address said its subject lives on, copied and bounded.
+///
+/// Copied rather than referenced: the decode's arena is gone long before the
+/// fetch runs. Bounded at two because each hint that gets used costs a
+/// throwaway socket to a relay this reader does not otherwise talk to, and an
+/// `nevent` can name as many as its author felt like.
+///
+/// Every hint is gated through `isSafeRelayUrl` on the way IN, so nothing
+/// downstream has to remember to check a string that came off the wire.
+pub const RelayHints = struct {
+    pub const cap = 2;
+
+    buf: [cap][place_relay_cap]u8 = @splat(@splat(0)),
+    len: [cap]u8 = @splat(0),
+    count: u8 = 0,
+    /// Dialled at most once. A hint that did not answer is not retried on every
+    /// round: it is one author's claim about where something lives, the pool is
+    /// still being asked on its own backoff, and retrying speculative sockets
+    /// forever is how a quiet cache turns into a connection storm.
+    tried: bool = false,
+
+    pub fn fill(self: *RelayHints, hints: []const []const u8) void {
+        self.count = 0;
+        self.tried = false;
+        for (hints) |h| {
+            if (self.count >= cap) break;
+            if (!isSafeRelayUrl(h)) continue;
+            // Never a duplicate: two mentions of the same relay would spend two
+            // of the two slots on one socket.
+            var seen = false;
+            for (0..self.count) |i| {
+                if (std.mem.eql(u8, self.at(@intCast(i)), h)) seen = true;
+            }
+            if (seen) continue;
+            self.len[self.count] = @intCast(copyBounded(&self.buf[self.count], h));
+            self.count += 1;
+        }
+    }
+
+    pub fn at(self: *const RelayHints, i: u8) []const u8 {
+        return self.buf[i][0..self.len[i]];
+    }
+
+    pub fn isEmpty(self: *const RelayHints) bool {
+        return self.count == 0;
+    }
+};
 
 /// Whether a place's `baseShareURL` is safe to hand a browser.
 ///
@@ -6302,6 +6353,88 @@ var g_login_error = std.atomic.Value(u8).init(0);
 /// belongs somewhere else, or neither.
 pub const LoginTarget = enum { nsec, bunker, invalid };
 
+/// Why a pasted address did not open anything.
+///
+/// `unreadable` covers both an unknown prefix and a string that starts right
+/// and does not decode: to a reader those are one thing, a bad address, and
+/// splitting them would only say which half of the check refused.
+///
+/// `wrong_kind` is separate because it is not the reader's mistake. A valid
+/// `naddr1` can name a kind Plaza has no screen for, and saying "that is not an
+/// address" about a perfectly good address is the kind of wrong answer that
+/// sends somebody looking for a typo that is not there.
+pub const AddressError = enum { none, unreadable, wrong_kind };
+
+/// What a pasted address names, once decoded.
+pub const AddressTarget = union(enum) {
+    event: [32]u8,
+    person: [32]u8,
+    /// `identifier` points into the arena the parse was given, so a caller that
+    /// outlives the arena copies it.
+    place: struct { pubkey: [32]u8, identifier: []const u8 },
+};
+
+/// The outcome of reading a pasted address.
+pub const AddressParse = union(enum) {
+    ok: struct {
+        target: AddressTarget,
+        /// The relays the address itself named, in the arena. Empty for the
+        /// forms that carry none (`note1`, `npub1`) and for one that named none.
+        hints: []const []const u8 = &.{},
+    },
+    /// Decoded, and names a kind there is no screen for.
+    wrong_kind,
+    /// Not an address, or an address that does not decode.
+    unreadable,
+};
+
+/// Reads a pasted address and says what it names.
+///
+/// Everything it hands back lives in `arena`, including the relay hints and a
+/// place's identifier, so a caller that outlives the arena copies what it keeps.
+///
+/// Three things are stripped before the prefix is looked at, because all three
+/// arrive routinely on a paste and none of them is a typo. Surrounding
+/// whitespace. A leading `nostr:`, which is what a NIP-21 link is. And
+/// everything up to the last `/`, which is what turns a web viewer's URL into
+/// the address it is showing: that is how a link out of another client arrives,
+/// and it is the case this whole field exists for.
+pub fn parseAddress(arena: std.mem.Allocator, raw: []const u8) AddressParse {
+    var text = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, text, "nostr:")) text = text["nostr:".len..];
+    if (std.mem.lastIndexOfScalar(u8, text, '/')) |slash| text = text[slash + 1 ..];
+    if (text.len == 0) return .unreadable;
+
+    if (std.mem.startsWith(u8, text, "note1")) {
+        const id = nostr.nip19.decodeNote(arena, text) catch return .unreadable;
+        return .{ .ok = .{ .target = .{ .event = id } } };
+    }
+    if (std.mem.startsWith(u8, text, "nevent1")) {
+        const ptr = nostr.nip19.decodeNevent(arena, text) catch return .unreadable;
+        return .{ .ok = .{ .target = .{ .event = ptr.id }, .hints = ptr.relays } };
+    }
+    if (std.mem.startsWith(u8, text, "npub1")) {
+        const pk = nostr.nip19.decodeNpub(arena, text) catch return .unreadable;
+        return .{ .ok = .{ .target = .{ .person = pk } } };
+    }
+    if (std.mem.startsWith(u8, text, "nprofile1")) {
+        const pp = nostr.nip19.decodeNprofile(arena, text) catch return .unreadable;
+        return .{ .ok = .{ .target = .{ .person = pp.pubkey }, .hints = pp.relays } };
+    }
+    if (std.mem.startsWith(u8, text, "naddr1")) {
+        const ptr = nostr.nip19.decodeNaddr(arena, text) catch return .unreadable;
+        // A place is the one addressable kind Plaza has a screen for. Anything
+        // else decoded fine and names something this app cannot show, which is
+        // a different answer from "that is not an address".
+        if (ptr.kind != place_kind) return .wrong_kind;
+        return .{ .ok = .{
+            .target = .{ .place = .{ .pubkey = ptr.pubkey, .identifier = ptr.identifier } },
+            .hints = ptr.relays,
+        } };
+    }
+    return .unreadable;
+}
+
 /// Classifies pasted login text by its prefix. Pure, so it is unit-tested.
 ///
 /// `nsec` is still recognised, and that is the point of keeping it. Plaza no
@@ -6640,6 +6773,11 @@ const WantedProfile = struct {
     last_tried: i64 = 0,
     attempts: u8 = 0,
     pubkey: [32]u8 = [_]u8{0} ** 32,
+    /// Where an `nprofile1` said this person publishes. Dropped on the floor
+    /// before: `parseMentionAt` read `.pubkey` off the pointer and nothing else,
+    /// so a mention that named a relay was asked for on the reader's own relays
+    /// and nowhere the address pointed.
+    hints: RelayHints = .{},
 };
 /// The longest a repeatedly silent pubkey waits between asks.
 const profile_retry_cap_s: i64 = 300;
@@ -6655,15 +6793,26 @@ fn profileRetryDue(w: *const WantedProfile, now: i64) bool {
 
 /// Notes that `pubkey` was mentioned but has no known name yet.
 fn wantProfile(pubkey: [32]u8) void {
+    wantProfileHinted(pubkey, &.{});
+}
+
+/// Wants someone's metadata, and remembers where an address said they publish.
+///
+/// The same keep-the-first rule as `wantQuoteHinted`, for the same reason.
+fn wantProfileHinted(pubkey: [32]u8, hints: []const []const u8) void {
     if (lookupProfile(pubkey)) |p| {
         if (p.name_len > 0) return;
     }
     for (&g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return;
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) {
+            if (w.hints.isEmpty()) w.hints.fill(hints);
+            return;
+        }
     }
     for (&g_wanted) |*w| {
         if (!w.used) {
             w.* = .{ .used = true, .pubkey = pubkey };
+            w.hints.fill(hints);
             return;
         }
     }
@@ -6675,7 +6824,10 @@ fn wantProfile(pubkey: [32]u8) void {
     for (&g_wanted) |*w| {
         if (oldest == null or w.last_tried < oldest.?.last_tried) oldest = w;
     }
-    if (oldest) |w| w.* = .{ .used = true, .pubkey = pubkey };
+    if (oldest) |w| {
+        w.* = .{ .used = true, .pubkey = pubkey };
+        w.hints.fill(hints);
+    }
 }
 
 /// Whether `pubkey`'s profile is still being fetched: no profile in hand yet, and
@@ -6774,6 +6926,56 @@ fn requestWantedProfiles() void {
         }
     }
     askProfiles(still_missing, missing);
+    askProfileHints();
+}
+
+/// Dials the relays an `nprofile1` named, for the people whose hints are still
+/// untried. Bounded per pass, like the quote half.
+fn askProfileHints() void {
+    var spawned: usize = 0;
+    for (&g_wanted) |*w| {
+        if (!w.used) continue;
+        if (w.hints.tried or w.hints.isEmpty()) continue;
+        if (spawned + w.hints.count > quote_hint_dials_per_pass) break;
+        w.hints.tried = true;
+        for (0..w.hints.count) |i| {
+            var url_buf: [place_relay_cap]u8 = undefined;
+            const len = copyBounded(&url_buf, w.hints.at(@intCast(i)));
+            const t = std.Thread.spawn(.{}, askProfileAt, .{ url_buf, len, w.pubkey }) catch continue;
+            t.detach();
+            spawned += 1;
+        }
+    }
+}
+
+/// Asks ONE relay an address named for one person's metadata, ingests it, and
+/// closes. `askQuoteAt`'s shape, with a kind:0 filter.
+fn askProfileAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+    const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse return;
+    defer releaseOneShot(watched);
+
+    const authors = [_][32]u8{pubkey};
+    const kinds = [_]u16{0};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .limit = 1 }};
+    relay.subscribe(one_shot_sub_prefix ++ "profile-hint", &filters) catch return;
+    while (true) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .eose => break,
+            else => {},
+        }
+    }
 }
 
 /// The filters for a relay the reader is not on, asked about the people who
@@ -6901,6 +7103,12 @@ const QuoteEntry = struct {
     /// the stored text is rendered and clamped and can drop the token entirely.
     quote_of: [32]u8 = [_]u8{0} ** 32,
     has_quote_of: bool = false,
+    /// Where the address that named this event said it lives.
+    ///
+    /// Without these the fetch only ever asks relays the reader already reads,
+    /// and `quotingPillLabel` then settles on "Quotes a note no relay has",
+    /// which is true about this reader's relays and false about the note.
+    hints: RelayHints = .{},
     last_used: u64 = 0,
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
@@ -7388,12 +7596,26 @@ fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
 /// Records that a quoted event `id` needs resolving, deduping and (when full)
 /// evicting the least-recently-drawn entry that is not mid-fetch.
 fn wantQuote(id: [32]u8) void {
+    wantQuoteHinted(id, &.{});
+}
+
+/// Wants a quoted event, and remembers where the address that named it said it
+/// lives, so the fetch can reach past the reader's own relays.
+///
+/// An entry that already has hints keeps them. The first address to name a
+/// relay is no worse than the second, and overwriting would clear `tried` and
+/// dial the same speculative socket again every time the note is re-parsed.
+fn wantQuoteHinted(id: [32]u8, hints: []const []const u8) void {
     for (&g_quotes) |*q| {
-        if (q.used and std.mem.eql(u8, &q.id, &id)) return;
+        if (q.used and std.mem.eql(u8, &q.id, &id)) {
+            if (q.hints.isEmpty()) q.hints.fill(hints);
+            return;
+        }
     }
     for (&g_quotes) |*q| {
         if (!q.used) {
             q.* = .{ .used = true, .id = id };
+            q.hints.fill(hints);
             return;
         }
     }
@@ -7410,7 +7632,10 @@ fn wantQuote(id: [32]u8) void {
             if (victim == null or q.last_used < victim.?.last_used) victim = q;
         }
     }
-    if (victim) |v| v.* = .{ .used = true, .id = id };
+    if (victim) |v| {
+        v.* = .{ .used = true, .id = id };
+        v.hints.fill(hints);
+    }
 }
 
 /// The cache entry for a quoted event `id` (marking it drawn this frame so the
@@ -7554,9 +7779,12 @@ fn requestWantedQuotes() void {
         if (q.state != .missing) q.state = .fetching;
         if (n == batch.len) break;
     }
-    if (n == 0) return;
     if (!networkAllowed()) return;
-    askQuotes(batch, n);
+    // The pool ask is skipped when nothing is due, but the hints are not: a
+    // quote whose hints arrived while its own backoff was still counting down
+    // would otherwise wait for the backoff before its relay was ever asked.
+    if (n > 0) askQuotes(batch, n);
+    askQuoteHints();
 }
 
 /// Fetches the quoted events in `batch` by id and ingests them, then closes.
@@ -7569,6 +7797,76 @@ fn requestWantedQuotes() void {
 fn askQuotes(batch: [quote_fetch_batch][32]u8, len: usize) void {
     const filters = [_]nostr.filter.Filter{.{ .ids = batch[0..len], .limit = @intCast(len) }};
     _ = askPool(one_shot_sub_prefix ++ "quotes", &filters);
+}
+
+/// The most hinted relays dialled in one pass.
+///
+/// A feed of quoted notes could otherwise open a socket for every one of them
+/// at once, and these are relays this reader does not talk to. Four at a time,
+/// with the rest left for the next pass, keeps the speculative half of the
+/// fetch smaller than the pool it is supplementing.
+const quote_hint_dials_per_pass = 4;
+
+/// Dials the relays an address named, for quotes whose hints are still untried.
+fn askQuoteHints() void {
+    var spawned: usize = 0;
+    for (&g_quotes) |*q| {
+        if (!q.used or q.state == .loaded) continue;
+        if (q.hints.tried or q.hints.isEmpty()) continue;
+        // Whole entry or none: a partly dialled entry that got marked tried
+        // would silently drop its second hint for good.
+        if (spawned + q.hints.count > quote_hint_dials_per_pass) break;
+        q.hints.tried = true;
+        for (0..q.hints.count) |i| {
+            var url_buf: [place_relay_cap]u8 = undefined;
+            const len = copyBounded(&url_buf, q.hints.at(@intCast(i)));
+            const t = std.Thread.spawn(.{}, askQuoteAt, .{ url_buf, len, q.id }) catch continue;
+            t.detach();
+            spawned += 1;
+        }
+    }
+}
+
+/// Asks ONE relay an address named for one event, ingests what comes back, and
+/// closes.
+///
+/// A throwaway socket, like `askPlaceAt`, and for the same reason: the pool
+/// holds the reader's own relays, and a hint names one that by definition is
+/// not among them, so there is no connection to reuse.
+///
+/// What it finds goes to the STORE and not back to the caller. `refreshQuotes`
+/// reads the store on the next tick and flips the entry to `.loaded`, so this
+/// thread hands nobody anything and nobody waits on it.
+fn askQuoteAt(url_buf: [place_relay_cap]u8, url_len: usize, id: [32]u8) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
+    defer relay.deinit();
+    // A full keeper table means this one does NOT run, which is the opposite of
+    // what the profile and place fetches do when they cannot get a slot. Those
+    // are the only ask for what they want, so an unwatched read beats no read.
+    // This is not: the pool is already being asked for the same event on its
+    // own backoff, so an unbounded speculative socket buys nothing.
+    const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse return;
+    defer releaseOneShot(watched);
+
+    const ids = [_][32]u8{id};
+    const filters = [_]nostr.filter.Filter{.{ .ids = &ids, .limit = 1 }};
+    relay.subscribe(one_shot_sub_prefix ++ "quote-hint", &filters) catch return;
+    while (true) {
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .eose => break,
+            else => {},
+        }
+    }
 }
 
 /// Builds a Note over `content` and runs the quote-reference scan, so a test can
@@ -10102,6 +10400,13 @@ pub const Model = struct {
     // Whether the join sheet is on its focused bunker-input step (chose "Use
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
+    // The address field: whether it is up, what is typed in it, and why the
+    // last submit did not go anywhere. Plaza could already COPY an address
+    // (`copy_nevent`) and had no way to open one, so a note shared out of here
+    // could be read by every other client and not by this one.
+    address_open: bool = false,
+    address_buffer: canvas.TextBuffer(220) = .{},
+    address_error: AddressError = .none,
     // The open thread: the focused note's id (0 = the feed, not a thread). When
     // set, the thread is layered OVER the feed (which stays mounted, so its
     // scroll offset survives) with the note and its replies.
@@ -10193,13 +10498,31 @@ pub const Model = struct {
         "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",     "viewing_thread",
         "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",      "thread_notes",
         "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",   "thread_seq",
-        "thread_open_at",
+        "thread_open_at",   "address_open",           "address_buffer",   "address_error",    "address_draft",
+        "address_empty",    "address_status",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
     /// opened it themselves rather than being sent there by a verb.
     pub fn pending_text(self: *const Model, ui: *AppUi) []const u8 {
         return pendingText(ui, self);
+    }
+
+    /// What is typed in the address field.
+    pub fn address_draft(self: *const Model) []const u8 {
+        return self.address_buffer.text();
+    }
+    /// Whether the address field is blank, which disables Open.
+    pub fn address_empty(self: *const Model) bool {
+        return std.mem.trim(u8, self.address_buffer.text(), " \t\r\n").len == 0;
+    }
+    /// What the field says under itself: the last refusal, or what it accepts.
+    pub fn address_status(self: *const Model) []const u8 {
+        return switch (self.address_error) {
+            .none => "Paste a note, a person or a place. A link from another client works too.",
+            .unreadable => "That is not an address Plaza can read.",
+            .wrong_kind => "That address is valid and names something Plaza has no screen for.",
+        };
     }
 
     /// The name beat's current text.
@@ -14095,6 +14418,11 @@ fn findQuoteRef(note: *Note) void {
         const arena = fba.allocator();
         const id: ?[32]u8 = if (std.mem.startsWith(u8, token, "nevent1")) blk: {
             const ptr = nostr.nip19.decodeNevent(arena, token) catch break :blk null;
+            // The relays the address named, recorded here because here is where
+            // they were being decoded and dropped. `Note.quote` deliberately
+            // does not carry them: it is a field on every note in the feed
+            // array, and this is two URLs that belong to one cache entry.
+            if (ptr.relays.len > 0) wantQuoteHinted(ptr.id, ptr.relays);
             break :blk ptr.id;
         } else (nostr.nip19.decodeNote(arena, token) catch null);
 
@@ -14543,6 +14871,8 @@ fn parseMentionAt(arena: std.mem.Allocator, src: []const u8, i: usize) ?struct {
     }
     if (std.mem.startsWith(u8, token, "nprofile1")) {
         const pp = nostr.nip19.decodeNprofile(arena, token) catch return null;
+        // Same as the quote side: decoded here, and thrown away here until now.
+        if (pp.relays.len > 0) wantProfileHinted(pp.pubkey, pp.relays);
         return .{ .end = end, .pubkey = pp.pubkey };
     }
     return null;
@@ -14715,6 +15045,13 @@ pub const Msg = union(enum) {
     open_bunker,
     /// Back out of the bunker input to the ladder.
     close_bunker,
+    /// Open the field that takes an address, and dismiss it.
+    open_address,
+    close_address,
+    /// A text edit in the address field, mirrored into its buffer.
+    address_edit: canvas.TextInputEvent,
+    /// Read what is in the address field and go where it points.
+    address_submit,
     /// Hide the guest strip for this session.
     dismiss_guest_strip,
     /// Open one of the chrome's anchored menus (or close it, when it is already
@@ -14905,7 +15242,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions", "open_address", "close_address", "address_edit", "address_submit" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -15777,6 +16114,9 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.stage == .ready and model.naming) {
         return ui.stack(.{ .grow = 1 }, .{ base, nameSheet(ui, model) });
     }
+    if (model.stage == .ready and model.address_open) {
+        return ui.stack(.{ .grow = 1 }, .{ base, addressSheet(ui, model) });
+    }
     if (model.notifications_open) {
         return ui.stack(.{ .grow = 1 }, .{ base, notificationsSheet(ui, model) });
     }
@@ -15789,6 +16129,12 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
         // Both sheets, in order, when a profile is being edited: dropping the
         // one underneath would make Settings blink out and back as the reader
         // opens and closes the editor it was opened from.
+        //
+        // The address field is reachable here too, by its shortcut, and needs
+        // the same treatment for the same reason.
+        if (model.address_open) {
+            return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), addressSheet(ui, model) });
+        }
         if (model.editing_profile) {
             return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), profileSheet(ui, model) });
         }
@@ -16344,6 +16690,49 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .semantics = .{ .label = "Join" },
     }, .{
         if (model.bunker_mode) bunkerCard(ui, model) else joinLadderCard(ui, model),
+    }));
+}
+
+/// The field that takes an address.
+///
+/// Plaza could already put an address on the clipboard and had no way to take
+/// one back, so a note shared out of here opened in every other client and not
+/// in this one, and a link followed out of another client dead-ended.
+///
+/// One field and one button, the bunker step's shape, because it is the same
+/// job: paste a string, go where it says.
+fn addressSheet(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return modalScrim(ui, "Open an address", .close_address, ui.el(.dialog, .{
+        .width = join_sheet_width,
+        .on_dismiss = .close_address,
+        .semantics = .{ .label = "Open an address" },
+    }, .{
+        modalCard(ui, join_sheet_width, ui.column(.{ .gap = 12 }, .{
+            ui.row(.{ .cross = .center, .gap = 6 }, .{
+                backControl(ui, "Back", .close_address),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "Open an address", .weight = .bold, .scale = 1.3 }},
+                ),
+            }),
+            ui.el(.textarea, .{
+                .text = model.address_draft(),
+                .placeholder = "nevent1... note1... npub1... nprofile1... naddr1...",
+                .on_input = AppUi.inputMsg(.address_edit),
+                .autofocus = true,
+                .on_submit = .address_submit,
+                .height = 56,
+            }, .{}),
+            // The refusal replaces the hint rather than sitting under it: two
+            // lines where one is stale reads as the app disagreeing with itself.
+            ui.text(
+                .{ .size = .sm, .wrap = true, .style = .{ .foreground = if (model.address_error == .none) p.text_muted else p.status_warning_text } },
+                model.address_status(),
+            ),
+            ui.button(.{ .variant = .primary, .disabled = model.address_empty(), .on_press = .address_submit }, "Open"),
+            vgap(ui, 5),
+        })),
     }));
 }
 
@@ -24398,7 +24787,7 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // means another boolean and another term, in the same expression.
     const show_notary = openNotaryAvailable();
     const show_bookmarks = activePubkey() != null;
-    const row_count: usize = 3 + @as(usize, @intFromBool(show_notary)) + @as(usize, @intFromBool(show_bookmarks));
+    const row_count: usize = 4 + @as(usize, @intFromBool(show_notary)) + @as(usize, @intFromBool(show_bookmarks));
     const rows = ui.arena.alloc(AppUi.Node, row_count) catch return ui.spacer(0);
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
@@ -24441,6 +24830,11 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // showing, so it was a second door to a room this menu already has a door
     // to, and the one thing on a status menu that could end a session is a
     // strange thing to keep a press away from the relay count.
+    // Guests too, deliberately. Opening an address is reading, and reading
+    // needs no key: a link somebody sent is one of the first things a person
+    // who has not signed in arrives with.
+    rows[n] = menuRow(ui, "Open an address…", null, "Cmd+L", .open_address);
+    n += 1;
     rows[n] = menuRow(ui, "Settings…", null, "Cmd+,", .open_settings);
     n += 1;
     return menuSurface(ui, 240, rows[0..n]);
@@ -25845,6 +26239,24 @@ pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
     q.text_len = @intCast(n);
 }
 
+/// How many relay hints the cache entry for `id` is holding, or null when there
+/// is no entry. For asserting that a decoded address actually left its hints
+/// somewhere the fetch will find them.
+pub fn quoteHintCountForTest(id: [32]u8) ?u8 {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints.count;
+    }
+    return null;
+}
+
+/// The same, for the person an `nprofile1` named.
+pub fn profileHintCountForTest(pubkey: [32]u8) ?u8 {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.hints.count;
+    }
+    return null;
+}
+
 pub fn wantQuoteForTest(id: [32]u8) void {
     wantQuote(id);
 }
@@ -26880,6 +27292,7 @@ const PlazaApp = native_sdk.UiApp(Model, Msg);
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "new-note")) return .open_compose;
     if (std.mem.eql(u8, name, "settings")) return .open_settings;
+    if (std.mem.eql(u8, name, "open-address")) return .open_address;
     // The same message the rail's own tile sends, so the key and the tile
     // cannot drift into two behaviours.
     if (std.mem.eql(u8, name, "places-rail")) return .toggle_places_rail;
@@ -28753,6 +29166,23 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.login_buffer.clear();
             g_login_error.store(@intFromEnum(LoginError.none), .release);
         },
+        .open_address => {
+            model.address_open = true;
+            model.address_error = .none;
+            // The row that opens this lives in the account menu, and a menu
+            // left standing under a sheet is a menu the reader has to dismiss
+            // twice.
+            model.menu = .none;
+        },
+        .close_address => closeAddress(model),
+        .address_edit => |edit| {
+            model.address_buffer.apply(edit);
+            // Typing IS the answer to the refusal, so the refusal goes now
+            // rather than on the next submit. A red line under a field the
+            // reader is already fixing is describing a string that is gone.
+            model.address_error = .none;
+        },
+        .address_submit => openAddress(model, fx),
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
         // A trigger toggles its own menu and replaces any other, so the chrome
         // never shows two floating surfaces at once.
@@ -32543,6 +32973,63 @@ pub fn enterProfileForTest(model: *Model, pubkey: [32]u8) void {
 /// this instead, and both only ever fire for an event already ingested (an
 /// unresolved quote card is not pressable, and an ancestor row exists because
 /// the walk found the event).
+/// Puts the address field away and forgets what was in it.
+fn closeAddress(model: *Model) void {
+    model.address_open = false;
+    model.address_buffer.clear();
+    model.address_error = .none;
+}
+
+/// Reads what is in the address field and goes where it points.
+///
+/// The field closes BEFORE the navigation, never after it. Every destination
+/// here has an early return in front of it, and closing on arrival leaves the
+/// sheet up in exactly the cases where the reader has least idea why nothing
+/// moved. This is the same rule `.open_event` already follows for the
+/// notifications sheet.
+///
+/// A refusal does the opposite and leaves the field open with what was typed
+/// still in it, because the reader is about to fix a character.
+fn openAddress(model: *Model, fx: *Effects) void {
+    // A NIP-19 entity is a few hundred bytes at the outside, and the decode
+    // allocates the relay list and a place's identifier out of this too.
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const parsed = parseAddress(fba.allocator(), model.address_buffer.text());
+    const hit = switch (parsed) {
+        .unreadable => {
+            model.address_error = .unreadable;
+            return;
+        },
+        .wrong_kind => {
+            model.address_error = .wrong_kind;
+            return;
+        },
+        .ok => |ok| ok,
+    };
+
+    closeAddress(model);
+    switch (hit.target) {
+        // The hints go in FIRST, so that if the note is not held the fetch
+        // `openEvent` starts already knows where to look. `wantQuote` inside
+        // `openEvent` then finds this entry and leaves it alone.
+        .event => |id| {
+            wantQuoteHinted(id, hit.hints);
+            openEvent(model, id);
+        },
+        .person => |pk| {
+            wantProfileHinted(pk, hit.hints);
+            openPerson(model, pk);
+        },
+        .place => |pl| {
+            var want: @TypeOf(g_place_want.?) = .{ .pubkey = pl.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+            want.ident_len = @intCast(copyBounded(&want.ident_buf, pl.identifier));
+            g_place_want = want;
+            askPlace(fx, hit.hints);
+        },
+    }
+}
+
 fn openEvent(model: *Model, id: [32]u8) void {
     if (g_store) |store| {
         if (store.getEvent(std.heap.page_allocator, id) catch null) |found| {
