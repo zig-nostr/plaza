@@ -79,6 +79,11 @@
     .shortcuts = .{
         .{ .id = "new-note", .key = "n", .modifiers = .{"primary"} },
         .{ .id = "settings", .key = ",", .modifiers = .{"primary"} },
+        // Cmd+L, which is where every browser puts "go to an address". Safe to
+        // declare even though a declared shortcut is swallowed before the
+        // responder chain: macOS binds no Cmd+L inside a text field, so no
+        // field here loses anything to it.
+        .{ .id = "open-address", .key = "l", .modifiers = .{"primary"} },
         // The places grammar. Cmd+Option is the safe corner of the keyboard for
         // these: a declared shortcut is swallowed by the shell's key monitor
         // before the responder chain, and bare Option+Up/Down (which is what
