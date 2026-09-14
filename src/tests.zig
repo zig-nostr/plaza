@@ -2610,6 +2610,38 @@ test "only one chrome menu is open at a time" {
     try testing.expectEqual(main.ChromeMenu.none, model.menu);
 }
 
+test "the account menu has room for every row it can build" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The ordinary signed-in shape, and the only one that builds every row: a
+    // key held by the keyholder Plaza ships, a window to open it in, and so
+    // "Open Notary" and "Bookmarks" both above "Settings...".
+    //
+    // Every row under the header is conditional, and the row array is allocated
+    // at a fixed size. So the size has to hold all of them AT ONCE, and the
+    // menu is built here in the state where they are all present rather than in
+    // the guest state, where two of them are absent and any size at all passes.
+    main.setIdentityForTest([_]u8{0x5c} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("helper");
+    main.setNotaryWindowFoundForTest(true);
+    defer main.setNotaryWindowFoundForTest(false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.menu = .account;
+    const tree = try buildTree(arena, &model);
+
+    // All three, and "Settings..." especially: it is written last, so it is the
+    // one that falls off the end.
+    try testing.expect(findAnyText(tree.root, "Open Notary") != null);
+    // Carries its count, so this matches the label rather than the whole string.
+    try testing.expect(findAnyTextContainingText(tree.root, "Bookmarks") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "Settings") != null);
+}
+
 test "one straggler is not a fault, at any pool size" {
     // The redesign's at-rest bar reads "4/5 relays" in green while its working
     // bar reads "3/5" in amber. A bar that goes amber for one straggler is a bar
