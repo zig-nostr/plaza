@@ -23,6 +23,19 @@ on:
 permissions:
   contents: write # push the branch
   pull-requests: write # open the PR
+  # The pin lives in `release.yml`, so editing it is editing a workflow, and a
+  # push that touches one is refused outright without this. Not a detail: it is
+  # why this job had never once opened a PR. Twice it had something to do, on
+  # 2026-09-07 for v0.10.8 and on 2026-09-15 for v0.10.12, and both times it
+  # built the branch, failed on the push, and went red. Every other run exited
+  # early with "already current" and went green, so the history read as 98
+  # successes and nothing was wrong with any of them.
+  #
+  # The alternative is moving the pin out of the workflow file, into something
+  # a job can write with `contents` alone. That is better on its own terms and
+  # it means every job in `release.yml` growing a step to read it, in the file
+  # that needed four corrective PRs in one day. Not worth it to avoid one line.
+  workflows: write # the pin it bumps IS a workflow file
 
 jobs:
   bump:
