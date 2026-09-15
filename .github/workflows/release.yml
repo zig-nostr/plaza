@@ -15,16 +15,22 @@ on:
 permissions:
   contents: write # create the release and upload the .app
 
-env:
-  # The Notary release this Plaza ships. Plaza carries Notary's daemon and its
-  # window rather than a signer of its own, so the keyholder has one
-  # implementation, built and audited once.
-  #
-  # A TAG, not a branch. A release is the one artifact nobody gets to re-check,
-  # and "whatever notary's main happened to be that afternoon" is not something
-  # anybody could reproduce later. Bump it deliberately, with the Plaza release
-  # that needs it.
-  NOTARY_REF: v0.10.11
+# The Notary release this Plaza ships is pinned in `.github/notary-ref`, one
+# line, nothing else in it. Plaza carries Notary's daemon and its window rather
+# than a signer of its own, so the keyholder has one implementation, built and
+# audited once.
+#
+# A TAG, not a branch. A release is the one artifact nobody gets to re-check,
+# and "whatever notary's main happened to be that afternoon" is not something
+# anybody could reproduce later. Bump it deliberately, with the Plaza release
+# that needs it.
+#
+# In a FILE and not in this workflow's `env:`, which is where it used to live.
+# `GITHUB_TOKEN` cannot push a change to a workflow file under any permission:
+# that is a platform rule, not a setting, so the job that exists to bump this
+# could never bump it. A plain file it can write with `contents` alone. It also
+# means five places stop parsing a value out of a YAML file with a sed and just
+# read the file that holds it.
 
 jobs:
   macos-app:
@@ -60,11 +66,15 @@ jobs:
       # rather than tracking a branch: a release is the one artifact nobody gets
       # to re-check, and "whatever notary's main happened to be" is not a thing
       # anybody could reproduce later.
+      - name: Read the pinned Notary
+        id: notary-ref
+        run: echo "ref=$(cat .github/notary-ref)" >> "$GITHUB_OUTPUT"
+
       - name: Check out Notary
         uses: actions/checkout@v4
         with:
           repository: zig-nostr/notary
-          ref: ${{ env.NOTARY_REF }}
+          ref: ${{ steps.notary-ref.outputs.ref }}
           path: .notary
 
       # The script clears both zig-outs, refuses to package a plaza carrying the
@@ -171,11 +181,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev
 
+      - name: Read the pinned Notary
+        id: notary-ref
+        run: echo "ref=$(cat .github/notary-ref)" >> "$GITHUB_OUTPUT"
+
       - name: Check out Notary
         uses: actions/checkout@v4
         with:
           repository: zig-nostr/notary
-          ref: ${{ env.NOTARY_REF }}
+          ref: ${{ steps.notary-ref.outputs.ref }}
           path: .notary
 
       # Packaging itself is not retried: with the cache warm it needs no

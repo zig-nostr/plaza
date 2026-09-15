@@ -290,8 +290,8 @@ journey_bundle() {
   # rather than typed here: a bundle built against a different Notary is not the
   # bundle anybody downloads, and this journey exists to test the one they do.
   local notary_ref
-  notary_ref="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' "$ROOT/.github/workflows/release.yml" | head -1)"
-  [ -n "$notary_ref" ] || { fail "could not read NOTARY_REF from the release workflow"; return; }
+  notary_ref="$(cat "$ROOT/.github/notary-ref")"
+  [ -n "$notary_ref" ] || { fail "could not read .github/notary-ref"; return; }
   local notary="$WORK/notary"
   info "packaging against notary $notary_ref"
   if ! git clone -q --depth 1 --branch "$notary_ref" https://github.com/zig-nostr/notary.git "$notary" 2>"$WORK/notary-clone.log"; then
