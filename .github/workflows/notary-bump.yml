@@ -23,19 +23,6 @@ on:
 permissions:
   contents: write # push the branch
   pull-requests: write # open the PR
-  # The pin lives in `release.yml`, so editing it is editing a workflow, and a
-  # push that touches one is refused outright without this. Not a detail: it is
-  # why this job had never once opened a PR. Twice it had something to do, on
-  # 2026-09-07 for v0.10.8 and on 2026-09-15 for v0.10.12, and both times it
-  # built the branch, failed on the push, and went red. Every other run exited
-  # early with "already current" and went green, so the history read as 98
-  # successes and nothing was wrong with any of them.
-  #
-  # The alternative is moving the pin out of the workflow file, into something
-  # a job can write with `contents` alone. That is better on its own terms and
-  # it means every job in `release.yml` growing a step to read it, in the file
-  # that needed four corrective PRs in one day. Not worth it to avoid one line.
-  workflows: write # the pin it bumps IS a workflow file
 
 jobs:
   bump:
@@ -48,8 +35,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          current="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' .github/workflows/release.yml | head -1)"
-          [ -n "$current" ] || { echo "could not read NOTARY_REF" >&2; exit 1; }
+          current="$(cat .github/notary-ref)"
+          [ -n "$current" ] || { echo "could not read .github/notary-ref" >&2; exit 1; }
 
           # The latest RELEASE, not the latest tag: a tag with no release behind
           # it is one whose build failed or has not finished, and shipping
@@ -83,7 +70,7 @@ jobs:
           git config user.email "safari.sepehr@gmail.com"
           git switch -c "$branch"
 
-          sed -i "s|^  NOTARY_REF: .*$|  NOTARY_REF: $latest|" .github/workflows/release.yml
+          printf '%s\n' "$latest" > .github/notary-ref
           sed -i "0,/\.version = \"$version\"/s||.version = \"$next\"|" app.zon
 
           notes="$(gh release view "$latest" --repo zig-nostr/notary --json body -q .body)"
@@ -101,7 +88,7 @@ jobs:
 
           {
             printf 'Notary released **%s**. Plaza pins the keyholder by tag and builds it from source, so it only reaches a reader through a Plaza release.\n\n' "$latest"
-            printf '`NOTARY_REF` moves to `%s` and Plaza goes to **%s**, because the artifact changes when the keyholder inside it changes and different bytes must not share a version.\n\n' "$latest" "$next"
+            printf 'The pin in `.github/notary-ref` moves to `%s` and Plaza goes to **%s**, because the artifact changes when the keyholder inside it changes and different bytes must not share a version.\n\n' "$latest" "$next"
             printf 'The notes below are Notary'"'"'s own, copied across. Edit them before merging: this is opened by CI, but what goes out is still a judgement.\n\n---\n\n'
             printf '%s\n' "$notes"
           } > /tmp/pr-body.md

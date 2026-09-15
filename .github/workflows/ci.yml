@@ -244,8 +244,8 @@ jobs:
       - name: Read the pinned Notary ref
         id: notary-ref
         run: |
-          ref="$(sed -n 's/^ *NOTARY_REF: *\(.*\)$/\1/p' .github/workflows/release.yml | head -1)"
-          [ -n "$ref" ] || { echo "could not read NOTARY_REF from the release workflow"; exit 1; }
+          ref="$(cat .github/notary-ref)"
+          [ -n "$ref" ] || { echo "could not read .github/notary-ref"; exit 1; }
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Check out Notary
