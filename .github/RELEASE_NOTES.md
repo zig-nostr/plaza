@@ -1,5 +1,13 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.20.1
+
+**The keyholder lets go of your key when Plaza closes.** Plaza carries Notary as its keyholder and starts it as a child process. If Plaza ever went away abnormally, that process was left running with nothing to do, and it kept the lock that says one keyholder holds this key at a time. Starting Plaza again and typing your passphrase then told you another Notary already had the key open, which was true, in a process you could not see and had not asked for. Nothing cleared it but a fifteen minute timer.
+
+The keyholder now notices that the app it was unlocked for has gone and exits within about a second, which hands the key back. A Notary you started yourself is unaffected and keeps running, because it has no such parent to lose.
+
+This is the other half of the crash fixed in v0.20.0. The crash is what stranded the key; this is what made it stay stranded.
+
 ### What's new in v0.20.0
 
 **A crash when the account menu was open.** Signed in with the keyholder available, that menu built one more row than it had reserved room for, and handed the layout a list running one past the end of its own memory. What you saw was the app vanishing, usually on the press that opens Notary, because that row is one of the two whose presence caused it. It arrived in v0.19.0. Nothing else in the app has this shape: I went through every other menu and list to be sure.
