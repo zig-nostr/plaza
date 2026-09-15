@@ -150,10 +150,20 @@ jobs:
 
       # The app ships ReleaseFast, and two things only exist there. The frame
       # budgets skip themselves in Debug, because a Debug rebuild is six times
-      # slower and a budget loosened six times is no longer a frame; so the one
-      # guard on the feed staying inside a frame has never actually run on any
-      # machine but mine. And optimized builds have caught correctness bugs the
-      # Debug build could not, so this is not only about the timings.
+      # slower and a budget loosened six times is no longer a frame. And
+      # optimized builds have caught correctness bugs the Debug build could not,
+      # so this is not only about the timings.
+      #
+      # This job is the ONLY place either of them runs, which is the opposite of
+      # what this comment used to claim. `zig build test -Doptimize=ReleaseFast`
+      # does not link on macOS at all: the SDK emits
+      # `native_sdk_update_verify_feed` and `native_sdk_update_verify_archive`
+      # only by force-referencing them from `src/platform/macos/root.zig`, which
+      # a test binary never analyses, while `build/app.zig` has the test reuse
+      # the EXE's module whenever the optimize modes match. That drags
+      # `appkit_host.m`, which calls both symbols, into a link that has nothing
+      # defining them. Debug does not match ReleaseFast, so plain
+      # `zig build test` is unaffected and so is the app that ships.
       - name: Test (ReleaseFast, the mode that ships)
         run: zig build test -Doptimize=ReleaseFast
 
