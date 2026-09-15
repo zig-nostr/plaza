@@ -2,12 +2,7 @@ name: CI
 
 on:
   push:
-    # `main`, and the branches the Notary-bump job pushes. A pull request opened
-    # with the default token does not start a workflow, so its checks would
-    # never run and branch protection would never be satisfiable. Checks attach
-    # to a COMMIT, so running them on the push covers the pull request that
-    # carries the same commit.
-    branches: [main, "notary-bump/**"]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -92,6 +87,37 @@ jobs:
             exit 1
           fi
           echo "release notes are for v$version"
+
+      # Says the pin is behind. Does not move it, does not open anything, and
+      # never fails the build.
+      #
+      # This replaces a scheduled job that pushed a branch and opened the PR
+      # itself. That job ran a hundred times, opened nothing, and needed the
+      # repository to allow Actions to create and approve pull requests, which
+      # is one setting: a bot that can open a PR in this repo can also approve
+      # one, in a repo whose whole protection model is that changes get read by
+      # a person first. The chore it replaced takes a minute and has never once
+      # been forgotten. So the reminder stays and the hands go.
+      #
+      # A warning and not a failure: a keyholder release has nothing to do with
+      # most changes here, and blocking an unrelated pull request until someone
+      # bumps a pin is how a check gets ignored.
+      - name: The pinned Notary is the released one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned="$(cat .github/notary-ref)"
+          [ -n "$pinned" ] || { echo "could not read .github/notary-ref"; exit 1; }
+          latest="$(gh release view --repo zig-nostr/notary --json tagName -q .tagName 2>/dev/null || true)"
+          if [ -z "$latest" ]; then
+            echo "could not reach Notary's releases; pin not checked"
+            exit 0
+          fi
+          if [ "$pinned" = "$latest" ]; then
+            echo "pinned Notary $pinned is the latest"
+            exit 0
+          fi
+          echo "::warning::Plaza pins Notary $pinned; the latest release is $latest. A keyholder fix only reaches a reader through a Plaza release, so move .github/notary-ref and cut one when it is wanted."
 
 
       # The installer verifies the file it downloaded, not whatever is listed
