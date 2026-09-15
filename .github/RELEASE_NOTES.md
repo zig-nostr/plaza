@@ -1,5 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.20.0
+
+**A crash when the account menu was open.** Signed in with the keyholder available, that menu built one more row than it had reserved room for, and handed the layout a list running one past the end of its own memory. What you saw was the app vanishing, usually on the press that opens Notary, because that row is one of the two whose presence caused it. It arrived in v0.19.0. Nothing else in the app has this shape: I went through every other menu and list to be sure.
+
+**Open an address.** Paste an `nevent1`, `note1`, `npub1`, `nprofile1`, or a place's `naddr1`, and Plaza opens what it names. Cmd+L, or the account menu. It also takes what a paste really looks like rather than only the bare token: surrounding whitespace, a leading `nostr:`, or a whole web viewer's URL ending in the address, which is how a link followed out of another client arrives. An address that reads fine but names something Plaza has no screen for says exactly that, instead of being called unreadable and sending you looking for a typo that is not there.
+
+**An address's relay hints are used.** An `nevent1` or an `nprofile1` carries the relays its author says the thing lives on. Plaza decoded those and dropped them, so a quoted note that lives somewhere you do not read came back as "no relay has" it. That was true about your relays and false about the note. Those relays are now asked as well, kept small on purpose: two per note, one attempt each, each on its own short-lived connection that is closed whether or not it answers.
+
+**The macOS installer verifies the file it downloaded.** It had been comparing your download against the first checksum listed in the release rather than the one belonging to the file it fetched. Once a release carried more than one download, that could abort a perfectly good install with a checksum mismatch. The installer is fetched fresh every time, so this one took effect before this release rather than with it.
+
 ### What's new in v0.19.0
 
 **The dead controls work now.** Three things under every note were drawn and did nothing. A bookmark you could press that saved nothing, a hashtag painted like a link that went nowhere, and no way at all to delete your own note. Each one is now a real verb.
