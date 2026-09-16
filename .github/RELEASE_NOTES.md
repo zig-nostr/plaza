@@ -1,5 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.21.0
+
+**Plaza tells you when a newer one exists.** Until now you stayed on whatever build you installed until you happened to visit the site again, which makes shipping a fix worth less than it should be. There is now a line naming the new version and the one you are on, with one press to the release page where the notes and the downloads are. It does not download anything and it does not replace the app: a bundle that is ad-hoc signed and installed by a script that clears quarantine is not something to swap out from under you while you are reading. It asks twenty seconds after launch and then every six hours, it says nothing at all when a check fails, and "Tell me when a newer Plaza exists" in Settings turns it off, in which case no request is made.
+
+**A search tile on the left rail opens an address.** Opening an address shipped behind Cmd+L and a row in the account menu. That menu is about who you are signed in as; going to a note somebody sent you is navigation. It has its own tile now, beside Home, notifications and Places, and it is there whether or not you are signed in, because reading needs no key.
+
+**An address for a note you do not have now opens it.** Pasting one said "Fetching that note" and really did fetch it, and then did nothing with it. The message went away, you were still looking at the feed, and pasting the same address a second time opened the thread instantly. That is the case the address field exists for, because an address somebody sends you is usually a note you do not already have. It now opens the thread the moment the note arrives. If nothing turns up within about fifteen seconds it says so, rather than leaving you wondering whether anything is still happening, and going off to read something else while it is fetching cancels it, so a note that lands late does not pull you out of whatever you moved on to.
+
+**A video is drawn as a video.** Plaza could not tell a video from a web page, so a video in a note got a link preview card, and, worse, a link preview fetch: up to a quarter of a megabyte downloaded per video, looking for page tags a video file cannot have. Plaza now reads the media type the note itself declares, which is what tells a video named `thumb.jpg` from a picture, and reads the file name only when the note said nothing. A video gets a card that says it is a video, with one press to open it in your browser. Playing one inside Plaza is still to come.
+
 ### What's new in v0.20.1
 
 **The keyholder lets go of your key when Plaza closes.** Plaza carries Notary as its keyholder and starts it as a child process. If Plaza ever went away abnormally, that process was left running with nothing to do, and it kept the lock that says one keyholder holds this key at a time. Starting Plaza again and typing your passphrase then told you another Notary already had the key open, which was true, in a process you could not see and had not asked for. Nothing cleared it but a fifteen minute timer.
