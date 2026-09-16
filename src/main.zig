@@ -29099,6 +29099,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 var link_buf: [2048]u8 = undefined;
                 if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
                 refreshPlaceFetch();
+                // Beside it, and after it: a place arriving from a link moves
+                // the reader into a room, and that is a walk away from a note
+                // they asked for a moment earlier.
+                refreshEventFetch(model);
                 flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
@@ -33573,7 +33577,132 @@ fn openEvent(model: *Model, id: [32]u8) void {
     // reader's own note from before this install. Silence here is the worst
     // answer, because the row looks alive and is not. So ask for it, and say so.
     wantQuote(id);
+    // And WAIT for it. Asking was all this did, and the fetch works: the id goes
+    // into the quote cache, the relays the address named get dialled, and the
+    // note lands in the store seconds later. Nothing recorded that the reader
+    // was trying to GO somewhere, so there was nobody waiting on it when it
+    // landed. The toast expired, the feed stayed the feed, and pasting the same
+    // address a second time opened the thread instantly off the local copy.
+    g_event_want = .{ .id = id, .from = standingNow(model) };
     setToast(model, "Fetching that note");
+}
+
+/// Where the reader is standing, in just enough detail to tell "still here"
+/// from "gone somewhere else".
+///
+/// One snapshot compared on the tick, rather than a cancel written into each
+/// door out of the feed. A cancel in `enterThread` would cover `enterThread`
+/// and nothing else, and a note can arrive while the reader has opened a
+/// profile, walked into a room, or gone into Settings just as easily.
+const Standing = struct {
+    stage: Stage = .ready,
+    /// The open thread, zero at the feed.
+    thread: i64 = 0,
+    profile: ?[32]u8 = null,
+    /// The open room: host plus `d`, the pair that is a place's identity, and
+    /// null in the reader's own plaza. A title is not an identity, and two
+    /// communities may share one.
+    place: ?struct { pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8 } = null,
+
+    fn eql(a: Standing, b: Standing) bool {
+        if (a.stage != b.stage or a.thread != b.thread) return false;
+        if ((a.profile == null) != (b.profile == null)) return false;
+        if (a.profile) |ap| {
+            if (!std.mem.eql(u8, &ap, &b.profile.?)) return false;
+        }
+        if ((a.place == null) != (b.place == null)) return false;
+        if (a.place) |ap| {
+            const bp = b.place.?;
+            if (!std.mem.eql(u8, &ap.pubkey, &bp.pubkey)) return false;
+            if (!std.mem.eql(u8, ap.ident_buf[0..ap.ident_len], bp.ident_buf[0..bp.ident_len])) return false;
+        }
+        return true;
+    }
+};
+
+fn standingNow(model: *const Model) Standing {
+    var s = Standing{
+        .stage = model.stage,
+        .thread = model.viewing_thread,
+        .profile = model.viewing_profile,
+    };
+    if (g_place) |*p| {
+        var here: @TypeOf(s.place.?) = .{ .pubkey = p.author, .ident_buf = @splat(0), .ident_len = 0 };
+        here.ident_len = @intCast(copyBounded(&here.ident_buf, p.ident()));
+        s.place = here;
+    }
+    return s;
+}
+
+/// The note the reader asked to open, while it is being fetched.
+///
+/// The same three parts the place fetch has: what was asked for, a tick that
+/// applies it when it arrives, and a bounded give-up.
+var g_event_want: ?struct {
+    id: [32]u8,
+    /// Ticks the fetch has been outstanding, so it can give up and say so.
+    waited: u16 = 0,
+    /// Where the reader was standing when they asked.
+    from: Standing,
+} = null;
+
+/// Looks for the note being waited on, once the store has grown. Called from
+/// the tick, beside the place fetch this is modelled on, which is where every
+/// other "did it arrive yet" check in this app lives.
+fn refreshEventFetch(model: *Model) void {
+    const want = g_event_want orelse return;
+    // Gone somewhere else since asking. The window closes rather than pulling
+    // the reader out of whatever they picked up instead, the same rule the
+    // place fetch follows when the reader steps sideways out of a linked room.
+    if (!want.from.eql(standingNow(model))) {
+        g_event_want = null;
+        return;
+    }
+    const store = g_store orelse return;
+    if (store.getEvent(std.heap.page_allocator, want.id) catch null) |found| {
+        var se = found;
+        defer se.deinit();
+        // Closed BEFORE the navigation. `enterThread` moves the reader, so a
+        // window still open here would read its own arrival as a walk away on
+        // the next tick: right by accident, and only while that stays the last
+        // thing this function does.
+        g_event_want = null;
+        enterThread(model, noteFrom(se.event, nowSeconds()));
+        return;
+    }
+    // Give up eventually rather than watching a store read forever, and say so
+    // out loud. A reader told "Fetching that note" and then left on the feed
+    // with no second word cannot tell a slow relay from a note nobody has.
+    g_event_want.?.waited +|= 1;
+    if (g_event_want.?.waited > event_fetch_ticks) {
+        g_event_want = null;
+        setToast(model, "That note did not turn up.");
+    }
+}
+
+/// How many ticks a note fetch may go unanswered. The same window a place gets,
+/// for the same reason: the tick is a second, and a relay that has not answered
+/// in fifteen is one that does not have it.
+const event_fetch_ticks = 15;
+
+/// Drives the REAL entry path, so what the test asserts is what a reader gets.
+pub fn openEventForTest(model: *Model, id: [32]u8) void {
+    openEvent(model, id);
+}
+
+/// One tick of the store-side half of that fetch.
+pub fn refreshEventFetchForTest(model: *Model) void {
+    refreshEventFetch(model);
+}
+
+/// Whether the window is still watching. Closed is what both walking away and
+/// arriving must produce: an open window keeps reading the store every tick.
+pub fn eventFetchArmedForTest() bool {
+    return g_event_want != null;
+}
+
+pub fn forgetEventFetchForTest() void {
+    g_event_want = null;
 }
 
 /// Back to the feed from wherever the reader has got to, in one press.
