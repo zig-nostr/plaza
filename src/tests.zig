@@ -4135,12 +4135,12 @@ test "the link a card previews is the first plain one" {
     // image: those are drawn, not summarised.
     const image = "https://host.example/a.jpg";
     const content = "look " ++ image ++ " and read https://example.com/post, then " ++ "https://other.example/b.png";
-    const link = main.firstLinkUrl(content, image) orelse return error.NoLink;
+    const link = main.firstLinkUrl(content, image, &.{}) orelse return error.NoLink;
     // The trailing comma is punctuation, not part of the address.
     try testing.expectEqualStrings("https://example.com/post", link);
 
     // A note with nothing but its picture has no link to preview.
-    try testing.expect(main.firstLinkUrl("here " ++ image, image) == null);
+    try testing.expect(main.firstLinkUrl("here " ++ image, image, &.{}) == null);
 }
 
 test "a blurhash decodes to the picture's own colours" {
@@ -22990,7 +22990,7 @@ test "every glyph the rail asks for is a real glyph" {
     // by name through `ui.icon`, `railDest` takes one of Plaza's own through
     // `ui.appIcon`.
     main.registerIcons();
-    const builtin_names = [_][]const u8{ "search", "edit", "settings" };
+    const builtin_names = [_][]const u8{ "search", "edit", "settings", "play" };
     for (builtin_names) |name| {
         if (canvas.icons.find(name) == null) {
             std.debug.print("\n  the toolkit has no built-in glyph named \"{s}\"\n", .{name});
@@ -23214,4 +23214,157 @@ test "a release that is not newer raises no line" {
     // And a reply that is not a release document leaves no line either.
     main.updateNewsForTest("<html>rate limited</html>");
     try testing.expectEqualStrings("", main.pendingUpdateVersion());
+}
+
+// ------------------------------------------------------- a video is a video
+
+test "a declared type beats the extension, in both directions" {
+    // Amethyst's rule, and the pair that makes it worth having: a video named
+    // like a picture, and a picture named like a video. Collapsing this into
+    // `mime says video OR the name says video` is what they replaced, because
+    // it drew poster-named videos as pictures.
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/thumb.jpg", "video/mp4"));
+    try testing.expectEqual(main.MediaKind.image, main.classifyMedia("https://x.com/clip.mp4", "image/jpeg"));
+
+    // Nothing declared: the name decides.
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/clip.mp4", ""));
+    try testing.expectEqual(main.MediaKind.image, main.classifyMedia("https://x.com/shot.jpg", ""));
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/page", ""));
+
+    // A type we do not know is NOT a veto: it means nothing was said, and the
+    // name still decides. This is the tier that is easy to drop.
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/clip.mp4", "application/octet-stream"));
+    try testing.expectEqual(main.MediaKind.image, main.classifyMedia("https://x.com/shot.png", "application/x-thing"));
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/file.bin", "application/octet-stream"));
+
+    // Audio is deliberately not video: Plaza plays neither, and a video card on
+    // a sound file says something untrue.
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/song.mp3", "audio/mpeg"));
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/song.mp3", ""));
+}
+
+test "the extension is read off the path, not off the whole address" {
+    // A query, and a fragment. `#t=30` is a real thing to write after a video
+    // and reading it as part of the extension loses the video.
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/clip.mp4?token=abc", ""));
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/clip.mp4#t=30", ""));
+    try testing.expect(main.looksLikeImageUrl("https://x.com/shot.jpg#x"));
+    try testing.expect(main.looksLikeImageUrl("https://x.com/shot.jpg?w=100"));
+
+    // The dot has to be an extension dot. A host that merely contains the
+    // letters is not a video, and a path with no dot at all is not one either.
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://cdn.mp4.example/watch", ""));
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/mp4", ""));
+    try testing.expectEqual(main.MediaKind.other, main.classifyMedia("https://x.com/", ""));
+
+    // Case, because a host writing `.MP4` is writing a video.
+    try testing.expectEqual(main.MediaKind.video, main.classifyMedia("https://x.com/CLIP.MP4", ""));
+}
+
+test "a note carrying a video knows it is carrying a video" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4d} ** 32);
+
+    // A bare video link, no tags: the name is all there is to go on.
+    {
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "look https://cdn.example/clip.mp4", null);
+        const note = main.noteFrom(ev, 1_800_000_000);
+        try testing.expect(note.hasLink());
+        try testing.expectEqualStrings("https://cdn.example/clip.mp4", note.linkUrl());
+        try testing.expect(note.link_is_video);
+        // And it is NOT claimed as a picture, which would try to decode it.
+        try testing.expect(!note.hasImage());
+    }
+
+    // An ordinary page is still an ordinary page.
+    {
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "read https://example.com/post", null);
+        const note = main.noteFrom(ev, 1_800_000_000);
+        try testing.expect(note.hasLink());
+        try testing.expect(!note.link_is_video);
+    }
+
+    // The case the `m` field exists for: a video whose name says picture. The
+    // note's own imeta is what tells them apart, and without reading `m` this
+    // would be handed to the image decoder.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "imeta", "url https://cdn.example/thumb.jpg", "m video/mp4" },
+        };
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, tags[0..], "look https://cdn.example/thumb.jpg", null);
+        const note = main.noteFrom(ev, 1_800_000_000);
+        try testing.expect(!note.hasImage());
+        try testing.expect(note.hasLink());
+        try testing.expect(note.link_is_video);
+    }
+
+    // And the other direction: a picture whose name says video.
+    {
+        const tags = [_]nostr.event.Tag{
+            &.{ "imeta", "url https://cdn.example/shot.mp4", "m image/jpeg" },
+        };
+        const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, tags[0..], "look https://cdn.example/shot.mp4", null);
+        const note = main.noteFrom(ev, 1_800_000_000);
+        try testing.expect(!note.link_is_video);
+    }
+}
+
+test "the imeta m field is read off the tag that names the url" {
+    const tags = [_]nostr.event.Tag{
+        &.{ "imeta", "url https://a.example/one.jpg", "m image/jpeg", "alt a picture" },
+        &.{ "imeta", "url https://b.example/two.mp4", "m video/mp4" },
+    };
+    try testing.expectEqualStrings("image/jpeg", main.imetaFor(tags[0..], "https://a.example/one.jpg").mime);
+    try testing.expectEqualStrings("video/mp4", main.imetaFor(tags[0..], "https://b.example/two.mp4").mime);
+    // A url with no tag of its own gets nothing, rather than the other one's.
+    try testing.expectEqualStrings("", main.imetaFor(tags[0..], "https://c.example/three.png").mime);
+    // The neighbouring fields still parse, so the new arm did not swallow them.
+    try testing.expectEqualStrings("a picture", main.imetaFor(tags[0..], "https://a.example/one.jpg").alt);
+}
+
+test "a video is not fetched as a web page" {
+    // The waste this closes: `previewableUrl` looks only at the authority, so
+    // it says yes to a video file exactly as it does to an article. The runtime
+    // truncates at 256 KiB, so every video in the feed cost up to a quarter of
+    // a megabyte downloaded to look for `og:` tags it could never have.
+    //
+    // Both halves asserted: that the old gate really would have said yes, and
+    // that knowing it is a video is what stops it. Asserting only the second
+    // would pass even if the first had quietly started refusing videos anyway.
+    try testing.expect(main.previewableUrl("https://cdn.example/clip.mp4"));
+    try testing.expect(!main.shouldPreviewLink(true, "https://cdn.example/clip.mp4"));
+
+    // An ordinary page is still previewed.
+    try testing.expect(main.shouldPreviewLink(false, "https://example.com/post"));
+    // And the authority rules still apply to something that is not a video.
+    try testing.expect(!main.shouldPreviewLink(false, "http://example.com/post"));
+    try testing.expect(!main.shouldPreviewLink(false, "https://localhost/post"));
+}
+
+test "a note carrying a video draws a video, not a page card" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5e} ** 32);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "look https://cdn.example/clip.mp4", null);
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    // It says what it is and where it goes. The page card cannot appear here at
+    // all: it draws nothing until a fetch has answered, and no fetch is made.
+    try testing.expect(findAnyText(tree.root, "Video") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "cdn.example") != null);
+    try testing.expect(findByLabel(tree.root, "Open video") != null);
 }

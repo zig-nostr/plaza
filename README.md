@@ -31,8 +31,11 @@ client.
 > itself, and the check can be switched off in Settings, after which it makes no
 > request at all.
 >
-> Not there yet: putting a picture in a note, setting an avatar, sending a zap,
-> search, and private messages.
+> A video in a note is drawn as a video rather than as a web page, though it is
+> not played in place yet.
+>
+> Not there yet: playing a video where it sits, putting a picture in a note,
+> setting an avatar, sending a zap, search, and private messages.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
