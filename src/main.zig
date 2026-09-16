@@ -3550,6 +3550,8 @@ else
 const copy_npub_key: u64 = 100;
 const copy_nevent_key: u64 = 103;
 const copy_note_text_key: u64 = 104;
+// The update check. One at a time, so one key rather than a base.
+const update_check_key: u64 = 110;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and
 // clipboard keys above.
 const avatar_fetch_key_base: u64 = 1000;
@@ -10765,6 +10767,17 @@ pub const Model = struct {
             .failed => "Could not sign this. Nothing was published, and your profile is unchanged.",
         };
     }
+    pub fn update_check_on(_: *const Model) bool {
+        return updateCheckOn();
+    }
+    /// Says what it does AND what it costs, because the cost is a request to a
+    /// server on a timer and that is the thing worth being able to refuse.
+    pub fn update_check_explainer(_: *const Model) []const u8 {
+        return if (updateCheckOn())
+            "Plaza asks GitHub for its newest release a few times a day, and says so here when there is one. Nothing else is sent."
+        else
+            "Plaza will not ask, and makes no request at all. You can check at github.com/zig-nostr/plaza/releases.";
+    }
     pub fn client_tag_on(_: *const Model) bool {
         return clientTag();
     }
@@ -12544,6 +12557,210 @@ fn scanNip05Fetches(fx: *Effects) void {
 
 /// True when the well-known JSON maps the identifier's name to `pubkey`. This is
 /// the whole trust test: a check is drawn on this and nothing weaker.
+// --------------------------------------------------------------- the update
+//
+// Whoever installed Plaza is otherwise on that build until they happen to visit
+// the site, which makes shipping a fix worth less than it should be.
+//
+// TOLD, not done. Plaza is ad-hoc signed and installed by a script that clears
+// quarantine, and it is not going to replace its own bundle while running. A
+// line saying a newer version exists, with one press to go and get it, is the
+// honest amount of automation for how this app is distributed. The toolkit does
+// ship a signed self-updater; it swaps the bundle and relaunches, it is macOS
+// only while Plaza also ships Linux, and it wants a signed feed hosted
+// somewhere. All three are reasons this does not use it.
+//
+// The releases API, because that is the same document `scripts/install-macos.sh`
+// already reads. One source of truth for what the newest release is, rather than
+// a second one to keep in step.
+
+const update_check_url = "https://api.github.com/repos/zig-nostr/plaza/releases/latest";
+
+/// Whether to ask at all. OFF IS A REAL ANSWER: a client that contacts a server
+/// on a timer should say so and let it be switched off, and while it is off it
+/// makes no request. The gate is in `maybeCheckForUpdate` before the fetch, not
+/// in the handler after it.
+var g_update_check: bool = true;
+/// The newest release seen, when it is newer than this build. Empty otherwise.
+var g_update_version_buf: [24]u8 = @splat(0);
+var g_update_version_len: usize = 0;
+var g_update_url_buf: [160]u8 = @splat(0);
+var g_update_url_len: usize = 0;
+/// A request is out. One at a time: the key is a single value, not a base.
+var g_update_asking: bool = false;
+/// When to ask next, in `awake` milliseconds. Set at boot to a short delay so
+/// the first ask does not race the feed for the network on a cold start.
+var g_update_next_at_ms: i64 = 0;
+/// Put away for this session. Not persisted: a newer version is still newer
+/// tomorrow, and a dismissal that outlived the release it was about would be a
+/// reader told once and never again.
+var g_update_dismissed: bool = false;
+
+/// The first ask waits this long after launch, so the feed gets the network
+/// first on a cold start.
+const update_first_delay_ms: i64 = 20_000;
+/// And then this far apart. A release is not something that happens hourly.
+const update_interval_ms: i64 = 6 * 60 * 60 * 1000;
+
+pub fn updateCheckOn() bool {
+    return g_update_check;
+}
+
+pub fn setUpdateCheck(on: bool) void {
+    g_update_check = on;
+    // Nothing is cleared here, deliberately. `pendingUpdateVersion` already
+    // returns nothing while the switch is off, so clearing the buffers changed
+    // nothing a reader could see. What it DID change is switching back on: the
+    // news would be gone until the next check came round, up to six hours
+    // later, and that release is still out. Keep it and show it again.
+    //
+    // I wrote the clear first and a probe found no test could tell the
+    // difference, which is how the behaviour question got asked at all.
+}
+
+/// The version this build is being offered, empty when there is nothing newer
+/// or the reader has put it away.
+pub fn pendingUpdateVersion() []const u8 {
+    if (!g_update_check or g_update_dismissed) return "";
+    return g_update_version_buf[0..g_update_version_len];
+}
+
+pub fn pendingUpdateUrl() []const u8 {
+    if (!g_update_check or g_update_dismissed) return "";
+    return g_update_url_buf[0..g_update_url_len];
+}
+
+/// Whether to ask right now.
+///
+/// Pure over the four inputs, because the promise this keeps is not observable
+/// any other way: the fetch cannot run under test at all (`networkAllowed` is
+/// comptime false there), so "off makes no request" has to be asserted on the
+/// decision rather than on the socket.
+///
+/// `enabled` is read FIRST and on its own. Off is not "ask less often" or "ask
+/// and ignore the answer", it is do not ask, and a reader who switched this off
+/// is owed exactly that.
+pub fn updateCheckDue(enabled: bool, asking: bool, now_ms: i64, next_at_ms: i64) bool {
+    if (!enabled) return false;
+    if (asking) return false;
+    return now_ms >= next_at_ms;
+}
+
+/// Asks the releases API, at most once every `update_interval_ms`.
+///
+/// Driven from the tick with a due stamp, which is the idiom this app already
+/// uses for anything slower than a tick (`pollHelper` polls the keyholder the
+/// same way). There is no one-shot timer to reach for.
+fn maybeCheckForUpdate(fx: *Effects) void {
+    if (!networkAllowed()) return;
+    const io = g_io orelse return;
+    const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    if (!updateCheckDue(g_update_check, g_update_asking, now, g_update_next_at_ms)) return;
+    g_update_next_at_ms = now + update_interval_ms;
+    g_update_asking = true;
+    fx.fetch(.{
+        .key = update_check_key,
+        .url = update_check_url,
+        // What the API wants to be asked for. Without it the answer is the v3
+        // default, which is the same shape today and is not promised to stay.
+        .headers = &.{.{ .name = "accept", .value = "application/vnd.github+json" }},
+        .timeout_ms = 10_000,
+        .on_response = Effects.responseMsg(.update_checked),
+    });
+}
+
+/// What the releases API answered.
+///
+/// A failure is silent on purpose. Nobody asked for this, it runs on a timer,
+/// and a reader who cannot reach GitHub is told nothing rather than shown an
+/// error about a check they did not request. The next due time is already set.
+fn handleUpdateChecked(response: native_sdk.EffectResponse) void {
+    g_update_asking = false;
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0) return;
+    // `response.body` is valid only for this call, so what is kept is copied
+    // into the buffers rather than aliased.
+    var version_buf: [24]u8 = undefined;
+    var url_buf: [160]u8 = undefined;
+    const news = newerRelease(response.body, plaza_version, &version_buf, &url_buf) orelse return;
+    @memcpy(g_update_version_buf[0..news.version_len], version_buf[0..news.version_len]);
+    g_update_version_len = news.version_len;
+    @memcpy(g_update_url_buf[0..news.url_len], url_buf[0..news.url_len]);
+    g_update_url_len = news.url_len;
+}
+
+pub fn updateNewsForTest(body: []const u8) void {
+    handleUpdateChecked(.{ .key = update_check_key, .outcome = .ok, .status = 200, .body = body, .truncated = false, .dropped_before = 0 });
+}
+
+pub fn resetUpdateStateForTest() void {
+    g_update_check = true;
+    g_update_version_len = 0;
+    g_update_url_len = 0;
+    g_update_asking = false;
+    g_update_dismissed = false;
+    g_update_next_at_ms = 0;
+}
+
+/// What a release document said, once it is known to be newer than this build.
+pub const ReleaseNews = struct {
+    version_len: usize,
+    url_len: usize,
+};
+
+/// Strips one leading `v`, which is the same thing CI does when it checks a tag
+/// against `app.zon` (`tagged="${GITHUB_REF_NAME#v}"`). Exactly one: `vv1.0.0`
+/// is not a version this project ever writes.
+fn withoutVPrefix(tag: []const u8) []const u8 {
+    if (tag.len > 1 and (tag[0] == 'v' or tag[0] == 'V')) return tag[1..];
+    return tag;
+}
+
+/// Reads a GitHub release document and reports the version it names when that
+/// version is NEWER than `current`. Null otherwise: same version, older, or
+/// anything that did not parse.
+///
+/// Pure over the bytes so the comparison is testable without a network, which
+/// is the shape `nip05Matches` already uses for a third party's JSON.
+///
+/// A real ORDER, not a string compare. "0.9.0" sorts after "0.10.0" as text,
+/// so a string inequality would offer somebody an upgrade that is a downgrade,
+/// and would do it exactly once per launch forever.
+pub fn newerRelease(body: []const u8, current: []const u8, version_out: []u8, url_out: []u8) ?ReleaseNews {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{}) catch return null;
+    if (root != .object) return null;
+
+    // A draft or a prerelease is not something to send anybody to. Both are
+    // absent from `/releases/latest` today, and reading them costs nothing and
+    // stops this from depending on that staying true.
+    if (root.object.get("draft")) |d| {
+        if (d == .bool and d.bool) return null;
+    }
+    if (root.object.get("prerelease")) |p| {
+        if (p == .bool and p.bool) return null;
+    }
+
+    const tag = root.object.get("tag_name") orelse return null;
+    if (tag != .string) return null;
+    const theirs = withoutVPrefix(tag.string);
+
+    const mine = std.SemanticVersion.parse(withoutVPrefix(current)) catch return null;
+    const newest = std.SemanticVersion.parse(theirs) catch return null;
+    if (newest.order(mine) != .gt) return null;
+
+    // The release PAGE, which carries the notes and the downloads together, so
+    // "what is in it" and "where do I get it" are one press rather than two.
+    const url = root.object.get("html_url") orelse return null;
+    if (url != .string) return null;
+    if (!isSafeShareUrl(url.string)) return null;
+    if (theirs.len > version_out.len or url.string.len > url_out.len) return null;
+
+    @memcpy(version_out[0..theirs.len], theirs);
+    @memcpy(url_out[0..url.string.len], url.string);
+    return .{ .version_len = theirs.len, .url_len = url.string.len };
+}
+
 pub fn nip05Matches(identifier: []const u8, pubkey: [32]u8, body: []const u8) bool {
     const at = std.mem.indexOfScalar(u8, identifier, '@') orelse return false;
     const name = identifier[0..at];
@@ -15181,6 +15398,14 @@ pub const Msg = union(enum) {
     nip05_verified: native_sdk.EffectResponse,
     /// A page that was asked what it says about itself.
     link_fetched: native_sdk.EffectResponse,
+    /// The releases API answered the update check.
+    update_checked: native_sdk.EffectResponse,
+    /// Go and get the newer version: opens the release page in a browser.
+    open_update,
+    /// Put the update line away for this session.
+    dismiss_update,
+    /// Settings: stop asking whether a newer version exists.
+    update_check_toggle,
     /// A text edit in the Settings media-proxy field.
     proxy_edit: canvas.TextInputEvent,
     /// Save the media-proxy setting.
@@ -15248,7 +15473,7 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions", "open_address", "close_address", "address_edit", "address_submit" };
+    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions", "open_address", "close_address", "address_edit", "address_submit", "update_checked", "open_update", "dismiss_update", "update_check_toggle" };
 };
 
 // ---------------------------------------------------------------- app + view
@@ -15647,6 +15872,26 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
             &.{.{ .text = model.client_tag_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.update_check_on(),
+            .text = "Tell me when a newer Plaza exists",
+            .on_toggle = Msg.update_check_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Tell me when a newer Plaza exists", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.update_check_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
         ui.row(.{ .cross = .center, .gap = 8 }, .{
@@ -23144,6 +23389,9 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
+        // Under both. A newer version existing is the least urgent of the three
+        // and the only one the reader can put away.
+        updateBanner(ui),
         // ONE header, not two. A place stacked its own banner on top of the
         // scope line, so the top of the room was the place's name over the
         // place's feed name over a rule, in two different rhythms. In a place
@@ -24890,6 +25138,77 @@ fn offlineBanner(ui: *AppUi, model: *const Model) AppUi.Node {
                                 .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.status_warning_text } },
                                 &.{.{ .text = offlineBannerText(ui, queued), .scale = meta_scale }},
                             ),
+                        }),
+                        vgap(ui, 8),
+                    }),
+                    hgap(ui, 11),
+                }),
+            }),
+            hgap(ui, chrome_inset),
+        }),
+    });
+}
+
+/// The line saying a newer Plaza exists.
+///
+/// TOLD, not done: it names the version and gives one press to the release
+/// page, where the notes and the downloads are. It does not download anything
+/// and it does not replace the app, because an ad-hoc signed bundle installed
+/// by a script is not something to swap out from under somebody.
+///
+/// The offline banner's shape, one tone quieter. That banner is about something
+/// broken right now; this is news, and it can wait. It is also the only one of
+/// the three strips a reader can put away.
+fn updateBanner(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const version = pendingUpdateVersion();
+    if (version.len == 0) return ui.spacer(0);
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_menu, .border = p.border_menu, .radius = 8, .stroke_width = 1 },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 11),
+                    ui.column(.{ .gap = 0 }, .{
+                        vgap(ui, 8),
+                        ui.row(.{ .cross = .center, .gap = 0 }, .{
+                            ui.paragraph(
+                                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body } },
+                                &.{.{ .text = ui.fmt("Plaza {s} is out. You are on {s}.", .{ version, plaza_version }), .scale = meta_scale }},
+                            ),
+                            hgap(ui, 8),
+                            // The verb, and it says where it goes rather than
+                            // "Update": nothing here updates anything.
+                            ui.row(.{
+                                .cross = .center,
+                                .gap = 0,
+                                .on_press = Msg.open_update,
+                                .style = .{ .quiet_hover = true },
+                                .semantics = .{ .role = .button, .label = "See what is new", .focusable = true },
+                            }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.text_primary } },
+                                    &.{.{ .text = "See what is new", .weight = .medium, .underline = true, .scale = meta_scale }},
+                                ),
+                            }),
+                            hgap(ui, 12),
+                            ui.row(.{
+                                .cross = .center,
+                                .gap = 0,
+                                .on_press = Msg.dismiss_update,
+                                .style = .{ .quiet_hover = true },
+                                .semantics = .{ .role = .button, .label = "Dismiss the update notice", .focusable = true },
+                            }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.text_muted } },
+                                    &.{.{ .text = "Not now", .scale = meta_scale }},
+                                ),
+                            }),
                         }),
                         vgap(ui, 8),
                     }),
@@ -28752,6 +29071,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // then fire any queued key setup.
                 pollHelper(fx);
                 driveHelperSetup(fx);
+                // Whether a newer Plaza exists, on its own slow clock. Returns
+                // at once when the reader has switched it off.
+                maybeCheckForUpdate(fx);
                 // A toast lives a few seconds, then the tick retires it.
                 if (model.toast_until != 0 and nowSeconds() >= model.toast_until) {
                     model.toast_until = 0;
@@ -29475,6 +29797,22 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
         .link_fetched => |response| handleLinkFetched(response),
+        .update_checked => |response| handleUpdateChecked(response),
+        .open_update => {
+            // The release page: the notes and the downloads are both on it, so
+            // "what is in it" and "where do I get it" are one press.
+            const url = pendingUpdateUrl();
+            if (url.len == 0) return;
+            openExternally(fx, url);
+            // Put away on the press. Somebody who has gone to look does not
+            // need the line still there when they come back.
+            g_update_dismissed = true;
+        },
+        .dismiss_update => g_update_dismissed = true,
+        .update_check_toggle => {
+            setUpdateCheck(!updateCheckOn());
+            saveSettings();
+        },
         // A paragraph carries one link handler, so a mention arrives here beside
         // the ordinary links. Its payload is not a URL and never reaches the
         // browser; see `mention_link_tag`.
@@ -34672,6 +35010,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
     g_client_tag = false;
+    g_update_check = true;
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     g_hidden = @splat(false);
@@ -34689,6 +35028,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "update_check")) g_update_check = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "media_direct_fallback")) g_media_direct_fallback = std.mem.eql(u8, line[eq + 1 ..], "on");
         // Written by id rather than by position, so adding an element to the
@@ -34989,7 +35329,7 @@ fn saveSettings() void {
     var place_buf: [160]u8 = undefined;
     const place = activePlaceLine(&place_buf);
     var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\nupdate_check={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
@@ -35000,6 +35340,7 @@ fn saveSettings() void {
         place,
         g_post_delay_s,
         @tagName(g_home_scope),
+        if (g_update_check) "on" else "off",
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
