@@ -26,7 +26,10 @@ client.
 > person, or a place, including one on relays you do not read, because an
 > address that carries relay hints is asked there too. A `plaza://place/` link
 > opens somebody else's corner of Nostr: their relay, and whatever it serves,
-> without disturbing your own.
+> without disturbing your own. Plaza also says when a newer version of itself is
+> out, with one press to the release page. It tells you rather than replacing
+> itself, and the check can be switched off in Settings, after which it makes no
+> request at all.
 >
 > Not there yet: putting a picture in a note, setting an avatar, sending a zap,
 > search, and private messages.
