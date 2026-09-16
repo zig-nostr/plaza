@@ -7210,6 +7210,22 @@ pub fn urlDomain(url: []const u8) []const u8 {
 /// It cannot stop a redirect INTO one of those (the runtime follows up to
 /// three), which is worth knowing and is why the fetch stays unauthenticated and
 /// its body is only ever read for two meta tags.
+/// Whether to ask a link what it says about itself.
+///
+/// The video half is the point. `previewableUrl` looks only at the AUTHORITY,
+/// so it says yes to any https host, video file or not, and a video link was
+/// therefore fetched as a web page to look for `og:` tags it could never have.
+/// The runtime truncates a response at 256 KiB, so that was up to a quarter of
+/// a megabyte of somebody's video downloaded per video in the feed, to learn
+/// nothing and then mark the preview missing.
+///
+/// Pure over the two inputs because the fetch cannot run under test at all, the
+/// same reason `updateCheckDue` is pure.
+pub fn shouldPreviewLink(is_video: bool, url: []const u8) bool {
+    if (is_video) return false;
+    return previewableUrl(url);
+}
+
 pub fn previewableUrl(url: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "https://")) return false;
     if (url.len > 300) return false;
@@ -7267,7 +7283,11 @@ fn isPrivateAddress(host: []const u8) bool {
 /// The first plain link in a note's content: the one the card previews. An image
 /// URL is not one (it is drawn as the picture), and neither is anything inside a
 /// `nostr:` token.
-pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
+/// `tags` so the note's own `imeta` decides what a URL is, the same way the
+/// image collection does. Without it the two disagree: a video the host serves
+/// as `thumb.jpg` is rejected as an image by one and skipped as an image by
+/// the other, and lands in no bucket at all.
+pub fn firstLinkUrl(content: []const u8, image_url: []const u8, tags: []const nostr.event.Tag) ?[]const u8 {
     @setRuntimeSafety(true); // Scans a stranger's content for a URL run.
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
@@ -7287,7 +7307,7 @@ pub fn firstLinkUrl(content: []const u8, image_url: []const u8) ?[]const u8 {
             i = j;
             continue;
         }
-        if (looksLikeImageUrl(candidate)) {
+        if (classifyMedia(candidate, imetaFor(tags, candidate).mime) == .image) {
             i = j;
             continue;
         }
@@ -7405,7 +7425,7 @@ fn scanLinkFetches(fx: *Effects, model: *const Model) void {
 
 fn fireLink(fx: *Effects, note: *const Note, fired: *usize) void {
     if (!note.hasLink()) return;
-    if (!previewableUrl(note.linkUrl())) return;
+    if (!shouldPreviewLink(note.link_is_video, note.linkUrl())) return;
     const slot = wantLink(note.linkUrl()) orelse return;
     // Stamped first, so the eviction guard above counts this entry as wanted in
     // this pass whatever happens next.
@@ -10036,6 +10056,13 @@ pub const Note = struct {
     /// per note, which is what 11o draws; the URL stays in the text as well.
     link_url_buf: [300]u8 = [_]u8{0} ** 300,
     link_url_len: u16 = 0,
+    /// Whether that link is a video file rather than a page.
+    ///
+    /// ONE BYTE, not a second URL buffer. The URL is already captured here and
+    /// already drawn as a card; what was missing is knowing what it points at.
+    /// A `Note` is a fixed struct in the feed array, so a second 300-byte buffer
+    /// would be paid on every note in the window to say one thing about a few.
+    link_is_video: bool = false,
     /// Whether the note described its picture. The chip is the marker the shot
     /// draws, one word: the description itself would need a hover expand, which
     /// is not expressible.
@@ -14146,7 +14173,19 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     var omit_len: usize = 0;
     for (found[0..found_len]) |url| {
         if (url.len > note.images[0].url_buf.len) continue;
-        note.images[note.images_len].set(url, imetaFor(ev.tags, url));
+        const meta = imetaFor(ev.tags, url);
+        // The note gets to overrule its own file names. `collectImageUrls` knows
+        // only the extension, so a video a host serves as `thumb.jpg` arrives
+        // here looking like a picture; declaring `m video/mp4` is the author
+        // saying otherwise, and handing it to the image decoder would spend a
+        // registry slot and a download on bytes that will never decode.
+        //
+        // Only ever to REJECT. A declared `image/` on a URL the extension does
+        // not recognise is not taken as permission to fetch it: that decides to
+        // download something on a stranger's say-so, and it is a separate
+        // question from this one.
+        if (classifyMedia(url, meta.mime) != .image) continue;
+        note.images[note.images_len].set(url, meta);
         omit[omit_len] = url;
         omit_len += 1;
         note.images_len += 1;
@@ -14158,10 +14197,13 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     // The first plain link, for the preview card. Read from the ORIGINAL content:
     // the rendered copy has mentions rewritten and may be capped.
-    if (firstLinkUrl(ev.content, note.imageUrl())) |link| {
+    if (firstLinkUrl(ev.content, note.imageUrl(), ev.tags)) |link| {
         if (link.len <= note.link_url_buf.len) {
             @memcpy(note.link_url_buf[0..link.len], link);
             note.link_url_len = @intCast(link.len);
+            // What it points at, decided once here with the note's own `imeta`
+            // in hand. The tags are gone by the time anything draws.
+            note.link_is_video = classifyMedia(link, imetaFor(ev.tags, link).mime) == .video;
         }
     }
 
@@ -14679,6 +14721,12 @@ pub const Imeta = struct {
     /// the SDK's fetch response carries no headers, so there is no Content-Length
     /// to read, and with previews off nothing is fetched at all.
     size: u32 = 0,
+    /// The `m` field: what the note says this file's type is, lowercase, from
+    /// NIP-94 by way of NIP-92. A slice of the EVENT's memory, like `alt`.
+    ///
+    /// It is what tells a video named `.jpg` from a picture. See `classifyMedia`
+    /// for why a type nobody recognises is treated as nothing said.
+    mime: []const u8 = "",
 
     /// Height over width, or 0 when the tag says nothing. Knowing the shape
     /// before the bytes arrive is what lets a row reserve exactly the right
@@ -14714,6 +14762,8 @@ pub fn imetaFor(tags: []const nostr.event.Tag, url: []const u8) Imeta {
                 found.size = std.fmt.parseInt(u32, std.mem.trim(u8, field[5..], " "), 10) catch 0;
             } else if (std.mem.startsWith(u8, field, "blurhash ")) {
                 found.blurhash = std.mem.trim(u8, field["blurhash ".len..], " ");
+            } else if (std.mem.startsWith(u8, field, "m ")) {
+                found.mime = std.mem.trim(u8, field[2..], " ");
             }
         }
         if (matches_url) return found;
@@ -14746,16 +14796,70 @@ pub fn imetaAspect(tags: []const nostr.event.Tag, url: []const u8) f32 {
     return 0;
 }
 
-/// Whether a URL names an image file. By extension, which is what Nostr media
-/// hosts serve; a link without one is an ordinary link.
-pub fn looksLikeImageUrl(url: []const u8) bool {
-    const exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
-    const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
-    const path = url[0..path_end];
+/// What a URL points at, once the note has had its say about it.
+pub const MediaKind = enum { image, video, other };
+
+const image_exts = [_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp" };
+/// What Amethyst carries, minus the audio half. See `classifyMedia`.
+const video_exts = [_][]const u8{ ".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".mpg", ".mpeg", ".m3u8" };
+
+/// The end of the path: the first `?` or the first `#`, whichever comes first.
+///
+/// Both, not just the query. `…/clip.mp4#t=30` is a real address that names a
+/// start time, and stopping only at `?` reads its extension as `.mp4#t=30` and
+/// decides it is not a video.
+fn urlPathEnd(url: []const u8) usize {
+    return std.mem.indexOfAny(u8, url, "?#") orelse url.len;
+}
+
+/// Whether the path ends in one of `exts`.
+///
+/// The dot has to be a real extension dot: after the last `/`, so a host like
+/// `cdn.mp4.example/watch` is not a video, and present at all, so a path that
+/// merely ends in the letters is not either.
+fn hasExtensionIn(url: []const u8, exts: []const []const u8) bool {
+    const path = url[0..urlPathEnd(url)];
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    if (slash != null and dot < slash.?) return false;
     for (exts) |ext| {
         if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
     }
     return false;
+}
+
+/// What a URL points at, given what the note's `imeta` said its type was.
+///
+/// Amethyst's rule, which is three tiers rather than two, and the third is the
+/// one worth keeping: a mime we RECOGNISE wins over the extension in both
+/// directions, a mime we do NOT recognise is treated as no declaration at all
+/// and the extension decides, and only then is it neither. Collapsing the first
+/// two into `startsWith("video/") or looksLikeVideo(url)` is exactly what their
+/// regression test says they replaced, because it made a video named `.jpg`
+/// render as a picture.
+///
+/// `m` comes from NIP-94 by way of NIP-92, which says an `imeta` MAY carry any
+/// NIP-94 field and delegates the vocabulary; NIP-94 defines `m` as a lowercase
+/// MIME type.
+///
+/// AUDIO IS NOT VIDEO HERE, and that is a deliberate difference from Amethyst.
+/// They fold the two together because they have one player for both. Plaza has
+/// neither, so calling an `.mp3` a video would put a video card on a sound file.
+/// It stays an ordinary link until there is something true to say about it.
+pub fn classifyMedia(url: []const u8, mime: []const u8) MediaKind {
+    if (std.ascii.startsWithIgnoreCase(mime, "image/")) return .image;
+    if (std.ascii.startsWithIgnoreCase(mime, "video/")) return .video;
+    // Anything else declared, including `audio/` and a mime that is nonsense,
+    // falls through to the extension rather than vetoing it.
+    if (hasExtensionIn(url, &image_exts)) return .image;
+    if (hasExtensionIn(url, &video_exts)) return .video;
+    return .other;
+}
+
+/// Whether a URL names an image file. By extension, which is what Nostr media
+/// hosts serve; a link without one is an ordinary link.
+pub fn looksLikeImageUrl(url: []const u8) bool {
+    return hasExtensionIn(url, &image_exts);
 }
 
 /// The first image URL in `content`, or null. Recognised by extension, which is
@@ -18774,7 +18878,7 @@ fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
                 focalBody(ui, note),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
+                if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
             }),
@@ -21556,7 +21660,7 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 noteBody(ui, note, true),
                 if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                 if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
+                if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, note),
             }),
@@ -26861,7 +26965,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         // shifts as images arrive.
                         if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
                         if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                        if (note.hasLink()) linkCard(ui, note) else ui.spacer(0),
+                        if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                         if (anyVerbShown()) vgap(ui, 10) else ui.spacer(0),
                         engagementRow(ui, note),
                     }),
@@ -27457,6 +27561,62 @@ const link_card_text_width: f32 = picture_column_width - 12 - link_card_tile_siz
 /// And how many characters of description fit that width at its scale. A length
 /// rather than a width because the engine will not elide this one: see the call.
 const link_desc_max: usize = 78;
+
+/// A video the note carries, said plainly.
+///
+/// Recognition only. Plaza draws no frame and plays nothing yet: the toolkit
+/// has the whole transport for it and Plaza calls none of it, and deciding who
+/// owns the one player in a scrolling column is the other half of this. What
+/// this fixes is that a video used to be indistinguishable from a web page, so
+/// it got a page's card and a page's fetch.
+///
+/// The host, because that is who you are about to hand a request to, and the
+/// note's own `alt` when it wrote one.
+fn videoCard(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    const url = note.linkUrl();
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 3),
+        ui.el(.list_item, .{
+            .width = picture_column_width,
+            .padding = 0.01,
+            .on_press = Msg{ .open_url = url },
+            .style = .{ .background = p.surface_link_card, .border = p.border_chip_alt, .radius = 10, .stroke_width = 1 },
+            .semantics = .{ .role = .link, .label = "Open video", .focusable = true },
+        }, .{
+            hgap(ui, 12),
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.el(.panel, .{
+                    .width = 30,
+                    .height = 30,
+                    .padding = 0.01,
+                    .style = .{ .background = p.surface_link_tile, .radius = 7, .stroke_width = 0 },
+                }, .{
+                    ui.column(.{ .width = 30, .height = 30, .main = .center, .cross = .center }, .{
+                        ui.icon(.{ .width = 14, .height = 14, .style = .{ .foreground = p.text_secondary } }, "play"),
+                    }),
+                }),
+                vgap(ui, 10),
+            }),
+            hgap(ui, 10),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{
+                vgap(ui, 10),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_body } },
+                    &.{.{ .text = "Video", .weight = .medium, .scale = meta_scale }},
+                ),
+                vgap(ui, 2),
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = urlHost(url), .monospace = true, .scale = mono_meta_scale }},
+                ),
+                vgap(ui, 10),
+            }),
+            hgap(ui, 12),
+        }),
+    });
+}
 
 fn linkCard(ui: *AppUi, note: *const Note) AppUi.Node {
     const p = theme.palette;
