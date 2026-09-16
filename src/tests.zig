@@ -22979,3 +22979,66 @@ test "no thread that dials a relay is spawned without a gate above it" {
         }
     }
 }
+
+test "every glyph the rail asks for is a real glyph" {
+    // `ui.icon` does not fail on a name nobody registered: `resolveOrMissing`
+    // hands back a placeholder, so a typo or a glyph that left the toolkit
+    // draws a box and every tree assertion still passes. The tile test below
+    // finds the press and would not notice.
+    //
+    // Both tables, because the rail draws from both: `railTile` takes a BUILT-IN
+    // by name through `ui.icon`, `railDest` takes one of Plaza's own through
+    // `ui.appIcon`.
+    main.registerIcons();
+    const builtin_names = [_][]const u8{ "search", "edit", "settings" };
+    for (builtin_names) |name| {
+        if (canvas.icons.find(name) == null) {
+            std.debug.print("\n  the toolkit has no built-in glyph named \"{s}\"\n", .{name});
+            return error.RailAsksForAMissingGlyph;
+        }
+    }
+    const app_names = [_][]const u8{ "mark", "bell", "places" };
+    for (app_names) |name| {
+        if (canvas.icons.resolve(name) == null) {
+            std.debug.print("\n  no registered app glyph named \"{s}\"\n", .{name});
+            return error.RailAsksForAMissingGlyph;
+        }
+    }
+}
+
+test "the rail opens an address, signed in or not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Shipped behind Cmd+L and a row in the account menu, which is a menu about
+    // identity and settings. Going to a note somebody sent you is navigation,
+    // so the only visible way to it sat behind the avatar.
+    //
+    // Both identity states, because reading needs no key: a link somebody sent
+    // is one of the first things a person who has not signed in arrives with.
+    main.clearIdentityForTest();
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const tree = try buildTree(arena, &model);
+        const msg = pressMsgByLabel(tree, "Open an address") orelse return error.GuestRailHasNoAddressTile;
+        switch (msg) {
+            .open_address => {},
+            else => return error.RailTileGoesSomewhereElse,
+        }
+    }
+
+    main.setIdentityForTest([_]u8{0x3a} ** 32);
+    defer main.clearIdentityForTest();
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        const tree = try buildTree(arena, &model);
+        const msg = pressMsgByLabel(tree, "Open an address") orelse return error.SignedInRailHasNoAddressTile;
+        switch (msg) {
+            .open_address => {},
+            else => return error.RailTileGoesSomewhereElse,
+        }
+    }
+}

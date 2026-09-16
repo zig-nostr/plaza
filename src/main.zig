@@ -23207,6 +23207,22 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
         // way in. The plate says you are IN a place, which is the fact worth
         // showing; whether the rail happens to be out is visible on its own.
         railDest(ui, "places", 17, Msg.toggle_places_rail, "Places", g_place != null),
+        vgap(ui, rail_gap),
+        // An address, and the way in for anything somebody hands you.
+        //
+        // The design names five rail destinations and Search is one of the two
+        // that were left out, because a tile that goes nowhere is worse than one
+        // fewer. It goes somewhere now.
+        //
+        // No selected plate, for the bell's reason rather than as an oversight:
+        // it opens a SHEET over whatever is underneath rather than being a
+        // section of its own, and a plate would claim a selection the app does
+        // not have.
+        //
+        // Shown to guests too. Reading needs no key, and a link somebody sent is
+        // one of the first things a person who has not signed in arrives with.
+        // That is the same call the account menu's row makes.
+        railTile(ui, "search", 16, .open_address, "Open an address", false),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
