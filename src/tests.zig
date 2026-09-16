@@ -22900,6 +22900,163 @@ test "the relays an address named reach the fetch that goes looking" {
     try testing.expectEqual(@as(?u8, 2), main.profileHintCountForTest(pk));
 }
 
+test "an address for a note you do not hold opens the thread when it arrives" {
+    // The reported bug. Paste an address for a note this machine does not have
+    // and Plaza said "Fetching that note", genuinely fetched it, and then did
+    // nothing with it. `openEvent` read the store once and, on a miss, asked
+    // for the note and raised the toast; nothing recorded that the reader was
+    // trying to GO somewhere, so when it landed a second later there was nobody
+    // waiting on it. The toast expired, the feed stayed the feed, and the note
+    // sat on disk until the same address was pasted a second time.
+    //
+    // An address somebody sends you is, by definition, usually a note you do
+    // not have. That is the case the field exists for.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3c} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/arrives.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetQuotesForTest();
+    main.forgetEventFetchForTest();
+    defer main.forgetEventFetchForTest();
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "the note behind the address");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // Pasted and submitted, with the note nowhere on this machine.
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, ev.id) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expectEqualStrings("Fetching that note", model.toast_text());
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+
+    // A tick with the note still missing moves nobody.
+    main.refreshEventFetchForTest(&model);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expect(main.eventFetchArmedForTest());
+
+    // It lands, the way the fetch lands it.
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.refreshEventFetchForTest(&model);
+
+    // And the reader is in the thread they asked for, without pasting again.
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &ev.id));
+    // The window closes on arrival: left open it reads the store every tick,
+    // and would take its own navigation for a walk away.
+    try testing.expect(!main.eventFetchArmedForTest());
+}
+
+test "a note that never turns up says so rather than waiting forever" {
+    // The other half of the fix. Giving up silently puts the reader back where
+    // the bug left them: told "Fetching that note", then left on the feed with
+    // no second word, unable to tell a slow relay from a note nobody has.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/nevercomes.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetQuotesForTest();
+    main.forgetEventFetchForTest();
+    defer main.forgetEventFetchForTest();
+
+    const id = [_]u8{0x4e} ** 32;
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, id) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+
+    // The whole window, with nothing ever arriving. Still watching: a relay
+    // that answers on the last tick of it is still in time.
+    for (0..15) |_| main.refreshEventFetchForTest(&model);
+    try testing.expect(main.eventFetchArmedForTest());
+    try testing.expectEqualStrings("Fetching that note", model.toast_text());
+
+    // One past it, and the reader is told.
+    main.refreshEventFetchForTest(&model);
+    try testing.expect(!main.eventFetchArmedForTest());
+    try testing.expectEqualStrings("That note did not turn up.", model.toast_text());
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+}
+
+test "a note that arrives after you have walked away does not drag you back" {
+    // The window has to close when the reader goes somewhere else, or a note
+    // fetched fifteen seconds ago yanks them out of whatever they picked up
+    // instead. This is the same rule the place fetch follows when the reader
+    // steps sideways out of a linked room.
+    //
+    // A snapshot compared on the tick rather than a cancel written into each
+    // door: `enterThread` is one way out of a feed, and opening a person,
+    // walking into a room and going into Settings are three more.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3d} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/walkedoff.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.resetQuotesForTest();
+    main.forgetEventFetchForTest();
+    defer main.forgetEventFetchForTest();
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "asked for, then abandoned");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, ev.id) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expect(main.eventFetchArmedForTest());
+
+    // The reader gives up on it and opens somebody's profile instead.
+    main.update(&model, Msg{ .open_person = kp.public_key }, &fx);
+    main.refreshEventFetchForTest(&model);
+    try testing.expect(!main.eventFetchArmedForTest());
+
+    // The note lands anyway, and the reader stays where they went.
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.refreshEventFetchForTest(&model);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expect(model.viewing_profile != null);
+}
+
 test "a quoted note in a note body keeps the relays its address named" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
