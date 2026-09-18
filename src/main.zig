@@ -2621,7 +2621,7 @@ const engagement_watch_cap = 128;
 // ids across four kinds is a very large thing to leave a busy relay to pick.
 const engagement_request_limit = 500;
 // What an engagement query asks for: replies, reposts, likes, zap receipts.
-const engagement_kinds = [_]u16{ 1, 6, 7, 9735 };
+const engagement_kinds = [_]u16{ 1, comment_kind, 6, 7, 9735 };
 
 // ------------------------------------------------------------------- places
 //
@@ -3443,7 +3443,11 @@ fn engagementKinds() []const u16 {
     var n: usize = 0;
     for (engagement_kinds) |k| {
         const drop = switch (k) {
-            1 => countHidden(.replies, .reply_counts),
+            // A comment IS a reply, so it follows the reply preference. Asking
+            // for it while replies are hidden would ask relays for the thing
+            // the reader turned off, which is the overclaim this function
+            // exists to avoid.
+            1, comment_kind => countHidden(.replies, .reply_counts),
             7 => countHidden(.reactions, .reaction_counts),
             9735 => countHidden(.zaps, .zap_totals),
             // 6 and 16 stay whatever is hidden, for the reason in the registry.
@@ -8229,7 +8233,7 @@ var g_seen_len: usize = 0;
 // split those decisions ended up with a badge that disagreed with its own list.
 
 /// The kinds a relay is asked for on the reader's behalf.
-pub const inbox_kinds = [_]u16{ 1, 6, 7, 9735 };
+pub const inbox_kinds = [_]u16{ 1, comment_kind, 6, 7, 9735 };
 
 /// How many items are kept. The KV holds one rewritten blob, so this is what
 /// bounds it, and the oldest fall off the end.
@@ -8391,6 +8395,26 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     hexLower(&hex, me);
     var last_p_is_me = false;
     for (ev.tags) |tag| {
+        // Lowercase `p` only, including for a comment, which is what the
+        // reference clients do and I checked rather than reasoned.
+        //
+        // NIP-22 gives a comment two author tags: `P` is the author of the
+        // thread's ROOT, `p` the author of the note being answered. Reading
+        // `P` here looks generous and is wrong. Amethyst's notification
+        // subscription asks `mapOf("p" to listOf(pubkey))` and its classifier
+        // is `it[0] == "p"`, both lowercase; Jumble's is `'#p': [pubkey]`.
+        // Both carry kind 1111 in their notification kinds, so this is a
+        // deliberate narrowing on their part rather than an oversight.
+        //
+        // Amethyst DOES parse `P`, as `RootAuthorTag`, and uses it for
+        // `pubKeyHints()` and `linkedPubKeys()`: relay hints and which
+        // profiles to prefetch. Never for the inbox. Taking that as "it
+        // admits both" is the misreading this comment exists to prevent.
+        //
+        // The behaviour it buys: a comment deep in a thread I started, between
+        // other people, is not news. A thread can run for a hundred messages
+        // and telling the root author about each one is the hellthread problem
+        // in NIP-22 clothing.
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
         p_tags += 1;
         const mine = std.ascii.eqlIgnoreCase(tag[1], &hex);
@@ -8405,7 +8429,12 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     if (p_tags > inbox_hellthread_max) return null;
 
     return switch (ev.kind) {
-        1 => noteVerbFor(ev, me, last_p_is_me),
+        // A comment is a reply written in the other vocabulary, so it asks the
+        // same question. Adding the kind to `inbox_kinds` without adding it
+        // here would let the events arrive and then produce no row: the REQ and
+        // this switch are two gates, and a kind in one but not the other is a
+        // subscription paying for events nobody draws.
+        1, comment_kind => noteVerbFor(ev, me, last_p_is_me),
         // A repost or a reaction copies the p tags of what it is about, and
         // NIP-10 has a reply carry every p tag of its parent plus the parent's
         // author. So the reader's key propagates down every thread they ever
@@ -8460,7 +8489,7 @@ fn noteVerbFor(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) ?InboxVerb
     // Named in the text. A mention is something the writer typed, so a quote of
     // the reader's note counts here too.
     if (contentNames(ev.content, me)) return .mention;
-    if (nip10Parent(ev.tags) != null) {
+    if (replyParent(ev.kind, ev.tags) != null) {
         // A reply whose parent this app does not hold, which is the normal case
         // for a reader who has been away. NIP-25's ordering rule is the same
         // fallback the reaction path leans on: the last `p` tag is the one the
@@ -8498,7 +8527,7 @@ fn reactionTargetsMe(ev: nostr.event.Event, me: [32]u8, last_p_is_me: bool) bool
 /// naming them. The difference is the difference between a conversation and a
 /// stranger putting a link in front of you.
 fn inboxTargetsMyNote(ev: nostr.event.Event, me: [32]u8) bool {
-    const parent = nip10Parent(ev.tags) orelse return false;
+    const parent = replyParent(ev.kind, ev.tags) orelse return false;
     const store = g_store orelse return false;
     var se = (store.getEvent(std.heap.page_allocator, parent) catch return false) orelse return false;
     defer se.deinit();
@@ -9179,6 +9208,20 @@ pub fn inboxAddForTest(ev: nostr.event.Event, now_s: i64) bool {
 
 pub fn inboxVerbForTest(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     return inboxVerbFor(ev, me);
+}
+
+/// A NIP-22 comment, for the inbox tests: same shape as the kind:1 builder
+/// there, with the kind that makes the other vocabulary apply.
+pub fn commentEventForTest(author: u8, tags: []const nostr.event.Tag) nostr.event.Event {
+    return .{
+        .id = [_]u8{author} ** 32,
+        .pubkey = [_]u8{author} ** 32,
+        .created_at = 100,
+        .kind = comment_kind,
+        .tags = tags,
+        .content = "a comment",
+        .sig = [_]u8{0} ** 64,
+    };
 }
 
 /// Drops the leaving account's notifications. Another reader must never open
@@ -11144,7 +11187,11 @@ pub const Model = struct {
     fn refreshProfileNotes(self: *Model, now_s: i64) void {
         const pk = self.viewing_profile orelse return;
         const store = g_store orelse return;
-        const kinds = [_]u16{1};
+        // Comments too. A person who answers in the other vocabulary was
+        // simply absent from their own profile, and the page looked like
+        // somebody who had stopped writing rather than one this app could not
+        // read.
+        const kinds = [_]u16{ 1, comment_kind };
         const authors = [_][32]u8{pk};
         var result = store.query(std.heap.page_allocator, .{
             .authors = &authors,
@@ -14217,7 +14264,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     // parent is the same problem, an event referenced by id that may or may not
     // be on the reader's relays, and it already has the fetching, the backoff
     // and the eviction.
-    if (nip10Parent(ev.tags)) |parent_id| {
+    if (replyParent(ev.kind, ev.tags)) |parent_id| {
         note.reply_parent = parent_id;
         note.has_reply_parent = true;
         wantQuote(parent_id);
@@ -14225,6 +14272,73 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 
     note.setTime(now_s);
     return note;
+}
+
+/// NIP-22's comment kind: a reply that is not a kind:1.
+///
+/// Worth reading even though the raw volume is small. Ditto and Coracle publish
+/// every reply as one of these whatever the parent is, and every client that
+/// writes them at all writes one when the PARENT is already one, so a single
+/// comment converts the whole branch beneath it. A client that cannot read them
+/// does not lose an event, it loses a subtree, and it shows silence rather than
+/// a gap.
+pub const comment_kind: u16 = 1111;
+
+/// The parent of a NIP-22 comment: the LAST lowercase `e`, falling back to the
+/// uppercase `E`.
+///
+/// No markers, and no positional fallback, because NIP-22 has no marker
+/// vocabulary at all. Field 4 of a NIP-22 `e` is the AUTHOR pubkey where NIP-10
+/// puts a marker, so reading it as one is how a reader quietly starts mistaking
+/// every comment for an unmarked positional reply.
+///
+/// A comment on a URL or a hashtag carries neither `e` nor `E`, only `I` or
+/// `A`, and answers null: it has no event parent, and calling one of those a
+/// reply to something would be inventing a tie.
+pub fn nip22Parent(tags: []const nostr.event.Tag) ?[32]u8 {
+    var lower: ?[32]u8 = null;
+    var upper: ?[32]u8 = null;
+    for (tags) |tag| {
+        if (tag.len < 2 or tag[1].len != 64) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, tag[1]) catch continue;
+        if (std.mem.eql(u8, tag[0], "e")) lower = id;
+        if (std.mem.eql(u8, tag[0], "E") and upper == null) upper = id;
+    }
+    return lower orelse upper;
+}
+
+/// The root of a NIP-22 comment: the uppercase `E`, read directly.
+///
+/// Never derived by climbing. Every writer copies the parent comment's
+/// uppercase scope forward verbatim, so a reader that reconstructs it by
+/// walking ancestors disagrees with every other client the moment one ancestor
+/// is missing from the store. For a client that renders from a local store,
+/// missing ancestors are the ordinary case rather than the exception.
+pub fn nip22Root(tags: []const nostr.event.Tag) ?[32]u8 {
+    for (tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "E")) continue;
+        if (tag[1].len != 64) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, tag[1]) catch continue;
+        return id;
+    }
+    return null;
+}
+
+/// The parent of a reply of EITHER kind, and the root likewise.
+///
+/// These exist so no call site has to remember which vocabulary an event
+/// speaks. A kind:1 reply and a kind:1111 comment answer the same question with
+/// different tags, and mixing the two readers is how a thread ends up half
+/// assembled: NIP-10 markers read off a NIP-22 tag find an author pubkey where
+/// they expect "reply".
+pub fn replyParent(kind: u16, tags: []const nostr.event.Tag) ?[32]u8 {
+    return if (kind == comment_kind) nip22Parent(tags) else nip10Parent(tags);
+}
+
+pub fn replyRoot(kind: u16, tags: []const nostr.event.Tag) ?[32]u8 {
+    return if (kind == comment_kind) nip22Root(tags) else nip10Root(tags);
 }
 
 /// The NIP-10 parent of a reply: the `e` tag marked `reply` wins; with only a
@@ -14378,9 +14492,9 @@ pub fn nip10Root(tags: []const nostr.event.Tag) ?[32]u8 {
 /// the conversation actually tags, and the pressed note is what keeps this
 /// working when a root tag is missing, wrong, or points at something else: its
 /// own direct children still match.
-pub fn threadQueryIds(focal: [32]u8, tags: []const nostr.event.Tag, out: *[2][32]u8) usize {
+pub fn threadQueryIds(focal: [32]u8, kind: u16, tags: []const nostr.event.Tag, out: *[2][32]u8) usize {
     out[0] = focal;
-    const root = nip10Root(tags) orelse return 1;
+    const root = replyRoot(kind, tags) orelse return 1;
     // A note that names itself as its own root is one id, not two.
     if (std.mem.eql(u8, &root, &focal)) return 1;
     out[1] = root;
@@ -14390,6 +14504,24 @@ pub fn threadQueryIds(focal: [32]u8, tags: []const nostr.event.Tag, out: *[2][32
 /// Whether the tags carry a NON-mention `e` reference to `id`: a root, reply,
 /// or positional ancestor pointer. A mention-marked tag is a quote, not an
 /// ancestor tie.
+/// Whether a reply of EITHER kind ties itself to `id`.
+///
+/// A comment's tie is its lowercase `e` or its uppercase `E`, and neither
+/// carries a marker, so there is no quote to exclude: NIP-22 has no `mention`
+/// vocabulary. A quoted event inside a comment is a `q` tag, which is not read
+/// here and so cannot be mistaken for an ancestor tie.
+pub fn replyReferences(kind: u16, tags: []const nostr.event.Tag, id: [32]u8) bool {
+    if (kind != comment_kind) return nip10References(tags, id);
+    for (tags) |tag| {
+        if (tag.len < 2 or tag[1].len != 64) continue;
+        if (!std.mem.eql(u8, tag[0], "e") and !std.mem.eql(u8, tag[0], "E")) continue;
+        var tid: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&tid, tag[1]) catch continue;
+        if (std.mem.eql(u8, &tid, &id)) return true;
+    }
+    return false;
+}
+
 pub fn nip10References(tags: []const nostr.event.Tag, id: [32]u8) bool {
     for (tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "e")) continue;
@@ -14474,10 +14606,14 @@ pub fn collectThreadIds(store: *nostr.store.Store, root_event_id: [32]u8, out: *
                 idx -= 1;
                 const ev = result.events[idx];
                 if (count >= out.len) break;
-                if (ev.kind != 1) continue;
+                // A comment is a reply, so it belongs in the thread it
+                // answers. Excluding it here is what made a conversation show
+                // silence rather than a gap: the events were in the store and
+                // the walk stepped over them.
+                if (ev.kind != 1 and ev.kind != comment_kind) continue;
                 if (std.mem.eql(u8, &ev.id, &root_event_id)) continue;
-                const parent = nip10Parent(ev.tags) orelse continue;
-                var connected = std.mem.eql(u8, &parent, &root_event_id) or nip10References(ev.tags, root_event_id);
+                const parent = replyParent(ev.kind, ev.tags) orelse continue;
+                var connected = std.mem.eql(u8, &parent, &root_event_id) or replyReferences(ev.kind, ev.tags, root_event_id);
                 if (!connected) {
                     for (out[0..count]) |*member| {
                         if (std.mem.eql(u8, member, &parent)) {
@@ -14577,7 +14713,7 @@ fn refreshAncestorChain(chain: *AncestorChain, store: *nostr.store.Store, focal:
     if (store.getEvent(std.heap.page_allocator, focal.event_id) catch null) |se| {
         var owned = se;
         defer owned.deinit();
-        declared_root = nip10Root(owned.event.tags);
+        declared_root = replyRoot(owned.event.kind, owned.event.tags);
     }
 
     // Newest first while walking, reversed into the cache at the end.
@@ -14607,7 +14743,7 @@ fn refreshAncestorChain(chain: *AncestorChain, store: *nostr.store.Store, focal:
         // Stamped here, where the event is already in hand.
         up_lines[n] = @intFromFloat(ancestorBodyLines(&noteFrom(se.event, now)));
         n += 1;
-        if (declared_root == null) declared_root = nip10Root(se.event.tags);
+        if (declared_root == null) declared_root = replyRoot(se.event.kind, se.event.tags);
         const parent = nip10Parent(se.event.tags) orelse break;
         // A malformed cycle (a note tagging one of its own descendants, or its
         // own id) would walk forever, so a repeat ends the chain where it
@@ -34227,7 +34363,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         if (store.getEvent(gpa, root_id) catch null) |se| {
             var owned = se;
             defer owned.deinit();
-            thread_count = threadQueryIds(root_id, owned.event.tags, &thread_ids);
+            thread_count = threadQueryIds(root_id, owned.event.kind, owned.event.tags, &thread_ids);
         }
     }
     var thread_hex: [2][64]u8 = undefined;
@@ -34263,7 +34399,17 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         var watch_len: usize = 0;
         while (watch_len < thread_count) : (watch_len += 1) watch_ids[watch_len] = thread_watch[watch_len];
 
-        const reply_kinds = [_]u16{1};
+        // Comments too, or a thread never FETCHES the half of itself written
+        // in the other vocabulary. The walk that assembles a thread admits them
+        // now, but it reads the local store, and nothing was putting them
+        // there: the conversation stayed exactly as holed as before.
+        //
+        // The `#e` filter finds them without a second one. NIP-22 has a
+        // top-level comment repeat its uppercase scope in the lowercase tags,
+        // so a comment on the root carries `e` = the root, and a nested one
+        // carries `e` = the comment it answers, which is a thread member by
+        // the time it matters.
+        const reply_kinds = [_]u16{ 1, comment_kind };
         const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = thread_evals[0..thread_count] }};
         const reply_filters = [_]nostr.filter.Filter{.{ .kinds = &reply_kinds, .tags = &reply_tags, .limit = thread_reply_cap }};
         relay.subscribe("plaza-thread", &reply_filters) catch continue;
