@@ -511,7 +511,38 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             //
             // macOS is left alone: its scrolling is a trackpad's and feels
             // right as it is.
+            //
+            // The glide STAYS, and eight is not a number to tidy away. I set it
+            // to zero on the reasoning that GTK's own GtkScrolledWindow applies
+            // a wheel detent straight to the adjustment with no animation, and
+            // that a glide nobody asked for is mush. Measured on Linux, that
+            // was wrong, and instructively so.
+            //
+            // The renderer off macOS manages about 23 frames a second, and a
+            // reader scrolling slowly delivers far fewer events than that. The
+            // kinetic step is what fills the gap: it puts a new offset on
+            // frames that no input arrived for. With the glide, 79% of frames
+            // carried a new scroll position. With it off, 50%, so half of every
+            // frame drew the previous frame again and it reads as sticking.
+            //
+            // So this is a smoothing term standing in for a frame rate, and it
+            // is load-bearing until the frame rate is fixed. GTK can apply a
+            // detent instantly because GTK is not drawing at 23fps.
             if (builtin.os.tag != .macos) {
+                // A detented notch travels instead of teleporting.
+                //
+                // One notch is 40 points here, about 6% of the feed, applied
+                // in a single step. At the five to ten notches a second a
+                // reader actually turns a wheel, that is a row of discrete
+                // jumps with nothing drawn between them, and no frame rate
+                // fixes it because no intermediate position exists. Reported
+                // as teeth on a gear rather than a sweeping hand.
+                //
+                // 200ms is GTK's own animation duration for the eased scrolls
+                // it ships, and roughly what a browser spends on a wheel
+                // notch. It only applies to DETENTED input: a trackpad keeps
+                // the instant path, which is right for it.
+                t.scroll.wheel_ease_ms = 200;
                 t.scroll.wheel_velocity_scale = 8;
                 t.scroll.deceleration_per_second = 0.002;
                 t.scroll.stop_velocity = 20;

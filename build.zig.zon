@@ -14,7 +14,7 @@
         // CLI and the framework speak different protocol versions, and moving
         // one alone does not fail the build: it silently breaks every live test.
         //
-        // A fork rather than vercel-labs/native, for four patches. Every one is
+        // A fork rather than vercel-labs/native, for eight patches. Every one is
         // a gap that only shows off macOS, where the toolkit's own software
         // renderer is the whole of what a user sees, and none is fixable from
         // up here:
@@ -38,10 +38,34 @@
         //      had just computed and converted the whole surface every frame.
         //      The fork uses it, which is upstream's own Windows code one
         //      platform over.
+        //   5. Every GTK scroll signal ran a full synchronous engine dispatch
+        //      inside the signal handler. At the 100 to 200 events a second a
+        //      high-resolution wheel or a touchpad delivers, that work outlasts
+        //      the gap to the next event, so GDK's input source stayed ready on
+        //      every main-loop iteration and the frame emission, which sits in
+        //      the idle band on purpose, never ran. Scrolling froze the window
+        //      for seconds at a time. The fork coalesces scroll to one event a
+        //      frame, which is what macOS has always done.
+        //      Upstream vercel-labs/native#440.
+        //   6. A detented wheel notch teleported. `applyWheel` adds the delta
+        //      to the offset in one step, which is right for a trackpad and
+        //      wrong for a wheel: one notch is 40 points in a 690 point
+        //      viewport however slowly it arrives, so the feed jumped with
+        //      nothing drawn in between and no frame rate could help. The fork
+        //      travels it over about 200ms instead.
+        //      Upstream vercel-labs/native#441.
+        //   7. The software rasteriser did per-pixel work that was either the
+        //      same at every pixel or provably absent from the answer: the
+        //      fill sample for a solid colour, the rounded-corner test on a
+        //      square rect, and the destination read under an opaque source.
+        //      Upstream vercel-labs/native#442.
+        //   8. It also ran on one core of four. The fork splits rows into
+        //      bands. Measured together with 7, scrolling this feed: present
+        //      26.4ms to 7.1ms a frame, 23fps to 55fps.
+        //      Upstream vercel-labs/native#443.
         //
-        // It is v0.10.1 plus those four commits and nothing else, one commit
-        // each, so any of them can be dropped on its own when it lands
-        // upstream. PATCHES.md in the fork is the tracker: one row per patch
+        // It is v0.10.1 plus those eight patches and nothing else, so any of
+        // them can be dropped on its own when it lands upstream. PATCHES.md in the fork is the tracker: one row per patch
         // with its upstream issue and how to remove it. Nothing watches those
         // issues automatically; the list is short enough to read.
         //
@@ -49,13 +73,13 @@
         // and colorLayerCount(), which are the fork's own API, so Plaza does
         // not compile against vercel-labs/native until those go too.
         //
-        // Also reachable as the tag `plaza-linux-gaps-2`, so the commit this
+        // Also reachable as the tag `plaza-linux-gaps-4`, so the commit this
         // fetches does not depend on one branch surviving. A branch deleted or
         // force-pushed past it takes the dependency down for every cold
         // checkout while a warm Zig cache hides it locally.
         .native_sdk = .{
-            .url = "git+https://github.com/zig-nostr/native.git#a90ee35d7813dfd5e4d55a053e29067e704c4e7a",
-            .hash = "native_sdk-0.1.0-hzDzQkVysQJeCEkO1f6kfnZt7cQ0YNriPiqOdn_CAYXg",
+            .url = "git+https://github.com/zig-nostr/native.git#0eee6e3b09bf6ee054e7c62956097ea033bd062e",
+            .hash = "native_sdk-0.1.0-hzDzQj5QsgJf3gwFivco6sig1wjGaQcE_2heLFq5zNAU",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the
