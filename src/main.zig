@@ -34391,7 +34391,17 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         var watch_len: usize = 0;
         while (watch_len < thread_count) : (watch_len += 1) watch_ids[watch_len] = thread_watch[watch_len];
 
-        const reply_kinds = [_]u16{1};
+        // Comments too, or a thread never FETCHES the half of itself written
+        // in the other vocabulary. The walk that assembles a thread admits them
+        // now, but it reads the local store, and nothing was putting them
+        // there: the conversation stayed exactly as holed as before.
+        //
+        // The `#e` filter finds them without a second one. NIP-22 has a
+        // top-level comment repeat its uppercase scope in the lowercase tags,
+        // so a comment on the root carries `e` = the root, and a nested one
+        // carries `e` = the comment it answers, which is a thread member by
+        // the time it matters.
+        const reply_kinds = [_]u16{ 1, comment_kind };
         const reply_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = thread_evals[0..thread_count] }};
         const reply_filters = [_]nostr.filter.Filter{.{ .kinds = &reply_kinds, .tags = &reply_tags, .limit = thread_reply_cap }};
         relay.subscribe("plaza-thread", &reply_filters) catch continue;
