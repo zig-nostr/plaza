@@ -1,5 +1,17 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.22.0
+
+**Scrolling on Linux works properly now.** It has been wrong since the first Linux build, in three separate ways, and all three are fixed.
+
+**The window used to freeze while you scrolled.** Not slow down, stop. Every scroll event from your mouse or trackpad made Plaza do a full rebuild of the view before it could accept the next one, and at the hundred-plus events a second those devices send, that work never finished before more arrived. The window then stopped drawing entirely for as long as you kept scrolling, and caught up when you stopped. Measured on one ordinary gesture: **26 seconds of frozen window out of 54, with the worst single stall lasting four seconds.** It now sits at zero, and the worst hiccup is a tenth of a second.
+
+**A wheel click used to jump.** One notch moved the feed a fixed distance in a single step, with nothing drawn in between, so the feed advanced in visible teeth rather than sliding. A notch now travels over about a fifth of a second, and spinning the wheel faster does not lose any of the distance you asked for. If you scroll with a trackpad nothing changes there: a trackpad is already smooth and gets the direct path.
+
+**And it draws more than twice as fast.** Plaza renders every pixel itself off macOS, and that renderer was doing per-pixel work it did not need to do and using one core of your machine's four. It now uses them all, and skips the work that could not change the answer. Scrolling went from **23 frames a second to 55**.
+
+None of this touches macOS, where the system handles scrolling and always did.
+
 ### What's new in v0.21.0
 
 **Plaza tells you when a newer one exists.** Until now you stayed on whatever build you installed until you happened to visit the site again, which makes shipping a fix worth less than it should be. There is now a line naming the new version and the one you are on, with one press to the release page where the notes and the downloads are. It does not download anything and it does not replace the app: a bundle that is ad-hoc signed and installed by a script that clears quarantine is not something to swap out from under you while you are reading. It asks twenty seconds after launch and then every six hours, it says nothing at all when a check fails, and "Tell me when a newer Plaza exists" in Settings turns it off, in which case no request is made.
