@@ -23609,16 +23609,19 @@ test "a comment naming me is a notification, by either p tag" {
     try testing.expectEqual(main.InboxVerb.reply, main.inboxVerbForTest(main.commentEventForTest(0xC1, &answers_me), me).?);
 
     // Named ONLY in the uppercase `P`: I started the thread, but this comment
-    // answers somebody else's comment in it. NOT a notification, and that is
-    // deliberate rather than an oversight. It is the same rule a kind:1 reply
-    // follows, and the reason is the same: a thread the reader started can run
-    // for a hundred messages between other people, and telling them about each
-    // one is the hellthread problem wearing NIP-22's clothes.
+    // answers somebody else's comment in it. NOT a notification, which is what
+    // the reference clients do. Amethyst's notification subscription asks for
+    // lowercase `p` and its classifier is `it[0] == "p"`; Jumble's filter is
+    // `'#p': [pubkey]`. Both carry kind 1111, so the narrowing is deliberate.
     //
-    // `P` is still read at the naming gate above, because an event that names
-    // the reader anywhere deserves to reach the verb decision rather than being
-    // dropped as addressed to nobody. What it does not do is manufacture a
-    // verb on its own.
+    // Amethyst parses `P` as `RootAuthorTag` and spends it on `pubKeyHints()`
+    // and `linkedPubKeys()`, which is relay hints and profile prefetching, not
+    // the inbox. It is easy to read that as "Amethyst admits both" and be
+    // wrong.
+    //
+    // The behaviour: a thread I started can run for a hundred messages between
+    // other people, and telling me about each one is the hellthread problem in
+    // NIP-22 clothing.
     const on_my_root = [_]nostr.event.Tag{
         &.{ "E", root_hex, "", &me_hex },
         &.{ "P", &me_hex },

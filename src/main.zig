@@ -8395,25 +8395,33 @@ fn inboxVerbFor(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
     hexLower(&hex, me);
     var last_p_is_me = false;
     for (ev.tags) |tag| {
-        // Uppercase `P` too. NIP-22 gives a comment BOTH: `P` is the author of
-        // the thread's root, `p` is the author of the note being answered. A
-        // reader named only in the uppercase is still being told about, and a
-        // lowercase-only check silently drops every comment on a root of
-        // theirs.
-        const is_p = std.mem.eql(u8, tag[0], "p");
-        const is_root_p = ev.kind == comment_kind and std.mem.eql(u8, tag[0], "P");
-        if (tag.len < 2 or (!is_p and !is_root_p)) continue;
-        // The hellthread count stays lowercase-only: `P` is one author, not a
-        // crowd, and counting it would push a two-person comment thread over a
-        // limit meant for a note addressed to twenty people.
-        if (is_p) p_tags += 1;
+        // Lowercase `p` only, including for a comment, which is what the
+        // reference clients do and I checked rather than reasoned.
+        //
+        // NIP-22 gives a comment two author tags: `P` is the author of the
+        // thread's ROOT, `p` the author of the note being answered. Reading
+        // `P` here looks generous and is wrong. Amethyst's notification
+        // subscription asks `mapOf("p" to listOf(pubkey))` and its classifier
+        // is `it[0] == "p"`, both lowercase; Jumble's is `'#p': [pubkey]`.
+        // Both carry kind 1111 in their notification kinds, so this is a
+        // deliberate narrowing on their part rather than an oversight.
+        //
+        // Amethyst DOES parse `P`, as `RootAuthorTag`, and uses it for
+        // `pubKeyHints()` and `linkedPubKeys()`: relay hints and which
+        // profiles to prefetch. Never for the inbox. Taking that as "it
+        // admits both" is the misreading this comment exists to prevent.
+        //
+        // The behaviour it buys: a comment deep in a thread I started, between
+        // other people, is not news. A thread can run for a hundred messages
+        // and telling the root author about each one is the hellthread problem
+        // in NIP-22 clothing.
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "p")) continue;
+        p_tags += 1;
         const mine = std.ascii.eqlIgnoreCase(tag[1], &hex);
         if (mine) names_me = true;
         // Tracked separately: for a reaction or a repost the LAST p tag is the
-        // one that means "this is about you". Only the lowercase counts here;
-        // an uppercase `P` names the ROOT's author, which says nothing about
-        // who this particular comment answers.
-        if (is_p) last_p_is_me = mine;
+        // one that means "this is about you".
+        last_p_is_me = mine;
     }
     if (!names_me) return null;
     // A note addressed to a crowd is a broadcast. Being one of twenty names on
