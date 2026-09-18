@@ -1,5 +1,15 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.23.0
+
+**Replies written as comments show up now.** Nostr has two ways to write a reply: the original one, and NIP-22 comments. Plaza only read the first, so a conversation could arrive with holes in it and nothing on screen said they were holes: no error, no empty state, just a thread that quietly skipped half of itself.
+
+That matters more than it sounds, because some clients write every reply the second way, and once one reply in a branch is written that way, everything under it follows. So a single comment could hide a whole run of the conversation.
+
+Three places were affected and all three are fixed. **A comment that mentions you is a notification.** **A person's comments appear on their profile**, where before someone who answered that way looked like they had stopped writing. **And a thread shows them**, including asking relays for them, which is the part that actually fills the gaps in.
+
+Hiding replies still hides these too, since a comment is a reply. Nothing else changes.
+
 ### What's new in v0.22.0
 
 **Scrolling on Linux works properly now.** It has been wrong since the first Linux build, in three separate ways, and all three are fixed.
