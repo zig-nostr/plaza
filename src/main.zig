@@ -7076,6 +7076,14 @@ const QuoteEntry = struct {
     next_round: u64 = 0,
     requested: bool = false,
     pubkey: [32]u8 = [_]u8{0} ** 32,
+    /// The kind of the event this entry holds.
+    ///
+    /// The card is reached without anybody asking for it: a note quoting a
+    /// long-form article rendered the article's raw markdown into the snippet,
+    /// and a note quoting an event whose content is empty by design drew a card
+    /// with a name and nothing under it, which reads as a fault rather than as
+    /// a thing the card cannot draw.
+    kind: u16 = 0,
     created_at: i64 = 0,
     text_buf: [quote_text_cap]u8 = [_]u8{0} ** quote_text_cap,
     text_len: u16 = 0,
@@ -7701,6 +7709,7 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         };
         defer se.deinit();
         q.pubkey = se.event.pubkey;
+        q.kind = se.event.kind;
         q.created_at = se.event.created_at;
         var tmp: [note_content_cap]u8 = undefined;
         const omit = firstImageUrl(se.event.content) orelse "";
@@ -7708,10 +7717,28 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         const host_len = @min(host.len, q.image_host_buf.len);
         @memcpy(q.image_host_buf[0..host_len], host[0..host_len]);
         q.image_host_len = @intCast(host_len);
-        const wrote = renderContent(&tmp, se.event.content, omit);
-        const keep = utf8SafeLen(tmp[0..wrote], q.text_buf.len);
-        @memcpy(q.text_buf[0..keep], tmp[0..keep]);
-        q.text_len = @intCast(keep);
+        // The same decision `noteFrom` makes, made here too, because this cache
+        // fills the card and `noteFrom` fills every other surface and the two
+        // must not disagree about one event.
+        switch (kindRender(se.event.kind)) {
+            .note, .media => {
+                const wrote = renderContent(&tmp, se.event.content, omit);
+                const keep = utf8SafeLen(tmp[0..wrote], q.text_buf.len);
+                @memcpy(q.text_buf[0..keep], tmp[0..keep]);
+                q.text_len = @intCast(keep);
+            },
+            .article => {
+                if (titleOf(se.event)) |title| {
+                    const keep = @min(title.len, q.text_buf.len);
+                    @memcpy(q.text_buf[0..keep], title[0..keep]);
+                    q.text_len = @intCast(keep);
+                }
+            },
+            // Nothing to bake. The card draws the chip instead, which says
+            // what this is rather than showing a slab of something nobody can
+            // read as a sentence.
+            .unsupported => q.text_len = 0,
+        }
         // Decoded from the ORIGINAL content, not the stored text: the stored
         // text is rendered and capped, so the token can be gone from it.
         var probe = Note{};
@@ -10074,6 +10101,25 @@ pub const Note = struct {
     // The full 32-byte event id, for the reaction's `e` tag and the engagement
     // subscription's `#e` filter. The i64 above is only a render/dedup key.
     event_id: [32]u8 = [_]u8{0} ** 32,
+    /// The kind this note was built from.
+    ///
+    /// Nothing used to branch on kind when it drew, and `noteFrom` built a note
+    /// out of any event without ever reading this. The feed and the thread got
+    /// away with it because they filter to kind 1 before they get there. The
+    /// quote cache and `openEvent` do not, so a long-form article arrived as a
+    /// slab of raw markdown painted into a note body, and an event whose content
+    /// is empty by design arrived as a card that said nothing at all.
+    ///
+    /// Two bytes on a fixed struct, which is what lets every surface ask the
+    /// same question and get the same answer.
+    ///
+    /// Defaults to 1, not 0. `noteFrom` always writes the event's real kind
+    /// over this, INCLUDING a real 0, so a kind:0 event still draws as the kind
+    /// nothing can render. The default only ever applies to a `Note` built
+    /// without an event behind it: a scratch struct, or a fixture. Those have
+    /// always been text notes, and 0 would quietly reclassify every one of them
+    /// as an event this app refuses to draw.
+    kind: u16 = 1,
     created_at: i64 = 0,
     // The author's full pubkey, so the view can resolve a display name and an
     // avatar from the profile cache at render time (picking up a name or a
@@ -14192,6 +14238,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         .pubkey = ev.pubkey,
         .id = noteIdOf(ev),
         .event_id = ev.id,
+        .kind = ev.kind,
     };
 
     // Avatar initials fallback: the first pubkey byte as two hex digits, stable
@@ -14238,9 +14285,35 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         note.images_len += 1;
     }
 
-    // Content: `nostr:` mentions rewritten to @name (or a short @npub), copied
-    // whole-codepoint so a split multi-byte sequence never reaches the shaper.
-    note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, omit[0..omit_len], &note.mentions));
+    // What text this note shows, decided by its kind rather than by assuming
+    // every event keeps its words in `content`.
+    //
+    // Only the body is decided here. What a card DRAWS around the body, the
+    // chip naming a kind nothing can render, belongs where the card is built,
+    // because the body buffer has no way to say "there is nothing to say".
+    switch (kindRender(ev.kind)) {
+        // Content: `nostr:` mentions rewritten to @name (or a short @npub),
+        // copied whole-codepoint so a split multi-byte sequence never reaches
+        // the shaper.
+        .note, .media => {
+            note.content_len = @intCast(renderContentInto(&note.content_buf, ev.content, omit[0..omit_len], &note.mentions));
+        },
+        // An article's content is markdown, and a card is not where anybody
+        // asked to read markdown. The `title` tag is the one line of it that
+        // belongs in a row. Without a title there is nothing honest to show,
+        // so the card falls to the unsupported chip rather than to the body.
+        .article => {
+            if (titleOf(ev)) |title| {
+                @memcpy(note.content_buf[0..title.len], title);
+                note.content_len = @intCast(title.len);
+            }
+        },
+        // Left empty on purpose. Rendering the content of a kind nothing knows
+        // how to draw is exactly the bug: a kind:1063's content is empty by
+        // design and an article's was markdown, and both were painted as though
+        // they were somebody's words.
+        .unsupported => {},
+    }
 
     // The first plain link, for the preview card. Read from the ORIGINAL content:
     // the rendered copy has mentions rewritten and may be capped.
@@ -14283,6 +14356,71 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 /// does not lose an event, it loses a subtree, and it shows silence rather than
 /// a gap.
 pub const comment_kind: u16 = 1111;
+
+/// How an event of a given kind gets drawn.
+///
+/// Nothing branched on kind before this. `noteFrom` built a note out of any
+/// event and every surface drew its `content` as a note body, which the feed
+/// and the thread got away with because they filter to kind 1 upstream. The
+/// quote card and `openEvent` do not filter, so a long-form article arrived as
+/// a slab of raw markdown and an event whose content is empty by design arrived
+/// as a card with a name, a time and nothing under it.
+///
+/// ONE function, so a quote card, a thread and `open_event` cannot disagree
+/// about the same event. Jumble does exactly this: an allowlist in front of the
+/// render chain, and everything outside it gets a card naming the kind and a
+/// way to open it somewhere that can draw it
+/// (`src/components/NoteContent/index.tsx:52`). Amethyst and Coracle instead
+/// fall through to drawing unknown content as a text note, which is the
+/// behaviour being fixed here, and they get away with it because their feeds
+/// are allow-listed too.
+pub const KindRender = enum {
+    /// Its content is the thing to read. Kind 1 and NIP-22 comments.
+    note,
+    /// Its content is markdown nobody asked to read in a card, so the `title`
+    /// tag stands in for it. Rendering long-form properly is separate work.
+    article,
+    /// The media is the point and the content is a caption, which is already
+    /// what `noteFrom` does with any note carrying a picture or a video.
+    media,
+    /// Plaza cannot draw this. Saying so, with the kind number, beats a blank
+    /// card: a reader who knows what it is can open it somewhere that can.
+    unsupported,
+};
+
+pub fn kindRender(kind: u16) KindRender {
+    return switch (kind) {
+        1, comment_kind => .note,
+        // NIP-23 long form, and its unpublished draft.
+        30023, 30024 => .article,
+        // NIP-68 picture, and the NIP-71 video kinds.
+        20, 21, 22 => .media,
+        else => .unsupported,
+    };
+}
+
+/// An event's `title` tag, clipped the way a client name is.
+///
+/// Modelled line for line on `clientOf`, including the truncate-rather-than-
+/// refuse rule and the control-character check: both read one short tag off a
+/// stranger's event and put it in a fixed row.
+pub fn titleOf(ev: nostr.event.Event) ?[]const u8 {
+    for (ev.tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "title")) continue;
+        const title = std.mem.trim(u8, tag[1], " \t\r\n");
+        if (title.len == 0) return null;
+        for (title) |c| {
+            if (c < 0x20 or c == 0x7f) return null;
+        }
+        return clipToChars(title, article_title_chars, article_title_bytes);
+    }
+    return null;
+}
+
+/// A title is one line in a card, so it is capped like every other such string
+/// here rather than allowed to fill the body buffer.
+const article_title_chars: usize = 96;
+const article_title_bytes: usize = 200;
 
 /// The parent of a NIP-22 comment: the LAST lowercase `e`, falling back to the
 /// uppercase `E`.
@@ -18157,7 +18295,12 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     const collapsed = noteIsLong(note) and !isExpanded(note.id);
     const shown_chars: f32 = @floatFromInt(if (collapsed) collapsedLen(note.content(), note_collapse_chars) else note.content_len);
     const lines = @max(1, @ceil(shown_chars / chars_per_line));
-    var extent = chrome + lines * line_height;
+    // A kind nothing can draw puts a chip where the body would be, so the row
+    // is priced as that chip rather than as a line of text it does not have.
+    // `@max(1, ...)` above would otherwise charge it a full line for a body of
+    // length zero, which is close enough to hide in the slack and still wrong.
+    const unsupported = kindRender(note.kind) == .unsupported;
+    var extent = chrome + (if (unsupported) quote_pill_height else lines * line_height);
     if (collapsed) extent += line_height;
     // The reply line and its gap, priced whatever state it is in: it occupies
     // one line while it says "reply to a note" and one line once it names
@@ -18210,6 +18353,7 @@ fn quoteAsideExtent(id: [32]u8) f32 {
         // a row of its own under the body, and the row around it is priced.
         .loaded => quote_aside_chrome + quoteBodyLines(e) * body_line_height +
             (if (e.has_quote_of) quote_pill_height + 4 else 0) +
+            (if (kindRender(e.kind) == .unsupported) quote_pill_height + 4 else 0) +
             (if (e.image_host_len > 0) quote_pill_height + 4 else 0),
     };
 }
@@ -26350,6 +26494,11 @@ fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
 /// a thread is about.
 fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink: canvas.Color) AppUi.Node {
     const p = theme.palette;
+    // A kind nothing here can draw says which kind, where the body would be.
+    // `noteFrom` leaves the body empty for these, and an empty paragraph is
+    // what made such a card read as a note that had failed to load rather than
+    // as one this app was never going to draw.
+    if (kindRender(note.kind) == .unsupported) return unsupportedKindChip(ui, note.kind);
     const full = note.content();
     const long = collapsible and noteIsLong(note);
     const expanded = long and isExpanded(note.id);
@@ -26539,7 +26688,7 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
     // other row instead of a second one built from the cache's parts. Writing a
     // parallel builder is what cost the focal note its quote card once already.
     const note = ui.arena.create(Note) catch return ui.spacer(0);
-    note.* = .{ .pubkey = q.pubkey, .created_at = q.created_at };
+    note.* = .{ .pubkey = q.pubkey, .created_at = q.created_at, .kind = q.kind };
     const hexdigits = "0123456789abcdef";
     note.initials_buf = .{ hexdigits[q.pubkey[0] >> 4], hexdigits[q.pubkey[0] & 0x0f] };
     setAuthor(note, q.pubkey);
@@ -26580,7 +26729,11 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // Four lines of the quoted note, and no more: a quote is an aside, and
         // its height has to be known where the outer row is priced.
         if (q.text_len > 0) quoteBody(ui, note) else ui.spacer(0),
-        // What the card cannot draw, said rather than left blank.
+        // What the card cannot draw, said rather than left blank. The chip for
+        // an unsupported kind sits beside the one for a picture because they
+        // answer the same question: a card with a name, a time and nothing
+        // under it reads as a rendering fault, and this says which it is.
+        if (kindRender(q.kind) == .unsupported) unsupportedKindChip(ui, q.kind) else ui.spacer(0),
         if (q.image_host_len > 0) quoteMediaChip(ui, q.image_host_buf[0..q.image_host_len]) else ui.spacer(0),
         // A quote of a quote stops here. One more body would be a third voice in
         // a row, so the second hop is a pill that says where it goes.
@@ -26605,6 +26758,36 @@ fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
 /// where the picture renders with a registry slot of its own. A second press
 /// target here would offer a shorter way to the same place and take a slot to
 /// do it.
+/// Says that an event is of a kind this app has no way to draw, and which kind.
+///
+/// The kind NUMBER, deliberately. A reader who sees "kind 31923" can look it up
+/// or open the event somewhere that draws it; a reader looking at a blank card
+/// has been told nothing, and cannot tell a kind Plaza will never draw from a
+/// note that failed to load. Jumble draws the same conclusion and puts a client
+/// picker next to it (`src/components/NoteContent/UnknownNote.tsx`).
+fn unsupportedKindChip(ui: *AppUi, kind: u16) AppUi.Node {
+    const p = theme.palette;
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.panel, .{
+            .height = quote_pill_height,
+            .padding = 0.01,
+            .style = .{ .background = p.surface_pill, .border = p.border_pill, .radius = 999, .stroke_width = 1 },
+        }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 8),
+                ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "file"),
+                hgap(ui, 6),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = ui.fmt("Plaza cannot draw a kind {d} event", .{kind}), .scale = meta_scale }},
+                ),
+                hgap(ui, 8),
+            }),
+        }),
+        ui.spacer(1),
+    });
+}
+
 fn quoteMediaChip(ui: *AppUi, host: []const u8) AppUi.Node {
     const p = theme.palette;
     return ui.row(.{ .gap = 0 }, .{
@@ -26721,7 +26904,13 @@ fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
         // Whose note, and the start of what it says: the shot's own pill reads
         // "Quoting @edith · Shipping it: the feed renders…", so the reader can
         // tell whether the hop is worth taking before taking it.
-        .loaded => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), oneLine(ui, e.text_buf[0..e.text_len]) }),
+        .loaded => switch (kindRender(e.kind)) {
+            // Naming the kind beats naming the author and then showing nothing:
+            // a kind whose content is empty by design drew "Quoting @somebody"
+            // with a blank after it, which reads as a note that failed to load.
+            .unsupported => ui.fmt("Quoting a kind {d} event", .{e.kind}),
+            else => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), oneLine(ui, e.text_buf[0..e.text_len]) }),
+        },
         .missing => "Quotes a note no relay has",
         else => "Quoting a note",
     };
@@ -26803,6 +26992,10 @@ pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []con
     const e = quoteFor(id) orelse return;
     e.pubkey = pubkey;
     e.created_at = created_at;
+    // These fixtures were written before a quote entry carried a kind, and
+    // every one of them means "a note". Left at the 0 default they would each
+    // claim to hold an event of a kind nothing can draw.
+    e.kind = 1;
     const keep = @min(text.len, e.text_buf.len);
     @memcpy(e.text_buf[0..keep], text[0..keep]);
     e.text_len = @intCast(keep);
@@ -26815,6 +27008,10 @@ pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
     const q = quoteFor(id) orelse return;
     q.state = .loaded;
     q.pubkey = pubkey;
+    // These fixtures were written before a quote entry carried a kind, and
+    // every one of them means "a note". Left at the 0 default they would each
+    // claim to hold an event of a kind nothing can draw.
+    q.kind = 1;
     const n = @min(text.len, q.text_buf.len);
     @memcpy(q.text_buf[0..n], text[0..n]);
     q.text_len = @intCast(n);
@@ -29872,7 +30069,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
             fx.writeClipboard(.{ .key = copy_nevent_key, .text = addr });
             setToast(model, "Address copied");
         },
@@ -29903,7 +30100,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
             // The base is validated at parse time (`isSafeShareUrl`) and the
             // menu row already named the host, so by here the only question
             // left is whether it ends in the separator.
@@ -29928,7 +30125,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const note = model.noteById(id) orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, 1) catch return;
+            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
             // Appended, not overwritten. Something half-written in the composer
             // is the reader's, and a quote arriving on top of it would be this
             // app deciding their draft was worth less than its own convenience.
