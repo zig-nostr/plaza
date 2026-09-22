@@ -10511,9 +10511,17 @@ pub const Model = struct {
     profile_name_long: bool = false,
     profile_about_long: bool = false,
     profile_picture_long: bool = false,
+    profile_website_long: bool = false,
+    profile_banner_long: bool = false,
+    profile_lud16_long: bool = false,
+    profile_nip05_long: bool = false,
     profile_name_buffer: canvas.TextBuffer(64) = .{},
     profile_about_buffer: canvas.TextBuffer(280) = .{},
     profile_picture_buffer: canvas.TextBuffer(200) = .{},
+    profile_website_buffer: canvas.TextBuffer(200) = .{},
+    profile_banner_buffer: canvas.TextBuffer(200) = .{},
+    profile_lud16_buffer: canvas.TextBuffer(96) = .{},
+    profile_nip05_buffer: canvas.TextBuffer(96) = .{},
     // The add-a-relay field, and why the last press did nothing.
     relay_buffer: canvas.TextBuffer(96) = .{},
     relay_error: bool = false,
@@ -10696,12 +10704,14 @@ pub const Model = struct {
         "previews_on",            "profile_about",          "profile_about_buffer",      "profile_about_long",   "profile_asked_at",
         "profile_can_save",       "profile_name",           "profile_name_buffer",       "profile_name_key",     "profile_name_long",
         "profile_picture",        "profile_picture_buffer", "profile_picture_long",      "profile_seeded",       "profile_stage",
-        "profile_status",         "profile_tab",            "profile_untouched",         "proxy_draft",          "proxy_explainer",
-        "proxy_on",               "proxy_status",           "relay_buffer",              "relay_count",          "relay_draft",
-        "relay_error",            "relay_full",             "relay_status",              "relays_paused",        "scope_name",
-        "signer_line",            "signer_sub",             "thread_outside_open",       "thread_page",          "topic_buf",
-        "topic_len",              "update_check_explainer", "update_check_on",           "version_line",         "viewingTopic",
-        "viewing_bookmarks",
+        "profile_banner",         "profile_banner_buffer",  "profile_banner_long",       "profile_invalid",      "profile_lud16",
+        "profile_lud16_buffer",   "profile_lud16_long",     "profile_nip05",             "profile_nip05_buffer", "profile_nip05_long",
+        "profile_website",        "profile_website_buffer", "profile_website_long",      "profile_status",       "profile_tab",
+        "profile_untouched",      "proxy_draft",            "proxy_explainer",           "proxy_on",             "proxy_status",
+        "relay_buffer",           "relay_count",            "relay_draft",               "relay_error",          "relay_full",
+        "relay_status",           "relays_paused",          "scope_name",                "signer_line",          "signer_sub",
+        "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",            "update_check_explainer",
+        "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -10921,6 +10931,18 @@ pub const Model = struct {
     pub fn profile_picture(self: *const Model) []const u8 {
         return self.profile_picture_buffer.text();
     }
+    pub fn profile_website(self: *const Model) []const u8 {
+        return self.profile_website_buffer.text();
+    }
+    pub fn profile_banner(self: *const Model) []const u8 {
+        return self.profile_banner_buffer.text();
+    }
+    pub fn profile_lud16(self: *const Model) []const u8 {
+        return self.profile_lud16_buffer.text();
+    }
+    pub fn profile_nip05(self: *const Model) []const u8 {
+        return self.profile_nip05_buffer.text();
+    }
     /// What the sheet is able to do right now, said in the sheet.
     pub fn profile_status(self: *const Model) []const u8 {
         return switch (self.profile_stage) {
@@ -10971,8 +10993,32 @@ pub const Model = struct {
     pub fn profile_untouched(self: *const Model) bool {
         return self.profile_name_buffer.text().len == 0 and
             self.profile_about_buffer.text().len == 0 and
-            self.profile_picture_buffer.text().len == 0;
+            self.profile_picture_buffer.text().len == 0 and
+            self.profile_website_buffer.text().len == 0 and
+            self.profile_banner_buffer.text().len == 0 and
+            self.profile_lud16_buffer.text().len == 0 and
+            self.profile_nip05_buffer.text().len == 0;
     }
+    /// The first field whose value no other client would be able to use, or an
+    /// empty string when every field is either empty or plausible.
+    ///
+    /// Validated only as far as is honest. A lightning address that looks right
+    /// can still have no LNURL endpoint behind it, and this cannot know that
+    /// without asking. What it can catch is the shape being wrong, which is the
+    /// difference between a field nobody can use and a field somebody typed a
+    /// sentence into.
+    ///
+    /// Empty is always allowed. An empty field removes its key, which is a way
+    /// of saying "I do not have one" and is not an error.
+    pub fn profile_invalid(self: *const Model) []const u8 {
+        if (!looksLikeUrl(trimmedField(self.profile_picture()))) return "Picture should start with https://";
+        if (!looksLikeUrl(trimmedField(self.profile_banner()))) return "Banner should start with https://";
+        if (!looksLikeUrl(trimmedField(self.profile_website()))) return "Website should start with https://";
+        if (!looksLikeAddress(trimmedField(self.profile_lud16()))) return "Lightning address should look like you@wallet.example";
+        if (!looksLikeAddress(trimmedField(self.profile_nip05()))) return "NIP-05 identifier should look like you@example.com";
+        return "";
+    }
+
     /// Saving is refused until the app HAS the profile it would be merging into.
     /// Publishing a merge of nothing is how a lightning address disappears.
     ///
@@ -10990,6 +11036,9 @@ pub const Model = struct {
         // `.sent` stays savable: a reader who spots a typo in the name they just
         // saved must be able to fix it, and a sheet whose Save is dead after one
         // press is a sheet they have to close and reopen to use again.
+        // A field nobody else could read is not worth publishing, and a kind:0
+        // is replaceable: the bad value would be what every other client sees.
+        if (self.profile_invalid().len > 0) return false;
         return switch (self.profile_stage) {
             .have, .failed, .sent => true,
             .absent => g_identity_minted_here,
@@ -15923,6 +15972,10 @@ pub const Msg = union(enum) {
     profile_name_edit: canvas.TextInputEvent,
     profile_about_edit: canvas.TextInputEvent,
     profile_picture_edit: canvas.TextInputEvent,
+    profile_website_edit: canvas.TextInputEvent,
+    profile_banner_edit: canvas.TextInputEvent,
+    profile_lud16_edit: canvas.TextInputEvent,
+    profile_nip05_edit: canvas.TextInputEvent,
     profile_save,
     profile_retry,
     /// Walks a relay through what it is for: both, read, write.
@@ -16199,6 +16252,10 @@ pub const Msg = union(enum) {
         "profile_about_edit",
         "profile_name_edit",
         "profile_picture_edit",
+        "profile_banner_edit",
+        "profile_lud16_edit",
+        "profile_nip05_edit",
+        "profile_website_edit",
         "profile_retry",
         "profile_save",
         "profile_tab",
@@ -17245,11 +17302,25 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             ),
             ui.paragraph(
                 .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                &.{.{ .text = "Your name, a line about you, and a picture. Anything else your other clients put in your profile is kept exactly as it is.", .scale = mono_hint_scale }},
+                &.{.{ .text = "Everything this app can read from a profile, it can now write. Anything else your other clients put there is kept exactly as it is.", .scale = mono_hint_scale }},
             ),
             profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
             profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
             profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
+            profileField(ui, "Banner", model.profile_banner(), "https://", .profile_banner_edit),
+            profileField(ui, "Website", model.profile_website(), "https://", .profile_website_edit),
+            // The one with a consequence. `lud16` is how NIP-57 finds somebody's
+            // LNURL callback, so an account set up only here could not be zapped
+            // by anyone, in any client, until its owner opened something else.
+            profileField(ui, "Lightning address", model.profile_lud16(), "you@wallet.example", .profile_lud16_edit),
+            profileField(ui, "NIP-05 identifier", model.profile_nip05(), "you@example.com", .profile_nip05_edit),
+            if (model.profile_invalid().len > 0)
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.status_warning_text } },
+                    &.{.{ .text = model.profile_invalid(), .scale = mono_hint_scale }},
+                )
+            else
+                ui.spacer(0),
             if (status.len > 0)
                 ui.paragraph(
                     .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
@@ -30203,6 +30274,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_name_edit => |edit| model.profile_name_buffer.apply(edit),
         .profile_about_edit => |edit| model.profile_about_buffer.apply(edit),
         .profile_picture_edit => |edit| model.profile_picture_buffer.apply(edit),
+        .profile_website_edit => |edit| model.profile_website_buffer.apply(edit),
+        .profile_banner_edit => |edit| model.profile_banner_buffer.apply(edit),
+        .profile_lud16_edit => |edit| model.profile_lud16_buffer.apply(edit),
+        .profile_nip05_edit => |edit| model.profile_nip05_buffer.apply(edit),
         .profile_save => saveProfile(model, fx),
         .profile_retry => {
             forgetOwnProfileAnswer();
@@ -31138,6 +31213,10 @@ fn openProfileEdit(model: *Model) void {
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
     model.profile_picture_buffer.clear();
+    model.profile_website_buffer.clear();
+    model.profile_banner_buffer.clear();
+    model.profile_lud16_buffer.clear();
+    model.profile_nip05_buffer.clear();
     const gpa = std.heap.page_allocator;
     if (ownProfileJson(gpa)) |own| {
         // The whole record, not just its content: freeing only `json` left every
@@ -31209,6 +31288,18 @@ fn seedProfileFields(model: *Model, json: []const u8, keep_typed: bool) void {
     }
     if (!(keep_typed and model.profile_picture_buffer.text().len > 0)) {
         model.profile_picture_long = seedField(&model.profile_picture_buffer, stringField(obj, "picture"));
+    }
+    if (!(keep_typed and model.profile_website_buffer.text().len > 0)) {
+        model.profile_website_long = seedField(&model.profile_website_buffer, stringField(obj, "website"));
+    }
+    if (!(keep_typed and model.profile_banner_buffer.text().len > 0)) {
+        model.profile_banner_long = seedField(&model.profile_banner_buffer, stringField(obj, "banner"));
+    }
+    if (!(keep_typed and model.profile_lud16_buffer.text().len > 0)) {
+        model.profile_lud16_long = seedField(&model.profile_lud16_buffer, stringField(obj, "lud16"));
+    }
+    if (!(keep_typed and model.profile_nip05_buffer.text().len > 0)) {
+        model.profile_nip05_long = seedField(&model.profile_nip05_buffer, stringField(obj, "nip05"));
     }
     model.profile_seeded = true;
 }
@@ -31323,6 +31414,33 @@ fn saveProfile(model: *Model, fx: *Effects) void {
 ///
 /// Only a caller saying there is nothing there may start from nothing, which is
 /// the literal `{}` passed when no record was found.
+/// Whether `s` is empty or a plain http(s) URL.
+///
+/// Scheme only. Anything past that is the host's business, and a checker that
+/// refused an unusual but working URL would be worse than one that let a typo
+/// through: the reader can see their own picture not loading, and cannot see
+/// why this app declined to save it.
+fn looksLikeUrl(s: []const u8) bool {
+    if (s.len == 0) return true;
+    return std.ascii.startsWithIgnoreCase(s, "https://") or std.ascii.startsWithIgnoreCase(s, "http://");
+}
+
+/// Whether `s` is empty or looks like `name@domain.tld`.
+///
+/// One `@`, something on each side, and a dot in the domain. Both a lightning
+/// address and a NIP-05 identifier are the same shape, and both are useless to
+/// every other client if that shape is wrong.
+fn looksLikeAddress(s: []const u8) bool {
+    if (s.len == 0) return true;
+    const at = std.mem.indexOfScalar(u8, s, '@') orelse return false;
+    if (std.mem.lastIndexOfScalar(u8, s, '@').? != at) return false;
+    const local = s[0..at];
+    const domain = s[at + 1 ..];
+    if (local.len == 0 or domain.len == 0) return false;
+    const dot = std.mem.indexOfScalar(u8, domain, '.') orelse return false;
+    return dot > 0 and dot + 1 < domain.len;
+}
+
 fn profileMergeBase(a: std.mem.Allocator, existing: []const u8) ?std.json.ObjectMap {
     const nothing_to_lose = existing.len == 0 or
         std.mem.eql(u8, std.mem.trim(u8, existing, " \t\r\n"), "{}");
@@ -31369,6 +31487,18 @@ fn mergeProfileJson(gpa: std.mem.Allocator, existing: []const u8, model: *const 
     }
     if (!model.profile_picture_long) {
         setOrRemove(&obj, a, "picture", trimmedField(model.profile_picture())) catch return null;
+    }
+    if (!model.profile_website_long) {
+        setOrRemove(&obj, a, "website", trimmedField(model.profile_website())) catch return null;
+    }
+    if (!model.profile_banner_long) {
+        setOrRemove(&obj, a, "banner", trimmedField(model.profile_banner())) catch return null;
+    }
+    if (!model.profile_lud16_long) {
+        setOrRemove(&obj, a, "lud16", trimmedField(model.profile_lud16())) catch return null;
+    }
+    if (!model.profile_nip05_long) {
+        setOrRemove(&obj, a, "nip05", trimmedField(model.profile_nip05())) catch return null;
     }
 
     // Straight onto the caller's allocator: the write seam holds this for the
