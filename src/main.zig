@@ -10669,19 +10669,39 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",            "notes_len",              "live_relays",      "offline_relays",   "draft_buffer",
-        "stage",            "login_buffer",           "logout_pending",   "proxy_buffer",     "proxy_saved",
-        "feed_scroll",      "feed_limit",             "draft",            "draft_empty",      "identity",
-        "has_notes",        "empty",                  "status",           "empty_text",       "footer",
-        "note_list",        "expanded_note",          "composing",        "caught_up",        "relay_health",
-        "relays_online",    "scope_voices",           "is_guest",         "show_guest_strip", "guest_strip_dismissed",
-        "joining",          "pending",                "naming",           "name_buffer",      "name_draft",
-        "name_empty",       "toast_buf",              "toast_len",        "toast_until",      "toast_text",
-        "backup_nudge",     "backup_nudge_dismissed", "bunker_mode",      "pending_text",     "viewing_thread",
-        "reply_buffer",     "reply_draft",            "reply_empty",      "thread_root",      "thread_notes",
-        "thread_notes_len", "thread_stack",           "thread_stack_len", "thread_loading",   "thread_seq",
-        "thread_open_at",   "address_open",           "address_buffer",   "address_error",    "address_draft",
-        "address_empty",    "address_status",
+        "notes",                  "notes_len",              "live_relays",               "offline_relays",       "draft_buffer",
+        "stage",                  "login_buffer",           "logout_pending",            "proxy_buffer",         "proxy_saved",
+        "feed_scroll",            "feed_limit",             "draft",                     "draft_empty",          "identity",
+        "has_notes",              "empty",                  "status",                    "empty_text",           "footer",
+        "note_list",              "expanded_note",          "composing",                 "caught_up",            "relay_health",
+        "relays_online",          "scope_voices",           "is_guest",                  "show_guest_strip",     "guest_strip_dismissed",
+        "joining",                "pending",                "naming",                    "name_buffer",          "name_draft",
+        "name_empty",             "toast_buf",              "toast_len",                 "toast_until",          "toast_text",
+        "backup_nudge",           "backup_nudge_dismissed", "bunker_mode",               "pending_text",         "viewing_thread",
+        "reply_buffer",           "reply_draft",            "reply_empty",               "thread_root",          "thread_notes",
+        "thread_notes_len",       "thread_stack",           "thread_stack_len",          "thread_loading",       "thread_seq",
+        "thread_open_at",         "address_open",           "address_buffer",            "address_error",        "address_draft",
+        "address_empty",          "address_status",
+        // Read by the Zig view rather than bound by name in markup. The one
+        // markup file is the join screen; everything else this app draws, it
+        // draws itself, so these are unbound by design rather than by mistake.
+        // Listed so the check has nothing left to say, and a NEW unbound field
+        // stands out against silence instead of hiding in a hundred lines.
+                "can_open_notary",           "client_tag_explainer", "client_tag_on",
+        "currentLevel",           "deleting_note",          "direct_fallback_explainer", "direct_fallback_on",   "draft_dropped",
+        "editing_profile",        "expanded_image",         "levelOpen",                 "logout_idle",          "logout_warning",
+        "mention_dismissed",      "mentionsOff",            "mentions_off",              "mentions_off_len",     "menu",
+        "notifications_everyone", "notifications_open",     "notifications_return",      "outbox_label",         "outbox_overflowed",
+        "outbox_pending",         "outbox_stuck",           "post_delay_explainer",      "post_delay_label",     "previews_explainer",
+        "previews_on",            "profile_about",          "profile_about_buffer",      "profile_about_long",   "profile_asked_at",
+        "profile_can_save",       "profile_name",           "profile_name_buffer",       "profile_name_key",     "profile_name_long",
+        "profile_picture",        "profile_picture_buffer", "profile_picture_long",      "profile_seeded",       "profile_stage",
+        "profile_status",         "profile_tab",            "profile_untouched",         "proxy_draft",          "proxy_explainer",
+        "proxy_on",               "proxy_status",           "relay_buffer",              "relay_count",          "relay_draft",
+        "relay_error",            "relay_full",             "relay_status",              "relays_paused",        "scope_name",
+        "signer_line",            "signer_sub",             "thread_outside_open",       "thread_page",          "topic_buf",
+        "topic_len",              "update_check_explainer", "update_check_on",           "version_line",         "viewingTopic",
+        "viewing_bookmarks",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -10822,26 +10842,9 @@ pub const Model = struct {
 
     // -- Settings ------------------------------------------------------------
 
-    /// The abbreviated npub of the signed-in identity (empty before sign-in).
-    pub fn active_npub(self: *const Model) []const u8 {
-        _ = self;
-        return g_identity_npub_buf[0..g_identity_npub_len];
-    }
-    /// How the identity signs: a local key on this device, or a remote signer.
-    pub fn identity_kind_label(self: *const Model) []const u8 {
-        _ = self;
-        return switch (g_signer_kind) {
-            .remote => "Remote signer",
-            .helper => "Notary",
-        };
-    }
     /// Whether the logout confirmation is not yet showing.
     pub fn logout_idle(self: *const Model) bool {
         return !self.logout_pending;
-    }
-    /// Whether the logout confirmation is showing.
-    pub fn logout_confirming(self: *const Model) bool {
-        return self.logout_pending;
     }
     /// The logout confirmation warning, sharper for a local key (it is deleted).
     pub fn logout_warning(self: *const Model) []const u8 {
@@ -11051,14 +11054,6 @@ pub const Model = struct {
             "Post waits, and becomes Undo. Nothing is signed until it runs out, so taking it back leaves nothing behind. Once a note is out, it cannot be recalled.";
     }
 
-    pub fn previews_state(self: *const Model) []const u8 {
-        _ = self;
-        return if (g_media_previews) "On" else "Off. Press a picture to load that one.";
-    }
-    pub fn previews_action(self: *const Model) []const u8 {
-        _ = self;
-        return if (g_media_previews) "Turn off" else "Turn on";
-    }
     /// How many notes are still waiting for their first relay. Read once per
     /// build, because the publisher writes the queue from its own thread and the
     /// view must see one answer for the whole frame.
@@ -16089,7 +16084,140 @@ pub const Msg = union(enum) {
 
     // Dispatched from Zig rather than markup: the effect results, and every
     // action on the feed screen (a Zig view now, not a markup file).
-    pub const view_unbound = .{ "tick", "animate", "profiles", "avatar_fetched", "avatar_warmed", "media_warmed", "banner_fetched", "place_logo_fetched", "media_fetched", "draft_edit", "post", "open_compose", "close_compose", "open_join", "close_join", "join_create", "open_notary_import", "open_bunker", "close_bunker", "nip05_verified", "link_fetched", "dismiss_guest_strip", "name_edit", "name_save", "name_skip", "backup_now", "backup_later", "private_half", "helper_line", "helper_exited", "notary_exited", "helper_pubkey", "helper_setup", "helper_signed", "open_settings", "feed_scrolled", "open_url", "expand_image", "expand_image_at", "load_image", "close_image", "like", "repost", "hide_toggle", "proxy_toggle", "post_delay_cycle", "direct_fallback_toggle", "mute_person", "open_thread", "open_event", "close_thread", "reply_edit", "reply_submit", "toggle_expand", "load_older", "absorb_press", "open_notary_window", "copy_note_text", "quote_note", "close_mentions", "open_address", "close_address", "address_edit", "address_submit", "update_checked", "open_update", "dismiss_update", "update_check_toggle" };
+    pub const view_unbound = .{
+        // Sent by Zig rather than wired to an on-* event in markup. The one
+        // markup file is the join screen; every other control this app draws,
+        // it draws itself, so these are dispatched from code by design.
+        "tick",
+        "animate",
+        "profiles",
+        "avatar_fetched",
+        "avatar_warmed",
+        "media_warmed",
+        "banner_fetched",
+        "place_logo_fetched",
+        "media_fetched",
+        "draft_edit",
+        "post",
+        "open_compose",
+        "close_compose",
+        "open_join",
+        "close_join",
+        "join_create",
+        "open_notary_import",
+        "open_bunker",
+        "close_bunker",
+        "nip05_verified",
+        "link_fetched",
+        "dismiss_guest_strip",
+        "name_edit",
+        "name_save",
+        "name_skip",
+        "backup_now",
+        "backup_later",
+        "private_half",
+        "helper_line",
+        "helper_exited",
+        "notary_exited",
+        "helper_pubkey",
+        "helper_setup",
+        "helper_signed",
+        "open_settings",
+        "feed_scrolled",
+        "open_url",
+        "expand_image",
+        "expand_image_at",
+        "load_image",
+        "close_image",
+        "like",
+        "repost",
+        "hide_toggle",
+        "proxy_toggle",
+        "post_delay_cycle",
+        "direct_fallback_toggle",
+        "mute_person",
+        "open_thread",
+        "open_event",
+        "close_thread",
+        "reply_edit",
+        "reply_submit",
+        "toggle_expand",
+        "load_older",
+        "absorb_press",
+        "open_notary_window",
+        "copy_note_text",
+        "quote_note",
+        "close_mentions",
+        "open_address",
+        "close_address",
+        "address_edit",
+        "address_submit",
+        "update_checked",
+        "open_update",
+        "dismiss_update",
+        "update_check_toggle",
+        "bookmark_privately",
+        "choose_home_scope",
+        "client_tag_toggle",
+        "close_menu",
+        "close_notifications",
+        "close_place_info",
+        "close_profile_edit",
+        "close_settings",
+        "copy_nevent",
+        "copy_npub",
+        "delete_note_cancel",
+        "delete_note_confirm",
+        "delete_note_request",
+        "follow_author",
+        "follow_person",
+        "go_home",
+        "insert_mention",
+        "jump_to_newest",
+        "logout_cancel",
+        "logout_confirm",
+        "logout_request",
+        "notifications_read_all",
+        "notifications_tab",
+        "open_bookmarks",
+        "open_person",
+        "open_place_handler",
+        "open_place_info",
+        "open_profile_edit",
+        "open_web",
+        "place_bounce",
+        "place_enter",
+        "place_feed",
+        "place_leave",
+        "place_leave_cancel",
+        "place_leave_request",
+        "place_open",
+        "place_resume",
+        "place_step",
+        "previews_toggle",
+        "private_seal",
+        "profile_about_edit",
+        "profile_name_edit",
+        "profile_picture_edit",
+        "profile_retry",
+        "profile_save",
+        "profile_tab",
+        "proxy_edit",
+        "proxy_save",
+        "relay_add",
+        "relay_cycle",
+        "relay_edit",
+        "relay_remove",
+        "relay_suggest",
+        "show_more_replies",
+        "toggle_bookmark",
+        "toggle_mention_off",
+        "toggle_menu",
+        "toggle_notifications",
+        "toggle_outside_replies",
+        "toggle_places_rail",
+        "toggle_relays_paused",
+    };
 };
 
 // ---------------------------------------------------------------- app + view
