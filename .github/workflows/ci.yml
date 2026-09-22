@@ -31,8 +31,28 @@ jobs:
       - name: Install the Native SDK CLI
         run: npm install -g @native-sdk/cli@0.10.1
 
+      # The typed half of `native check` reads zig-out/model-contract.zon, which
+      # is emitted rather than committed, so a fresh checkout does not have one.
+      # This step used to run before anything built it: the check found no
+      # contract, said so, downgraded itself to a structural pass and exited 0.
+      # The binding and icon-name checks this step is named for had therefore
+      # never run here, on any commit.
+      - name: Emit the model contract
+        run: zig build model-contract
+
       - name: Check markup and manifest
-        run: native check
+        run: |
+          set -euo pipefail
+          out="$(native check 2>&1)"
+          printf '%s\n' "$out"
+          # A check that could not do its job must not report success. Without
+          # this the step is green whether the typed half ran or not, which is
+          # the shape of the defect in #362: a step that says it checked
+          # something and only knows that nothing errored.
+          if printf '%s' "$out" | grep -qE 'model contract: (not yet built|.*is stale)'; then
+            echo "native check ran without a model contract, so the typed checks did not run" >&2
+            exit 1
+          fi
 
       - name: Test
         run: native test
