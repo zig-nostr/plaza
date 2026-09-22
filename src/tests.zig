@@ -5529,9 +5529,16 @@ test "editing a profile keeps every field this app does not model" {
         \\"nip05":"alice@example.com","pronouns":"she/her"}
     ;
     var model = main.initialModel();
+    // Seeded the way the sheet seeds it from the published record, then edited.
+    // The merge writes what the MODEL holds, so a field this app models and has
+    // not read is a field it would delete: `profile_can_save` is what stops that
+    // reaching a relay, and `the sheet refuses to save until it has read the
+    // profile it would replace` is what holds it.
+    main.seedProfileFieldsForTest(&model, existing, false);
     model.profile_name_buffer.set("Alice Liddell");
     model.profile_about_buffer.set("new bio");
     model.profile_picture_buffer.set("https://new.example.com/a.png");
+    model.profile_lud16_buffer.set("alice@walletofsatoshi.com");
 
     const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
     defer testing.allocator.free(merged);
@@ -5540,11 +5547,13 @@ test "editing a profile keeps every field this app does not model" {
     try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice Liddell\"") != null);
     try testing.expect(std.mem.indexOf(u8, merged, "\"about\":\"new bio\"") != null);
     try testing.expect(std.mem.indexOf(u8, merged, "\"picture\":\"https://new.example.com/a.png\"") != null);
-    // What they did not, and what this app cannot even see.
-    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@walletofsatoshi.com\"") != null);
+    // What they did not touch, but which the sheet now shows: carried through
+    // from the published record rather than dropped.
     try testing.expect(std.mem.indexOf(u8, merged, "\"banner\":\"https://ex.com/b.png\"") != null);
     try testing.expect(std.mem.indexOf(u8, merged, "\"website\":\"https://alice.example\"") != null);
     try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
+    // And what this app still cannot see at all, which is the point of the merge.
     try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
     // The handle is not the display name, and an account that already has one
     // keeps it: renaming yourself must not rename your @handle out from under
@@ -5552,17 +5561,119 @@ test "editing a profile keeps every field this app does not model" {
     try testing.expect(std.mem.indexOf(u8, merged, "\"name\":\"alice\"") != null);
 }
 
+test "the fields Plaza reads are the fields Plaza can write" {
+    // The gap this closes: `parseMetadataInto` and `parsePersonMetadata` read
+    // nine keys and the sheet offered three, so an account set up only here had
+    // no way to put in a lightning address and could not be zapped by anyone, in
+    // any client, until its owner opened something else.
+    const existing = "{\"name\":\"alice\",\"pronouns\":\"she/her\"}";
+    var model = main.initialModel();
+    main.seedProfileFieldsForTest(&model, existing, false);
+    model.profile_name_buffer.set("Alice");
+    model.profile_website_buffer.set("https://alice.example");
+    model.profile_banner_buffer.set("https://ex.com/b.png");
+    model.profile_lud16_buffer.set("alice@walletofsatoshi.com");
+    model.profile_nip05_buffer.set("alice@example.com");
+
+    const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
+    defer testing.allocator.free(merged);
+
+    try testing.expect(std.mem.indexOf(u8, merged, "\"website\":\"https://alice.example\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"banner\":\"https://ex.com/b.png\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@walletofsatoshi.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
+    // And the key it still cannot see comes through untouched.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
+}
+
+test "a published profile seeds every field the sheet shows" {
+    // Seeding is what stands between the merge and deleting a key: the merge
+    // writes what the MODEL holds, so a field shown but never read would be
+    // published as absent.
+    const existing =
+        \\{"name":"alice","about":"bio","picture":"https://p.example/a.png",
+        \\"website":"https://alice.example","banner":"https://b.example/x.png",
+        \\"lud16":"alice@getalby.com","nip05":"alice@example.com"}
+    ;
+    var model = main.initialModel();
+    main.seedProfileFieldsForTest(&model, existing, false);
+
+    try testing.expectEqualStrings("bio", model.profile_about());
+    try testing.expectEqualStrings("https://p.example/a.png", model.profile_picture());
+    try testing.expectEqualStrings("https://alice.example", model.profile_website());
+    try testing.expectEqualStrings("https://b.example/x.png", model.profile_banner());
+    try testing.expectEqualStrings("alice@getalby.com", model.profile_lud16());
+    try testing.expectEqualStrings("alice@example.com", model.profile_nip05());
+}
+
+test "a field no other client could read is not published" {
+    var model = main.initialModel();
+    model.profile_stage = .have;
+    try testing.expect(model.profile_can_save());
+    try testing.expectEqualStrings("", model.profile_invalid());
+
+    // A sentence in the lightning address field is the case worth catching: it
+    // saves cleanly, and then nothing can pay you and nothing says why.
+    model.profile_lud16_buffer.set("ask me on telegram");
+    try testing.expect(model.profile_invalid().len > 0);
+    try testing.expect(!model.profile_can_save());
+
+    model.profile_lud16_buffer.set("alice@getalby.com");
+    try testing.expectEqualStrings("", model.profile_invalid());
+    try testing.expect(model.profile_can_save());
+
+    // Empty is not an error. It removes the key, which is how somebody says
+    // they do not have one.
+    model.profile_lud16_buffer.set("");
+    try testing.expectEqualStrings("", model.profile_invalid());
+
+    model.profile_website_buffer.set("alice.example");
+    try testing.expect(model.profile_invalid().len > 0);
+    model.profile_website_buffer.set("https://alice.example");
+    try testing.expectEqualStrings("", model.profile_invalid());
+
+    model.profile_nip05_buffer.set("nope");
+    try testing.expect(model.profile_invalid().len > 0);
+}
+
+test "the shape checks accept what works and refuse what cannot" {
+    // Only the shape. A lightning address that looks right can still have no
+    // endpoint behind it, and this cannot know that without asking.
+    for ([_][]const u8{ "", "a@b.co", "alice@getalby.com", "a.b@sub.domain.org" }) |good| {
+        var m = main.initialModel();
+        m.profile_lud16_buffer.set(good);
+        try testing.expectEqualStrings("", m.profile_invalid());
+    }
+    for ([_][]const u8{ "alice", "@getalby.com", "alice@", "a@b@c.com", "alice@nodot" }) |bad| {
+        var m = main.initialModel();
+        m.profile_lud16_buffer.set(bad);
+        try testing.expect(m.profile_invalid().len > 0);
+    }
+    for ([_][]const u8{ "", "https://a.example", "http://a.example/x?y=1", "HTTPS://A.EXAMPLE" }) |good| {
+        var m = main.initialModel();
+        m.profile_website_buffer.set(good);
+        try testing.expectEqualStrings("", m.profile_invalid());
+    }
+    for ([_][]const u8{ "a.example", "ftp://a.example", "www.a.example" }) |bad| {
+        var m = main.initialModel();
+        m.profile_website_buffer.set(bad);
+        try testing.expect(m.profile_invalid().len > 0);
+    }
+}
+
 test "an emptied profile field removes its key rather than blanking it" {
     // `"about": ""` reads to other clients as a bio deliberately blanked, which
     // is a different statement from not having one.
-    const existing = "{\"name\":\"alice\",\"about\":\"old bio\",\"lud16\":\"alice@getalby.com\"}";
+    const existing = "{\"name\":\"alice\",\"about\":\"old bio\",\"pronouns\":\"she/her\"}";
     var model = main.initialModel();
     model.profile_name_buffer.set("Alice");
     model.profile_about_buffer.set("   ");
     const merged = main.mergeProfileJsonForTest(testing.allocator, existing, &model).?;
     defer testing.allocator.free(merged);
     try testing.expect(std.mem.indexOf(u8, merged, "about") == null);
-    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@getalby.com\"") != null);
+    // `pronouns` rather than `lud16`: the sheet shows a lightning address now,
+    // so it is no longer an example of a key this app leaves alone.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
 }
 
 test "a profile with no handle gets one, and prose survives being prose" {
@@ -5667,13 +5778,16 @@ test "a profile that will not parse does not become a blank profile" {
 
     // And the ordinary path still merges: a field the sheet does not show must
     // come through the edit untouched, which is what the merge is for.
-    const held = "{\"name\":\"alice\",\"lud16\":\"alice@example.com\",\"nip05\":\"alice@example.com\"}";
+    const held = "{\"name\":\"alice\",\"pronouns\":\"she/her\",\"lud06\":\"LNURL1DP68\"}";
     const merged = main.mergeProfileJsonForTest(testing.allocator, held, &model) orelse
         return error.LostAReadableProfile;
     defer testing.allocator.free(merged);
     try testing.expect(std.mem.indexOf(u8, merged, "\"display_name\":\"Alice\"") != null);
-    try testing.expect(std.mem.indexOf(u8, merged, "\"lud16\":\"alice@example.com\"") != null);
-    try testing.expect(std.mem.indexOf(u8, merged, "\"nip05\":\"alice@example.com\"") != null);
+    // Keys the sheet still does not show. `lud16` and `nip05` used to stand here
+    // and both are editable now, so they no longer prove anything about fields
+    // the merge carries blind.
+    try testing.expect(std.mem.indexOf(u8, merged, "\"pronouns\":\"she/her\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"lud06\":\"LNURL1DP68\"") != null);
 }
 
 test "the sheet refuses to save until it has read the profile it would replace" {
