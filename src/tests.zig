@@ -119,6 +119,19 @@ fn ui_fmt_pool(arena: std.mem.Allocator, live: usize) []const u8 {
 }
 
 /// A signed kind:1 note with the given timestamp and content.
+/// Whether a filter is one of the feed's note filters rather than a metadata one.
+///
+/// By whether it asks for kind 1, not by how many kinds it names. It used to be
+/// `kinds.len == 1`, which stopped meaning anything the moment the feed asked
+/// for reposts as well: the notes filter names three kinds now and the metadata
+/// filters name several, so counting them tells the two apart by accident.
+fn isNotesFilter(f: nostr.filter.Filter) bool {
+    for (f.kinds orelse return false) |k| {
+        if (k == 1) return true;
+    }
+    return false;
+}
+
 fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, created_at: i64, content: []const u8) !nostr.event.Event {
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
 }
@@ -232,6 +245,157 @@ test "every surface answers the same way about one kind" {
     try testing.expectEqual(main.KindRender.media, main.kindRender(22));
     try testing.expectEqual(main.KindRender.unsupported, main.kindRender(1063));
     try testing.expectEqual(main.KindRender.unsupported, main.kindRender(31923));
+}
+
+/// A NIP-18 repost of `target`, tagged the way this app writes them.
+fn signedRepost(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    created_at: i64,
+    target: nostr.event.Event,
+    content: []const u8,
+) !nostr.event.Event {
+    const id_hex = try std.fmt.allocPrint(arena, "{x}", .{target.id});
+    const author_hex = try std.fmt.allocPrint(arena, "{x}", .{target.pubkey});
+    // Allocated, not `&[_][]const u8{...}` inline in an array literal: those are
+    // temporaries, and the `Tag` slices pointing at them dangle by the time the
+    // store encodes the event. It shows up as a nonsense tag length inside
+    // `encodeEvent` rather than as anything that names this line.
+    const e_tag = try arena.dupe([]const u8, &.{ "e", id_hex, "", author_hex });
+    const p_tag = try arena.dupe([]const u8, &.{ "p", author_hex });
+    const tags = try arena.alloc(nostr.event.Tag, 2);
+    tags[0] = e_tag;
+    tags[1] = p_tag;
+    return nostr.event.create(arena, signer, kp, created_at, main.repost_kind, tags, content, null);
+}
+
+test "a repost points at the last e tag" {
+    const a = [_]u8{0xaa} ** 32;
+    const b = [_]u8{0xbb} ** 32;
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&buf_a, "{x}", .{a});
+    _ = try std.fmt.bufPrint(&buf_b, "{x}", .{b});
+
+    // The LAST one, which is what Amethyst reads. A repost normally carries one,
+    // so the two answers differ only for a malformed event, and differing from
+    // the network about a malformed event shows a row nobody else does.
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "e", &buf_a },
+        &[_][]const u8{ "p", &buf_a },
+        &[_][]const u8{ "e", &buf_b },
+    };
+    try testing.expectEqualSlices(u8, &b, &(main.repostTargetId(&tags).?));
+
+    // Nothing to point at is not a row.
+    const none = [_]nostr.event.Tag{&[_][]const u8{ "p", &buf_a }};
+    try testing.expect(main.repostTargetId(&none) == null);
+}
+
+test "a repost by a follow shows the note it points at, named" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me = try signer.keyPairFromSecretKey([_]u8{0x61} ** 32);
+    const author = try signer.keyPairFromSecretKey([_]u8{0x62} ** 32);
+    main.setIdentityForTest([_]u8{0x61} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/repost.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const note = try signedNote(arena, signer, author, 1_800_000_000, "the original words");
+    _ = try store.ingest(arena, note, .{});
+    const boost = try signedRepost(arena, signer, me, 1_800_000_100, note, "");
+    _ = try store.ingest(arena, boost, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_200);
+
+    // One row, and it is the REPOSTED note: its id, its author, its words. That
+    // is what makes the counts under it belong to the note rather than to the
+    // wrapper, because engagement is already keyed on `event_id`.
+    try testing.expectEqual(@as(usize, 1), model.notes_len);
+    const row = model.notes[0];
+    try testing.expectEqualSlices(u8, &note.id, &row.event_id);
+    try testing.expectEqualSlices(u8, &author.public_key, &row.pubkey);
+    try testing.expectEqualStrings("the original words", row.content());
+    try testing.expect(row.has_reposter);
+    try testing.expectEqualSlices(u8, &me.public_key, &row.reposter);
+}
+
+test "a note already in the feed is not drawn again by a repost of it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me = try signer.keyPairFromSecretKey([_]u8{0x63} ** 32);
+    main.setIdentityForTest([_]u8{0x63} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/dedup.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // My own note, and my own repost of it: the note is in the window under its
+    // own name already.
+    const note = try signedNote(arena, signer, me, 1_800_000_000, "said once");
+    _ = try store.ingest(arena, note, .{});
+    const boost = try signedRepost(arena, signer, me, 1_800_000_100, note, "");
+    _ = try store.ingest(arena, boost, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_200);
+
+    try testing.expectEqual(@as(usize, 1), model.notes_len);
+    try testing.expectEqualStrings("said once", model.notes[0].content());
+}
+
+test "a repost whose note nobody has draws no row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me = try signer.keyPairFromSecretKey([_]u8{0x64} ** 32);
+    const author = try signer.keyPairFromSecretKey([_]u8{0x65} ** 32);
+    main.setIdentityForTest([_]u8{0x64} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/missing.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // The wrapper is stored, the note it points at is not. A row drawn from the
+    // wrapper alone would be the reposter's name over an empty body, which is
+    // the thing being avoided. Notedeck drops the row for the same reason.
+    const note = try signedNote(arena, signer, author, 1_800_000_000, "never stored");
+    const boost = try signedRepost(arena, signer, me, 1_800_000_100, note, "");
+    _ = try store.ingest(arena, boost, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.reconcileForTest(&model, &store, 1_800_000_200);
+    try testing.expectEqual(@as(usize, 0), model.notes_len);
 }
 
 test "first run shows the onboarding welcome, not the feed" {
@@ -14685,7 +14849,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
         try testing.expect(list.len <= 500);
         try testing.expect(list.len > 0);
         // Only count the note filters, or every author is seen twice by design.
-        if (f.kinds.?.len != 1) continue;
+        if (!isNotesFilter(f)) continue;
         for (list) |a| {
             const index = @as(usize, a[0]) * 256 + @as(usize, a[1]);
             seen[index] += 1;
@@ -14703,7 +14867,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // The limit is NOT divided across chunks: each names different people, so
     // splitting it would starve whoever landed last.
     for (filters) |f| {
-        if (f.kinds.?.len == 1) try testing.expectEqual(@as(u32, 300), f.limit.?);
+        if (isNotesFilter(f)) try testing.expectEqual(@as(u32, 300), f.limit.?);
     }
 
     // The metadata limit is derived from the chunk, never from a screen cache.
@@ -14715,7 +14879,7 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // in-memory profile table, which permitted a fraction of a chunk and left
     // the rest of those people nameless.
     for (filters) |f| {
-        if (f.kinds.?.len == 1) continue;
+        if (isNotesFilter(f)) continue;
         try testing.expectEqual(@as(u32, @intCast(f.authors.?.len * f.kinds.?.len)), f.limit.?);
     }
 
@@ -15683,9 +15847,14 @@ test "reaching the bottom asks the relays for what came before" {
         counted += f.authors.?.len;
         // The point of the whole change.
         try testing.expectEqual(until, f.until.?);
-        // Notes only: profiles and relay lists are replaceable, so there is no
-        // older copy to page back to and asking for one wastes the budget.
-        try testing.expectEqual(@as(usize, 1), f.kinds.?.len);
+        // Notes and reposts only: profiles and relay lists are replaceable, so
+        // there is no older copy to page back to and asking for one wastes the
+        // budget. Checked by what the kinds ARE rather than how many, so this
+        // keeps saying what it means if the list grows again.
+        try testing.expect(isNotesFilter(f));
+        for (f.kinds.?) |k| {
+            try testing.expect(k == 1 or k == main.repost_kind or k == main.generic_repost_kind);
+        }
         try testing.expectEqual(@as(u16, 1), f.kinds.?[0]);
     }
     try testing.expectEqual(total, counted);
@@ -15723,7 +15892,7 @@ test "the feed asks only for what it does not already hold" {
     var notes: usize = 0;
     var meta: usize = 0;
     for (filters) |f| {
-        if (f.kinds.?.len == 1 and f.kinds.?[0] == 1) {
+        if (isNotesFilter(f)) {
             notes += 1;
             try testing.expectEqual(newest, f.since.?);
         } else {

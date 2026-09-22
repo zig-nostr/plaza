@@ -1888,6 +1888,29 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
     // note from a reaction, and the feed used to re-read everything on either.
     switch (ev.kind) {
         1 => if (result == .added) noteFeedArrival(ev.id),
+        // A repost forces the fuller read rather than splicing.
+        //
+        // The splice path is keyed on the arriving event's OWN id: it asks
+        // whether that id is already held, and merges it by its own timestamp.
+        // For a repost neither is the card. The card is the note it points at,
+        // which may already be on screen under its own name and which has a
+        // different id and a different time. Teaching the splice to unwrap
+        // would mean teaching it all three, and the full read already knows
+        // how. Reposts are a small share of arrivals, so paying for a rebuild
+        // on one is cheaper than a splice that puts the wrong row in the wrong
+        // place.
+        repost_kind, generic_repost_kind => if (result == .added) {
+            // The reposted note, out of the wrapper's content, ingested like
+            // anything else so `ingest` checks its signature. NIP-18 puts the
+            // whole event there and this app writes it too, so the note is
+            // usually in hand without asking any relay for it.
+            //
+            // Straight to `store.ingest` rather than back through here: the
+            // embedded event is a note, this door is for arrivals, and routing
+            // it back would invite a wrapper that contains a wrapper.
+            ingestRepostedNote(gpa, store, ev);
+            invalidateFeed();
+        },
         // A deletion takes a note OUT, and no arrival describes a removal, so
         // the list in hand has to be read again. Amethyst hit the mirror image
         // of this: one kind:5 folded into an ordinary batch quietly emptied rows
@@ -1898,6 +1921,29 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
         else => {},
     }
     return result;
+}
+
+/// Stores the note carried inside a repost, when it carries one.
+///
+/// Every reference client treats the embedded copy this way: as a shortcut that
+/// saves a round trip, never as something to draw. Amethyst consumes it into
+/// the cache keyed by its OWN id and verified like any relay event; Jumble and
+/// Coracle both verify it and fall back to fetching when it fails. Nothing
+/// renders it straight out of the wrapper, because the wrapper's author chose
+/// those bytes and no relay serving them vouches for them.
+///
+/// Here that safety is `store.ingest`, which checks the signature and refuses
+/// anything that does not match its own id. A forged copy is simply not stored,
+/// and the feed then finds nothing to draw and skips the row, which is what
+/// Notedeck does for a target it cannot resolve.
+fn ingestRepostedNote(gpa: std.mem.Allocator, store: *nostr.store.Store, ev: nostr.event.Event) void {
+    if (ev.content.len == 0) return;
+    var parsed = nostr.event.fromJson(gpa, ev.content) catch return;
+    defer parsed.deinit();
+    // Only what a feed row can be. A repost naming something else is legal and
+    // is not a row here.
+    if (kindRender(parsed.value.kind) != .note) return;
+    _ = store.ingest(gpa, parsed.value, .{}) catch return;
 }
 
 const ReplacedCopy = struct { json: []u8 };
@@ -10113,6 +10159,18 @@ pub const Note = struct {
     /// Two bytes on a fixed struct, which is what lets every surface ask the
     /// same question and get the same answer.
     ///
+    /// Who passed this note on, when the card got here as a repost.
+    ///
+    /// The card itself is the REPOSTED note: its id, its author, its words, its
+    /// counts. That is what makes the rest fall out for free. Dedup already
+    /// keys on `event_id`, so two follows reposting one note collapse to one
+    /// row and a repost of something already in the window does not draw it
+    /// twice; and engagement is already counted against the note's own id, so
+    /// the numbers under the row belong to what was reposted rather than to the
+    /// wrapper. Amethyst gates the wrapper's whole reaction bar off to reach
+    /// the same place (`NoteCompose.kt:774`, `isNotRepost`).
+    reposter: [32]u8 = [_]u8{0} ** 32,
+    has_reposter: bool = false,
     /// Defaults to 1, not 0. `noteFrom` always writes the event's real kind
     /// over this, INCLUDING a real 0, so a kind:0 event still draws as the kind
     /// nothing can render. The default only ever applies to a `Note` built
@@ -11446,7 +11504,11 @@ pub const Model = struct {
         // Whatever the feed ends up holding, the relays get told about it. On
         // every path out of here, including the two that return early.
         defer publishFeedWatch(self.notes[0..self.notes_len]);
-        const kinds = [_]u16{1};
+        // Notes and the two repost kinds. `rebuildNotesFromStore` reads one
+        // query per kind for the reason given there, so this list costs three
+        // cursors per author rather than multiplying into one query the store
+        // would refuse to index.
+        const kinds = [_]u16{ 1, repost_kind, generic_repost_kind };
         // Scope the feed to the follow set (the starter pack) plus the user's own
         // notes, so it reads as a real follow feed, not a firehose. Filtering
         // here (not just at the subscription) also hides notes an earlier,
@@ -11625,6 +11687,8 @@ pub const Model = struct {
 
         // Where each kind's result has been read up to.
         var cursors = [_]usize{0} ** feed_kind_cap;
+        // What this pass has already placed, for the repost dedup below.
+        const placed = placedReset(limit);
 
         // The old cards, so new positions can take them over by id.
         const old = g_feed_scratch;
@@ -11651,10 +11715,28 @@ pub const Model = struct {
             // rather than at render time because a hidden row would still hold a
             // slot in a window that pages by count.
             if (isMuted(ev.pubkey)) continue;
+            // A repost becomes the note it points at, so what is placed, reused
+            // and deduped below is the REPOSTED note and not the wrapper.
+            const card = feedCardFrom(store, ev, now_s) orelse continue;
+            // One row per reposted note. Two follows passing the same note on is
+            // one card, and a repost of something the window already holds does
+            // not draw it twice. All four reference clients key this on the
+            // reposted note; Amethyst's is `distinctBy { replyTo.last().idHex }`
+            // with the comment "only the most recent repost per feed", and
+            // reading newest-first is what makes the first one seen the keeper.
+            if (placedTake(placed, self.notes[0..n], card.event_id, n)) continue;
             self.notes[n] = blk: {
-                if (heldIndex(slots, old[0..old_len], ev.id)) |at| break :blk old[at];
+                if (heldIndex(slots, old[0..old_len], card.event_id)) |at| {
+                    var held = old[at];
+                    // A held card may have been drawn plain before, or passed on
+                    // by somebody else. The wrapper in hand is the newest one
+                    // that named it, so the byline comes from this pass.
+                    held.reposter = card.reposter;
+                    held.has_reposter = card.has_reposter;
+                    break :blk held;
+                }
                 g_feed_work.parses += 1;
-                break :blk noteFrom(ev, now_s);
+                break :blk card;
             };
             n += 1;
         }
@@ -12016,6 +12098,81 @@ fn heldIndex(table: []const u32, old: []const Note, event_id: [32]u8) ?usize {
         if (std.mem.eql(u8, &old[i].event_id, &event_id)) return i;
     }
     return null;
+}
+
+/// A seen-set over the cards this rebuild has already placed.
+///
+/// A hash rather than a look-back scan: the feed grows as the reader pages down
+/// and is never handed back, so scanning what is already placed would be
+/// quadratic in how far they have read.
+///
+/// Hashed on the render key and compared on the FULL id, for the reason
+/// `heldIndex` gives one screen up: the key is a handle and two ids could in
+/// principle share one, and getting this wrong would hide a real note behind a
+/// stranger's card.
+var g_placed_slots: []u32 = &.{};
+
+fn placedReset(want_len: usize) []u32 {
+    var want: usize = 128;
+    while (want < want_len * 2) want *|= 2;
+    if (g_placed_slots.len < want) {
+        g_placed_slots = std.heap.page_allocator.realloc(g_placed_slots, want) catch return &.{};
+    }
+    const table = g_placed_slots[0..want];
+    @memset(table, reuse_empty);
+    return table;
+}
+
+/// True when `event_id` is already placed; records it at `index` otherwise.
+///
+/// False when the table could not be sized, which draws a duplicate rather than
+/// dropping a card. Of the two wrong answers, showing something twice is the
+/// one a reader can see and understand.
+fn placedTake(table: []u32, notes: []const Note, event_id: [32]u8, index: usize) bool {
+    if (table.len == 0) return false;
+    const mask = table.len - 1;
+    var at = reuseHash(feedKeyOf(event_id), mask);
+    while (table[at] != reuse_empty) : (at = (at + 1) & mask) {
+        if (std.mem.eql(u8, &notes[table[at]].event_id, &event_id)) return true;
+    }
+    table[at] = @intCast(index);
+    return false;
+}
+
+/// The card an event becomes in the feed.
+///
+/// A repost is not drawn as itself. NIP-18 wraps somebody else's note, and what
+/// a reader wants is that note with a line saying who passed it on, so the card
+/// built here IS the reposted note: its id, its author, its words. Everything
+/// else then falls out for free, because the rest of this file already keys on
+/// `event_id`: dedup collapses two follows reposting one note into one row, and
+/// engagement is already counted against the note's own id, so the numbers
+/// belong to what was reposted rather than to the wrapper.
+///
+/// The target is resolved FROM THE STORE by the `e` tag, never rendered out of
+/// the wrapper's `content`. Every reference client does it this way, and the
+/// embedded copy is the reason: it is whatever the reposter pasted, and no
+/// relay serving it vouches for it. Coracle spells out the consequence, that a
+/// forged or unsigned embedded copy costs a round trip rather than rendering.
+/// The copy still earns its keep, one door up in `plazaIngest`, where it is
+/// ingested like any other event and has its signature checked there.
+///
+/// Null when the target is not in the store yet, or is not something drawable
+/// as a note. Notedeck drops the row for exactly these two reasons.
+fn feedCardFrom(store: *nostr.store.Store, ev: nostr.event.Event, now_s: i64) ?Note {
+    if (!isRepostKind(ev.kind)) return noteFrom(ev, now_s);
+    const target_id = repostTargetId(ev.tags) orelse return null;
+    var se = (store.getEvent(std.heap.page_allocator, target_id) catch return null) orelse return null;
+    defer se.deinit();
+    if (kindRender(se.event.kind) != .note) return null;
+    // Both authors get a say. The loop above already refused a muted reposter;
+    // this refuses a muted author whose note a follow passed on, which is the
+    // same reader asking not to see the same person.
+    if (isMuted(se.event.pubkey)) return null;
+    var note = noteFrom(se.event, now_s);
+    note.reposter = ev.pubkey;
+    note.has_reposter = true;
+    return note;
 }
 
 /// Points a model at the feed storage, growing it to at least one page. Called
@@ -14408,6 +14565,35 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
 /// does not lose an event, it loses a subtree, and it shows silence rather than
 /// a gap.
 pub const comment_kind: u16 = 1111;
+
+/// NIP-18 reposts. 6 wraps a kind 1; 16 wraps anything else and carries a `k`
+/// tag saying what.
+pub const repost_kind: u16 = 6;
+pub const generic_repost_kind: u16 = 16;
+
+pub fn isRepostKind(kind: u16) bool {
+    return kind == repost_kind or kind == generic_repost_kind;
+}
+
+/// What a repost points at: the LAST `e` tag.
+///
+/// The last rather than the first, which is what Amethyst reads
+/// (`RepostEvent.boostedEventId()` is `tags.lastNotNullOfOrNull(ETag::parseId)`)
+/// and what the dedup key below has to agree with. A repost normally carries
+/// exactly one, so the two answers differ only for a malformed event, and
+/// differing from the rest of the network about a malformed event is how one
+/// client shows a row nobody else does.
+pub fn repostTargetId(tags: []const nostr.event.Tag) ?[32]u8 {
+    var last: ?[32]u8 = null;
+    for (tags) |tag| {
+        if (tag.len < 2 or tag[1].len != 64) continue;
+        if (!std.mem.eql(u8, tag[0], "e")) continue;
+        var id: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, tag[1]) catch continue;
+        last = id;
+    }
+    return last;
+}
 
 /// How an event of a given kind gets drawn.
 ///
@@ -18359,6 +18545,8 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     // somebody, so the row does not resize under the reader when the parent
     // resolves a moment later.
     if (note.has_reply_parent) extent += line_height + 4;
+    // The line naming who passed this on, and the gap under it.
+    if (note.has_reposter) extent += line_height + 4;
     if (!media) return extent;
     // A link card, once the page has answered; nothing before that.
     if (note.hasLink()) {
@@ -19523,7 +19711,7 @@ pub const max_feed_filters = 2 * (max_follows_divided + 1) + 1;
 /// stack array and how many cursors exist at once.
 const feed_kind_cap: usize = 4;
 
-const feed_filter_kinds = [_]u16{1};
+const feed_filter_kinds = [_]u16{ 1, repost_kind, generic_repost_kind };
 /// What the feed needs about the people in it: kind:0 is who they are, 10002 is
 /// where they are.
 ///
@@ -26834,7 +27022,13 @@ fn unsupportedKindChip(ui: *AppUi, kind: u16) AppUi.Node {
         }, .{
             ui.row(.{ .cross = .center, .gap = 0 }, .{
                 hgap(ui, 8),
-                ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "file"),
+                // `dashed-ring`, which is this app's placeholder glyph, used at
+                // avatar size wherever there is nothing yet to draw. `appIcon`
+                // takes an APP-REGISTERED name and there are ten of them; an
+                // unregistered one draws the missing-icon fallback, a slashed
+                // circle, with no compile error and no test failure. This said
+                // "file" when it shipped, and drew exactly that.
+                ui.appIcon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "dashed-ring"),
                 hgap(ui, 6),
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_faint_alt } },
@@ -27275,6 +27469,31 @@ fn quoteTime(ui: *AppUi, created_at: i64) []const u8 {
 /// and the engagement row. The content is a fixed reading column centered in
 /// the window, with a hairline under each row as the only separation. Keyed by
 /// the note id so the list diff holds scroll position across reconciles.
+/// Who passed this note on, above the card.
+///
+/// The reposter in the quiet colour over the author's row in the normal one,
+/// which is the shape Amethyst uses: the wrapper's byline is greyed
+/// (`NoteCompose.kt:2013`, `textColor = grayText` when `isRepost`) and the note
+/// underneath is drawn as itself.
+///
+/// No icon. `appIcon` resolves an APP-REGISTERED name and this app registers
+/// ten, none of them a repost glyph; an unregistered name draws the
+/// missing-icon fallback rather than failing, so a word is the honest choice
+/// until there is a glyph to use.
+fn repostByline(ui: *AppUi, note: *const Note) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .gap = 0, .cross = .center }, .{
+            hgap(ui, row_pad_side),
+            ui.paragraph(
+                .{ .style = .{ .foreground = p.text_faint_alt } },
+                &.{.{ .text = ui.fmt("{s} reposted", .{quotePillHandle(ui, note.reposter)}), .scale = meta_scale }},
+            ),
+        }),
+        vgap(ui, 4),
+    });
+}
+
 fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
     var node = ui.row(.{ .grow = 1, .main = .center }, .{
         ui.column(.{ .width = feed_column_width }, .{
@@ -27296,6 +27515,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
             // off the reading rail.
             ui.el(.data_row, .{ .width = feed_column_width, .padding = 0.01, .on_press = Msg{ .open_thread = note.id }, .context_menu = noteContextItems(ui, note, false), .semantics = .{ .label = "Open thread" } }, .{ui.column(.{ .gap = 0, .width = feed_column_width }, .{
                 vgap(ui, row_pad_top),
+                if (note.has_reposter) repostByline(ui, note) else ui.spacer(0),
                 ui.row(.{ .gap = 0, .cross = .start }, .{
                     hgap(ui, row_pad_side),
                     noteAvatar(ui, note),
