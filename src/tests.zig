@@ -123,6 +123,117 @@ fn signedNote(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.key
     return nostr.event.create(arena, signer, kp, created_at, 1, &.{}, content, null);
 }
 
+/// A signed event of any kind, with tags. `signedNote` is the kind-1 case.
+fn signedKind(
+    arena: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    kp: nostr.keys.KeyPair,
+    created_at: i64,
+    kind: u16,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.event.Event {
+    return nostr.event.create(arena, signer, kp, created_at, kind, tags, content, null);
+}
+
+test "an event carries its kind into the note built from it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x31} ** 32);
+
+    for ([_]u16{ 1, 6, 20, 1063, 30023 }) |kind| {
+        const ev = try signedKind(arena, signer, kp, 1_800_000_000, kind, &.{}, "x");
+        const note = main.noteFrom(ev, 1_800_000_000);
+        try testing.expectEqual(kind, note.kind);
+    }
+}
+
+test "a long-form article shows its title, not its markdown" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x32} ** 32);
+
+    const markdown = "## A heading\n\nA paragraph of the article body that nobody asked to read in a card.";
+    const tags = [_]nostr.event.Tag{&[_][]const u8{ "title", "What the article is called" }};
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, markdown);
+    const note = main.noteFrom(ev, 1_800_000_000);
+
+    try testing.expectEqualStrings("What the article is called", note.content());
+    // The markdown must not be in there at all: painting it as a note body is
+    // the whole defect.
+    try testing.expect(std.mem.indexOf(u8, note.content(), "## A heading") == null);
+}
+
+test "an article with no title falls to the unsupported card rather than its markdown" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &.{}, "# raw markdown");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqual(@as(u16, 0), note.content_len);
+}
+
+test "a kind nothing can draw keeps its content out of the body" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x34} ** 32);
+
+    // A file metadata event: its content is empty by design, and what it holds
+    // is in its tags.
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 1063, &.{}, "not a sentence");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqual(main.KindRender.unsupported, main.kindRender(note.kind));
+    try testing.expectEqual(@as(u16, 0), note.content_len);
+}
+
+test "a real kind:0 is unsupported, and the default does not hide it" {
+    // `Note.kind` defaults to 1 so a fixture or a scratch struct reads as a text
+    // note. This is the case that default could have masked: an event whose kind
+    // really is 0 must still be refused, because `noteFrom` writes the real kind
+    // over the default rather than leaving it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x35} ** 32);
+
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 0, &.{}, "{\"name\":\"somebody\"}");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqual(@as(u16, 0), note.kind);
+    try testing.expectEqual(main.KindRender.unsupported, main.kindRender(note.kind));
+
+    // And a Note nobody filled from an event is still a text note.
+    const blank = main.Note{};
+    try testing.expectEqual(main.KindRender.note, main.kindRender(blank.kind));
+}
+
+test "every surface answers the same way about one kind" {
+    // The point of having a single dispatch: a quote card, a thread and
+    // open_event cannot disagree about the same event.
+    try testing.expectEqual(main.KindRender.note, main.kindRender(1));
+    try testing.expectEqual(main.KindRender.note, main.kindRender(main.comment_kind));
+    try testing.expectEqual(main.KindRender.article, main.kindRender(30023));
+    try testing.expectEqual(main.KindRender.media, main.kindRender(20));
+    try testing.expectEqual(main.KindRender.media, main.kindRender(21));
+    try testing.expectEqual(main.KindRender.media, main.kindRender(22));
+    try testing.expectEqual(main.KindRender.unsupported, main.kindRender(1063));
+    try testing.expectEqual(main.KindRender.unsupported, main.kindRender(31923));
+}
+
 test "first run shows the onboarding welcome, not the feed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
