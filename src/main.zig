@@ -11585,13 +11585,46 @@ pub const Model = struct {
         limit: usize,
         reuse_ok: bool,
     ) void {
-        var result = store.query(std.heap.page_allocator, .{
-            .authors = authors,
-            .kinds = kinds,
-            .limit = @intCast(limit),
-        }) catch return;
-        defer result.deinit();
+        // ONE QUERY PER KIND, merged here, rather than one query naming them all.
+        //
+        // The store picks its index on the product of authors and kinds: at or
+        // under `max_merge_streams` (4096) it opens a cursor per author-kind
+        // pair on `idx_author_kind`; over it, it drops to the plain author index
+        // and pays a decode for every event those authors ever wrote. A full
+        // follow list is 2049 authors, so one kind fits with room to spare and
+        // two do not: 4098 pairs misses the cap by two, and the feed would
+        // quietly become a full scan of everything two thousand people have
+        // ever posted.
+        //
+        // Splitting by kind means the product is always authors times one,
+        // whatever this list grows to. It is robust by construction rather than
+        // correct up to a follow count nobody is watching, and it holds fewer
+        // cursors open at once than the single query did. The events of one kind
+        // come back newest-first, so merging them is a pick across `kinds.len`
+        // cursors, which is the same thing the store does internally with three
+        // streams instead of six thousand.
+        var results: [feed_kind_cap]nostr.store.QueryResult = undefined;
+        var results_len: usize = 0;
+        defer for (results[0..results_len]) |*r| r.deinit();
+        for (kinds) |kd| {
+            if (results_len >= results.len) break;
+            const one = [_]u16{kd};
+            results[results_len] = store.query(std.heap.page_allocator, .{
+                .authors = authors,
+                .kinds = &one,
+                .limit = @intCast(limit),
+                // `return`, not `continue`. A failed read used to abandon the
+                // whole rebuild and leave the feed as it was; skipping one kind
+                // instead would silently show a feed missing everything of that
+                // kind, which looks like an empty day rather than a failure.
+                // The defer above frees whatever was opened before this.
+            }) catch return;
+            results_len += 1;
+        }
         g_feed_work.full_reads += 1;
+
+        // Where each kind's result has been read up to.
+        var cursors = [_]usize{0} ** feed_kind_cap;
 
         // The old cards, so new positions can take them over by id.
         const old = g_feed_scratch;
@@ -11600,8 +11633,19 @@ pub const Model = struct {
         const slots = if (reuse_ok) buildReuseIndex(old[0..old_len]) else &.{};
 
         var n: usize = 0;
-        for (result.events) |ev| {
-            if (n >= limit) break;
+        while (n < limit) {
+            // The newest unread event across the per-kind results. Linear over
+            // `kinds.len`, which is three.
+            var best: ?usize = null;
+            for (results[0..results_len], 0..) |r, i| {
+                if (cursors[i] >= r.events.len) continue;
+                if (best == null or
+                    eventNewer(r.events[cursors[i]], results[best.?].events[cursors[best.?]])) best = i;
+            }
+            const bi = best orelse break;
+            const ev = results[bi].events[cursors[bi]];
+            cursors[bi] += 1;
+
             // A muted author never becomes a card. Filtered here rather than in
             // the query because the store has no idea who this reader muted, and
             // rather than at render time because a hidden row would still hold a
@@ -11718,6 +11762,14 @@ fn authorInSet(authors: []const [32]u8, pubkey: [32]u8) bool {
 fn eventNewerThanNote(ev: nostr.event.Event, note: Note) bool {
     if (ev.created_at != note.created_at) return ev.created_at > note.created_at;
     return std.mem.order(u8, &ev.id, &note.event_id) == .gt;
+}
+
+/// Orders two events the way the store orders them: newest first, ties broken
+/// by id so the sequence is total and stable rather than dependent on which
+/// cursor happened to answer first.
+fn eventNewer(a: nostr.event.Event, b: nostr.event.Event) bool {
+    if (a.created_at != b.created_at) return a.created_at > b.created_at;
+    return std.mem.order(u8, &a.id, &b.id) == .gt;
 }
 
 /// Adopts `secret` as the active local identity. For tests: the feed scopes
@@ -19464,6 +19516,13 @@ const max_follows_divided = (max_follows + 1 + follow_chunk - 1) / follow_chunk;
 pub const max_feed_filters = 2 * (max_follows_divided + 1) + 1;
 
 /// The feed's notes.
+/// How many kinds the feed may read in one rebuild.
+///
+/// The store read opens one query per kind (see `rebuildNotesFromStore` for
+/// why), and they are held open together to be merged, so this bounds both the
+/// stack array and how many cursors exist at once.
+const feed_kind_cap: usize = 4;
+
 const feed_filter_kinds = [_]u16{1};
 /// What the feed needs about the people in it: kind:0 is who they are, 10002 is
 /// where they are.
