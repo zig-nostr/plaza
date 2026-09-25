@@ -32,6 +32,20 @@ const plaza_icons = @import("plaza_icons.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
+// The toolkit compiles its macOS host (appkit_host.m) into every binary built
+// from this module: the app, the test binary and the model-contract tool. The
+// host calls two functions the toolkit exports from Zig, but only its macOS
+// platform module references them, and only the app's run path reaches that
+// module. A Debug link drops the unused host object, so nothing noticed; an
+// optimized one keeps it and fails with the two symbols undefined. Referencing
+// them here exports them wherever this module is built.
+comptime {
+    if (builtin.os.tag == .macos) {
+        _ = native_sdk.updater.c_api.native_sdk_update_verify_feed;
+        _ = native_sdk.updater.c_api.native_sdk_update_verify_archive;
+    }
+}
+
 // ------------------------------------------------- bytes that are not ours
 //
 // `@setRuntimeSafety(true)` appears at the top of every function below that

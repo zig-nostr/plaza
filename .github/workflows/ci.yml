@@ -57,6 +57,12 @@ jobs:
       - name: Test
         run: native test
 
+      # The mode the app ships in, on the platform it ships on. The Linux job
+      # already runs the suite optimized; this one did not, so an optimized test
+      # build that could not even link on macOS went unnoticed.
+      - name: Test (ReleaseFast, the mode that ships)
+        run: zig build test -Doptimize=ReleaseFast
+
       # The keyholder is a separate binary with its own step, so `native test`
       # and `zig build test` both walk straight past it. Its 21 tests had never
       # run on any machine but mine, including the ones guarding the migration
