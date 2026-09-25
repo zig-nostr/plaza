@@ -57,11 +57,17 @@ jobs:
       - name: Test
         run: native test
 
-      # The mode the app ships in, on the platform it ships on. The Linux job
-      # already runs the suite optimized; this one did not, so an optimized test
-      # build that could not even link on macOS went unnoticed.
-      - name: Test (ReleaseFast, the mode that ships)
-        run: zig build test -Doptimize=ReleaseFast
+      # An optimized macOS build of something other than the app has to link:
+      # one that could not (#389) went unnoticed because nothing built one. The
+      # model-contract tool carries the same toolkit host as the test binary,
+      # so it fails the same way, and building it runs no tests.
+      #
+      # Not the whole suite in ReleaseFast. That includes absolute frame-time
+      # budgets, and this runner is a shared VM roughly twice as slow as the
+      # machines they are set for, so it failed on timing, not on code. The
+      # Linux job runs the optimized suite, as it always has.
+      - name: An optimized build links
+        run: zig build model-contract -Doptimize=ReleaseFast
 
       # The keyholder is a separate binary with its own step, so `native test`
       # and `zig build test` both walk straight past it. Its 21 tests had never
