@@ -153,6 +153,13 @@ jobs:
       # file does not carry shell that only ever runs on a runner.
       - name: The macOS installer verifies the macOS download
         run: scripts/check-macos-installer.sh ${{ github.repository }} .
+
+      # The release's publish job refuses to lift the draft until this says every
+      # artifact is up. Its self-test covers a missing file, an upload that never
+      # finished, an empty file and another version's files, and checks its list
+      # of architectures against release.yml's matrix.
+      - name: The release check refuses an incomplete release
+        run: scripts/check-release-assets.sh --self-test
   portability:
     name: portability (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
