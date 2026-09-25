@@ -87,6 +87,13 @@ jobs:
       - name: Zip the .app (ditto preserves the signature)
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Plaza.app" "Plaza-${{ github.ref_name }}-macos.zip"
 
+      # Published beside the zip, the same way each Linux tarball has its
+      # `.sha256`, so the macOS installer can read the digest of the file it
+      # downloads by name instead of picking it out of the release JSON, and a
+      # reader can check a download by hand from the release page.
+      - name: Write the zip's digest
+        run: shasum -a 256 "Plaza-${{ github.ref_name }}-macos.zip" > "Plaza-${{ github.ref_name }}-macos.zip.sha256"
+
       # The tag and the manifest have to agree, and this is the last place that
       # can be checked. `app.zon` is where the app reads its own version from, so
       # tagging v0.5.0 on a tree that still says 0.4.1 ships a build that tells
@@ -130,14 +137,14 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "release exists; hiding it and replacing its artifact with the one built here"
             gh release edit "$GITHUB_REF_NAME" --draft=true
-            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+            gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber
           else
             # A DRAFT. The Linux tarballs are built by another job that takes
             # minutes longer, and a release published before they arrive offers
             # a Linux install that 404s for exactly that long. v0.18.0 was live
             # with macOS only for eight minutes, which somebody noticed. The
             # `publish` job below lifts the draft once every artifact is up.
-            gh release create "$GITHUB_REF_NAME" "$asset" \
+            gh release create "$GITHUB_REF_NAME" "$asset" "$asset.sha256" \
               --draft \
               --title "Plaza $GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
