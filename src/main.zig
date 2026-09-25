@@ -3575,6 +3575,8 @@ const engagement_widen_ms: i64 = 5_000;
 // moved the wall from 512 to 4096. What fixes it is saying so, which is what
 // `draft_dropped` is for.
 const compose_capacity = 4096;
+/// The profile editor's "about" box.
+const profile_about_capacity = 280;
 const refresh_timer_key: u64 = 1;
 const refresh_interval_ms: u64 = 1_000;
 // Wanted-profile fetching runs on its own cadence, decoupled from the view
@@ -3851,8 +3853,9 @@ const compose_header_height: f32 = 38;
 /// STATED, not inherited, and that is the whole point. A text element measures
 /// at its natural width whatever its ancestors say, so a field that takes its
 /// width from a `grow` parent wraps for LAYOUT at one width and measures for
-/// PAINT at another. Two wrappings of the same paragraph then land on the same
-/// rows, which is what made a pasted note look shredded.
+/// PAINT at another, and two wrappings of the same paragraph land on the same
+/// rows. That was once blamed for a pasted note drawing scrambled (#165); it was
+/// not the cause, which turned out to be CR line breaks (see `plainLineBreaks`).
 const compose_editor_width: f32 = compose_sheet_width - 14 * 2 - avatar_size - 12;
 pub const compose_editor_width_for_test = compose_editor_width;
 const compose_editor_height: f32 = 150;
@@ -5736,8 +5739,8 @@ fn scanHelperSign(model: *Model) void {
         // The composer holds one draft. A reader who has started typing again
         // keeps what they are typing; the restored one would overwrite it.
         if (restorable and model.draft_empty()) {
-            model.draft_buffer.set(c);
-            saveDraft(c);
+            setPlain(compose_capacity, &model.draft_buffer, c);
+            saveDraft(model.draft());
             // Said out loud, because the notice this used to rely on cannot be
             // read: its string lives in `Model.identity()`, which is listed in
             // `view_unbound` and rendered by nothing. So a reader saw "Posted",
@@ -10516,7 +10519,7 @@ pub const Model = struct {
     profile_lud16_long: bool = false,
     profile_nip05_long: bool = false,
     profile_name_buffer: canvas.TextBuffer(64) = .{},
-    profile_about_buffer: canvas.TextBuffer(280) = .{},
+    profile_about_buffer: canvas.TextBuffer(profile_about_capacity) = .{},
     profile_picture_buffer: canvas.TextBuffer(200) = .{},
     profile_website_buffer: canvas.TextBuffer(200) = .{},
     profile_banner_buffer: canvas.TextBuffer(200) = .{},
@@ -29856,7 +29859,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // composer where it was left.
     var draft_buf: [note_content_cap]u8 = undefined;
     const stashed = loadDraft(&draft_buf);
-    if (stashed.len > 0) model.draft_buffer = @TypeOf(model.draft_buffer).init(stashed);
+    if (stashed.len > 0) setPlain(compose_capacity, &model.draft_buffer, stashed);
     // What was owed when the app last closed. Read before the first frame, so a
     // note written offline yesterday is visible as owed rather than lost, and
     // offered again as soon as a relay answers. Whose queue that is comes from
@@ -29896,6 +29899,116 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.profiles),
     });
+}
+
+/// What `plainLineBreaks` wrote, how long the whole input comes to once its
+/// breaks are plain (including whatever did not fit in `out`), and whether it
+/// had to change anything.
+pub const PlainLineBreaks = struct { text: []const u8, full_len: usize, changed: bool };
+
+/// Every line break that macOS draws as one and the toolkit does not lay out as
+/// one becomes a plain LF: CR on its own, vertical tab, form feed, NEL (U+0085),
+/// and the Unicode line and paragraph separators (U+2028, U+2029). Writes what
+/// fits into `out`, never cutting a UTF-8 sequence, and counts the rest.
+///
+/// The toolkit breaks a line only at LF, so it lays "end.\rNext" out as one
+/// word on one row. On macOS the host then draws each of those rows through
+/// AppKit, which DOES break there, so the words after the break land a row
+/// lower, on top of the next row. That is what made a pasted note look
+/// scrambled (#165), reproduced with each of these separators by pasting into
+/// the composer.
+///
+/// CRLF is left as it is. The layout breaks at its LF, so its CR is the last
+/// byte of a row and nothing is drawn after it: it has always drawn correctly,
+/// and changing it would cost the reader the caret and undo (see
+/// `applyPlainEdit`) for nothing.
+pub fn plainLineBreaks(in: []const u8, out: []u8) PlainLineBreaks {
+    var written: usize = 0;
+    var full: usize = 0;
+    var changed = false;
+    var i: usize = 0;
+    while (i < in.len) {
+        var take: usize = 1;
+        var plain = false;
+        switch (in[i]) {
+            '\r' => plain = !(i + 1 < in.len and in[i + 1] == '\n'),
+            0x0B, 0x0C => plain = true,
+            0xC2 => if (i + 1 < in.len and in[i + 1] == 0x85) {
+                plain = true;
+                take = 2;
+            },
+            0xE2 => if (i + 2 < in.len and in[i + 1] == 0x80 and (in[i + 2] == 0xA8 or in[i + 2] == 0xA9)) {
+                plain = true;
+                take = 3;
+            },
+            else => {},
+        }
+        // Anything else is copied with the rest of its UTF-8 sequence, so a
+        // full `out` never ends halfway through a character.
+        if (!plain) take = @min(std.unicode.utf8ByteSequenceLength(in[i]) catch 1, in.len - i);
+        const len: usize = if (plain) 1 else take;
+        // Written only while everything before it was: the text is always a
+        // prefix of the whole.
+        if (written == full and written + len <= out.len) {
+            if (plain) out[written] = '\n' else @memcpy(out[written..][0..len], in[i..][0..len]);
+            written += len;
+        }
+        changed = changed or plain;
+        full += len;
+        i += take;
+    }
+    return .{ .text = out[0..written], .full_len = full, .changed = changed };
+}
+
+/// Applies an edit to a multi-line text buffer with its line breaks made plain
+/// first (see `plainLineBreaks`). Returns what an insert asked to add, counted
+/// after that, so a caller can tell how much a clamp refused.
+///
+/// The editor keeps its own copy of the text, and it holds far more than this
+/// buffer does. Whenever this buffer ends up with different text from what the
+/// editor inserted, because a separator was replaced or because the paste was
+/// cut to fit, the editor takes this text and puts ITS caret at the end: the
+/// toolkit gives an app no way to say where the caret should be. So this
+/// buffer's caret goes to the end too, or the next key would land where the
+/// reader cannot see it. A cut can also split a CRLF and leave a lone CR at the
+/// cut, so the whole text is made plain again then. The editor's undo history
+/// for the box starts again from there, which is the price of both.
+///
+/// An insert refused outright changes nothing here, and the editor keeps its
+/// own copy, so nothing is moved.
+fn applyPlainEdit(comptime capacity: usize, buffer: *canvas.TextBuffer(capacity), edit: canvas.TextInputEvent) usize {
+    switch (edit) {
+        .insert_text => |inserted| {
+            var scratch: [capacity]u8 = undefined;
+            const plain = plainLineBreaks(inserted, &scratch);
+            const before_len = buffer.len;
+            const before_selection = buffer.selection;
+            buffer.apply(.{ .insert_text = plain.text });
+            // Anything past `scratch` is more than the whole buffer holds, so
+            // it is a clamp even when the buffer took all of `plain.text`.
+            const clamped = buffer.truncated or plain.full_len > plain.text.len;
+            buffer.truncated = clamped;
+            const refused = clamped and buffer.len == before_len and
+                std.meta.eql(buffer.selection, before_selection);
+            if (!refused and (plain.changed or clamped)) {
+                var whole: [capacity]u8 = undefined;
+                buffer.set(plainLineBreaks(buffer.text(), &whole).text);
+            }
+            return plain.full_len;
+        },
+        else => {
+            buffer.apply(edit);
+            return 0;
+        },
+    }
+}
+
+/// Puts text into a buffer with its line breaks made plain, for text that
+/// arrives other than by typing: a draft restored from disk, which an older
+/// Plaza may have saved with a CR in it.
+fn setPlain(comptime capacity: usize, buffer: *canvas.TextBuffer(capacity), text: []const u8) void {
+    var scratch: [capacity]u8 = undefined;
+    buffer.set(plainLineBreaks(text, &scratch).text);
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -30129,12 +30242,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .draft_edit => |edit| {
             // What this edit meant to add, before it is clamped. Only an insert
             // can overflow; every other edit is rejected whole.
-            const wanted: usize = switch (edit) {
-                .insert_text => |t| t.len,
-                else => 0,
-            };
             const before = model.draft_buffer.len;
-            model.draft_buffer.apply(edit);
+            const wanted = applyPlainEdit(compose_capacity, &model.draft_buffer, edit);
             // The buffer's own words for this flag are "loud seam for paste:
             // check after applying a clipboard insert", and nothing here ever
             // did. A paste past the cap lost the overflow in silence: the
@@ -30272,7 +30381,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_profile_edit => openProfileEdit(model),
         .close_profile_edit => model.editing_profile = false,
         .profile_name_edit => |edit| model.profile_name_buffer.apply(edit),
-        .profile_about_edit => |edit| model.profile_about_buffer.apply(edit),
+        .profile_about_edit => |edit| _ = applyPlainEdit(profile_about_capacity, &model.profile_about_buffer, edit),
         .profile_picture_edit => |edit| model.profile_picture_buffer.apply(edit),
         .profile_website_edit => |edit| model.profile_website_buffer.apply(edit),
         .profile_banner_edit => |edit| model.profile_banner_buffer.apply(edit),
@@ -30842,7 +30951,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             closeThread(model);
         },
         .go_home => goHome(model),
-        .reply_edit => |edit| model.reply_buffer.apply(edit),
+        .reply_edit => |edit| _ = applyPlainEdit(compose_capacity, &model.reply_buffer, edit),
         .reply_submit => {
             // The one verb that was gated nowhere: a guest could type a reply and
             // press send, and `publishReply` would reach for a signer that does
@@ -35695,7 +35804,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     }
 
     if (restore) |c| {
-        if (model.draft_empty()) model.draft_buffer.set(c);
+        if (model.draft_empty()) setPlain(compose_capacity, &model.draft_buffer, c);
         gpa.free(c);
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
