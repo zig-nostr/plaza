@@ -152,19 +152,25 @@ jobs:
           echo "::warning::Plaza pins Notary $pinned; the latest release is $latest. A keyholder fix only reaches a reader through a Plaza release, so move .github/notary-ref and cut one when it is wanted."
 
 
-      # The installer verifies the file it downloaded, not whatever is listed
-      # first. This fired for real on v0.19.0: the script took the first
-      # `sha256:` in the release JSON, which was correct while a release carried
-      # one asset and quietly stopped being correct when Linux tarballs were
-      # added. GitHub lists assets in upload order, so the first digest belongs
-      # to whichever packaging job won the race. macOS won through v0.18.x and
-      # lost at v0.19.0, and every macOS install then failed with "checksum
-      # mismatch" on a download that was perfectly fine.
+      # Both installers are served over `curl | bash`, and macOS ships bash 3.2,
+      # where a multibyte character next to a $variable under `set -u` aborts the
+      # script before it has said anything. So they stay pure ASCII, and they
+      # have to parse. `tr` rather than a grep class, because BSD grep has no -P
+      # and the two greps disagree on classes.
       #
-      # The checks live in the script so they can be run by hand, and so this
-      # file does not carry shell that only ever runs on a runner.
-      - name: The macOS installer verifies the macOS download
-        run: scripts/check-macos-installer.sh ${{ github.repository }} .
+      # This replaces a check that tested how the macOS installer picked its
+      # digest out of the release JSON. It no longer does that: it reads the
+      # `.sha256` published beside the zip, which the release refuses to publish
+      # without, so there is nothing left to pick from.
+      - name: The installers are ASCII and parse
+        run: |
+          set -eu
+          for f in scripts/install-macos.sh scripts/install-linux.sh; do
+            n="$(tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')"
+            [ "$n" = "0" ] || { echo "$f carries $n bytes outside ASCII" >&2; exit 1; }
+            bash -n "$f"
+          done
+          echo "the installers are ASCII and parse"
 
       # The release's publish job refuses to lift the draft until this says every
       # artifact is up. Its self-test covers a missing file, an upload that never

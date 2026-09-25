@@ -60,35 +60,9 @@ main() {
   # whole script on the spot with no message at all. The explicit check below,
   # which exists to explain precisely that case, would never be reached: the
   # reader would see the "Finding the latest release" line and then silence.
-  local tag url digest
+  local tag url
   tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   url="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*macos\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/' || true)"
-  # The digest OF THE FILE BEING DOWNLOADED, which is not the same thing as the
-  # first digest in the release.
-  #
-  # This used to be `grep -o 'sha256:...' | head -1` over the whole response.
-  # Correct while a release carried one asset, and silently wrong once Linux
-  # tarballs were added: GitHub lists assets in upload order, so the first digest
-  # belongs to whichever packaging job finished first. macOS won that race
-  # through v0.18.x and lost it at v0.19.0, and every macOS install then died
-  # with "checksum mismatch" on a download that was perfectly fine. Nothing in
-  # this script changed between those two releases.
-  #
-  # That is the worst way for a checksum to fail. The bytes were right and the
-  # comparison was against a different file, so the tool told people their
-  # download was corrupt and refused to continue. A check that cries wolf
-  # teaches people to skip checks.
-  #
-  # So the digest is read from the asset that names the file. The response is
-  # pretty-printed, so it is FLATTENED FIRST and only then split on the `{` that
-  # starts each object: without the flatten every field is already on its own
-  # line and the name and the digest can never meet. The segment that names the
-  # macOS zip is bounded by the next asset's `{`, so it cannot reach a
-  # neighbour's digest.
-  #
-  # No jq. This runs before anything is installed and uses only what macOS
-  # already ships.
-  digest="$(printf '%s' "$json" | tr -d '\n' | tr '{' '\n' | grep 'macos\.zip' | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2 || true)"
 
   [ -n "$url" ] || die "release ${tag:-unknown} has no macOS build attached. Try https://github.com/$repo/releases"
   say "Latest release: ${tag:-unknown}"
@@ -104,14 +78,27 @@ main() {
   say "Downloading $(basename "$url")..."
   curl -fSL --progress-bar -o "$zip" "$url" || die "download failed."
 
-  if [ -n "$digest" ]; then
-    local got
-    got="$(shasum -a 256 "$zip" | awk '{print $1}')"
-    [ "$got" = "$digest" ] || die "checksum mismatch (expected $digest, got $got). Aborting."
-    say "SHA-256 verified."
-  else
-    say "No published checksum for this release; skipping verification."
-  fi
+  # The digest is the file published beside the zip, `<zip>.sha256`, fetched by
+  # the zip's own name, exactly as the Linux installer reads its tarball's. It
+  # used to be picked out of the release JSON, which went wrong once already:
+  # the first digest in the response belonged to whichever asset uploaded
+  # first, and at v0.19.0 that was a Linux tarball, so every macOS install
+  # reported a perfectly good download as corrupt. There is no list to pick
+  # from any more.
+  #
+  # And no checksum means no install. This used to say "skipping verification"
+  # and carry on, which is the one outcome a checksum exists to prevent.
+  curl -fsSL --retry 2 --retry-all-errors -o "$zip.sha256" "$url.sha256" 2>/dev/null ||
+    die "could not fetch the published SHA-256 for $(basename "$url"), so the download cannot be verified. Not installing it. Try again, or get it from https://github.com/$repo/releases"
+  local want got
+  want="$(awk '{print $1}' "$zip.sha256")"
+  case "$want" in
+    "" | *[!0-9a-f]*) die "the published SHA-256 for $(basename "$url") is empty or malformed. Not installing it." ;;
+  esac
+  [ "${#want}" -eq 64 ] || die "the published SHA-256 for $(basename "$url") is malformed. Not installing it."
+  got="$(shasum -a 256 "$zip" | awk '{print $1}')"
+  [ "$got" = "$want" ] || die "checksum mismatch (expected $want, got $got). Not installing it."
+  say "SHA-256 verified."
 
   # --- unpack --------------------------------------------------------------
   say "Unpacking..."
