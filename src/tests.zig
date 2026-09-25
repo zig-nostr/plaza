@@ -22749,6 +22749,167 @@ test "a paste that does not fit says so instead of vanishing" {
     try testing.expectEqual(@as(usize, 0), model.draft_dropped);
 }
 
+test "every line break macOS draws and the layout does not becomes a plain LF" {
+    // The toolkit breaks a line only at LF, and on macOS the host draws each
+    // row through AppKit, which also breaks at these. A paste separated by any
+    // of them drew the words after the break a row lower, on top of the next
+    // row (#165). Reproduced live with CR, U+2028 and vertical tab.
+    const Case = struct { in: []const u8, want: []const u8, changed: bool };
+    const cases = [_]Case{
+        .{ .in = "one\rtwo", .want = "one\ntwo", .changed = true },
+        .{ .in = "one\r\rtwo", .want = "one\n\ntwo", .changed = true },
+        .{ .in = "one\x0btwo\x0cthree", .want = "one\ntwo\nthree", .changed = true },
+        .{ .in = "one\u{0085}two", .want = "one\ntwo", .changed = true },
+        .{ .in = "one\u{2028}two\u{2029}three", .want = "one\ntwo\nthree", .changed = true },
+        .{ .in = "trailing\r", .want = "trailing\n", .changed = true },
+        .{ .in = "one\r\r\ntwo", .want = "one\n\r\ntwo", .changed = true },
+        // Left alone. CRLF draws correctly, since its CR ends a row, and a
+        // change would cost the caret and undo for nothing.
+        .{ .in = "one\r\ntwo", .want = "one\r\ntwo", .changed = false },
+        .{ .in = "one\r\n\r\ntwo", .want = "one\r\n\r\ntwo", .changed = false },
+        .{ .in = "one\n\ntwo", .want = "one\n\ntwo", .changed = false },
+        // Characters that share a leading byte with a separator.
+        .{ .in = "caf\u{e9} \u{2026} \u{2022} \u{1F600}", .want = "caf\u{e9} \u{2026} \u{2022} \u{1F600}", .changed = false },
+        // Truncated sequences at the very end are copied, not misread.
+        .{ .in = "a\xe2\x80", .want = "a\xe2\x80", .changed = false },
+        .{ .in = "a\xc2", .want = "a\xc2", .changed = false },
+        .{ .in = "", .want = "", .changed = false },
+    };
+    for (cases) |c| {
+        var out: [64]u8 = undefined;
+        const got = main.plainLineBreaks(c.in, &out);
+        testing.expectEqualStrings(c.want, got.text) catch |err| {
+            std.debug.print("for input {any}\n", .{c.in});
+            return err;
+        };
+        try testing.expectEqual(c.want.len, got.full_len);
+        try testing.expectEqual(c.changed, got.changed);
+    }
+}
+
+test "a full buffer stops at a character boundary and still counts the rest" {
+    // "ab" then a three-byte character: with room for four bytes, the
+    // character does not fit whole, so it is left out rather than cut, and
+    // "cd", which would fit, is not written after the gap.
+    var out: [4]u8 = undefined;
+    const got = main.plainLineBreaks("ab\u{2026}cd", &out);
+    try testing.expectEqualStrings("ab", got.text);
+    try testing.expectEqual(@as(usize, 7), got.full_len);
+}
+
+test "a paste with CR line breaks lands in every multi-line box as LF" {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    const pasted = "Alpha one.\rBravo two.\r\rCharlie three.\u{2028}Delta four.";
+    const plain = "Alpha one.\nBravo two.\n\nCharlie three.\nDelta four.";
+
+    main.update(&model, .{ .draft_edit = .{ .insert_text = pasted } }, &fx);
+    try testing.expectEqualStrings(plain, model.draft());
+    try testing.expectEqual(@as(usize, 0), model.draft_dropped);
+
+    main.update(&model, .{ .reply_edit = .{ .insert_text = pasted } }, &fx);
+    try testing.expectEqualStrings(plain, model.reply_buffer.text());
+
+    main.update(&model, .{ .profile_about_edit = .{ .insert_text = pasted } }, &fx);
+    try testing.expectEqualStrings(plain, model.profile_about_buffer.text());
+}
+
+test "a paste that had to change leaves the caret where the editor puts it" {
+    // The editor takes the model's text when the two differ, and then puts
+    // its caret at the end, with no way for the app to say otherwise. The
+    // model's caret has to be there too, or the next key goes in somewhere
+    // the reader cannot see: found live, typing after a mid-text paste.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "Hello world" } }, &fx);
+    main.update(&model, .{ .draft_edit = .{ .set_selection = canvas.TextSelection.collapsed(5) } }, &fx);
+
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "A\rB" } }, &fx);
+    try testing.expectEqualStrings("HelloA\nB world", model.draft());
+    try testing.expectEqual(canvas.TextSelection.collapsed(model.draft().len), model.draft_buffer.selection);
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "x" } }, &fx);
+    try testing.expectEqualStrings("HelloA\nB worldx", model.draft());
+
+    // A paste that needed no change is an ordinary edit, caret and all.
+    main.update(&model, .{ .draft_edit = .{ .set_selection = canvas.TextSelection.collapsed(5) } }, &fx);
+    main.update(&model, .{ .draft_edit = .{ .insert_text = "C\r\nD" } }, &fx);
+    try testing.expectEqualStrings("HelloC\r\nDA\nB worldx", model.draft());
+    try testing.expectEqual(canvas.TextSelection.collapsed(9), model.draft_buffer.selection);
+}
+
+test "a paste cut to fit keeps the caret where the editor puts it, and no lone CR" {
+    // The editor holds the whole paste, the draft only what fits, so the
+    // editor takes the draft's text and moves its caret to the end. A cut can
+    // also land between a CR and its LF, which would leave exactly the lone CR
+    // that #165 is about.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const cap = main.compose_capacity_for_test;
+    const start = "Hello world\nSecond line";
+    const room = cap - start.len;
+
+    // The cut lands between CR and LF.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.update(&model, .{ .draft_edit = .{ .insert_text = start } }, &fx);
+    main.update(&model, .{ .draft_edit = .{ .set_selection = canvas.TextSelection.collapsed(5) } }, &fx);
+    const split = try arena_state.allocator().alloc(u8, room + 5);
+    @memset(split, 'x');
+    split[room - 1] = '\r';
+    split[room] = '\n';
+    main.update(&model, .{ .draft_edit = .{ .insert_text = split } }, &fx);
+    try testing.expectEqual(cap, model.draft().len);
+    if (std.mem.indexOfScalar(u8, model.draft(), '\r') != null) return error.ALoneCrSurvivedTheCut;
+    try testing.expectEqual(canvas.TextSelection.collapsed(cap), model.draft_buffer.selection);
+
+    // A plain paste cut to fit, in the middle of the text.
+    var model2 = main.initialModel();
+    model2.stage = .ready;
+    model2.composing = true;
+    main.update(&model2, .{ .draft_edit = .{ .insert_text = start } }, &fx);
+    main.update(&model2, .{ .draft_edit = .{ .set_selection = canvas.TextSelection.collapsed(5) } }, &fx);
+    const long = try arena_state.allocator().alloc(u8, room + 100);
+    @memset(long, 'y');
+    main.update(&model2, .{ .draft_edit = .{ .insert_text = long } }, &fx);
+    try testing.expectEqual(canvas.TextSelection.collapsed(cap), model2.draft_buffer.selection);
+
+    // Refused outright, into a full draft: nothing here changes, and the
+    // caret stays where it was.
+    main.update(&model2, .{ .draft_edit = .{ .set_selection = canvas.TextSelection.collapsed(5) } }, &fx);
+    const full = try arena_state.allocator().dupe(u8, model2.draft());
+    main.update(&model2, .{ .draft_edit = .{ .insert_text = "p\rq" } }, &fx);
+    try testing.expectEqualStrings(full, model2.draft());
+    try testing.expectEqual(canvas.TextSelection.collapsed(5), model2.draft_buffer.selection);
+}
+
+test "a paste that does not fit is counted after its line breaks are made plain" {
+    // Past the cap, the overflow reported is measured in what the draft would
+    // have held.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    const cap = main.compose_capacity_for_test;
+    // cap + 1 bytes of U+2028, three bytes each on the way in and one once
+    // plain: cap + 1 plain bytes asked for, cap of them fit.
+    const big = try arena_state.allocator().alloc(u8, (cap + 1) * 3);
+    for (0..cap + 1) |i| @memcpy(big[i * 3 ..][0..3], "\u{2028}");
+    main.update(&model, .{ .draft_edit = .{ .insert_text = big } }, &fx);
+    try testing.expectEqual(cap, model.draft().len);
+    try testing.expect(std.mem.indexOfScalar(u8, model.draft(), 0xE2) == null);
+    try testing.expectEqual(@as(usize, 1), model.draft_dropped);
+}
+
 test "a test identity signs the way the app does, through the keyholder" {
     // The suite's ~400 "be somebody" tests used to hold a secret key in this
     // process and sign inline. Plaza does not do that any more, so neither do
