@@ -1,5 +1,17 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.24.0
+
+**Reposts from people you follow show up in your feed.** Plaza could repost a note and could count other people's reposts, and it never showed one. A repost now appears as the note itself, with its author and its words. If several people you follow repost the same note, it shows once, and if you already had it on screen it is not drawn twice. The note is always read from what its author signed, never from the copy inside the repost, so a repost cannot put words in somebody's mouth.
+
+**You can set everything Plaza shows on a profile.** The profile editor had three fields, so a website, a banner, a Lightning address and a NIP-05 identifier, all of which Plaza shows, could only be set from another app. They are all editable now. The Lightning address is the one that matters: it is how anybody's client finds where to send a zap, so an account set up only in Plaza could not be zapped by anyone until its owner set one in another app. Saving still leaves everything else on your profile as it was.
+
+**Something Plaza cannot draw says what it is.** A long-form article, a calendar entry or anything else that is not a short note used to be drawn as if it were one when you opened it from a link or saw it quoted. An article now shows its title, and anything Plaza does not draw yet shows a small card naming its kind, so you can tell it apart from a note that has not loaded, and look it up or open it in an app that draws it.
+
+**A pasted note no longer draws scrambled.** Text whose lines were separated by carriage returns, rather than ordinary line breaks, was drawn by macOS as separate lines and laid out by Plaza as one, so in the composer the start of each paragraph was drawn over the line below it. The text itself was never altered; only the drawing was wrong. Line breaks are now made plain as they are pasted, in the composer, the reply box and the profile's about field.
+
+**The macOS download comes with its checksum.** Next to the zip on the release page is its SHA-256, the way the Linux downloads have always had theirs, so you can check a download by hand.
+
 ### What's new in v0.23.0
 
 **Replies written as comments show up now.** Nostr has two ways to write a reply: the original one, and NIP-22 comments. Plaza only read the first, so a conversation could arrive with holes in it and nothing on screen said they were holes: no error, no empty state, just a thread that quietly skipped half of itself.
