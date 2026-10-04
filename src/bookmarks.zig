@@ -537,50 +537,33 @@ fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, ev
     var hex: [64]u8 = undefined;
     hexLower(&hex, event_id);
 
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(gpa);
-    out.append(gpa, '[') catch return null;
-    var wrote: usize = 0;
+    var tags = std.ArrayList([]const []const u8).empty;
+    defer tags.deinit(gpa);
     var found = false;
 
+    var parsed: ?std.json.Parsed([]const []const []const u8) = null;
+    defer if (parsed) |p| p.deinit();
     if (base_content.len > 0) {
         const plain = privateHalfOpened(base_content) orelse return null;
-        const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return null;
-        defer parsed.deinit();
-        for (parsed.value) |tag| {
+        parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return null;
+        for (parsed.?.value) |tag| {
             if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e") and hexEqlIgnoreCase(tag[1], &hex)) {
                 found = true;
                 if (!adding) continue;
             }
-            if (wrote > 0) out.append(gpa, ',') catch return null;
-            out.append(gpa, '[') catch return null;
-            for (tag, 0..) |field, fi| {
-                if (fi > 0) out.append(gpa, ',') catch return null;
-                out.append(gpa, '"') catch return null;
-                // Escaped by hand, and only the two characters that can appear
-                // here: a tag field off a decrypted list is a hex id, a relay
-                // url or a label, and anything else is carried as-is rather
-                // than dropped.
-                for (field) |c| {
-                    if (c == '"' or c == '\\') out.append(gpa, '\\') catch return null;
-                    out.append(gpa, c) catch return null;
-                }
-                out.append(gpa, '"') catch return null;
-            }
-            out.append(gpa, ']') catch return null;
-            wrote += 1;
+            tags.append(gpa, tag) catch return null;
         }
     }
     if (adding and found) return null; // Already private. Nothing to seal.
     if (!adding and !found) return null; // Not private. Nothing to seal.
-    if (adding) {
-        if (wrote > 0) out.append(gpa, ',') catch return null;
-        out.appendSlice(gpa, "[\"e\",\"") catch return null;
-        out.appendSlice(gpa, &hex) catch return null;
-        out.appendSlice(gpa, "\"]") catch return null;
-    }
-    out.append(gpa, ']') catch return null;
-    return out.toOwnedSlice(gpa) catch null;
+    const added = [_][]const u8{ "e", &hex };
+    if (adding) tags.append(gpa, &added) catch return null;
+    // Serialized by the JSON writer, not by hand. Every field is carried as it
+    // was, and a field from another client can hold anything a JSON string can:
+    // a newline, a tab, a control byte. Escaping only `"` and `\` sealed those
+    // raw, which is invalid JSON, and then every client found the whole private
+    // half unreadable.
+    return std.json.Stringify.valueAlloc(gpa, tags.items, .{}) catch null;
 }
 
 /// The keyholder a test has, for the seal path.

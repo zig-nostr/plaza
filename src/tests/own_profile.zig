@@ -753,6 +753,63 @@ test "a relay that sent the reader's list and Plaza could not keep it has not sa
     }
 }
 
+test "a private bookmark list with control characters in it seals back whole" {
+    // NIP-51 entries can carry anything a JSON string can: a label with a
+    // newline or a tab, a control byte, any script. The new private half was
+    // escaped by hand for `"` and `\` only, so those went in raw, the sealed
+    // JSON did not parse, and the whole private half became unreadable for
+    // every client.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateSealForTest();
+    defer {
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmctl.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const old_id = "d4" ** 32;
+    const entries = [_][]const []const u8{
+        &.{ "e", old_id, "wss://relay.example", "line one\nline two" },
+        &.{ "t", "tab\there" },
+        &.{ "title", "bell\x01and quote \" and slash \\" },
+        &.{ "title", "日本語 und Grüße 🌿" },
+    };
+    const plain = try std.json.Stringify.valueAlloc(arena, entries, .{});
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x84} ** 32);
+    var threaded = std.Io.Threaded.init(arena, .{});
+    defer threaded.deinit();
+    const sealed = try nostr.nip44.encrypt(arena, threaded.io(), signer, kp.secret_key, kp.public_key, plain);
+    _ = try bookmarkFixture(arena, &signer, &store, &.{}, sealed);
+
+    var fx: main.EffectsForTest = undefined;
+    const new_id = [_]u8{0xd5} ** 32;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, new_id, true));
+    const opened = try nostr.nip44.decrypt(arena, signer, kp.secret_key, kp.public_key, main.lastSealedForTest());
+    const back = try std.json.parseFromSliceLeaky([]const []const []const u8, arena, opened, .{});
+    try testing.expectEqual(entries.len + 1, back.len);
+    for (entries, 0..) |want, i| {
+        try testing.expectEqual(want.len, back[i].len);
+        for (want, 0..) |field, j| try testing.expectEqualStrings(field, back[i][j]);
+    }
+    var new_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&new_hex, "{x}", .{&new_id});
+    try testing.expectEqualStrings("e", back[entries.len][0]);
+    try testing.expectEqualStrings(&new_hex, back[entries.len][1]);
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes
