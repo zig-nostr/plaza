@@ -24,6 +24,7 @@ const forgetOutboxAcks = main.forgetOutboxAcks;
 const forgetRelayRemovals = main.forgetRelayRemovals;
 const freeOwnProfile = main.freeOwnProfile;
 const isRelayUrl = main.isRelayUrl;
+const listWriteInFlight = main.listWriteInFlight;
 const lockRelayTable = main.lockRelayTable;
 const max_relays = main.max_relays;
 const noteOwnOutbox = main.noteOwnOutbox;
@@ -367,6 +368,11 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     // moment the signer is free. This is the half of the same-tick collision the
     // relay list was on the losing end of.
     if (!signerReady()) return false;
+    // A bunker signs several things at once, so it is always "ready". Kept
+    // pending while a relay list is out with it or on its way into the store:
+    // this write splices onto the stored list, which does not have that one
+    // yet, and would publish over it.
+    if (listWriteInFlight(relay_list_kind)) return false;
     // Kept pending, the same way, while the last list published is not in the
     // store: splicing onto the one before it would drop that change.
     if (ownWriteUnstored(relay_list_kind)) return false;

@@ -315,6 +315,51 @@ test "one relay's EOSE is not permission to replace a relay list" {
     try testing.expect(!main.canWriteRelayListForTest());
     try testing.expect(!main.publishRelayListForTest(&fx));
 }
+test "a relay edit waits while a bunker still has the last relay list" {
+    // A bunker is always ready to sign, so an edit inside its round trip
+    // spliced onto the stored list, which did not have the one still out, and
+    // published over it. The other list writes already waited for that.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetRelaysForTest();
+    main.clearRelayListPublishForTest();
+    defer main.clearRelayListPublishForTest();
+    main.setIdentityForTest([_]u8{0x5a} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var fx: main.EffectsForTest = undefined;
+
+    _ = main.addRelayForTest("wss://first.example.com", true, true);
+    main.markRelaysMineForTest();
+    main.relayListEditedForTest(1_000);
+    main.flushRelayListForTest(&fx, 1_003);
+    try testing.expect(!main.relayListPendingForTest());
+
+    // A second edit while the first is with the bunker stays pending.
+    _ = main.addRelayForTest("wss://second.example.com", true, true);
+    main.relayListEditedForTest(1_004);
+    main.flushRelayListForTest(&fx, 1_007);
+    try testing.expect(main.relayListPendingForTest());
+
+    // Answered and not stored yet is still out.
+    var idbuf: [24]u8 = undefined;
+    const sign = main.pendingSignIdForKindForTest(10002, &idbuf) orelse return error.NoPendingSign;
+    try testing.expect(main.takeAnsweredForTest(sign));
+    var landed = false;
+    defer if (!landed) main.signLandedForTest();
+    main.flushRelayListForTest(&fx, 1_008);
+    try testing.expect(main.relayListPendingForTest());
+
+    // Landed: the same edit goes out without another press.
+    main.signLandedForTest();
+    landed = true;
+    main.flushRelayListForTest(&fx, 1_009);
+    try testing.expect(!main.relayListPendingForTest());
+}
+
 test "an edit that could not be published is still pending" {
     // The settle timer used to CONSUME the edit: it cleared the dirty flag and
     // handed the publish a chance it could refuse. An edit made before this
