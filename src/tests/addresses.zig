@@ -379,3 +379,53 @@ test "a quote card's address is never evicted from under it" {
     // The card still knows what it names, so it can still be asked for and opened.
     try testing.expect(main.addressRegisteredForTest(card.quote.id));
 }
+
+test "a public host is told by its spelling, the same way for a relay and a picture" {
+    // Each host as a relay and as a picture: the two share one host rule.
+    const Case = struct { relay: []const u8, picture: []const u8 };
+    const accepted = [_]Case{
+        // An internationalised top-level domain has a digit in its last label,
+        // and is a name all the same.
+        .{ .relay = "wss://relay.example.xn--p1ai", .picture = "https://img.example.xn--p1ai/a.png" },
+        .{ .relay = "wss://relay.xn--80asehdb.xn--p1ai/", .picture = "http://img.xn--80asehdb.xn--p1ai/a.png" },
+        // The scheme's own port, written out, goes where no port goes.
+        .{ .relay = "wss://relay.example.com:443", .picture = "https://img.example.com:443/a.png" },
+        .{ .relay = "wss://relay.example.com:443/", .picture = "http://img.example.com:80/a.png" },
+        // A plain public address, a zero octet included.
+        .{ .relay = "wss://93.184.0.34", .picture = "https://93.184.0.34/a.png" },
+    };
+    for (accepted) |c| {
+        if (!main.isPublicRelayUrl(c.relay) or !main.isPublicMediaUrl(c.picture)) {
+            std.debug.print("\nrefused a public host: {s} / {s}\n", .{ c.relay, c.picture });
+            return error.PublicHostRefused;
+        }
+    }
+    const refused = [_]Case{
+        // A last label that is a number, decimal or hex, makes it an address,
+        // and only the plain four-number form is one.
+        .{ .relay = "wss://127.1", .picture = "https://127.1/a.png" },
+        .{ .relay = "wss://0x7f.1", .picture = "https://0x7f.1/a.png" },
+        .{ .relay = "wss://93.184.216.0x22", .picture = "https://93.184.216.0x22/a.png" },
+        .{ .relay = "wss://example.0x1f", .picture = "https://example.0x1f/a.png" },
+        // A leading zero reads as octal to some parsers, so the address is not
+        // one address everywhere.
+        .{ .relay = "wss://010.0.0.1", .picture = "https://010.0.0.1/a.png" },
+        .{ .relay = "wss://093.184.216.34", .picture = "https://093.184.216.34/a.png" },
+        .{ .relay = "wss://93.184.216.034", .picture = "http://93.184.216.034/a.png" },
+        .{ .relay = "wss://0177.0.0.1", .picture = "https://0177.0.0.1/a.png" },
+        // Still the reader's own network.
+        .{ .relay = "wss://192.168.1.2", .picture = "https://192.168.1.2/a.png" },
+        .{ .relay = "wss://relay.local", .picture = "https://img.local/a.png" },
+    };
+    for (refused) |c| {
+        if (main.isPublicRelayUrl(c.relay) or main.isPublicMediaUrl(c.picture)) {
+            std.debug.print("\naccepted a host it should not: {s} / {s}\n", .{ c.relay, c.picture });
+            return error.PrivateHostAccepted;
+        }
+    }
+    // A picture names no port but its scheme's own.
+    try testing.expect(!main.isPublicMediaUrl("https://img.example.com:80/a.png"));
+    try testing.expect(!main.isPublicMediaUrl("http://img.example.com:443/a.png"));
+    try testing.expect(!main.isPublicMediaUrl("https://img.example.com:8443/a.png"));
+    try testing.expect(!main.isPublicMediaUrl("https://img.example.com:/a.png"));
+}

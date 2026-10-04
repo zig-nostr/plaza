@@ -18,7 +18,8 @@ const Note = main.Note;
 const cacheName = main.cacheName;
 const classifyMedia = main.classifyMedia;
 const imetaFor = main.imetaFor;
-const isDottedQuad = main.isDottedQuad;
+const isDefaultPort = main.isDefaultPort;
+const isPublicHostName = main.isPublicHostName;
 const link_fetch_key_base = main.link_fetch_key_base;
 const mediaProxy = main.mediaProxy;
 const noteCovered = main.noteCovered;
@@ -161,9 +162,10 @@ pub fn previewableUrl(url: []const u8) bool {
 
 /// Whether a picture URL may be fetched: `http` or `https`, and a host on the
 /// public internet by the lines `previewableUrl` draws for a link (no userinfo,
-/// no port, no bare or `.local`-style name, no private or loopback address),
-/// plus the loose numeric spellings a resolver accepts for one (`127.1`,
-/// `0x7f.1`), which only the plain four-number form is taken past.
+/// no port but the scheme's own, no bare or `.local`-style name, no private or
+/// loopback address), plus the loose numeric spellings a resolver accepts for
+/// one (`127.1`, `0x7f.1`, `010.0.0.1`), which only the plain four-number form
+/// is taken past. `isPublicHostName` holds the host rule.
 ///
 /// Every picture is fetched with nobody pressing anything: a note, a profile, an
 /// article or a place names it and it loads as it scrolls into view. Without
@@ -171,12 +173,13 @@ pub fn previewableUrl(url: []const u8) bool {
 /// loopback or LAN, and an extension check is no obstacle (`/admin#.png`).
 /// A picture that fails it is not drawn.
 pub fn isPublicMediaUrl(url: []const u8) bool {
-    const rest = if (std.mem.startsWith(u8, url, "https://"))
-        url["https://".len..]
+    const scheme: []const u8 = if (std.mem.startsWith(u8, url, "https://"))
+        "https"
     else if (std.mem.startsWith(u8, url, "http://"))
-        url["http://".len..]
+        "http"
     else
         return false;
+    const rest = url[scheme.len + "://".len ..];
     if (url.len > 2048) return false;
     for (url) |c| {
         if (c <= 0x20 or c == 0x7f) return false;
@@ -184,22 +187,15 @@ pub fn isPublicMediaUrl(url: []const u8) bool {
     const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
     if (authority.len == 0) return false;
     if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
-    if (std.mem.indexOfScalar(u8, authority, ':') != null) return false;
     if (authority[0] == '[') return false;
-    const host = std.mem.trimEnd(u8, authority, ".");
-    for (host) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') return false;
+    var host = authority;
+    // A port, only the scheme's own: any other is a different service on the
+    // host, which a picture has no reason to name.
+    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        if (!isDefaultPort(scheme, authority[colon + 1 ..])) return false;
+        host = authority[0..colon];
     }
-    const dot = std.mem.lastIndexOfScalar(u8, host, '.') orelse return false;
-    if (dot == 0 or dot + 1 >= host.len) return false;
-    const suffixes = [_][]const u8{ ".local", ".internal", ".localhost", ".onion", ".lan", ".home.arpa" };
-    for (suffixes) |suffix| {
-        if (std.ascii.endsWithIgnoreCase(host, suffix)) return false;
-    }
-    for (host[dot + 1 ..]) |c| {
-        if (std.ascii.isDigit(c)) return isDottedQuad(host) and !isPrivateAddress(host);
-    }
-    return true;
+    return isPublicHostName(std.mem.trimEnd(u8, host, "."));
 }
 
 /// Whether `url` is a request to the reader's own media proxy, which is theirs

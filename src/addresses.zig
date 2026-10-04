@@ -327,7 +327,15 @@ pub fn isPublicRelayUrl(url: []const u8) bool {
     // A bracketed IPv6 literal is never a public relay's name.
     if (host.len == 0 or host[0] == '[') return false;
     if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
-    host = std.mem.trimEnd(u8, host, ".");
+    return isPublicHostName(std.mem.trimEnd(u8, host, "."));
+}
+
+/// Whether a host, as it is written, names something on the public internet:
+/// a name with a dot in it and none of the suffixes that stay on the reader's
+/// own network, or a plain four-number address outside the private ranges. The
+/// rule `isPublicRelayUrl` and `isPublicMediaUrl` share. It reads the spelling
+/// and nothing more: the name is not resolved.
+pub fn isPublicHostName(host: []const u8) bool {
     for (host) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') return false;
     }
@@ -337,21 +345,45 @@ pub fn isPublicRelayUrl(url: []const u8) bool {
     for (suffixes) |suffix| {
         if (std.ascii.endsWithIgnoreCase(host, suffix)) return false;
     }
-    // A name ends in letters. A last label with a digit in it is an address, in
-    // one of the forms a resolver reads loosely (`127.1`, `0x7f.1`), so only the
-    // plain four-number form is taken, and only outside the private ranges.
-    for (host[dot + 1 ..]) |c| {
-        if (std.ascii.isDigit(c)) return isPrivateAddress(host) == false and isDottedQuad(host);
+    // A last label that is a number makes the whole host an address, in one of
+    // the forms a resolver reads loosely (`127.1`, `0x7f.1`), so only the plain
+    // four-number form is taken, and only outside the private ranges. A label
+    // that only holds a digit is a name: an internationalised top-level domain
+    // such as `xn--p1ai` has one.
+    if (isNumericLabel(host[dot + 1 ..])) return !isPrivateAddress(host) and isDottedQuad(host);
+    return true;
+}
+
+/// Whether a label reads as a number to an address parser: all decimal digits,
+/// or `0x` and hex digits.
+fn isNumericLabel(label: []const u8) bool {
+    if (label.len == 0) return false;
+    const digits = if (label.len >= 2 and label[0] == '0' and (label[1] == 'x' or label[1] == 'X')) label[2..] else label;
+    const hex = digits.ptr != label.ptr;
+    for (digits) |c| {
+        if (!(if (hex) std.ascii.isHex(c) else std.ascii.isDigit(c))) return false;
     }
     return true;
 }
 
-/// Four decimal numbers, each 0 to 255, and nothing else.
+/// Whether `port` is the one `scheme` uses when none is written: 443 for
+/// `https` and `wss`, 80 for `http` and `ws`. Writing it changes nothing about
+/// where the request goes.
+pub fn isDefaultPort(scheme: []const u8, port: []const u8) bool {
+    if (std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "wss")) return std.mem.eql(u8, port, "443");
+    if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "ws")) return std.mem.eql(u8, port, "80");
+    return false;
+}
+
+/// Four decimal numbers, each 0 to 255, and nothing else. A number written
+/// with a leading zero is refused: some parsers read `010` as octal, so it does
+/// not name one address everywhere.
 pub fn isDottedQuad(host: []const u8) bool {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, host, '.');
     while (it.next()) |part| {
         if (part.len == 0 or part.len > 3) return false;
+        if (part.len > 1 and part[0] == '0') return false;
         for (part) |c| {
             if (!std.ascii.isDigit(c)) return false;
         }
