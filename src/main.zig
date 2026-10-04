@@ -6112,6 +6112,7 @@ pub const appendAvatarSliceForTest = feed_media.appendAvatarSliceForTest;
 pub const appendMediaSliceForTest = feed_media.appendMediaSliceForTest;
 pub const claimMediaSlotForTest = feed_media.claimMediaSlotForTest;
 pub const deliverMediaResponseForTest = feed_media.deliverMediaResponseForTest;
+pub const fetchSliceForTest = feed_media.fetchSliceForTest;
 pub const hostOfForTest = feed_media.hostOfForTest;
 pub const markMediaFailedForTest = feed_media.markMediaFailedForTest;
 pub const markMediaLoadedForTest = feed_media.markMediaLoadedForTest;

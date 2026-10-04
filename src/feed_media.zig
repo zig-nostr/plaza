@@ -543,7 +543,12 @@ fn fireMediaSlot(fx: *Effects, key: i64, link: []const u8, fired: *usize, per_ti
     if (fired.* >= per_tick) return;
     slot.state = .fetching;
     slot.down.release();
-    fetchMediaSlice(fx, slot, 0);
+    if (!fetchMediaSlice(fx, slot, 0)) {
+        // Refused before anything was asked, so no answer is coming: settled
+        // here, or the slot sat in `.fetching` for good and held its id.
+        slot.state = .failed;
+        return;
+    }
     fired.* += 1;
 }
 
@@ -555,16 +560,20 @@ fn fireMediaSlot(fx: *Effects, key: i64, link: []const u8, fired: *usize, per_ti
 /// slice comes back whole on the first answer and costs no extra round trip.
 /// A host that does not do ranges answers 200 with the whole body instead of
 /// 206 with a slice, which is a difference the caller can see, so ignoring the
-/// header can never be mistaken for a complete picture.
-fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
-    fetchSlice(fx, media_fetch_key_base + mediaSlotIndex(slot), slot.url(), offset, Effects.responseMsg(.media_fetched));
+/// header can never be mistaken for a complete picture. False when nothing was
+/// asked (see `fetchSlice`).
+fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) bool {
+    return fetchSlice(fx, media_fetch_key_base + mediaSlotIndex(slot), slot.url(), offset, Effects.responseMsg(.media_fetched));
 }
 
-/// One slice of one image, whoever wants it.
-pub fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_response: anytype) void {
-    if (!mediaFetchAllowed(url)) return;
+/// One slice of one image, whoever wants it. False when nothing was asked: the
+/// URL is not one this app fetches, or the offset is past any range it can
+/// write. No answer comes for that, so the caller settles its own state rather
+/// than wait in `.fetching` for one.
+pub fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_response: anytype) bool {
+    if (!mediaFetchAllowed(url)) return false;
     var range_buf: [64]u8 = undefined;
-    const range = rangeHeader(&range_buf, offset) orelse return;
+    const range = rangeHeader(&range_buf, offset) orelse return false;
     fx.fetch(.{
         .key = key,
         .url = url,
@@ -581,6 +590,7 @@ pub fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_res
         },
         .on_response = on_response,
     });
+    return true;
 }
 
 /// The value of a `Range` header asking for the slice that starts at `offset`.
@@ -803,7 +813,10 @@ pub fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) voi
             return;
         };
         if (outcome == .want_more) {
-            fetchMediaSlice(fx, slot, slot.down.len);
+            if (!fetchMediaSlice(fx, slot, slot.down.len)) {
+                slot.down.release();
+                slot.state = .failed;
+            }
             return;
         }
         // Whole. The bytes are in the slice buffer unless this was a single
@@ -928,6 +941,11 @@ pub fn setVisibleRangeForTest(first: usize, last: usize) void {
 pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
     const m = mediaSlotFor(note_id) orelse return null;
     return m.last_used == profile_cache.g_image_clock;
+}
+
+/// Whether a slice of `url` would be asked for, the way every picture asks.
+pub fn fetchSliceForTest(fx: *Effects, url: []const u8) bool {
+    return fetchSlice(fx, media_fetch_key_base, url, 0, Effects.responseMsg(.media_fetched));
 }
 
 pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {

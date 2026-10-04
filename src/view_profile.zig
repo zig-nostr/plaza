@@ -213,7 +213,8 @@ pub fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     g_banner_state = .fetching;
     g_banner_asked_for = pubkey;
     g_banner_down.release();
-    fetchSlice(fx, banner_fetch_key, bannerUrl(), 0, Effects.responseMsg(.banner_fetched));
+    // Refused, so no answer is coming: settled now rather than left fetching.
+    if (!fetchSlice(fx, banner_fetch_key, bannerUrl(), 0, Effects.responseMsg(.banner_fetched))) g_banner_state = .failed;
 }
 
 /// A banner too big for one response body. The widest of the three, drawn at
@@ -252,7 +253,10 @@ pub fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) vo
             return;
         };
         if (outcome == .want_more) {
-            fetchSlice(fx, banner_fetch_key, bannerUrl(), g_banner_down.len, Effects.responseMsg(.banner_fetched));
+            if (!fetchSlice(fx, banner_fetch_key, bannerUrl(), g_banner_down.len, Effects.responseMsg(.banner_fetched))) {
+                g_banner_down.release();
+                g_banner_state = .failed;
+            }
             return;
         }
         const whole = g_banner_down.bytes() orelse response.body;

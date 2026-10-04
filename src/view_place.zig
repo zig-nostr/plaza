@@ -238,7 +238,8 @@ pub fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
     g_place_logo_asked_for = place.author;
     g_place_logo_asked_ident_len = @intCast(copyBounded(&g_place_logo_asked_ident_buf, place.ident()));
     var url_buf: [1024]u8 = undefined;
-    fetchSlice(fx, place_logo_fetch_key, placeLogoUrl(&url_buf, logo), 0, Effects.responseMsg(.place_logo_fetched));
+    // Refused, so no answer is coming: settled now rather than left fetching.
+    if (!fetchSlice(fx, place_logo_fetch_key, placeLogoUrl(&url_buf, logo), 0, Effects.responseMsg(.place_logo_fetched))) g_place_logo_state = .failed;
 }
 
 pub fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse) void {

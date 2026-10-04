@@ -478,7 +478,11 @@ pub fn scanAvatarFetches(fx: *Effects) void {
         if (fired >= per_tick) continue;
         p.avatar_state = .fetching;
         p.down.release();
-        fetchSlice(fx, avatar_fetch_key_base + @as(u64, @intCast(i)), p.url(), 0, Effects.responseMsg(.avatar_fetched));
+        if (!fetchSlice(fx, avatar_fetch_key_base + @as(u64, @intCast(i)), p.url(), 0, Effects.responseMsg(.avatar_fetched))) {
+            // Refused, so no answer is coming: initials, not a wait for good.
+            p.avatar_state = .failed;
+            continue;
+        }
         fired += 1;
     }
 }
@@ -507,7 +511,10 @@ pub fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) vo
             return;
         };
         if (outcome == .want_more) {
-            fetchSlice(fx, response.key, p.url(), p.down.len, Effects.responseMsg(.avatar_fetched));
+            if (!fetchSlice(fx, response.key, p.url(), p.down.len, Effects.responseMsg(.avatar_fetched))) {
+                p.down.release();
+                p.avatar_state = .failed;
+            }
             return;
         }
         const whole = p.down.bytes() orelse response.body;

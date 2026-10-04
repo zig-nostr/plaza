@@ -171,10 +171,17 @@ test "a quote card loads and draws the picture in the note it quotes" {
     defer main.resetMediaForTest();
     const previews_were = main.mediaPreviews();
     const proxy_was = main.mediaProxyOn();
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
     main.setMediaPreviews(true);
-    // The proxy off, so the address that goes out is the one in the note: this
-    // test reaches a closed loopback port and nothing else.
-    main.setMediaProxyOn(false);
+    // A proxy of the reader's own on a closed loopback port, so a fetch really
+    // goes out and this test reaches nothing. The note's own loopback address
+    // is one this app refuses to ask directly.
+    main.setMediaProxy("http://127.0.0.1:9/");
+    main.setMediaProxyOn(true);
     defer main.setMediaPreviews(previews_were);
     defer main.setMediaProxyOn(proxy_was);
 
@@ -196,7 +203,7 @@ test "a quote card loads and draws the picture in the note it quotes" {
     const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
     try testing.expectEqualStrings("fetching", held.state);
     try testing.expect(held.image_id != 0);
-    try testing.expectEqualStrings(quote_picture_url, held.url);
+    try testing.expect(std.mem.startsWith(u8, held.url, "http://127.0.0.1:9/?url=http%3A%2F%2F127.0.0.1%3A9%2Fshot.png"));
     try testing.expectEqualStrings("media", main.imageIdOwnerNameForTest(held.image_id));
     try testing.expectEqual(@as(?bool, true), main.mediaSlotWantedForTest(key));
 
@@ -960,4 +967,44 @@ test "a covered note does not fetch the picture of the note it quotes" {
     main.scanMediaFetchesForTest(&fx, &model);
     const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
     try testing.expect(held.image_id != 0);
+}
+
+test "a picture refused before it is asked for settles, and does not hold its slot as fetching" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+    main.setMediaPreviews(true);
+    main.setMediaProxyOn(false);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    // The last check before a request says whether one went out. Through the
+    // reader's own proxy, here a closed loopback port so nothing is reached, it
+    // does; straight to a loopback host, it does not.
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
+    main.setMediaProxy("http://127.0.0.1:9/");
+    main.setMediaProxyOn(true);
+    try testing.expect(main.fetchSliceForTest(&fx, "http://127.0.0.1:9/?url=x"));
+    main.setMediaProxyOn(false);
+    try testing.expect(!main.fetchSliceForTest(&fx, "http://127.0.0.1:9/inward.png"));
+
+    // A note whose picture that check refuses. Nothing was asked, so nothing
+    // will answer: the slot is settled, not fetching for the rest of the run.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 4343;
+    _ = model.notes[0].setImageForTest(0, "http://127.0.0.1:9/inward.png");
+    model.notes_len = 1;
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    const held = main.mediaSlotStateForTest(main.mediaKeyForTest(4343, 0)) orelse return error.NoSlotClaimed;
+    try testing.expectEqualStrings("failed", held.state);
 }
