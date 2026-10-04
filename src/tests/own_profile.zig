@@ -810,6 +810,56 @@ test "a private bookmark list with control characters in it seals back whole" {
     try testing.expectEqualStrings(&new_hex, back[entries.len][1]);
 }
 
+test "a list published but not stored holds the next write until it is read back" {
+    // Notary's writes are published even when the store refuses them, so the
+    // store can be a write behind the relays. The next mute spliced onto the
+    // stored list and published it without the mute that was already out.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("unstored");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x8d} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    defer main.forgetMutesForTest();
+    defer main.failIngestForTest(false);
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    const first = [_]u8{0xf1} ** 32;
+    const second = [_]u8{0xf2} ** 32;
+
+    // The first mute is signed and published, and the store refuses it.
+    main.failIngestForTest(true);
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, first, true));
+    main.failIngestForTest(false);
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(main.ownWriteUnstoredForTest(10000));
+
+    // The second is held back, and says why.
+    main.forgetLastPublishedForTest();
+    const held = main.writeMuteForTest(&fx, second, true);
+    try testing.expectEqual(main.MuteWrite.not_read_back, held);
+    try testing.expect(main.lastPublishedForTest() == null);
+    main.sayMuteWriteForTest(&model, held, true);
+    try testing.expectEqualStrings("Last change not read back yet. Try again soon.", model.toast_text());
+
+    // The first comes back from a relay. Now the second splices onto it.
+    _ = try main.plazaIngestVerifiedForTest(arena, out, signer);
+    try testing.expect(!main.ownWriteUnstoredForTest(10000));
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, second, true));
+    const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingStored;
+    defer testing.allocator.free(tags);
+    try testing.expect(std.mem.indexOf(u8, tags, "f1" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, tags, "f2" ** 32) != null);
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes

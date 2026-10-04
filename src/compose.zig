@@ -17,6 +17,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const noteOwnWriteUnstored = main.noteOwnWriteUnstored;
 const postWaitsForPicture = main.postWaitsForPicture;
 const AppUi = main.AppUi;
 const Effects = main.Effects;
@@ -1347,11 +1348,19 @@ pub fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?
     if (verify) |signer| {
         // A note we did not produce: verification is the gate into the store
         // AND the pool, so a bad signature is dropped rather than propagated.
-        _ = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return;
+        // `.invalid` is the result that says so, not an error, and it used to
+        // be ignored here and the event published anyway.
+        const result = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return;
+        if (result == .invalid) return;
     } else {
         // A note we just signed: a store failure (e.g. a duplicate id) must not
-        // stop it reaching the pool.
-        _ = plazaIngest(gpa, ev, .{}) catch {};
+        // stop it reaching the pool. But the store is now behind what went
+        // out, and a write that splices onto it must wait for this record.
+        const stored = if (plazaIngest(gpa, ev, .{})) |result| switch (result) {
+            .added, .replaced, .duplicate, .stale => true,
+            else => false,
+        } else |_| false;
+        if (!stored) noteOwnWriteUnstored(ev);
     }
     // Queued BEFORE the walk, so a note that never reaches a relay is still a
     // note the app knows it owes the reader. A queue with no room says so:

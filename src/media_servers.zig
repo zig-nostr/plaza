@@ -13,6 +13,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const ownWriteUnstored = main.ownWriteUnstored;
 const listWriteInFlight = main.listWriteInFlight;
 const Effects = main.Effects;
 const FreshAsk = main.FreshAsk;
@@ -279,6 +280,8 @@ pub const BlossomWrite = enum {
     no_list_yet,
     /// The list is as long as Plaza sends to.
     full,
+    /// The last write was published and is not in the store yet.
+    not_read_back,
     failed,
 };
 
@@ -292,6 +295,7 @@ pub const BlossomWrite = enum {
 pub fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]const u8) BlossomWrite {
     if (!signerReady()) return .signer_busy;
     if (listWriteInFlight(blossom_list_kind)) return .signer_busy;
+    if (ownWriteUnstored(blossom_list_kind)) return .not_read_back;
     _ = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
     // Compared and written in one spelling, whatever the caller was handed.
@@ -397,6 +401,7 @@ pub fn sayBlossomAdd(model: *Model, outcome: BlossomWrite) void {
         .signer_busy => model.blossom_error = .busy,
         .no_list_yet => model.blossom_error = .unread,
         .full => model.blossom_error = .full,
+        .not_read_back => model.blossom_error = .not_read_back,
         .failed => model.blossom_error = .failed,
     }
 }
@@ -411,6 +416,7 @@ pub fn blossomRemove(model: *Model, fx: *Effects, index: u8) void {
         .signer_busy => model.blossom_error = .busy,
         .no_list_yet => model.blossom_error = .unread,
         .full => model.blossom_error = .full,
+        .not_read_back => model.blossom_error = .not_read_back,
         .failed => model.blossom_error = .failed,
     }
 }

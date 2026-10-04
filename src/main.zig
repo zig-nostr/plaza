@@ -4650,6 +4650,7 @@ pub fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) voi
         .private_half_waiting => setToast(model, "Opening your private bookmarks. Try again soon."),
         .private_half_declined => setToast(model, "Signer declined. Asked again, approve it there."),
         .private_half_unreadable => setToast(model, "Cannot open private bookmarks. Nothing was sent."),
+        .not_read_back => setToast(model, unstored_toast),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -4671,6 +4672,7 @@ pub fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
         .private_half_declined => setToast(model, "Signer declined. Asked again, approve it there."),
         .private_half_unreadable => setToast(model, "Cannot read your private mutes. Nothing changed."),
         .would_shrink => setToast(model, "That would change several names. Nothing sent."),
+        .not_read_back => setToast(model, unstored_toast),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -4766,7 +4768,7 @@ pub fn nowSecondsForTest() i64 {
     return nowSeconds();
 }
 
-pub const BlossomEdit = enum { none, invalid, busy, unread, full, failed };
+pub const BlossomEdit = enum { none, invalid, busy, unread, full, not_read_back, failed };
 
 // -------------------------------------------------------------------- app run
 
@@ -6162,6 +6164,12 @@ pub const startedFresh = own_lists.startedFresh;
 pub const takeFresh = own_lists.takeFresh;
 
 // re-exports: follows.zig
+pub const ownWriteUnstoredForTest = follows.ownWriteUnstoredForTest;
+pub const noteOwnRecordStored = follows.noteOwnRecordStored;
+pub const failIngestForTest = follows.failIngestForTest;
+pub const unstored_toast = follows.unstored_toast;
+pub const noteOwnWriteUnstored = follows.noteOwnWriteUnstored;
+pub const ownWriteUnstored = follows.ownWriteUnstored;
 pub const ingestFeedEventForTest = follows.ingestFeedEventForTest;
 pub const ingestFeedEvent = follows.ingestFeedEvent;
 pub const SelfReadForTest = follows.SelfReadForTest;

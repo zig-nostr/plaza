@@ -186,6 +186,73 @@ pub const SelfRead = struct {
 
 pub const SelfReadForTest = SelfRead;
 
+/// The reader's own records that were published and did not reach the store,
+/// by kind, with the stamp that went out.
+///
+/// Every write to one of these splices onto the record in the store. When a
+/// write is signed and published but the store refuses it, the store still
+/// holds the record before it, and the next write would splice onto that and
+/// publish a list without the change that is already out on the relays. So
+/// the kind is held until a record at least that new is stored, normally the
+/// same event coming back from a relay, and writes to it are refused with a
+/// reason until then.
+var g_unstored_for: ?[32]u8 = null;
+
+var g_unstored_at: [self_filter_kinds.len]i64 = @splat(0);
+
+fn selfKindIndex(kind: u16) ?usize {
+    return std.mem.indexOfScalar(u16, &self_filter_kinds, kind);
+}
+
+/// Records that the reader's own `ev` was published without being stored.
+pub fn noteOwnWriteUnstored(ev: nostr.event.Event) void {
+    const i = selfKindIndex(ev.kind) orelse return;
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    if (g_unstored_for) |who| {
+        if (!std.mem.eql(u8, &who, &me)) g_unstored_at = @splat(0);
+    }
+    g_unstored_for = me;
+    g_unstored_at[i] = @max(g_unstored_at[i], ev.created_at);
+}
+
+/// A record of the reader's own, of `kind` and stamped `created_at`, is in the
+/// store now.
+pub fn noteOwnRecordStored(pubkey: [32]u8, kind: u16, created_at: i64) void {
+    const i = selfKindIndex(kind) orelse return;
+    const who = g_unstored_for orelse return;
+    if (!std.mem.eql(u8, &who, &pubkey)) return;
+    if (created_at >= g_unstored_at[i]) g_unstored_at[i] = 0;
+}
+
+/// Whether a write of `kind` must wait for a published record to be read back.
+pub fn ownWriteUnstored(kind: u16) bool {
+    const i = selfKindIndex(kind) orelse return false;
+    const me = activePubkey() orelse return false;
+    const who = g_unstored_for orelse return false;
+    if (!std.mem.eql(u8, &who, &me)) return false;
+    return g_unstored_at[i] != 0;
+}
+
+fn forgetOwnWritesUnstored() void {
+    g_unstored_for = null;
+    g_unstored_at = @splat(0);
+}
+
+pub fn ownWriteUnstoredForTest(kind: u16) bool {
+    return ownWriteUnstored(kind);
+}
+
+/// Makes the next store ingests fail, the way a full disk or a store error does.
+pub var g_test_fail_ingest = false;
+
+pub fn failIngestForTest(fail: bool) void {
+    g_test_fail_ingest = fail;
+}
+
+/// The toast for a write held back by `ownWriteUnstored`.
+pub const unstored_toast = "Last change not read back yet. Try again soon.";
+
 /// One event on the feed subscription, verified and stored, and noted against
 /// `self_read` when it is one of the reader's own records that was not. Null
 /// when it was not stored.
@@ -497,6 +564,8 @@ pub fn forgetFollows() void {
     // behind, it would be the base the NEXT account's first follow builds on.
     clearPendingFollowBase();
     forgetOwnListMemo();
+    // A record of the previous account's held back is nothing to this one.
+    forgetOwnWritesUnstored();
     // And how long it has been waiting on this account's lists: the next one
     // starts its own clock.
     own_lists.g_own_lists_since_for = null;

@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const ownWriteUnstored = main.ownWriteUnstored;
 const Effects = main.Effects;
 const OwnProfile = main.OwnProfile;
 const RelayEntry = main.RelayEntry;
@@ -365,6 +366,9 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     // moment the signer is free. This is the half of the same-tick collision the
     // relay list was on the losing end of.
     if (!signerReady()) return false;
+    // Kept pending, the same way, while the last list published is not in the
+    // store: splicing onto the one before it would drop that change.
+    if (ownWriteUnstored(relay_list_kind)) return false;
     const gpa = std.heap.page_allocator;
 
     // Read ONCE, and gate on the read that is actually spliced from.

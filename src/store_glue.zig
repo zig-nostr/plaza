@@ -6,11 +6,13 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const follows = @import("follows.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const noteOwnRecordStored = main.noteOwnRecordStored;
 const activePubkey = main.activePubkey;
 const blossom_list_kind = main.blossom_list_kind;
 const bookmark_list_kind = main.bookmark_list_kind;
@@ -85,6 +87,7 @@ pub fn plazaIngestFrom(gpa: std.mem.Allocator, ev: nostr.event.Event, options: n
 /// missed call site is a contact list lost while the app believes it has a copy.
 pub fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.store.IngestOptions) !nostr.store.IngestResult {
     const store = main.g_store orelse return error.NoStore;
+    if (builtin.is_test and follows.g_test_fail_ingest) return error.StoreFailedForTest;
     // Read what is about to be destroyed, BEFORE the write that destroys it,
     // but keep the copy only once the store says it actually replaced
     // something. Backing up on the way in was wrong twice over: the signature
@@ -98,6 +101,12 @@ pub fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr
     const result = try store.ingest(gpa, ev, options);
     if (result == .replaced) {
         if (previous) |prev| keepReplaced(gpa, store, ev.kind, prev.json);
+    }
+    // Stored, or something at least as new already was: a write held back for
+    // want of this record may build on the store again.
+    switch (result) {
+        .added, .replaced, .duplicate, .stale => noteOwnRecordStored(ev.pubkey, ev.kind, ev.created_at),
+        else => {},
     }
     // A contact list this app was holding as the base for the next follow is
     // released the moment one at least as new reaches the store. This is the one

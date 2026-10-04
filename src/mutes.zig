@@ -12,6 +12,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const ownWriteUnstored = main.ownWriteUnstored;
 const listWriteInFlight = main.listWriteInFlight;
 const Model = main.Model;
 const forgetBookmarks = main.forgetBookmarks;
@@ -182,6 +183,9 @@ pub const MuteWrite = enum {
     private_half_unreadable,
     /// The write would have dropped more people than the press asked for.
     would_shrink,
+    /// The last write was published and is not in the store yet, so the store
+    /// holds an older list than the relays do.
+    not_read_back,
     failed,
 };
 /// Mutes or unmutes `pubkey`, by splicing this reader's own kind:10000.
@@ -198,6 +202,7 @@ pub const MuteWrite = enum {
 pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     if (!signerReady()) return .signer_busy;
     if (listWriteInFlight(mute_list_kind)) return .signer_busy;
+    if (ownWriteUnstored(mute_list_kind)) return .not_read_back;
     const me = activePubkey() orelse return .failed;
     // Muting yourself would hide your own notes from your own feed.
     if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;

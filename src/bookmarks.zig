@@ -15,6 +15,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const unstored_toast = main.unstored_toast;
+const ownWriteUnstored = main.ownWriteUnstored;
 const listWriteInFlight = main.listWriteInFlight;
 const parkSealAnswer = main.parkSealAnswer;
 const max_private_cipher_len = main.max_private_cipher_len;
@@ -204,6 +206,9 @@ pub const BookmarkWrite = enum {
     /// The list has a private half this app could not decrypt, so it cannot
     /// carry it forward and will not write without it.
     private_half_unreadable,
+    /// The last write was published and is not in the store yet, so the store
+    /// holds an older list than the relays do.
+    not_read_back,
     failed,
 };
 
@@ -233,6 +238,7 @@ pub const BookmarkWrite = enum {
 pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     if (!signerReady()) return .signer_busy;
     if (listWriteInFlight(bookmark_list_kind)) return .signer_busy;
+    if (ownWriteUnstored(bookmark_list_kind)) return .not_read_back;
     // A private bookmark being sealed is a write to this same list. Its finish
     // checks the stored record is the one it was built on, and a public write
     // still out is in no store, so that check could not see it: whichever
@@ -329,6 +335,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     // And the other way round: a public write still out would be missing from
     // the record this seal is built on.
     if (listWriteInFlight(bookmark_list_kind)) return .signer_busy;
+    if (ownWriteUnstored(bookmark_list_kind)) return .not_read_back;
     const me = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
 
@@ -437,6 +444,10 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     // bookmark with bytes nobody can open.
     if (!plausibleSeal(ciphertext, seal.plain_len)) {
         setToast(model, "That seal came back damaged. Nothing was sent.");
+        return;
+    }
+    if (ownWriteUnstored(bookmark_list_kind)) {
+        setToast(model, unstored_toast);
         return;
     }
     const gpa = std.heap.page_allocator;

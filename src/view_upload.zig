@@ -307,6 +307,7 @@ pub fn blossomStatusText(error_kind: BlossomEdit) []const u8 {
         .busy => "Your signer is busy. Try again in a moment.",
         .unread => "Plaza has not read your server list yet, so it will not replace it.",
         .full => "Plaza sends to up to 4 servers.",
+        .not_read_back => "Your last change has not come back from your relays yet. Try again soon.",
         .failed => "That did not go through.",
         .none => if (blossomProbeAsking() and !haveOwnBlossomList())
             "Reading your server list..."

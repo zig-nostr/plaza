@@ -16,6 +16,9 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const unstored_toast = main.unstored_toast;
+const setToast = main.setToast;
+const ownWriteUnstored = main.ownWriteUnstored;
 const takeFresh = main.takeFresh;
 const listWriteInFlight = main.listWriteInFlight;
 const SelfRead = main.SelfRead;
@@ -360,6 +363,12 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
     // rejected sign would show a saved profile that was never signed. Refusing
     // leaves the sheet exactly as it was, with Save still live.
     if (!signerReady()) return;
+    // The last profile published is not in the store, and merging into the one
+    // before it would undo that edit on every relay.
+    if (ownWriteUnstored(0)) {
+        setToast(model, unstored_toast);
+        return;
+    }
     const gpa = std.heap.page_allocator;
 
     var prev_created_at: i64 = 0;
@@ -681,6 +690,10 @@ fn ownProfileWorker(pk: [32]u8) void {
 pub fn publishName(model: *Model, fx: *Effects) void {
     const raw = trimmedField(model.name_buffer.text());
     if (raw.len == 0) return;
+    if (ownWriteUnstored(0)) {
+        setToast(model, unstored_toast);
+        return;
+    }
     const gpa = std.heap.page_allocator;
 
     var prev_created_at: i64 = 0;
