@@ -246,6 +246,7 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
     // landed second would publish a list without the other.
     if (private_lists.g_private_seal.active) return .signer_busy;
     _ = activePubkey() orelse return .failed;
+    forgetPrivateAnnounce();
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
@@ -338,6 +339,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     if (listWriteInFlight(bookmark_list_kind)) return .signer_busy;
     if (ownWriteUnstored(bookmark_list_kind)) return .not_read_back;
     const me = activePubkey() orelse return .failed;
+    forgetPrivateAnnounce();
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
@@ -545,6 +547,15 @@ var g_private_announce_account: [32]u8 = undefined;
 /// 0 nothing to say, 1 bookmarked, 2 removed. Set where it is published, said
 /// on the tick.
 var g_private_announced = std.atomic.Value(u8).init(0);
+
+/// A private bookmark whose sign failed is never published, so its stamp stayed
+/// armed, and a later write of the list with the same stamp was announced as
+/// bookmarked privately. Each new write of the list starts clean. Only after a
+/// press passes its busy checks: one refused while an earlier private bookmark
+/// is still signing must not silence that one.
+fn forgetPrivateAnnounce() void {
+    g_private_announce_at.store(0, .release);
+}
 
 /// The publish path's half: `ev` is going out, and if it is the private
 /// bookmark write, the tick says so.

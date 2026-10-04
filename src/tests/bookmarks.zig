@@ -311,3 +311,48 @@ test "a private bookmark sealed while Notary signs a like is not sent, and says 
     main.sayPrivateBookmarkPublished(&model);
     try testing.expectEqualStrings("Bookmarked privately", model.toast_text());
 }
+
+test "a private bookmark that was never signed is not announced by a later public one" {
+    // Its stamp stayed armed, and a public bookmark published with the same
+    // stamp was announced as "Bookmarked privately".
+    defer main.resetOutboxForTest();
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.releaseHelperSignForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmstamp.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    _ = try bookmarkFixture(arena, &signer, &store, &.{}, "");
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.sayPrivateBookmarkPublished(&model);
+    model.toast_len = 0;
+
+    // Sealed, handed to a signer that never answers, and given up on.
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xb9} ** 32, true));
+    main.silenceTestSignerForTest(true);
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    main.silenceTestSignerForTest(false);
+    main.releaseHelperSignForTest();
+
+    // A public bookmark built on the same stored list, so with the same stamp.
+    const public_one = [_]u8{0xba} ** 32;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, public_one, true));
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqual(@as(u16, 10003), out.kind);
+    main.sayPrivateBookmarkPublished(&model);
+    try testing.expectEqual(@as(usize, 0), model.toast_len);
+}
