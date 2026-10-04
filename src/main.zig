@@ -3698,6 +3698,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 setToast(model, "Kept here.");
                 return;
             }
+            if (postWaitsForPicture()) return;
             if (compose.g_post_delay_s > 0) {
                 // The room it is being written in, taken NOW. The pause exists
                 // so the reader can change their mind, and they are free to walk
@@ -6499,6 +6500,11 @@ pub const trimmedField = own_profile.trimmedField;
 pub const unlockOwnProfile = own_profile.unlockOwnProfile;
 
 // re-exports: uploads.zig
+pub const pickRefusedForTest = uploads.pickRefusedForTest;
+pub const postWaitsForTest = uploads.postWaitsForTest;
+pub const pickRefusedFor = uploads.pickRefusedFor;
+pub const composerPictureUnfinished = uploads.composerPictureUnfinished;
+pub const postWaitsForPicture = uploads.postWaitsForPicture;
 pub const setProfileUploadUnsavedForTest = uploads.setProfileUploadUnsavedForTest;
 pub const ageUploadTokenForTest = uploads.ageUploadTokenForTest;
 pub const appendPictureToDraftForTest = uploads.appendPictureToDraftForTest;

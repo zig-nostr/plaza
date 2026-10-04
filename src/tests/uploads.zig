@@ -19,6 +19,7 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const findByText = harness.findByText;
 const awaitUpload = harness.awaitUpload;
 const blossom = harness.blossom;
 const buildTree = harness.buildTree;
@@ -172,6 +173,85 @@ fn blossomPngText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const
     var sum: [4]u8 = undefined;
     std.mem.writeInt(u32, &sum, crc.final(), .big);
     try out.appendSlice(gpa, &sum);
+}
+
+test "Post waits for the composer's picture, and a second pick never drops the first" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4e} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const path = try writeTestPicture("upload-test-wait.png", 8, 8, "");
+    defer testing.allocator.free(path);
+    const srv = try blossom.TestServer.start(testing.io, .accept, 2);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    main.setBlossomServersForTest(&.{srv.url(&url_buf)});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("look at this");
+    var fx: main.EffectsForTest = undefined;
+
+    // A picture chosen and not sent yet. Post is off, and Cmd+Enter, which
+    // reaches the same message, is refused on the card.
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    {
+        const tree = try buildTree(a.allocator(), &model);
+        const post = findByText(tree.root, .button, "Post") orelse return error.NoPost;
+        try testing.expect(!canvas.semanticActions(post).press);
+    }
+    main.update(&model, .post, &fx);
+    try testing.expect(model.composing);
+    try testing.expectEqualStrings("look at this", model.draft());
+    try testing.expect(main.postWaitsForTest());
+    try testing.expect(findAnyTextContaining((try buildTree(a.allocator(), &model)).root, "Post waits for this picture."));
+
+    // An avatar picked meanwhile, from the Edit profile sheet. The note's
+    // picture stays, and the sheet says why nothing happened.
+    var sheet = main.initialModel();
+    sheet.stage = .settings;
+    sheet.editing_profile = true;
+    sheet.profile_stage = .have;
+    main.update(&sheet, .{ .upload_pick = 1 }, &fx);
+    try testing.expectEqualStrings("ready", main.uploadStateForTest());
+    try testing.expect(main.postWaitsForTest());
+    try testing.expect(main.pickRefusedForTest(1) != null);
+    {
+        const sheet_tree = try buildTree(a.allocator(), &sheet);
+        try testing.expect(findAnyTextContaining(sheet_tree.root, "waiting in the composer"));
+        // The introduction gives the note its room, or Save leaves the card at
+        // the window's minimum height.
+        try testing.expect(!findAnyTextContaining(sheet_tree.root, "Everything this app can read from a profile"));
+    }
+
+    // Uploading: still refused, and the card says until when.
+    main.silenceTestSignerForTest(true);
+    defer main.silenceTestSignerForTest(false);
+    defer main.releaseHelperSignForTest();
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+    main.update(&model, .post, &fx);
+    try testing.expect(model.composing);
+    try testing.expectEqualStrings("look at this", model.draft());
+    try testing.expect(findAnyTextContaining((try buildTree(a.allocator(), &model)).root, "Post waits until this picture is in your note."));
+    // A pick while it uploads says so beside the control, not in a toast the
+    // sheet covers.
+    main.update(&sheet, .{ .upload_pick = 2 }, &fx);
+    try testing.expect(findAnyTextContaining((try buildTree(a.allocator(), &sheet)).root, "still uploading"));
+
+    // Put away, and Post is live again.
+    main.update(&model, .upload_cancel, &fx);
+    try testing.expect(main.pickRefusedForTest(1) == null);
+    const tree = try buildTree(a.allocator(), &model);
+    const post = findByText(tree.root, .button, "Post") orelse return error.NoPost;
+    try testing.expect(canvas.semanticActions(post).press);
 }
 
 test "a failed upload keeps the draft, says why in plain words, and can be tried again" {

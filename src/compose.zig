@@ -17,6 +17,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const postWaitsForPicture = main.postWaitsForPicture;
 const AppUi = main.AppUi;
 const Effects = main.Effects;
 const HintList = main.HintList;
@@ -94,6 +95,9 @@ pub var g_held_route: PlaceRoute = .none;
 
 pub fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     g_post_due_s = 0;
+    // A picture chosen during the pause is on its way into this note. The
+    // note stays in the composer and the card says why.
+    if (postWaitsForPicture()) return false;
     // Nothing below runs unless the note actually went to a signer. It used to
     // run regardless: the composer emptied, the draft file was deleted and the
     // toast said "Posted" for a sign that had been refused before it left the

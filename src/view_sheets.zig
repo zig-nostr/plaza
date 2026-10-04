@@ -12,6 +12,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const pickRefusedFor = main.pickRefusedFor;
 const AppUi = main.AppUi;
 const FreshAsk = main.FreshAsk;
 const Model = main.Model;
@@ -168,8 +169,10 @@ pub fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             // a window at its minimum height: the button row was drawn below the
             // bottom edge, so Try again and Save could not be pressed in exactly
             // the states that need them. Nor while a picture is being added: the
-            // card that takes the field's place is taller than the field.
-            if (status.len == 0 and (if (uploads.g_upload) |job| job.target == .note else true))
+            // card that takes the field's place is taller than the field, nor
+            // while a refused Upload says why beside its field.
+            if (status.len == 0 and (if (uploads.g_upload) |job| job.target == .note else true) and
+                pickRefusedFor(.avatar) == null and pickRefusedFor(.banner) == null)
                 profileIntro(ui)
             else
                 ui.spacer(0),

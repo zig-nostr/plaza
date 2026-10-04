@@ -101,6 +101,9 @@ pub const UploadJob = struct {
     /// What the send found. Written before the phase moves to `.sent` or
     /// `.failed`.
     outcome: ?blossom.Outcome = null,
+    /// Post was pressed while this picture was still on its way into the note,
+    /// and was refused. The card says so, since the composer shows no toast.
+    post_waits: bool = false,
 
     pub fn phase(self: *const UploadJob) UploadPhase {
         return @enumFromInt(self.phase_raw.load(.acquire));
@@ -177,6 +180,8 @@ fn releaseUploadJob(job: *UploadJob) void {
 pub fn dropUpload() void {
     const job = g_upload orelse return;
     g_upload = null;
+    // What was in the way of another pick is gone with it.
+    g_pick_refused = null;
     job.progress.cancel.store(true, .release);
     releaseUploadJob(job);
 }
@@ -185,6 +190,43 @@ pub fn dropUpload() void {
 pub fn uploadJobFor(target: UploadTarget) ?*UploadJob {
     const job = g_upload orelse return null;
     return if (job.target == target) job else null;
+}
+
+/// A pick that was refused because the one job slot is taken, said beside the
+/// control that was pressed. A toast cannot say it: the composer and the Edit
+/// profile sheet both draw over the toast.
+const PickRefused = struct { target: UploadTarget, why: []const u8 };
+
+var g_pick_refused: ?PickRefused = null;
+
+pub fn pickRefusedFor(target: UploadTarget) ?[]const u8 {
+    const r = g_pick_refused orelse return null;
+    return if (r.target == target) r.why else null;
+}
+
+pub fn pickRefusedForTest(target: u8) ?[]const u8 {
+    return pickRefusedFor(std.enums.fromInt(UploadTarget, target) orelse return null);
+}
+
+/// Whether the composer has a picture on its way into the note: chosen and not
+/// yet uploaded, or uploading. Posting now would send the note without it, and
+/// the address would then land in the emptied composer as a draft of its own.
+pub fn composerPictureUnfinished() bool {
+    const job = uploadJobFor(.note) orelse return false;
+    return job.phase() != .failed;
+}
+
+/// Refuses a post that would leave the composer's picture behind, and marks the
+/// card, which is where the reader is looking.
+pub fn postWaitsForPicture() bool {
+    if (!composerPictureUnfinished()) return false;
+    uploadJobFor(.note).?.post_waits = true;
+    return true;
+}
+
+pub fn postWaitsForTest() bool {
+    const job = uploadJobFor(.note) orelse return false;
+    return job.post_waits;
 }
 
 fn uploadBusy(job: *const UploadJob) bool {
@@ -200,11 +242,23 @@ pub fn uploadPick(model: *Model, fx: *Effects, target: UploadTarget) void {
     if (model.is_guest()) return;
     if (g_upload) |job| {
         if (uploadBusy(job)) {
-            setToast(model, "A picture is already on its way.");
+            g_pick_refused = .{ .target = target, .why = "Another picture is still uploading. Try again once it is in." };
+            return;
+        }
+        // A picture chosen for another field and not sent yet is the reader's
+        // choice, with a description typed for it perhaps, and the slot holds
+        // one job. Dropping it to make room was silent.
+        if (job.phase() == .ready and job.target != target) {
+            g_pick_refused = .{ .target = target, .why = switch (job.target) {
+                .note => "A picture for your note is waiting in the composer. Upload or cancel it there first.",
+                .avatar => "A picture for your avatar is waiting. Upload or cancel it first.",
+                .banner => "A picture for your banner is waiting. Upload or cancel it first.",
+            } };
             return;
         }
         dropUpload();
     }
+    g_pick_refused = null;
     var buf: [1024]u8 = undefined;
     const path = pickPicturePath(fx, &buf) orelse return;
     startPrepare(model, target, path);

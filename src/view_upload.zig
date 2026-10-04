@@ -13,6 +13,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const pickRefusedFor = main.pickRefusedFor;
 const AppUi = main.AppUi;
 const BlossomEdit = main.BlossomEdit;
 const Model = main.Model;
@@ -46,7 +47,7 @@ pub fn uploadStrip(ui: *AppUi, model: *const Model, target: UploadTarget) AppUi.
     const p = theme.palette;
     if (uploadJobFor(target)) |job| return uploadCard(ui, model, job);
     const servers = uploadServers();
-    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+    const strip = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 2),
         ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .upload_pick = @intFromEnum(target) } }, "Add picture"),
         hgap(ui, 8),
@@ -55,6 +56,8 @@ pub fn uploadStrip(ui: *AppUi, model: *const Model, target: UploadTarget) AppUi.
             &.{.{ .text = ui.fmt("Uploads to {s}", .{blossom.serverLabel(servers.at(0))}), .monospace = true, .scale = mono_meta_scale }},
         ),
     });
+    const why = pickRefusedFor(target) orelse return strip;
+    return ui.column(.{ .gap = 6 }, .{ strip, uploadNote(ui, why, p.status_warning_text) });
 }
 
 /// Where the servers are said, in the reader's terms. Named before anything is
@@ -142,6 +145,15 @@ fn uploadCard(ui: *AppUi, model: *const Model, job: *UploadJob) AppUi.Node {
             n += 1;
         },
     }
+    // A refused Post, above the buttons that answer it.
+    if (job.post_waits and job.phase() != .failed) {
+        rows[n] = rows[n - 1];
+        rows[n - 1] = uploadNote(ui, if (job.phase() == .ready)
+            "Post waits for this picture. Upload it or cancel it first."
+        else
+            "Post waits until this picture is in your note.", p.status_warning_text);
+        n += 1;
+    }
     return ui.el(.card, .{
         .padding = 12,
         .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 },
@@ -212,6 +224,8 @@ pub fn profilePictureField(ui: *AppUi, model: *const Model, label: []const u8, v
             ui.spacer(1),
             settingsLink(ui, "Upload...", Msg{ .upload_pick = @intFromEnum(target) }),
         }),
+        // Why Upload did nothing, where it was pressed.
+        if (pickRefusedFor(target)) |why| uploadNote(ui, why, p.status_warning_text) else ui.spacer(0),
         vgap(ui, 5),
         ui.el(.textarea, .{
             .text = value,

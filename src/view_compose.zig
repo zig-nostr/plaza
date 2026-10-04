@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const composerPictureUnfinished = main.composerPictureUnfinished;
 const AppUi = main.AppUi;
 const Model = main.Model;
 const Msg = main.Msg;
@@ -213,7 +214,7 @@ fn composeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
                 std.fmt.allocPrint(ui.arena, "Undo · {d}", .{postSecondsLeft(compose.g_post_due_s, nowSeconds())}) catch "Undo",
             )
         else
-            ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty(), .on_press = .post }, "Post"),
+            ui.button(.{ .size = .sm, .variant = .primary, .disabled = model.draft_empty() or composerPictureUnfinished(), .on_press = .post }, "Post"),
         hgap(ui, 10),
     });
 }
