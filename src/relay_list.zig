@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const relay_table = @import("relay_table.zig");
 const routing = @import("routing.zig");
+const own_lists = @import("own_lists.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -331,7 +332,7 @@ fn publishRelayList(fx: *Effects) void {
 pub fn canWriteRelayList() bool {
     if (activePubkey() == null) return false;
     if (haveOwnRelayList()) return true;
-    return main.g_identity_minted_here;
+    return own_lists.g_identity_minted_here;
 }
 
 /// Whether this account's own kind:10002 is in the local store.
@@ -379,7 +380,7 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
     // Somebody else's list may not be overwritten sight unseen. Minting the
     // identity here is the one case where there is legitimately nothing to read.
-    if (previous == null and !main.g_identity_minted_here) return false;
+    if (previous == null and !own_lists.g_identity_minted_here) return false;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
