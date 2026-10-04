@@ -545,6 +545,56 @@ test "a profile that lands between the two presses is shown, not merged over" {
     try testing.expectEqualStrings("pay@real.example", model.profile_lud16_buffer.text());
 }
 
+test "the profile sheet shows the profile that went out, and a bio-only save keeps its name" {
+    // The sheet was seeded from the store only. With the last save published
+    // and not stored, it showed the name before it, and the next save, which
+    // builds on what went out, published that old name back.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("heldprofile");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x7a} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.failIngestForTest(false);
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x7a} ** 32);
+    const alice = try nostr.event.create(arena, signer, kp, 1_700_000_000, 0, &.{}, "{\"name\":\"Alice\"}", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, alice, signer);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expectEqualStrings("Alice", model.profile_name());
+
+    // Bob goes out, and the store refuses it.
+    main.failIngestForTest(true);
+    model.profile_name_buffer.set("Bob");
+    main.update(&model, .profile_save, &fx);
+    main.failIngestForTest(false);
+    const bob = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(std.mem.indexOf(u8, bob.content, "Bob") != null);
+    try testing.expect(main.heldOwnRecordForTest(0));
+
+    // Reopened, the sheet shows Bob, and a save that changes only the bio
+    // keeps him.
+    model.editing_profile = false;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expectEqualStrings("Bob", model.profile_name());
+    model.profile_about_buffer.set("a bio");
+    main.forgetLastPublishedForTest();
+    main.update(&model, .profile_save, &fx);
+    const next = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(std.mem.indexOf(u8, next.content, "Bob") != null);
+    try testing.expect(std.mem.indexOf(u8, next.content, "a bio") != null);
+    try testing.expect(std.mem.indexOf(u8, next.content, "Alice") == null);
+}
+
 test "the length a seal must come back at is the length NIP-44 produces" {
     // The check before a sealed half is published compares its length with the
     // one this plaintext seals to. Wrong by a byte, it would refuse every good

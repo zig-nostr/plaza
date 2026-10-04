@@ -240,7 +240,11 @@ pub fn openProfileEdit(model: *Model) void {
     model.profile_lud16_buffer.clear();
     model.profile_nip05_buffer.clear();
     const gpa = std.heap.page_allocator;
-    if (ownProfileJson(gpa)) |own| {
+    // What Save will build on, so what is shown is what is merged into: a profile
+    // published and not stored yet is newer than the store's, and the sheet
+    // seeded from the store showed the old name, which a bio-only save then
+    // published back.
+    if (ownWriteBase(gpa, 0)) |own| {
         // The whole record, not just its content: freeing only `json` left every
         // tag it carried behind on each open of the sheet.
         defer freeOwnProfile(gpa, own);
@@ -368,7 +372,7 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
         // never shown, so merging the sheet into it would remove every one the
         // reader did not happen to type. Show it first; the next Save merges.
         const gpa = std.heap.page_allocator;
-        if (ownProfileJson(gpa)) |own| {
+        if (ownWriteBase(gpa, 0)) |own| {
             defer freeOwnProfile(gpa, own);
             seedProfileFields(model, own.json, true);
             model.profile_stage = .have;

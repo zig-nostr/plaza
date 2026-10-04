@@ -3492,7 +3492,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // A profile that arrives after it is shown rather than left
                     // for a Save to merge blank fields into.
                     const gpa = std.heap.page_allocator;
-                    if (ownProfileJson(gpa)) |own| {
+                    if (ownWriteBase(gpa, 0)) |own| {
                         defer freeOwnProfile(gpa, own);
                         seedProfileFields(model, own.json, true);
                         model.profile_stage = .have;
@@ -3500,7 +3500,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     }
                 } else if (model.editing_profile and model.profile_stage == .fetching) {
                     const gpa = std.heap.page_allocator;
-                    if (ownProfileJson(gpa)) |own| {
+                    if (ownWriteBase(gpa, 0)) |own| {
                         defer freeOwnProfile(gpa, own);
                         // A profile arriving a few seconds late must not replace
                         // the sentence the reader is in the middle of typing,
