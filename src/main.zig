@@ -28,6 +28,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
+pub const search = @import("search.zig");
 const plaza_icons = @import("plaza_icons.zig");
 const article = @import("article.zig");
 
@@ -3642,6 +3643,9 @@ const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
 // NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
 const nip05_fetch_key_base: u64 = 3000;
+// The one NIP-05 lookup the search field can have in flight: the reader's own
+// question, not a profile's verification, so it sits clear of the slot range.
+const nip05_lookup_key: u64 = 3900;
 const link_fetch_key_base: u64 = 4000;
 // Warming: the same bytes, fetched for a row that is NOT on screen yet, and
 // written to the disk cache without claiming a registry id. See `warmAhead`.
@@ -6515,7 +6519,7 @@ pub const LoginTarget = enum { nsec, bunker, invalid };
 /// `naddr1` can name a kind Plaza has no screen for, and saying "that is not an
 /// address" about a perfectly good address is the kind of wrong answer that
 /// sends somebody looking for a typo that is not there.
-pub const AddressError = enum { none, unreadable, wrong_kind };
+pub const AddressError = enum { none, unreadable, wrong_kind, not_found, lookup_failed };
 
 /// What a pasted address names, once decoded.
 pub const AddressTarget = union(enum) {
@@ -6543,6 +6547,15 @@ pub const AddressParse = union(enum) {
     unreadable,
 };
 
+/// What is left of a pasted string once the three routine wrappers are off it:
+/// surrounding whitespace, a leading `nostr:`, and everything up to the last `/`.
+fn addressCandidate(raw: []const u8) []const u8 {
+    var text = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, text, "nostr:")) text = text["nostr:".len..];
+    if (std.mem.lastIndexOfScalar(u8, text, '/')) |slash| text = text[slash + 1 ..];
+    return text;
+}
+
 /// Reads a pasted address and says what it names.
 ///
 /// Everything it hands back lives in `arena`, including the relay hints and a
@@ -6555,9 +6568,7 @@ pub const AddressParse = union(enum) {
 /// the address it is showing: that is how a link out of another client arrives,
 /// and it is the case this whole field exists for.
 pub fn parseAddress(arena: std.mem.Allocator, raw: []const u8) AddressParse {
-    var text = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.mem.startsWith(u8, text, "nostr:")) text = text["nostr:".len..];
-    if (std.mem.lastIndexOfScalar(u8, text, '/')) |slash| text = text[slash + 1 ..];
+    const text = addressCandidate(raw);
     if (text.len == 0) return .unreadable;
 
     if (std.mem.startsWith(u8, text, "note1")) {
@@ -6592,6 +6603,120 @@ pub fn parseAddress(arena: std.mem.Allocator, raw: []const u8) AddressParse {
         return .wrong_kind;
     }
     return .unreadable;
+}
+
+/// What the search field holds, which decides what pressing Enter does.
+pub const SearchInput = enum {
+    /// Nothing to act on.
+    blank,
+    /// A NIP-19 address, or something that starts like one. It is read by
+    /// `parseAddress` and never put to a relay as a name: a half-pasted `npub1`
+    /// is a typo to be told about, not somebody to search for.
+    address,
+    /// `name@domain`. The domain is the authority on who that is, so it is asked
+    /// rather than searched for.
+    nip05,
+    /// Anything else, which is a name.
+    term,
+};
+
+/// Decides which of the field's jobs a string is for.
+///
+/// One field takes all of them, as Jumble's search bar does (an `npub1`,
+/// `nprofile1` or other NIP-19 string becomes the profile or note itself rather
+/// than a query: SearchBar/index.tsx:40-46 and :150-153) and Amethyst's does
+/// (CacheSearch.findUsersStartingWith decodes the term as a key before it
+/// searches, CacheSearch.kt:72-79). Two fields side by side would put the
+/// decision on the reader, and the strings are not ambiguous: a bech32 prefix and
+/// an `@` between two names are not how anybody spells a person.
+pub fn classifySearch(raw: []const u8) SearchInput {
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return .blank;
+    const text = addressCandidate(raw);
+    for ([_][]const u8{ "npub1", "nprofile1", "note1", "nevent1", "naddr1" }) |prefix| {
+        if (std.mem.startsWith(u8, text, prefix)) return .address;
+    }
+    if (nip05Address(raw) != null) return .nip05;
+    return .term;
+}
+
+/// A NIP-05 address split and lowercased, in buffers of its own.
+pub const Nip05Address = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    domain_buf: [253]u8 = undefined,
+    domain_len: u8 = 0,
+
+    pub fn name(self: *const Nip05Address) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn domain(self: *const Nip05Address) []const u8 {
+        return self.domain_buf[0..self.domain_len];
+    }
+};
+
+/// `name@domain` as NIP-05 spells it, or null. The local part and the domain go
+/// through the checks the verification fetch already uses, and a port or an IP
+/// literal is refused the way Amethyst's `Nip05Id.parse` refuses them
+/// (Nip05Id.kt:59-70): an address somebody types is a hostname, and a lookup
+/// that Plaza sends from the reader's own address should not be steerable at one
+/// machine by a string that merely looks like a name.
+pub fn nip05Address(raw: []const u8) ?Nip05Address {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    const at = std.mem.indexOfScalar(u8, text, '@') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, text, at + 1, '@') != null) return null;
+    const name = text[0..at];
+    const domain = text[at + 1 ..];
+    if (!validNip05Name(name) or !validNip05Domain(domain)) return null;
+    if (std.mem.indexOfScalar(u8, domain, ':') != null) return null;
+    const tld = domain[std.mem.lastIndexOfScalar(u8, domain, '.').? + 1 ..];
+    if (tld.len == 0) return null;
+    var all_digits = true;
+    for (tld) |c| {
+        if (!std.ascii.isDigit(c)) all_digits = false;
+    }
+    if (all_digits) return null;
+    var out = Nip05Address{};
+    out.name_len = @intCast(name.len);
+    out.domain_len = @intCast(domain.len);
+    _ = std.ascii.lowerString(out.name_buf[0..name.len], name);
+    _ = std.ascii.lowerString(out.domain_buf[0..domain.len], domain);
+    return out;
+}
+
+/// The well-known document for `addr`, which is the same URL the verification
+/// fetch builds for a profile's own identifier.
+pub fn nip05LookupUrl(buf: []u8, addr: *const Nip05Address) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "https://{s}/.well-known/nostr.json?name={s}", .{ addr.domain(), addr.name() }) catch null;
+}
+
+/// Who a well-known document says `name` is, and the relays it says that person
+/// uses (NIP-05's optional `relays` map), which `arena` owns. Null when the
+/// document does not list the name or lists something that is not a key.
+pub fn nip05Resolve(arena: std.mem.Allocator, name: []const u8, body: []const u8) ?struct { pubkey: [32]u8, relays: []const []const u8 } {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+    if (root != .object) return null;
+    const names = root.object.get("names") orelse return null;
+    if (names != .object) return null;
+    const entry = names.object.get(name) orelse return null;
+    if (entry != .string or entry.string.len != 64) return null;
+    var pubkey: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pubkey, entry.string) catch return null;
+
+    var hints: std.ArrayList([]const u8) = .empty;
+    if (root.object.get("relays")) |map| {
+        if (map == .object) {
+            if (map.object.get(entry.string)) |list| {
+                if (list == .array) {
+                    for (list.array.items) |item| {
+                        if (item != .string or !isSafeRelayUrl(item.string)) continue;
+                        if (hints.items.len == 3) break;
+                        hints.append(arena, item.string) catch break;
+                    }
+                }
+            }
+        }
+    }
+    return .{ .pubkey = pubkey, .relays = hints.items };
 }
 
 /// Classifies pasted login text by its prefix. Pure, so it is unit-tested.
@@ -7056,19 +7181,8 @@ fn requestWantedProfiles() void {
     // and keeps at most one kind:0 per pubkey.
     var still_missing: [wanted_profiles_cap][32]u8 = undefined;
     var missing: usize = 0;
-    if (g_store) |store| {
-        const kinds = [_]u16{0};
-        if (store.query(std.heap.page_allocator, .{ .authors = batch[0..n], .kinds = &kinds, .limit = @intCast(n) })) |res| {
-            var result = res;
-            defer result.deinit();
-            for (result.events) |ev| {
-                const prof = upsertProfile(ev.pubkey) orelse continue;
-                if (std.mem.eql(u8, &prof.meta_id, &ev.id)) continue;
-                parseMetadataInto(prof, ev.content);
-                prof.meta_id = ev.id;
-                g_names_generation +%= 1;
-            }
-        } else |_| {}
+    if (g_store != null) {
+        hydrateProfiles(batch[0..n]);
         for (batch[0..n]) |pk| {
             const known = if (lookupProfile(pk)) |prof| prof.name_len > 0 else false;
             if (known) {
@@ -11936,10 +12050,10 @@ pub const Model = struct {
     // Whether the join sheet is on its focused bunker-input step (chose "Use
     // your own signer") rather than the ladder.
     bunker_mode: bool = false,
-    // The address field: whether it is up, what is typed in it, and why the
-    // last submit did not go anywhere. Plaza could already COPY an address
-    // (`copy_nevent`) and had no way to open one, so a note shared out of here
-    // could be read by every other client and not by this one.
+    // The search field, which is also where an address is pasted: whether it is
+    // up, what is typed in it, and why the last submit did not go anywhere. It
+    // began as the way to open an address (Plaza could COPY one and had no way
+    // to take one back), and kept its names when it learned to find people.
     address_open: bool = false,
     address_buffer: canvas.TextBuffer(220) = .{},
     address_error: AddressError = .none,
@@ -12023,42 +12137,42 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                  "notes_len",              "live_relays",               "offline_relays",       "draft_buffer",
-        "stage",                  "login_buffer",           "logout_pending",            "proxy_buffer",         "proxy_saved",
-        "feed_scroll",            "feed_limit",             "draft",                     "draft_empty",          "identity",
-        "has_notes",              "empty",                  "status",                    "empty_text",           "footer",
-        "note_list",              "expanded_note",          "composing",                 "caught_up",            "relay_health",
-        "relays_online",          "scope_voices",           "is_guest",                  "show_guest_strip",     "guest_strip_dismissed",
-        "joining",                "pending",                "naming",                    "name_buffer",          "name_draft",
-        "name_empty",             "toast_buf",              "toast_len",                 "toast_until",          "toast_text",
-        "backup_nudge",           "backup_nudge_dismissed", "bunker_mode",               "pending_text",         "viewing_thread",
-        "reply_buffer",           "reply_draft",            "reply_empty",               "thread_root",          "thread_notes",
-        "thread_notes_len",       "thread_stack",           "thread_stack_len",          "thread_loading",       "thread_seq",
-        "thread_open_at",         "address_open",           "address_buffer",            "address_error",        "address_draft",
-        "address_empty",          "address_status",
+        "notes",                  "notes_len",              "live_relays",            "offline_relays",            "draft_buffer",
+        "stage",                  "login_buffer",           "logout_pending",         "proxy_buffer",              "proxy_saved",
+        "feed_scroll",            "feed_limit",             "draft",                  "draft_empty",               "identity",
+        "has_notes",              "empty",                  "status",                 "empty_text",                "footer",
+        "note_list",              "expanded_note",          "composing",              "caught_up",                 "relay_health",
+        "relays_online",          "scope_voices",           "is_guest",               "show_guest_strip",          "guest_strip_dismissed",
+        "joining",                "pending",                "naming",                 "name_buffer",               "name_draft",
+        "name_empty",             "toast_buf",              "toast_len",              "toast_until",               "toast_text",
+        "backup_nudge",           "backup_nudge_dismissed", "bunker_mode",            "pending_text",              "viewing_thread",
+        "reply_buffer",           "reply_draft",            "reply_empty",            "thread_root",               "thread_notes",
+        "thread_notes_len",       "thread_stack",           "thread_stack_len",       "thread_loading",            "thread_seq",
+        "thread_open_at",         "address_open",           "address_buffer",         "address_error",             "address_draft",
+        "address_empty",          "address_status",         "address_action",
         // Read by the Zig view rather than bound by name in markup. The one
         // markup file is the join screen; everything else this app draws, it
         // draws itself, so these are unbound by design rather than by mistake.
         // Listed so the check has nothing left to say, and a NEW unbound field
         // stands out against silence instead of hiding in a hundred lines.
-                "can_open_notary",           "client_tag_explainer", "client_tag_on",
-        "currentLevel",           "deleting_note",          "direct_fallback_explainer", "direct_fallback_on",   "draft_dropped",
-        "editing_profile",        "expanded_image",         "levelOpen",                 "logout_idle",          "logout_warning",
-        "mention_dismissed",      "mentionsOff",            "mentions_off",              "mentions_off_len",     "menu",
-        "notifications_everyone", "notifications_open",     "notifications_return",      "outbox_label",         "outbox_overflowed",
-        "outbox_pending",         "outbox_stuck",           "post_delay_explainer",      "post_delay_label",     "previews_explainer",
-        "previews_on",            "profile_about",          "profile_about_buffer",      "profile_about_long",   "profile_asked_at",
-        "profile_can_save",       "profile_name",           "profile_name_buffer",       "profile_name_key",     "profile_name_long",
-        "profile_picture",        "profile_picture_buffer", "profile_picture_long",      "profile_seeded",       "profile_stage",
-        "profile_banner",         "profile_banner_buffer",  "profile_banner_long",       "profile_invalid",      "profile_lud16",
-        "profile_lud16_buffer",   "profile_lud16_long",     "profile_nip05",             "profile_nip05_buffer", "profile_nip05_long",
-        "profile_website",        "profile_website_buffer", "profile_website_long",      "profile_status",       "profile_tab",
-        "profile_untouched",      "proxy_draft",            "proxy_explainer",           "proxy_on",             "proxy_status",
-        "relay_buffer",           "relay_count",            "relay_draft",               "relay_error",          "relay_full",
-        "relay_status",           "relays_paused",          "scope_name",                "sensitive_explainer",  "sensitive_on",
-        "signer_line",            "signer_sub",             "warn_buffer",               "warn_draft",           "warn_on",
-        "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",            "update_check_explainer",
-        "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
+                "can_open_notary",           "client_tag_explainer",
+        "client_tag_on",          "currentLevel",           "deleting_note",          "direct_fallback_explainer", "direct_fallback_on",
+        "draft_dropped",          "editing_profile",        "expanded_image",         "levelOpen",                 "logout_idle",
+        "logout_warning",         "mention_dismissed",      "mentionsOff",            "mentions_off",              "mentions_off_len",
+        "menu",                   "notifications_everyone", "notifications_open",     "notifications_return",      "outbox_label",
+        "outbox_overflowed",      "outbox_pending",         "outbox_stuck",           "post_delay_explainer",      "post_delay_label",
+        "previews_explainer",     "previews_on",            "profile_about",          "profile_about_buffer",      "profile_about_long",
+        "profile_asked_at",       "profile_can_save",       "profile_name",           "profile_name_buffer",       "profile_name_key",
+        "profile_name_long",      "profile_picture",        "profile_picture_buffer", "profile_picture_long",      "profile_seeded",
+        "profile_stage",          "profile_banner",         "profile_banner_buffer",  "profile_banner_long",       "profile_invalid",
+        "profile_lud16",          "profile_lud16_buffer",   "profile_lud16_long",     "profile_nip05",             "profile_nip05_buffer",
+        "profile_nip05_long",     "profile_website",        "profile_website_buffer", "profile_website_long",      "profile_status",
+        "profile_tab",            "profile_untouched",      "proxy_draft",            "proxy_explainer",           "proxy_on",
+        "proxy_status",           "relay_buffer",           "relay_count",            "relay_draft",               "relay_error",
+        "relay_full",             "relay_status",           "relays_paused",          "scope_name",                "sensitive_explainer",
+        "sensitive_on",           "signer_line",            "signer_sub",             "warn_buffer",               "warn_draft",
+        "warn_on",                "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",
+        "update_check_explainer", "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12078,9 +12192,24 @@ pub const Model = struct {
     /// What the field says under itself: the last refusal, or what it accepts.
     pub fn address_status(self: *const Model) []const u8 {
         return switch (self.address_error) {
-            .none => "Paste a note, a person, a place or an article. A link from another client works too.",
+            .none => switch (classifySearch(self.address_buffer.text())) {
+                .blank => "",
+                .address => "An address. Enter opens it.",
+                .nip05 => if (g_nip05_ask != null) "Asking the domain who that is." else "A NIP-05 address. Enter asks its domain who that is.",
+                .term => "Enter asks the search relays now.",
+            },
             .unreadable => "That is not an address Plaza can read.",
             .wrong_kind => "That address is valid and names something Plaza has no screen for.",
+            .not_found => "That domain does not list anyone by that name.",
+            .lookup_failed => "That domain did not answer.",
+        };
+    }
+    /// What the field's one button does with what is in it.
+    pub fn address_action(self: *const Model) []const u8 {
+        return switch (classifySearch(self.address_buffer.text())) {
+            .blank, .address => "Open",
+            .nip05 => "Look up",
+            .term => "Search relays",
         };
     }
 
@@ -17457,6 +17586,10 @@ pub const Msg = union(enum) {
     address_edit: canvas.TextInputEvent,
     /// Read what is in the address field and go where it points.
     address_submit,
+    /// A person pressed in the results under it.
+    search_pick: [32]u8,
+    /// The well-known document for a NIP-05 address typed into it.
+    nip05_found: native_sdk.EffectResponse,
     /// Hide the guest strip for this session.
     dismiss_guest_strip,
     /// Open one of the chrome's anchored menus (or close it, when it is already
@@ -17746,6 +17879,8 @@ pub const Msg = union(enum) {
         "close_address",
         "address_edit",
         "address_submit",
+        "search_pick",
+        "nip05_found",
         "update_checked",
         "open_update",
         "dismiss_update",
@@ -19389,47 +19524,294 @@ fn joinSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     }));
 }
 
-/// The field that takes an address.
+/// The width of the search sheet. The dialog and the card inside it share the
+/// one number, for the reason `join_sheet_width` gives.
+const search_sheet_width: f32 = 520;
+/// How tall the results are before they scroll.
+const search_results_height: f32 = 280;
+/// The empty field's box, and what one relay's line costs under the list.
+const search_empty_height: f32 = 140;
+const search_relay_line_height: f32 = 19;
+/// What a line of text in the card may span: the card less its padding. Wrapped
+/// text is given this as a definite width because a leaf measures one line at
+/// its natural width otherwise. The body is also given a definite HEIGHT, below,
+/// because the card is sized from its content and wrapped text is not counted at
+/// its wrapped height: the last control ran 16pt out of the bottom of the card.
+/// A fixed body also means the sheet does not change size as results arrive.
+const search_sheet_inner: f32 = search_sheet_width - 48;
+/// Characters the second line of a row may spend on each of its two parts.
+const search_identity_max = 24;
+const search_source_max = 44;
+
+/// The field that finds a person and takes an address.
 ///
-/// Plaza could already put an address on the clipboard and had no way to take
-/// one back, so a note shared out of here opened in every other client and not
-/// in this one, and a link followed out of another client dead-ended.
-///
-/// One field and one button, the bunker step's shape, because it is the same
-/// job: paste a string, go where it says.
+/// It began as the place to paste an address (Plaza could put one on the
+/// clipboard and had no way to take one back), and it is also where somebody
+/// says who they mean. One field does both because the two never collide: a
+/// string that starts `npub1` or has an `@` between two names is an address, and
+/// anything else is a name. What Enter will do is said on the button, so the
+/// reader is never guessing which of the two they have got.
 fn addressSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    return modalScrim(ui, "Open an address", .close_address, ui.el(.dialog, .{
-        .width = join_sheet_width,
+    const kind = classifySearch(model.address_draft());
+    return modalScrim(ui, "Search", .close_address, ui.el(.dialog, .{
+        .width = search_sheet_width,
         .on_dismiss = .close_address,
-        .semantics = .{ .label = "Open an address" },
+        .semantics = .{ .label = "Search" },
     }, .{
-        modalCard(ui, join_sheet_width, ui.column(.{ .gap = 12 }, .{
+        modalCard(ui, search_sheet_width, ui.column(.{ .gap = 12 }, .{
             ui.row(.{ .cross = .center, .gap = 6 }, .{
                 backControl(ui, "Back", .close_address),
                 ui.paragraph(
                     .{ .style = .{ .foreground = p.text_primary } },
-                    &.{.{ .text = "Open an address", .weight = .bold, .scale = 1.3 }},
+                    &.{.{ .text = "Search", .weight = .bold, .scale = 1.3 }},
                 ),
             }),
             ui.el(.textarea, .{
                 .text = model.address_draft(),
-                .placeholder = "nevent1... note1... npub1... nprofile1... naddr1...",
+                .placeholder = "A name, an npub or nprofile, name@domain, or a link",
                 .on_input = AppUi.inputMsg(.address_edit),
                 .autofocus = true,
                 .on_submit = .address_submit,
+                // Enter submits, as it does in every search box. Shift+Enter is
+                // the newline, which nothing here has any use for. A pasted
+                // address is long enough to wrap, so the field holds two lines.
+                .submit_on_enter = true,
                 .height = 56,
+                .semantics = .{ .label = "Search" },
             }, .{}),
             // The refusal replaces the hint rather than sitting under it: two
             // lines where one is stale reads as the app disagreeing with itself.
-            ui.text(
-                .{ .size = .sm, .wrap = true, .style = .{ .foreground = if (model.address_error == .none) p.text_muted else p.status_warning_text } },
-                model.address_status(),
-            ),
-            ui.button(.{ .variant = .primary, .disabled = model.address_empty(), .on_press = .address_submit }, "Open"),
+            if (model.address_status().len > 0)
+                ui.text(
+                    .{ .size = .sm, .wrap = true, .style = .{ .foreground = if (model.address_error == .none) p.text_muted else p.status_warning_text } },
+                    model.address_status(),
+                )
+            else
+                ui.spacer(0),
+            searchBody(ui, kind),
+            ui.button(.{ .variant = .primary, .disabled = model.address_empty(), .on_press = .address_submit }, model.address_action()),
             vgap(ui, 5),
         })),
     }));
+}
+
+/// Everything between the field and its button: what to do with an empty field,
+/// or the people found and the relays that were asked.
+fn searchBody(ui: *AppUi, kind: SearchInput) AppUi.Node {
+    const p = theme.palette;
+    if (kind == .blank) return ui.column(.{ .height = search_empty_height }, .{searchEmpty(ui)});
+    // An address is opened, not searched for, so there is nothing to list.
+    if (kind == .address) return ui.spacer(0);
+
+    const rows = g_search_rows[0..g_search_len];
+    var nodes: [search_rows_max + 2]AppUi.Node = undefined;
+    var n: usize = 0;
+    var locals: usize = 0;
+    for (rows) |r| {
+        if (r.local) locals += 1;
+    }
+    if (locals > 0) {
+        nodes[n] = searchSectionLabel(ui, ui.fmt("ON THIS DEVICE  {d}", .{locals}));
+        n += 1;
+        for (rows) |*r| {
+            if (!r.local) continue;
+            nodes[n] = searchRow(ui, r);
+            n += 1;
+        }
+    }
+    if (rows.len > locals) {
+        nodes[n] = searchSectionLabel(ui, ui.fmt("FROM SEARCH RELAYS  {d}", .{rows.len - locals}));
+        n += 1;
+        for (rows) |*r| {
+            if (r.local) continue;
+            nodes[n] = searchRow(ui, r);
+            n += 1;
+        }
+    }
+    // Boxed to the list's own height, so the relays keep their place under it
+    // whether or not anybody has turned up.
+    const results: AppUi.Node = if (rows.len == 0)
+        ui.column(.{ .height = if (kind == .nip05) 0 else search_results_height }, .{
+            ui.paragraph(
+                .{ .wrap = true, .width = search_sheet_inner, .style = .{ .foreground = p.text_dim } },
+                &.{.{ .text = searchNothingYet(kind), .scale = mono_hint_scale }},
+            ),
+        })
+    else
+        ui.scroll(.{ .height = search_results_height }, .{ui.column(.{ .gap = 2 }, .{nodes[0..n]})});
+    // The relays are only worth naming when a name is being searched for: for a
+    // NIP-05 address they are not the ones being asked.
+    // Nothing to list and no relays to name: the line alone, not a tall empty box.
+    if (kind == .nip05 and rows.len == 0) return results;
+    const relay_lines: f32 = @floatFromInt(searchRelays().len);
+    const height = search_results_height + if (kind == .term) 18 + relay_lines * search_relay_line_height else 0;
+    return ui.column(.{ .height = height, .gap = 10 }, .{
+        results,
+        if (kind == .term) searchRelayLines(ui) else ui.spacer(0),
+    });
+}
+
+/// What the list says when it has nothing in it, which depends on whether the
+/// relays have been heard from.
+fn searchNothingYet(kind: SearchInput) []const u8 {
+    // An address is asked of its domain; the search relays are not part of it.
+    if (kind == .nip05) return "No one on this device has that address.";
+    var asking = false;
+    var answered = false;
+    for (searchRelays(), 0..) |_, i| {
+        switch (searchRelayStatus(i).state) {
+            .asking => asking = true,
+            .answered, .declined, .unreachable_, .silent => answered = true,
+            else => {},
+        }
+    }
+    if (asking) return "No one on this device matches. Asking the search relays.";
+    if (answered) return "No one on this device matches, and the search relays found no one.";
+    return "No one on this device matches. The search relays are asked once you stop typing.";
+}
+
+fn searchSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
+    return ui.paragraph(.{ .style = .{ .foreground = theme.palette.text_label } }, &.{.{ .text = text, .monospace = true, .scale = mono_meta_scale }});
+}
+
+/// The empty field: what it takes, and where a name goes when it is searched for.
+fn searchEmpty(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const relays = searchRelays();
+    var hosts: [search.relays_max][]const u8 = undefined;
+    for (relays, 0..) |url, i| hosts[i] = relayShortName(url);
+    return ui.column(.{ .gap = 8 }, .{
+        ui.paragraph(
+            .{ .wrap = true, .width = search_sheet_inner, .style = .{ .foreground = p.text_body } },
+            &.{.{ .text = "Type a name to look through the profiles on this device. Nothing leaves it until you stop typing.", .scale = menu_scale }},
+        ),
+        ui.paragraph(
+            .{ .wrap = true, .width = search_sheet_inner, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = "An npub, an nprofile, name@domain or a link to a note or a place goes straight there.", .scale = menu_scale }},
+        ),
+        ui.paragraph(
+            .{ .wrap = true, .width = search_sheet_inner, .style = .{ .foreground = p.text_dim } },
+            &.{.{ .text = ui.fmt("Then the search relays are asked for the name: {s}.", .{joinStrings(ui, hosts[0..relays.len], ", ")}), .scale = mono_hint_scale }},
+        ),
+    });
+}
+
+fn joinStrings(ui: *AppUi, parts: []const []const u8, sep: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (parts, 0..) |part, i| {
+        if (i > 0) out.appendSlice(ui.arena, sep) catch return "";
+        out.appendSlice(ui.arena, part) catch return "";
+    }
+    return out.items;
+}
+
+/// One line per search relay, so a relay that found no one is named rather than
+/// absent, and one that could not be reached says that instead.
+fn searchRelayLines(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const urls = searchRelays();
+    var lines: [search.relays_max]AppUi.Node = undefined;
+    for (urls, 0..) |url, i| {
+        const st = searchRelayStatus(i);
+        var buf: [32]u8 = undefined;
+        const said = search.describe(&buf, st.state, st.count);
+        const ink = switch (st.state) {
+            .answered => if (st.count > 0) p.text_body_strong else p.text_muted,
+            .unreachable_, .declined, .silent => p.status_warning_text,
+            else => p.text_dim,
+        };
+        lines[i] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = relayShortName(url), .monospace = true, .scale = mono_meta_scale }}),
+            ui.spacer(1),
+            ui.paragraph(.{ .style = .{ .foreground = ink } }, &.{.{ .text = ui.fmt("{s}", .{said}), .monospace = true, .scale = mono_meta_scale }}),
+        });
+    }
+    return ui.column(.{ .gap = 3 }, .{
+        ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
+        lines[0..urls.len],
+    });
+}
+
+/// Where a result came from, in words: this machine, and each relay that named
+/// them. Long lists give the first and a count, so the line stays on its row.
+fn searchSourceText(ui: *AppUi, row: *const SearchRow) []const u8 {
+    var parts: [search.relays_max + 1][]const u8 = undefined;
+    var n: usize = 0;
+    if (row.local) {
+        parts[n] = "this device";
+        n += 1;
+    }
+    for (searchRelays(), 0..) |url, i| {
+        if (i >= search.relays_max) break;
+        if (row.relays & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        parts[n] = relayShortName(url);
+        n += 1;
+    }
+    const whole = joinStrings(ui, parts[0..n], ", ");
+    if (whole.len <= search_source_max or n < 2) return whole;
+    return ui.fmt("{s} +{d}", .{ parts[0], n - 1 });
+}
+
+/// One person in the results: the name, what they are called elsewhere, and
+/// where this machine heard of them.
+fn searchRow(ui: *AppUi, row: *const SearchRow) AppUi.Node {
+    const p = theme.palette;
+    const pk = row.pubkey;
+    const prof = lookupProfile(pk);
+    const name = if (prof) |pr| (if (pr.name_len > 0) pr.name() else "") else "";
+    const shown = if (name.len > 0) name else personNpubShort(ui, pk);
+    const verified = if (prof) |pr| pr.nip05_state == .verified else false;
+    // The address only once it has been checked, as everywhere else in the app:
+    // one nobody has confirmed is a claim, not a credential. The exception is
+    // an address the term matched, shown plainly so a row is never a mystery
+    // about why it is in the list.
+    const identity: []const u8 = blk: {
+        const pr = prof orelse break :blk "";
+        if (verified) break :blk pr.nip05();
+        if (pr.nip05_len > 0 and search.quality(pr.nip05(), g_search_term[0..g_search_term_len]) != null) break :blk pr.nip05();
+        if (pr.username_len > 0) break :blk ui.fmt("@{s}", .{pr.username()});
+        break :blk "";
+    };
+    const tint = avatarTint(pk);
+    const hexdigits = "0123456789abcdef";
+
+    // Built as slices so a line with nothing to say costs no node.
+    var name_line: [2]AppUi.Node = undefined;
+    var name_n: usize = 1;
+    name_line[0] = ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = elide(ui, shown, 40), .weight = .medium, .scale = menu_scale }});
+    if (verified) {
+        name_line[1] = ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.status_success } }, "check-circle");
+        name_n = 2;
+    }
+    var second: [2]AppUi.Node = undefined;
+    var second_n: usize = 0;
+    if (identity.len > 0) {
+        second[second_n] = ui.paragraph(.{ .style = .{ .foreground = identityInk() } }, &.{.{ .text = elide(ui, identity, search_identity_max), .scale = mono_row_scale }});
+        second_n += 1;
+    }
+    second[second_n] = ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = searchSourceText(ui, row), .monospace = true, .scale = mono_chip_scale }});
+    second_n += 1;
+
+    return ui.el(.list_item, .{
+        .padding = 6,
+        .gap = 10,
+        .cross = .center,
+        .on_press = Msg{ .search_pick = pk },
+        .style = .{ .radius = 8, .quiet_hover = true },
+        .semantics = .{ .role = .button, .label = shown, .focusable = true },
+    }, .{
+        ui.avatar(.{
+            .image = 0,
+            .width = 30,
+            .height = 30,
+            .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 1 },
+        }, ui.fmt("{c}{c}", .{ hexdigits[pk[0] >> 4], hexdigits[pk[0] & 0x0f] })),
+        ui.column(.{ .grow = 1, .gap = 2 }, .{
+            ui.row(.{ .cross = .center, .gap = 5 }, .{name_line[0..name_n]}),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{second[0..second_n]}),
+        }),
+    });
 }
 
 /// Why the sheet appeared, in the reader's own terms: the thing they reached for
@@ -26613,7 +26995,7 @@ fn railView(ui: *AppUi, model: *const Model) AppUi.Node {
         // Shown to guests too. Reading needs no key, and a link somebody sent is
         // one of the first things a person who has not signed in arrives with.
         // That is the same call the account menu's row makes.
-        railTile(ui, "search", 16, .open_address, "Open an address", false),
+        railTile(ui, "search", 16, .open_address, "Search", false),
         // The bottom cluster hangs off the floor of the rail: verbs, then meta.
         ui.spacer(1),
         // Compose: the one bright tile.
@@ -28256,7 +28638,7 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // Guests too, deliberately. Opening an address is reading, and reading
     // needs no key: a link somebody sent is one of the first things a person
     // who has not signed in arrives with.
-    rows[n] = menuRow(ui, "Open an address…", null, "Cmd+L", .open_address);
+    rows[n] = menuRow(ui, "Search…", null, "Cmd+L", .open_address);
     n += 1;
     rows[n] = menuRow(ui, "Settings…", null, "Cmd+,", .open_settings);
     n += 1;
@@ -32760,6 +33142,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // they asked for a moment earlier.
                 refreshEventFetch(model);
                 refreshAddressFetch(model);
+                searchTick(model, awakeMs());
                 flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
@@ -33346,6 +33729,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_address => {
             model.address_open = true;
             model.address_error = .none;
+            searchOpen();
             // The row that opens this lives in the account menu, and a menu
             // left standing under a sheet is a menu the reader has to dismiss
             // twice.
@@ -33358,8 +33742,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // rather than on the next submit. A red line under a field the
             // reader is already fixing is describing a string that is gone.
             model.address_error = .none;
+            searchOnEdit(model);
         },
-        .address_submit => openAddress(model, fx),
+        .address_submit => submitAddress(model, fx),
+        .search_pick => |pubkey| searchPick(model, pubkey),
+        .nip05_found => |response| handleNip05Found(model, response),
         .dismiss_guest_strip => model.guest_strip_dismissed = true,
         // A trigger toggles its own menu and replaces any other, so the chrome
         // never shows two floating surfaces at once.
@@ -37491,6 +37878,8 @@ fn closeAddress(model: *Model) void {
     model.address_open = false;
     model.address_buffer.clear();
     model.address_error = .none;
+    g_nip05_ask = null;
+    searchReset();
 }
 
 /// Reads what is in the address field and goes where it points.
@@ -37563,6 +37952,654 @@ fn enterEvent(model: *Model, ev: nostr.event.Event) void {
     }
     enterThread(model, noteFrom(ev, nowSeconds()));
 }
+
+// ------------------------------------------------------- finding a person
+//
+// The field that opens an address finds people by name as well, because it is
+// the one place somebody goes to say who they mean. Two sources answer it, and
+// they are not mixed up: every profile already on this machine, instantly and
+// with the network off, then NIP-50 search relays, whose results are folded in
+// as they land and each marked with the relay that gave it.
+
+/// Most rows the results list holds, and how many of those can be people the
+/// store already knew. This is a node budget as much as a taste: the sheet is
+/// stacked over the feed, and a row costs about a dozen of the 1024 nodes a view
+/// may have.
+pub const search_rows_max = 20;
+const search_local_max = 12;
+/// How many kind:0 events one page of the index build reads, and the most it
+/// reads in all. The store keeps one kind:0 per author, so this is a ceiling on
+/// people. Newest first, so a store larger than this loses its oldest profiles
+/// from the instant half, not its recent ones.
+const search_scan_page = 1024;
+const search_scan_max = 32 * 1024;
+/// How many contact lists name the reader, at most, when working out who follows
+/// them.
+const search_followers_max = 4096;
+/// Seconds an index may be old before opening the field builds a new one.
+const search_index_ttl_s: i64 = 30;
+/// Quiet time after the last keystroke before a name goes to the relays. A name
+/// is put to three strangers, so it waits until the reader has stopped typing.
+const search_settle_ms: i64 = 600;
+/// Shortest term that goes to relays on its own. Enter sends anything.
+const search_auto_min = 2;
+/// Frames one relay may spend on a search before it is let go.
+const search_frames_max = 200;
+
+/// One line of the results.
+const SearchRow = struct {
+    pubkey: [32]u8,
+    /// The store already had this person.
+    local: bool,
+    /// Bit `i` set: search relay `i` returned them.
+    relays: u8,
+};
+
+var g_search_rows: [search_rows_max]SearchRow = undefined;
+var g_search_len: usize = 0;
+/// The term the rows answer, in the form that was searched.
+var g_search_term: [search.term_max]u8 = undefined;
+var g_search_term_len: usize = 0;
+/// Moves every time the term changes, so an answer to an earlier term that
+/// arrives late is recognised and dropped.
+var g_search_gen = std.atomic.Value(u32).init(0);
+/// The generation already put to the relays.
+var g_search_asked: u32 = 0;
+/// When the term last changed, on the awake clock.
+var g_search_typed_ms: i64 = 0;
+/// Where each search relay stands, as a packed `search.Status`.
+var g_search_status: [search.relays_max]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+
+/// A person a relay returned, on its way from the thread that read it to the one
+/// that draws it.
+const SearchArrival = struct { gen: u32, relay: u8, pubkey: [32]u8 };
+const search_inbox_cap = 64;
+var g_search_inbox: [search_inbox_cap]SearchArrival = undefined;
+var g_search_inbox_len: usize = 0;
+var g_search_inbox_lock = std.atomic.Value(bool).init(false);
+
+fn lockSearchInbox() void {
+    while (g_search_inbox_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockSearchInbox() void {
+    g_search_inbox_lock.store(false, .release);
+}
+
+/// Every profile on this machine with something to match on. Replaced whole by
+/// a worker; held under `g_search_index_lock` by anything that reads it.
+var g_search_index: search.Index = .{};
+var g_search_index_ready = false;
+var g_search_index_built_s: i64 = 0;
+var g_search_index_lock = std.atomic.Value(bool).init(false);
+var g_search_index_building = std.atomic.Value(bool).init(false);
+
+fn lockSearchIndex() void {
+    while (g_search_index_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn unlockSearchIndex() void {
+    g_search_index_lock.store(false, .release);
+}
+
+/// The relays a name is put to, by slot.
+fn searchRelays() []const []const u8 {
+    return &search.default_relays;
+}
+
+fn awakeMs() i64 {
+    const io = g_io orelse return 0;
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
+}
+
+/// The term on screen, cleaned, or null when the field holds no name.
+fn searchTermOf(model: *const Model, out: *[search.term_max]u8) ?[]const u8 {
+    return switch (classifySearch(model.address_buffer.text())) {
+        .blank, .address => null,
+        .nip05, .term => search.cleanTerm(out, model.address_buffer.text()),
+    };
+}
+
+/// Forgets the results and cancels whatever was still on its way.
+fn searchReset() void {
+    _ = g_search_gen.fetchAdd(1, .acq_rel);
+    g_search_len = 0;
+    g_search_term_len = 0;
+    lockSearchInbox();
+    g_search_inbox_len = 0;
+    unlockSearchInbox();
+    for (&g_search_status) |*s| s.store(0, .release);
+}
+
+/// The field has opened: nothing to show yet, and a fresh index on its way so
+/// the first letters typed are matched against everything held.
+fn searchOpen() void {
+    searchReset();
+    searchIndexEnsure();
+}
+
+/// The field's text changed. The instant half answers now, synchronously; the
+/// relays are asked once typing settles, from the tick.
+fn searchOnEdit(model: *const Model) void {
+    searchReset();
+    var buf: [search.term_max]u8 = undefined;
+    const term = searchTermOf(model, &buf) orelse return;
+    @memcpy(g_search_term[0..term.len], term);
+    g_search_term_len = term.len;
+    g_search_typed_ms = awakeMs();
+    searchRunLocal(term);
+}
+
+/// Matches `term` against every profile held and fills the list with the best.
+fn searchRunLocal(term: []const u8) void {
+    var picked: [search_local_max][32]u8 = undefined;
+    var n: usize = 0;
+    var hits: [search_local_max * 2]search.Hit = undefined;
+
+    lockSearchIndex();
+    const have_index = g_search_index_ready;
+    if (have_index) {
+        const found = g_search_index.find(term, &hits);
+        for (hits[0..found]) |hit| {
+            if (n == picked.len) break;
+            const pk = g_search_index.entries[hit.entry].pubkey;
+            if (isMuted(pk)) continue;
+            picked[n] = pk;
+            n += 1;
+        }
+    }
+    unlockSearchIndex();
+
+    // Before the index has been built (the first moments after a launch, or no
+    // store at all) the profiles the app already holds in memory answer, which
+    // is what the mention picker has always done.
+    if (!have_index) n = searchCachePick(term, &picked);
+
+    g_search_len = 0;
+    for (picked[0..n]) |pk| {
+        g_search_rows[g_search_len] = .{ .pubkey = pk, .local = true, .relays = 0 };
+        g_search_len += 1;
+    }
+    hydrateProfiles(picked[0..n]);
+}
+
+/// The cache-only answer: the in-memory profiles, ranked the same way.
+fn searchCachePick(term: []const u8, out: *[search_local_max][32]u8) usize {
+    const gpa = std.heap.page_allocator;
+    var builder = search.Builder.init(gpa);
+    defer builder.deinit();
+    for (&g_profiles) |*pr| {
+        if (!pr.used) continue;
+        const tier: search.Tier = if (inFollowGraph(pr.pubkey)) .follows else .seen;
+        builder.add(pr.pubkey, tier, 0, pr.name(), pr.username(), pr.nip05()) catch return 0;
+    }
+    var index = builder.finish() catch return 0;
+    defer index.deinit(gpa);
+    var hits: [search_local_max * 2]search.Hit = undefined;
+    const found = index.find(term, &hits);
+    var n: usize = 0;
+    for (hits[0..found]) |hit| {
+        if (n == out.len) break;
+        const pk = index.entries[hit.entry].pubkey;
+        if (isMuted(pk)) continue;
+        out[n] = pk;
+        n += 1;
+    }
+    return n;
+}
+
+/// Reads the kind:0 of each person from the store into the profile cache, so a
+/// row can draw a name rather than a key. Disk first and exact, as the wanted
+/// profiles pass has always done: the store has an author+kind index.
+fn hydrateProfiles(pubkeys: []const [32]u8) void {
+    if (pubkeys.len == 0) return;
+    const store = g_store orelse return;
+    const kinds = [_]u16{0};
+    var result = store.query(std.heap.page_allocator, .{ .authors = pubkeys, .kinds = &kinds, .limit = @intCast(pubkeys.len) }) catch return;
+    defer result.deinit();
+    for (result.events) |ev| {
+        const prof = upsertProfile(ev.pubkey) orelse continue;
+        if (std.mem.eql(u8, &prof.meta_id, &ev.id)) continue;
+        parseMetadataInto(prof, ev.content);
+        prof.meta_id = ev.id;
+        g_names_generation +%= 1;
+    }
+}
+
+// --- the index
+
+/// Builds a fresh index on a worker if the one held is missing or old.
+fn searchIndexEnsure() void {
+    if (comptime builtin.is_test) return;
+    if (g_store == null) return;
+    if (g_search_index_ready and nowSeconds() - g_search_index_built_s < search_index_ttl_s) return;
+    if (g_search_index_building.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, searchIndexWorker, .{}) catch {
+        g_search_index_building.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn searchIndexWorker() void {
+    defer g_search_index_building.store(false, .release);
+    searchIndexRefresh();
+}
+
+/// The accounts whose contact lists name the reader. The store can only say who
+/// follows the reader among the lists it holds, which is the honest meaning of
+/// "people who follow me" here: nothing local can know about a list never read.
+fn searchFollowers(gpa: std.mem.Allocator, store: *nostr.store.Store) std.AutoHashMapUnmanaged([32]u8, void) {
+    var set: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    const me = activePubkey() orelse return set;
+    var hex: [64]u8 = undefined;
+    hexLower(&hex, me);
+    const kinds = [_]u16{contact_list_kind};
+    const values = [_][]const u8{&hex};
+    const tags = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &values }};
+    var result = store.query(gpa, .{ .kinds = &kinds, .tags = &tags, .limit = search_followers_max }) catch return set;
+    defer result.deinit();
+    for (result.events) |ev| set.put(gpa, ev.pubkey, {}) catch break;
+    return set;
+}
+
+/// Reads every kind:0 in the store into a new index and swaps it in.
+fn searchIndexRefresh() void {
+    const store = g_store orelse return;
+    const gpa = std.heap.page_allocator;
+    var builder = search.Builder.init(gpa);
+    defer builder.deinit();
+    var followers = searchFollowers(gpa, store);
+    defer followers.deinit(gpa);
+    var added: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer added.deinit(gpa);
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+
+    const Meta = struct {
+        name: ?[]const u8 = null,
+        display_name: ?[]const u8 = null,
+        displayName: ?[]const u8 = null,
+        nip05: ?[]const u8 = null,
+    };
+
+    var until: ?i64 = null;
+    var scanned: usize = 0;
+    while (scanned < search_scan_max) {
+        const kinds = [_]u16{0};
+        var page = store.query(gpa, .{ .kinds = &kinds, .until = until, .limit = search_scan_page }) catch break;
+        defer page.deinit();
+        if (page.events.len == 0) break;
+        var fresh: usize = 0;
+        for (page.events) |ev| {
+            scanned += 1;
+            if (added.contains(ev.pubkey)) continue;
+            _ = scratch.reset(.retain_capacity);
+            const meta = std.json.parseFromSliceLeaky(Meta, scratch.allocator(), ev.content, .{ .ignore_unknown_fields = true }) catch continue;
+            // The same choice `parseMetadataInto` makes, so the row that is
+            // drawn is named by the string that was matched.
+            var shown: []const u8 = "";
+            for ([_]?[]const u8{ meta.displayName, meta.display_name, meta.name }) |candidate| {
+                const trimmed = std.mem.trim(u8, candidate orelse continue, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                shown = trimmed;
+                break;
+            }
+            const user = std.mem.trim(u8, meta.name orelse "", " \t\r\n");
+            var address = std.mem.trim(u8, meta.nip05 orelse "", " \t\r\n");
+            if (std.mem.indexOfScalar(u8, address, '@') == null) address = "";
+            const tier: search.Tier = if (inFollowGraph(ev.pubkey)) .follows else if (followers.contains(ev.pubkey)) .follows_me else .seen;
+            builder.add(ev.pubkey, tier, ev.created_at, shown, user, address) catch break;
+            added.put(gpa, ev.pubkey, {}) catch break;
+            fresh += 1;
+        }
+        if (page.events.len < search_scan_page) break;
+        const oldest = page.events[page.events.len - 1].created_at;
+        // A whole page inside one second that brought nothing new will bring
+        // nothing new again.
+        if (until != null and until.? == oldest and fresh == 0) break;
+        until = oldest;
+    }
+
+    var fresh_index = builder.finish() catch return;
+    lockSearchIndex();
+    std.mem.swap(search.Index, &g_search_index, &fresh_index);
+    g_search_index_ready = true;
+    unlockSearchIndex();
+    g_search_index_built_s = nowSeconds();
+    fresh_index.deinit(gpa);
+}
+
+// --- the relays
+
+/// What one relay thread is told.
+const SearchJob = struct {
+    gen: u32,
+    relay: u8,
+    url: []const u8,
+    term: [search.term_max]u8,
+    term_len: u8,
+};
+
+/// Puts the term on screen to the search relays, once per term.
+fn searchAskRelays() void {
+    const gen = g_search_gen.load(.acquire);
+    if (g_search_term_len == 0 or g_search_asked == gen) return;
+    g_search_asked = gen;
+    if (!relayFetchAllowed()) return;
+    const urls = searchRelays();
+    for (urls, 0..) |url, i| {
+        if (i >= search.relays_max) break;
+        if (relaysPaused()) {
+            g_search_status[i].store((search.Status{ .gen = gen, .state = .paused, .count = 0 }).pack(), .release);
+            continue;
+        }
+        g_search_status[i].store((search.Status{ .gen = gen, .state = .asking, .count = 0 }).pack(), .release);
+        var job = SearchJob{ .gen = gen, .relay = @intCast(i), .url = url, .term = undefined, .term_len = @intCast(g_search_term_len) };
+        @memcpy(job.term[0..g_search_term_len], g_search_term[0..g_search_term_len]);
+        const thread = std.Thread.spawn(.{}, searchRelayWorker, .{job}) catch {
+            g_search_status[i].store((search.Status{ .gen = gen, .state = .unreachable_, .count = 0 }).pack(), .release);
+            continue;
+        };
+        thread.detach();
+    }
+}
+
+/// Publishes a relay's outcome, unless the term has moved on.
+fn searchPublish(job: SearchJob, state: search.RelayState, count: u16) void {
+    if (g_search_gen.load(.acquire) != job.gen) return;
+    g_search_status[job.relay].store((search.Status{ .gen = job.gen, .state = state, .count = count }).pack(), .release);
+}
+
+/// Keeps one person a relay returned: verified, stored, and queued for the list.
+/// False when the event is not a profile or does not verify.
+fn searchAccept(gpa: std.mem.Allocator, signer: nostr.keys.Signer, job: SearchJob, ev: nostr.event.Event) bool {
+    if (ev.kind != 0) return false;
+    const result = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return false;
+    if (result == .invalid) return false;
+    searchArrived(job.gen, job.relay, ev.pubkey);
+    return true;
+}
+
+fn searchArrived(gen: u32, relay: u8, pubkey: [32]u8) void {
+    lockSearchInbox();
+    defer unlockSearchInbox();
+    // A full inbox drops the newest: the list is as full as it will get long
+    // before this many people have been named.
+    if (g_search_inbox_len == g_search_inbox.len) return;
+    g_search_inbox[g_search_inbox_len] = .{ .gen = gen, .relay = relay, .pubkey = pubkey };
+    g_search_inbox_len += 1;
+}
+
+/// Asks one search relay for profiles matching the term, on its own thread.
+fn searchRelayWorker(job: SearchJob) void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var state: search.RelayState = .unreachable_;
+    var found: u16 = 0;
+    defer searchPublish(job, state, found);
+
+    var relay = nostr.relay.dial(gpa, io, job.url) catch return;
+    defer relay.deinit();
+    // Bounded by the keeper like every other one-shot read: a relay that takes
+    // the request and goes quiet must not hold this thread for the life of the
+    // process.
+    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    defer releaseOneShot(watched);
+    const request = search.requestText(gpa, job.term[0..job.term_len]) catch return;
+    defer gpa.free(request);
+    search.sendText(relay, request) catch return;
+    // Asked. From here a relay that never says anything is a quiet one, not one
+    // that could not be reached.
+    state = .silent;
+
+    var frames: usize = 0;
+    while (frames < search_frames_max) : (frames += 1) {
+        if (g_search_gen.load(.acquire) != job.gen) return;
+        var msg = (relay.receive() catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                if (searchAccept(gpa, signer, job, e.event)) found +|= 1;
+            },
+            .eose => {
+                state = .answered;
+                return;
+            },
+            // A relay that cannot search says so in place of results. A notice
+            // after results are already coming is about something else.
+            .closed => {
+                state = if (found > 0) .answered else .declined;
+                return;
+            },
+            .notice => {
+                if (found == 0) {
+                    state = .declined;
+                    return;
+                }
+            },
+            .auth => {
+                state = .declined;
+                return;
+            },
+            else => {},
+        }
+    }
+    // The connection ended, or the budget did, with people already in hand.
+    if (found > 0) state = .answered;
+}
+
+/// Moves what the relay threads found into the list, on the UI thread.
+fn searchDrain() void {
+    var batch: [search_inbox_cap]SearchArrival = undefined;
+    lockSearchInbox();
+    const n = g_search_inbox_len;
+    @memcpy(batch[0..n], g_search_inbox[0..n]);
+    g_search_inbox_len = 0;
+    unlockSearchInbox();
+    if (n == 0) return;
+
+    const gen = g_search_gen.load(.acquire);
+    var fresh: [search_inbox_cap][32]u8 = undefined;
+    var fresh_len: usize = 0;
+    for (batch[0..n]) |arrival| {
+        if (arrival.gen != gen) continue;
+        const bit: u8 = @as(u8, 1) << @intCast(arrival.relay);
+        var known = false;
+        for (g_search_rows[0..g_search_len]) |*row| {
+            if (!std.mem.eql(u8, &row.pubkey, &arrival.pubkey)) continue;
+            row.relays |= bit;
+            known = true;
+            break;
+        }
+        if (known or g_search_len == search_rows_max or isMuted(arrival.pubkey)) continue;
+        g_search_rows[g_search_len] = .{ .pubkey = arrival.pubkey, .local = false, .relays = bit };
+        g_search_len += 1;
+        fresh[fresh_len] = arrival.pubkey;
+        fresh_len += 1;
+    }
+    hydrateProfiles(fresh[0..fresh_len]);
+}
+
+/// The tick's share: ask the relays once typing has settled, and take in what
+/// they have sent. Only while the field is open.
+fn searchTick(model: *const Model, now_ms: i64) void {
+    if (!model.address_open) return;
+    // A NIP-05 address is asked of its domain, so only a name is put to relays.
+    const is_name = classifySearch(model.address_buffer.text()) == .term;
+    if (is_name and g_search_term_len >= search_auto_min and now_ms - g_search_typed_ms >= search_settle_ms) searchAskRelays();
+    searchDrain();
+}
+
+/// How one relay stands for the term on screen. A status left over from an
+/// earlier term reads as not asked.
+fn searchRelayStatus(i: usize) search.Status {
+    const s = search.Status.unpack(g_search_status[i].load(.acquire));
+    if (s.gen != g_search_gen.load(.acquire)) return .{ .gen = 0, .state = .idle, .count = 0 };
+    return s;
+}
+
+// --- NIP-05
+
+/// The address being looked up, and whether the answer is awaited.
+var g_nip05_ask: ?Nip05Address = null;
+
+/// Sends the lookup for `name@domain`. The domain is a stranger's, from the
+/// reader's own address, which is why this waits for an explicit press instead
+/// of running as they type.
+fn lookupNip05(model: *Model, fx: *Effects) void {
+    const addr = nip05Address(model.address_buffer.text()) orelse return;
+    var url_buf: [320]u8 = undefined;
+    const url = nip05LookupUrl(&url_buf, &addr) orelse {
+        model.address_error = .unreadable;
+        return;
+    };
+    g_nip05_ask = addr;
+    model.address_error = .none;
+    if (!networkAllowed()) return;
+    fx.fetch(.{
+        .key = nip05_lookup_key,
+        .url = url,
+        .on_response = Effects.responseMsg(.nip05_found),
+    });
+}
+
+/// The well-known document came back. Goes to the person it names, if the
+/// reader is still looking at the address they asked about.
+fn handleNip05Found(model: *Model, response: native_sdk.EffectResponse) void {
+    if (response.key != nip05_lookup_key) return;
+    const ask = g_nip05_ask orelse return;
+    g_nip05_ask = null;
+    // The reader typed on, or left. The answer is to a question nobody is
+    // asking any more.
+    const current = nip05Address(model.address_buffer.text()) orelse return;
+    if (!model.address_open) return;
+    if (!std.mem.eql(u8, current.name(), ask.name()) or !std.mem.eql(u8, current.domain(), ask.domain())) return;
+
+    if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0) {
+        model.address_error = .lookup_failed;
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const hit = nip05Resolve(arena_state.allocator(), ask.name(), response.body) orelse {
+        model.address_error = .not_found;
+        return;
+    };
+    closeAddress(model);
+    wantProfileHinted(hit.pubkey, hit.relays);
+    openPerson(model, hit.pubkey);
+}
+
+/// Pressing a result.
+fn searchPick(model: *Model, pubkey: [32]u8) void {
+    closeAddress(model);
+    openPerson(model, pubkey);
+}
+
+/// What Enter does with what is in the field.
+fn submitAddress(model: *Model, fx: *Effects) void {
+    switch (classifySearch(model.address_buffer.text())) {
+        .blank => {},
+        .address => openAddress(model, fx),
+        .nip05 => lookupNip05(model, fx),
+        // Straight to the relays: pressing Enter is asking now, not after the
+        // pause that typing waits for.
+        .term => searchAskRelays(),
+    }
+}
+
+// --- test seams
+
+/// Back to a fresh start: no index, no rows, no relay state.
+pub fn searchResetForTest() void {
+    searchReset();
+    lockSearchIndex();
+    g_search_index.deinit(std.heap.page_allocator);
+    g_search_index_ready = false;
+    unlockSearchIndex();
+    g_search_asked = 0;
+    g_search_typed_ms = 0;
+    g_nip05_ask = null;
+}
+
+/// Builds the index now, on this thread, from the store.
+pub fn searchIndexRefreshForTest() void {
+    searchIndexRefresh();
+}
+
+pub fn searchIndexLenForTest() usize {
+    lockSearchIndex();
+    defer unlockSearchIndex();
+    return g_search_index.entries.len;
+}
+
+pub fn searchRowCountForTest() usize {
+    return g_search_len;
+}
+
+pub fn searchRowPubkeyForTest(i: usize) [32]u8 {
+    return g_search_rows[i].pubkey;
+}
+
+pub fn searchRowLocalForTest(i: usize) bool {
+    return g_search_rows[i].local;
+}
+
+/// Bit `n` set means search relay `n` returned this row.
+pub fn searchRowRelaysForTest(i: usize) u8 {
+    return g_search_rows[i].relays;
+}
+
+pub fn searchTickForTest(model: *const Model, now_ms: i64) void {
+    searchTick(model, now_ms);
+}
+
+/// Whether the term on screen has been put to the relays.
+pub fn searchAskedForTest() bool {
+    return g_search_term_len > 0 and g_search_asked == g_search_gen.load(.acquire);
+}
+
+pub fn searchGenForTest() u32 {
+    return g_search_gen.load(.acquire);
+}
+
+/// A relay thread's hand-off, without the thread.
+pub fn searchArrivedForTest(gen: u32, relay: u8, pubkey: [32]u8) void {
+    searchArrived(gen, relay, pubkey);
+}
+
+/// What a relay thread does with one event.
+pub fn searchAcceptForTest(gen: u32, relay: u8, signer: nostr.keys.Signer, ev: nostr.event.Event) bool {
+    const job = SearchJob{ .gen = gen, .relay = relay, .url = "", .term = undefined, .term_len = 0 };
+    return searchAccept(std.heap.page_allocator, signer, job, ev);
+}
+
+pub fn searchSetStatusForTest(relay: usize, state: search.RelayState, count: u16) void {
+    g_search_status[relay].store((search.Status{ .gen = g_search_gen.load(.acquire), .state = state, .count = count }).pack(), .release);
+}
+
+pub fn searchRelayCountForTest() usize {
+    return searchRelays().len;
+}
+
+pub fn searchRelayUrlForTest(i: usize) []const u8 {
+    return searchRelays()[i];
+}
+
+pub fn nip05AskedForTest() bool {
+    return g_nip05_ask != null;
+}
+
+pub fn handleNip05FoundForTest(model: *Model, response: native_sdk.EffectResponse) void {
+    handleNip05Found(model, response);
+}
+
+pub const nip05_lookup_key_for_test = nip05_lookup_key;
+pub const search_scan_page_for_test = search_scan_page;
 
 fn openEvent(model: *Model, id: [32]u8) void {
     // A quote card or pill for an `naddr` carries the address's stand-in key

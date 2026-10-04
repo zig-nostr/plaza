@@ -22,9 +22,7 @@ client.
 > pool of background threads keeps filled, no IPC on the read path, so it is on
 > screen before any relay answers. Composing signs a note (in the keyholder, or
 > by a round-trip to an external signer), stores it at once and publishes it to
-> the pool. Paste an address (Cmd+L) and Plaza opens what it names: a note, a
-> person, or a place, including one on relays you do not read, because an
-> address that carries relay hints is asked there too. Plaza gives hints back: an address it copies, and the reply, quote, repost and like it publishes, name a relay the note was seen on or one its author writes to, and name none when it knows of none. A `plaza://place/` link
+> the pool. Search (the magnifier in the rail, or Cmd+L) finds a person by name. The profiles already on your machine answer first, instantly and with the network off, ranked with the people you follow first and then the people who follow you. Once you stop typing, NIP-50 search relays are asked too, and each result says which relay returned it, with every relay named whether it found anyone or not. The same field takes an address, and opens what it names: an npub or nprofile, a `name@domain` NIP-05 address, a note, or a place, including one on relays you do not read, because an address that carries relay hints is asked there too. Plaza gives hints back: an address it copies, and the reply, quote, repost and like it publishes, name a relay the note was seen on or one its author writes to, and name none when it knows of none. A `plaza://place/` link
 > opens somebody else's corner of Nostr: their relay, and whatever it serves,
 > without disturbing your own. Plaza also says when a newer version of itself is
 > out, with one press to the release page. It tells you rather than replacing
@@ -35,7 +33,7 @@ client.
 > not played in place yet.
 >
 > Not there yet: playing a video where it sits, putting a picture in a note,
-> setting an avatar, sending a zap, search, and private messages.
+> setting an avatar, sending a zap, searching notes, and private messages.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 

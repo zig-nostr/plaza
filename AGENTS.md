@@ -14,6 +14,7 @@ Plaza never holds a secret key. It ships [Notary](https://github.com/zig-nostr/n
 src/main.zig         # the app: model, update, the hand-written feed view, relay and store work
 src/tests.zig        # the test suite
 src/onboarding.native  # declarative markup for the static screens
+src/search.zig       # finding a person: matching, ranking, the NIP-50 request and relay status
 src/theme.zig        # colors and type
 src/painted.zig      # custom-drawn pieces
 app.zon              # app manifest; its .version is the release version

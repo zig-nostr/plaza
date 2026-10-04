@@ -24701,13 +24701,15 @@ test "an address Plaza cannot read keeps the field open with what was typed in i
     main.update(&model, Msg.open_address, &fx);
     try testing.expect(model.address_open);
 
-    main.update(&model, Msg{ .address_edit = .{ .insert_text = "not an address" } }, &fx);
+    // Starts like an address and does not decode. Plain words would not do: the
+    // same field finds people by name, so those are a search and not a refusal.
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "npub1notreal" } }, &fx);
     main.update(&model, Msg.address_submit, &fx);
 
     // Open, with the text still there: the reader is about to fix a character,
     // and a field that empties itself on a refusal makes them paste again.
     try testing.expect(model.address_open);
-    try testing.expectEqualStrings("not an address", model.address_draft());
+    try testing.expectEqualStrings("npub1notreal", model.address_draft());
     try testing.expectEqual(main.AddressError.unreadable, model.address_error);
 
     // And the sheet says so, rather than still offering the hint.
@@ -25039,7 +25041,7 @@ test "every glyph the rail asks for is a real glyph" {
     }
 }
 
-test "the rail opens an address, signed in or not" {
+test "the rail opens search, signed in or not" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -25055,7 +25057,7 @@ test "the rail opens an address, signed in or not" {
         var model = main.initialModel();
         model.stage = .ready;
         const tree = try buildTree(arena, &model);
-        const msg = pressMsgByLabel(tree, "Open an address") orelse return error.GuestRailHasNoAddressTile;
+        const msg = pressMsgByLabel(tree, "Search") orelse return error.GuestRailHasNoAddressTile;
         switch (msg) {
             .open_address => {},
             else => return error.RailTileGoesSomewhereElse,
@@ -25068,7 +25070,7 @@ test "the rail opens an address, signed in or not" {
         var model = main.initialModel();
         model.stage = .ready;
         const tree = try buildTree(arena, &model);
-        const msg = pressMsgByLabel(tree, "Open an address") orelse return error.SignedInRailHasNoAddressTile;
+        const msg = pressMsgByLabel(tree, "Search") orelse return error.SignedInRailHasNoAddressTile;
         switch (msg) {
             .open_address => {},
             else => return error.RailTileGoesSomewhereElse,
@@ -28822,4 +28824,669 @@ test "a quoted note and a mentioned person carry the hints Plaza knows" {
         try testing.expectEqual(@as(usize, 3), p.len);
         try testing.expectEqualStrings(hint_b, p[2]);
     }
+}
+
+// ---------------------------------------------------------- finding a person
+//
+// The field that opens an address finds people by name too. Two halves answer:
+// every profile already on this machine, instantly and offline, then NIP-50
+// search relays, folded in as they land and each marked with where it came from.
+// These cover the matching and the ranking (`search.zig`), the field's decision
+// about what a string is, and the hand-off from the relay threads to the list.
+
+const search = main.search;
+
+fn profileEvent(arena: std.mem.Allocator, signer: nostr.keys.Signer, seed: u8, created_at: i64, json: []const u8) !nostr.event.Event {
+    const kp = try signer.keyPairFromSecretKey([_]u8{seed} ** 32);
+    return signedKind(arena, signer, kp, created_at, 0, &.{}, json);
+}
+
+fn typeIntoSearch(model: *Model, text: []const u8) void {
+    var fx: main.EffectsForTest = undefined;
+    main.update(model, Msg.open_address, &fx);
+    main.update(model, Msg{ .address_edit = .{ .insert_text = text } }, &fx);
+}
+
+test "a term matches at the start, at a word, or anywhere, and says which" {
+    try testing.expectEqual(search.Quality.exact, search.quality("jack", "JACK").?);
+    try testing.expectEqual(search.Quality.prefix, search.quality("Jackson", "jack").?);
+    try testing.expectEqual(search.Quality.word, search.quality("Black Jack", "jack").?);
+    // The domain half of an address is a word of its own: `@` is a boundary.
+    try testing.expectEqual(search.Quality.word, search.quality("bob@jack.example", "jack").?);
+    try testing.expectEqual(search.Quality.within, search.quality("Hijack", "jack").?);
+    try testing.expect(search.quality("Alice", "jack") == null);
+    // The best occurrence wins, not the first.
+    try testing.expectEqual(search.Quality.word, search.quality("Hijack jack", "jack").?);
+}
+
+test "the people who follow are listed before the people who are followed back before everyone" {
+    const gpa = testing.allocator;
+    var b = search.Builder.init(gpa);
+    defer b.deinit();
+    const pk = struct {
+        fn of(n: u8) [32]u8 {
+            return [_]u8{n} ** 32;
+        }
+    }.of;
+    // Added newest-last on purpose, so order cannot come from insertion.
+    try b.add(pk(1), .seen, 100, "Jackson", "", "");
+    try b.add(pk(2), .seen, 100, "Hijack", "", "");
+    try b.add(pk(3), .follows_me, 100, "Jack", "", "");
+    try b.add(pk(4), .follows, 100, "Black Jack", "", "");
+    try b.add(pk(5), .seen, 100, "Bob", "", "bob@jack.example");
+    try b.add(pk(6), .seen, 100, "Nobody Relevant", "", "");
+    var index = try b.finish();
+    defer index.deinit(gpa);
+
+    var hits: [8]search.Hit = undefined;
+    const n = index.find("JACK", &hits);
+    try testing.expectEqual(@as(usize, 5), n);
+    const order = [_]u8{ 4, 3, 1, 5, 2 };
+    for (order, 0..) |want, i| {
+        try testing.expectEqual(want, index.entries[hits[i].entry].pubkey[0]);
+    }
+
+    // A short list keeps the best, not the first: the cap never costs the top.
+    var two: [2]search.Hit = undefined;
+    try testing.expectEqual(@as(usize, 2), index.find("jack", &two));
+    try testing.expectEqual(@as(u8, 4), index.entries[two[0].entry].pubkey[0]);
+    try testing.expectEqual(@as(u8, 3), index.entries[two[1].entry].pubkey[0]);
+}
+
+test "a term is cleaned the way it is sent" {
+    var buf: [search.term_max]u8 = undefined;
+    try testing.expectEqualStrings("Jack dorsey", search.cleanTerm(&buf, "  @Jack\n  dorsey  ").?);
+    try testing.expect(search.cleanTerm(&buf, " \n\t ") == null);
+    try testing.expect(search.cleanTerm(&buf, "@@") == null);
+    // Cut at the cap, and never in the middle of a character.
+    const long = "a" ** (search.term_max - 1) ++ "\u{00e9}";
+    const cut = search.cleanTerm(&buf, long).?;
+    try testing.expect(cut.len <= search.term_max);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+test "the search request is the NIP-50 shape and survives a hostile term" {
+    const gpa = testing.allocator;
+    const text = try search.requestText(gpa, "al\"ice\\ \u{00e9}\n");
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array.items;
+    try testing.expectEqualStrings("REQ", arr[0].string);
+    try testing.expectEqualStrings(search.sub_id, arr[1].string);
+    const filter = arr[2].object;
+    try testing.expectEqualStrings("al\"ice\\ \u{00e9}\n", filter.get("search").?.string);
+    try testing.expectEqual(@as(i64, 0), filter.get("kinds").?.array.items[0].integer);
+    try testing.expectEqual(@as(i64, search.relay_limit), filter.get("limit").?.integer);
+}
+
+test "a relay's state and count travel as one word" {
+    const s = search.Status{ .gen = 7, .state = .answered, .count = 12 };
+    const back = search.Status.unpack(s.pack());
+    try testing.expectEqual(@as(u32, 7), back.gen);
+    try testing.expectEqual(search.RelayState.answered, back.state);
+    try testing.expectEqual(@as(u16, 12), back.count);
+
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("found no one", search.describe(&buf, .answered, 0));
+    try testing.expectEqualStrings("1 person", search.describe(&buf, .answered, 1));
+    try testing.expectEqualStrings("3 people", search.describe(&buf, .answered, 3));
+    try testing.expectEqualStrings("could not connect", search.describe(&buf, .unreachable_, 0));
+    try testing.expectEqualStrings("did not answer", search.describe(&buf, .silent, 0));
+}
+
+test "the field knows an address, a NIP-05 name and a name apart" {
+    try testing.expectEqual(main.SearchInput.blank, main.classifySearch("  \n"));
+    try testing.expectEqual(main.SearchInput.term, main.classifySearch("alice"));
+    try testing.expectEqual(main.SearchInput.term, main.classifySearch("@alice"));
+    try testing.expectEqual(main.SearchInput.term, main.classifySearch("alice smith"));
+
+    // Anything that starts like an address is one, decoded or not: half a paste
+    // is a typo to be told about, never a name to put to three relays.
+    for ([_][]const u8{ "npub1", "npub1abc", "nprofile1xyz", "note1q", "nevent1q", "naddr1q", "nostr:npub1abc", "https://njump.me/npub1abc" }) |s| {
+        try testing.expectEqual(main.SearchInput.address, main.classifySearch(s));
+    }
+
+    try testing.expectEqual(main.SearchInput.nip05, main.classifySearch("alice@example.com"));
+    try testing.expectEqual(main.SearchInput.nip05, main.classifySearch(" _@example.com "));
+    // Not addresses: no dot in the domain, an IP literal, a port, two `@`.
+    for ([_][]const u8{ "alice@example", "alice@10.0.0.1", "alice@example.com:8080", "a@b@example.com", "alice@" }) |s| {
+        try testing.expectEqual(main.SearchInput.term, main.classifySearch(s));
+    }
+    const parts = main.nip05Address("Alice@Example.COM").?;
+    try testing.expectEqualStrings("alice", parts.name());
+    try testing.expectEqualStrings("example.com", parts.domain());
+}
+
+test "a well-known document names the person and the relays they use" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const hex = "ab" ** 32;
+    const body = "{\"names\":{\"alice\":\"" ++ hex ++ "\",\"short\":\"abcd\"},\"relays\":{\"" ++ hex ++
+        "\":[\"wss://relay.example.com\",\"ws://insecure.example.com\",\"wss://bad host\"]}}";
+    const hit = main.nip05Resolve(arena, "alice", body).?;
+    try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &hit.pubkey);
+    // Only a relay Plaza would dial anyway.
+    try testing.expectEqual(@as(usize, 1), hit.relays.len);
+    try testing.expectEqualStrings("wss://relay.example.com", hit.relays[0]);
+
+    try testing.expect(main.nip05Resolve(arena, "bob", body) == null);
+    try testing.expect(main.nip05Resolve(arena, "short", body) == null);
+    try testing.expect(main.nip05Resolve(arena, "alice", "not json") == null);
+    try testing.expect(main.nip05Resolve(arena, "alice", "{\"names\":[]}") == null);
+}
+
+test "profiles on this machine are found by any part of a name, and the follows come first" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/findlocal.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfilesForTest();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    main.setIdentityForTest([_]u8{0x7a} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&me_hex, "{x}", .{&me});
+
+    // 0x21 is followed, 0x22 follows the reader, the rest are strangers.
+    const people = [_]struct { seed: u8, json: []const u8 }{
+        .{ .seed = 0x21, .json = "{\"display_name\":\"Black Jack\"}" },
+        .{ .seed = 0x22, .json = "{\"name\":\"jack\"}" },
+        .{ .seed = 0x23, .json = "{\"name\":\"jackson\"}" },
+        .{ .seed = 0x24, .json = "{\"display_name\":\"Hijack\"}" },
+        .{ .seed = 0x25, .json = "{\"name\":\"bob\",\"nip05\":\"bob@jack.example\"}" },
+        .{ .seed = 0x26, .json = "{\"name\":\"zed\"}" },
+        // Nothing to find it by.
+        .{ .seed = 0x27, .json = "{\"about\":\"jack of nothing\"}" },
+    };
+    var pks: [people.len][32]u8 = undefined;
+    for (people, 0..) |person, i| {
+        const ev = try profileEvent(arena, signer, person.seed, 1_800_000_000, person.json);
+        pks[i] = ev.pubkey;
+        _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    }
+    _ = main.setFollowsForTest(&.{pks[0]}, 1_800_000_001);
+    const kp22 = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const followed_back = try signedKind(arena, signer, kp22, 1_800_000_002, 3, &[_]nostr.event.Tag{&.{ "p", &me_hex }}, "");
+    _ = try main.plazaIngestVerifiedForTest(arena, followed_back, signer);
+
+    main.searchIndexRefreshForTest();
+    // The profile with only an `about` is not in it: nothing to match on.
+    try testing.expectEqual(@as(usize, 6), main.searchIndexLenForTest());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "JACK");
+
+    // Five matches, in the order the field promises, and not one network call:
+    // typing alone has asked no relay.
+    try testing.expect(!main.searchAskedForTest());
+    try testing.expectEqual(@as(usize, 5), main.searchRowCountForTest());
+    const want = [_]usize{ 0, 1, 2, 4, 3 };
+    for (want, 0..) |who, i| {
+        try testing.expectEqualSlices(u8, &pks[who], &main.searchRowPubkeyForTest(i));
+        try testing.expect(main.searchRowLocalForTest(i));
+        try testing.expectEqual(@as(u8, 0), main.searchRowRelaysForTest(i));
+    }
+
+    // Matching an address's domain alone is enough.
+    var by_domain = main.initialModel();
+    by_domain.stage = .ready;
+    typeIntoSearch(&by_domain, "jack.exam");
+    try testing.expectEqual(@as(usize, 1), main.searchRowCountForTest());
+    try testing.expectEqualSlices(u8, &pks[4], &main.searchRowPubkeyForTest(0));
+    // The row shows the address that put it in the list, so it is never a
+    // mystery why Bob is there, even though nobody has checked it yet.
+    {
+        const tree = try buildTree(arena, &by_domain);
+        try testing.expect(findAnyText(tree.root, "bob@jack.example") != null);
+        try testing.expect(findAnyText(tree.root, "this device") != null);
+    }
+
+    // And somebody the reader has muted is not offered.
+    try testing.expect(main.setMutesForTest(&.{pks[1]}, 1_800_000_003));
+    defer main.forgetMutesForTest();
+    var muted = main.initialModel();
+    muted.stage = .ready;
+    typeIntoSearch(&muted, "jack");
+    try testing.expectEqual(@as(usize, 4), main.searchRowCountForTest());
+    for (0..main.searchRowCountForTest()) |i| {
+        try testing.expect(!std.mem.eql(u8, &pks[1], &main.searchRowPubkeyForTest(i)));
+    }
+}
+
+test "the index reads every page of profiles, not just the first" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/pages.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.clearIdentityForTest();
+
+    // One more than a page, each its own author with its own second, so the
+    // oldest is on the second page and only a build that pages can see it.
+    const total = main.search_scan_page_for_test + 5;
+    for (0..total) |i| {
+        var secret = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, secret[0..4], @intCast(i + 1), .big);
+        secret[31] = 1;
+        const kp = try signer.keyPairFromSecretKey(secret);
+        const json = try std.fmt.allocPrint(arena, "{{\"name\":\"person{d}\"}}", .{i});
+        const ev = try signedKind(arena, signer, kp, 1_700_000_000 + @as(i64, @intCast(i)), 0, &.{}, json);
+        _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    }
+    main.searchIndexRefreshForTest();
+    try testing.expectEqual(total, main.searchIndexLenForTest());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    // The very first one written, the last the newest-first walk reaches.
+    typeIntoSearch(&model, "person0");
+    try testing.expect(main.searchRowCountForTest() >= 1);
+}
+
+test "typing asks the relays once the typing stops, once" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    typeIntoSearch(&model, "alice");
+    const gen = main.searchGenForTest();
+    // Still typing: not yet.
+    main.searchTickForTest(&model, 0);
+    try testing.expect(!main.searchAskedForTest());
+
+    // Typed on, which starts the wait again.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "x" } }, &fx);
+    try testing.expect(main.searchGenForTest() != gen);
+    main.searchTickForTest(&model, 100);
+    try testing.expect(!main.searchAskedForTest());
+
+    // Quiet for long enough: asked, and asking again changes nothing.
+    main.searchTickForTest(&model, 100_000);
+    try testing.expect(main.searchAskedForTest());
+
+    // A single letter is never sent on its own.
+    var one = main.initialModel();
+    one.stage = .ready;
+    typeIntoSearch(&one, "a");
+    main.searchTickForTest(&one, 100_000);
+    try testing.expect(!main.searchAskedForTest());
+
+    // An address is not a name, so it never goes to a relay.
+    var addr = main.initialModel();
+    addr.stage = .ready;
+    typeIntoSearch(&addr, "npub1abc");
+    main.searchTickForTest(&addr, 100_000);
+    try testing.expect(!main.searchAskedForTest());
+    try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+
+    // Nor a NIP-05 address: the domain answers that, not the search relays.
+    var nip = main.initialModel();
+    nip.stage = .ready;
+    typeIntoSearch(&nip, "alice@example.com");
+    main.searchTickForTest(&nip, 100_000);
+    try testing.expect(!main.searchAskedForTest());
+}
+
+test "people the relays name are folded in, marked with who named them, and counted once" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/fold.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfilesForTest();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.clearIdentityForTest();
+
+    // One person the store already holds, one it does not.
+    const held = try profileEvent(arena, signer, 0x31, 1_800_000_000, "{\"name\":\"alice held\"}");
+    _ = try main.plazaIngestVerifiedForTest(arena, held, signer);
+    const stranger = try profileEvent(arena, signer, 0x32, 1_800_000_000, "{\"display_name\":\"Alicia Stranger\"}");
+    main.searchIndexRefreshForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "ali");
+    const gen = main.searchGenForTest();
+    try testing.expectEqual(@as(usize, 1), main.searchRowCountForTest());
+    try testing.expect(main.searchRowLocalForTest(0));
+
+    // A relay thread's work on an event: verified, stored, handed over.
+    try testing.expect(main.searchAcceptForTest(gen, 0, signer, stranger));
+    // Not a profile, so not a person.
+    const note = try signedNote(arena, signer, try signer.keyPairFromSecretKey([_]u8{0x33} ** 32), 1_800_000_000, "hi");
+    try testing.expect(!main.searchAcceptForTest(gen, 0, signer, note));
+    // A forgery is dropped at the door.
+    var forged = stranger;
+    forged.content = "{\"name\":\"someone else\"}";
+    try testing.expect(!main.searchAcceptForTest(gen, 0, signer, forged));
+
+    // The same stranger from a second relay, the held person from the first, and
+    // an answer to a term that has since been replaced.
+    main.searchArrivedForTest(gen, 1, stranger.pubkey);
+    main.searchArrivedForTest(gen, 0, held.pubkey);
+    main.searchArrivedForTest(gen -% 1, 2, [_]u8{0x99} ** 32);
+
+    main.searchTickForTest(&model, 0);
+    try testing.expectEqual(@as(usize, 2), main.searchRowCountForTest());
+
+    // The person already held stays where they were, and gains the relay.
+    try testing.expectEqualSlices(u8, &held.pubkey, &main.searchRowPubkeyForTest(0));
+    try testing.expect(main.searchRowLocalForTest(0));
+    try testing.expectEqual(@as(u8, 0b001), main.searchRowRelaysForTest(0));
+    // The stranger is one row naming both relays that returned them.
+    try testing.expectEqualSlices(u8, &stranger.pubkey, &main.searchRowPubkeyForTest(1));
+    try testing.expect(!main.searchRowLocalForTest(1));
+    try testing.expectEqual(@as(u8, 0b011), main.searchRowRelaysForTest(1));
+
+    // And the sheet says so, by relay name, with the profile read from the store.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyText(tree.root, "Alicia Stranger") != null);
+    const first = main.searchRelayUrlForTest(0);
+    const second = main.searchRelayUrlForTest(1);
+    const both = try std.fmt.allocPrint(arena, "{s}, {s}", .{ main.relayShortName(first), main.relayShortName(second) });
+    try testing.expect(findAnyTextContainingText(tree.root, both) != null);
+    const device = try std.fmt.allocPrint(arena, "this device, {s}", .{main.relayShortName(first)});
+    try testing.expect(findAnyTextContainingText(tree.root, device) != null);
+
+    // Editing the term drops what the old one found.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "z" } }, &fx);
+    main.searchArrivedForTest(gen, 0, stranger.pubkey);
+    main.searchTickForTest(&model, 0);
+    try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+}
+
+test "a relay that found no one is named, not left out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "nobody here");
+
+    main.searchSetStatusForTest(0, .answered, 0);
+    main.searchSetStatusForTest(1, .unreachable_, 0);
+    main.searchSetStatusForTest(2, .declined, 0);
+
+    const tree = try buildTree(arena, &model);
+    // Every relay has its own line, with what became of it.
+    for (0..main.searchRelayCountForTest()) |i| {
+        try testing.expect(findAnyText(tree.root, main.relayShortName(main.searchRelayUrlForTest(i))) != null);
+    }
+    try testing.expect(findAnyText(tree.root, "found no one") != null);
+    try testing.expect(findAnyText(tree.root, "could not connect") != null);
+    try testing.expect(findAnyText(tree.root, "does not take searches") != null);
+    // And the list itself says nobody turned up, rather than showing a blank.
+    try testing.expect(findAnyTextContainingText(tree.root, "the search relays found no one") != null);
+}
+
+test "an empty field says what it takes and where a name goes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg.open_address, &fx);
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContainingText(tree.root, "Nothing leaves it until you stop typing") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "name@domain") != null);
+    // The relays a name will be put to are named before anything is typed.
+    for (0..main.searchRelayCountForTest()) |i| {
+        try testing.expect(findAnyTextContainingText(tree.root, main.relayShortName(main.searchRelayUrlForTest(i))) != null);
+    }
+    // Nothing to act on yet.
+    try testing.expectEqualStrings("Open", model.address_action());
+    try testing.expect(model.address_empty());
+}
+
+test "one field: the button says what Enter will do with what is in it" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg.open_address, &fx);
+
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "alice" } }, &fx);
+    try testing.expectEqualStrings("Search relays", model.address_action());
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "@example.com" } }, &fx);
+    try testing.expectEqualStrings("Look up", model.address_action());
+
+    var addr = main.initialModel();
+    addr.stage = .ready;
+    main.update(&addr, Msg.open_address, &fx);
+    main.update(&addr, Msg{ .address_edit = .{ .insert_text = "npub1abc" } }, &fx);
+    try testing.expectEqualStrings("Open", addr.address_action());
+}
+
+test "an npub typed into the field opens that person, not a search" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    const pk = [_]u8{0x44} ** 32;
+    const relays = [_][]const u8{"wss://one.example"};
+    for ([_][]const u8{
+        try nostr.nip19.encodeNpub(arena, pk),
+        try nostr.nip19.encodeNprofile(arena, pk, &relays),
+        try std.fmt.allocPrint(arena, "nostr:{s}", .{try nostr.nip19.encodeNpub(arena, pk)}),
+    }) |address| {
+        var model = main.initialModel();
+        model.stage = .ready;
+        var fx: main.EffectsForTest = undefined;
+        typeIntoSearch(&model, address);
+        // Nothing is listed or asked for while it is typed.
+        try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+        main.update(&model, Msg.address_submit, &fx);
+        try testing.expect(!model.address_open);
+        try testing.expect(model.viewing_profile != null);
+        try testing.expectEqualSlices(u8, &pk, &model.viewing_profile.?);
+        try testing.expect(!main.searchAskedForTest());
+    }
+}
+
+test "a NIP-05 address typed into the field opens the person its domain names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    const hex = "cd" ** 32;
+    const body = "{\"names\":{\"alice\":\"" ++ hex ++ "\"}}";
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    typeIntoSearch(&model, "alice@example.com");
+    main.update(&model, Msg.address_submit, &fx);
+    // Waiting on the domain, with the field still up.
+    try testing.expect(main.nip05AskedForTest());
+    try testing.expect(model.address_open);
+
+    main.handleNip05FoundForTest(&model, .{ .key = main.nip05_lookup_key_for_test, .status = 200, .body = body });
+    try testing.expect(!model.address_open);
+    try testing.expect(model.viewing_profile != null);
+    try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 32), &model.viewing_profile.?);
+    try testing.expect(!main.nip05AskedForTest());
+}
+
+test "a NIP-05 lookup that fails says why and leaves the field to be fixed" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    var fx: main.EffectsForTest = undefined;
+    const ok_key = main.nip05_lookup_key_for_test;
+
+    // The domain does not list the name.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        typeIntoSearch(&model, "bob@example.com");
+        main.update(&model, Msg.address_submit, &fx);
+        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 200, .body = "{\"names\":{}}" });
+        try testing.expect(model.address_open);
+        try testing.expectEqual(main.AddressError.not_found, model.address_error);
+        try testing.expectEqualStrings("bob@example.com", model.address_draft());
+    }
+    // The domain did not answer properly.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        typeIntoSearch(&model, "bob@example.com");
+        main.update(&model, Msg.address_submit, &fx);
+        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 503, .body = "" });
+        try testing.expect(model.address_open);
+        try testing.expectEqual(main.AddressError.lookup_failed, model.address_error);
+        try testing.expect(model.viewing_profile == null);
+    }
+    // The reader typed on while it was out: the answer is to a question nobody
+    // is asking, and navigates nowhere.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        typeIntoSearch(&model, "bob@example.com");
+        main.update(&model, Msg.address_submit, &fx);
+        main.update(&model, Msg{ .address_edit = .{ .insert_text = "x" } }, &fx);
+        const hex = "ef" ** 32;
+        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 200, .body = "{\"names\":{\"bob\":\"" ++ hex ++ "\"}}" });
+        try testing.expect(model.address_open);
+        try testing.expect(model.viewing_profile == null);
+    }
+}
+
+test "pressing a result opens that person and puts the field away" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/press.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfilesForTest();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    const ev = try profileEvent(arena, signer, 0x41, 1_800_000_000, "{\"name\":\"pressme\"}");
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.searchIndexRefreshForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "pressme");
+    const tree = try buildTree(arena, &model);
+    // The row is a button carrying the person, found by the name it shows.
+    const msg = pressMsgByLabel(tree, "pressme") orelse return error.ResultIsNotPressable;
+    switch (msg) {
+        .search_pick => |pk| try testing.expectEqualSlices(u8, &ev.pubkey, &pk),
+        else => return error.ResultPressesSomethingElse,
+    }
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, msg, &fx);
+    try testing.expect(!model.address_open);
+    try testing.expectEqualSlices(u8, &ev.pubkey, &model.viewing_profile.?);
+    try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+}
+
+test "the search sheet fits the view budget with a full list over the deepest thing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "full");
+    // As many rows as the list can ever hold.
+    const gen = main.searchGenForTest();
+    for (0..main.search_rows_max) |i| main.searchArrivedForTest(gen, @intCast(i % 3), [_]u8{@intCast(i + 1)} ** 32);
+    main.searchTickForTest(&model, 0);
+    try testing.expectEqual(main.search_rows_max, main.searchRowCountForTest());
+
+    const author = [_]u8{0x55} ** 32;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = author;
+    var n: usize = 0;
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        model.thread_notes[n] = threadNote(0x10 + i, 200 + @as(i64, i), 0xAA);
+        model.thread_notes[n].pubkey = author;
+        model.thread_notes[n].id = @as(i64, i) + 10;
+        n += 1;
+    }
+    model.thread_notes_len = n;
+    for (0..main.thread_depth_max) |d| {
+        model.thread_stack[d] = .{ .note = threadNote(0xC0 + @as(u8, @intCast(d)), 50, 0) };
+        model.thread_stack[d].note.id = 500 + @as(i64, @intCast(d));
+        model.thread_stack[d].note.pubkey = author;
+    }
+    model.thread_stack_len = main.thread_depth_max;
+
+    const p = painted.Painted.render(arena, &model) catch |err| {
+        std.debug.print("search sheet over a full back stack refused: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    // Inside the ceiling AND leaving a tenth of it free, the margin the other
+    // sheets keep.
+    try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view / 10 * 9);
 }
