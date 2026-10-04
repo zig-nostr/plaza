@@ -44,6 +44,14 @@ const upsertProfile = main.upsertProfile;
 const wantProfileHinted = main.wantProfileHinted;
 const watchOneShot = main.watchOneShot;
 
+// ------------------------------------------------------- finding a person
+//
+// The field that opens an address finds people by name as well, because it is
+// the one place somebody goes to say who they mean. Two sources answer it, and
+// they are not mixed up: every profile already on this machine, instantly and
+// with the network off, then NIP-50 search relays, whose results are folded in
+// as they land and each marked with the relay that gave it.
+
 /// Most rows the results list holds, and how many of those can be people the
 /// store already knew. This is a node budget as much as a taste: the sheet is
 /// stacked over the feed, and a row costs about a dozen of the 1024 nodes a view
@@ -630,6 +638,8 @@ pub fn submitAddress(model: *Model, fx: *Effects) void {
         .term => searchAskRelays(),
     }
 }
+
+// --- test seams
 
 /// Back to a fresh start: no index, no rows, no relay state.
 pub fn searchResetForTest() void {

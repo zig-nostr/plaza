@@ -23,6 +23,23 @@ const noteFrom = main.noteFrom;
 const repostTargetId = main.repostTargetId;
 const thread_reply_cap = main.thread_reply_cap;
 
+// -- What just arrived -------------------------------------------------------
+//
+// The feed used to answer "has anything changed" by asking the store for the
+// whole thing again, once a second, on the render thread: a cursor per followed
+// author and a linear pick across all of them per note returned. Measured in the
+// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
+// screenful and 10.8 ms once the reader has paged twenty pages down, against a
+// 16.7 ms frame. The cost is set by how many people the reader follows, not by
+// how much actually changed, and almost nothing changes between two ticks.
+//
+// So the ingest threads say what landed instead. No reference client re-reads
+// its store on arrival: Notedeck polls note keys ingested since the last poll
+// and merges them, Jumble splices the arriving event into a sorted array, and
+// Amethyst hands its filter only the new items. This is that, with the ids
+// carried across the thread boundary and the events read back by id, which is a
+// direct read each rather than a walk of the follow list.
+
 /// Ids of kind:1 events an ingest thread has just added to the store.
 ///
 /// Sized well past a busy second so the common case never overflows. A backfill

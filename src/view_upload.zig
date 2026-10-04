@@ -37,6 +37,8 @@ const uploadJobFor = main.uploadJobFor;
 const uploadServers = main.uploadServers;
 const vgap = main.vgap;
 
+// -------------------------------------------------------------------- views
+
 /// What sits in the composer, or beside a profile field, for putting a picture
 /// in: a button while there is nothing going on, and the card for the job while
 /// there is.

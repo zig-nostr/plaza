@@ -36,6 +36,18 @@ const signAndPublish = main.signAndPublish;
 const signerReady = main.signerReady;
 const takeFresh = main.takeFresh;
 
+// ---------------------------------------------------------------- muting
+//
+// The reader's NIP-51 mute list, read and honoured. Not written: a mute list is
+// REPLACEABLE, and the rule this app already learned about contact lists holds
+// here too, that nothing may write over a record it has not read back first.
+// Jumble does the careful version of that write (it re-fetches immediately
+// before every change, and when the fetch comes back empty it ASKS rather than
+// assuming there is nothing there, because "not found" and "the fetch failed"
+// look identical). Doing that properly is its own change; honouring a list made
+// elsewhere costs nothing and is most of the value, because muting is something
+// people mostly did in whatever client they came from.
+
 pub var g_mutes: [max_mutes][32]u8 = undefined;
 pub var g_mute_count: usize = 0;
 var g_mute_owner: ?[32]u8 = null;

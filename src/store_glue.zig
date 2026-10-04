@@ -30,6 +30,22 @@ const relay_list_kind = main.relay_list_kind;
 const releasePendingFollowBase = main.releasePendingFollowBase;
 const repost_kind = main.repost_kind;
 
+// ------------------------------------------------------- your own lists
+//
+// kind:0, kind:3 and kind:10002 are REPLACEABLE. The store enforces that the way
+// relays do: `ingestReplaceable` DELETES the superseded event and its indexes in
+// the same transaction. That is right for other people's records, and it means
+// that the moment a newer version of one of OUR OWN lists arrives, the version
+// it replaces is gone from this machine with no way back.
+//
+// Usually that is fine, because the newer one is ours too. It is not fine when
+// the newer one is wrong: a list published by a client with a bad clock, a list
+// this app itself published from a pool it should not have, a relay replaying
+// something ancient. Losing a contact list is not a display bug.
+//
+// So every ingest goes through one door, and that door keeps a copy of what is
+// about to be overwritten.
+
 /// How many superseded versions of each of our own lists to keep. Small on
 /// purpose: this is a way back from the last mistake, not an archive. The
 /// store's KV has no cursor and no delete, so a growing key scheme could never

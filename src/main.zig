@@ -159,88 +159,6 @@ pub const feed_column_width: f32 = 620;
 // width and one left edge.
 pub const thread_column_width: f32 = feed_column_width;
 
-// -- Where the people you follow actually write ------------------------------
-//
-// The suggestions used to be first come, first kept: the first six write relays
-// seen in anyone's kind:10002 filled the table and everything after was
-// dropped. Which six that is depends on whose relay list happened to arrive
-// first, so a relay one person uses could sit above one two hundred people use,
-// and the reader was being asked to add relays in arrival order.
-//
-// What the answer should be is the inversion every outbox implementation
-// starts with: turn "person -> relays they write to" into "relay -> people who
-// write there", and rank by how many. Jumble does exactly this, and takes each
-// author's top few write relays rather than all of them, on the reasoning
-// written into their source: most people do not understand relays and a list
-// of nine cannot be trusted to mean anything.
-//
-// Computed from the STORE rather than accumulated on ingest. The store already
-// holds one kind:10002 per author, which is the whole input, and counting on
-// arrival would need per-relay author sets to avoid counting one person twice
-// when their list is re-sent. Reading it back is both simpler and correct by
-// construction.
-
-// ------------------------------------------------------- your own lists
-//
-// kind:0, kind:3 and kind:10002 are REPLACEABLE. The store enforces that the way
-// relays do: `ingestReplaceable` DELETES the superseded event and its indexes in
-// the same transaction. That is right for other people's records, and it means
-// that the moment a newer version of one of OUR OWN lists arrives, the version
-// it replaces is gone from this machine with no way back.
-//
-// Usually that is fine, because the newer one is ours too. It is not fine when
-// the newer one is wrong: a list published by a client with a bad clock, a list
-// this app itself published from a pool it should not have, a relay replaying
-// something ancient. Losing a contact list is not a display bug.
-//
-// So every ingest goes through one door, and that door keeps a copy of what is
-// about to be overwritten.
-
-// ------------------------------------------------------------------- places
-//
-// A place is somebody else's Plaza, published as an event.
-//
-// fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
-// static site on your own domain. That works, and it costs a deploy per variant,
-// so you only get variants worth a deploy. His own suggestion for a native app
-// was the other shape: one binary, several rooms, each instantiated from a URL
-// or an event shared by whoever runs the community. Then a place costs nothing to
-// make, and you get the ones nobody would have deployed a site for: one
-// conference weekend, a reading group of nine people.
-//
-// This is the first slice of that. A place carries an app name, a home text, and
-// the relays its feeds read from. v1 reads the first two and one feed; the rest
-// of Hallway's surface (colours, kinds, publish targets, densities) arrives in
-// later versions against the same document.
-//
-// EVERYTHING HERE COMES FROM A STRANGER. A place is an event by definition
-// somebody else signed, so every field is bounded, copied into fixed storage,
-// and never trusted for its length. The relay URL is the sharp one: it decides
-// where the app connects.
-
-// -------------------------------------------------- things you can take away
-//
-// A client you can make quiet.
-//
-// Every element here is one the reader can remove, and the point of the whole
-// thing is the second column: a hidden thing should not be FETCHED. Hide
-// reaction counts and the subscription stops asking relays for kind:7, so the
-// preference is less bandwidth, less parsing and a smaller store rather than a
-// number painted over. It is also what makes the claim honest. "The data is
-// absent" and "the data is covered up" are different promises, and only one of
-// them can be made about a thing that is still being downloaded.
-//
-// A registry rather than a handful of booleans on the Model, because the ids are
-// written to a file and will eventually be a NIP-78 `kind:30078` record, and
-// because the same table drives the settings list. That list is not decoration:
-// hide something, forget, and there is nothing left to right click. One screen
-// naming everything that can be hidden is how this avoids the way hide-based
-// customisation usually fails.
-//
-// Subtractive on purpose. Taking things away cannot make the app ugly or slow;
-// rearranging can, and it would mean making the feed's layout data-driven, which
-// is an architectural change rather than a preference.
-
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Plaza canvas", .accessibility_label = "Plaza", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
@@ -293,23 +211,6 @@ pub var g_last_count: usize = std.math.maxInt(usize);
 /// otherwise see an unchanged count and never fill.
 var g_last_level_count: usize = std.math.maxInt(usize);
 
-// -- What just arrived -------------------------------------------------------
-//
-// The feed used to answer "has anything changed" by asking the store for the
-// whole thing again, once a second, on the render thread: a cursor per followed
-// author and a linear pick across all of them per note returned. Measured in the
-// library's benchmark at 2049 authors, ReleaseFast, best of fifty: 1.46 ms for a
-// screenful and 10.8 ms once the reader has paged twenty pages down, against a
-// 16.7 ms frame. The cost is set by how many people the reader follows, not by
-// how much actually changed, and almost nothing changes between two ticks.
-//
-// So the ingest threads say what landed instead. No reference client re-reads
-// its store on arrival: Notedeck polls note keys ingested since the last poll
-// and merges them, Jumble splices the arriving event into a sorted array, and
-// Amethyst hands its filter only the new items. This is that, with the ids
-// carried across the thread boundary and the events read back by id, which is a
-// direct read each rather than a walk of the follow list.
-
 /// Whether a secret key is sitting in THIS process.
 ///
 /// A constant false, and that is the assertion rather than a stub: there is no
@@ -331,62 +232,6 @@ pub fn holdsKeyInProcessForTest() bool {
 /// sends somebody looking for a typo that is not there.
 pub const AddressError = enum { none, unreadable, wrong_kind, not_found, lookup_failed };
 
-// --------------------------------------------------------------- media proxy
-//
-// The image registry decodes at most a 512x512 image and the fetch effect caps
-// bodies at 256 KiB, so a full-size photo can neither be downloaded nor decoded
-// as-is. Images are therefore requested at the size they will actually be drawn:
-// through a host's own resizer when it has one, otherwise through a
-// weserv-compatible proxy (the free public wsrv.nl by default, and any instance
-// the user prefers, including their own). Clearing the setting loads originals
-// straight from their host, which still works for anything small enough.
-
-// -- Asking on a socket that is already open ---------------------------------
-//
-// A one-shot fetch used to dial its own connection to every relay, serially,
-// and read until EOSE. Eight relays meant eight TLS handshakes for one question
-// about one profile, a thread parked for the duration, and a connect bounded
-// only by the operating system.
-//
-// The pool already holds those sockets. No client dials for a one-shot:
-// NDK, Jumble and welshman all bottom out in a pool lookup, every one of them.
-//
-// What makes a shared socket safe here is that there is no reply to deliver.
-// Every event a relay sends is ingested into the store by the thread that owns
-// that socket, whoever asked for it, and the render thread reads the store.
-// That is welshman's ingest policy, and it means a subscription id only has to
-// name a question, never a caller waiting on an answer.
-//
-// So this WRITES the REQ from the asking thread. Writes on a connection are
-// serialized inside the library (nostr v0.8.0), which is what makes it sound
-// while the owning thread is blocked reading the same socket.
-
-// ------------------------------------------------------------------ profiles
-//
-// Kind:0 metadata gives each author a display name and an avatar. The pool
-// ingests kind:0 for the feed's authors alongside their notes (the store keeps
-// only the newest per author, kind:0 being replaceable); the UI thread parses
-// them into this cache during the feed rebuild, keyed by pubkey. The feed reads
-// names and avatar image ids from the cache at render time, so a name or a
-// just-loaded avatar shows on the next frame without a re-query. Avatars are
-// fetched (bounded, cap-aware) and registered as canvas images; the cache is
-// UI-thread-only, so no synchronisation is needed.
-
-// ---------------------------------------------------------------- addresses
-//
-// An `naddr` names a replaceable event by its author, its kind and its `d` tag,
-// not by an id, and the event it names changes id every time its author edits
-// it. So nothing here is looked up by id: the question is always "the newest
-// copy of this coordinate", asked of the store first and of the relays after.
-//
-// Jumble resolves it the same way: the cache by coordinate first
-// (src/services/client.service.ts:891-936), then a filter of author + kind + `d`
-// (982-993) sent to the address's own relay hints or, when it has none, to the
-// author's first five write relays (1004-1009), keeping the newest answer
-// (1027). Plaza asks the hints and the author's write relays both, rather than
-// one or the other. Jumble also accepts a newer copy arriving afterwards and
-// swaps it in (src/hooks/useFetchEvent.tsx:39-54), which `g_address_want` does.
-
 /// Puts a loaded link preview in the cache, so a view test can render a card
 /// without a network round trip. The long-description case is the one that
 /// matters: it is what used to run off the side of the window.
@@ -399,63 +244,6 @@ pub fn noteWithLinkForTest(url: []const u8) Note {
     n.link_url_len = @intCast(u);
     return n;
 }
-
-// ------------------------------------------------------------ engagement counts
-//
-// Reply / repost / like / zap tallies per feed note, aggregated client-side (no
-// NIP-45 COUNT, whose relay support is spotty). Each ingest thread opens a second
-// subscription, `{kinds:[1,6,7,9735], "#e":[the notes it loaded]}`, and folds the
-// arriving events into this in-memory table, deduped across relays by event id.
-// The view reads it at render time. Counts are per session: a relaunch refetches
-// them, so nothing here is persisted.
-
-/// Notes that this relay has now delivered. Called from each relay's ingest
-/// thread as the event lands, so the count is of relays that ACTUALLY sent it.
-// ------------------------------------------------------------------- the inbox
-//
-// What other people did that was aimed at this reader: replies, mentions, likes,
-// reposts and zaps. It is the first surface in this app where a stranger can put
-// something in front of the reader, so what does NOT get in matters as much as
-// what does.
-//
-// One function decides three things at once: whether an event becomes an item,
-// which verb it is, and whether it counts toward the bell. Every client that
-// split those decisions ended up with a badge that disagreed with its own list.
-
-// -------------------------------------------------------- where a note can be found
-//
-// A relay hint is a claim, written into something other people will read, about
-// where a thing can be asked for. Plaza has taken hints since an `nevent1` that
-// names relays started getting those relays asked, and wrote none of its own:
-// the address it copied, the `e` tag under a reply and the `q` tag under a quote
-// all left the slot empty, so every other client was handed the problem Plaza
-// itself had been given a way to solve.
-//
-// Two things are known about where a note lives, and they prove different
-// amounts. A relay that DELIVERED the note holds it, because it just sent it. A
-// relay the AUTHOR lists as a write relay (their kind:10002) is where they say
-// they publish, which is likely and not verified. The order follows that:
-//
-//   1. a relay that delivered it and is also one of the author's write relays
-//   2. a relay that delivered it
-//   3. one of the author's write relays
-//
-// That is Amethyst's `Note.relayHintUrl`: the delivering relay that is in the
-// author's outbox set, then the first delivering relay, then the author's own
-// first outbox relay. Jumble's `getEventHint` is the second rule alone. The
-// third rule is only reached when nothing is known to have delivered the note,
-// which is a note read straight off disk after a restart.
-//
-// When none of the three applies the hint is EMPTY, and that is a considered
-// answer rather than a gap: a wrong hint costs every reader a socket to a relay
-// that does not have the note, and an empty one costs them nothing they were not
-// already paying.
-//
-// A relay is only offered when a stranger could dial it. `ws://` is cleartext,
-// and a private or loopback address in a published tag is useless to everyone
-// else and says something about the publisher's network that nobody asked them
-// to say. Jumble drops its own local-network relays from every hint for the
-// same reason (`getEventHints`, `isLocalNetworkUrl`).
 
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 pub fn nowSeconds() i64 {
@@ -2748,33 +2536,6 @@ pub fn refreshProfileNotesForTest(model: *Model) void {
 // `g_names_generation`).
 pub var g_notes_names_generation: u64 = 0;
 
-/// True when the well-known JSON maps the identifier's name to `pubkey`. This is
-/// the whole trust test: a check is drawn on this and nothing weaker.
-// --------------------------------------------------------------- the update
-//
-// Whoever installed Plaza is otherwise on that build until they happen to visit
-// the site, which makes shipping a fix worth less than it should be.
-//
-// TOLD, not done. Plaza is ad-hoc signed and installed by a script that clears
-// quarantine, and it is not going to replace its own bundle while running. A
-// line saying a newer version exists, with one press to go and get it, is the
-// honest amount of automation for how this app is distributed. The toolkit does
-// ship a signed self-updater; it swaps the bundle and relaunches, it is macOS
-// only while Plaza also ships Linux, and it wants a signed feed hosted
-// somewhere. All three are reasons this does not use it.
-//
-// The releases API, because that is the same document `scripts/install-macos.sh`
-// already reads. One source of truth for what the newest release is, rather than
-// a second one to keep in step.
-
-// --------------------------------------------------------------- image decode
-//
-// The canvas image registry decodes through the platform codec and refuses
-// anything over 512x512, with no downscaler of its own. Most real avatars and
-// nearly every feed photo are larger than that, so Plaza decodes and resizes
-// them itself: the platform decoder is tried first (it knows every format the
-// OS does, WebP and HEIC included), and stb takes over when it refuses.
-
 // -------------------------------------------------------------------- msg
 
 /// The chrome's anchored menus. These are floating surfaces positioned against
@@ -3292,19 +3053,6 @@ pub fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
-// ------------------------------------------------------------- the article reader
-//
-// A kind:30023 opened by id is a level of its own, drawn as a reader rather than
-// as a thread. It is the same level in every other way (the back-stack, the
-// scroll offset kept per level, the avatar and picture passes), so the only fork
-// is in `feedView`, which asks `isArticleRoot` of the level's root.
-//
-// The body is not baked into the `Note`: that struct carries a few kilobytes of
-// text because it is copied on every rebuild, and an article is tens of
-// kilobytes. It is read from the store when the level is first drawn and kept
-// here, cut into rows (see `article.chunk`) so that only the rows near the
-// viewport are built, the way the feed and the thread are.
-
 /// A profile's two tabs. "Notes" is what they wrote; "Replies" is what they
 /// wrote at somebody else.
 pub const ProfileTab = enum { notes, replies };
@@ -3358,35 +3106,11 @@ pub const Screen = struct {
     }
 };
 
-// ---------------------------------------------------------------- muting
-//
-// The reader's NIP-51 mute list, read and honoured. Not written: a mute list is
-// REPLACEABLE, and the rule this app already learned about contact lists holds
-// here too, that nothing may write over a record it has not read back first.
-// Jumble does the careful version of that write (it re-fetches immediately
-// before every change, and when the fetch comes back empty it ASKS rather than
-// assuming there is nothing there, because "not found" and "the fetch failed"
-// look identical). Doing that properly is its own change; honouring a list made
-// elsewhere costs nothing and is most of the value, because muting is something
-// people mostly did in whatever client they came from.
-
-// ------------------------------------------------------------- bookmarks
-
 /// Delivers one decrypt answer for slot zero the way the runtime would, so a
 /// test can drive a keyholder that refuses.
 pub fn deliverPrivateHalfForTest(status: u16, body: []const u8) void {
     deliverPrivateHalfKeyedForTest(privateHalfAskKeyForTest(0), status, body);
 }
-
-// ----------------------------------------------------------------- a person
-//
-// Everything the profile screen needs about somebody, read from the RAW kind:0
-// rather than the name-and-face cache. The cache models four fields and drops
-// the rest, which is right for a feed row and useless here: a profile is mostly
-// the fields it does not keep.
-//
-// Cached per pubkey for the life of a level, because a virtual list rebuilds its
-// visible rows every frame and a JSON parse per frame is not free.
 
 /// A real effect queue whose requests are only recorded, so a handler that asks
 /// for a clipboard write or a timer can run to its end in a test. The caller
@@ -5018,129 +4742,12 @@ pub fn initialModel() Model {
     return model;
 }
 
-// -------------------------------------------------------------- compose & post
-//
-// Posting is local-first: a composed note is signed, written to the local store
-// straight away (so it shows in the feed on the next tick), and published to the
-// pool on a detached thread. The feed dedupes by event id, so when a relay later
-// echoes our own note back through the ingest subscriptions it collapses onto
-// the local copy.
-
-// ------------------------------------------------------------ picture upload
-//
-// Putting a picture into a note, an avatar or a banner.
-//
-// The protocol is Blossom and `blossom.zig` holds it. What lives here is what
-// only the app can know: who is signed in, which signer will sign, which draft or
-// profile field the address belongs in, and what is on screen while it happens.
-//
-// The shape of one upload, because it spans three threads and a signer:
-//
-//   1. The reader presses a button, a file dialog opens, and a file is chosen.
-//      Nothing has left the machine.
-//   2. A worker reads it, checks what it is, removes location and camera
-//      metadata and works out the hash, size and blurhash. The card now says what
-//      will be sent and to which servers, and waits for a press on Upload.
-//   3. The press asks the signer for a kind:24242 token naming that hash. It goes
-//      through exactly the signer every other event goes through, so a Notary or
-//      a NIP-46 bunker prompts as it would for a note. The token is never stored
-//      and never published: it is a bearer credential for one file.
-//   4. A second worker sends the picture, server by server, until one takes it.
-//   5. The tick puts the returned address where the picture was asked for.
-//
-// A job is shared between the UI thread and at most one worker at a time, and it
-// is reference counted so that cancelling while a worker is mid-write cannot free
-// what the worker is reading. The UI holds one reference; each worker holds one
-// while it runs.
-
 /// The clock a token's expiry is checked against.
 pub fn nowSecondsForTest() i64 {
     return nowSeconds();
 }
 
 pub const BlossomEdit = enum { none, invalid, busy, unread, full, failed };
-
-// -------------------------------------------------------------------- views
-
-// ------------------------------------------------------------------------ likes
-//
-// A like is a NIP-25 kind:7 reaction with content "+", e/p/k-tagging the note.
-// It rides the same three sign paths as a post and is local-first and optimistic:
-// the heart fills the instant it is pressed (read from `g_my_likes` at render),
-// and the reaction publishes in the background. Un-like is a NIP-09 kind:5
-// deletion e-tagging our own reaction, since NIP-25 has no un-react. A guest
-// press cannot sign, so it is remembered and completed after sign-in.
-
-// -------------------------------------------------------------------- the outbox
-//
-// What happens to a note between pressing Post and knowing it is somewhere else.
-//
-// Publishing used to be fire-and-forget: a detached thread dialled every relay,
-// wrote the frame, read one message to flush it, and dropped the verdict. The
-// note was in the local store, so the feed showed it, and whether it ever
-// reached anyone was not a question the app could answer.
-//
-// Now every publish goes through a queue. Each entry names an event that is
-// already in the store's own tables (we ingest what we sign) and carries one bit
-// per relay: did that relay say OK. The queue is the app's answer to "is my note
-// out there", the status bar reads it, and it survives a quit, because a note
-// written on a train and lost on landing is the worst thing a client can do.
-//
-// The queue is small on purpose. It is not a retry engine for a broken network;
-// it is a record of what has not been acknowledged yet, drained whenever a relay
-// comes back.
-
-// ------------------------------------------------------------------------ threads
-//
-// A thread is the focused note plus the kind:1 replies that e-tag it. It is
-// layered OVER the feed, which stays mounted so its scroll offset survives.
-// Opening one snapshots the root, reads any replies already in the store, and
-// fires a one-shot fetch of the rest (with their engagement) into the store; the
-// replies are cached in the model so they are pressable (open as a sub-thread)
-// and get their pictures fetched, the same local-first path the feed uses.
-
-// ------------------------------------------------------- finding a person
-//
-// The field that opens an address finds people by name as well, because it is
-// the one place somebody goes to say who they mean. Two sources answer it, and
-// they are not mixed up: every profile already on this machine, instantly and
-// with the network off, then NIP-50 search relays, whose results are folded in
-// as they land and each marked with the relay that gave it.
-
-// --- test seams
-
-/// Fetches a note's replies (and their engagement) into the store, on a detached
-/// thread. One dial per relay: opening a thread is a rare, human-paced action, so
-// --------------------------------------------------------- the relay-list sweep
-//
-// Who to ask about the people nobody in the pool can answer for.
-//
-// Every author whose kind:10002 Plaza does not hold is asked of the indexers,
-// once per run. Eager over the whole follow list rather than lazily on a miss,
-// because the routing table has to be warm BEFORE the first feed REQ or the
-// feed goes to the wrong relays and the round trip is paid twice: three of the
-// four clients read do the eager sweep for exactly that reason, and welshman,
-// the one that does not, is also the one with no negative caching and an
-// unbounded retry.
-//
-// DEFERRED, and named rather than quietly skipped: the answer is not written
-// down across launches, so an author who has genuinely never published a
-// relay list is asked again next time Plaza starts. Within a run they are
-// asked once. Jumble is the only client of the five that persists a negative
-// result, and doing it properly means a `checked_at` per pubkey in the store
-// with a staleness rule, which is its own change.
-
-// ------------------------------------------------------- remote signer (NIP-46)
-//
-// Signing can be routed to an external signer (Notary) over NIP-46 so the user's
-// secret key never enters Plaza. Plaza is the CLIENT: it holds an ephemeral
-// transport keypair, and the user's identity is the bunker's own pubkey. The
-// wire is kind:24133 events whose content is a NIP-44-encrypted request/response
-// `p`-tagged to the recipient. A persistent listener thread holds the bunker
-// relay and processes responses; each request (connect, then one per post) goes
-// out on its own short-lived connection, so a blocked receive never stalls a
-// send. A signed note returns as a response `result`, stored and published to
-// the feed pool exactly like a locally signed one.
 
 // -------------------------------------------------------------------- app run
 
@@ -5423,88 +5030,6 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
     const db_path = try std.fmt.bufPrintZ(&path_buf, "{s}/feed.mdb", .{dir_path});
     return nostr.store.Store.open(db_path, .{ .map_size = feed_store_map_size });
 }
-
-// ----------------------------------------------------------------- identity
-//
-// Plaza's local signing identity lives beside the feed store, at
-// `$HOME/.plaza/identity.key` (the raw 32-byte secret, mode 0600). It is created
-// on the user's onboarding action, not silently: a first run with no key file
-// opens the welcome screen, and "Create your identity" generates and persists
-// it. This is the zero-config local signer; connecting an external signer
-// (Notary, over NIP-46) so the key never touches the client is the next
-// onboarding option, and swaps in at `signAndPublish`.
-
-// ----------------------------------------------------------- background ingest
-//
-// Each relay's ingest loop runs on its own thread with its own `std.Io.Threaded`
-// and its own secp256k1 context, the io backend and the signer are not shared
-// across threads, the exact shape the Notary daemon uses per relay. It dials,
-// subscribes for recent kind:1, verifies each event, and writes it into the
-// shared store; the UI thread reads it back through `Model.refresh`.
-
-// -- Every socket asks only about the people it can answer for ---------------
-//
-// The pool used to ask all eight of its relays about every followed author, and
-// the routed relays asked about theirs. That is a hybrid: the routing bought
-// reach, and none of it bought the pool relays a smaller question. Jumble and
-// Amethyst both route the WHOLE feed, and this is that.
-//
-// Each pool relay is asked about the follows who write THERE, plus the
-// residual: everyone no relay in either set is going to be asked about. The
-// residual is what makes the change safe, and defining it correctly is the
-// whole risk. It is NOT "authors with no relay list". It is every author not
-// covered by any chosen relay, list or no list, because an author who publishes
-// only to a relay that did not make the cut is otherwise asked of nobody at all
-// and simply vanishes from the feed. No error, no empty state, which is the
-// exact failure the outbox model exists to fix and the easiest one to
-// reintroduce while fixing it.
-//
-// So the invariant, and there is a test for it by name: every followed author
-// appears in at least one relay's filters.
-
-// -- Being asked who you are (NIP-42) ----------------------------------------
-//
-// A relay may send `["AUTH", <challenge>]`. Answering means signing a kind:22242
-// event that names the relay and echoes the challenge, with the reader's key.
-// That tells the relay whose connection this is, so it is never done without the
-// reader's say: the first time a relay refuses us for want of it, a notice names
-// the relay and the reader chooses Allow or Don't allow. The answer is kept per account and relay, so a
-// second account on the same machine is asked for itself, and it can be changed
-// in the relay's row.
-//
-// Nothing here happens because a relay greeted us. Plenty of public relays send
-// a challenge on every connection and gate nothing, and answering those would
-// both ask the reader about relays that do not care and tell those relays who
-// they are. So a challenge is only kept, quietly, as the latest one that relay
-// sent. The reader's choice is consulted when the relay actually refuses
-// something with an `auth-required:` reason: allow answers and re-sends what was
-// refused, don't allow does nothing, and ask raises the notice. A relay that
-// never refuses anything is never asked about and never sent an AUTH.
-//
-// Three parties are involved and none of them may wait on another. The relay's
-// reader thread hears the AUTH and the CLOSED and later sends the reply. The UI
-// thread gets the signature, because the signer is reached through effects
-// (Notary's loopback door, or a bunker over NIP-46) and a person may take a
-// while to approve. So they meet in a per-relay slot under a spin lock, and each
-// only reads the slot or moves it one step. The reader never blocks on a
-// signature: it keeps reading, and the feed on every other relay is untouched.
-//
-// What is copied, and from where:
-//   - A challenge is stored and an `auth-required:` CLOSED reuses it, because a
-//     relay does not re-issue one (Amethyst RelayAuthenticator.kt:176-178,
-//     :231-237, :273-290).
-//   - Authentication is started by the refusal and not by the challenge: Jumble
-//     calls its authenticator only from the `auth-required` branch of a REQ's
-//     close handler (relay-subscription.ts:86-89), never when the challenge
-//     arrives.
-//   - The AUTH's OK is what re-sends the refused subscriptions, once, so a
-//     refusal cannot loop (Amethyst RelayAuthenticator.kt:293-305; Jumble
-//     relay-subscription.ts:86-100 restarts the REQ only after `authenticate`
-//     resolves and only if it has not authed before).
-//   - Whether to identify is the reader's decision per relay, asked once and
-//     remembered (Amethyst AuthCoordinator.kt:117-149, :193-226). A CLOSED
-//     that stays refused is a finished subscription, counted as settled and
-//     not as data (Jumble relay-subscription.ts:107-110).
 
 // re-exports: tuning.zig
 pub const ancestor_row_chrome_for_test = tuning.ancestor_row_chrome_for_test;

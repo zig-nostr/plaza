@@ -43,6 +43,21 @@ const standingNow = main.standingNow;
 const swapThreadRoot = main.swapThreadRoot;
 const watchOneShot = main.watchOneShot;
 
+// ---------------------------------------------------------------- addresses
+//
+// An `naddr` names a replaceable event by its author, its kind and its `d` tag,
+// not by an id, and the event it names changes id every time its author edits
+// it. So nothing here is looked up by id: the question is always "the newest
+// copy of this coordinate", asked of the store first and of the relays after.
+//
+// Jumble resolves it the same way: the cache by coordinate first
+// (src/services/client.service.ts:891-936), then a filter of author + kind + `d`
+// (982-993) sent to the address's own relay hints or, when it has none, to the
+// author's first five write relays (1004-1009), keeping the newest answer
+// (1027). Plaza asks the hints and the author's write relays both, rather than
+// one or the other. Jumble also accepts a newer copy arriving afterwards and
+// swaps it in (src/hooks/useFetchEvent.tsx:39-54), which `g_address_want` does.
+
 /// Whether a kind is one an address may name and still open as an article: the
 /// published kind, and its draft, which opens as a refusal rather than a page.
 fn isArticleKind(kind: u32) bool {

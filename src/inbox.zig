@@ -36,6 +36,19 @@ const wantProfile = main.wantProfile;
 const wantQuote = main.wantQuote;
 const warning_reason_bytes = main.warning_reason_bytes;
 
+/// Notes that this relay has now delivered. Called from each relay's ingest
+/// thread as the event lands, so the count is of relays that ACTUALLY sent it.
+// ------------------------------------------------------------------- the inbox
+//
+// What other people did that was aimed at this reader: replies, mentions, likes,
+// reposts and zaps. It is the first surface in this app where a stranger can put
+// something in front of the reader, so what does NOT get in matters as much as
+// what does.
+//
+// One function decides three things at once: whether an event becomes an item,
+// which verb it is, and whether it counts toward the bell. Every client that
+// split those decisions ended up with a badge that disagreed with its own list.
+
 /// The kinds a relay is asked for on the reader's behalf.
 pub const inbox_kinds = [_]u16{ 1, comment_kind, 6, 7, 9735 };
 

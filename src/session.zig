@@ -44,6 +44,16 @@ const saveDraft = main.saveDraft;
 const secret_file_permissions = main.secret_file_permissions;
 const sendConnect = main.sendConnect;
 
+// ----------------------------------------------------------------- identity
+//
+// Plaza's local signing identity lives beside the feed store, at
+// `$HOME/.plaza/identity.key` (the raw 32-byte secret, mode 0600). It is created
+// on the user's onboarding action, not silently: a first run with no key file
+// opens the welcome screen, and "Create your identity" generates and persists
+// it. This is the zero-config local signer; connecting an external signer
+// (Notary, over NIP-46) so the key never touches the client is the next
+// onboarding option, and swaps in at `signAndPublish`.
+
 /// Opens (creating if needed) `$HOME/.plaza`, returning the directory handle.
 pub fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
     const home = environ.get("HOME") orelse ".";

@@ -17,6 +17,29 @@ const engagement_kinds = main.engagement_kinds;
 const invalidateFeed = main.invalidateFeed;
 const resetFeedEnd = main.resetFeedEnd;
 
+// -------------------------------------------------- things you can take away
+//
+// A client you can make quiet.
+//
+// Every element here is one the reader can remove, and the point of the whole
+// thing is the second column: a hidden thing should not be FETCHED. Hide
+// reaction counts and the subscription stops asking relays for kind:7, so the
+// preference is less bandwidth, less parsing and a smaller store rather than a
+// number painted over. It is also what makes the claim honest. "The data is
+// absent" and "the data is covered up" are different promises, and only one of
+// them can be made about a thing that is still being downloaded.
+//
+// A registry rather than a handful of booleans on the Model, because the ids are
+// written to a file and will eventually be a NIP-78 `kind:30078` record, and
+// because the same table drives the settings list. That list is not decoration:
+// hide something, forget, and there is nothing left to right click. One screen
+// naming everything that can be hidden is how this avoids the way hide-based
+// customisation usually fails.
+//
+// Subtractive on purpose. Taking things away cannot make the app ugly or slow;
+// rearranging can, and it would mean making the feed's layout data-driven, which
+// is an architectural change rather than a preference.
+
 /// What can be hidden. The enum is the index into the registry below, so a call
 /// site is checked at compile time while the table stays data.
 /// What can be taken away. Each verb has two, and they are a hierarchy rather

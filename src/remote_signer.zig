@@ -268,6 +268,18 @@ pub fn clearPending() void {
         slot.* = .{};
     }
 }
+// ------------------------------------------------------- remote signer (NIP-46)
+//
+// Signing can be routed to an external signer (Notary) over NIP-46 so the user's
+// secret key never enters Plaza. Plaza is the CLIENT: it holds an ephemeral
+// transport keypair, and the user's identity is the bunker's own pubkey. The
+// wire is kind:24133 events whose content is a NIP-44-encrypted request/response
+// `p`-tagged to the recipient. A persistent listener thread holds the bunker
+// relay and processes responses; each request (connect, then one per post) goes
+// out on its own short-lived connection, so a blocked receive never stalls a
+// send. A signed note returns as a response `result`, stored and published to
+// the feed pool exactly like a locally signed one.
+
 /// Pairs with an external signer from a `bunker://` URL: parses it, mints an
 /// ephemeral client key, starts the response listener, and sends the connect
 /// request. Returns false (and marks the status failed) on a bad URL. Returning

@@ -413,6 +413,26 @@ fn median(sorted: []const u16) u16 {
     if (sorted.len % 2 == 1) return sorted[mid];
     return @intCast((@as(u32, sorted[mid - 1]) + @as(u32, sorted[mid])) / 2);
 }
+// -- Asking on a socket that is already open ---------------------------------
+//
+// A one-shot fetch used to dial its own connection to every relay, serially,
+// and read until EOSE. Eight relays meant eight TLS handshakes for one question
+// about one profile, a thread parked for the duration, and a connect bounded
+// only by the operating system.
+//
+// The pool already holds those sockets. No client dials for a one-shot:
+// NDK, Jumble and welshman all bottom out in a pool lookup, every one of them.
+//
+// What makes a shared socket safe here is that there is no reply to deliver.
+// Every event a relay sends is ingested into the store by the thread that owns
+// that socket, whoever asked for it, and the render thread reads the store.
+// That is welshman's ingest policy, and it means a subscription id only has to
+// name a question, never a caller waiting on an answer.
+//
+// So this WRITES the REQ from the asking thread. Writes on a connection are
+// serialized inside the library (nostr v0.8.0), which is what makes it sound
+// while the owning thread is blocked reading the same socket.
+
 /// Prefix for a one-shot's subscription id, so the relay threads can recognise
 /// one and close it at EOSE. Anything not the feed, the inbox or a one-shot is
 /// the engagement subscription, and that dispatch is by prefix rather than by a

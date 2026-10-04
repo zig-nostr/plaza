@@ -81,6 +81,15 @@ pub fn forgetLike(note_id: i64) ?[32]u8 {
     }
     return null;
 }
+// ------------------------------------------------------------ engagement counts
+//
+// Reply / repost / like / zap tallies per feed note, aggregated client-side (no
+// NIP-45 COUNT, whose relay support is spotty). Each ingest thread opens a second
+// subscription, `{kinds:[1,6,7,9735], "#e":[the notes it loaded]}`, and folds the
+// arriving events into this in-memory table, deduped across relays by event id.
+// The view reads it at render time. Counts are per session: a relaunch refetches
+// them, so nothing here is persisted.
+
 // Above the displayed feed so the union of the relays' watched sets fits with
 // room to spare; a full table then only degrades gracefully (see ensureEngagement).
 pub const engagement_cap = 512;

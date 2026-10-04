@@ -40,6 +40,27 @@ const unlockLiveRelay = main.unlockLiveRelay;
 const unlockRelayTable = main.unlockRelayTable;
 const watchOneShot = main.watchOneShot;
 
+// -- Where the people you follow actually write ------------------------------
+//
+// The suggestions used to be first come, first kept: the first six write relays
+// seen in anyone's kind:10002 filled the table and everything after was
+// dropped. Which six that is depends on whose relay list happened to arrive
+// first, so a relay one person uses could sit above one two hundred people use,
+// and the reader was being asked to add relays in arrival order.
+//
+// What the answer should be is the inversion every outbox implementation
+// starts with: turn "person -> relays they write to" into "relay -> people who
+// write there", and rank by how many. Jumble does exactly this, and takes each
+// author's top few write relays rather than all of them, on the reasoning
+// written into their source: most people do not understand relays and a list
+// of nine cannot be trusted to mean anything.
+//
+// Computed from the STORE rather than accumulated on ingest. The store already
+// holds one kind:10002 per author, which is the whole input, and counting on
+// arrival would need per-relay author sets to avoid counting one person twice
+// when their list is re-sent. Reading it back is both simpler and correct by
+// construction.
+
 /// How many of one author's write relays count toward the ranking.
 ///
 /// Jumble's number. An author advertising a dozen relays is not telling you
@@ -1109,6 +1130,27 @@ pub fn relaysSeenFor(note_id: i64) usize {
     }
     return 0;
 }
+/// Fetches a note's replies (and their engagement) into the store, on a detached
+/// thread. One dial per relay: opening a thread is a rare, human-paced action, so
+// --------------------------------------------------------- the relay-list sweep
+//
+// Who to ask about the people nobody in the pool can answer for.
+//
+// Every author whose kind:10002 Plaza does not hold is asked of the indexers,
+// once per run. Eager over the whole follow list rather than lazily on a miss,
+// because the routing table has to be warm BEFORE the first feed REQ or the
+// feed goes to the wrong relays and the round trip is paid twice: three of the
+// four clients read do the eager sweep for exactly that reason, and welshman,
+// the one that does not, is also the one with no negative caching and an
+// unbounded retry.
+//
+// DEFERRED, and named rather than quietly skipped: the answer is not written
+// down across launches, so an author who has genuinely never published a
+// relay list is asked again next time Plaza starts. Within a run they are
+// asked once. Jumble is the only client of the five that persists a negative
+// result, and doing it properly means a `checked_at` per pubkey in the store
+// with a staleness rule, which is its own change.
+
 /// Pubkeys already put to the indexers this run, so a follow with no relay list
 /// anywhere is asked once rather than on every rebuild of the routing table.
 pub var g_indexed = std.atomic.Value(u32).init(0);
@@ -1252,6 +1294,26 @@ pub fn relayFetchAllowed() bool {
     if (comptime builtin.is_test) return false;
     return main.g_store != null;
 }
+// -- Every socket asks only about the people it can answer for ---------------
+//
+// The pool used to ask all eight of its relays about every followed author, and
+// the routed relays asked about theirs. That is a hybrid: the routing bought
+// reach, and none of it bought the pool relays a smaller question. Jumble and
+// Amethyst both route the WHOLE feed, and this is that.
+//
+// Each pool relay is asked about the follows who write THERE, plus the
+// residual: everyone no relay in either set is going to be asked about. The
+// residual is what makes the change safe, and defining it correctly is the
+// whole risk. It is NOT "authors with no relay list". It is every author not
+// covered by any chosen relay, list or no list, because an author who publishes
+// only to a relay that did not make the cut is otherwise asked of nobody at all
+// and simply vanishes from the feed. No error, no empty state, which is the
+// exact failure the outbox model exists to fix and the easiest one to
+// reintroduce while fixing it.
+//
+// So the invariant, and there is a test for it by name: every followed author
+// appears in at least one relay's filters.
+
 /// Authors routed to each POOL slot: the follows who write to that relay.
 pub var g_pool_routed: [max_relays]DiscoveredRelay = @splat(.{});
 /// Everyone no chosen relay covers. Goes to every read-capable pool relay,

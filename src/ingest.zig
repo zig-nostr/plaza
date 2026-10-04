@@ -71,6 +71,14 @@ const setRelayStatus = main.setRelayStatus;
 const setRoutedLive = main.setRoutedLive;
 const subscribeInbox = main.subscribeInbox;
 
+// ----------------------------------------------------------- background ingest
+//
+// Each relay's ingest loop runs on its own thread with its own `std.Io.Threaded`
+// and its own secp256k1 context, the io backend and the signer are not shared
+// across threads, the exact shape the Notary daemon uses per relay. It dials,
+// subscribes for recent kind:1, verifies each event, and writes it into the
+// shared store; the UI thread reads it back through `Model.refresh`.
+
 /// The first wait before redialling a relay whose connection ended, and the
 /// ceiling that wait grows to.
 ///

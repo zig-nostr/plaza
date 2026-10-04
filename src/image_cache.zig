@@ -319,6 +319,14 @@ pub fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32)
     return .{ .width = dst_w, .height = dst_h };
 }
 
+// --------------------------------------------------------------- image decode
+//
+// The canvas image registry decodes through the platform codec and refuses
+// anything over 512x512, with no downscaler of its own. Most real avatars and
+// nearly every feed photo are larger than that, so Plaza decodes and resizes
+// them itself: the platform decoder is tried first (it knows every format the
+// OS does, WebP and HEIC included), and stb takes over when it refuses.
+
 /// Whether the vendored decoder can read `bytes` at all. Test seam: what makes
 /// the platform fallback in `decodeAndRegister` load-bearing is precisely which
 /// formats stb was NOT built for.

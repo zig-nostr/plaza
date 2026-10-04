@@ -29,6 +29,25 @@ const relay_list_kind = main.relay_list_kind;
 const releaseOneShot = main.releaseOneShot;
 const watchOneShot = main.watchOneShot;
 
+// -------------------------------------------------------------------- the outbox
+//
+// What happens to a note between pressing Post and knowing it is somewhere else.
+//
+// Publishing used to be fire-and-forget: a detached thread dialled every relay,
+// wrote the frame, read one message to flush it, and dropped the verdict. The
+// note was in the local store, so the feed showed it, and whether it ever
+// reached anyone was not a question the app could answer.
+//
+// Now every publish goes through a queue. Each entry names an event that is
+// already in the store's own tables (we ingest what we sign) and carries one bit
+// per relay: did that relay say OK. The queue is the app's answer to "is my note
+// out there", the status bar reads it, and it survives a quit, because a note
+// written on a train and lost on landing is the worst thing a client can do.
+//
+// The queue is small on purpose. It is not a retry engine for a broken network;
+// it is a record of what has not been acknowledged yet, drained whenever a relay
+// comes back.
+
 /// One note on its way out.
 pub const OutboxEntry = struct {
     used: bool = false,

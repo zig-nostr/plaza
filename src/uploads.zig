@@ -28,6 +28,33 @@ const setToast = main.setToast;
 const signerReady = main.signerReady;
 const uploadServers = main.uploadServers;
 
+// ------------------------------------------------------------ picture upload
+//
+// Putting a picture into a note, an avatar or a banner.
+//
+// The protocol is Blossom and `blossom.zig` holds it. What lives here is what
+// only the app can know: who is signed in, which signer will sign, which draft or
+// profile field the address belongs in, and what is on screen while it happens.
+//
+// The shape of one upload, because it spans three threads and a signer:
+//
+//   1. The reader presses a button, a file dialog opens, and a file is chosen.
+//      Nothing has left the machine.
+//   2. A worker reads it, checks what it is, removes location and camera
+//      metadata and works out the hash, size and blurhash. The card now says what
+//      will be sent and to which servers, and waits for a press on Upload.
+//   3. The press asks the signer for a kind:24242 token naming that hash. It goes
+//      through exactly the signer every other event goes through, so a Notary or
+//      a NIP-46 bunker prompts as it would for a note. The token is never stored
+//      and never published: it is a bearer credential for one file.
+//   4. A second worker sends the picture, server by server, until one takes it.
+//   5. The tick puts the returned address where the picture was asked for.
+//
+// A job is shared between the UI thread and at most one worker at a time, and it
+// is reference counted so that cancelling while a worker is mid-write cannot free
+// what the worker is reading. The UI holds one reference; each worker holds one
+// while it runs.
+
 /// BUD-03's list of a person's media servers.
 pub const blossom_list_kind: u16 = 10063;
 

@@ -28,6 +28,16 @@ const stringField = main.stringField;
 const thread_depth_max = main.thread_depth_max;
 const utf8SafeLen = main.utf8SafeLen;
 
+// ----------------------------------------------------------------- a person
+//
+// Everything the profile screen needs about somebody, read from the RAW kind:0
+// rather than the name-and-face cache. The cache models four fields and drops
+// the rest, which is right for a feed row and useless here: a profile is mostly
+// the fields it does not keep.
+//
+// Cached per pubkey for the life of a level, because a virtual list rebuilds its
+// visible rows every frame and a JSON parse per frame is not free.
+
 const PersonCard = struct {
     used: bool = false,
     pubkey: [32]u8 = [_]u8{0} ** 32,

@@ -43,6 +43,17 @@ const thread_reply_cap = main.thread_reply_cap;
 const urlHost = main.urlHost;
 const watchOneShot = main.watchOneShot;
 
+// ------------------------------------------------------------------ profiles
+//
+// Kind:0 metadata gives each author a display name and an avatar. The pool
+// ingests kind:0 for the feed's authors alongside their notes (the store keeps
+// only the newest per author, kind:0 being replaceable); the UI thread parses
+// them into this cache during the feed rebuild, keyed by pubkey. The feed reads
+// names and avatar image ids from the cache at render time, so a name or a
+// just-loaded avatar shows on the next frame without a re-query. Avatars are
+// fetched (bounded, cap-aware) and registered as canvas images; the cache is
+// UI-thread-only, so no synchronisation is needed.
+
 // Pubkeys a note mentioned that we have no name for. The pool only subscribes
 // to the follow set's metadata, so a mention of anyone else would render as a
 // bare npub forever; these are fetched separately, once each, and then resolve

@@ -32,6 +32,28 @@ const setToast = main.setToast;
 const wantProfile = main.wantProfile;
 const watchOneShot = main.watchOneShot;
 
+// ------------------------------------------------------------------- places
+//
+// A place is somebody else's Plaza, published as an event.
+//
+// fiatjaf's Hallway configures a client at DEPLOY time: fill in a form, get a
+// static site on your own domain. That works, and it costs a deploy per variant,
+// so you only get variants worth a deploy. His own suggestion for a native app
+// was the other shape: one binary, several rooms, each instantiated from a URL
+// or an event shared by whoever runs the community. Then a place costs nothing to
+// make, and you get the ones nobody would have deployed a site for: one
+// conference weekend, a reading group of nine people.
+//
+// This is the first slice of that. A place carries an app name, a home text, and
+// the relays its feeds read from. v1 reads the first two and one feed; the rest
+// of Hallway's surface (colours, kinds, publish targets, densities) arrives in
+// later versions against the same document.
+//
+// EVERYTHING HERE COMES FROM A STRANGER. A place is an event by definition
+// somebody else signed, so every field is bounded, copied into fixed storage,
+// and never trusted for its length. The relay URL is the sharp one: it decides
+// where the app connects.
+
 /// How much of each field a place may carry. Small on purpose: this is chrome,
 /// not content, and a place that wants to say more than this wants to be a note.
 const place_name_cap = 64;

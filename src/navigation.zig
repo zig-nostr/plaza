@@ -110,6 +110,15 @@ pub fn enterSettings(model: *Model) void {
     startBlossomProbe();
     model.stage = .settings;
 }
+// ------------------------------------------------------------------------ threads
+//
+// A thread is the focused note plus the kind:1 replies that e-tag it. It is
+// layered OVER the feed, which stays mounted so its scroll offset survives.
+// Opening one snapshots the root, reads any replies already in the store, and
+// fires a one-shot fetch of the rest (with their engagement) into the store; the
+// replies are cached in the model so they are pressable (open as a sub-thread)
+// and get their pictures fetched, the same local-first path the feed uses.
+
 /// Opens `note_id` as a thread. The target may live in the feed or the current
 /// thread; it is snapshotted as the new root so it survives store rebuilds. When
 /// a thread is already open, the current root is pushed so Back returns to it.

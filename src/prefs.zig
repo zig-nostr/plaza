@@ -24,6 +24,16 @@ const hiddenLine = main.hiddenLine;
 const plazaDir = main.plazaDir;
 const secret_file_permissions = main.secret_file_permissions;
 
+// --------------------------------------------------------------- media proxy
+//
+// The image registry decodes at most a 512x512 image and the fetch effect caps
+// bodies at 256 KiB, so a full-size photo can neither be downloaded nor decoded
+// as-is. Images are therefore requested at the size they will actually be drawn:
+// through a host's own resizer when it has one, otherwise through a
+// weserv-compatible proxy (the free public wsrv.nl by default, and any instance
+// the user prefers, including their own). Clearing the setting loads originals
+// straight from their host, which still works for anything small enough.
+
 const default_media_proxy = "https://wsrv.nl/";
 /// Whether the app reaches out for the things a note POINTS AT: its picture, the
 /// faces of the people in the feed, the page a link goes to, and the domain a

@@ -68,6 +68,14 @@ const uploadedImeta = main.uploadedImeta;
 const uploadedPictureFor = main.uploadedPictureFor;
 const writeFollow = main.writeFollow;
 
+// -------------------------------------------------------------- compose & post
+//
+// Posting is local-first: a composed note is signed, written to the local store
+// straight away (so it shows in the feed on the next tick), and published to the
+// pool on a detached thread. The feed dedupes by event id, so when a relay later
+// echoes our own note back through the ingest subscriptions it collapses onto
+// the local copy.
+
 /// Posts the current draft: sign a kind:1 note, store it locally at once, and
 /// publish it to the pool in the background. A blank draft or a not-yet-ready
 /// identity is a no-op.
@@ -532,6 +540,15 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false, kept, route);
     model.reply_buffer.clear();
 }
+// ------------------------------------------------------------------------ likes
+//
+// A like is a NIP-25 kind:7 reaction with content "+", e/p/k-tagging the note.
+// It rides the same three sign paths as a post and is local-first and optimistic:
+// the heart fills the instant it is pressed (read from `g_my_likes` at render),
+// and the reaction publishes in the background. Un-like is a NIP-09 kind:5
+// deletion e-tagging our own reaction, since NIP-25 has no un-react. A guest
+// press cannot sign, so it is remembered and completed after sign-in.
+
 /// Lowercase-hex-encodes a 32-byte value into a fresh process-lifetime slice.
 pub fn hexAlloc(gpa: std.mem.Allocator, bytes: [32]u8) ?[]const u8 {
     const out = gpa.alloc(u8, 64) catch return null;

@@ -23,6 +23,41 @@ const relay_list_kind = main.relay_list_kind;
 const selectWriteRelays = main.selectWriteRelays;
 const writeTagUrls = main.writeTagUrls;
 
+// -------------------------------------------------------- where a note can be found
+//
+// A relay hint is a claim, written into something other people will read, about
+// where a thing can be asked for. Plaza has taken hints since an `nevent1` that
+// names relays started getting those relays asked, and wrote none of its own:
+// the address it copied, the `e` tag under a reply and the `q` tag under a quote
+// all left the slot empty, so every other client was handed the problem Plaza
+// itself had been given a way to solve.
+//
+// Two things are known about where a note lives, and they prove different
+// amounts. A relay that DELIVERED the note holds it, because it just sent it. A
+// relay the AUTHOR lists as a write relay (their kind:10002) is where they say
+// they publish, which is likely and not verified. The order follows that:
+//
+//   1. a relay that delivered it and is also one of the author's write relays
+//   2. a relay that delivered it
+//   3. one of the author's write relays
+//
+// That is Amethyst's `Note.relayHintUrl`: the delivering relay that is in the
+// author's outbox set, then the first delivering relay, then the author's own
+// first outbox relay. Jumble's `getEventHint` is the second rule alone. The
+// third rule is only reached when nothing is known to have delivered the note,
+// which is a note read straight off disk after a restart.
+//
+// When none of the three applies the hint is EMPTY, and that is a considered
+// answer rather than a gap: a wrong hint costs every reader a socket to a relay
+// that does not have the note, and an empty one costs them nothing they were not
+// already paying.
+//
+// A relay is only offered when a stranger could dial it. `ws://` is cleartext,
+// and a private or loopback address in a published tag is useless to everyone
+// else and says something about the publisher's network that nobody asked them
+// to say. Jumble drops its own local-network relays from every hint for the
+// same reason (`getEventHints`, `isLocalNetworkUrl`).
+
 /// How many relays go into an address Plaza hands out. Jumble's number
 /// (`getNoteBech32Id` slices to two): each hint a reader follows is a socket.
 pub const hint_cap = 2;

@@ -41,6 +41,8 @@ const signAndPublish = main.signAndPublish;
 const signerReady = main.signerReady;
 const takeFresh = main.takeFresh;
 
+// ------------------------------------------------------------- bookmarks
+
 /// The event ids this reader has bookmarked, public half and private half
 /// together, and whose list it is.
 ///

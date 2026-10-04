@@ -36,6 +36,19 @@ const topicLinkFor = main.topicLinkFor;
 const vgap = main.vgap;
 const window_height = main.window_height;
 
+// ------------------------------------------------------------- the article reader
+//
+// A kind:30023 opened by id is a level of its own, drawn as a reader rather than
+// as a thread. It is the same level in every other way (the back-stack, the
+// scroll offset kept per level, the avatar and picture passes), so the only fork
+// is in `feedView`, which asks `isArticleRoot` of the level's root.
+//
+// The body is not baked into the `Note`: that struct carries a few kilobytes of
+// text because it is copied on every rebuild, and an article is tens of
+// kilobytes. It is read from the store when the level is first drawn and kept
+// here, cut into rows (see `article.chunk`) so that only the rows near the
+// viewport are built, the way the feed and the thread are.
+
 /// The reading column. The width a note's picture takes, so a cover lines up
 /// with the text beneath it and the column is a comfortable line length with
 /// real margin either side of it in the 620 point row.

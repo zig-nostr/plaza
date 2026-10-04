@@ -17,6 +17,25 @@ const networkAllowed = main.networkAllowed;
 const plaza_version = main.plaza_version;
 const update_check_key = main.update_check_key;
 
+/// True when the well-known JSON maps the identifier's name to `pubkey`. This is
+/// the whole trust test: a check is drawn on this and nothing weaker.
+// --------------------------------------------------------------- the update
+//
+// Whoever installed Plaza is otherwise on that build until they happen to visit
+// the site, which makes shipping a fix worth less than it should be.
+//
+// TOLD, not done. Plaza is ad-hoc signed and installed by a script that clears
+// quarantine, and it is not going to replace its own bundle while running. A
+// line saying a newer version exists, with one press to go and get it, is the
+// honest amount of automation for how this app is distributed. The toolkit does
+// ship a signed self-updater; it swaps the bundle and relaunches, it is macOS
+// only while Plaza also ships Linux, and it wants a signed feed hosted
+// somewhere. All three are reasons this does not use it.
+//
+// The releases API, because that is the same document `scripts/install-macos.sh`
+// already reads. One source of truth for what the newest release is, rather than
+// a second one to keep in step.
+
 const update_check_url = "https://api.github.com/repos/zig-nostr/plaza/releases/latest";
 
 /// Whether to ask at all. OFF IS A REAL ANSWER: a client that contacts a server

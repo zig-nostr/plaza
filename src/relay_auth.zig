@@ -32,6 +32,50 @@ const relayUrlEql = main.relayUrlEql;
 const secret_file_permissions = main.secret_file_permissions;
 const sendRequest = main.sendRequest;
 
+// -- Being asked who you are (NIP-42) ----------------------------------------
+//
+// A relay may send `["AUTH", <challenge>]`. Answering means signing a kind:22242
+// event that names the relay and echoes the challenge, with the reader's key.
+// That tells the relay whose connection this is, so it is never done without the
+// reader's say: the first time a relay refuses us for want of it, a notice names
+// the relay and the reader chooses Allow or Don't allow. The answer is kept per account and relay, so a
+// second account on the same machine is asked for itself, and it can be changed
+// in the relay's row.
+//
+// Nothing here happens because a relay greeted us. Plenty of public relays send
+// a challenge on every connection and gate nothing, and answering those would
+// both ask the reader about relays that do not care and tell those relays who
+// they are. So a challenge is only kept, quietly, as the latest one that relay
+// sent. The reader's choice is consulted when the relay actually refuses
+// something with an `auth-required:` reason: allow answers and re-sends what was
+// refused, don't allow does nothing, and ask raises the notice. A relay that
+// never refuses anything is never asked about and never sent an AUTH.
+//
+// Three parties are involved and none of them may wait on another. The relay's
+// reader thread hears the AUTH and the CLOSED and later sends the reply. The UI
+// thread gets the signature, because the signer is reached through effects
+// (Notary's loopback door, or a bunker over NIP-46) and a person may take a
+// while to approve. So they meet in a per-relay slot under a spin lock, and each
+// only reads the slot or moves it one step. The reader never blocks on a
+// signature: it keeps reading, and the feed on every other relay is untouched.
+//
+// What is copied, and from where:
+//   - A challenge is stored and an `auth-required:` CLOSED reuses it, because a
+//     relay does not re-issue one (Amethyst RelayAuthenticator.kt:176-178,
+//     :231-237, :273-290).
+//   - Authentication is started by the refusal and not by the challenge: Jumble
+//     calls its authenticator only from the `auth-required` branch of a REQ's
+//     close handler (relay-subscription.ts:86-89), never when the challenge
+//     arrives.
+//   - The AUTH's OK is what re-sends the refused subscriptions, once, so a
+//     refusal cannot loop (Amethyst RelayAuthenticator.kt:293-305; Jumble
+//     relay-subscription.ts:86-100 restarts the REQ only after `authenticate`
+//     resolves and only if it has not authed before).
+//   - Whether to identify is the reader's decision per relay, asked once and
+//     remembered (Amethyst AuthCoordinator.kt:117-149, :193-226). A CLOSED
+//     that stays refused is a finished subscription, counted as settled and
+//     not as data (Jumble relay-subscription.ts:107-110).
+
 /// The longest challenge Plaza will sign. NIP-42 leaves it an arbitrary string;
 /// real relays send a few dozen bytes. One past this is not a challenge worth
 /// putting inside a signed event.
