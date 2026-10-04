@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const places = @import("places.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -243,8 +244,8 @@ pub fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
     // other kind is a link that lies, not a kind to go and fetch.
     if (ptr.kind != place_kind) return;
 
-    var want: @TypeOf(main.g_place_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    var want: @TypeOf(places.g_place_want.?) = .{ .pubkey = ptr.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
     want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
-    main.g_place_want = want;
+    places.g_place_want = want;
     askPlace(fx, ptr.relays);
 }

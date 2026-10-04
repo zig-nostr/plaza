@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const hiding = @import("hiding.zig");
 const updates = @import("updates.zig");
+const places = @import("places.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -183,8 +184,8 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     hiding.g_hidden = @splat(false);
-    main.g_rail_open = false;
-    main.g_boot_place_set = false;
+    places.g_rail_open = false;
+    places.g_boot_place_set = false;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
     const gpa = std.heap.page_allocator;
@@ -210,7 +211,7 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // Written by id rather than by position, so adding an element to the
         // registry, or reordering it, cannot silently un-hide something.
         if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
-        if (std.mem.eql(u8, line[0..eq], "rail_open")) main.g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "rail_open")) places.g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
         // Only a name this app wrote. Anything else keeps the default, which
         // for a key made here is set at the mint and for every other key is
         // their own follows.
@@ -254,7 +255,7 @@ pub fn saveSettings() void {
         hidden_ids,
         if (g_media_proxy_on) "on" else "off",
         if (g_media_direct_fallback) "on" else "off",
-        if (main.g_rail_open) "on" else "off",
+        if (places.g_rail_open) "on" else "off",
         place,
         main.g_post_delay_s,
         @tagName(main.g_home_scope),
