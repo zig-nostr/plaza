@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const relay_table = @import("relay_table.zig");
+const relay_conn = @import("relay_conn.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1458,19 +1459,19 @@ pub fn followRouteChanges(io: std.Io) void {
         switch (routeFollowUp(r.url[0..r.url_len], r.gen, slot_url[0..slot_url_len], slot_gen)) {
             .leave_it => {},
             .re_ask => {
-                const relay = main.g_relay_live[watch] orelse continue;
+                const relay = relay_conn.g_relay_live[watch] orelse continue;
                 var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
                 const filters = buildRoutedFilters(authors[0..snap.?.authors_len], &filter_buf);
                 relay.subscribe(outbox_sub_id, filters) catch continue;
                 r.gen = slot_gen;
             },
             .retire => {
-                const relay = main.g_relay_live[watch] orelse continue;
+                const relay = relay_conn.g_relay_live[watch] orelse continue;
                 // Half-close, so the owner's blocked `receive` returns and it
                 // redials through its own path. NOT deinit: the owner still
                 // holds this and has to unwind.
                 relay.shutdown(io);
-                main.g_relay_live[watch] = null;
+                relay_conn.g_relay_live[watch] = null;
                 r.url_len = 0;
             },
         }
