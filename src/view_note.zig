@@ -739,6 +739,7 @@ pub fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, 
 
     // Fast path unchanged: a plain note with no fold is exactly one paragraph.
     if (!has_card and !long) return textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
+    const folded = cut < full.len;
 
     var kids: [5]AppUi.Node = undefined;
     var n: usize = 0;
@@ -753,11 +754,11 @@ pub fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, 
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");
         if (tail.len > 0) {
-            kids[n] = textParaAt(ui, noteSpans(ui, note, tail), scale, ink);
+            kids[n] = textParaAt(ui, if (folded) foldedSpans(ui, note, tail) else noteSpans(ui, note, tail), scale, ink);
             n += 1;
         }
     } else {
-        kids[n] = textParaAt(ui, noteSpans(ui, note, full[0..cut]), scale, ink);
+        kids[n] = textParaAt(ui, if (folded) foldedSpans(ui, note, full[0..cut]) else noteSpans(ui, note, full[0..cut]), scale, ink);
         n += 1;
     }
     if (long) {
@@ -769,6 +770,33 @@ pub fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, 
         n += 1;
     }
     return ui.column(.{ .gap = 8 }, .{kids[0..n]});
+}
+
+/// The spans of a collapsed note's last piece, `piece` being a prefix cut from
+/// `note.content()` at the fold.
+///
+/// A fold that lands inside a link leaves half of it. The half-link used to be
+/// shown as if it were the whole of it ("...segment/pat"), and pressing it opened
+/// the half. It now ends in an ellipsis, and the link still points at the whole
+/// address: only the shown text is cut.
+pub fn foldedSpans(ui: *AppUi, note: *const Note, piece: []const u8) []const canvas.TextSpan {
+    const spans = noteSpans(ui, note, piece);
+    const full = note.content();
+    const start = @intFromPtr(piece.ptr);
+    const first = @intFromPtr(full.ptr);
+    if (spans.len == 0 or start < first or start + piece.len > first + full.len) return spans;
+    const end = start - first + piece.len;
+    if (end >= full.len or std.ascii.isWhitespace(full[end]) or std.ascii.isWhitespace(piece[piece.len - 1])) return spans;
+    const last = spans[spans.len - 1];
+    if (!std.mem.startsWith(u8, last.text, "https://") and !std.mem.startsWith(u8, last.text, "http://")) return spans;
+    if (!std.mem.eql(u8, last.link, last.text)) return spans;
+    var stop = end;
+    while (stop < full.len and !std.ascii.isWhitespace(full[stop])) stop += 1;
+    const out = ui.arena.alloc(canvas.TextSpan, spans.len) catch return spans;
+    @memcpy(out, spans);
+    out[out.len - 1].text = ui.fmt("{s}\u{2026}", .{last.text});
+    out[out.len - 1].link = full[end - last.text.len .. stop];
+    return out;
 }
 
 /// The line above a reply saying what it answers.

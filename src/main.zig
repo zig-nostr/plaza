@@ -7084,6 +7084,7 @@ pub const engagementRow = view_note.engagementRow;
 pub const engagementRowAt = view_note.engagementRowAt;
 pub const firstLineOf = view_note.firstLineOf;
 pub const firstLineOfForTest = view_note.firstLineOfForTest;
+pub const foldedSpans = view_note.foldedSpans;
 pub const forgetAskedMediaForTest = view_note.forgetAskedMediaForTest;
 pub const forgetUncoveredForTest = view_note.forgetUncoveredForTest;
 pub const formatCount = view_note.formatCount;

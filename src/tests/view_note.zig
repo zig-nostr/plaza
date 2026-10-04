@@ -324,3 +324,57 @@ test "a long display name stays on one line above the handle" {
     }
     try testing.expect(std.mem.endsWith(u8, tree_text.?, "\u{2026}"));
 }
+
+test "a link cut by the fold ends in an ellipsis and still opens the whole address" {
+    // The fold cuts a long note at a character count. When it fell inside a URL
+    // the shown half read as the whole address, and pressing it opened the half.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ui = main.AppUi.init(arena);
+
+    const url = "https://example.invalid/" ++ "path/segment/" ** 12;
+    const body = "An unbroken token: " ++ "x" ** 160 ++ " and a long url " ++ url ++ " ends here.";
+    var note: main.Note = .{};
+    @memcpy(note.content_buf[0..body.len], body);
+    note.content_len = body.len;
+    // A real id: 0 is also what an empty fold-state slot holds, which reads as expanded.
+    note.id = 770031;
+
+    const cut = main.collapsedLen(note.content(), main.note_collapse_chars);
+    try testing.expect(cut < body.len);
+    const start = std.mem.indexOf(u8, body, "https://").?;
+    // The fold really does land inside the address, or this proves nothing.
+    try testing.expect(cut > start and cut < start + url.len);
+
+    const spans = main.foldedSpans(&ui, &note, note.content()[0..cut]);
+    const last = spans[spans.len - 1];
+    try testing.expect(std.mem.startsWith(u8, last.text, "https://"));
+    try testing.expect(std.mem.endsWith(u8, last.text, "\u{2026}"));
+    try testing.expectEqualStrings(url, last.link);
+
+    // And through the body itself, which is where the cut is made.
+    const Build = struct {
+        var n: main.Note = .{};
+        fn render(u: *main.AppUi) main.AppUi.Node {
+            return main.noteBody(u, &n, true);
+        }
+    };
+    Build.n = note;
+    const model = main.Model{};
+    const p = try painted.Painted.renderPiece(arena, &model, Build.render, main.window_width, 600);
+    var shown = false;
+    for (p.layout.nodes) |node| {
+        const t = node.widget.text;
+        if (std.mem.indexOf(u8, t, "https://example.invalid") != null and std.mem.endsWith(u8, t, "\u{2026}")) shown = true;
+    }
+    try testing.expect(shown);
+
+    // A fold that leaves the link whole adds nothing to it.
+    const short = "see https://example.invalid/a and then a lot more words after it";
+    var other: main.Note = .{};
+    @memcpy(other.content_buf[0..short.len], short);
+    other.content_len = short.len;
+    const mid = main.foldedSpans(&ui, &other, other.content()[0..short.len]);
+    for (mid) |s| try testing.expect(!std.mem.endsWith(u8, s.text, "\u{2026}"));
+}
