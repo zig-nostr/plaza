@@ -751,3 +751,32 @@ test "a search result leaves room for its focus ring" {
         try testing.expectApproxEqAbs(f.x, node.widget.frame.x, 0.01);
     }
 }
+
+test "a search result inks a username quietly and keeps the violet for an address" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    const p = try renderOneSearchRow(arena_state.allocator());
+
+    var handle_ink: ?canvas.Color = null;
+    for (p.layout.nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "@rowan")) handle_ink = node.widget.style.foreground;
+    }
+    const ink = handle_ink orelse return error.NoHandle;
+    try testing.expect(!std.meta.eql(ink, main.identityInkForTest()));
+
+    // The same person once their address checks out: that line is violet.
+    main.setProfileNip05ForTest([_]u8{0x4e} ** 32, "rowan@example.com", true);
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "row");
+    const q = try painted.Painted.render(arena_state.allocator(), &model);
+    var address_ink: ?canvas.Color = null;
+    for (q.layout.nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "rowan@example.com")) address_ink = node.widget.style.foreground;
+    }
+    try testing.expect(std.meta.eql(address_ink orelse return error.NoAddress, main.identityInkForTest()));
+}

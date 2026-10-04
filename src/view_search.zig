@@ -240,6 +240,9 @@ fn searchRow(ui: *AppUi, row: *const SearchRow) AppUi.Node {
         if (pr.username_len > 0) break :blk ui.fmt("@{s}", .{pr.username()});
         break :blk "";
     };
+    // The identity violet is for an address, as on every note's handle line. A
+    // kind:0 username is a name anybody can type, so it takes the quiet ink.
+    const identity_is_address = if (prof) |pr| pr.nip05_len > 0 and std.mem.eql(u8, identity, pr.nip05()) else false;
     const tint = avatarTint(pk);
     const hexdigits = "0123456789abcdef";
 
@@ -254,7 +257,7 @@ fn searchRow(ui: *AppUi, row: *const SearchRow) AppUi.Node {
     var second: [2]AppUi.Node = undefined;
     var second_n: usize = 0;
     if (identity.len > 0) {
-        second[second_n] = ui.paragraph(.{ .style = .{ .foreground = identityInk() } }, &.{.{ .text = elide(ui, identity, search_identity_max), .scale = mono_row_scale }});
+        second[second_n] = ui.paragraph(.{ .style = .{ .foreground = if (identity_is_address) identityInk() else p.text_faint } }, &.{.{ .text = elide(ui, identity, search_identity_max), .scale = mono_row_scale }});
         second_n += 1;
     }
     second[second_n] = ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = searchSourceText(ui, row), .monospace = true, .scale = mono_chip_scale }});
