@@ -1111,6 +1111,10 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
         failHelperSign();
         return;
     };
+    // Handed to the publish on success, and freed on every other way out: each
+    // refusal below used to leave this copy and the tags behind.
+    var handed = false;
+    defer if (!handed) gpa.free(owned);
     var out = parsed.value;
     out.content = owned;
     // Preserve the signed event's tags (a reaction carries e/p/k): forcing them
@@ -1122,6 +1126,13 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     out.tags = dupeTags(gpa, parsed.value.tags) orelse {
         failHelperSign();
         return;
+    };
+    defer if (!handed) {
+        for (out.tags) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        gpa.free(out.tags);
     };
     // Checked, not trusted, and that is a change of mind rather than an
     // oversight. The old reasoning was written down here: "it came from our own
@@ -1167,12 +1178,6 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     if (out.kind == blossom.auth_kind) {
         releaseHelperSign();
         acceptUploadAuth(gpa, out);
-        gpa.free(owned);
-        for (out.tags) |tag| {
-            for (tag) |field| gpa.free(field);
-            gpa.free(tag);
-        }
-        gpa.free(out.tags);
         return;
     }
     if (out.kind == 0) {
@@ -1192,6 +1197,7 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // ingest that fails would otherwise leave the record armed.
     // The room this write was submitted FROM, not the one on screen now: the
     // keyholder can ask a person, and the reader can walk out while it waits.
+    handed = true;
     ingestAndPublish(gpa, out, null, route);
 }
 
