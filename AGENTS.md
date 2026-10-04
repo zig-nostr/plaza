@@ -11,11 +11,15 @@ Plaza never holds a secret key. It ships [Notary](https://github.com/zig-nostr/n
 ## Layout
 
 ```
-src/main.zig         # the app: model, update, the hand-written feed view, relay and store work
+src/main.zig         # the hub: Model, Msg, update, boot and main, and a re-export of every module's public names
+src/<area>.zig       # the app's logic, one file per area (listed below), each beside main.zig
+src/view_<area>.zig  # the hand-written views, one file per screen or surface
 src/blossom.zig      # Blossom uploads: server addresses, the signed token, preparing a picture, the PUT
-src/tests.zig        # the test suite
-src/onboarding.native  # declarative markup for the static screens
+src/article.zig      # NIP-23 articles: what a kind:30023 says about itself, its body cut into rows
 src/search.zig       # finding a person: matching, ranking, the NIP-50 request and relay status
+src/tests.zig        # the test harness: shared helpers, the list of app files, and the test files
+src/tests/<area>.zig # the tests, by the file whose code they exercise; app.zig for what stays in main.zig
+src/onboarding.native  # declarative markup for the static screens
 src/theme.zig        # colors and type
 src/painted.zig      # custom-drawn pieces
 app.zon              # app manifest; its .version is the release version
@@ -24,6 +28,10 @@ build.zig.zon        # dependencies: native_sdk and nostr, pinned by hash
 .github/RELEASE_NOTES.md  # the text of each release page
 scripts/             # packaging, installers, acceptance and frame-budget checks
 ```
+
+The areas, each a file under `src/`: app-wide numbers and settings (`tuning`, `prefs`, `hiding`, `updates`, `links`, `login`, `places`); relays (`relay_table`, `relay_list`, `routing`, `relay_conn`, `relay_hints`, `relay_auth`, `ingest`); the store and what is cached from it (`store_glue`, `feed_state`, `thread_model`, `note_build`, `profile_cache`, `person_card`, `quote_cache`, `addresses`, `link_preview`, `engagement`, `inbox`, `image_cache`, `image_pool`, `feed_media`); the reader's own lists (`own_lists`, `follows`, `mutes`, `bookmarks`, `private_lists`); signing and the session (`keyholder`, `remote_signer`, `session`, `own_profile`); writing (`drafts`, `uploads`, `media_servers`, `compose`, `outbox`); and moving between screens (`people_search`, `profile_notes`, `navigation`). Each file opens with a line saying what it holds.
+
+Every module imports `main.zig` and takes the names it uses from there (`const Model = main.Model;`), and main.zig re-exports what each module declares, so a call site reads `main.x` wherever `x` lives. A container-level `var` cannot be re-exported, so it is always named through the file that owns it (`follows.g_follows`, `main.g_io`). A new file is imported from main.zig and added to `app_sources` in `src/tests.zig`: the tests that read the source read that list, and the network gate test fails on a file main.zig imports that the list does not name. A new test goes in the `src/tests/` file for the area it exercises.
 
 ## Build and test
 
@@ -60,7 +68,7 @@ Two scripts are not part of CI:
 - `zig fmt` is the formatter; CI fails on unformatted code.
 - [Conventional Commits](https://www.conventionalcommits.org/). One concern per pull request, with its tests, and every pull request links its issue.
 - Never commit to `main`; everything lands through a reviewed pull request.
-- A row that answers a press is built with `pressRow` in `src/main.zig`, never with a bare `row`, `column` or `data_row` and an `on_press`. The toolkit gives Tab a stop, a focus ring and Return/Space activation to its own controls and to `list_item` only, so a layout kind with a press can be clicked and nothing else. A test walks every screen and fails on one.
+- A row that answers a press is built with `pressRow` in `src/view_note.zig`, never with a bare `row`, `column` or `data_row` and an `on_press`. The toolkit gives Tab a stop, a focus ring and Return/Space activation to its own controls and to `list_item` only, so a layout kind with a press can be clicked and nothing else. A test walks every screen and fails on one.
 - A release is a version bump in `app.zon` plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds it.
 
 ## Nostr rules that matter here

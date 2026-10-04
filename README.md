@@ -264,7 +264,7 @@ throwaway account rather than a checkout, and it says so and skips rather than
 guessing. The details are in the script.
 
 Plaza is a [Native SDK](https://github.com/vercel-labs/native) app: plain Zig
-for the logic and the feed (`src/main.zig`), declarative `.native` markup for
+for the logic and the feed (`src/*.zig`), declarative `.native` markup for
 the static screens, rendered natively, no browser, no Electron.
 
 ### Building on Linux
