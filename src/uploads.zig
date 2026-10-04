@@ -153,6 +153,11 @@ pub var g_upload: ?*UploadJob = null;
 /// picture is not published yet.
 pub var g_profile_upload_unsaved: bool = false;
 
+/// Whether the edit that went to be signed carried such a picture. Save takes
+/// the notice down as the edit leaves; if the signer refuses it, the picture is
+/// unpublished again and the notice has to come back with the failure.
+pub var g_profile_unsaved_at_save: bool = false;
+
 pub fn setProfileUploadUnsavedForTest(on: bool) void {
     g_profile_upload_unsaved = on;
 }

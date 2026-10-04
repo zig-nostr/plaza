@@ -467,6 +467,46 @@ test "the unsaved picture notice stays until Save really sends" {
     try testing.expect(!findAnyTextContaining((try buildTree(arena, &model)).root, notice));
 }
 
+test "the unsaved picture notice comes back when the signer refuses the save" {
+    // Save took the notice down as the edit left, and a refusal never put it
+    // back: the sheet went on showing the new picture with nothing saying it
+    // was not published.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("refusedpic");
+    defer fs.close();
+    _ = signInNothingFound(0x7b);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    defer main.setProfileUploadUnsavedForTest(false);
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    model.profile_picture_buffer.set("https://media.example/new.png");
+    var fx: main.EffectsForTest = undefined;
+    main.setProfileUploadUnsavedForTest(true);
+    const notice = "not published until you press Save";
+
+    // Asked, answered, and out with the signer: the notice is down.
+    main.update(&model, .profile_save, &fx);
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(main.helperSignPendingForTest());
+    try testing.expect(!findAnyTextContaining((try buildTree(arena, &model)).root, notice));
+
+    // Refused. The picture is unpublished again, and the sheet says so.
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqual(main.ProfileStage.failed, model.profile_stage);
+    try testing.expect(findAnyTextContaining((try buildTree(arena, &model)).root, notice));
+}
+
 test "a profile that lands between the two presses is shown, not merged over" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

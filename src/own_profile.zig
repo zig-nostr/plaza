@@ -206,6 +206,7 @@ pub fn openProfileEdit(model: *Model) void {
     }
     model.editing_profile = true;
     uploads.g_profile_upload_unsaved = false;
+    uploads.g_profile_unsaved_at_save = false;
     uploads.clearPickRefused();
     model.profile_confirm_new = false;
     model.profile_name_buffer.clear();
@@ -422,6 +423,9 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
     // signature never comes back, that seeding is what has to be contradicted:
     // "Saved here and sent to your relays" is otherwise the last word on an
     // edit that reached nobody.
+    // Remembered before the edit goes, for a signer that refuses it. A signer
+    // that answers at once releases this inside the call.
+    uploads.g_profile_unsaved_at_save = uploads.g_profile_upload_unsaved;
     signAndPublish(fx, gpa, created, 0, tags, merged, false, .profile, null);
     // Only here, where the edit has actually gone to be signed. Every return
     // above leaves the sheet as it was, and the picture in it is still not out.

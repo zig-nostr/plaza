@@ -10,6 +10,7 @@ const own_lists = @import("own_lists.zig");
 const relay_list = @import("relay_list.zig");
 const routing = @import("routing.zig");
 const mutes = @import("mutes.zig");
+const uploads = @import("uploads.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1022,6 +1023,8 @@ pub const PendingUndo = union(enum) {
 pub fn releaseUndo(u: PendingUndo) void {
     switch (u) {
         .reply => |r| std.heap.page_allocator.free(r.text),
+        // Signed: the picture that went with it is out.
+        .profile => uploads.g_profile_unsaved_at_save = false,
         else => {},
     }
 }
@@ -1119,6 +1122,10 @@ pub fn applyUndo(model: *Model, undo: PendingUndo) void {
         },
         .profile => {
             model.profile_stage = .failed;
+            // The picture that went with the edit is unpublished again, and the
+            // sheet that still shows it says so, as it did before Save.
+            if (uploads.g_profile_unsaved_at_save and model.editing_profile) uploads.g_profile_upload_unsaved = true;
+            uploads.g_profile_unsaved_at_save = false;
             setToast(model, "That was not saved.");
         },
     }

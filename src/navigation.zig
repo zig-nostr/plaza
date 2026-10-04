@@ -108,6 +108,7 @@ pub fn enterSettings(model: *Model) void {
         if (job.target != .note) dropUpload();
     }
     uploads.g_profile_upload_unsaved = false;
+    uploads.g_profile_unsaved_at_save = false;
     uploads.clearPickRefused();
     model.blossom_error = .none;
     // Whether this account has a media server list is asked of the relays now,
