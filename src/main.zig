@@ -7106,10 +7106,13 @@ pub const updateBanner = view_chrome.updateBanner;
 
 // re-exports: view_place.zig
 pub const deliverPlaceLogoBodyForTest = view_place.deliverPlaceLogoBodyForTest;
+pub const deliverPlaceLogoStatusForTest = view_place.deliverPlaceLogoStatusForTest;
 pub const lowerScopeForTest = view_place.lowerScopeForTest;
 pub const placeHomeHeightForTest = view_place.placeHomeHeightForTest;
+pub const placeLogoDirectForTest = view_place.placeLogoDirectForTest;
 pub const placeLogoShownForTest = view_place.placeLogoShownForTest;
 pub const placeLogoStateNameForTest = view_place.placeLogoStateNameForTest;
+pub const placeLogoUrlForTest = view_place.placeLogoUrlForTest;
 pub const scanPlaceLogoForTest = view_place.scanPlaceLogoForTest;
 pub const setPlaceLogoAskedForTest = view_place.setPlaceLogoAskedForTest;
 pub const setPlaceLogoIdForTest = view_place.setPlaceLogoIdForTest;

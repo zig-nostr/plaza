@@ -10,6 +10,7 @@ const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
 const feed_media = @import("feed_media.zig");
 const view_profile = @import("view_profile.zig");
+const view_place = @import("view_place.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -213,6 +214,7 @@ pub fn forgetDirectFallbacks() void {
     for (&profile_cache.g_profiles) |*p| p.avatar_direct = false;
     for (&feed_media.g_media) |*m| m.direct = false;
     view_profile.g_banner_direct = false;
+    view_place.g_place_logo_direct = false;
 }
 
 pub fn feedImageUrlDirectForTest(buf: []u8, src: []const u8, direct: bool) []const u8 {

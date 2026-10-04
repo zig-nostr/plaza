@@ -27,6 +27,7 @@ const chrome_inset = main.chrome_inset;
 const copyBounded = main.copyBounded;
 const currentPlaceFeed = main.currentPlaceFeed;
 const decodeAndRegister = main.decodeAndRegister;
+const directAllowed = main.directAllowed;
 const elide = main.elide;
 const feed_column_width = main.feed_column_width;
 const fetchSlice = main.fetchSlice;
@@ -38,6 +39,7 @@ const join_sub_scale = main.join_sub_scale;
 const join_title_scale = main.join_title_scale;
 const loadCachedImage = main.loadCachedImage;
 const max_image_bytes = main.max_image_bytes;
+const mediaUrl = main.mediaUrl;
 const menuRow = main.menuRow;
 const menuSurfacePlaced = main.menuSurfacePlaced;
 const modalCard = main.modalCard;
@@ -47,8 +49,10 @@ const mono_meta_scale = main.mono_meta_scale;
 const outboxZone = main.outboxZone;
 const placeLink = main.placeLink;
 const pressRow = main.pressRow;
+const proxyRefusedHost = main.proxyRefusedHost;
 const relayHost = main.relayHost;
 const relayZone = main.relayZone;
+const rememberProxyRefusal = main.rememberProxyRefusal;
 const scope_title_scale = main.scope_title_scale;
 const signerZone = main.signerZone;
 const statusChip = main.statusChip;
@@ -149,7 +153,41 @@ fn forgetPlaceLogo(fx: *Effects) void {
     g_place_logo_for = @splat(0);
     g_place_logo_for_ident_len = 0;
     g_place_logo_state = .idle;
+    // Another room's mark is another host, so it goes through the proxy first.
+    g_place_logo_direct = false;
 }
+
+/// Whether the room's mark is fetched from its own host, because the proxy
+/// refused that host and the reader allows the fallback. The banner's rule.
+pub var g_place_logo_direct: bool = false;
+
+/// The address the room's mark is fetched from: through the reader's proxy,
+/// at the size it is drawn, like every other picture. It went to the host
+/// itself, raw, whatever the proxy setting said.
+fn placeLogoUrl(buf: []u8, logo: []const u8) []const u8 {
+    if (directAllowed(logo, g_place_logo_direct)) return logo;
+    return mediaUrl(buf, logo, place_logo_px, .square);
+}
+
+pub fn placeLogoUrlForTest(buf: []u8, logo: []const u8) []const u8 {
+    return placeLogoUrl(buf, logo);
+}
+
+pub fn placeLogoDirectForTest() bool {
+    return g_place_logo_direct;
+}
+
+/// Hands the logo pipeline an answer with no body, the way the effect loop
+/// does, for a test of a proxy refusing the host.
+pub fn deliverPlaceLogoStatusForTest(fx: *Effects, status: u16) void {
+    handlePlaceLogoFetched(fx, .{
+        .key = place_logo_fetch_key,
+        .outcome = .ok,
+        .status = status,
+        .body = "",
+    });
+}
+
 /// Fetches the place's mark once, and forgets it when the reader leaves.
 pub fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
     _ = model;
@@ -199,7 +237,8 @@ pub fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
     // Stamped with the asker, next to the ask.
     g_place_logo_asked_for = place.author;
     g_place_logo_asked_ident_len = @intCast(copyBounded(&g_place_logo_asked_ident_buf, place.ident()));
-    fetchSlice(fx, place_logo_fetch_key, logo, 0, Effects.responseMsg(.place_logo_fetched));
+    var url_buf: [1024]u8 = undefined;
+    fetchSlice(fx, place_logo_fetch_key, placeLogoUrl(&url_buf, logo), 0, Effects.responseMsg(.place_logo_fetched));
 }
 
 pub fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
@@ -222,6 +261,16 @@ pub fn handlePlaceLogoFetched(fx: *Effects, response: native_sdk.EffectResponse)
     }
     // Every effect slot was busy: ask again next tick.
     if (response.outcome == .rejected) {
+        g_place_logo_state = .idle;
+        return;
+    }
+    // The proxy refusing the HOST: the source itself, once, and only while the
+    // reader allows it. The same fallback faces and the banner take.
+    if (prefs.g_media_direct_fallback and prefs.g_media_proxy_on and !g_place_logo_direct and
+        proxyRefusedHost(response.outcome, response.status))
+    {
+        rememberProxyRefusal(arrived_for.logo());
+        g_place_logo_direct = true;
         g_place_logo_state = .idle;
         return;
     }

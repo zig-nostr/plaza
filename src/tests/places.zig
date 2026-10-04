@@ -1665,6 +1665,48 @@ test "stepping sideways out of a linked room closes its fetch window" {
     main.refreshPlaceFetchForTest();
     try testing.expect(!main.placeFetchArmedForTest());
 }
+
+test "a place's logo goes through the media proxy, and to its host only when the proxy refuses" {
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
+    const was_on = main.mediaProxyOn();
+    defer main.setMediaProxyOn(was_on);
+    const fallback_was = main.mediaDirectFallback();
+    defer main.setMediaDirectFallback(fallback_was);
+    var fx = main.inertEffectsForTest();
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    main.setMediaProxy("https://wsrv.nl/");
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+    var buf: [1024]u8 = undefined;
+    const logo = "https://community.example/logo.png";
+
+    // Through the proxy, as a square at the size the card draws it.
+    const url = main.placeLogoUrlForTest(&buf, logo);
+    try testing.expect(std.mem.startsWith(u8, url, "https://wsrv.nl/?url="));
+    try testing.expect(std.mem.indexOf(u8, url, "fit=cover") != null);
+
+    // The proxy refuses the host: the room's mark is asked of its host instead.
+    main.visitPlaceForTest([_]u8{0xa4} ** 32, "inward", "Inward");
+    main.setPlaceLogoAskedForTest([_]u8{0xa4} ** 32, "inward");
+    main.deliverPlaceLogoStatusForTest(&fx, 400);
+    try testing.expectEqualStrings("idle", main.placeLogoStateNameForTest());
+    try testing.expect(main.placeLogoDirectForTest());
+    try testing.expectEqualStrings(logo, main.placeLogoUrlForTest(&buf, logo));
+
+    // Unless the reader said not to.
+    main.setMediaDirectFallback(false);
+    try testing.expect(!main.placeLogoDirectForTest());
+    try testing.expect(std.mem.startsWith(u8, main.placeLogoUrlForTest(&buf, logo), "https://wsrv.nl/?url="));
+    main.setPlaceLogoAskedForTest([_]u8{0xa4} ** 32, "inward");
+    main.deliverPlaceLogoStatusForTest(&fx, 400);
+    try testing.expectEqualStrings("failed", main.placeLogoStateNameForTest());
+}
 test "a link into another place does not inherit the room you are standing in" {
     // Reported as two places that could not be told apart: entering BASSPISTOL
     // and then following a link to Monero Hallway left the second room showing
