@@ -6303,7 +6303,7 @@ test "an imported key cannot publish a profile over one nobody has read" {
     main.setIdentityMintedForTest(false);
     defer main.setIdentityMintedForTest(false);
     try testing.expect(!model.profile_can_save());
-    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "did not find a profile for you") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "still hearing from your relays") != null);
     try testing.expect(std.mem.indexOf(u8, model.profile_status(), "publishes your first one") == null);
 
     // A key minted in this app has no profile anywhere, which is the one case
@@ -7488,7 +7488,10 @@ test "no follow is written before a relay has said who you already follow" {
     const me = main.activePubkeyForTest().?;
     for (0..5) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expect(!main.canWriteFollows());
-    try testing.expect(main.followBlockedReason() != null);
+    try testing.expect(!main.writeFollowForTest(&fx, someone, true));
+    // It makes the press ask instead: see "pressing Follow when every relay
+    // finished empty asks first".
+    try testing.expect(main.needsFreshConsentForTest(.follows));
 
     // A key MINTED here is different in kind: it provably has no history, so
     // there is nothing a write could destroy.
@@ -8251,8 +8254,10 @@ test "an imported key is never assumed to follow nobody, however quiet the relay
     main.setIdentityMintedForTest(false);
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expect(!main.canWriteFollows());
-    // And the reader is told why, rather than handed a button that does nothing.
-    try testing.expectEqualStrings("No follow list found on your relays", main.followBlockedReason().?);
+    // The answers are not a licence to write. They make the press ask: the
+    // reader is the one party who can say the list is not somewhere unlooked.
+    try testing.expect(main.needsFreshConsentForTest(.follows));
+    try testing.expect(!main.canWriteFollows());
 
     // A key minted here is the one case where "no list" is knowledge, not a
     // guess, because the key did not exist a minute ago.
@@ -8344,14 +8349,14 @@ test "follow, mute and bookmark say what is wrong once the wait runs out, and ca
     // Every relay finished and none had a list: said plainly, still no write.
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expectEqual(main.OwnListsRead.none_found, main.ownListsRead());
-    try testing.expectEqualStrings("No follow list found on your relays", main.followBlockedReason().?);
-    try testing.expectEqualStrings("No mute list found on your relays", main.muteBlockedReason().?);
-    try testing.expectEqualStrings("No bookmark list found on your relays", main.bookmarkBlockedReason().?);
+    // The controls are live and the press asks first; none of it can write.
+    try testing.expect(main.followBlockedReason() == null);
+    try testing.expect(main.muteBlockedReason() == null);
+    try testing.expect(main.bookmarkBlockedReason() == null);
+    try testing.expect(main.needsFreshConsentForTest(.follows));
+    try testing.expect(main.needsFreshConsentForTest(.mutes));
+    try testing.expect(main.needsFreshConsentForTest(.bookmarks));
     try testing.expect(!main.canWriteFollows());
-    {
-        const tree = try buildTree(arena, &model);
-        try testing.expect(findAnyTextContaining(tree.root, "None of your relays sent a follow and mute lists"));
-    }
 }
 
 test "the press that asks to retry reaches the relays and tells the reader" {
@@ -8383,13 +8388,301 @@ test "the profile sheet offers to ask again whenever it cannot save for want of 
     model.profile_stage = .absent;
     try testing.expect(model.profile_can_retry());
     try testing.expect(!model.profile_can_save());
-    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "add that app's relays in Settings") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "still hearing from your relays") != null);
     model.profile_stage = .have;
     try testing.expect(!model.profile_can_retry());
     // Made here, absent is a fact: nothing to ask again.
     main.setIdentityMintedForTest(true);
     model.profile_stage = .absent;
     try testing.expect(!model.profile_can_retry());
+}
+
+/// A store in a temp dir, installed as the app's, for a test that drives a real
+/// write and reads back what went out.
+const FreshStore = struct {
+    tmp: std.testing.TmpDir,
+    store: nostr.store.Store,
+
+    fn open(self: *FreshStore, name: []const u8) !void {
+        self.tmp = testing.tmpDir(.{});
+        var pbuf: [128]u8 = undefined;
+        const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/{s}.mdb", .{ self.tmp.sub_path, name });
+        self.store = try nostr.store.Store.open(db_path, .{});
+        main.setStoreForTest(&self.store);
+    }
+
+    fn close(self: *FreshStore) void {
+        main.setStoreForTest(null);
+        self.store.deinit();
+        self.tmp.cleanup();
+    }
+};
+
+/// Signs in an imported key (not made here) whose every relay has finished
+/// without sending any of its lists: the state the dead-end hunt found.
+fn signInNothingFound(secret_byte: u8) [32]u8 {
+    main.setIdentityForTest([_]u8{secret_byte} ** 32);
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(false);
+    const me = main.activePubkeyForTest().?;
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    return me;
+}
+
+test "pressing Follow when every relay finished empty asks first, and writes only on a yes" {
+    // The account the hunt found: no kind:3 anywhere. Follow used to stay grey for
+    // the whole session. Now it is live, and the press puts the one question only
+    // the reader can answer. A no leaves the relays exactly as they were.
+    var fs: FreshStore = undefined;
+    try fs.open("askfollow");
+    defer fs.close();
+    _ = signInNothingFound(0x6a);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const bob = [_]u8{0xb3} ** 32;
+
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask != null);
+    try testing.expectEqual(main.FreshAsk.Action.follow, model.fresh_ask.?.action);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 3) == null);
+    // The question is on screen, with both answers pressable.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const tree = try buildTree(arena_state.allocator(), &model);
+        try testing.expect(findAnyTextContaining(tree.root, "Start a new follow list?"));
+        try testing.expect(findAnyTextContaining(tree.root, "would replace it with a list holding only this one person"));
+        try testing.expect(pressableByLabel(tree, tree.root, "Start a new list") or findByText(tree.root, .button, "Start a new list") != null);
+        try testing.expect(findByText(tree.root, .button, "Cancel") != null);
+    }
+
+    // No: nothing is written, nothing is remembered, and the next press asks again.
+    main.update(&model, .fresh_list_cancel, &fx);
+    try testing.expect(model.fresh_ask == null);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 3) == null);
+    try testing.expect(!main.canWriteFollows());
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask != null);
+
+    // Yes: the follow goes out as a list of one, and the answer covers follows
+    // only. Mutes and bookmarks are separate lists and still ask.
+    main.update(&model, .fresh_list_confirm, &fx);
+    try testing.expect(model.fresh_ask == null);
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 3) orelse return error.NothingWritten;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "b3" ** 32) != null);
+    try testing.expect(main.canWriteFollows());
+    try testing.expect(main.needsFreshConsentForTest(.mutes));
+    try testing.expect(main.needsFreshConsentForTest(.bookmarks));
+}
+
+test "the yes is only taken while every relay still has finished without the list" {
+    // The question can sit on screen while the situation moves: a retry, a relay
+    // added, an identity switch. A yes that no longer describes anything is not
+    // taken, and it writes nothing.
+    var fs: FreshStore = undefined;
+    try fs.open("staleyes");
+    defer fs.close();
+    const me = signInNothingFound(0x6b);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const bob = [_]u8{0xb4} ** 32;
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask != null);
+
+    // The reader (or the app) asks the relays again, and they have not answered.
+    main.retryOwnListsReadForTest();
+    main.update(&model, .fresh_list_confirm, &fx);
+    try testing.expect(model.fresh_ask == null);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 3) == null);
+    try testing.expect(!main.canWriteFollows());
+    try testing.expect(model.toast_until != 0);
+
+    // And the refusal in the other direction: with only some relays done there is
+    // nothing to ask about, so the press explains instead of asking.
+    for (0..2) |i| main.noteContactsAnsweredByForTest(i, me);
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask == null);
+    try testing.expect(!main.confirmStartFreshForTest(.follows));
+
+    // A different account inherits no yes.
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(main.confirmStartFreshForTest(.follows));
+    try testing.expect(main.canWriteFollows());
+    main.setIdentityForTest([_]u8{0x6c} ** 32);
+    main.forgetFollowsForTest();
+    try testing.expect(!main.canWriteFollows());
+}
+
+test "a list that is held is never asked about" {
+    // Asking is for a list that is not there. One in the store is spliced onto, as
+    // it always was, with no question.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("heldlist");
+    defer fs.close();
+    const me = signInNothingFound(0x6d);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6d} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "p", "11" ** 32 }};
+    const existing = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, existing, signer);
+    main.forgetOwnListMemoForTest();
+    _ = me;
+
+    try testing.expect(!main.needsFreshConsentForTest(.follows));
+    try testing.expect(main.canWriteFollows());
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .follow_author = .{ .who = [_]u8{0xb5} ** 32, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask == null);
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 3).?;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "11" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "b5" ** 32) != null);
+}
+
+test "mute and bookmark ask the same question about their own list" {
+    var fs: FreshStore = undefined;
+    try fs.open("askothers");
+    defer fs.close();
+    _ = signInNothingFound(0x6e);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5f);
+    model.viewing_profile = who;
+    model.thread_notes[0] = threadNote(0x01, 100, 0);
+    model.thread_notes[0].id = 77;
+    model.thread_notes[0].pubkey = who;
+    model.thread_notes_len = 1;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, Msg{ .mute_person = 1 }, &fx);
+    try testing.expectEqual(main.FreshAsk.Action.mute, model.fresh_ask.?.action);
+    try testing.expectEqual(main.ListKind.mutes, model.fresh_ask.?.kind());
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10000) == null);
+    main.update(&model, .fresh_list_cancel, &fx);
+
+    main.update(&model, Msg{ .toggle_bookmark = 77 }, &fx);
+    try testing.expectEqual(main.FreshAsk.Action.bookmark, model.fresh_ask.?.action);
+    try testing.expectEqual(main.ListKind.bookmarks, model.fresh_ask.?.kind());
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10003) == null);
+    main.update(&model, .fresh_list_cancel, &fx);
+
+    main.update(&model, Msg{ .bookmark_privately = 77 }, &fx);
+    try testing.expectEqual(main.FreshAsk.Action.bookmark_privately, model.fresh_ask.?.action);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10003) == null);
+    main.update(&model, .fresh_list_cancel, &fx);
+
+    // Yes on the mute list publishes a list of one and leaves the others asking.
+    main.update(&model, Msg{ .mute_person = 1 }, &fx);
+    main.update(&model, .fresh_list_confirm, &fx);
+    const muted = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingWritten;
+    defer testing.allocator.free(muted);
+    try testing.expect(std.mem.indexOf(u8, muted, "5f" ** 32) != null);
+    try testing.expect(main.needsFreshConsentForTest(.bookmarks));
+    try testing.expect(main.needsFreshConsentForTest(.follows));
+}
+
+test "a first profile is published only after a second, informed press" {
+    // Save was dead for good on an account with no kind:0 on the relays. It is
+    // live once every relay has finished, the first press shows what a wrong
+    // guess costs and writes nothing, and the second is the reader's answer.
+    var fs: FreshStore = undefined;
+    try fs.open("firstprofile");
+    defer fs.close();
+    _ = signInNothingFound(0x6f);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    model.profile_name_buffer.set("Fresh");
+    var fx: main.EffectsForTest = undefined;
+
+    try testing.expect(model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "No relay has a profile for you") != null);
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+    try testing.expect(model.profile_stage == .absent);
+    try testing.expect(main.ownRecordContentForTest(testing.allocator, 0) == null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "would be replaced") != null);
+
+    // Closing and reopening forgets the first press: the question is asked again.
+    model.profile_confirm_new = false;
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+    main.update(&model, .profile_save, &fx);
+    const content = main.ownRecordContentForTest(testing.allocator, 0) orelse return error.NothingWritten;
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "Fresh") != null);
+
+    // Not every relay finished: Save stays off, and says so.
+    main.forgetOwnRecordAnswersForTest();
+    main.ownListsWaitedForTest(60);
+    var other = main.initialModel();
+    other.profile_stage = .absent;
+    try testing.expect(!other.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, other.profile_status(), "Some relays did not answer") != null);
+}
+
+test "every status the Edit profile sheet can show fits the two lines it has room for" {
+    // The sheet is a fixed card in a 760 high window and the status sits above the
+    // buttons. Three lines pushed Save and Try again past the card and off the
+    // window, so a reader in exactly the state that needs them could not press
+    // them. Two lines at the sheet's width is about 104 characters.
+    main.setIdentityForTest([_]u8{0x71} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    defer main.setIdentityMintedForTest(false);
+    const me = main.activePubkeyForTest().?;
+    const limit: usize = 104;
+
+    var model = main.initialModel();
+    const stages = [_]main.ProfileStage{ .fetching, .absent, .unread, .have, .saving, .sent, .failed };
+    for ([_]bool{ false, true }) |minted| {
+        main.setIdentityMintedForTest(minted);
+        for ([_]u8{ 0, 1, 2 }) |relays| {
+            main.forgetFollowsForTest();
+            main.forgetOwnRecordAnswersForTest();
+            main.resetRelaysForTest();
+            switch (relays) {
+                0 => {},
+                1 => main.ownListsWaitedForTest(60),
+                else => for (0..8) |i| main.noteContactsAnsweredByForTest(i, me),
+            }
+            for (stages) |stage| {
+                for ([_]bool{ false, true }) |confirming| {
+                    model.profile_stage = stage;
+                    model.profile_confirm_new = confirming;
+                    try testing.expect(model.profile_status().len <= limit);
+                }
+            }
+        }
+    }
 }
 
 test "a write that would drop more names than the press implies is refused" {

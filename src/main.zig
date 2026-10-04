@@ -12309,6 +12309,13 @@ pub const Model = struct {
     /// The note this reader has asked to delete, while the confirmation is up.
     /// The one action here with no undo, so it is asked rather than done.
     deleting_note: ?i64 = null,
+    /// A write that would start a list from nothing, held while the reader is
+    /// asked. Every relay has finished without sending that list, and only the
+    /// reader can say whether this account really has none.
+    fresh_ask: ?FreshAsk = null,
+    /// The Edit profile sheet, one press into publishing a first profile: the
+    /// warning is up and the next Save goes through.
+    profile_confirm_new: bool = false,
     /// Whether the mention picker has been dismissed for the query now in the
     /// draft. It has no open flag of its own: it shows whenever the draft ends
     /// in a `@word`, so Escape and a press outside had nothing to clear and it
@@ -12506,7 +12513,7 @@ pub const Model = struct {
         "topic_buf",                 "topic_len",              "update_check_explainer", "update_check_on",        "version_line",
         "viewingTopic",              "viewing_bookmarks",      "blossom_buffer",         "blossom_draft",          "blossom_error",
         "blossom_status",            "upload_alt",             "upload_alt_buffer",      "profile_limit",          "profile_autofill",
-        "profile_asked_until",       "relay_last",             "profile_can_retry",
+        "profile_asked_until",       "relay_last",             "profile_can_retry",      "fresh_ask",              "profile_confirm_new",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12782,10 +12789,18 @@ pub const Model = struct {
             // imported key it is only what the relays this app happens to dial
             // have said, and publishing over it would delete a profile living
             // somewhere they have not been asked.
-            .absent => if (g_identity_minted_here)
+            .absent => if (g_identity_minted_here or startedFresh(.profile))
                 "You have no profile yet. Saving publishes your first one."
-            else
-                "Plaza did not find a profile for you on the relays it reads, and it will not publish over one it has not seen. If you have one in another app, add that app's relays in Settings and try again.",
+            else switch (ownListsRead()) {
+                // Every relay finished and none has a profile. The reader is the
+                // only one who can say whether that is the whole story.
+                .none_found => if (self.profile_confirm_new)
+                    "A profile you keep in another app would be replaced. Press again only if this account is new."
+                else
+                    "No relay has a profile for you. If this account is new, Save publishes your first one.",
+                .reading => "Plaza has not found a profile yet and is still hearing from your relays.",
+                .incomplete => "Some relays did not answer, so Plaza cannot tell whether you have a profile. Try again.",
+            },
             // Deliberately NOT "you have no profile". Not hearing back is not
             // the same as being told there is nothing, and only one of those is
             // safe to publish over.
@@ -12856,7 +12871,7 @@ pub const Model = struct {
     pub fn profile_can_retry(self: *const Model) bool {
         return switch (self.profile_stage) {
             .unread => true,
-            .absent => !g_identity_minted_here,
+            .absent => !noHistoryKnown(.profile),
             else => false,
         };
     }
@@ -12881,7 +12896,9 @@ pub const Model = struct {
         if (self.profile_invalid().len > 0) return false;
         return switch (self.profile_stage) {
             .have, .failed, .sent => true,
-            .absent => g_identity_minted_here,
+            // Not made here, and not yet said to be new: Save is live only once
+            // every relay has finished without a profile, and then it asks.
+            .absent => noHistoryKnown(.profile) or ownListsRead() == .none_found,
             .fetching, .saving, .unread => false,
         };
     }
@@ -18043,6 +18060,10 @@ pub const Msg = union(enum) {
     delete_note_request: i64,
     delete_note_confirm,
     delete_note_cancel,
+    /// The answer to "start a new list?": yes carries on with the write that
+    /// asked, no drops it.
+    fresh_list_confirm,
+    fresh_list_cancel,
     /// Add or remove a bookmark, and open the list of them.
     toggle_bookmark: i64,
     /// Save it where only this reader can read it. NIP-51's private half, sealed
@@ -18415,6 +18436,8 @@ pub const Msg = union(enum) {
         "delete_note_cancel",
         "delete_note_confirm",
         "delete_note_request",
+        "fresh_list_cancel",
+        "fresh_list_confirm",
         "follow_author",
         "follow_person",
         "go_home",
@@ -19439,6 +19462,9 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.deleting_note) |_| {
         return ui.stack(.{ .grow = 1 }, .{ base, deleteConfirm(ui) });
     }
+    if (model.fresh_ask) |ask| {
+        return ui.stack(.{ .grow = 1 }, .{ base, freshListConfirm(ui, ask) });
+    }
     if (model.expanded_note) |note_id| {
         if (model.noteById(note_id)) |note| {
             // Layered OVER the feed rather than replacing it, so the scroll
@@ -19638,7 +19664,7 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     .variant = .primary,
                     .disabled = !model.profile_can_save(),
                     .on_press = Msg.profile_save,
-                }, "Save"),
+                }, if (model.profile_confirm_new) "Publish first profile" else "Save"),
             }),
         })),
     }));
@@ -21253,6 +21279,45 @@ fn deleteConfirm(ui: *AppUi) AppUi.Node {
                 ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .delete_note_cancel }, "Cancel"),
                 ui.spacer(1),
                 ui.button(.{ .size = .sm, .variant = .destructive, .on_press = .delete_note_confirm }, "Delete"),
+            }),
+        }),
+    });
+}
+
+/// The question asked before a list is started from nothing.
+///
+/// Every relay Plaza reads from has finished and none sent this list, which is
+/// the strongest thing the app can know and still not proof: the list may sit on
+/// a relay Plaza has never dialed. So it asks the one party who can know, and says
+/// what a wrong yes costs. A list is replaceable, and the new one would hold only
+/// what this press adds.
+fn freshListConfirm(ui: *AppUi, ask: FreshAsk) AppUi.Node {
+    const p = theme.palette;
+    const list = switch (ask.action) {
+        .follow => "follow list",
+        .mute => "mute list",
+        .bookmark, .bookmark_privately => "bookmark list",
+    };
+    const holds = switch (ask.action) {
+        .follow => "this one person",
+        .mute => "this one person",
+        .bookmark, .bookmark_privately => "this one note",
+    };
+    return ui.el(.dialog, .{
+        .padding = 20,
+        .on_press = .fresh_list_cancel,
+        .semantics = .{ .label = "Start a new list?" },
+    }, .{
+        ui.column(.{ .gap = 12, .cross = .stretch }, .{
+            ui.text(.{}, ui.fmt("Start a new {s}?", .{list})),
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = ui.fmt("None of your relays has a {s} for you. If you already have one somewhere Plaza has not looked, a new one would replace it with a list holding only {s}. Go on only if this account is new, or you know it has no {s}.", .{ list, holds, list }) }},
+            ),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .fresh_list_cancel }, "Cancel"),
+                ui.spacer(1),
+                ui.button(.{ .size = .sm, .variant = .destructive, .on_press = .fresh_list_confirm }, "Start a new list"),
             }),
         }),
     });
@@ -23385,7 +23450,7 @@ fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     const have_base = previous != null;
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
 
-    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+    if (!have_base and !noHistoryKnown(.bookmarks)) return .no_list_yet;
 
     if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
         .readable => {},
@@ -23468,7 +23533,7 @@ fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWr
     if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
-    if (previous == null and !g_identity_minted_here) return .no_list_yet;
+    if (previous == null and !noHistoryKnown(.bookmarks)) return .no_list_yet;
     if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
         .readable => {},
         .waiting => return .private_half_waiting,
@@ -23557,7 +23622,7 @@ fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) vo
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
-    if (previous == null and !g_identity_minted_here) {
+    if (previous == null and !noHistoryKnown(.bookmarks)) {
         setToast(model, noListToast("bookmarks"));
         return;
     }
@@ -23751,7 +23816,7 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     const have_base = previous != null;
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
 
-    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+    if (!have_base and !noHistoryKnown(.mutes)) return .no_list_yet;
 
     // The private half, carried forward VERBATIM and only when it is understood.
     //
@@ -24675,6 +24740,7 @@ fn forgetFollows() void {
     // And how long it has been waiting on this account's lists: the next one
     // starts its own clock.
     g_own_lists_since_for = null;
+    forgetFresh();
     // The open subscriptions were built for the previous identity and are now
     // asking the wrong question. Without this a sign-in never gets its own
     // records requested on an already-open socket, and following stays disabled
@@ -24732,7 +24798,7 @@ fn loadFollowsFromStore() void {
 pub fn canWriteFollows() bool {
     if (activePubkey() == null) return false;
     if (haveOwnContactList()) return true;
-    return g_identity_minted_here;
+    return noHistoryKnown(.follows);
 }
 
 /// Why the follow control is unavailable, in the reader's terms. An unexplained
@@ -24744,7 +24810,9 @@ pub fn followBlockedReason() ?[]const u8 {
     return switch (ownListsRead()) {
         .reading => "Looking for your follow list…",
         .incomplete => "Could not read your follow list. Try again",
-        .none_found => "No follow list found on your relays",
+        // Every relay finished and none has one: the press asks first, so the
+        // control is live. See `needsFreshConsent`.
+        .none_found => null,
     };
 }
 
@@ -24756,7 +24824,7 @@ pub fn followBlockedReason() ?[]const u8 {
 /// case where having none is a fact rather than a read that has not landed.
 pub fn muteBlockedReason() ?[]const u8 {
     if (activePubkey() == null) return null;
-    if (g_identity_minted_here) return null;
+    if (noHistoryKnown(.mutes)) return null;
     // Free, and the right question. `mutesAreOwned` is true exactly when this
     // account's own kind:10000 has been read, which is what the gate in
     // `writeMute` decides on. No store query per frame: the button asks this,
@@ -24767,7 +24835,7 @@ pub fn muteBlockedReason() ?[]const u8 {
     return switch (ownListsRead()) {
         .reading => "Looking for your mute list…",
         .incomplete => "Could not read your mute list. Try again",
-        .none_found => "No mute list found on your relays",
+        .none_found => null,
     };
 }
 
@@ -24775,12 +24843,12 @@ pub fn muteBlockedReason() ?[]const u8 {
 /// when the list is read (or provably empty). Same rule as the mute list.
 pub fn bookmarkBlockedReason() ?[]const u8 {
     if (activePubkey() == null) return null;
-    if (g_identity_minted_here) return null;
+    if (noHistoryKnown(.bookmarks)) return null;
     if (bookmarksAreOwned()) return null;
     return switch (ownListsRead()) {
         .reading => "Still fetching your bookmarks",
         .incomplete => "Could not read your bookmarks. Try again",
-        .none_found => "No bookmark list found on your relays",
+        .none_found => null,
     };
 }
 
@@ -24924,6 +24992,75 @@ fn retryOwnListsRead() void {
     // The open subscriptions re-ask on this counter, which is what makes every
     // relay send its stored answer (and its end-of-stored-events) again.
     _ = g_follow_gen.fetchAdd(1, .monotonic);
+}
+
+/// The lists a write can replace.
+pub const ListKind = enum { follows, mutes, bookmarks, profile };
+
+/// Which lists the reader has said, with every relay finished, are new for this
+/// account. Keyed by the pubkey it was said about, like every conclusion about
+/// the reader's own records, and dropped on any identity change.
+var g_fresh_for: ?[32]u8 = null;
+var g_fresh: [@typeInfo(ListKind).@"enum".fields.len]bool = @splat(false);
+
+fn forgetFresh() void {
+    g_fresh_for = null;
+    g_fresh = @splat(false);
+}
+
+fn startedFresh(kind: ListKind) bool {
+    const pk = activePubkey() orelse return false;
+    const who = g_fresh_for orelse return false;
+    return std.mem.eql(u8, &who, &pk) and g_fresh[@intFromEnum(kind)];
+}
+
+/// Whether having no `kind` list is a fact about this account rather than a read
+/// that did not land: the key was made here, or the reader said so after every
+/// relay finished without one.
+fn noHistoryKnown(kind: ListKind) bool {
+    return g_identity_minted_here or startedFresh(kind);
+}
+
+/// Records the reader's answer to "start a new list?". Refused unless every relay
+/// has still finished without sending one, so a question left open on screen
+/// while the relays changed (a retry, a relay added) cannot be answered with a
+/// yes that no longer describes anything.
+///
+/// Set here, on the confirmation, and never on the press that asked for it.
+fn confirmStartFresh(kind: ListKind) bool {
+    const pk = activePubkey() orelse return false;
+    if (!contactsConfirmedAbsent()) return false;
+    if (g_fresh_for) |who| {
+        if (!std.mem.eql(u8, &who, &pk)) g_fresh = @splat(false);
+    }
+    g_fresh_for = pk;
+    g_fresh[@intFromEnum(kind)] = true;
+    return true;
+}
+
+/// Whether a write of `kind` has to be asked about first: no copy of the list is
+/// held, nothing says the account is new, and every relay has finished without
+/// one. While relays are still answering (or stopped answering) there is nothing
+/// to ask about, because the answer would be a guess; the control says so instead.
+fn needsFreshConsent(kind: ListKind) bool {
+    if (activePubkey() == null) return false;
+    if (noHistoryKnown(kind)) return false;
+    const held = switch (kind) {
+        .follows => g_pending_follow_tags != null or haveOwnContactList(),
+        .mutes => ownRecordExists(mute_list_kind),
+        .bookmarks => ownRecordExists(bookmark_list_kind),
+        .profile => ownRecordExists(0),
+    };
+    if (held) return false;
+    return ownListsRead() == .none_found;
+}
+
+pub fn needsFreshConsentForTest(kind: ListKind) bool {
+    return needsFreshConsent(kind);
+}
+
+pub fn confirmStartFreshForTest(kind: ListKind) bool {
+    return confirmStartFresh(kind);
 }
 
 pub fn retryOwnListsReadForTest() void {
@@ -25073,7 +25210,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // the two turned "they have a list, splice onto it" into "they have none,
     // publish the nine names this app chose" over a real list. A key minted here
     // is the only case where having nothing is a fact rather than a read error.
-    if (!have_base and !g_identity_minted_here) return .no_list_yet;
+    if (!have_base and !noHistoryKnown(.follows)) return .no_list_yet;
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     // Freed on every path that does not hand it to the write seam. Two of those
@@ -34507,6 +34644,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             const who = model.viewing_profile orelse return;
+            if (direction == 1 and askFreshFirst(model, .{ .action = .follow, .who = who })) return;
             sayFollowWrite(model, writeFollow(fx, who, direction == 1), direction == 1);
         },
         .mute_person => |direction| {
@@ -34519,6 +34657,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             const who = model.viewing_profile orelse return;
+            if (direction == 1 and askFreshFirst(model, .{ .action = .mute, .who = who })) return;
             sayMuteWrite(model, writeMute(fx, who, direction == 1), direction == 1);
         },
         .choose_home_scope => |which| {
@@ -34563,6 +34702,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.joining = true;
                 return;
             }
+            if (press.direction == 1 and askFreshFirst(model, .{ .action = .follow, .who = press.who })) return;
             sayFollowWrite(model, writeFollow(fx, press.who, press.direction == 1), press.direction == 1);
         },
         .open_profile_edit => openProfileEdit(model),
@@ -34591,6 +34731,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             setToast(model, "Asking your relays again.");
         },
         .profile_retry => {
+            model.profile_confirm_new = false;
             forgetOwnProfileAnswer();
             model.profile_asked_at = nowSeconds();
             model.profile_stage = .fetching;
@@ -34741,10 +34882,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_bookmark => |note_id| {
             const note = model.noteById(note_id) orelse return;
             const adding = !isBookmarked(note.event_id);
+            if (adding and askFreshFirst(model, .{ .action = .bookmark, .note_id = note_id })) return;
             sayBookmarkWrite(model, writeBookmark(fx, note.event_id, adding), adding);
         },
         .bookmark_privately => |note_id| {
             const note = model.noteById(note_id) orelse return;
+            if (askFreshFirst(model, .{ .action = .bookmark_privately, .note_id = note_id })) return;
             // A seal is a round trip, so nothing is said until it lands: the
             // toast comes from `finishPrivateBookmark`, or from the refusal.
             switch (writePrivateBookmark(fx, note.event_id, true)) {
@@ -34755,6 +34898,32 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_bookmarks => openBookmarks(model),
         .delete_note_request => |id| model.deleting_note = id,
         .delete_note_cancel => model.deleting_note = null,
+        .fresh_list_cancel => model.fresh_ask = null,
+        .fresh_list_confirm => {
+            const ask = model.fresh_ask orelse return;
+            model.fresh_ask = null;
+            // Said before anything is written: the question was put while every
+            // relay had finished, and the yes is only taken if that still holds.
+            if (!confirmStartFresh(ask.kind())) {
+                setToast(model, "Your relays changed while you were deciding, so nothing was changed.");
+                return;
+            }
+            switch (ask.action) {
+                .follow => sayFollowWrite(model, writeFollow(fx, ask.who, true), true),
+                .mute => sayMuteWrite(model, writeMute(fx, ask.who, true), true),
+                .bookmark => {
+                    const note = model.noteById(ask.note_id) orelse return;
+                    sayBookmarkWrite(model, writeBookmark(fx, note.event_id, true), true);
+                },
+                .bookmark_privately => {
+                    const note = model.noteById(ask.note_id) orelse return;
+                    switch (writePrivateBookmark(fx, note.event_id, true)) {
+                        .published => {},
+                        else => |outcome| sayBookmarkWrite(model, outcome, true),
+                    }
+                },
+            }
+        },
         .delete_note_confirm => {
             const id = model.deleting_note;
             model.deleting_note = null;
@@ -35428,6 +35597,14 @@ pub fn lastClipboardForTest() []const u8 {
     return g_last_clipboard[0..g_last_clipboard_len];
 }
 
+/// Holds a write that would start a list from nothing and puts the question to
+/// the reader. Returns whether it did, so the caller stops there.
+fn askFreshFirst(model: *Model, ask: FreshAsk) bool {
+    if (!needsFreshConsent(ask.kind())) return false;
+    model.fresh_ask = ask;
+    return true;
+}
+
 /// What a refused list write says, by how far the read of that list got. The
 /// refusal is the same every time (nothing was changed); what the reader can do
 /// about it is not.
@@ -35492,6 +35669,25 @@ fn enterSettings(model: *Model) void {
 /// this app models, which is how somebody's lightning address disappears. So the
 /// sheet asks every read relay first, and only calls it `absent` once they have
 /// all answered.
+/// What is waiting on the reader's answer to "start a new list?".
+pub const FreshAsk = struct {
+    action: Action,
+    /// The person to follow or mute.
+    who: [32]u8 = [_]u8{0} ** 32,
+    /// The note to bookmark.
+    note_id: i64 = 0,
+
+    pub const Action = enum { follow, mute, bookmark, bookmark_privately };
+
+    pub fn kind(self: FreshAsk) ListKind {
+        return switch (self.action) {
+            .follow => .follows,
+            .mute => .mutes,
+            .bookmark, .bookmark_privately => .bookmarks,
+        };
+    }
+};
+
 pub const ProfileStage = enum { fetching, absent, unread, have, saving, sent, failed };
 
 /// How long the sheet waits for a relay before saying it could not read the
@@ -35564,6 +35760,7 @@ fn forgetOwnRecordAnswers() void {
     // relay having said a word about them.
     g_contacts_answered_by = [_]bool{false} ** max_relays;
     g_own_lists_since_for = null;
+    forgetFresh();
 }
 var g_own_profile_asking = std.atomic.Value(bool).init(false);
 /// Set by the worker when at least one relay ANSWERED (EOSE), paired with the
@@ -35693,6 +35890,7 @@ fn openProfileEdit(model: *Model) void {
     }
     model.editing_profile = true;
     g_profile_upload_unsaved = false;
+    model.profile_confirm_new = false;
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
     model.profile_picture_buffer.clear();
@@ -35818,6 +36016,17 @@ fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 fn saveProfile(model: *Model, fx: *Effects) void {
     if (!model.profile_can_save()) return;
     if (activePubkey() == null) return;
+    // A profile not found on any relay, for a key that was not made here: the
+    // first press shows what a wrong guess costs, and the second is the reader's
+    // answer. Nothing is signed or written by the first.
+    if (model.profile_stage == .absent and !noHistoryKnown(.profile)) {
+        if (!model.profile_confirm_new) {
+            model.profile_confirm_new = true;
+            return;
+        }
+        model.profile_confirm_new = false;
+        if (!confirmStartFresh(.profile)) return;
+    }
     // The sheet reports `.sent` as soon as it has handed the merge over, so a
     // rejected sign would show a saved profile that was never signed. Refusing
     // leaves the sheet exactly as it was, with Save still live.
@@ -39045,6 +39254,9 @@ fn drivePendingIntent(model: *Model, fx: *Effects) void {
             // than queued, because a write that lands minutes later, silently, is
             // exactly the shape this app refuses everywhere else.
             if (!canWriteFollows()) {
+                // Every relay finished with no list: the guest's first follow is
+                // asked about like any other, now that they have an account.
+                if (askFreshFirst(model, .{ .action = .follow, .who = pk })) return;
                 setToast(model, noListToast("follow list"));
                 return;
             }
@@ -44478,6 +44690,8 @@ fn performLogout(model: *Model, fx: *Effects) void {
     model.notifications_open = false;
     model.editing_profile = false;
     model.profile_seeded = false;
+    model.profile_confirm_new = false;
+    model.fresh_ask = null;
 
     // And this key was not made here, whoever comes next. The flag is the ONE
     // piece of evidence that authorizes building a contact list, a relay list or

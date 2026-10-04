@@ -66,6 +66,7 @@ Two scripts are not part of CI:
 ## Nostr rules that matter here
 
 - Never publish a replaceable event (kind 0, 3, 10000, 10002 and the rest of `1xxxx`) over data you have not read back first. An empty answer from a relay does not mean the user has no such event. Writing over a list you never read deletes the user's data.
+- The one thing that may stand in for a read is the user's own answer. When every relay Plaza reads from has finished and none sent the list, Plaza asks before starting a new one and says what that would replace, and it asks again for each kind of list. A relay that has not finished never counts, and neither does a timeout: those show what went wrong and offer a retry.
 - Before designing anything at the protocol level (a new subscription, relay choice, batching, caching, pagination), read how established clients do the same job. Nostr has many traps and they are already solved in shipping code.
 - Validate everything that comes from a relay at the boundary.
 
