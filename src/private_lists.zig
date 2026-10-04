@@ -14,6 +14,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const max_private_cipher_len = main.max_private_cipher_len;
+const max_private_plain_len = main.max_private_plain_len;
 const handlePrivateSeal = main.handlePrivateSeal;
 const Model = main.Model;
 const no_half_id = main.no_half_id;
@@ -60,7 +62,10 @@ const PrivateHalf = struct {
     /// The ask in flight over Notary's door, if that is who was asked. The
     /// answer comes back with nothing but a key, so the key carries this.
     ask_seq: u32 = 0,
-    plain_buf: [4096]u8 = undefined,
+    /// As long as NIP-44 can seal, so any list a signer can write can be read
+    /// back. It was 4096 bytes, which a few dozen entries outgrow, and an
+    /// unreadable half refuses every write to its list.
+    plain_buf: [max_private_plain_len]u8 = undefined,
     plain_len: u16 = 0,
 
     fn plain(self: *const PrivateHalf) []const u8 {
@@ -75,8 +80,8 @@ pub var g_private_halves: [4]PrivateHalf = [_]PrivateHalf{.{}} ** 4;
 /// The ciphertext each slot is about, held because the ask happens on a later
 /// tick than the read that noticed it was needed.
 const PrivateCiphertext = struct {
-    buf: [4096]u8 = undefined,
-    len: u16 = 0,
+    buf: [max_private_cipher_len]u8 = undefined,
+    len: u32 = 0,
     fn slice(self: *const PrivateCiphertext) []const u8 {
         return self.buf[0..self.len];
     }

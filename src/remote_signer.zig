@@ -165,7 +165,7 @@ const HalfInbox = struct {
     ok: bool = false,
     /// The answer was longer than this can hold, so it was not kept at all.
     too_large: bool = false,
-    plain_buf: [4096]u8 = undefined,
+    plain_buf: [max_private_plain_len]u8 = undefined,
     plain_len: u16 = 0,
 };
 pub var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;

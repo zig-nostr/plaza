@@ -606,6 +606,41 @@ test "a bunker's seal of a long private bookmark list is published whole" {
     try testing.expect(std.mem.indexOf(u8, opened, &hex) != null);
 }
 
+test "a private half past 4096 bytes is read, and the list can still be written" {
+    // The private-half cache held 4096 bytes of ciphertext and of plaintext.
+    // Thirty-six private bookmarks seal to 4188, so that list read as
+    // unreadable: its private bookmarks did not show, and every bookmark
+    // press after that was refused.
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.forgetLastPublishedForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmbig.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    _ = try privateBookmarksFixture(arena, &signer, &store, 36);
+
+    var last = [_]u8{0xd0} ** 32;
+    last[31] = 35;
+    try testing.expect(main.isBookmarked(last));
+
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, [_]u8{0xd3} ** 32, true));
+    try testing.expect(main.isBookmarked(last));
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes
