@@ -103,6 +103,39 @@ test "a bunker's refused reply comes back, and the like pressed after it stays" 
     try testing.expect(!main.isLikedForTest(liked));
 }
 
+test "a press one account left unsigned is never undone in the next account's session" {
+    // The undo record outlived the sign-out, and a failed upload token applied
+    // whatever record was armed although the token never armed one. So account
+    // A's unsigned like, followed by B's upload failing, un-liked the note for
+    // B; a reply would have been filed as a draft in B's session.
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const note: i64 = 0x7e57;
+
+    // A likes a note, and signs out while Notary is still asking.
+    main.setIdentityForTest([_]u8{0x8b} ** 32);
+    main.rememberLikeForTest(note, [_]u8{0x21} ** 32);
+    main.signAndPublishWithUndoForTest(&fx, 1_800_000_000, 7, "+", .{ .like = note });
+    main.performLogoutForTest(&model, &fx);
+
+    // B likes the same note, then an upload token of B's is refused.
+    main.clearLoggedOutLatchForTest();
+    main.setIdentityForTest([_]u8{0x8c} ** 32);
+    main.rememberLikeForTest(note, [_]u8{0x22} ** 32);
+    main.requestHelperSignForTest(&fx, 1_800_000_001, 24242, "Upload a picture", false);
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expect(main.isLikedForTest(note));
+}
+
 test "a reply waits for Notary to finish the sign it is already doing" {
     // Every other write asks `signerReady` first. A reply did not, so one sent
     // while Notary was signing something else took that request's slot, and
