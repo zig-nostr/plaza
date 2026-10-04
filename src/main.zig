@@ -38402,11 +38402,22 @@ fn searchRelayWorker(job: SearchJob) void {
     // that could not be reached.
     state = .silent;
 
+    // Read in slices of a second rather than parked in `receive`. A thread
+    // blocked there cannot see that the term has moved on, and kept a socket
+    // and a keeper slot for a search nobody was looking at until the relay next
+    // spoke. The deadline is its own as well as the keeper's, so the thread ends
+    // even when the keeper's table was full and nothing is watching it.
+    const deadline = std.Io.Timestamp.now(io, .awake).toMilliseconds() + one_shot_budget_ms;
     var frames: usize = 0;
-    while (frames < search_frames_max) : (frames += 1) {
+    while (frames < search_frames_max) {
         if (g_search_gen.load(.acquire) != job.gen) return;
-        var msg = (relay.receive() catch break) orelse break;
+        if (std.Io.Timestamp.now(io, .awake).toMilliseconds() >= deadline) break;
+        var msg = (relay.receiveTimeout(ingest_wake) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => break,
+        }) orelse break;
         defer msg.deinit();
+        frames += 1;
         const reply: search.Reply = switch (msg.value) {
             .event => |e| blk: {
                 if (searchAccept(gpa, signer, job, e.event) and seen.add(e.event.pubkey)) found +|= 1;
