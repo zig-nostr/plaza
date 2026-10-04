@@ -6294,6 +6294,9 @@ pub const sameRecord = private_lists.sameRecord;
 pub const scanPrivateHalves = private_lists.scanPrivateHalves;
 
 // re-exports: keyholder.zig
+pub const lastPublishedRouteExclusiveForTest = keyholder.lastPublishedRouteExclusiveForTest;
+pub const lastPublishedRouteRelaysForTest = keyholder.lastPublishedRouteRelaysForTest;
+pub const requestHelperSignRoutedForTest = keyholder.requestHelperSignRoutedForTest;
 pub const answerHelperSignForTest = keyholder.answerHelperSignForTest;
 pub const ceremonyCanTakeKeyForTest = keyholder.ceremonyCanTakeKeyForTest;
 pub const ceremonyOwesNameForTest = keyholder.ceremonyOwesNameForTest;

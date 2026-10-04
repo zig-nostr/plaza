@@ -374,6 +374,30 @@ test "a sign that never gets an answer at all still gives the note back" {
     try testing.expectEqualStrings("a note into the void", model.draft());
 }
 
+test "a note Notary signs goes to the place it was written in" {
+    // The route rides the sign slot across the round trip, and the slot is
+    // reset the moment the signature is accepted. Read after that, the route
+    // was always "no place": a note written in a place that writes only to its
+    // own relay went to the reader's public relays instead.
+    // The stand-in keyholder answers through the same handler Notary's answer
+    // reaches, so the release and the read happen in the order they ship in.
+    main.setIdentityForTest([_]u8{0x52} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    main.requestHelperSignRoutedForTest(&fx, 1_800_000_000, "written in the back room", "wss://backroom.example", true);
+
+    const published = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqualStrings("written in the back room", published.content);
+    var urls: [4][]const u8 = undefined;
+    const n = main.lastPublishedRouteRelaysForTest(&urls);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("wss://backroom.example", urls[0]);
+    try testing.expect(main.lastPublishedRouteExclusiveForTest());
+}
+
 // ---- B3: guest-first launch ------------------------------------------------
 
 test "a guest feed shows the join strip; dismissing keeps the Guest chip" {

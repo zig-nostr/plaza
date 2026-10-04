@@ -1331,7 +1331,10 @@ pub fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?
     // A media server's upload token is a bearer credential for one file, not a
     // record. It is never stored and never published, whatever signed it.
     if (ev.kind == blossom.auth_kind) return;
-    if (builtin.is_test) keyholder.g_last_published = ev;
+    if (builtin.is_test) {
+        keyholder.g_last_published = ev;
+        keyholder.g_last_published_route = route;
+    }
     if (main.g_store == null) return;
     if (verify) |signer| {
         // A note we did not produce: verification is the gate into the store

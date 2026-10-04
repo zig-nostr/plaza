@@ -16,6 +16,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const copyBounded = main.copyBounded;
 const Effects = main.Effects;
 const Model = main.Model;
 const PlaceRoute = main.PlaceRoute;
@@ -1167,6 +1168,11 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
+    // The room is read BEFORE the slot is released, because releasing it resets
+    // the slot and with it the route. Read after, every note Notary signed went
+    // to the reader's public relays, the exclusive place it was written in
+    // included or not, and the outbox retried it there too.
+    const route = g_helper_sign.route;
     // Signed. The note is the store's and the outbox's problem now, so the copy
     // held for a restore is dropped and any earlier failure notice retired.
     releaseHelperSign();
@@ -1178,7 +1184,7 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     releaseUndo();
     // The room this write was submitted FROM, not the one on screen now: the
     // keyholder can ask a person, and the reader can walk out while it waits.
-    ingestAndPublish(gpa, out, null, g_helper_sign.route);
+    ingestAndPublish(gpa, out, null, route);
 }
 
 /// Delivers one /pubkey answer the way the runtime would.
@@ -1316,6 +1322,29 @@ pub fn helperSignRestorableForTest() bool {
 
 pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
     requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none);
+}
+
+/// The same, submitted from a place that writes to `relay` and, when
+/// `exclusive`, nowhere else.
+pub fn requestHelperSignRoutedForTest(fx: *Effects, created: i64, content: []const u8, relay: []const u8, exclusive: bool) void {
+    var route: PlaceRoute = .{ .exclusive = exclusive };
+    route.lens[0] = @intCast(copyBounded(&route.urls[0], relay));
+    route.len = 1;
+    requestHelperSign(fx, std.heap.page_allocator, created, 1, &.{}, content, true, route);
+}
+
+/// The route the last published event was handed to the publish with. Only
+/// recorded in a test binary.
+pub var g_last_published_route: PlaceRoute = .none;
+
+pub fn lastPublishedRouteRelaysForTest(out: [][]const u8) usize {
+    var n: usize = 0;
+    while (n < g_last_published_route.len and n < out.len) : (n += 1) out[n] = g_last_published_route.url(n);
+    return n;
+}
+
+pub fn lastPublishedRouteExclusiveForTest() bool {
+    return g_last_published_route.exclusive;
 }
 
 pub fn handleHelperSignedForTest(response: native_sdk.EffectResponse) void {
