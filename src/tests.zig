@@ -12273,6 +12273,7 @@ test "a restored Notary session on an install with no Notary says so, and does n
     main.setIdentityForTest([_]u8{0x3C} ** 32);
     defer main.clearIdentityForTest();
     main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
     main.setKeyholderMissingForTest(true);
     defer main.setKeyholderMissingForTest(false);
 
