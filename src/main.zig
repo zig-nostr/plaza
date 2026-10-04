@@ -38387,31 +38387,20 @@ fn searchRelayWorker(job: SearchJob) void {
         if (g_search_gen.load(.acquire) != job.gen) return;
         var msg = (relay.receive() catch break) orelse break;
         defer msg.deinit();
-        switch (msg.value) {
-            .event => |e| {
+        const reply: search.Reply = switch (msg.value) {
+            .event => |e| blk: {
                 if (searchAccept(gpa, signer, job, e.event)) found +|= 1;
+                break :blk .event;
             },
-            .eose => {
-                state = .answered;
-                return;
-            },
-            // A relay that cannot search says so in place of results. A notice
-            // after results are already coming is about something else.
-            .closed => {
-                state = if (found > 0) .answered else .declined;
-                return;
-            },
-            .notice => {
-                if (found == 0) {
-                    state = .declined;
-                    return;
-                }
-            },
-            .auth => {
-                state = .declined;
-                return;
-            },
-            else => {},
+            .eose => .eose,
+            .closed => .closed,
+            .notice => .notice,
+            .auth => .auth,
+            else => .other,
+        };
+        if (search.settle(reply, found)) |done| {
+            state = done;
+            return;
         }
     }
     // The connection ended, or the budget did, with people already in hand.

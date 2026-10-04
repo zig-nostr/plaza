@@ -317,6 +317,26 @@ pub const RelayState = enum(u8) {
     silent = 6,
 };
 
+/// The kinds of message a search relay sends back, as far as a search cares.
+pub const Reply = enum { event, eose, closed, notice, auth, other };
+
+/// Where a search stands after `reply`, with `found` people already in hand:
+/// the state it ends on, or null to keep reading.
+///
+/// An AUTH challenge is not an answer. NIP-42 lets a relay send one at any time,
+/// and many send it on connect whether or not the request needs it; one that
+/// does need it says so by closing the subscription with `auth-required:`, which
+/// lands here as a CLOSED. A NOTICE with nothing found yet is how a relay without
+/// NIP-50 refuses; after results have started it is about something else.
+pub fn settle(reply: Reply, found: u16) ?RelayState {
+    return switch (reply) {
+        .event, .auth, .other => null,
+        .eose => .answered,
+        .closed => if (found > 0) .answered else .declined,
+        .notice => if (found == 0) .declined else null,
+    };
+}
+
 /// A relay's state and result count in one word, so a worker can publish both
 /// with a single store and the reader can never see one half of an update. The
 /// term generation rides along so a late answer for an old term is ignored.

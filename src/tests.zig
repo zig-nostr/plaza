@@ -28920,6 +28920,19 @@ test "the search request is the NIP-50 shape and survives a hostile term" {
     try testing.expectEqual(@as(i64, search.relay_limit), filter.get("limit").?.integer);
 }
 
+test "a search relay that asks for a login on connect is still read, and one that refuses is declined" {
+    // The challenge alone ends nothing: the relay may well answer anyway.
+    try testing.expect(search.settle(.auth, 0) == null);
+    try testing.expect(search.settle(.event, 0) == null);
+    try testing.expectEqual(search.RelayState.answered, search.settle(.eose, 0).?);
+    try testing.expectEqual(search.RelayState.answered, search.settle(.eose, 4).?);
+    // A CLOSED in place of results, `auth-required:` among them, is a refusal.
+    try testing.expectEqual(search.RelayState.declined, search.settle(.closed, 0).?);
+    try testing.expectEqual(search.RelayState.answered, search.settle(.closed, 2).?);
+    try testing.expectEqual(search.RelayState.declined, search.settle(.notice, 0).?);
+    try testing.expect(search.settle(.notice, 3) == null);
+}
+
 test "a relay's state and count travel as one word" {
     const s = search.Status{ .gen = 7, .state = .answered, .count = 12 };
     const back = search.Status.unpack(s.pack());
