@@ -127,3 +127,40 @@ test "an extent context that is not a table is refused, not read" {
     try testing.expect(main.extentTableLenForTest(table) > 0);
     try testing.expect(main.rowExtentFromTableForTest(table, 0) > 0);
 }
+
+test "the thread header counts notes below, not replies, so it never contradicts the stat row" {
+    // The header counts every descendant and the root's stat row counts direct
+    // replies. Both said "replies", so a root with two answers and one answer to
+    // an answer read "3 replies" over "2 replies" on one screen.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Build = struct {
+        var model: Model = .{};
+        fn header(ui: *main.AppUi) main.AppUi.Node {
+            return main.threadHeader(ui, &model);
+        }
+    };
+    Build.model = .{};
+    Build.model.viewing_thread = 1;
+    Build.model.thread_root.id = 1;
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+
+    const cases = [_]struct { n: usize, text: []const u8 }{
+        .{ .n = 1, .text = "1 note below" },
+        .{ .n = 3, .text = "3 notes below" },
+    };
+    for (cases) |c| {
+        Build.model.thread_notes_len = c.n;
+        const p = try painted.Painted.renderPiece(arena, &Build.model, Build.header, main.window_width, 200);
+        var found = false;
+        for (p.layout.nodes) |node| {
+            const t = node.widget.text;
+            if (std.mem.indexOf(u8, t, "repl") != null) return error.HeaderSaysReplies;
+            if (std.mem.eql(u8, t, c.text)) found = true;
+        }
+        try testing.expect(found);
+    }
+}

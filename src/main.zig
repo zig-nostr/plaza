@@ -3057,8 +3057,8 @@ pub const Msg = union(enum) {
 pub const AppUi = canvas.Ui(Msg);
 
 /// The thread header: a Back affordance (to the parent thread, or the feed), the
-/// "Thread" label, and the reply count (known from the crowd count up front, so
-/// it reads right before the replies are fetched).
+/// "Thread" label, and how many notes sit below the root (known from the crowd
+/// count up front, so it reads right before the replies are fetched).
 pub fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // Back names WHERE it goes, never a bare "Thread" beside the "Thread" title.
@@ -3071,13 +3071,21 @@ pub fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             // The count reads once replies are known; before then it says nothing
             // rather than a misleading "0 replies" on a note that has some.
             if (count > 0)
-                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, ui.fmt("{d} {s}", .{ count, if (count == 1) "reply" else "replies" }))
+                ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_faint_alt } }, threadCountLabel(ui, count))
             else
                 ui.spacer(0),
             ui.spacer(1),
         }),
         ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
     });
+}
+
+/// What the thread header says about its size: every note below the root, at any
+/// depth. The root's own stat row counts DIRECT replies, so the two numbers
+/// differ whenever a reply has answers of its own, and the header must not use
+/// the stat row's word for a different count.
+pub fn threadCountLabel(ui: *AppUi, count: usize) []const u8 {
+    return ui.fmt("{d} {s} below", .{ count, if (count == 1) "note" else "notes" });
 }
 
 /// A profile's two tabs. "Notes" is what they wrote; "Replies" is what they
