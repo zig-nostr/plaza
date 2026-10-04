@@ -4,6 +4,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const main = @import("main.zig");
 const painted = @import("painted.zig");
+const long_form = @import("article.zig");
 const theme = @import("theme.zig");
 
 const canvas = native_sdk.canvas;
@@ -26953,4 +26954,419 @@ test "a signature that comes back after the reader switched account is dropped a
     _ = main.authPollForTest(&sess, auth_test_url, &rec, 1);
     try testing.expectEqual(@as(usize, 1), rec.sent);
     try testing.expectEqualSlices(u8, &bob, &rec.pubkey);
+}
+
+// ------------------------------------------------------------ long-form articles
+
+/// A markdown body of `paragraphs` paragraphs, each its own distinctive line, with
+/// a heading every tenth and a fenced block and a list in the middle.
+fn longArticleBody(arena: std.mem.Allocator, paragraphs: usize) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    for (0..paragraphs) |i| {
+        if (i % 10 == 0) try out.print(arena, "## Section {d}\n\n", .{i / 10});
+        try out.print(arena, "Paragraph number {d} says something about the subject at a length that wraps onto a second line when it is drawn in a reading column.\n\n", .{i});
+        if (i == paragraphs / 2) {
+            try out.appendSlice(arena, "```zig\nconst a = 1;\n\nconst b = 2;\n```\n\n");
+            try out.appendSlice(arena, "1. first item\n\n2. second item\n\n3. third item\n\n");
+        }
+    }
+    return out.items;
+}
+
+/// The blocks the toolkit's Markdown view makes of `source`, counted the plain
+/// way: a run of non-blank lines after a blank one. Exact for text whose blocks
+/// are set apart by blank lines, which is what the tests below hand it.
+fn blocksIn(source: []const u8) usize {
+    var n: usize = 0;
+    var blank = true;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        const empty = std.mem.trim(u8, line, " \t\r").len == 0;
+        if (!empty and blank) n += 1;
+        blank = empty;
+    }
+    return n;
+}
+
+/// The row whose bytes hold all of `needle`, if one does.
+fn rowHolding(source: []const u8, rows: []const long_form.Chunk, needle: []const u8) ?usize {
+    const at = std.mem.indexOf(u8, source, needle) orelse return null;
+    for (rows, 0..) |c, i| {
+        if (at >= c.start and at + needle.len <= c.end) return i;
+    }
+    return null;
+}
+
+test "an article's tags are read the way the reader needs them" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x61} ** 32);
+
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "a-slug" },
+        &[_][]const u8{ "title", "  The title  " },
+        &[_][]const u8{ "summary", "One line about it." },
+        &[_][]const u8{ "image", "https://example.com/cover.jpg" },
+        &[_][]const u8{ "published_at", "1700000000" },
+        &[_][]const u8{ "t", "Zig" },
+        &[_][]const u8{ "t", "zig" },
+        &[_][]const u8{ "t", "nostr" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, "body");
+    const meta = long_form.metaOf(ev);
+    try testing.expectEqualStrings("The title", meta.title);
+    try testing.expectEqualStrings("One line about it.", meta.summary);
+    try testing.expectEqualStrings("https://example.com/cover.jpg", meta.image);
+    try testing.expectEqual(@as(i64, 1_700_000_000), meta.published_at);
+    // Two spellings of one topic are one chip.
+    try testing.expectEqual(@as(usize, 2), meta.tag_count);
+
+    // An article cannot have been published after the event carrying it was made.
+    const future = [_]nostr.event.Tag{&[_][]const u8{ "published_at", "1900000000" }};
+    const late = long_form.metaOf(try signedKind(arena, signer, kp, 1_800_000_000, 30023, &future, "body"));
+    try testing.expectEqual(@as(i64, 1_800_000_000), late.published_at);
+    const junk = [_]nostr.event.Tag{&[_][]const u8{ "published_at", "yesterday" }};
+    const unparsed = long_form.metaOf(try signedKind(arena, signer, kp, 1_800_000_000, 30023, &junk, "body"));
+    try testing.expectEqual(@as(i64, 1_800_000_000), unparsed.published_at);
+
+    try testing.expect(long_form.isWebUrl("https://example.com/a.png"));
+    try testing.expect(!long_form.isWebUrl("javascript:alert(1)"));
+    try testing.expect(!long_form.isWebUrl("https://exa mple.com/a.png"));
+    try testing.expectEqual(@as(u32, 1), long_form.readingMinutes("a few words"));
+    try testing.expectEqual(@as(u32, 2), long_form.readingMinutes("word " ** 226));
+}
+
+test "an article body is cut where cutting cannot change how it reads" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try longArticleBody(arena, 400);
+    var chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const cut = long_form.chunk(body, &chunks);
+    try testing.expect(!cut.truncated);
+    // Many rows, not one: the list can only skip what is cut into pieces.
+    try testing.expect(cut.len > 10);
+
+    // In order, inside the body, and with no row a few kilobytes past the target
+    // unless it holds something that must stay whole.
+    var prev_end: u32 = 0;
+    for (chunks[0..cut.len]) |c| {
+        try testing.expect(c.start >= prev_end);
+        try testing.expect(c.end > c.start);
+        try testing.expect(c.end <= body.len);
+        try testing.expect(c.height > 0);
+        prev_end = c.end;
+    }
+
+    // The fenced block, blank line and all, is inside exactly one row.
+    const fence_at = std.mem.indexOf(u8, body, "const a = 1;").?;
+    for (chunks[0..cut.len]) |c| {
+        if (fence_at >= c.start and fence_at < c.end) {
+            try testing.expect(std.mem.indexOf(u8, body[c.start..c.end], "const b = 2;") != null);
+            try testing.expect(std.mem.indexOf(u8, body[c.start..c.end], "```\n") != null);
+        }
+    }
+    // A fenced block longer than a whole row, with a blank line deep inside it:
+    // the blank line is code, not a paragraph break.
+    var big = std.ArrayList(u8).empty;
+    try big.appendSlice(arena, "Before.\n\n```\n");
+    for (0..300) |_| try big.appendSlice(arena, "let x = 1;\n");
+    try big.appendSlice(arena, "\nTAIL_OF_THE_BLOCK\n```\n\nAfter.\n");
+    var big_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const big_cut = long_form.chunk(big.items, &big_chunks);
+    const tail_at = std.mem.indexOf(u8, big.items, "TAIL_OF_THE_BLOCK").?;
+    for (big_chunks[0..big_cut.len]) |c| {
+        if (tail_at >= c.start and tail_at < c.end) {
+            try testing.expect(std.mem.indexOf(u8, big.items[c.start..c.end], "let x = 1;") != null);
+        }
+    }
+
+    // A list longer than a whole row, its items set apart by blank lines. The
+    // toolkit draws 64 blocks of a row and drops the rest, and a blank line ends
+    // a list there, so each item is a block: one row holding all eighty lost the
+    // last sixteen and the line after them. Each item is cut whole, and keeps the
+    // number its author wrote.
+    var items = std.ArrayList(u8).empty;
+    try items.appendSlice(arena, "Steps:\n\n");
+    for (1..81) |n| try items.print(arena, "{d}. step number {d} is described here at some length\n\n", .{ n, n });
+    try items.appendSlice(arena, "Done.\n");
+    var item_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const item_cut = long_form.chunk(items.items, &item_chunks);
+    for (item_chunks[0..item_cut.len]) |c| {
+        try testing.expect(blocksIn(items.items[c.start..c.end]) <= long_form.max_row_weight);
+    }
+    for (1..81) |n| {
+        const line = try std.fmt.allocPrint(arena, "{d}. step number {d} is described here at some length\n", .{ n, n });
+        try testing.expect(rowHolding(items.items, item_chunks[0..item_cut.len], line) != null);
+    }
+
+    // Short paragraphs, the way a poem is set: two thousand bytes of them is a
+    // hundred blocks. The byte target alone made that one row.
+    var poem = std.ArrayList(u8).empty;
+    for (0..300) |n| try poem.print(arena, "Verse {d} goes here\n\n", .{n});
+    var poem_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const poem_cut = long_form.chunk(poem.items, &poem_chunks);
+    for (poem_chunks[0..poem_cut.len]) |c| {
+        try testing.expect(blocksIn(poem.items[c.start..c.end]) <= long_form.max_row_weight);
+    }
+
+    // Headings on consecutive lines are a block each with no blank line between
+    // them, so the row ends before a block rather than only at a blank line.
+    var heads = std.ArrayList(u8).empty;
+    for (0..200) |n| try heads.print(arena, "## Heading {d}\n", .{n});
+    var head_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const head_cut = long_form.chunk(heads.items, &head_chunks);
+    try testing.expect(head_cut.len > 1);
+    for (head_chunks[0..head_cut.len]) |c| {
+        try testing.expect(std.mem.count(u8, heads.items[c.start..c.end], "## ") <= long_form.max_row_weight);
+    }
+
+    // `<details>` written as an example in prose is not a details block, the
+    // toolkit's own test being a line that starts with it. Read as one, it was
+    // never closed, and nothing after it could be cut.
+    var prose = std.ArrayList(u8).empty;
+    try prose.appendSlice(arena, "Wrap it in a `<details>` element to fold it.\n\n");
+    try prose.appendSlice(arena, body);
+    var prose_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+    const prose_cut = long_form.chunk(prose.items, &prose_chunks);
+    try testing.expect(prose_cut.len > 10);
+
+    // Whatever a row is in the middle of, it ends by `row_hard_bytes`: a fence
+    // that never closes, a details block that never closes, one line that never
+    // ends. A cut inside the fence says so, so the row can be drawn as code.
+    const hostile = [_][]const u8{ "```\n", "<details>\n", "# " };
+    for (hostile) |opening| {
+        var wall = std.ArrayList(u8).empty;
+        try wall.appendSlice(arena, opening);
+        for (0..6000) |n| try wall.print(arena, "w{d} ", .{n});
+        if (opening[0] != '#') {
+            for (0..3000) |n| try wall.print(arena, "\nline {d}", .{n});
+        }
+        var wall_chunks: [long_form.max_chunks]long_form.Chunk = undefined;
+        const wall_cut = long_form.chunk(wall.items, &wall_chunks);
+        try testing.expect(!wall_cut.truncated);
+        try testing.expect(wall_cut.len > 3);
+        var at: u32 = 0;
+        for (wall_chunks[0..wall_cut.len], 0..) |c, i| {
+            try testing.expectEqual(at, c.start);
+            try testing.expect(c.end - c.start <= long_form.row_hard_bytes);
+            try testing.expectEqual(i > 0 and opening[0] == '`', c.in_fence);
+            at = c.end;
+        }
+        try testing.expectEqual(@as(u32, @intCast(wall.items.len)), at);
+    }
+
+    // A body past the cap is cut and says so, rather than silently running on.
+    var few: [3]long_form.Chunk = undefined;
+    const clipped = long_form.chunk(body, &few);
+    try testing.expectEqual(@as(usize, 3), clipped.len);
+    try testing.expect(clipped.truncated);
+}
+
+test "an article's cover is its one picture, and the body's pictures stay in the body" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x62} ** 32);
+
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "title", "With a cover" },
+        &[_][]const u8{ "image", "https://example.com/cover.jpg" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, "Words.\n\nhttps://example.com/inline.png\n");
+    const note = main.noteFrom(ev, 1_800_000_000);
+    try testing.expectEqual(@as(usize, 1), note.imageCount());
+    try testing.expectEqualStrings("https://example.com/cover.jpg", note.imageAt(0).url());
+
+    // No cover at all: a picture inside the body is still the body's, not a
+    // cover hung under the title.
+    const plain = [_]nostr.event.Tag{&[_][]const u8{ "title", "No cover" }};
+    const inline_only = main.noteFrom(try signedKind(arena, signer, kp, 1_800_000_000, 30023, &plain, "Words.\n\nhttps://example.com/inline.png\n"), 1_800_000_000);
+    try testing.expectEqual(@as(usize, 0), inline_only.imageCount());
+
+    // A cover that is not a web address is not fetched from.
+    const bad = [_]nostr.event.Tag{&[_][]const u8{ "image", "file:///etc/passwd" }};
+    const nope = main.noteFrom(try signedKind(arena, signer, kp, 1_800_000_000, 30023, &bad, "x"), 1_800_000_000);
+    try testing.expectEqual(@as(usize, 0), nope.imageCount());
+}
+
+/// A store in a temp directory with `ev` ingested, and the app pointed at it.
+fn articleStore(tmp: *std.testing.TmpDir, pbuf: []u8, name: []const u8) !nostr.store.Store {
+    const db_path = try std.fmt.bufPrintZ(pbuf, ".zig-cache/tmp/{s}/{s}.mdb", .{ tmp.sub_path, name });
+    return nostr.store.Store.open(db_path, .{});
+}
+
+test "opening an article by id opens a reader, and a long one builds only what is on screen" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x63} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "reader");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+
+    const body = try longArticleBody(arena, 400);
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "the-long-one" },
+        &[_][]const u8{ "title", "A reasonably long article" },
+        &[_][]const u8{ "summary", "What the article is about, in a sentence." },
+        &[_][]const u8{ "t", "zig" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, body);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openEventForTest(&model, ev.id);
+    // A level of its own, rooted at the article.
+    try testing.expectEqual(@as(u16, 30023), model.thread_root.kind);
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &ev.id));
+
+    const tree = try buildTree(arena, &model);
+    // The head: title, summary and the reading time.
+    try testing.expect(findAnyTextContaining(tree.root, "A reasonably long article"));
+    try testing.expect(findAnyTextContaining(tree.root, "What the article is about, in a sentence."));
+    try testing.expect(findAnyTextContaining(tree.root, "min read"));
+    // The body, rendered: the first section's heading and paragraph are here, as
+    // text rather than as markup.
+    try testing.expect(findAnyTextContaining(tree.root, "Section 0"));
+    try testing.expect(findAnyTextContaining(tree.root, "Paragraph number 0 says"));
+    try testing.expect(!findAnyTextContaining(tree.root, "## Section 0"));
+    // And the end of it is not: four hundred paragraphs are not built to show the
+    // first screenful.
+    try testing.expect(!findAnyTextContaining(tree.root, "Paragraph number 399 says"));
+    try testing.expect(!findAnyTextContaining(tree.root, "Paragraph number 200 says"));
+    try testing.expect(main.articleRowCountForTest(ev.id) > 20);
+    try testing.expect(countNodes(tree.root) < 600);
+}
+
+/// The first widget whose text contains `needle`.
+fn widgetContaining(widget: canvas.Widget, needle: []const u8) ?canvas.Widget {
+    if (std.mem.indexOf(u8, widget.text, needle) != null) return widget;
+    for (widget.children) |child| {
+        if (widgetContaining(child, needle)) |found| return found;
+    }
+    return null;
+}
+
+test "every part of a long article is drawn by some row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6d} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "every-row");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+
+    // What a writer actually does, each at a size that used to lose text: a
+    // poem in short stanzas, a listing longer than a row, a folded aside, and one
+    // paragraph written as a single enormous line.
+    var body = std.ArrayList(u8).empty;
+    try body.appendSlice(arena, "Fold the notes in a `<details>` element if they run long.\n\n");
+    for (0..150) |n| try body.print(arena, "Verse {d} of the poem\n\n", .{n});
+    try body.appendSlice(arena, "```\n");
+    for (0..500) |n| try body.print(arena, "listing line {d};\n", .{n});
+    try body.appendSlice(arena, "```\n\n");
+    try body.appendSlice(arena, "<details>\n<summary>Notes</summary>\n\nThe folded words.\n\n</details>\n\n");
+    for (0..3000) |n| try body.print(arena, "word{d} ", .{n});
+    try body.appendSlice(arena, "END_OF_THE_LONG_LINE\n\nThe last paragraph.\n");
+
+    const tags = [_]nostr.event.Tag{ &[_][]const u8{ "d", "every-row" }, &[_][]const u8{ "title", "All of it" } };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, body.items);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openEventForTest(&model, ev.id);
+
+    // Every row, drawn on its own, as the list draws it.
+    const rows = main.articleRowCountForTest(ev.id);
+    try testing.expect(rows > 2);
+    const trees = try arena.alloc(AppUi.Tree, rows - 2);
+    for (trees, 1..) |*tree, index| {
+        var ui = AppUi.init(arena);
+        const node = main.articleRowForTest(&ui, &model.thread_root, index);
+        try testing.expect(!ui.failed);
+        tree.* = try ui.finalize(node);
+        // And a row stays a size the window can hold a few of at once.
+        try testing.expect(countNodes(tree.root) < 200);
+    }
+    const Find = struct {
+        fn in(all: []const AppUi.Tree, needle: []const u8) ?canvas.Widget {
+            for (all) |t| {
+                if (widgetContaining(t.root, needle)) |w| return w;
+            }
+            return null;
+        }
+    };
+    for (0..150) |n| {
+        const verse = try std.fmt.allocPrint(arena, "Verse {d} of the poem", .{n});
+        try testing.expect(Find.in(trees, verse) != null);
+    }
+    // The listing is code from its first line to its last, across the rows it
+    // was cut into: line for line, where prose would have run them together.
+    const first = Find.in(trees, "listing line 0;") orelse return error.ListingStartMissing;
+    const last = Find.in(trees, "listing line 499;") orelse return error.ListingEndMissing;
+    try testing.expectEqual(first.kind, last.kind);
+    try testing.expect(std.mem.indexOf(u8, last.text, "listing line 498;\nlisting line 499;") != null);
+    try testing.expect(Find.in(trees, "The folded words.") != null);
+    try testing.expect(Find.in(trees, "END_OF_THE_LONG_LINE") != null);
+    try testing.expect(Find.in(trees, "The last paragraph.") != null);
+}
+
+test "a draft is not opened as though it were published" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x64} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "draft");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "unfinished" },
+        &[_][]const u8{ "title", "Not ready" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30024, &tags, "Half a thought.");
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openEventForTest(&model, ev.id);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expectEqualStrings("That is an unpublished draft.", model.toast_text());
+    // And the reader will not draw one even if asked directly.
+    try testing.expectEqual(@as(usize, 0), main.articleRowCountForTest(ev.id));
 }

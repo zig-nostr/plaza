@@ -29,6 +29,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const plaza_icons = @import("plaza_icons.zig");
+const article = @import("article.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -14873,8 +14874,12 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
     // omit list below borrows them again; the note keeps its own copies. A URL
     // too long for the buffer is left in the text, which is the honest fallback:
     // it is still a link the reader can open.
+    //
+    // Not for an article: its pictures are inside the markdown, to be drawn where
+    // the author put them, and lifting the first four out of a long read would
+    // hang them under its title as though they were its cover.
     var found: [max_note_images][]const u8 = undefined;
-    const found_len = collectImageUrls(ev.content, &found);
+    const found_len = if (kindRender(ev.kind) == .article) 0 else collectImageUrls(ev.content, &found);
     var omit: [max_note_images][]const u8 = undefined;
     var omit_len: usize = 0;
     for (found[0..found_len]) |url| {
@@ -14918,6 +14923,17 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             if (titleOf(ev)) |title| {
                 @memcpy(note.content_buf[0..title.len], title);
                 note.content_len = @intCast(title.len);
+            }
+            // The `image` tag is the article's cover, and the one picture the
+            // note carries, so the reader draws it through the same path every
+            // other picture takes (its slot, its disk cache, its placeholder).
+            const meta = article.metaOf(ev);
+            if (article.isWebUrl(meta.image) and meta.image.len <= note.images[0].url_buf.len) {
+                note.images[0].set(meta.image, imetaFor(ev.tags, meta.image));
+                // A cover with no declared shape is held to a wide one, so the
+                // head does not reserve a portrait-sized box for a banner.
+                if (note.images[0].aspect <= 0) note.images[0].aspect = article.cover_aspect;
+                note.images_len = 1;
             }
         },
         // Left empty on purpose. Rendering the content of a kind nothing knows
@@ -15019,7 +15035,8 @@ pub const KindRender = enum {
     /// Its content is the thing to read. Kind 1 and NIP-22 comments.
     note,
     /// Its content is markdown nobody asked to read in a card, so the `title`
-    /// tag stands in for it. Rendering long-form properly is separate work.
+    /// tag stands in for it there. Opened by id it is read in full, in the
+    /// reader `articlePanel` draws.
     article,
     /// The media is the point and the content is a caption, which is already
     /// what `noteFrom` does with any note carrying a picture or a video.
@@ -19439,7 +19456,7 @@ const RowExtents = struct {
     /// would read one struct as the other and hand the list garbage heights,
     /// silently. This turns that into a fallback the suite can catch.
     magic: u64 = row_extents_magic,
-    heights: [thread_reply_cap * 2]f32 = [_]f32{0} ** (thread_reply_cap * 2),
+    heights: [row_extent_cap]f32 = [_]f32{0} ** row_extent_cap,
     len: usize = 0,
 
     fn reset(self: *RowExtents) void {
@@ -19457,6 +19474,10 @@ const RowExtents = struct {
         return self.heights[index];
     }
 };
+
+/// Rows a level can price: a thread's replies, or an article's body rows plus its
+/// head and foot, whichever is larger.
+const row_extent_cap = @max(thread_reply_cap * 2, article.max_chunks + 2);
 
 const row_extents_magic: u64 = 0x524f57455854_4142;
 
@@ -20004,6 +20025,327 @@ fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.spacer(1),
         }),
         ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    });
+}
+
+// ------------------------------------------------------------- the article reader
+//
+// A kind:30023 opened by id is a level of its own, drawn as a reader rather than
+// as a thread. It is the same level in every other way (the back-stack, the
+// scroll offset kept per level, the avatar and picture passes), so the only fork
+// is in `feedView`, which asks `isArticleRoot` of the level's root.
+//
+// The body is not baked into the `Note`: that struct carries a few kilobytes of
+// text because it is copied on every rebuild, and an article is tens of
+// kilobytes. It is read from the store when the level is first drawn and kept
+// here, cut into rows (see `article.chunk`) so that only the rows near the
+// viewport are built, the way the feed and the thread are.
+
+/// The reading column. The width a note's picture takes, so a cover lines up
+/// with the text beneath it and the column is a comfortable line length with
+/// real margin either side of it in the 620 point row.
+const article_text_width: f32 = picture_column_width;
+const article_title_scale: f32 = 25.0 / 14.5;
+const article_summary_scale: f32 = 16.0 / 14.5;
+const article_foot_pad: f32 = 56;
+
+/// One article, loaded for reading. Owns its text; replaced when another opens.
+const ArticleView = struct {
+    arena: std.heap.ArenaAllocator,
+    event_id: [32]u8,
+    title: []const u8 = "",
+    summary: []const u8 = "",
+    body: []const u8 = "",
+    tags: [article.max_tags][]const u8 = [_][]const u8{""} ** article.max_tags,
+    tag_count: usize = 0,
+    published_at: i64 = 0,
+    minutes: u32 = 1,
+    chunks: [article.max_chunks]article.Chunk = undefined,
+    chunk_count: usize = 0,
+    truncated: bool = false,
+
+    /// Rows in the list: the head, each piece of the body, and the foot.
+    fn rowCount(self: *const ArticleView) usize {
+        return self.chunk_count + 2;
+    }
+};
+
+/// The cap on the body Plaza will read. Relays refuse events well under this, so
+/// it bounds the copy rather than the article.
+const article_body_cap = 1 << 20;
+
+/// The article on screen. UI-thread only. Only the front level draws a body, so
+/// one is enough: walking back to an article underneath reads it again, which is
+/// one store lookup.
+var g_article: ?*ArticleView = null;
+
+/// The article behind `event_id`, read from the store the first time it is asked
+/// for. Null when this machine does not hold it, or holds something that is not
+/// a published article.
+fn articleFor(event_id: [32]u8) ?*const ArticleView {
+    if (g_article) |held| {
+        if (std.mem.eql(u8, &held.event_id, &event_id)) return held;
+    }
+    const store = g_store orelse return null;
+    var se = (store.getEvent(std.heap.page_allocator, event_id) catch return null) orelse return null;
+    defer se.deinit();
+    if (se.event.kind != article.kind) return null;
+
+    const view = std.heap.page_allocator.create(ArticleView) catch return null;
+    view.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .event_id = event_id };
+    const a = view.arena.allocator();
+    const meta = article.metaOf(se.event);
+    const loaded = blk: {
+        view.title = article.cleanLine(a, meta.title, 400, false) catch break :blk false;
+        view.summary = article.cleanLine(a, meta.summary, 1200, true) catch break :blk false;
+        view.body = a.dupe(u8, article.clipUtf8(se.event.content, article_body_cap)) catch break :blk false;
+        for (meta.tags[0..meta.tag_count], 0..) |t, i| view.tags[i] = a.dupe(u8, t) catch break :blk false;
+        break :blk true;
+    };
+    if (!loaded) {
+        view.arena.deinit();
+        std.heap.page_allocator.destroy(view);
+        return null;
+    }
+    view.tag_count = meta.tag_count;
+    view.published_at = meta.published_at;
+    view.minutes = article.readingMinutes(view.body);
+    const cut = article.chunk(view.body, &view.chunks);
+    view.chunk_count = cut.len;
+    view.truncated = cut.truncated;
+
+    if (g_article) |old| {
+        old.arena.deinit();
+        std.heap.page_allocator.destroy(old);
+    }
+    g_article = view;
+    return view;
+}
+
+/// Whether a level's root is an article to be read rather than a thread.
+fn isArticleRoot(root: *const Note) bool {
+    return root.kind == article.kind;
+}
+
+/// Forgets the loaded article, for a test that opens several in turn.
+pub fn forgetArticleForTest() void {
+    if (g_article) |old| {
+        old.arena.deinit();
+        std.heap.page_allocator.destroy(old);
+    }
+    g_article = null;
+}
+
+/// How many rows the reader built for the article behind `event_id`, and how many
+/// the list was told about. The difference is the whole point of windowing.
+pub fn articleRowCountForTest(event_id: [32]u8) usize {
+    return if (articleFor(event_id)) |a| a.rowCount() else 0;
+}
+
+/// Row `index` of the article `root` names, built the way the reader builds it,
+/// so a test can read every row and not only the ones a viewport would mount.
+pub fn articleRowForTest(ui: *AppUi, root: *const Note, index: usize) AppUi.Node {
+    return articleRowAt(ui, root, articleFor(root.event_id), index);
+}
+
+/// A height guess for the head: the byline, the title and summary at their
+/// wrapped lengths, the cover, and the date line.
+fn articleHeadHeight(root: *const Note, av: ?*const ArticleView) f32 {
+    var h: f32 = 20 + avatar_size + 18 + 16 + 12 + 1 + 20;
+    const title = if (av) |a| a.title else root.content();
+    const title_lines = @max(@ceil(@as(f32, @floatFromInt(@max(title.len, 1))) / 39), 1);
+    h += title_lines * 14.5 * article_title_scale * 1.3 + 10;
+    if (av) |a| {
+        if (a.summary.len > 0) {
+            const lines = @max(@ceil(@as(f32, @floatFromInt(a.summary.len)) / 62), 1);
+            h += lines * 14.5 * article_summary_scale * 1.4 + 12;
+        }
+    }
+    if (root.hasImage()) h += pictureHeight(root) + 14;
+    return h + 22;
+}
+
+fn articleFootHeight(av: ?*const ArticleView) f32 {
+    const a = av orelse return article_foot_pad;
+    return article_foot_pad + (if (a.tag_count > 0) @as(f32, 30) else 0) + (if (a.truncated) @as(f32, 30) else 0);
+}
+
+fn articleHeader(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const back_label = if (model.thread_stack_len > 0)
+        model.thread_stack[model.thread_stack_len - 1].backLabel()
+    else
+        model.scope_name();
+    return ui.column(.{}, .{
+        ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
+            backControl(ui, back_label, .close_thread),
+            ui.paragraph(.{ .style = .{ .foreground = p.text_primary } }, &.{.{ .text = "Article", .weight = .bold }}),
+            ui.spacer(1),
+        }),
+        ui.separator(.{ .style = .{ .foreground = p.divider_chrome, .background = p.divider_chrome } }),
+    });
+}
+
+/// The byline, the title, the summary, the cover and the date: what the card in
+/// a feed would say, at the size of the thing being read.
+fn articleHead(ui: *AppUi, root: *const Note, av: ?*const ArticleView) AppUi.Node {
+    const p = theme.palette;
+    const title = if (av) |a| a.title else root.content();
+    return ui.column(.{ .width = article_text_width, .gap = 0 }, .{
+        vgap(ui, 20),
+        ui.row(.{ .gap = 0, .cross = .center }, .{
+            noteAvatar(ui, root),
+            hgap(ui, avatar_to_text_gap),
+            identityBlock(ui, root),
+            ui.spacer(1),
+        }),
+        vgap(ui, 18),
+        if (title.len > 0)
+            ui.paragraph(
+                .{ .wrap = true, .style = .{ .foreground = p.text_primary } },
+                &.{.{ .text = title, .weight = .bold, .scale = article_title_scale }},
+            )
+        else
+            ui.spacer(0),
+        if (title.len > 0) vgap(ui, 10) else ui.spacer(0),
+        if (av) |a| (if (a.summary.len > 0) ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
+            &.{.{ .text = a.summary, .scale = article_summary_scale }},
+        ) else ui.spacer(0)) else ui.spacer(0),
+        if (av) |a| (if (a.summary.len > 0) vgap(ui, 12) else ui.spacer(0)) else ui.spacer(0),
+        if (root.hasImage()) notePicture(ui, root) else ui.spacer(0),
+        if (root.hasImage()) vgap(ui, 14) else ui.spacer(0),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{
+                .text = if (av) |a|
+                    ui.fmt("{s} · {d} min read", .{ absoluteNoteTime(ui.arena, a.published_at), a.minutes })
+                else
+                    "Not on this machine yet",
+                .monospace = true,
+                .scale = mono_hint_scale,
+            }},
+        ),
+        vgap(ui, 16),
+        ui.separator(.{ .style = .{ .foreground = p.divider_card, .background = p.divider_card } }),
+        vgap(ui, 12),
+    });
+}
+
+/// The hashtags the author filed it under, as the same pressable topics a note's
+/// hashtags are, and a line saying so when the body was cut.
+fn articleFoot(ui: *AppUi, av: ?*const ArticleView) AppUi.Node {
+    const p = theme.palette;
+    const a = av orelse return vgap(ui, article_foot_pad);
+    var spans: [article.max_tags * 2]canvas.TextSpan = undefined;
+    var n: usize = 0;
+    for (a.tags[0..a.tag_count]) |tag| {
+        const link = topicLinkFor(tag) orelse continue;
+        if (n > 0) {
+            spans[n] = .{ .text = "  " };
+            n += 1;
+        }
+        spans[n] = .{ .text = ui.fmt("#{s}", .{tag}), .color = .text_muted, .link = link };
+        n += 1;
+    }
+    return ui.column(.{ .width = article_text_width, .gap = 0 }, .{
+        vgap(ui, 8),
+        if (n > 0) ui.paragraph(.{ .wrap = true, .on_link = AppUi.linkMsg(.open_url), .style = .{ .foreground = p.text_muted } }, spans[0..n]) else ui.spacer(0),
+        if (a.truncated) vgap(ui, 10) else ui.spacer(0),
+        if (a.truncated) ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{ .text = "This article is longer than Plaza shows. The rest is in the original.", .scale = join_sub_scale }},
+        ) else ui.spacer(0),
+        vgap(ui, article_foot_pad),
+    });
+}
+
+/// One row of the list. `index` 0 is the head, the last is the foot, and the
+/// ones between are the body, each rendered from its own slice of the markdown.
+fn articleRowAt(ui: *AppUi, root: *const Note, av: ?*const ArticleView, index: usize) AppUi.Node {
+    const inner: AppUi.Node = if (index == 0)
+        articleHead(ui, root, av)
+    else if (av) |a| (if (index > a.chunk_count)
+        articleFoot(ui, av)
+    else blk: {
+        const c = a.chunks[index - 1];
+        const piece = a.body[c.start..c.end];
+        // A row cut out of the middle of a long code block gets its fence back,
+        // or the rest of the listing would be read as prose.
+        const source = if (c.in_fence) ui.fmt("```\n{s}", .{piece}) else piece;
+        break :blk ui.column(.{ .width = article_text_width, .gap = 0 }, .{
+            vgap(ui, 6),
+            canvas.markdown.Markdown(Msg).view(ui, source, .{
+                .on_link = AppUi.linkMsg(.open_url),
+                .details_expanded = &article_details_open,
+            }),
+            vgap(ui, 6),
+        });
+    }) else articleFoot(ui, av);
+    var node = ui.row(.{ .grow = 1, .main = .center }, .{inner});
+    node.key = .{ .int = placeholderKey(@intFromEnum(KindOfRow.article), index) };
+    return node;
+}
+
+/// A `<details>` block in an article is drawn open. The toolkit draws one closed
+/// unless told otherwise, and opening it needs a message and a place in the model
+/// per block per row; with neither, what the author put inside could not be read
+/// at all.
+const article_details_open = [_]bool{true} ** canvas.markdown.max_markdown_details_per_document;
+
+/// Row identities in a reader share `placeholderKey`'s space with the thread's
+/// placeholder rows; the number only has to differ from theirs.
+const KindOfRow = enum(u64) { article = 40 };
+
+/// The reader for one level: the header bar over a windowed list of the body.
+/// `occluded` levels build nothing and keep their place, exactly as a thread's do.
+fn articlePanel(ui: *AppUi, model: *const Model, root: *const Note, level_key: u64, level: usize, occluded: bool) AppUi.Node {
+    const av = if (occluded) null else articleFor(root.event_id);
+    const total: usize = if (av) |a| a.rowCount() else 1;
+    const table = &g_thread_extents[@min(level, g_thread_extents.len - 1)];
+    table.reset();
+    if (!occluded) {
+        table.push(articleHeadHeight(root, av));
+        if (av) |a| {
+            for (a.chunks[0..a.chunk_count]) |c| table.push(c.height);
+            table.push(articleFootHeight(av));
+        }
+    }
+    const options: AppUi.VirtualListOptions = .{
+        .id = ui.fmt("thread-{d}", .{level_key}),
+        .item_count = if (occluded) 0 else total,
+        .item_extent = 0,
+        .extent_estimate = rowExtentFromTable,
+        .extent_context = table,
+        .gap = 0,
+        .padding = 0,
+        .overscan = 2,
+        .grow = 1,
+        .viewport_fallback = window_height,
+        .semantics = .{ .label = "Article" },
+    };
+    const window = ui.virtualWindow(options);
+    if (!occluded) {
+        const set = &g_level_visible[@min(level, g_level_visible.len - 1)];
+        set.reset();
+        g_visible_level = @min(level, g_level_visible.len - 1);
+        // Only while the head is on screen: the face and the cover are both in
+        // it, and a reader deep in the body has no use for either.
+        if (window.first_visible_index == 0) {
+            set.pushAuthor(root.pubkey);
+            set.pushNote(root.id);
+        }
+    }
+    const rows = if (occluded)
+        &[_]AppUi.Node{}
+    else blk: {
+        const built = ui.arena.alloc(AppUi.Node, window.itemCount()) catch return ui.column(.{}, .{});
+        for (built, 0..) |*row, offset| row.* = articleRowAt(ui, root, av, window.start_index + offset);
+        break :blk built;
+    };
+    return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
+        if (occluded) ui.spacer(0) else articleHeader(ui, model),
+        ui.virtualList(options, window, .{rows}),
     });
 }
 
@@ -24870,7 +25212,10 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
             }
             const root = &screen.note;
             const lk = threadLevelKey(d, root.id);
-            kids[1 + d] = threadOccluder(ui, lk, threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
+            kids[1 + d] = threadOccluder(ui, lk, if (isArticleRoot(root))
+                articlePanel(ui, model, root, lk, d, true)
+            else
+                threadPanel(ui, model, root, threadRepliesFromStore(ui, d, root.event_id), false, lk, d, true));
         }
         if (model.viewing_bookmarks) {
             const lk = bookmarks_level_key + model.thread_stack_len;
@@ -24888,7 +25233,10 @@ fn feedView(ui: *AppUi, model: *const Model, levels: bool) AppUi.Node {
             break :blk ui.stack(.{ .grow = 1 }, .{kids});
         }
         const lk = threadLevelKey(model.thread_stack_len, model.thread_root.id);
-        kids[kids.len - 1] = threadOccluder(ui, lk, threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
+        kids[kids.len - 1] = threadOccluder(ui, lk, if (isArticleRoot(&model.thread_root))
+            articlePanel(ui, model, &model.thread_root, lk, model.thread_stack_len, false)
+        else
+            threadPanel(ui, model, &model.thread_root, model.thread_notes[0..model.thread_notes_len], model.thread_loading, lk, model.thread_stack_len, false));
         break :blk ui.stack(.{ .grow = 1 }, .{kids});
     } else feed;
 
@@ -35855,12 +36203,27 @@ fn openAddress(model: *Model, fx: *Effects) void {
     }
 }
 
+/// Goes to a stored event the reader asked for by id. A note opens as a thread
+/// and a published article opens as the article, which `feedView` draws as a
+/// reader instead of a thread because its root is a kind:30023.
+///
+/// A draft (kind:30024) opens nothing. It is the author's unfinished copy, it is
+/// not addressed to a reader, and putting it on screen with the same title and
+/// body as the published one is how a draft gets read as the real thing.
+fn enterEvent(model: *Model, ev: nostr.event.Event) void {
+    if (ev.kind == article.draft_kind) {
+        setToast(model, "That is an unpublished draft.");
+        return;
+    }
+    enterThread(model, noteFrom(ev, nowSeconds()));
+}
+
 fn openEvent(model: *Model, id: [32]u8) void {
     if (g_store) |store| {
         if (store.getEvent(std.heap.page_allocator, id) catch null) |found| {
             var se = found;
             defer se.deinit();
-            enterThread(model, noteFrom(se.event, nowSeconds()));
+            enterEvent(model, se.event);
             return;
         }
     }
@@ -35960,7 +36323,7 @@ fn refreshEventFetch(model: *Model) void {
         // the next tick: right by accident, and only while that stays the last
         // thing this function does.
         g_event_want = null;
-        enterThread(model, noteFrom(se.event, nowSeconds()));
+        enterEvent(model, se.event);
         return;
     }
     // Give up eventually rather than watching a store read forever, and say so
