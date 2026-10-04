@@ -31,6 +31,7 @@ const theme = @import("theme.zig");
 pub const search = @import("search.zig");
 const plaza_icons = @import("plaza_icons.zig");
 const article = @import("article.zig");
+const blossom = @import("blossom.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -1859,7 +1860,7 @@ fn ownBackupKey(buf: *[96]u8, kind: u16, pubkey: [32]u8) []const u8 {
 /// this app writes exactly these.
 fn isOwnList(kind: u16) bool {
     return kind == 0 or kind == relay_list_kind or kind == contact_list_kind or
-        kind == mute_list_kind or kind == bookmark_list_kind;
+        kind == mute_list_kind or kind == bookmark_list_kind or kind == blossom_list_kind;
 }
 
 /// `plazaIngest` for an event a relay just delivered, which also remembers WHICH
@@ -1945,6 +1946,7 @@ fn plazaIngest(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.sto
         5 => if (result != .invalid) invalidateFeed(),
         mute_list_kind => if (result != .invalid) ingestMuteList(ev),
         bookmark_list_kind => if (result != .invalid) ingestBookmarkList(ev),
+        blossom_list_kind => if (result != .invalid) ingestBlossomList(ev),
         else => {},
     }
     return result;
@@ -5727,6 +5729,9 @@ const HelperSign = struct {
     /// The content warning this note was signed with, so the note that comes back
     /// is handed back with ITS warning and not whichever one was set last.
     warn: WarnCarry = .{},
+    /// What is out for signing is an upload token, not something to publish:
+    /// its failure belongs to the upload card, not to the composer.
+    upload_auth: bool = false,
 };
 var g_helper_sign: HelperSign = .{};
 
@@ -5798,8 +5803,10 @@ fn scanHelperSign(model: *Model) void {
     const restorable = g_helper_sign.restorable;
     const content = g_helper_sign.content;
     const warn = g_helper_sign.warn;
+    const upload_auth = g_helper_sign.upload_auth;
     g_helper_sign = .{};
     const gpa = std.heap.page_allocator;
+    if (upload_auth) uploadSignFailed();
     if (content) |c| {
         // The composer holds one draft. A reader who has started typing again
         // keeps what they are typing; the restored one would overwrite it.
@@ -6003,6 +6010,7 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
     // Recorded first. Every `catch return` below is a path that used to end with
     // the note gone and the app saying "Posted".
     rememberHelperSign(gpa, content_owned, restorable, route, WarnCarry.fromTags(tags));
+    g_helper_sign.upload_auth = kind == blossom.auth_kind;
     const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
         failHelperSign();
         return;
@@ -6265,6 +6273,26 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
         return;
     }
 
+    // An upload token is asked for, and answered, as one. A note that comes back
+    // where a token was asked for would otherwise be published below, and a
+    // token that comes back for a note would take the note's slot with it and
+    // never hand the draft back.
+    if ((out.kind == blossom.auth_kind) != g_helper_sign.upload_auth) {
+        failHelperSign();
+        return;
+    }
+    // An upload token goes to the upload and nowhere else.
+    if (out.kind == blossom.auth_kind) {
+        releaseHelperSign();
+        acceptUploadAuth(gpa, out);
+        gpa.free(owned);
+        for (out.tags) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        gpa.free(out.tags);
+        return;
+    }
     if (out.kind == 0) {
         if (upsertProfile(out.pubkey)) |prof| parseMetadataInto(prof, owned);
     }
@@ -6311,7 +6339,7 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
 const no_half_id = [_]u8{0} ** 32;
-const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt, sign_auth };
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt, sign_auth, sign_upload_auth };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
@@ -12013,6 +12041,11 @@ pub const Model = struct {
     relay_buffer: canvas.TextBuffer(96) = .{},
     relay_error: bool = false,
     relay_full: bool = false,
+    // The add-a-media-server field in Settings, and why the last press did nothing.
+    blossom_buffer: canvas.TextBuffer(96) = .{},
+    blossom_error: BlossomEdit = .none,
+    // The description of the picture waiting to be uploaded from the composer.
+    upload_alt_buffer: canvas.TextBuffer(200) = .{},
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
     /// Which of that note's pictures the viewer is showing. Zero for a note with
@@ -12200,6 +12233,8 @@ pub const Model = struct {
         "sensitive_on",           "signer_line",            "signer_sub",             "warn_buffer",               "warn_draft",
         "warn_on",                "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",
         "update_check_explainer", "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
+        "blossom_buffer",         "blossom_draft",          "blossom_error",          "blossom_status",            "upload_alt",
+        "upload_alt_buffer",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12577,6 +12612,19 @@ pub const Model = struct {
         // one thing it is not.
         if (relayWriteBlockedReason()) |why| return why;
         return "";
+    }
+    /// The add-a-media-server field's text.
+    pub fn blossom_draft(self: *const Model) []const u8 {
+        return self.blossom_buffer.text();
+    }
+    /// What the line under that field says: why the last press did nothing, or
+    /// what the list is waiting on.
+    pub fn blossom_status(self: *const Model) []const u8 {
+        return blossomStatusText(self.blossom_error);
+    }
+    /// The description typed for the picture about to be uploaded.
+    pub fn upload_alt(self: *const Model) []const u8 {
+        return self.upload_alt_buffer.text();
     }
     /// What the previews switch is, in the terms that matter: not bandwidth.
     pub fn previews_explainer(self: *const Model) []const u8 {
@@ -17827,6 +17875,23 @@ pub const Msg = union(enum) {
     toggle_expand: i64,
     /// The reader reached the end of the feed: ask the store for another page.
     load_older,
+    /// Choose a picture to upload: 0 for a note, 1 for the avatar, 2 for the
+    /// banner. Opens the file dialog; nothing is sent until the card asks.
+    upload_pick: u8,
+    /// Send the chosen picture.
+    upload_go,
+    /// Send it again after a failure.
+    upload_retry,
+    /// Put the upload away, whatever it is doing.
+    upload_cancel,
+    /// A text edit in the picture's description.
+    upload_alt_edit: canvas.TextInputEvent,
+    /// A text edit in Settings' add-a-media-server field.
+    blossom_edit: canvas.TextInputEvent,
+    /// Add what was typed to the media server list.
+    blossom_add,
+    /// Drop one server from the list, by its row.
+    blossom_remove: u8,
     /// A press that landed on a modal's own card rather than on a control in it.
     ///
     /// It does nothing, and that IS the job. A press does not land where it
@@ -17979,6 +18044,14 @@ pub const Msg = union(enum) {
         "relay_edit",
         "relay_remove",
         "relay_suggest",
+        "upload_pick",
+        "upload_go",
+        "upload_retry",
+        "upload_cancel",
+        "upload_alt_edit",
+        "blossom_edit",
+        "blossom_add",
+        "blossom_remove",
         "show_more_replies",
         "toggle_bookmark",
         "toggle_mention_off",
@@ -18015,9 +18088,9 @@ const OnboardingView = canvas.CompiledMarkupView(Model, Msg, @embedFile("onboard
 fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     // Exactly the number of `sections[n] =` lines below. It was full when this
-    // screen grew a section, and the bounds check is what said so. Seven since
-    // the signing section left; an oversize array is legal and a lie.
-    var sections: [7]AppUi.Node = undefined;
+    // screen grew a section, and the bounds check is what said so. Eight with
+    // the media servers; an oversize array is legal and a lie.
+    var sections: [8]AppUi.Node = undefined;
     var n: usize = 0;
 
     sections[n] = identitySection(ui, model);
@@ -18029,6 +18102,10 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         relayCard(ui, model),
     );
     n += 1;
+    if (!model.is_guest()) {
+        sections[n] = settingsSection(ui, "MEDIA SERVERS", "where pictures you add are uploaded", mediaServersCard(ui, model));
+        n += 1;
+    }
     sections[n] = settingsSection(ui, "APPEARANCE", "", appearanceCard(ui));
     n += 1;
     sections[n] = settingsSection(ui, "FEED", "", feedCard(ui, model));
@@ -19064,14 +19141,16 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
             ),
-            ui.paragraph(
-                .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
-                &.{.{ .text = "Everything this app can read from a profile, it can now write. Anything else your other clients put there is kept exactly as it is.", .scale = mono_hint_scale }},
-            ),
+            // Not while a picture is being added: the card that takes the field's
+            // place is taller than the field, and the sheet has no room to spare.
+            if (g_upload) |job|
+                (if (job.target != .note) ui.spacer(0) else profileIntro(ui))
+            else
+                profileIntro(ui),
             profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
             profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
-            profileField(ui, "Picture", model.profile_picture(), "https://", .profile_picture_edit),
-            profileField(ui, "Banner", model.profile_banner(), "https://", .profile_banner_edit),
+            profilePictureField(ui, model, "Picture", model.profile_picture(), .profile_picture_edit, .avatar),
+            profilePictureField(ui, model, "Banner", model.profile_banner(), .profile_banner_edit, .banner),
             profileField(ui, "Website", model.profile_website(), "https://", .profile_website_edit),
             // The one with a consequence. `lud16` is how NIP-57 finds somebody's
             // LNURL callback, so an account set up only here could not be zapped
@@ -19082,6 +19161,13 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.paragraph(
                     .{ .wrap = true, .style = .{ .foreground = p.status_warning_text } },
                     &.{.{ .text = model.profile_invalid(), .scale = mono_hint_scale }},
+                )
+            else
+                ui.spacer(0),
+            if (g_profile_upload_unsaved)
+                ui.paragraph(
+                    .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
+                    &.{.{ .text = "The new picture is not published until you press Save.", .scale = mono_hint_scale }},
                 )
             else
                 ui.spacer(0),
@@ -19109,6 +19195,13 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
         })),
     }));
+}
+
+fn profileIntro(ui: *AppUi) AppUi.Node {
+    return ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = theme.palette.text_faint } },
+        &.{.{ .text = "Everything this app can read from a profile, it can now write. Anything else your other clients put there is kept exactly as it is.", .scale = mono_hint_scale }},
+    );
 }
 
 /// One labelled field in the sheet.
@@ -20265,6 +20358,11 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     }),
                     composeNotifyRow(ui, model),
                     composeWarningRow(ui, model),
+                    vgap(ui, 10),
+                    // Under the words, where the picture's address will land.
+                    // The servers it goes to are named here, before anything is
+                    // picked, and again on the card before anything is sent.
+                    uploadStrip(ui, model, .note),
                     vgap(ui, 10),
                     // What pressing Post will do, in the terms that matter: how
                     // far the note goes, and how much room is left when that
@@ -22361,7 +22459,7 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
 /// the one where getting that wrong empties somebody's account. It is one
 /// author and three records, so it costs nothing to ask for separately, which
 /// is the entire reason the bulk filter above can stop asking for it.
-const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind, bookmark_list_kind };
+const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind, bookmark_list_kind, blossom_list_kind };
 
 /// Backing store for the reader's own author filter. A `Filter` borrows its
 /// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
@@ -33303,6 +33401,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // A relay that asked who the reader is, and was told yes: get
                 // the answer signed. The reader thread sends it.
                 driveRelayAuth(fx);
+                // A picture on its way: a token that came back, a send that
+                // finished, a signer that never answered.
+                driveUpload(model);
                 // Health-check the signer daemon until the loopback IPC answers,
                 // then fire any queued key setup.
                 pollHelper(fx);
@@ -33527,7 +33628,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             sayFollowWrite(model, writeFollow(fx, press.who, press.direction == 1), press.direction == 1);
         },
         .open_profile_edit => openProfileEdit(model),
-        .close_profile_edit => model.editing_profile = false,
+        .close_profile_edit => {
+            model.editing_profile = false;
+            g_profile_upload_unsaved = false;
+            // A picture on its way to the avatar or banner has nowhere to go
+            // once the sheet is closed.
+            if (g_upload) |job| {
+                if (job.target != .note) uploadCancel(model);
+            }
+        },
         .profile_name_edit => |edit| model.profile_name_buffer.apply(edit),
         .profile_about_edit => |edit| _ = applyPlainEdit(profile_about_capacity, &model.profile_about_buffer, edit),
         .profile_picture_edit => |edit| model.profile_picture_buffer.apply(edit),
@@ -33535,7 +33644,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_banner_edit => |edit| model.profile_banner_buffer.apply(edit),
         .profile_lud16_edit => |edit| model.profile_lud16_buffer.apply(edit),
         .profile_nip05_edit => |edit| model.profile_nip05_buffer.apply(edit),
-        .profile_save => saveProfile(model, fx),
+        .profile_save => {
+            g_profile_upload_unsaved = false;
+            saveProfile(model, fx);
+        },
         .profile_retry => {
             forgetOwnProfileAnswer();
             model.profile_asked_at = nowSeconds();
@@ -33546,6 +33658,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .auth_deny => |i| authAnswer(i, false),
         .auth_cycle => |i| authCycle(i),
         .helper_auth_signed => |response| handleHelperAuthSigned(response),
+        .upload_pick => |which| {
+            const target = std.enums.fromInt(UploadTarget, which) orelse return;
+            uploadPick(model, fx, target);
+        },
+        .upload_go => uploadGo(model, fx),
+        .upload_retry => uploadRetry(model, fx),
+        .upload_cancel => uploadCancel(model),
+        .upload_alt_edit => |edit| model.upload_alt_buffer.apply(edit),
+        .blossom_edit => |edit| {
+            model.blossom_buffer.apply(edit);
+            // Typing answers whatever the field last complained about.
+            model.blossom_error = .none;
+        },
+        .blossom_add => blossomAdd(model, fx),
+        .blossom_remove => |i| blossomRemove(model, fx, i),
         .relay_cycle => |i| {
             cycleRelay(i);
             // The ack bits name slots, and this slot's direction just changed.
@@ -34339,6 +34466,17 @@ fn enterSettings(model: *Model) void {
     model.proxy_buffer.set(mediaProxy());
     model.proxy_saved = false;
     model.editing_profile = false;
+    // The Edit profile sheet closes here too, and a picture on its way to the
+    // avatar or banner has nowhere to land once it has: it would finish
+    // uploading into a field the next open clears.
+    if (g_upload) |job| {
+        if (job.target != .note) dropUpload();
+    }
+    g_profile_upload_unsaved = false;
+    model.blossom_error = .none;
+    // Whether this account has a media server list is asked of the relays now,
+    // so by the time an edit is made the answer is in.
+    startBlossomProbe();
     model.stage = .settings;
 }
 
@@ -34550,6 +34688,7 @@ fn openProfileEdit(model: *Model) void {
         return;
     }
     model.editing_profile = true;
+    g_profile_upload_unsaved = false;
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
     model.profile_picture_buffer.clear();
@@ -35160,9 +35299,13 @@ fn enterFeed(model: *Model) void {
     forgetFollows();
     forgetMutes();
     forgetBookmarks();
+    // A picture on its way belongs to whoever asked for it.
+    dropUpload();
+    forgetBlossom();
     loadFollowsFromStore();
     loadMutesFromStore();
     loadBookmarksFromStore();
+    loadBlossomFromStore();
     // And what people sent this account while it was away.
     loadInbox();
 }
@@ -35681,6 +35824,1411 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     model.reply_buffer.clear();
 }
 
+// ------------------------------------------------------------ picture upload
+//
+// Putting a picture into a note, an avatar or a banner.
+//
+// The protocol is Blossom and `blossom.zig` holds it. What lives here is what
+// only the app can know: who is signed in, which signer will sign, which draft or
+// profile field the address belongs in, and what is on screen while it happens.
+//
+// The shape of one upload, because it spans three threads and a signer:
+//
+//   1. The reader presses a button, a file dialog opens, and a file is chosen.
+//      Nothing has left the machine.
+//   2. A worker reads it, checks what it is, removes location and camera
+//      metadata and works out the hash, size and blurhash. The card now says what
+//      will be sent and to which servers, and waits for a press on Upload.
+//   3. The press asks the signer for a kind:24242 token naming that hash. It goes
+//      through exactly the signer every other event goes through, so a Notary or
+//      a NIP-46 bunker prompts as it would for a note. The token is never stored
+//      and never published: it is a bearer credential for one file.
+//   4. A second worker sends the picture, server by server, until one takes it.
+//   5. The tick puts the returned address where the picture was asked for.
+//
+// A job is shared between the UI thread and at most one worker at a time, and it
+// is reference counted so that cancelling while a worker is mid-write cannot free
+// what the worker is reading. The UI holds one reference; each worker holds one
+// while it runs.
+
+/// BUD-03's list of a person's media servers.
+const blossom_list_kind: u16 = 10063;
+
+const UploadTarget = enum(u8) { note, avatar, banner };
+
+const UploadPhase = enum(u8) {
+    /// A worker is reading the file.
+    preparing,
+    /// Checked and waiting for the reader to say go.
+    ready,
+    /// The token is with the signer.
+    signing,
+    /// The token is back; the tick starts the send.
+    signed,
+    sending,
+    /// A server took it; the tick applies the address.
+    sent,
+    failed,
+};
+
+const UploadJob = struct {
+    refs: std.atomic.Value(u32) = .init(1),
+    phase_raw: std.atomic.Value(u8) = .init(@intFromEnum(UploadPhase.preparing)),
+    target: UploadTarget,
+    path_buf: [1024]u8 = undefined,
+    path_len: u16 = 0,
+    prepared: ?blossom.Prepared = null,
+    /// Why it failed, or empty. Written before the phase moves to `.failed`.
+    message_buf: [200]u8 = undefined,
+    message_len: u8 = 0,
+    /// The servers this upload will try, fixed when the file is chosen so what
+    /// the card named is what is used.
+    servers: [blossom.max_servers][blossom.max_server_len]u8 = undefined,
+    server_lens: [blossom.max_servers]u8 = [_]u8{0} ** blossom.max_servers,
+    server_count: u8 = 0,
+    /// Whether those are the reader's own list rather than the defaults.
+    from_list: bool = false,
+    alt_buf: [200]u8 = undefined,
+    alt_len: u8 = 0,
+    signing_since_s: i64 = 0,
+    /// The `Authorization` header, once the signer has answered.
+    authorization: ?[]u8 = null,
+    progress: blossom.Progress = .{},
+    /// What the send found. Written before the phase moves to `.sent` or
+    /// `.failed`.
+    outcome: ?blossom.Outcome = null,
+
+    fn phase(self: *const UploadJob) UploadPhase {
+        return @enumFromInt(self.phase_raw.load(.acquire));
+    }
+
+    fn setPhase(self: *UploadJob, next: UploadPhase) void {
+        self.phase_raw.store(@intFromEnum(next), .release);
+    }
+
+    fn path(self: *const UploadJob) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    /// The file's name, without the folders it was found in.
+    fn fileName(self: *const UploadJob) []const u8 {
+        const p = self.path();
+        const slash = std.mem.lastIndexOfAny(u8, p, "/\\") orelse return p;
+        return p[slash + 1 ..];
+    }
+
+    fn message(self: *const UploadJob) []const u8 {
+        return self.message_buf[0..self.message_len];
+    }
+
+    fn server(self: *const UploadJob, i: usize) []const u8 {
+        return self.servers[i][0..self.server_lens[i]];
+    }
+
+    fn alt(self: *const UploadJob) []const u8 {
+        return self.alt_buf[0..self.alt_len];
+    }
+
+    /// Ends the job in a failure the reader can read. Safe from a worker.
+    fn fail(self: *UploadJob, text: []const u8) void {
+        const n = @min(text.len, self.message_buf.len);
+        @memcpy(self.message_buf[0..n], text[0..n]);
+        self.message_len = @intCast(n);
+        self.setPhase(.failed);
+    }
+};
+
+/// The job on screen, if any. UI thread only.
+var g_upload: ?*UploadJob = null;
+
+/// A profile picture or banner has been filled in by an upload and not saved.
+/// The sheet says so, because the field alone does not tell anyone that the
+/// picture is not published yet.
+var g_profile_upload_unsaved: bool = false;
+
+/// Stands in for the file dialog: tests, and the harness that drives the real
+/// app without a person to click through a native panel. Null in a build nobody
+/// has set it in, which is every shipped one.
+var g_pick_path_override: ?[]const u8 = null;
+
+/// How long a token may be out with the signer before the upload gives up on it.
+/// Longer than either signer's own timeout, so this only ever fires for a
+/// request that was never sent at all.
+const upload_sign_wait_s: i64 = 90;
+
+fn releaseUploadJob(job: *UploadJob) void {
+    if (job.refs.fetchSub(1, .acq_rel) != 1) return;
+    const gpa = std.heap.page_allocator;
+    if (job.prepared) |*prepared| prepared.deinit(gpa);
+    if (job.authorization) |header| gpa.free(header);
+    gpa.destroy(job);
+}
+
+/// Lets go of the job on screen. A worker still running keeps it alive until it
+/// is done, and is told to stop.
+fn dropUpload() void {
+    const job = g_upload orelse return;
+    g_upload = null;
+    job.progress.cancel.store(true, .release);
+    releaseUploadJob(job);
+}
+
+/// The job on screen when it is for `target`.
+fn uploadJobFor(target: UploadTarget) ?*UploadJob {
+    const job = g_upload orelse return null;
+    return if (job.target == target) job else null;
+}
+
+fn uploadBusy(job: *const UploadJob) bool {
+    return switch (job.phase()) {
+        .preparing, .signing, .signed, .sending, .sent => true,
+        .ready, .failed => false,
+    };
+}
+
+/// Asks for a file and starts reading it. The dialog is the SDK's own, so the
+/// reader sees the native one, and nothing is read or sent until they choose.
+fn uploadPick(model: *Model, fx: *Effects, target: UploadTarget) void {
+    if (model.is_guest()) return;
+    if (g_upload) |job| {
+        if (uploadBusy(job)) {
+            setToast(model, "A picture is already on its way.");
+            return;
+        }
+        dropUpload();
+    }
+    var buf: [1024]u8 = undefined;
+    const path = pickPicturePath(fx, &buf) orelse return;
+    startPrepare(model, target, path);
+}
+
+fn pickPicturePath(fx: *Effects, buf: []u8) ?[]const u8 {
+    if (g_pick_path_override) |path| {
+        const n = @min(path.len, buf.len);
+        @memcpy(buf[0..n], path[0..n]);
+        return buf[0..n];
+    }
+    if (builtin.is_test) return null;
+    const services = fx.services orelse return null;
+    const exts = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp" };
+    const filters = [_]native_sdk.FileFilter{.{ .name = "Pictures", .extensions = &exts }};
+    var out: [4096 * 4]u8 = undefined;
+    const result = services.showOpenDialog(.{ .title = "Choose a picture", .filters = &filters }, &out) catch return null;
+    if (result.count == 0) return null;
+    // One path per line; one was asked for.
+    const first = std.mem.sliceTo(result.paths, '\n');
+    const n = @min(first.len, buf.len);
+    @memcpy(buf[0..n], first[0..n]);
+    return buf[0..n];
+}
+
+fn startPrepare(model: *Model, target: UploadTarget, path: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    if (path.len == 0 or path.len > 1024) return;
+    const job = gpa.create(UploadJob) catch return;
+    job.* = .{ .target = target };
+    @memcpy(job.path_buf[0..path.len], path);
+    job.path_len = @intCast(path.len);
+    model.upload_alt_buffer.clear();
+    // The servers are named now, before anything is read from disk, so the card
+    // that asks for a press has the same answer a later look would.
+    const servers = uploadServers();
+    job.server_count = @intCast(servers.count);
+    job.from_list = servers.own;
+    for (0..servers.count) |i| {
+        job.server_lens[i] = servers.lens[i];
+        @memcpy(job.servers[i][0..servers.lens[i]], servers.at(i));
+    }
+    g_upload = job;
+    job.refs.store(2, .release);
+    const thread = std.Thread.spawn(.{}, prepareWorker, .{job}) catch {
+        job.refs.store(1, .release);
+        job.fail("Plaza could not start reading the file.");
+        return;
+    };
+    thread.detach();
+}
+
+fn prepareWorker(job: *UploadJob) void {
+    defer releaseUploadJob(job);
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Read here, with the process's own access, and not through the SDK's file
+    // effect: that one caps a read at 1 MiB, and since 0.9.1 it also refuses any
+    // path outside the app's own folders unless the manifest asks for
+    // `filesystem`. A picture is neither small nor in those folders, and the
+    // reader just chose it.
+    const file = std.Io.Dir.cwd().readFileAlloc(io, job.path(), gpa, .limited(blossom.max_picture_bytes + 1)) catch |err| {
+        job.fail(switch (err) {
+            error.StreamTooLong => "That file is larger than the 32 MB Plaza will upload.",
+            error.FileNotFound => "That file is no longer there.",
+            error.AccessDenied, error.PermissionDenied => "Plaza is not allowed to read that file.",
+            else => "Plaza could not read that file.",
+        });
+        return;
+    };
+    const prepared = blossom.prepare(gpa, file) catch |err| {
+        job.fail(switch (err) {
+            error.TooLarge => "That file is larger than the 32 MB Plaza will upload.",
+            error.NotAPicture => "That is not a picture Plaza can upload. It takes PNG, JPEG, GIF and WebP.",
+            error.Damaged => "That picture's file looks damaged, so Plaza did not upload it.",
+            error.OutOfMemory => "Plaza ran out of memory reading that file.",
+        });
+        return;
+    };
+    job.prepared = prepared;
+    job.setPhase(.ready);
+}
+
+/// The Upload press: asks the signer for a token, which is the first thing that
+/// leaves this process, and the first thing a bunker will ask its owner about.
+fn uploadGo(model: *Model, fx: *Effects) void {
+    const job = g_upload orelse return;
+    if (job.phase() != .ready) return;
+    if (activePubkey() == null) return;
+    const prepared = job.prepared orelse return;
+    // Said on the card, which stays up, and not as a toast: the composer draws
+    // none, so a toast raised from there would turn up on the feed afterwards.
+    job.message_len = 0;
+    if (!signerReady() or uploadTokenOutstanding()) {
+        const busy = "Your signer is busy with something else. Press Upload again in a moment.";
+        @memcpy(job.message_buf[0..busy.len], busy);
+        job.message_len = busy.len;
+        return;
+    }
+    if (job.target == .note) {
+        const alt = std.mem.trim(u8, model.upload_alt(), " \t\r\n");
+        const n = @min(alt.len, job.alt_buf.len);
+        @memcpy(job.alt_buf[0..n], alt[0..n]);
+        job.alt_len = @intCast(n);
+    }
+    const gpa = std.heap.page_allocator;
+    const created = nowSeconds();
+    const tags = blossom.authTags(gpa, &prepared.sha256, prepared.bytes.len, created + blossom.auth_lifetime_s) catch {
+        job.fail("Plaza ran out of memory.");
+        return;
+    };
+    const content = gpa.dupe(u8, blossom.auth_content) catch {
+        job.fail("Plaza ran out of memory.");
+        return;
+    };
+    job.signing_since_s = created;
+    job.setPhase(.signing);
+    switch (g_signer_kind) {
+        .remote => requestRemoteSignAs(.sign_upload_auth, gpa, created, blossom.auth_kind, tags, content, false, .none),
+        .helper => requestHelperSign(fx, gpa, created, blossom.auth_kind, tags, content, false, .none),
+    }
+}
+
+/// Whether a token asked for earlier, for a picture since put away, is still out
+/// with the signer. Its answer, or its failure, lands on whichever upload is
+/// signing when it arrives, and is not that upload's, so a new request waits
+/// until it has come back. A bunker takes several requests at once, so being
+/// ready is not enough to say so.
+fn uploadTokenOutstanding() bool {
+    if (g_helper_sign.active and g_helper_sign.upload_auth) return true;
+    pendingLock();
+    defer pendingUnlock();
+    if (g_upload_sign_inbox.used) return true;
+    for (&g_pending) |*slot| {
+        if (slot.active and slot.method == .sign_upload_auth) return true;
+    }
+    return false;
+}
+
+/// Sends the same picture again after a failure, with the same token when there
+/// is one, so a signer is not asked twice for the same file. A token near the end
+/// of its hour is asked for again rather than sent to be refused.
+fn uploadRetry(model: *Model, fx: *Effects) void {
+    const job = g_upload orelse return;
+    if (job.phase() != .failed or job.prepared == null) return;
+    job.message_len = 0;
+    job.outcome = null;
+    job.progress.sent.store(0, .release);
+    job.progress.cancel.store(false, .release);
+    if (job.authorization) |header| {
+        if (nowSeconds() < job.signing_since_s + blossom.auth_lifetime_s - 120) {
+            job.setPhase(.signed);
+            return;
+        }
+        std.heap.page_allocator.free(header);
+        job.authorization = null;
+    }
+    job.setPhase(.ready);
+    uploadGo(model, fx);
+}
+
+fn uploadCancel(model: *Model) void {
+    _ = model;
+    dropUpload();
+}
+
+/// Whether a token is the one that was asked for: an upload token for this file
+/// and nothing else, that runs out within the hour. A signer that returns
+/// anything wider has not signed what the reader saw: a second `x` would let a
+/// server store a different file under this key, a `t delete` would let it
+/// delete one, and a token with no expiry is good for as long as anyone keeps it.
+fn tokenNamesFile(tags: []const nostr.event.Tag, sha256_hex: []const u8, now: i64) bool {
+    var upload = false;
+    var named = false;
+    var expires = false;
+    for (tags) |tag| {
+        if (tag.len < 2) continue;
+        if (std.mem.eql(u8, tag[0], "t")) {
+            if (!std.mem.eql(u8, tag[1], "upload")) return false;
+            upload = true;
+        } else if (std.mem.eql(u8, tag[0], "x")) {
+            if (!std.mem.eql(u8, tag[1], sha256_hex)) return false;
+            named = true;
+        } else if (std.mem.eql(u8, tag[0], "expiration")) {
+            const at = std.fmt.parseInt(i64, tag[1], 10) catch return false;
+            // Plaza asked for an hour from the moment it asked. A minute of
+            // slack, and no more.
+            if (at <= now or at > now + blossom.auth_lifetime_s + 60) return false;
+            expires = true;
+        }
+    }
+    return upload and named and expires;
+}
+
+/// A signed token arriving from the signer. UI thread. It becomes the header the
+/// send carries, and goes nowhere else.
+fn acceptUploadAuth(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    const job = g_upload orelse return;
+    if (job.phase() != .signing) return;
+    const prepared = job.prepared orelse return;
+    const me = activePubkey() orelse return;
+    if (ev.kind != blossom.auth_kind or !std.mem.eql(u8, &ev.pubkey, &me) or !tokenNamesFile(ev.tags, &prepared.sha256, nowSeconds())) {
+        job.fail("Your signer returned something other than the upload request, so nothing was uploaded.");
+        return;
+    }
+    const json = nostr.event.toJson(gpa, ev) catch {
+        job.fail("Plaza ran out of memory.");
+        return;
+    };
+    defer gpa.free(json);
+    job.authorization = blossom.authorizationHeader(gpa, json) catch {
+        job.fail("Plaza ran out of memory.");
+        return;
+    };
+    job.setPhase(.signed);
+}
+
+/// The signer would not, or could not.
+fn uploadSignFailed() void {
+    const job = g_upload orelse return;
+    if (job.phase() != .signing) return;
+    job.fail("Your signer did not approve the upload, so nothing was uploaded.");
+}
+
+/// A token the bunker's listener thread has read, parked for the tick. The same
+/// crossing a sealed private half takes, for the same reason: the listener must
+/// not touch what the view is reading.
+const UploadSignInbox = struct {
+    used: bool = false,
+    ok: bool = false,
+    buf: [4096]u8 = undefined,
+    len: u16 = 0,
+};
+var g_upload_sign_inbox: UploadSignInbox = .{};
+
+/// Listener thread. `event_json` is the signed token, or null when the answer
+/// was unusable.
+fn parkUploadSign(event_json: ?[]const u8) void {
+    pendingLock();
+    defer pendingUnlock();
+    g_upload_sign_inbox.used = true;
+    g_upload_sign_inbox.ok = false;
+    if (event_json) |json| {
+        if (json.len <= g_upload_sign_inbox.buf.len) {
+            @memcpy(g_upload_sign_inbox.buf[0..json.len], json);
+            g_upload_sign_inbox.len = @intCast(json.len);
+            g_upload_sign_inbox.ok = true;
+        }
+    }
+}
+
+/// UI thread: hands a parked token to the job it was for.
+fn drainUploadSignInbox() void {
+    var local: [4096]u8 = undefined;
+    var len: usize = 0;
+    var ok = false;
+    {
+        pendingLock();
+        defer pendingUnlock();
+        if (!g_upload_sign_inbox.used) return;
+        ok = g_upload_sign_inbox.ok;
+        len = g_upload_sign_inbox.len;
+        if (ok) @memcpy(local[0..len], g_upload_sign_inbox.buf[0..len]);
+        g_upload_sign_inbox = .{};
+    }
+    if (!ok) {
+        uploadSignFailed();
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var parsed = nostr.event.fromJson(gpa, local[0..len]) catch {
+        uploadSignFailed();
+        return;
+    };
+    defer parsed.deinit();
+    acceptUploadAuth(gpa, parsed.value);
+}
+
+/// Called from the tick.
+fn driveUpload(model: *Model) void {
+    drainUploadSignInbox();
+    const job = g_upload orelse return;
+    switch (job.phase()) {
+        .signed => startSend(job),
+        .sent => finishUpload(model, job),
+        .signing => if (nowSeconds() - job.signing_since_s > upload_sign_wait_s) {
+            job.fail("Your signer did not answer, so nothing was uploaded.");
+        },
+        else => {},
+    }
+}
+
+fn startSend(job: *UploadJob) void {
+    const prepared = job.prepared orelse return;
+    job.progress.total = prepared.bytes.len;
+    job.setPhase(.sending);
+    _ = job.refs.fetchAdd(1, .monotonic);
+    const thread = std.Thread.spawn(.{}, sendWorker, .{job}) catch {
+        _ = job.refs.fetchSub(1, .monotonic);
+        job.fail("Plaza could not start the upload.");
+        return;
+    };
+    thread.detach();
+}
+
+fn sendWorker(job: *UploadJob) void {
+    defer releaseUploadJob(job);
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const prepared = job.prepared orelse return;
+    const header = job.authorization orelse return;
+    var servers: [blossom.max_servers][]const u8 = undefined;
+    for (0..job.server_count) |i| servers[i] = job.server(i);
+    const out = blossom.upload(io, .{
+        .servers = servers[0..job.server_count],
+        .bytes = prepared.bytes,
+        .mime = prepared.format.mime(),
+        .ext = prepared.format.ext(),
+        .sha256_hex = &prepared.sha256,
+        .authorization = header,
+    }, &job.progress);
+    job.outcome = out;
+    switch (out) {
+        .ok => job.setPhase(.sent),
+        .failed => |why| job.fail(why.text()),
+        // The reader has already let go of it.
+        .cancelled => {},
+    }
+}
+
+/// A server took the picture. Puts its address where it was asked for.
+fn finishUpload(model: *Model, job: *UploadJob) void {
+    const outcome = job.outcome orelse return;
+    const ok = switch (outcome) {
+        .ok => |o| o,
+        else => return,
+    };
+    const url = ok.descriptor.url();
+    switch (job.target) {
+        .note => {
+            if (!appendPictureToDraft(model, url)) {
+                job.fail("It uploaded, but your note has no room left for its address.");
+                return;
+            }
+            rememberUploaded(job, ok.descriptor);
+        },
+        .avatar, .banner => {
+            const buffer = if (job.target == .avatar) &model.profile_picture_buffer else &model.profile_banner_buffer;
+            if (url.len > buffer.storage.len) {
+                job.fail("It uploaded, but its address is too long for a profile field.");
+                return;
+            }
+            buffer.set(url);
+            // The reader has now chosen this value, so the field no longer
+            // stands for one that did not fit.
+            if (job.target == .avatar) model.profile_picture_long = false else model.profile_banner_long = false;
+            g_profile_upload_unsaved = true;
+        },
+    }
+    dropUpload();
+}
+
+/// Appends `url` to the draft on a line of its own. False when it will not fit.
+fn appendPictureToDraft(model: *Model, url: []const u8) bool {
+    const text = model.draft();
+    var buf: [compose_capacity]u8 = undefined;
+    const lead: []const u8 = if (text.len == 0 or text[text.len - 1] == '\n') "" else "\n";
+    const written = std.fmt.bufPrint(&buf, "{s}{s}{s}\n", .{ text, lead, url }) catch return false;
+    model.draft_buffer = @TypeOf(model.draft_buffer).init(written);
+    g_draft_dirty = true;
+    return true;
+}
+
+pub fn appendPictureToDraftForTest(model: *Model, url: []const u8) bool {
+    return appendPictureToDraft(model, url);
+}
+
+// What the uploader knew about a picture it sent, kept so the note that carries
+// its address can say so. Only an uploader has the hash, the dimensions and the
+// blurhash before anyone has fetched the file.
+const UploadedPicture = struct {
+    used: bool = false,
+    url_buf: [512]u8 = undefined,
+    url_len: u16 = 0,
+    mime: []const u8 = "",
+    sha_buf: [64]u8 = undefined,
+    size: usize = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    blur_buf: [blossom.max_blurhash_len]u8 = undefined,
+    blur_len: u8 = 0,
+    alt_buf: [200]u8 = undefined,
+    alt_len: u8 = 0,
+
+    fn url(self: *const UploadedPicture) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
+var g_uploaded: [8]UploadedPicture = [_]UploadedPicture{.{}} ** 8;
+var g_uploaded_next: usize = 0;
+
+fn rememberUploaded(job: *const UploadJob, d: blossom.Descriptor) void {
+    const prepared = job.prepared orelse return;
+    var entry: UploadedPicture = .{ .used = true, .mime = prepared.format.mime() };
+    @memcpy(entry.url_buf[0..d.url().len], d.url());
+    entry.url_len = @intCast(d.url().len);
+    // What the server says it stored, when it says. If that is not the file that
+    // was sent, the size, dimensions and blurhash describe a different file and
+    // are left out; the hash is the server's, because that is what the address
+    // serves.
+    const same = if (d.sha256()) |theirs| std.mem.eql(u8, theirs, &prepared.sha256) else true;
+    @memcpy(&entry.sha_buf, d.sha256() orelse &prepared.sha256);
+    if (same) {
+        entry.size = prepared.bytes.len;
+        entry.width = prepared.width;
+        entry.height = prepared.height;
+        const blur = prepared.blurhashText();
+        @memcpy(entry.blur_buf[0..blur.len], blur);
+        entry.blur_len = @intCast(blur.len);
+    }
+    @memcpy(entry.alt_buf[0..job.alt_len], job.alt());
+    entry.alt_len = job.alt_len;
+    g_uploaded[g_uploaded_next % g_uploaded.len] = entry;
+    g_uploaded_next +%= 1;
+}
+
+fn uploadedPictureFor(url: []const u8) ?*const UploadedPicture {
+    for (&g_uploaded) |*entry| {
+        if (entry.used and std.mem.eql(u8, entry.url(), url)) return entry;
+    }
+    return null;
+}
+
+/// The full `imeta` tag for a picture this app uploaded, or null for any other.
+fn uploadedImeta(gpa: std.mem.Allocator, url: []const u8) ?[]const []const u8 {
+    const entry = uploadedPictureFor(url) orelse return null;
+    return blossom.imetaTag(gpa, url, entry.mime, &entry.sha_buf, entry.size, entry.width, entry.height, entry.blur_buf[0..entry.blur_len], entry.alt_buf[0..entry.alt_len]) catch null;
+}
+
+/// Records a picture as if it had just been uploaded. For tests.
+pub fn rememberUploadedForTest(url: []const u8, mime: []const u8, sha_hex: []const u8, size: usize, width: u32, height: u32, hash: []const u8, alt: []const u8) void {
+    var entry: UploadedPicture = .{ .used = true, .mime = mime, .size = size, .width = width, .height = height };
+    @memcpy(entry.url_buf[0..url.len], url);
+    entry.url_len = @intCast(url.len);
+    @memcpy(entry.sha_buf[0..sha_hex.len], sha_hex);
+    @memcpy(entry.blur_buf[0..hash.len], hash);
+    entry.blur_len = @intCast(hash.len);
+    @memcpy(entry.alt_buf[0..alt.len], alt);
+    entry.alt_len = @intCast(alt.len);
+    g_uploaded[g_uploaded_next % g_uploaded.len] = entry;
+    g_uploaded_next +%= 1;
+}
+
+pub fn forgetUploadedForTest() void {
+    g_uploaded = [_]UploadedPicture{.{}} ** 8;
+    g_uploaded_next = 0;
+}
+
+// Test seams for the upload: the file dialog stood in for, the phases read, and
+// the stages that happen on a thread or in a signer driven by hand.
+
+pub fn setPickPathForTest(path: ?[]const u8) void {
+    g_pick_path_override = path;
+}
+
+pub fn uploadPickForTest(model: *Model, fx: *Effects, target: u8) void {
+    uploadPick(model, fx, std.enums.fromInt(UploadTarget, target) orelse return);
+}
+
+pub fn uploadGoForTest(model: *Model, fx: *Effects) void {
+    uploadGo(model, fx);
+}
+
+pub fn uploadRetryForTest(model: *Model, fx: *Effects) void {
+    uploadRetry(model, fx);
+}
+
+pub fn uploadCancelForTest(model: *Model) void {
+    uploadCancel(model);
+}
+
+pub fn driveUploadForTest(model: *Model) void {
+    driveUpload(model);
+}
+
+pub fn dropUploadForTest() void {
+    dropUpload();
+}
+
+/// The phase of the job on screen, or "none".
+pub fn uploadStateForTest() []const u8 {
+    const job = g_upload orelse return "none";
+    return @tagName(job.phase());
+}
+
+/// Why the job failed, or empty.
+pub fn uploadMessageForTest() []const u8 {
+    const job = g_upload orelse return "";
+    return job.message();
+}
+
+/// Moves the job's token back in time, as if it had been signed `seconds` ago.
+pub fn ageUploadTokenForTest(seconds: i64) void {
+    const job = g_upload orelse return;
+    job.signing_since_s -= seconds;
+}
+
+pub fn uploadSentBytesForTest() usize {
+    const job = g_upload orelse return 0;
+    return job.progress.sent.load(.acquire);
+}
+
+/// Makes `urls` this account's server list, as if a kind:10063 had been read.
+pub fn setBlossomServersForTest(urls: []const []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const tags = gpa.alloc(nostr.event.Tag, urls.len) catch return;
+    for (urls, 0..) |url, i| tags[i] = gpa.dupe([]const u8, &.{ "server", url }) catch return;
+    setBlossomServers(tags, 1);
+}
+
+pub fn forgetBlossomForTest() void {
+    forgetBlossom();
+}
+
+pub fn loadBlossomFromStoreForTest() void {
+    loadBlossomFromStore();
+}
+
+pub fn ingestAndPublishForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    ingestAndPublish(gpa, ev, null, .none);
+}
+
+pub fn clearLastPublishedForTest() void {
+    g_last_published = null;
+    g_last_published_tags = &.{};
+}
+
+pub fn ownRecordCreatedAtForTest(kind: u16) i64 {
+    return ownRecordCreatedAt(kind);
+}
+
+/// A token as the bunker's listener thread would park it.
+pub fn parkUploadSignForTest(event_json: ?[]const u8) void {
+    parkUploadSign(event_json);
+}
+
+pub fn tokenNamesFileForTest(tags: []const nostr.event.Tag, sha256_hex: []const u8, now: i64) bool {
+    return tokenNamesFile(tags, sha256_hex, now);
+}
+
+/// The clock a token's expiry is checked against.
+pub fn nowSecondsForTest() i64 {
+    return nowSeconds();
+}
+
+/// Says the probe found nothing on any relay, for the account that is signed in.
+pub fn markBlossomProbeCleanForTest(clean: bool) void {
+    lockBlossom();
+    g_blossom_probe_for = activePubkey();
+    unlockBlossom();
+    g_blossom_probe_state.store(if (clean) probe_clean else probe_unknown, .release);
+}
+
+// ------------------------------------------------------- the reader's servers
+
+/// The media servers uploads go to, with where they came from.
+const UploadServers = struct {
+    urls: [blossom.max_servers][blossom.max_server_len]u8 = undefined,
+    lens: [blossom.max_servers]u8 = [_]u8{0} ** blossom.max_servers,
+    count: usize = 0,
+    /// The reader's own list, rather than the built-in fallback.
+    own: bool = false,
+
+    fn at(self: *const UploadServers, i: usize) []const u8 {
+        return self.urls[i][0..self.lens[i]];
+    }
+};
+
+var g_blossom_lock = std.atomic.Value(bool).init(false);
+var g_blossom_owner: ?[32]u8 = null;
+var g_blossom_urls: [blossom.max_servers][blossom.max_server_len]u8 = undefined;
+var g_blossom_lens: [blossom.max_servers]u8 = [_]u8{0} ** blossom.max_servers;
+var g_blossom_count: usize = 0;
+/// When the list held here was signed, or 0 when this account has none.
+var g_blossom_created_at: i64 = 0;
+
+fn lockBlossom() void {
+    while (g_blossom_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn unlockBlossom() void {
+    g_blossom_lock.store(false, .release);
+}
+
+/// Whether the list held here is the signed-in account's.
+fn blossomIsOwned() bool {
+    const pk = activePubkey() orelse return false;
+    const owner = g_blossom_owner orelse return false;
+    return std.mem.eql(u8, &owner, &pk);
+}
+
+/// Where a picture goes: the reader's own list when they have published one,
+/// else the two built-in servers.
+fn uploadServers() UploadServers {
+    var out: UploadServers = .{};
+    {
+        lockBlossom();
+        defer unlockBlossom();
+        if (blossomIsOwned() and g_blossom_count > 0) {
+            out.own = true;
+            out.count = g_blossom_count;
+            for (0..g_blossom_count) |i| {
+                out.lens[i] = g_blossom_lens[i];
+                @memcpy(out.urls[i][0..g_blossom_lens[i]], g_blossom_urls[i][0..g_blossom_lens[i]]);
+            }
+            return out;
+        }
+    }
+    for (blossom.default_servers) |url| {
+        var buf: [blossom.max_server_len]u8 = undefined;
+        const norm = blossom.normalizeServer(&buf, url) orelse continue;
+        out.lens[out.count] = @intCast(norm.len);
+        @memcpy(out.urls[out.count][0..norm.len], norm);
+        out.count += 1;
+    }
+    return out;
+}
+
+fn setBlossomServers(tags: []const nostr.event.Tag, created_at: i64) void {
+    const pk = activePubkey() orelse return;
+    var urls: [blossom.max_servers][blossom.max_server_len]u8 = undefined;
+    var lens: [blossom.max_servers]u8 = undefined;
+    const n = blossom.serversFromTags(tags, &urls, &lens);
+    lockBlossom();
+    defer unlockBlossom();
+    g_blossom_urls = urls;
+    g_blossom_lens = lens;
+    g_blossom_count = n;
+    g_blossom_owner = pk;
+    g_blossom_created_at = created_at;
+}
+
+fn forgetBlossom() void {
+    lockBlossom();
+    defer unlockBlossom();
+    g_blossom_owner = null;
+    g_blossom_count = 0;
+    g_blossom_created_at = 0;
+}
+
+fn loadBlossomFromStore() void {
+    const gpa = std.heap.page_allocator;
+    const own = ownRecordJson(gpa, blossom_list_kind) orelse return;
+    defer freeOwnProfile(gpa, own);
+    setBlossomServers(own.tags, own.created_at);
+}
+
+/// A server list arriving from a relay. This reader's own only, and only a newer
+/// one than the one held.
+fn ingestBlossomList(ev: nostr.event.Event) void {
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    // Under the lock: this runs on whichever relay thread delivered the list,
+    // while the UI thread reads the same fields.
+    lockBlossom();
+    const older = blossomIsOwned() and ev.created_at < g_blossom_created_at;
+    unlockBlossom();
+    if (older) return;
+    loadBlossomFromStore();
+}
+
+/// Whether this account's own server list is held here.
+fn haveOwnBlossomList() bool {
+    lockBlossom();
+    defer unlockBlossom();
+    return blossomIsOwned() and g_blossom_created_at > 0;
+}
+
+// Whether a list that is not here is a list that does not exist. Not a question
+// the local store can answer: it holds no row both when there is none and when
+// the fetch has not landed. So every relay the reader reads from is asked once,
+// and only if ALL of them answer without one is the account treated as having
+// none. One that is down, slow or write-only proves nothing about the others.
+var g_blossom_probe_state = std.atomic.Value(u8).init(0);
+var g_blossom_probe_for: ?[32]u8 = null;
+const probe_none: u8 = 0;
+const probe_asking: u8 = 1;
+const probe_clean: u8 = 2;
+const probe_unknown: u8 = 3;
+
+/// Asks the relays whether this account has a server list. Once per account,
+/// unless the last round could not tell: a relay that was down a minute ago may
+/// be up now, and until it answers the list cannot be edited.
+fn startBlossomProbe() void {
+    if (!relayFetchAllowed()) return;
+    const pk = activePubkey() orelse return;
+    {
+        lockBlossom();
+        defer unlockBlossom();
+        if (!blossomProbeWantedUnlocked(pk)) return;
+        g_blossom_probe_for = pk;
+    }
+    g_blossom_probe_state.store(probe_asking, .release);
+    const thread = std.Thread.spawn(.{}, blossomProbeWorker, .{pk}) catch {
+        g_blossom_probe_state.store(probe_unknown, .release);
+        return;
+    };
+    thread.detach();
+}
+
+/// Whether `pk` should be asked about. Called with the blossom lock held.
+fn blossomProbeWantedUnlocked(pk: [32]u8) bool {
+    const asked = g_blossom_probe_for orelse return true;
+    if (!std.mem.eql(u8, &asked, &pk)) return true;
+    return g_blossom_probe_state.load(.acquire) == probe_unknown;
+}
+
+pub fn blossomProbeWantedForTest() bool {
+    const pk = activePubkey() orelse return false;
+    lockBlossom();
+    defer unlockBlossom();
+    return blossomProbeWantedUnlocked(pk);
+}
+
+/// Whether one relay's reply to the probe answers it. EOSE does: that relay
+/// looked and has sent everything it holds. CLOSED does not: it is the relay
+/// declining to look (auth-required, rate-limited, restricted), and a list kept
+/// there is exactly as possible as before it said so.
+fn probeReplyAnswers(tag: std.meta.Tag(nostr.message.RelayMessage)) bool {
+    return tag == .eose;
+}
+
+pub fn probeReplyAnswersForTest(tag: std.meta.Tag(nostr.message.RelayMessage)) bool {
+    return probeReplyAnswers(tag);
+}
+
+fn blossomProbeWorker(pk: [32]u8) void {
+    var asked: usize = 0;
+    var answered: usize = 0;
+    var found = false;
+    defer {
+        // An answer about one account is not an answer about another.
+        lockBlossom();
+        const still_current = if (g_blossom_probe_for) |current| std.mem.eql(u8, &current, &pk) else false;
+        unlockBlossom();
+        if (still_current) {
+            g_blossom_probe_state.store(if (asked > 0 and answered == asked and !found) probe_clean else probe_unknown, .release);
+        }
+    }
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    const kinds = [_]u16{blossom_list_kind};
+    const authors = [_][32]u8{pk};
+    const filters = [_]nostr.filter.Filter{.{ .authors = &authors, .kinds = &kinds, .limit = 1 }};
+    for (0..relaySlots()) |ri| {
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        asked += 1;
+        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.subscribe("plaza-bl", &filters) catch continue;
+        var seen: usize = 0;
+        while (seen < 32) : (seen += 1) {
+            var msg = (relay.receive() catch break) orelse break;
+            defer msg.deinit();
+            switch (msg.value) {
+                .event => |e| {
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    if (result == .invalid) continue;
+                    if (e.event.kind != blossom_list_kind) continue;
+                    if (!std.mem.eql(u8, &e.event.pubkey, &pk)) continue;
+                    found = true;
+                },
+                .eose, .closed => {
+                    if (probeReplyAnswers(std.meta.activeTag(msg.value))) answered += 1;
+                    break;
+                },
+                else => continue,
+            }
+        }
+    }
+}
+
+fn blossomProbeClean() bool {
+    const pk = activePubkey() orelse return false;
+    lockBlossom();
+    defer unlockBlossom();
+    const asked = g_blossom_probe_for orelse return false;
+    if (!std.mem.eql(u8, &asked, &pk)) return false;
+    return g_blossom_probe_state.load(.acquire) == probe_clean;
+}
+
+fn blossomProbeAsking() bool {
+    return g_blossom_probe_state.load(.acquire) == probe_asking;
+}
+
+/// Whether the account's server list may be published. Either it is here, so an
+/// edit splices onto it and loses nothing, or the key was made in this app a
+/// moment ago, or every relay was asked and none has one.
+fn canWriteBlossomList() bool {
+    if (activePubkey() == null) return false;
+    if (haveOwnBlossomList()) return true;
+    if (g_identity_minted_here) return true;
+    return blossomProbeClean();
+}
+
+pub const BlossomWrite = enum {
+    published,
+    /// Already there, or already gone.
+    nothing_to_do,
+    /// A signature is already out. One key signs one thing at a time.
+    signer_busy,
+    /// This account's list has not been read back, so publishing one would
+    /// replace whatever is really out there.
+    no_list_yet,
+    /// The list is as long as Plaza sends to.
+    full,
+    failed,
+};
+
+/// Adds `add` to, or removes `remove` from, this reader's kind:10063. Either is
+/// a normalized server address.
+///
+/// A near-copy of `writeBookmark`'s discipline, applied to a smaller list: the
+/// RAW previous record is read, every tag and the content are carried forward
+/// whole, only the one server moves, and nothing is written over a record that
+/// has not been read.
+fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]const u8) BlossomWrite {
+    if (!signerReady()) return .signer_busy;
+    _ = activePubkey() orelse return .failed;
+    const gpa = std.heap.page_allocator;
+    // Compared and written in one spelling, whatever the caller was handed.
+    var add_buf: [blossom.max_server_len]u8 = undefined;
+    var remove_buf: [blossom.max_server_len]u8 = undefined;
+    const add: ?[]const u8 = if (add_raw) |raw| (blossom.normalizeServer(&add_buf, raw) orelse return .failed) else null;
+    const remove: ?[]const u8 = if (remove_raw) |raw| (blossom.normalizeServer(&remove_buf, raw) orelse return .failed) else null;
+
+    var previous: ?OwnProfile = null;
+    if (ownRecordJson(gpa, blossom_list_kind)) |own| previous = own;
+    defer if (previous) |prev| freeOwnProfile(gpa, prev);
+    // With nothing stored to splice onto, only proof that there is nothing to
+    // lose licenses a write. A list held in memory is not that proof: it is a
+    // copy of a stored record, and a stored record that has gone is the case
+    // where writing from nothing replaces it with one server.
+    if (previous == null and !(g_identity_minted_here or blossomProbeClean())) return .no_list_yet;
+
+    const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
+    const base_content: []const u8 = if (previous) |prev| prev.json else "";
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    var handed_off = false;
+    defer if (!handed_off) {
+        for (tags.items) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        tags.deinit(gpa);
+    };
+    var found = false;
+    var dropped = false;
+    var usable: usize = 0;
+    for (base_tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "server")) {
+            var buf: [blossom.max_server_len]u8 = undefined;
+            if (blossom.normalizeServer(&buf, tag[1])) |norm| {
+                if (add) |a| {
+                    if (std.mem.eql(u8, norm, a)) found = true;
+                }
+                if (remove) |r| {
+                    if (std.mem.eql(u8, norm, r)) {
+                        dropped = true;
+                        continue;
+                    }
+                }
+                usable += 1;
+            }
+        }
+        // Everything else, and any server this app cannot read, goes back out
+        // exactly as it came in.
+        const copy = gpa.alloc([]const u8, tag.len) catch return .failed;
+        for (tag, 0..) |field, i| copy[i] = gpa.dupe(u8, field) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    }
+    if (add) |a| {
+        if (found) return .nothing_to_do;
+        if (usable >= blossom.max_servers) return .full;
+        const copy = gpa.alloc([]const u8, 2) catch return .failed;
+        copy[0] = gpa.dupe(u8, "server") catch return .failed;
+        copy[1] = gpa.dupe(u8, a) catch return .failed;
+        tags.append(gpa, copy) catch return .failed;
+    } else if (!dropped) {
+        return .nothing_to_do;
+    }
+
+    const owned_tags = tags.toOwnedSlice(gpa) catch return .failed;
+    handed_off = true;
+    const content = gpa.dupe(u8, base_content) catch return .failed;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(blossom_list_kind) + 1), base_created_at + 1);
+    g_blossom_saving = created;
+    signAndPublish(fx, gpa, created, blossom_list_kind, owned_tags, content, false, .none, null);
+    return .published;
+}
+
+/// The stamp of a server list that has been sent to be signed and has not come
+/// back yet, or 0.
+var g_blossom_saving: i64 = 0;
+
+pub fn writeBlossomServersForTest(fx: *Effects, add: ?[]const u8, remove: ?[]const u8) BlossomWrite {
+    return writeBlossomServers(fx, add, remove);
+}
+
+pub fn blossomServersForTest(out: *[blossom.max_servers][]const u8) usize {
+    const s = uploadServers();
+    for (0..s.count) |i| out[i] = std.heap.page_allocator.dupe(u8, s.at(i)) catch "";
+    return s.count;
+}
+
+pub fn blossomOwnListForTest() bool {
+    return uploadServers().own;
+}
+
+fn blossomAdd(model: *Model, fx: *Effects) void {
+    const typed = std.mem.trim(u8, model.blossom_buffer.text(), " \t\r\n");
+    model.blossom_error = .none;
+    var buf: [blossom.max_server_len]u8 = undefined;
+    const norm = blossom.normalizeServer(&buf, typed) orelse {
+        model.blossom_error = .invalid;
+        return;
+    };
+    switch (writeBlossomServers(fx, norm, null)) {
+        .published => model.blossom_buffer.clear(),
+        .nothing_to_do => model.blossom_buffer.clear(),
+        .signer_busy => model.blossom_error = .busy,
+        .no_list_yet => model.blossom_error = .unread,
+        .full => model.blossom_error = .full,
+        .failed => model.blossom_error = .failed,
+    }
+}
+
+fn blossomRemove(model: *Model, fx: *Effects, index: u8) void {
+    model.blossom_error = .none;
+    const servers = uploadServers();
+    // Only the reader's own list has rows to remove; the fallback is not theirs.
+    if (!servers.own or index >= servers.count) return;
+    switch (writeBlossomServers(fx, null, servers.at(index))) {
+        .published, .nothing_to_do => {},
+        .signer_busy => model.blossom_error = .busy,
+        .no_list_yet => model.blossom_error = .unread,
+        .full => model.blossom_error = .full,
+        .failed => model.blossom_error = .failed,
+    }
+}
+
+const BlossomEdit = enum { none, invalid, busy, unread, full, failed };
+
+// -------------------------------------------------------------------- views
+
+/// What sits in the composer, or beside a profile field, for putting a picture
+/// in: a button while there is nothing going on, and the card for the job while
+/// there is.
+fn uploadStrip(ui: *AppUi, model: *const Model, target: UploadTarget) AppUi.Node {
+    const p = theme.palette;
+    if (uploadJobFor(target)) |job| return uploadCard(ui, model, job);
+    const servers = uploadServers();
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        hgap(ui, 2),
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg{ .upload_pick = @intFromEnum(target) } }, "Add picture"),
+        hgap(ui, 8),
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_dim } },
+            &.{.{ .text = ui.fmt("Uploads to {s}", .{blossom.serverLabel(servers.at(0))}), .monospace = true, .scale = mono_meta_scale }},
+        ),
+    });
+}
+
+/// Where the servers are said, in the reader's terms. Named before anything is
+/// sent, and the same words whether they chose the servers or the app did.
+fn uploadWhere(ui: *AppUi, job: *const UploadJob) []const u8 {
+    if (job.server_count == 0) return "No media server is set up.";
+    const first = blossom.serverLabel(job.server(0));
+    if (job.from_list) {
+        if (job.server_count == 1) return ui.fmt("Uploads to {s}, from your server list.", .{first});
+        return ui.fmt("Uploads to {s}, from your server list. If it refuses, {s} is next.", .{ first, blossom.serverLabel(job.server(1)) });
+    }
+    if (job.server_count == 1) return ui.fmt("You have no server list, so this goes to {s}.", .{first});
+    return ui.fmt("You have no server list, so this goes to {s}, then {s} if it refuses. Settings has the list.", .{ first, blossom.serverLabel(job.server(1)) });
+}
+
+fn uploadCard(ui: *AppUi, model: *const Model, job: *UploadJob) AppUi.Node {
+    const p = theme.palette;
+    var rows: [9]AppUi.Node = undefined;
+    var n: usize = 0;
+    const name = job.fileName();
+    switch (job.phase()) {
+        .preparing => {
+            rows[n] = uploadLine(ui, ui.fmt("Reading {s}...", .{name}), p.text_secondary);
+            n += 1;
+            rows[n] = uploadButtons(ui, null, "", "Cancel");
+            n += 1;
+        },
+        .ready => {
+            const prepared = job.prepared.?;
+            var detail: []const u8 = byteSize(ui.arena, @intCast(@min(prepared.bytes.len, std.math.maxInt(u32))));
+            // A profile sheet is a fixed card with no room to spare, so its
+            // version of this is the short one.
+            if (prepared.width > 0 and prepared.height > 0 and job.target == .note) detail = ui.fmt("{s}, {d} x {d}", .{ detail, prepared.width, prepared.height });
+            rows[n] = uploadLine(ui, ui.fmt("{s}  {s}", .{ name, detail }), p.text_primary);
+            n += 1;
+            rows[n] = uploadNote(ui, uploadWhere(ui, job), p.text_muted);
+            n += 1;
+            if (prepared.stripped and job.target == .note) {
+                rows[n] = uploadNote(ui, "Location and camera details in the file are removed first.", p.text_faint);
+                n += 1;
+            }
+            if (job.message().len > 0) {
+                rows[n] = uploadNote(ui, job.message(), p.status_warning_text);
+                n += 1;
+            }
+            if (job.target == .note) {
+                rows[n] = ui.el(.textarea, .{
+                    .text = model.upload_alt(),
+                    .placeholder = "Describe the picture (optional)",
+                    .on_input = AppUi.inputMsg(.upload_alt_edit),
+                    .height = 34,
+                    .semantics = .{ .label = "Picture description" },
+                }, .{});
+                n += 1;
+            }
+            rows[n] = uploadButtons(ui, Msg.upload_go, "Upload", "Cancel");
+            n += 1;
+        },
+        .signing => {
+            rows[n] = uploadLine(ui, "Waiting for your signer to approve the upload...", p.text_secondary);
+            n += 1;
+            rows[n] = uploadButtons(ui, null, "", "Cancel");
+            n += 1;
+        },
+        .signed, .sending, .sent => {
+            const total = @max(job.progress.total, 1);
+            const sent = @min(job.progress.sent.load(.acquire), total);
+            const percent: usize = sent * 100 / total;
+            const at: usize = @min(job.progress.server.load(.acquire), @max(job.server_count, 1) - 1);
+            rows[n] = uploadLine(ui, ui.fmt("Uploading {s} to {s}", .{ name, blossom.serverLabel(job.server(at)) }), p.text_secondary);
+            n += 1;
+            rows[n] = uploadBar(ui, percent);
+            n += 1;
+            rows[n] = uploadButtons(ui, null, "", "Cancel");
+            n += 1;
+        },
+        .failed => {
+            rows[n] = uploadNote(ui, if (job.message().len > 0) job.message() else "The upload did not work.", p.status_warning_text);
+            n += 1;
+            // The file read fine and the failure was the network or a server:
+            // the same picture can be sent again without choosing it again.
+            const sent_ok = if (job.outcome) |o| o == .ok else false;
+            const again: ?Msg = if (job.prepared != null and !sent_ok) Msg.upload_retry else null;
+            rows[n] = uploadButtons(ui, again, "Try again", "Dismiss");
+            n += 1;
+        },
+    }
+    return ui.el(.card, .{
+        .padding = 12,
+        .style = .{ .background = p.surface_settings_card, .border = p.border_chip, .radius = settings_card_radius, .stroke_width = 1 },
+        .semantics = .{ .label = "Picture upload" },
+    }, .{
+        ui.column(.{ .gap = 8, .grow = 1 }, .{rows[0..n]}),
+    });
+}
+
+fn uploadLine(ui: *AppUi, text: []const u8, color: canvas.Color) AppUi.Node {
+    return ui.paragraph(.{ .wrap = true, .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = menu_scale }});
+}
+
+fn uploadNote(ui: *AppUi, text: []const u8, color: canvas.Color) AppUi.Node {
+    return ui.paragraph(.{ .wrap = true, .style = .{ .foreground = color } }, &.{.{ .text = text, .scale = mono_hint_scale }});
+}
+
+/// A thin bar and the number beside it.
+fn uploadBar(ui: *AppUi, percent: usize) AppUi.Node {
+    const p = theme.palette;
+    const track: f32 = 240;
+    const fill = track * @as(f32, @floatFromInt(@min(percent, 100))) / 100.0;
+    return ui.row(.{ .cross = .center, .gap = 0 }, .{
+        ui.row(.{ .gap = 0, .width = track, .height = 4 }, .{
+            if (fill >= 1)
+                ui.el(.panel, .{ .width = fill, .height = 4, .padding = 0.01, .style = .{ .background = p.accent, .radius = 2, .stroke_width = 0 } }, .{})
+            else
+                ui.spacer(0),
+            ui.el(.panel, .{ .width = @max(track - fill, 0.01), .height = 4, .padding = 0.01, .style = .{ .background = p.border_control, .radius = 2, .stroke_width = 0 } }, .{}),
+        }),
+        hgap(ui, 10),
+        ui.paragraph(.{ .style = .{ .foreground = p.text_muted } }, &.{.{ .text = ui.fmt("{d}%", .{percent}), .monospace = true, .scale = mono_meta_scale }}),
+    });
+}
+
+fn uploadButtons(ui: *AppUi, primary: ?Msg, primary_label: []const u8, cancel_label: []const u8) AppUi.Node {
+    return ui.row(.{ .gap = 8, .cross = .center }, .{
+        if (primary) |msg|
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = msg }, primary_label)
+        else
+            ui.spacer(0),
+        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.upload_cancel }, cancel_label),
+        ui.spacer(1),
+    });
+}
+
+/// The label row of a profile field that can take a picture: the name, and on
+/// the right the way to upload one. While a job for this field is on screen, the
+/// card stands where the text box was.
+fn profilePictureField(ui: *AppUi, model: *const Model, label: []const u8, value: []const u8, comptime tag: std.meta.Tag(Msg), target: UploadTarget) AppUi.Node {
+    const p = theme.palette;
+    if (uploadJobFor(target)) |job| {
+        return ui.column(.{ .gap = 0 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }}),
+            vgap(ui, 5),
+            uploadCard(ui, model, job),
+        });
+    }
+    return ui.column(.{ .gap = 0 }, .{
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.paragraph(.{ .style = .{ .foreground = p.text_label } }, &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }}),
+            ui.spacer(1),
+            settingsLink(ui, "Upload...", Msg{ .upload_pick = @intFromEnum(target) }),
+        }),
+        vgap(ui, 5),
+        ui.el(.textarea, .{
+            .text = value,
+            .placeholder = "https://",
+            .on_input = AppUi.inputMsg(tag),
+            .on_submit = Msg.profile_save,
+            .height = 34,
+            .semantics = .{ .label = label },
+        }, .{}),
+    });
+}
+
+/// Settings: the servers pictures go to, and how to change them.
+fn mediaServersCard(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    const servers = uploadServers();
+    const rows = ui.arena.alloc(AppUi.Node, servers.count + 4) catch return ui.spacer(0);
+    var n: usize = 0;
+    rows[n] = ui.paragraph(
+        .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+        &.{.{ .text = if (servers.own)
+            "A picture goes to the first of these that takes it."
+        else
+            "You have not published a list, so a picture goes to the first of these that takes it. Adding one publishes your list.", .scale = mono_hint_scale }},
+    );
+    n += 1;
+    rows[n] = vgap(ui, 10);
+    n += 1;
+    for (0..servers.count) |i| {
+        rows[n] = ui.column(.{ .gap = 0 }, .{
+            ui.row(.{ .cross = .center, .gap = 0 }, .{
+                ui.paragraph(.{ .style = .{ .foreground = p.text_secondary } }, &.{.{ .text = blossom.serverLabel(servers.at(i)), .monospace = true, .scale = mono_row_scale }}),
+                ui.spacer(1),
+                if (servers.own)
+                    ui.el(.list_item, .{
+                        .padding = 0.01,
+                        .height = 20,
+                        .cross = .center,
+                        .on_press = Msg{ .blossom_remove = @intCast(i) },
+                        .style = .{ .radius = 4 },
+                        .semantics = .{ .role = .button, .label = ui.fmt("Remove {s}", .{servers.at(i)}), .focusable = true },
+                    }, .{
+                        hgap(ui, 4),
+                        ui.icon(.{ .width = 11, .height = 11, .style = .{ .foreground = p.text_dim } }, "x"),
+                        hgap(ui, 4),
+                    })
+                else
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_dim } }, &.{.{ .text = "built in", .monospace = true, .scale = mono_chip_scale }}),
+            }),
+            vgap(ui, 9),
+        });
+        n += 1;
+    }
+    rows[n] = ui.inputGroup(
+        .{ .semantics = .{ .label = "Add a media server" } },
+        ui.el(.textarea, .{
+            .text = model.blossom_draft(),
+            .placeholder = "https://",
+            .on_input = AppUi.inputMsg(.blossom_edit),
+            .on_submit = Msg.blossom_add,
+            .height = 30,
+        }, .{}),
+        ui.inputGroupActions(.{}, .{
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = if (model.blossom_error != .none) p.status_warning_text else p.text_dim } },
+                &.{.{ .text = model.blossom_status(), .scale = mono_meta_scale }},
+            ),
+            ui.button(.{ .size = .sm, .on_press = Msg.blossom_add }, "Add"),
+        }),
+    );
+    n += 1;
+    return settingsCard(ui, .{rows[0..n]});
+}
+
+/// What the line under the add field says.
+fn blossomStatusText(error_kind: BlossomEdit) []const u8 {
+    return switch (error_kind) {
+        .invalid => "A server address starts with https:// and names a host.",
+        .busy => "Your signer is busy. Try again in a moment.",
+        .unread => "Plaza has not read your server list yet, so it will not replace it.",
+        .full => "Plaza sends to up to 4 servers.",
+        .failed => "That did not go through.",
+        .none => if (blossomProbeAsking() and !haveOwnBlossomList())
+            "Reading your server list..."
+        else if (g_blossom_saving != 0 and g_blossom_saving > g_blossom_created_at)
+            "Saving..."
+        else if (activePubkey() != null and !canWriteBlossomList())
+            // Said before the press, as the relay list does: an edit that will not
+            // be published must not look as though it will.
+            "Plaza has not read your server list yet, so it will not replace it."
+        else
+            "",
+    };
+}
+
 // ------------------------------------------------------------------------ likes
 //
 // A like is a NIP-25 kind:7 reaction with content "+", e/p/k-tagging the note.
@@ -35934,7 +37482,9 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
             var j = i;
             while (j < content.len and !std.ascii.isWhitespace(content[j])) j += 1;
             const url = content[i..j];
-            if (images_len < images.len and looksLikeImageUrl(url)) {
+            // A picture this app uploaded is one whatever its address ends in:
+            // it knows what it sent.
+            if (images_len < images.len and (looksLikeImageUrl(url) or uploadedPictureFor(url) != null)) {
                 var dup = false;
                 for (images[0..images_len]) |seen| {
                     if (std.mem.eql(u8, seen, url)) dup = true;
@@ -36120,6 +37670,12 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
         out.appendAssumeCapacity(tag);
     }
     for (images[0..images_len]) |url| {
+        // One this app uploaded: it carries everything the uploader knew, which
+        // is more than a reader fetching it would learn.
+        if (uploadedImeta(gpa, url)) |full| {
+            out.appendAssumeCapacity(full);
+            continue;
+        }
         // NIP-92's fields are one space-joined "key value" string each, and a
         // value may itself contain spaces, so a reader splits on the FIRST space
         // only. Plaza's own reader already does; this writes what that reads.
@@ -36470,6 +38026,9 @@ fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nost
 /// process-lifetime allocation, since the detached publisher reads it after
 /// this returns.
 fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?nostr.keys.Signer, route: PlaceRoute) void {
+    // A media server's upload token is a bearer credential for one file, not a
+    // record. It is never stored and never published, whatever signed it.
+    if (ev.kind == blossom.auth_kind) return;
     if (builtin.is_test) g_last_published = ev;
     if (g_store == null) return;
     if (verify) |signer| {
@@ -39572,6 +41131,12 @@ fn sendConnect(gpa: std.mem.Allocator) void {
 /// the listener, which stores and publishes it. `restorable` is true only for a
 /// composer draft, so a failed reaction never lands "+"-text in the composer.
 fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
+    requestRemoteSignAs(.sign_event, gpa, created_at, kind, tags, content_owned, restorable, route);
+}
+
+/// The same request, tracked as `method`: an upload token is signed the same way
+/// and answered to a different place.
+fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
     // `content_owned` is handed to the pending slot (so a timeout can restore
     // it to the composer); it is freed here only on an early return.
     // A canonical unsigned event (the bunker fills in the signature). The id is
@@ -39602,7 +41167,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags))) {
+    if (!registerPending(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags))) {
         gpa.free(content_owned);
         return;
     }
@@ -39853,6 +41418,26 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             defer parsed.deinit();
             authDeliverSigned(gpa, signer, pending.half_index, parsed.value);
         },
+        // An upload token: checked here, parked for the tick, never stored.
+        .sign_upload_auth => {
+            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch {
+                parkUploadSign(null);
+                return;
+            };
+            defer parsed.deinit();
+            const sound = std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey) and
+                (nostr.event.verify(gpa, signer, parsed.value) catch false);
+            if (!sound) {
+                parkUploadSign(null);
+                return;
+            }
+            const json = nostr.event.toJson(gpa, parsed.value) catch {
+                parkUploadSign(null);
+                return;
+            };
+            defer gpa.free(json);
+            parkUploadSign(json);
+        },
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
@@ -39899,6 +41484,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var any_sign_failed = false;
     var connect_failed = false;
     var seal_failed = false;
+    var upload_sign_failed = false;
 
     pendingLock();
     for (&g_pending) |*slot| {
@@ -39945,6 +41531,12 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
             .connect => {
                 if (content) |c| gpa.free(c);
                 connect_failed = true;
+            },
+            // A token the bunker refused or never answered. The upload card says
+            // so; there is no draft to give back.
+            .sign_upload_auth => {
+                if (content) |c| gpa.free(c);
+                upload_sign_failed = true;
             },
             // Refused or never answered. NOT "the half is empty": that
             // distinction is the whole reason this cache exists, and collapsing
@@ -40031,6 +41623,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
     if (any_sign_failed) applyUndo(model);
+    if (upload_sign_failed) uploadSignFailed();
     if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }
 
@@ -40237,6 +41830,7 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     loadFollowsFromStore();
     loadMutesFromStore();
     loadBookmarksFromStore();
+    loadBlossomFromStore();
     loadInbox();
 
     // The reader's own list, or the one the app was born with. Read before the
@@ -41042,6 +42636,8 @@ fn performLogout(model: *Model, fx: *Effects) void {
     forgetMutes();
     forgetBookmarks();
     forgetPrivateHalves();
+    dropUpload();
+    forgetBlossom();
     resetInbox();
     forgetPlaces();
     // And a note this account was about to sign. It is held on the near side of
@@ -43134,4 +44730,5 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
 
 test {
     _ = @import("tests.zig");
+    _ = @import("blossom.zig");
 }

@@ -28490,8 +28490,9 @@ test "the funnel records the relay that delivered an event, and only a verified 
 test "every relay-fed note ingest remembers which relay it came from" {
     // The helper being right is half of it. A new fetch path that ingests with the
     // bare funnel quietly stops teaching the hint table, and nothing else fails:
-    // notes from it just publish with an empty hint. The five left on the bare
-    // funnel read profiles, places and relay lists, which are never hinted at.
+    // notes from it just publish with an empty hint. The six left on the bare
+    // funnel read profiles, places, relay lists and media server lists, which
+    // are never hinted at.
     // An article fetched by its address is a note like any other and is counted
     // with the rest.
     const source = @embedFile("main.zig");
@@ -28502,7 +28503,7 @@ test "every relay-fed note ingest remembers which relay it came from" {
         if (std.mem.indexOf(u8, line, "plazaIngest(gpa, e.event, .{ .verify_with = signer })") != null) bare += 1;
         if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, ") != null) from += 1;
     }
-    try testing.expectEqual(@as(usize, 5), bare);
+    try testing.expectEqual(@as(usize, 6), bare);
     try testing.expectEqual(@as(usize, 11), from);
 }
 
@@ -29647,4 +29648,787 @@ test "the search sheet fits the view budget with a full list over the deepest th
     // Inside the ceiling AND leaving a tenth of it free, the margin the other
     // sheets keep.
     try testing.expect(p.layout.nodes.len < native_sdk.runtime.max_canvas_widget_nodes_per_view / 10 * 9);
+}
+
+// ------------------------------------------------------------ picture upload
+
+const blossom = @import("blossom.zig");
+
+/// Waits for an upload job to reach `phase`, which is moved by a worker thread.
+fn awaitUpload(phase: []const u8) !void {
+    var waited: usize = 0;
+    while (waited < 1000) : (waited += 1) {
+        if (std.mem.eql(u8, main.uploadStateForTest(), phase)) return;
+        // A job that has failed will not reach anything else.
+        if (std.mem.eql(u8, main.uploadStateForTest(), "failed") and !std.mem.eql(u8, phase, "failed")) return error.UploadFailed;
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    std.debug.print("\nupload stuck in {s}, wanted {s}\n", .{ main.uploadStateForTest(), phase });
+    return error.UploadStuck;
+}
+
+/// A picture on disk for the file dialog to hand back.
+fn writeTestPicture(name: []const u8, w: u32, h: u32, extra: []const u8) ![]const u8 {
+    const png = try blossom.testPng(testing.allocator, w, h, extra);
+    defer testing.allocator.free(png);
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/{s}", .{name});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = png });
+    return path;
+}
+
+test "a picture this app uploaded carries everything the uploader knew in its imeta" {
+    // A reader fetching a picture learns its type from the server. Only an
+    // uploader has the hash, the size, the dimensions and the blurhash before
+    // anyone has fetched the file, and a note that leaves them out makes every
+    // client that opens it lay the picture out blind.
+    main.forgetUploadedForTest();
+    defer main.forgetUploadedForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+    const sha = "ab" ** 32;
+    main.rememberUploadedForTest("https://cdn.example/" ++ sha ++ ".png", "image/png", sha, 48211, 800, 600, "LEHV6nWB2yk8pyo0adR*.7kCMdnj", "A red door");
+
+    const tags = main.contentTagsForTest(gpa, "look at this\nhttps://cdn.example/" ++ sha ++ ".png\n");
+    const im = tagNamed(tags, "imeta") orelse return error.NoImetaTag;
+    try testing.expectEqual(@as(usize, 8), im.len);
+    try testing.expectEqualStrings("url https://cdn.example/" ++ sha ++ ".png", im[1]);
+    try testing.expectEqualStrings("m image/png", im[2]);
+    try testing.expectEqualStrings("x " ++ sha, im[3]);
+    try testing.expectEqualStrings("size 48211", im[4]);
+    try testing.expectEqualStrings("dim 800x600", im[5]);
+    try testing.expectEqualStrings("blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj", im[6]);
+    try testing.expectEqualStrings("alt A red door", im[7]);
+    // And the reader of that note can use it: Plaza's own parser reads it back.
+    const meta = main.imetaFor(tags, "https://cdn.example/" ++ sha ++ ".png");
+    try testing.expectEqual(@as(u16, 800), meta.width);
+    try testing.expectEqual(@as(u16, 600), meta.height);
+    try testing.expectEqualStrings("A red door", meta.alt);
+    try testing.expectEqual(@as(u32, 48211), meta.size);
+
+    // An address with no extension is a picture here, because this app sent it;
+    // anywhere else it is a link, and gets no tag.
+    main.rememberUploadedForTest("https://cdn.example/" ++ sha, "image/webp", sha, 10, 0, 0, "", "");
+    const bare = main.contentTagsForTest(gpa, "https://cdn.example/" ++ sha ++ " and https://other.example/page");
+    try testing.expectEqual(@as(usize, 1), countTags(bare, "imeta"));
+    const bare_im = tagNamed(bare, "imeta").?;
+    try testing.expectEqualStrings("m image/webp", bare_im[2]);
+    // Nothing unknown is written empty.
+    try testing.expectEqual(@as(usize, 5), bare_im.len);
+}
+
+test "a picture goes from a chosen file to an address in the note, through the signer and over HTTP" {
+    // The whole path on one thread of events: the file dialog (stood in for), the
+    // worker that reads and cleans the file, the kind:24242 token signed by the
+    // same stand-in keyholder every other test signs with, the send to a server
+    // on loopback, and the address landing in the draft with its imeta.
+    main.forgetBlossomForTest();
+    main.forgetUploadedForTest();
+    main.clearLastPublishedForTest();
+    main.setIdentityForTest([_]u8{0x4a} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.forgetUploadedForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    var extra = std.ArrayList(u8).empty;
+    defer extra.deinit(testing.allocator);
+    try blossomPngText(testing.allocator, &extra, "taken at 12.34N 56.78E");
+    const path = try writeTestPicture("upload-test-note.png", 40, 30, extra.items);
+    defer testing.allocator.free(path);
+
+    const srv = try blossom.TestServer.start(testing.io, .accept, 2);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    const server_url = srv.url(&url_buf);
+    main.setBlossomServersForTest(&.{server_url});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("a good one");
+    var fx: main.EffectsForTest = undefined;
+
+    // Choosing the file reads it and stops. Nothing has been signed or sent.
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    try testing.expectEqual(@as(usize, 0), srv.heads.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), srv.puts.load(.acquire));
+    try testing.expect(!main.helperSignPendingForTest());
+
+    // The card names the server before the press.
+    const ready_tree = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyTextContaining(ready_tree.root, "from your server list"));
+    try testing.expect(findAnyTextContaining(ready_tree.root, "127.0.0.1"));
+    try testing.expect(findAnyTextContaining(ready_tree.root, "upload-test-note.png"));
+    try testing.expect(findAnyText(ready_tree.root, "Upload") != null);
+    try testing.expect(findAnyTextContaining(ready_tree.root, "Location and camera details"));
+
+    model.upload_alt_buffer.set("A square of nothing");
+    main.update(&model, .upload_go, &fx);
+    // The stand-in keyholder answers at once, so the token is already back.
+    try testing.expectEqualStrings("signed", main.uploadStateForTest());
+    main.driveUploadForTest(&model);
+    try awaitUpload("sent");
+    main.driveUploadForTest(&model);
+
+    try testing.expectEqualStrings("none", main.uploadStateForTest());
+    try testing.expectEqual(@as(usize, 1), srv.puts.load(.acquire));
+    try testing.expect(srv.body_matches_header.load(.acquire));
+    try testing.expect(srv.auth_ok.load(.acquire));
+    // The file that was sent is the cleaned one: the text chunk with where it was
+    // taken is not in it.
+    try testing.expect(srv.body_len.load(.acquire) > 0);
+    try testing.expect(!srv.body_has_text.load(.acquire));
+
+    // The address is in the draft, after what was already there, and the whole
+    // note's tags carry the picture's imeta.
+    const draft = model.draft();
+    try testing.expect(std.mem.startsWith(u8, draft, "a good one\nhttp://127.0.0.1:"));
+    const tags = main.contentTagsForTest(a.allocator(), draft);
+    const im = tagNamed(tags, "imeta") orelse return error.NoImetaTag;
+    try testing.expect(std.mem.startsWith(u8, im[1], "url http://127.0.0.1:"));
+    try testing.expectEqualStrings("m image/png", im[2]);
+    try testing.expect(std.mem.startsWith(u8, im[3], "x "));
+    try testing.expectEqual(@as(usize, 64 + 2), im[3].len);
+    try testing.expectEqualStrings("dim 40x30", im[5]);
+    try testing.expectEqualStrings("blurhash L00000fQfQfQfQfQfQfQfQfQfQfQ", im[6]);
+    try testing.expectEqualStrings("alt A square of nothing", im[7]);
+    // Nothing was published: the token is a credential, not a record.
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+fn blossomPngText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    // A tEXt chunk, built by hand so the test does not depend on blossom.zig's
+    // private helper.
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast("Comment\x00".len + text.len), .big);
+    try out.appendSlice(gpa, &len);
+    try out.appendSlice(gpa, "tEXt");
+    try out.appendSlice(gpa, "Comment\x00");
+    try out.appendSlice(gpa, text);
+    var crc = std.hash.Crc32.init();
+    crc.update("tEXt");
+    crc.update("Comment\x00");
+    crc.update(text);
+    var sum: [4]u8 = undefined;
+    std.mem.writeInt(u32, &sum, crc.final(), .big);
+    try out.appendSlice(gpa, &sum);
+}
+
+test "a failed upload keeps the draft, says why in plain words, and can be tried again" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4b} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const path = try writeTestPicture("upload-test-fail.png", 8, 8, "");
+    defer testing.allocator.free(path);
+
+    const srv = try blossom.TestServer.start(testing.io, .refuse_put, 4);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    main.setBlossomServersForTest(&.{srv.url(&url_buf)});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("words I must not lose");
+    var fx: main.EffectsForTest = undefined;
+
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.update(&model, .upload_go, &fx);
+    main.driveUploadForTest(&model);
+    try awaitUpload("failed");
+
+    try testing.expectEqualStrings("words I must not lose", model.draft());
+    try testing.expect(std.mem.indexOf(u8, main.uploadMessageForTest(), "payment required") != null);
+    const tree = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyTextContaining(tree.root, "payment required"));
+    try testing.expect(findAnyText(tree.root, "Try again") != null);
+    try testing.expect(findAnyText(tree.root, "Dismiss") != null);
+
+    // Try again sends the same file with the same token: the signer is not
+    // asked a second time for something it already approved.
+    main.update(&model, .upload_retry, &fx);
+    try testing.expectEqualStrings("signed", main.uploadStateForTest());
+    main.driveUploadForTest(&model);
+    try awaitUpload("failed");
+    try testing.expectEqual(@as(usize, 2), srv.puts.load(.acquire));
+
+    // A token is good for an hour. Once that is nearly over, Try again asks the
+    // signer for a new one instead of sending one every server will refuse.
+    main.ageUploadTokenForTest(blossom.auth_lifetime_s);
+    main.silenceTestSignerForTest(true);
+    defer main.silenceTestSignerForTest(false);
+    defer main.releaseHelperSignForTest();
+    main.update(&model, .upload_retry, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+    try testing.expect(main.helperSignPendingForTest());
+
+    // Dismissing puts the card away and leaves the words.
+    main.update(&model, .upload_cancel, &fx);
+    try testing.expectEqualStrings("none", main.uploadStateForTest());
+    try testing.expectEqualStrings("words I must not lose", model.draft());
+}
+
+test "choosing a file uploads nothing, and what is not a picture is refused by its bytes" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4c} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = ".zig-cache/upload-test-notes.png", .data = "%PDF-1.7 a document that has been named like a picture" });
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setPickPathForTest(".zig-cache/upload-test-notes.png");
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("failed");
+    try testing.expect(std.mem.indexOf(u8, main.uploadMessageForTest(), "not a picture") != null);
+    try testing.expect(!main.helperSignPendingForTest());
+
+    // A file that is not there.
+    main.dropUploadForTest();
+    main.setPickPathForTest(".zig-cache/upload-test-missing.png");
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("failed");
+    try testing.expect(std.mem.indexOf(u8, main.uploadMessageForTest(), "no longer there") != null);
+
+    // A guest is not offered any of it.
+    main.dropUploadForTest();
+    main.clearIdentityForTest();
+    var guest = main.initialModel();
+    main.setPickPathForTest(".zig-cache/upload-test-notes.png");
+    main.update(&guest, .{ .upload_pick = 0 }, &fx);
+    try testing.expectEqualStrings("none", main.uploadStateForTest());
+}
+
+test "an upload whose signer refuses, or never answers, fails without sending anything" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4d} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    defer main.silenceTestSignerForTest(false);
+    defer main.releaseHelperSignForTest();
+    const path = try writeTestPicture("upload-test-signer.png", 8, 8, "");
+    defer testing.allocator.free(path);
+    const srv = try blossom.TestServer.start(testing.io, .accept, 2);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    main.setBlossomServersForTest(&.{srv.url(&url_buf)});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 1 }, &fx);
+    try awaitUpload("ready");
+
+    // The keyholder holds the request, then refuses it.
+    main.silenceTestSignerForTest(true);
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+    main.handleHelperSignedForTest(.{ .key = 0, .outcome = .ok, .status = 409, .body = "" });
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("failed", main.uploadStateForTest());
+    try testing.expect(std.mem.indexOf(u8, main.uploadMessageForTest(), "signer did not approve") != null);
+    // The composer's own failure notice is not raised for a token.
+    try testing.expect(!main.helperSignNoticeForTest());
+    main.driveUploadForTest(&model);
+    try testing.expectEqual(@as(usize, 0), srv.heads.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), srv.puts.load(.acquire));
+}
+
+test "a token for some other file, or for more than this upload, is not accepted from a signer" {
+    const sha = "cd" ** 32;
+    const now: i64 = 1_700_000_000;
+    const good = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "expiration", "1700003600" }, &.{ "x", sha } };
+    try testing.expect(main.tokenNamesFileForTest(&good, sha, now));
+    try testing.expect(!main.tokenNamesFileForTest(&good, "ef" ** 32, now));
+    const wrong_purpose = [_]nostr.event.Tag{ &.{ "t", "delete" }, &.{ "expiration", "1700003600" }, &.{ "x", sha } };
+    try testing.expect(!main.tokenNamesFileForTest(&wrong_purpose, sha, now));
+    const no_file = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "expiration", "1700003600" } };
+    try testing.expect(!main.tokenNamesFileForTest(&no_file, sha, now));
+    // Wider than what was asked: a delete as well, or a second file.
+    const also_delete = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "t", "delete" }, &.{ "expiration", "1700003600" }, &.{ "x", sha } };
+    try testing.expect(!main.tokenNamesFileForTest(&also_delete, sha, now));
+    const two_files = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "expiration", "1700003600" }, &.{ "x", sha }, &.{ "x", "ef" ** 32 } };
+    try testing.expect(!main.tokenNamesFileForTest(&two_files, sha, now));
+    // Good forever, already over, or good for a year.
+    const no_expiry = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "x", sha } };
+    try testing.expect(!main.tokenNamesFileForTest(&no_expiry, sha, now));
+    const expired = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "expiration", "1699999999" }, &.{ "x", sha } };
+    try testing.expect(!main.tokenNamesFileForTest(&expired, sha, now));
+    const a_year = [_]nostr.event.Tag{ &.{ "t", "upload" }, &.{ "expiration", "1731536000" }, &.{ "x", sha } };
+    try testing.expect(!main.tokenNamesFileForTest(&a_year, sha, now));
+}
+
+test "a signer that answers an upload token with a note has nothing published, and the reverse loses no draft" {
+    // The built-in keyholder is a separate product, so what it returns is
+    // checked. An event of another kind where a token was asked for is not
+    // what the reader approved, and the note path would have published it.
+    main.forgetBlossomForTest();
+    const secret = [_]u8{0x56} ** 32;
+    main.setIdentityForTest(secret);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const path = try writeTestPicture("upload-test-wrong-kind.png", 8, 8, "");
+    defer testing.allocator.free(path);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.setSignerKindHelperForTest();
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+
+    // The reader's own key and a good signature, on something they never wrote.
+    const note = try nostr.event.create(arena, signer, kp, 1_800_000_000, 1, &.{}, "never written by the reader", null);
+    main.deliverHelperSignedForTest(try (nostr.signer_ipc.SignEvent{ .event = try nostr.event.toJson(arena, note) }).toJson(arena));
+    try testing.expect(main.lastPublishedForTest() == null);
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("failed", main.uploadStateForTest());
+
+    // And a token where a note was asked for: the note comes back to the
+    // composer instead of going with the slot.
+    main.dropUploadForTest();
+    const draft = "the note that was out being signed";
+    model.draft_buffer.set(draft);
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expect(model.draft_empty());
+    const tags = try blossom.authTags(arena, "ab" ** 32, 1, 1_900_000_000);
+    const token = try nostr.event.create(arena, signer, kp, 1_800_000_000, blossom.auth_kind, tags, blossom.auth_content, null);
+    main.deliverHelperSignedForTest(try (nostr.signer_ipc.SignEvent{ .event = try nostr.event.toJson(arena, token) }).toJson(arena));
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings(draft, model.draft());
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+test "a new upload waits while a bunker still holds the token of one that was put away" {
+    // A bunker takes several requests at once. A picture put away while its
+    // token was out leaves that request live, and whatever comes back for it
+    // would land on the next upload to start signing: a refusal would fail it,
+    // and an approval would be for a different file.
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x57} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    defer main.clearPendingForTest();
+    defer main.setSignerKindLocalForTest();
+    const path = try writeTestPicture("upload-test-outstanding.png", 8, 8, "");
+    defer testing.allocator.free(path);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.setRemotePubkeyForTest([_]u8{0x58} ** 32);
+    main.setSignerKindForTest("remote");
+
+    try testing.expect(main.registerPendingForTest("an-earlier-token", .sign_upload_auth, null));
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("ready", main.uploadStateForTest());
+    try testing.expect(std.mem.indexOf(u8, main.uploadMessageForTest(), "busy") != null);
+
+    // Once that one has come back, the press goes through.
+    _ = main.takePendingContentForTest("an-earlier-token");
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+}
+
+test "a token from a remote signer reaches the upload and is never published" {
+    // The bunker's answer arrives on the listener thread and is parked for the
+    // tick; the same signed event is what the built-in keyholder returns.
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4e} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    defer main.silenceTestSignerForTest(false);
+    defer main.releaseHelperSignForTest();
+    main.forgetLastPublishedForTest();
+    const path = try writeTestPicture("upload-test-remote.png", 8, 8, "");
+    defer testing.allocator.free(path);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.silenceTestSignerForTest(true);
+    main.update(&model, .upload_go, &fx);
+    try testing.expectEqualStrings("signing", main.uploadStateForTest());
+
+    // What the bunker would return: this account's token, for this file.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4e} ** 32);
+    const sha = try uploadedFileSha(a.allocator(), path);
+    const now = main.nowSecondsForTest();
+    const tags = try blossom.authTags(a.allocator(), &sha, 0, now + blossom.auth_lifetime_s);
+    const ev = try nostr.event.create(a.allocator(), signer, kp, now, blossom.auth_kind, tags, blossom.auth_content, null);
+    main.parkUploadSignForTest(try nostr.event.toJson(a.allocator(), ev));
+    main.driveUploadForTest(&model);
+    try testing.expectEqualStrings("sending", main.uploadStateForTest());
+    try testing.expect(main.lastPublishedForTest() == null);
+
+    // And a bunker that answers with nothing usable ends the attempt.
+    main.dropUploadForTest();
+    main.releaseHelperSignForTest();
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.update(&model, .upload_go, &fx);
+    main.parkUploadSignForTest(null);
+    main.driveUploadForTest(&model);
+    try testing.expectEqualStrings("failed", main.uploadStateForTest());
+}
+
+/// The sha256 the app will compute for a test picture on disk (it has no
+/// metadata to strip, so it is the file's own).
+fn uploadedFileSha(gpa: std.mem.Allocator, path: []const u8) ![64]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(1 << 20));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+test "an upload token is never stored or published, whatever signed it" {
+    main.setIdentityForTest([_]u8{0x4f} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x4f} ** 32);
+    const tags = try blossom.authTags(a.allocator(), "ab" ** 32, 1, 1_900_000_000);
+    const ev = try nostr.event.create(a.allocator(), signer, kp, 1_800_000_000, blossom.auth_kind, tags, "x", null);
+    main.ingestAndPublishForTest(a.allocator(), ev);
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+test "the avatar and the banner take the address into their own fields, and only those" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x50} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const path = try writeTestPicture("upload-test-avatar.png", 16, 16, "");
+    defer testing.allocator.free(path);
+    const srv = try blossom.TestServer.start(testing.io, .accept, 4);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    main.setBlossomServersForTest(&.{srv.url(&url_buf)});
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .have;
+    model.profile_banner_buffer.set("https://old.example/banner.png");
+    model.draft_buffer.set("untouched");
+    var fx: main.EffectsForTest = undefined;
+
+    // The sheet offers both, and the card stands where the field was.
+    const before = try buildTree(a.allocator(), &model);
+    try testing.expectEqual(@as(usize, 2), countByLabel(before.root, "Upload..."));
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 1 }, &fx);
+    try awaitUpload("ready");
+    const during = try buildTree(a.allocator(), &model);
+    try testing.expectEqual(@as(usize, 1), countByLabel(during.root, "Upload..."));
+    try testing.expect(findAnyTextContaining(during.root, "127.0.0.1"));
+    // No description box for a profile picture: it has no imeta to put one in.
+    try testing.expect(findByLabel(during.root, "Picture description") == null);
+
+    main.update(&model, .upload_go, &fx);
+    main.driveUploadForTest(&model);
+    try awaitUpload("sent");
+    main.driveUploadForTest(&model);
+    try testing.expect(std.mem.startsWith(u8, model.profile_picture(), "http://127.0.0.1:"));
+    try testing.expectEqualStrings("https://old.example/banner.png", model.profile_banner());
+    try testing.expectEqualStrings("untouched", model.draft());
+    // Not saved: that is its own press, and the sheet says so, because a field
+    // with an address in it does not tell anyone the picture is not out yet.
+    try testing.expect(main.lastPublishedForTest() == null);
+    const filled = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyTextContaining(filled.root, "not published until you press Save"));
+
+    // Closing the sheet puts a picture still on its way away with it.
+    main.update(&model, .{ .upload_pick = 2 }, &fx);
+    try awaitUpload("ready");
+    main.update(&model, .close_profile_edit, &fx);
+    try testing.expectEqualStrings("none", main.uploadStateForTest());
+    // And so does the sheet closing because Settings was opened over it.
+    model.editing_profile = true;
+    main.update(&model, .{ .upload_pick = 1 }, &fx);
+    try awaitUpload("ready");
+    main.update(&model, .open_settings, &fx);
+    try testing.expect(!model.editing_profile);
+    try testing.expectEqualStrings("none", main.uploadStateForTest());
+    // And reopening starts clean.
+    model.editing_profile = true;
+    const reopened = try buildTree(a.allocator(), &model);
+    try testing.expect(!findAnyTextContaining(reopened.root, "not published until you press Save"));
+}
+
+test "the composer names where pictures go before anything is chosen" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x51} ** 32);
+    defer main.clearIdentityForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    const tree = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyText(tree.root, "Add picture") != null);
+    // No list published: the built-in server, named.
+    try testing.expect(findAnyText(tree.root, "Uploads to blossom.primal.net") != null);
+
+    main.setBlossomServersForTest(&.{"https://media.example.org"});
+    const own = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyText(own.root, "Uploads to media.example.org") != null);
+}
+
+test "Settings lists the media servers and offers to add one, and a guest is not shown them" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x52} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    var model = main.initialModel();
+    model.stage = .settings;
+    const tree = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyText(tree.root, "MEDIA SERVERS") != null);
+    try testing.expect(findAnyText(tree.root, "blossom.primal.net") != null);
+    try testing.expect(findAnyText(tree.root, "blossom.band") != null);
+    try testing.expect(findAnyText(tree.root, "built in") != null);
+
+    main.setBlossomServersForTest(&.{ "https://one.example", "https://two.example" });
+    const own = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyText(own.root, "one.example") != null);
+    try testing.expect(findAnyText(own.root, "two.example") != null);
+    try testing.expect(findAnyText(own.root, "blossom.primal.net") == null);
+    try testing.expect(findByLabel(own.root, "Remove https://one.example") != null);
+
+    main.clearIdentityForTest();
+    const guest = try buildTree(a.allocator(), &model);
+    try testing.expect(findAnyText(guest.root, "MEDIA SERVERS") == null);
+}
+
+fn blossomFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !void {
+    const secret = [_]u8{0x53} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10063, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadBlossomFromStoreForTest();
+}
+
+test "the server list is spliced, not rebuilt, and is never written over a list that was not read" {
+    main.forgetBlossomForTest();
+    defer {
+        main.forgetBlossomForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var fx: main.EffectsForTest = undefined;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bl.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // A list from another client: two servers, a tag this app does not know, and
+    // a server address it cannot use. Everything that is not the one change must
+    // come back out exactly as it went in.
+    const existing = [_]nostr.event.Tag{
+        &.{ "server", "https://one.example" },
+        &.{ "server", "gopher://odd.example" },
+        &.{ "alt", "media servers" },
+        &.{ "server", "https://two.example" },
+    };
+    try blossomFixture(arena, &signer, &store, &existing, "legacy");
+    try testing.expect(main.blossomOwnListForTest());
+
+    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, "https://three.example", null));
+    const added = main.ownRecordTagsJoinedForTest(arena, 10063).?;
+    try testing.expect(std.mem.indexOf(u8, added, "server https://one.example") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "server gopher://odd.example") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "alt media servers") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "server https://two.example") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "server https://three.example") != null);
+    try testing.expectEqualStrings("legacy", main.ownRecordContentForTest(arena, 10063).?);
+    // Newer than what it replaced, or every relay drops it.
+    try testing.expect(main.ownRecordCreatedAtForTest(10063) > 1_800_000_000);
+
+    // Adding what is there already is nothing to do.
+    main.releaseHelperSignForTest();
+    try testing.expectEqual(main.BlossomWrite.nothing_to_do, main.writeBlossomServersForTest(&fx, "https://ONE.example/", null));
+
+    // A fifth usable server is more than Plaza sends to.
+    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, "https://four.example", null));
+    main.releaseHelperSignForTest();
+    try testing.expectEqual(main.BlossomWrite.full, main.writeBlossomServersForTest(&fx, "https://five.example", null));
+    main.releaseHelperSignForTest();
+
+    // Removing one drops that one and nothing else.
+    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, null, "https://two.example"));
+    const removed = main.ownRecordTagsJoinedForTest(arena, 10063).?;
+    try testing.expect(std.mem.indexOf(u8, removed, "two.example") == null);
+    try testing.expect(std.mem.indexOf(u8, removed, "server https://one.example") != null);
+    try testing.expect(std.mem.indexOf(u8, removed, "server gopher://odd.example") != null);
+    try testing.expect(std.mem.indexOf(u8, removed, "alt media servers") != null);
+    main.releaseHelperSignForTest();
+    try testing.expectEqual(main.BlossomWrite.nothing_to_do, main.writeBlossomServersForTest(&fx, null, "https://nowhere.example"));
+}
+
+test "with no list read, nothing is written; once every relay has said there is none, a first list can be" {
+    main.forgetBlossomForTest();
+    defer {
+        main.forgetBlossomForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx: main.EffectsForTest = undefined;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bl2.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setIdentityForTest([_]u8{0x54} ** 32);
+    main.setStoreForTest(&store);
+
+    // An empty store is "not fetched yet" as much as "has none".
+    try testing.expectEqual(main.BlossomWrite.no_list_yet, main.writeBlossomServersForTest(&fx, "https://one.example", null));
+    try testing.expect(main.ownRecordTagsJoinedForTest(arena, 10063) == null);
+
+    // Some relay failed to answer: still not proof.
+    main.markBlossomProbeCleanForTest(false);
+    try testing.expectEqual(main.BlossomWrite.no_list_yet, main.writeBlossomServersForTest(&fx, "https://one.example", null));
+
+    // Every relay answered and none had one: now the first list can be made.
+    main.markBlossomProbeCleanForTest(true);
+    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, "https://one.example", null));
+    const tags = main.ownRecordTagsJoinedForTest(arena, 10063).?;
+    try testing.expect(std.mem.indexOf(u8, tags, "server https://one.example") != null);
+    try testing.expect(main.blossomOwnListForTest());
+}
+
+test "a relay that declines to look, or a list only held in memory, never licenses writing a first list" {
+    // EOSE is a relay saying it looked. CLOSED is one saying it will not
+    // (auth-required, rate-limited), and the list may well be kept there.
+    try testing.expect(main.probeReplyAnswersForTest(.eose));
+    try testing.expect(!main.probeReplyAnswersForTest(.closed));
+
+    main.forgetBlossomForTest();
+    defer {
+        main.forgetBlossomForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx: main.EffectsForTest = undefined;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bl3.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setIdentityForTest([_]u8{0x59} ** 32);
+    main.setStoreForTest(&store);
+    main.markBlossomProbeCleanForTest(false);
+
+    // Two servers held in memory, and nothing in the store to splice onto.
+    // Writing now would publish a list of one and replace whatever is out there.
+    main.setBlossomServersForTest(&.{ "https://one.example", "https://two.example" });
+    try testing.expectEqual(main.BlossomWrite.no_list_yet, main.writeBlossomServersForTest(&fx, "https://three.example", null));
+    try testing.expect(main.ownRecordTagsJoinedForTest(arena, 10063) == null);
+
+    // A round that could not tell is asked again; one that could is not.
+    try testing.expect(main.blossomProbeWantedForTest());
+    main.markBlossomProbeCleanForTest(true);
+    try testing.expect(!main.blossomProbeWantedForTest());
+}
+
+test "a server address that is not an origin is refused in the field and nothing is written" {
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x55} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    var model = main.initialModel();
+    model.stage = .settings;
+    var fx: main.EffectsForTest = undefined;
+    for ([_][]const u8{ "not a url", "http://cdn.example.com", "https://cdn.example.com/media", "https://user@cdn.example.com" }) |bad| {
+        model.blossom_buffer.set(bad);
+        main.update(&model, .blossom_add, &fx);
+        try testing.expectEqualStrings("A server address starts with https:// and names a host.", model.blossom_status());
+        // The field keeps what was typed, so it can be fixed.
+        try testing.expectEqualStrings(bad, model.blossom_draft());
+    }
+    try testing.expect(!main.helperSignPendingForTest());
+    // Typing answers the complaint.
+    model.blossom_buffer.set("https://cdn.example.com");
+    main.update(&model, .{ .blossom_edit = .{ .insert_text = "x" } }, &fx);
+    try testing.expect(std.mem.indexOf(u8, model.blossom_status(), "starts with https") == null);
 }

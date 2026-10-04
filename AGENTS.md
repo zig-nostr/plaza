@@ -12,6 +12,7 @@ Plaza never holds a secret key. It ships [Notary](https://github.com/zig-nostr/n
 
 ```
 src/main.zig         # the app: model, update, the hand-written feed view, relay and store work
+src/blossom.zig      # Blossom uploads: server addresses, the signed token, preparing a picture, the PUT
 src/tests.zig        # the test suite
 src/onboarding.native  # declarative markup for the static screens
 src/search.zig       # finding a person: matching, ranking, the NIP-50 request and relay status

@@ -32,8 +32,9 @@ client.
 > A video in a note is drawn as a video rather than as a web page, though it is
 > not played in place yet.
 >
-> Not there yet: playing a video where it sits, putting a picture in a note,
-> setting an avatar, sending a zap, searching notes, and private messages.
+> A picture can go into a note, or be set as an avatar or a banner. It is uploaded to a Blossom media server: the first in your published server list that takes it, or one of two built in when you have none. A card names the server and waits for a press before anything is sent, and the location and camera details in the file are removed first. Settings lists the servers and edits the list.
+>
+> Not there yet: playing a video where it sits, sending a zap, searching notes, and private messages.
 
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
