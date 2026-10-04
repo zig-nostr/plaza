@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const putBackRefusedReply = main.putBackRefusedReply;
 const Effects = main.Effects;
 const Model = main.Model;
 const OwnProfile = main.OwnProfile;
@@ -914,18 +915,14 @@ pub fn applyUndo(model: *Model) void {
             setToast(model, "Your relays were not saved. Trying again.");
         },
         .reply => |r| {
-            // Into the reply box it was taken from, and only if the reader has
-            // not started typing another one. The box belongs to whatever thread
-            // is open NOW, so when the reader has moved on the reply is kept for
-            // its own thread instead: put in the open box it would read as an
-            // answer to somebody else, one press from being sent there.
-            if (model.viewing_thread != 0 and std.mem.eql(u8, &model.thread_root.event_id, &r.root)) {
-                if (model.reply_empty()) model.reply_buffer.set(r.text);
-            } else {
-                keepReplyDraft(r.root, r.text, false);
-            }
-            std.heap.page_allocator.free(r.text);
-            setToast(model, "Not signed. Your reply is back.");
+            defer std.heap.page_allocator.free(r.text);
+            setToast(model, switch (putBackRefusedReply(model, r.root, r.text)) {
+                .box => "Not signed. Your reply is back.",
+                .box_below => "Not signed. Reply put back under your new text.",
+                .kept => "Not signed. Reply kept in its thread.",
+                .kept_below => "Not signed. Reply kept under the newer one.",
+                .copied => "Not signed. Reply did not fit back, so copied.",
+            });
         },
         .profile => {
             model.profile_stage = .failed;

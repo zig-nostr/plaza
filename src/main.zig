@@ -3559,6 +3559,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (keyholder.g_signer_kind == .helper) scanHelperSign(model);
+                // A refused reply with no room left to go back into.
+                flushRefusedReplyClip(fx);
                 // A relay that asked who the reader is, and was told yes: get
                 // the answer signed. The reader thread sends it.
                 driveRelayAuth(fx);
@@ -4665,7 +4667,7 @@ pub fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
 /// Puts `text` on the clipboard. A test build records it instead, because the
 /// effect queue behind `fx` does not exist there and the text is the thing worth
 /// checking: what Plaza hands another client.
-fn writeClipboardText(fx: *Effects, key: u64, text: []const u8) void {
+pub fn writeClipboardText(fx: *Effects, key: u64, text: []const u8) void {
     if (builtin.is_test) {
         g_last_clipboard_len = copyBounded(&g_last_clipboard, text);
         return;
@@ -5035,6 +5037,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 }
 
 // re-exports: tuning.zig
+pub const copy_refused_reply_key = tuning.copy_refused_reply_key;
 pub const ancestor_row_chrome_for_test = tuning.ancestor_row_chrome_for_test;
 pub const compose_capacity_for_test = tuning.compose_capacity_for_test;
 pub const compose_editor_width_for_test = tuning.compose_editor_width_for_test;
@@ -6420,6 +6423,9 @@ pub const takeAnswered = remote_signer.takeAnswered;
 pub const takePending = remote_signer.takePending;
 
 // re-exports: drafts.zig
+pub const refusedReplyClipForTest = drafts.refusedReplyClipForTest;
+pub const flushRefusedReplyClip = drafts.flushRefusedReplyClip;
+pub const putBackRefusedReply = drafts.putBackRefusedReply;
 pub const draftWarningForModelForTest = drafts.draftWarningForModelForTest;
 pub const keptReplyDraftForTest = drafts.keptReplyDraftForTest;
 pub const loadDraftIntoForTest = drafts.loadDraftIntoForTest;

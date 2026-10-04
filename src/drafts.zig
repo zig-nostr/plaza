@@ -12,6 +12,9 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const copy_refused_reply_key = main.copy_refused_reply_key;
+const writeClipboardText = main.writeClipboardText;
+const Effects = main.Effects;
 const note_content_cap = main.note_content_cap;
 const warning_input_capacity = main.warning_input_capacity;
 const Model = main.Model;
@@ -95,6 +98,74 @@ pub fn keepReplyDraft(event_id: [32]u8, text: []const u8, replace: bool) void {
     @memcpy(g_reply_drafts[i].text[0..n], text[0..n]);
 }
 
+/// Where a refused reply went, so the toast says what is true.
+const RefusedReply = enum { box, box_below, kept, kept_below, copied };
+
+/// Puts a reply the signer refused back where the reader can find it.
+///
+/// Into the reply box it was taken from when its thread is still open. The box
+/// belongs to whatever thread is open NOW, so when the reader has moved on the
+/// reply is kept for its own thread instead: put in the open box it would read
+/// as an answer to somebody else, one press from being sent there.
+///
+/// Whatever was typed since stays first and untouched, and the refused text goes
+/// under it after a blank line. When the two do not fit in one reply it is
+/// copied instead, so it is never dropped and never claimed to be back.
+pub fn putBackRefusedReply(model: *Model, root: [32]u8, text: []const u8) RefusedReply {
+    const sep = "\n\n";
+    var joined: [compose_capacity]u8 = undefined;
+    if (model.viewing_thread != 0 and std.mem.eql(u8, &model.thread_root.event_id, &root)) {
+        if (model.reply_empty()) {
+            model.reply_buffer.set(text);
+            return .box;
+        }
+        const typed = model.reply_buffer.text();
+        if (typed.len + sep.len + text.len > compose_capacity) return copyRefusedReply(text);
+        model.reply_buffer.set(std.fmt.bufPrint(&joined, "{s}" ++ sep ++ "{s}", .{ typed, text }) catch unreachable);
+        return .box_below;
+    }
+    const kept = keptReplyDraft(root) orelse {
+        keepReplyDraft(root, text, false);
+        return .kept;
+    };
+    if (kept.len + sep.len + text.len > compose_capacity) return copyRefusedReply(text);
+    const both = std.fmt.bufPrint(&joined, "{s}" ++ sep ++ "{s}", .{ kept, text }) catch unreachable;
+    keepReplyDraft(root, both, true);
+    return .kept_below;
+}
+
+/// Holds a refused reply for the clipboard, which the next tick writes: the
+/// signer's answer is read where no `Effects` is at hand.
+fn copyRefusedReply(text: []const u8) RefusedReply {
+    const n = @min(text.len, compose_capacity);
+    @memcpy(g_refused_reply_clip[0..n], text[0..n]);
+    g_refused_reply_clip_len = n;
+    return .copied;
+}
+
+var g_refused_reply_clip: [compose_capacity]u8 = undefined;
+
+var g_refused_reply_clip_len: usize = 0;
+
+pub fn flushRefusedReplyClip(fx: *Effects) void {
+    if (g_refused_reply_clip_len == 0) return;
+    writeClipboardText(fx, copy_refused_reply_key, g_refused_reply_clip[0..g_refused_reply_clip_len]);
+    @memset(g_refused_reply_clip[0..g_refused_reply_clip_len], 0);
+    g_refused_reply_clip_len = 0;
+}
+
+pub fn refusedReplyClipForTest() []const u8 {
+    return g_refused_reply_clip[0..g_refused_reply_clip_len];
+}
+
+/// The reply kept for the thread rooted at `event_id`, if there is one.
+fn keptReplyDraft(event_id: [32]u8) ?[]const u8 {
+    for (&g_reply_drafts) |*d| {
+        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) return d.text[0..d.len];
+    }
+    return null;
+}
+
 /// Puts back the reply the reader left in this thread, or leaves the box empty.
 pub fn takeReplyDraft(model: *Model, event_id: [32]u8) void {
     model.reply_buffer.clear();
@@ -109,6 +180,8 @@ pub fn takeReplyDraft(model: *Model, event_id: [32]u8) void {
 /// Forgets every kept reply, for a session that is ending. The text is wiped as
 /// well as released: it is the leaving account's private thinking.
 pub fn forgetReplyDrafts() void {
+    @memset(&g_refused_reply_clip, 0);
+    g_refused_reply_clip_len = 0;
     for (&g_reply_drafts) |*d| {
         @memset(&d.text, 0);
         d.used = false;
@@ -209,10 +282,7 @@ pub fn readDraft(io: std.Io, dir: *std.Io.Dir, out: []u8, warn_out: []u8) Stashe
 
 /// The thread a kept reply is filed under, for a test of where a reply went.
 pub fn keptReplyDraftForTest(event_id: [32]u8) ?[]const u8 {
-    for (&g_reply_drafts) |*d| {
-        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) return d.text[0..d.len];
-    }
-    return null;
+    return keptReplyDraft(event_id);
 }
 pub fn writeDraftForTest(io: std.Io, dir: *std.Io.Dir, text: []const u8, warn: ?[]const u8) void {
     writeDraft(io, dir, text, warn);

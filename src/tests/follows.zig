@@ -56,13 +56,55 @@ test "a refused reply goes back to its own thread, never into the open one" {
     try testing.expectEqualStrings("an answer to a", model.reply_draft());
 
     // And a refusal never writes over a reply typed since: the first thread's
-    // new reply is kept, and the late one is not filed on top of it.
+    // new reply is kept first, and the late one goes under it.
     model.reply_buffer.set("typed since");
     main.closeThreadForTest(&model);
     const late = try std.heap.page_allocator.dupe(u8, "the refused one");
     main.armUndoForTest(.{ .reply = .{ .text = late, .root = a.event_id } });
     main.applyUndoForTest(&model);
-    try testing.expectEqualStrings("typed since", main.keptReplyDraftForTest(a.event_id).?);
+    try testing.expectEqualStrings("typed since\n\nthe refused one", main.keptReplyDraftForTest(a.event_id).?);
+    try testing.expectEqualStrings("Not signed. Reply kept under the newer one.", model.toast_text());
+}
+
+test "a refused reply is never dropped, and never said to be back when it is not" {
+    main.setIdentityForTest([_]u8{0x84} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+    const a = bareRoot(0xa4);
+
+    // Its thread is open and the reader has started another reply. The box
+    // keeps what they typed, first, and the refused one goes under it.
+    main.enterThreadForTest(&model, a);
+    model.reply_buffer.set("started again");
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "the first try"), .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expectEqualStrings("started again\n\nthe first try", model.reply_draft());
+    try testing.expectEqualStrings("Not signed. Reply put back under your new text.", model.toast_text());
+
+    // The two do not fit in one reply. The box is left as it was, the refused
+    // one is held for the clipboard, and the toast says that, not "back".
+    const cap = main.compose_capacity_for_test;
+    const long = try testing.allocator.alloc(u8, cap - 8);
+    defer testing.allocator.free(long);
+    @memset(long, 'x');
+    model.reply_buffer.set(long);
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "no room for me"), .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expectEqualStrings(long, model.reply_draft());
+    try testing.expectEqualStrings("no room for me", main.refusedReplyClipForTest());
+    try testing.expectEqualStrings("Not signed. Reply did not fit back, so copied.", model.toast_text());
+
+    // The same when the reader has left the thread and its kept reply is long.
+    main.goHomeForTest(&model);
+    try testing.expectEqualStrings(long, main.keptReplyDraftForTest(a.event_id).?);
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "still no room"), .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expectEqualStrings(long, main.keptReplyDraftForTest(a.event_id).?);
+    try testing.expectEqualStrings("still no room", main.refusedReplyClipForTest());
+    try testing.expectEqualStrings("Not signed. Reply did not fit back, so copied.", model.toast_text());
 }
 test "replies from outside the follow graph are held below, not dropped" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
