@@ -22,12 +22,20 @@ const media_target_px = main.media_target_px;
 const proxyRefusesHost = main.proxyRefusesHost;
 const secret_file_permissions = main.secret_file_permissions;
 
-/// Whether the host serves its own resized variants via `?w=`, letting us skip
-/// the proxy hop entirely. nostr.build's Blossom hosts do; most others ignore it.
+/// Whether the host serves its own resized variants via `?w=`. nostr.build's
+/// Blossom hosts do; most others ignore it.
+///
+/// Read from the URL's parsed host, never by substring: a match anywhere in the
+/// string let `https://tracker.example/x.blossom.band/p.png` pass for one.
 fn hostSupportsWidthParam(src: []const u8) bool {
-    return std.mem.indexOf(u8, src, "://blossom.nostr.build/") != null or
-        std.mem.indexOf(u8, src, "://blossom.band/") != null or
-        std.mem.indexOf(u8, src, ".blossom.band/") != null;
+    if (!std.ascii.startsWithIgnoreCase(src, "https://")) return false;
+    const rest = src["https://".len..];
+    var host = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (std.mem.indexOfScalar(u8, host, '@') != null) return false;
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    return std.ascii.eqlIgnoreCase(host, "blossom.nostr.build") or
+        std.ascii.eqlIgnoreCase(host, "blossom.band") or
+        (host.len > ".blossom.band".len and std.ascii.endsWithIgnoreCase(host, ".blossom.band"));
 }
 
 /// How an image is fitted when resized.
@@ -53,12 +61,17 @@ pub fn isGifUrl(src: []const u8) bool {
 /// and returning the slice to request. Falls back to `src` itself whenever no
 /// resizing route applies or the URL would not fit.
 pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u8 {
-    // A host that resizes for us: cheapest path, no third party involved.
-    if (hostSupportsWidthParam(src) and std.mem.indexOfScalar(u8, src, '?') == null) {
-        return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
-    }
     const proxy = mediaProxy();
-    if (!prefs.g_media_proxy_on or proxy.len == 0) return src;
+    if (!prefs.g_media_proxy_on or proxy.len == 0) {
+        // Loading originals: a host that resizes for itself is asked for the
+        // smaller copy. Never while the proxy is on. The proxy is what keeps
+        // the reader's address from the host, and a host-side shortcut ahead
+        // of it sent every picture uploaded to the default server direct.
+        if (hostSupportsWidthParam(src) and std.mem.indexOfScalar(u8, src, '?') == null) {
+            return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
+        }
+        return src;
+    }
 
     var encoded_buf: [768]u8 = undefined;
     const encoded = percentEncode(&encoded_buf, src) orelse return src;

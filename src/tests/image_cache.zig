@@ -41,14 +41,58 @@ test "media URLs route through the proxy, the host, or neither" {
     try testing.expect(std.mem.indexOf(u8, square, "fit=cover") != null);
     try testing.expect(std.mem.indexOf(u8, square, "h=128") != null);
 
-    // A host that resizes for itself skips the proxy entirely.
-    const native_resize = main.mediaUrl(&buf, "https://blossom.nostr.build/abc.jpg", 512, .inside);
-    try testing.expectEqualStrings("https://blossom.nostr.build/abc.jpg?w=512", native_resize);
+    // A host that resizes for itself still goes through the proxy while the
+    // proxy is on: it is the proxy that keeps the reader's address private.
+    const via_proxy = main.mediaUrl(&buf, "https://blossom.nostr.build/abc.jpg", 512, .inside);
+    try testing.expect(std.mem.startsWith(u8, via_proxy, "https://wsrv.nl/?url="));
 
     // No proxy configured: load the original, untouched.
     main.setMediaProxy("");
     const direct = main.mediaUrl(&buf, "https://host.example/a.jpg", 512, .inside);
     try testing.expectEqualStrings("https://host.example/a.jpg", direct);
+}
+
+test "the proxy is never skipped, and the width shortcut reads the host, not the string" {
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
+    const was_on = main.mediaProxyOn();
+    defer main.setMediaProxyOn(was_on);
+
+    var buf: [1024]u8 = undefined;
+    main.setMediaProxy("https://wsrv.nl/");
+    main.setMediaProxyOn(true);
+    // Proxy on: everything goes through it. A path that merely contains a
+    // resizing host's name, and the resizing hosts themselves (one of them is
+    // a default upload server), alike.
+    for ([_][]const u8{
+        "https://tracker.example/x.blossom.band/p.png",
+        "https://blossom.band/abc.jpg",
+        "https://npub1x.blossom.band/abc.jpg",
+        "https://blossom.nostr.build/abc.jpg",
+    }) |src| {
+        const url = main.mediaUrl(&buf, src, 512, .inside);
+        if (!std.mem.startsWith(u8, url, "https://wsrv.nl/?url=")) {
+            std.debug.print("\nfetched without the proxy: {s}\n", .{url});
+            return error.ProxySkipped;
+        }
+    }
+
+    // Proxy off: the shortcut, for the real hosts only.
+    main.setMediaProxyOn(false);
+    try testing.expectEqualStrings("https://blossom.band/abc.jpg?w=512", main.mediaUrl(&buf, "https://blossom.band/abc.jpg", 512, .inside));
+    try testing.expectEqualStrings("https://npub1x.blossom.band/abc.jpg?w=512", main.mediaUrl(&buf, "https://npub1x.blossom.band/abc.jpg", 512, .inside));
+    for ([_][]const u8{
+        "https://tracker.example/x.blossom.band/p.png",
+        "https://evilblossom.band/a.jpg",
+        "https://blossom.band.evil.example/a.jpg",
+        "https://blossom.band@evil.example/a.jpg",
+        "http://blossom.band/a.jpg",
+    }) |src| {
+        try testing.expectEqualStrings(src, main.mediaUrl(&buf, src, 512, .inside));
+    }
 }
 test "gif sources are recognised so their frames are kept" {
     try testing.expect(main.isGifUrl("https://x.com/a.gif"));
