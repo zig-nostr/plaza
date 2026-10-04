@@ -429,6 +429,10 @@ pub fn quoteCardShown(note: *const Note, collapsible: bool) bool {
 /// window, drawn or not, and must not make the cache think they all were.
 fn quotePictureFor(note: *const Note, collapsible: bool) ?*const QuoteEntry {
     if (!quoteCardShown(note, collapsible)) return null;
+    // A covered note (NIP-36) draws its cover and no quote card, so the picture
+    // of the note it quotes is no more on screen than its own pictures are, and
+    // fetching it would tell the host what the reader chose not to look at.
+    if (noteCovered(note)) return null;
     for (&quote_cache.g_quotes) |*q| {
         if (!q.used or !std.mem.eql(u8, &q.id, &note.quote.id)) continue;
         // A covered quote (NIP-36) fetches nothing until it is shown.

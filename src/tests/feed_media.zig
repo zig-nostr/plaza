@@ -925,3 +925,39 @@ test "a screen of picture-heavy notes gets more slots than the old fixed share" 
         return error.StillCappedAtTheOldShare;
     }
 }
+
+test "a covered note does not fetch the picture of the note it quotes" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+    main.setMediaProxyOn(false);
+    main.setMediaPreviews(true);
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    defer main.setShowSensitive(false);
+
+    // The quoted note carries no warning. The note quoting it does, so the row
+    // draws its cover and no card, and the quoted picture is not on screen.
+    const quoted_id = [_]u8{0x60} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    model.notes[0].warned = true;
+    const key = main.quoteMediaKeyForTest(quoted_id);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+
+    // Shown: the card is drawn, and its picture is claimed like any other.
+    main.setShowSensitive(true);
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
+    try testing.expect(held.image_id != 0);
+}
