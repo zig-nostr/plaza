@@ -5502,6 +5502,7 @@ pub const relayWriteBlockedReason = relay_list.relayWriteBlockedReason;
 pub const setRelayListStamp = relay_list.setRelayListStamp;
 
 // re-exports: routing.zig
+pub const takeRelayRanksDirtyForTest = routing.takeRelayRanksDirtyForTest;
 pub const RelayRankForTest = routing.RelayRankForTest;
 pub const clearRelayRefusalForTest = routing.clearRelayRefusalForTest;
 pub const clearRoutesForTest = routing.clearRoutesForTest;

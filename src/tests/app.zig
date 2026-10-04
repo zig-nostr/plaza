@@ -2972,6 +2972,21 @@ test "the relays one account read through are never the next account's hints" {
     try testing.expectEqual(@as(usize, 0), main.hintsForTest(note_id, null).count);
 }
 
+test "a sign-out asks for the routing to be redone" {
+    // The routed connections ask the relays the follows of whoever is signed in
+    // write to. Without a new routing pass after a sign-out they went on asking
+    // about the previous account's follows until something else moved it.
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.setIdentityForTest([_]u8{0x8e} ** 32);
+    _ = main.takeRelayRanksDirtyForTest();
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(main.takeRelayRanksDirtyForTest());
+}
+
 test "the three ways to hand out a note address all carry the hint" {
     freshHints();
     defer freshHints();

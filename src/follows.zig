@@ -578,6 +578,9 @@ pub fn forgetFollows() void {
     // The author set moved, so whatever was concluded about the end of their
     // history was concluded about a different question.
     resetFeedEnd();
+    // And the routing is redone, so the connections opened to where the
+    // previous account's follows write stop asking about those people.
+    routing.g_relay_ranks_dirty.store(true, .release);
     // And this is the one thing the inbox DOES depend on: whose notifications
     // these are. It is the only place that bumps it, which is the point.
     bumpIdentityGeneration();

@@ -856,6 +856,11 @@ pub fn routeRecomputeDue(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i
     }
     return true;
 }
+
+/// Whether a routing pass is wanted, and clears the want, for a test.
+pub fn takeRelayRanksDirtyForTest() bool {
+    return g_relay_ranks_dirty.swap(false, .acq_rel);
+}
 /// Monotonic milliseconds since the app woke, or null before `main` wires the
 /// clock. Null and not zero: zero is a real reading, and a rate limit that
 /// stops working at a particular clock value is not a rate limit.
