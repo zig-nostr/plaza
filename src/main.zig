@@ -19627,17 +19627,23 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
         .on_dismiss = Msg.close_profile_edit,
         .semantics = .{ .label = "Edit profile" },
     }, .{
-        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = 10, .padding = 20 }, .{
+        // The card pads itself. A second 20 inside it was 44 on every side,
+        // and those 40 rows were what pushed the buttons off the card.
+        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = 10 }, .{
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
                 &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
             ),
-            // Not while a picture is being added: the card that takes the field's
-            // place is taller than the field, and the sheet has no room to spare.
-            if (g_upload) |job|
-                (if (job.target != .note) ui.spacer(0) else profileIntro(ui))
+            // The introduction gives way to whatever else needs the room. Seven
+            // fields, three lines of introduction and a two-line status do not fit
+            // a window at its minimum height: the button row was drawn below the
+            // bottom edge, so Try again and Save could not be pressed in exactly
+            // the states that need them. Nor while a picture is being added: the
+            // card that takes the field's place is taller than the field.
+            if (status.len == 0 and (if (g_upload) |job| job.target == .note else true))
+                profileIntro(ui)
             else
-                profileIntro(ui),
+                ui.spacer(0),
             profileField(ui, "Name", model.profile_name(), "A name people will see", .profile_name_edit),
             profileField(ui, "About", model.profile_about(), "A line about you", .profile_about_edit),
             profilePictureField(ui, model, "Picture", model.profile_picture(), .profile_picture_edit, .avatar),
@@ -20650,6 +20656,9 @@ fn modalScrim(ui: *AppUi, label: []const u8, dismiss: Msg, child: AppUi.Node) Ap
     }, .{child});
 }
 
+/// What a `.card` insets its content by on every side.
+const modal_card_padding: f32 = 24;
+
 fn modalCard(ui: *AppUi, width: f32, inner: AppUi.Node) AppUi.Node {
     const p = theme.palette;
     return ui.el(.card, .{
@@ -21321,24 +21330,41 @@ fn freshListConfirm(ui: *AppUi, ask: FreshAsk) AppUi.Node {
         .mute => "this one person",
         .bookmark, .bookmark_privately => "this one note",
     };
-    return ui.el(.dialog, .{
-        .padding = 20,
-        .on_press = .fresh_list_cancel,
+    // A set width, and the panel drawn by a card that pads itself around one
+    // column, like the join sheet. The dialog sizes what it holds as if a
+    // paragraph were a single line, so a bare dialog (and then a card in one)
+    // kept a one-line height while the text wrapped to five, and the buttons
+    // fell out of the bottom of the box. So the card is given its height: the
+    // lines the text wraps to at the inner width, priced a little wider per
+    // character than the feed prices a note body so it errs toward air, plus
+    // the title, the buttons and the gaps between them.
+    const inner = join_sheet_width - 2 * modal_card_padding;
+    const text = ui.fmt("None of your relays has a {s} for you. If you already have one somewhere Plaza has not looked, a new one would replace it with a list holding only {s}. Go on only if this account is new, or you know it has no {s}.", .{ list, holds, list });
+    const lines = @max(1, @ceil(@as(f32, @floatFromInt(text.len)) / @floor(inner / 8)));
+    const height = 2 * modal_card_padding + 18 + 12 + lines * body_line_height + 12 + 28;
+    return modalScrim(ui, "Start a new list?", .fresh_list_cancel, ui.el(.dialog, .{
+        .width = join_sheet_width,
+        .on_dismiss = .fresh_list_cancel,
         .semantics = .{ .label = "Start a new list?" },
     }, .{
-        ui.column(.{ .gap = 12, .cross = .stretch }, .{
+        ui.el(.card, .{
+            .width = join_sheet_width,
+            .height = height,
+            .on_press = Msg.absorb_press,
+            .style = .{ .background = p.surface_modal, .border = p.border_modal, .radius = 14, .stroke_width = 1 },
+        }, .{ui.column(.{ .gap = 12 }, .{
             ui.text(.{}, ui.fmt("Start a new {s}?", .{list})),
             ui.paragraph(
-                .{ .wrap = true, .style = .{ .foreground = p.text_secondary } },
-                &.{.{ .text = ui.fmt("None of your relays has a {s} for you. If you already have one somewhere Plaza has not looked, a new one would replace it with a list holding only {s}. Go on only if this account is new, or you know it has no {s}.", .{ list, holds, list }) }},
+                .{ .wrap = true, .width = inner, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = text }},
             ),
-            ui.row(.{ .cross = .center, .gap = 8 }, .{
+            ui.row(.{ .width = inner, .cross = .center, .gap = 8 }, .{
                 ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = .fresh_list_cancel }, "Cancel"),
                 ui.spacer(1),
                 ui.button(.{ .size = .sm, .variant = .destructive, .on_press = .fresh_list_confirm }, "Start a new list"),
             }),
-        }),
-    });
+        })}),
+    }));
 }
 
 /// The expanded picture, filling the window over the feed. The registry decodes

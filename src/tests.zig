@@ -8998,6 +8998,36 @@ test "a private bookmark is not published over a list that landed while it was s
     try testing.expectEqualStrings("a-private-half-this-seal-never-saw", content);
 }
 
+test "the Edit profile sheet gives its introduction's room to a status" {
+    // Seven fields, three lines of introduction and a two-line status put the
+    // button row below the window at its minimum height, so Try again and Save
+    // could not be pressed in exactly the states that need them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = signInNothingFound(0x7b);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    const intro = "Everything this app can read from a profile";
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    try testing.expect(model.profile_status().len > 0);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "No relay has a profile for you"));
+        try testing.expect(!findAnyTextContaining(tree.root, intro));
+    }
+    model.profile_stage = .have;
+    try testing.expectEqual(@as(usize, 0), model.profile_status().len);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, intro));
+    }
+}
+
 test "only the feed subscription's own ids are read as the feed" {
     try testing.expect(main.isFeedSubForTest("plaza-feed"));
     try testing.expect(main.isFeedSubForTest("plaza-feed-12"));
