@@ -471,6 +471,33 @@ test "the name beat forwards the tags it read, the same as the sheet's save" {
     try testing.expect(std.mem.indexOf(u8, written, "github:someone") != null);
     try testing.expect(std.mem.indexOf(u8, written, "mastodon:someone@example.social") != null);
 }
+test "the name beat waits for a busy signer and says so" {
+    // It signed without asking, and said "Name set" for a name a busy signer
+    // never took.
+    main.setIdentityForTest([_]u8{0x5c} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    model.naming = true;
+    model.name_buffer.set("Bob");
+    var fx: main.EffectsForTest = undefined;
+
+    main.holdHelperSignForTest();
+    main.update(&model, .name_save, &fx);
+    try testing.expectEqualStrings(main.signer_busy_toast, model.toast_text());
+    try testing.expect(model.naming);
+    try testing.expectEqualStrings("Bob", model.name_buffer.text());
+    try testing.expect(main.lastPublishedForTest() == null);
+
+    main.releaseHelperSignForTest();
+    main.update(&model, .name_save, &fx);
+    try testing.expectEqualStrings("Name set", model.toast_text());
+    try testing.expect(!model.naming);
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqual(@as(u16, 0), out.kind);
+}
+
 test "a replaced relay list is kept, and can be read back" {
     // The store enforces replaceable semantics the way relays do:
     // `ingestReplaceable` DELETES the superseded event in the same transaction.

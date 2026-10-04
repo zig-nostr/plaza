@@ -649,3 +649,37 @@ test "a bunker sign that cannot go out puts the like back" {
     try testing.expect(!main.isLikedForTest(note));
     try testing.expectEqualStrings("That like was not signed.", model.toast_text());
 }
+
+test "a bunker sign parked while the table is full still gives its text back and its press" {
+    // With every slot taken there was nowhere to park it, and it was freed:
+    // the note was gone and the like stayed filled with nothing sent.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    defer main.forgetRefused();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    main.setIdentityForTest([_]u8{0x94} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.draft_buffer.set("typing the next one");
+    var fx: main.EffectsForTest = undefined;
+    const note: i64 = 0x1cef;
+    main.rememberLikeForTest(note, [_]u8{0x43} ** 32);
+
+    var ids: [main.max_pending_remote][8]u8 = undefined;
+    for (&ids, 0..) |*buf, i| {
+        try testing.expect(main.registerPendingForTest(try std.fmt.bufPrint(buf, "full{d}", .{i}), .nip44_decrypt, null));
+    }
+    const gpa = std.heap.page_allocator;
+    main.requestRemoteSign(gpa, 1_800_000_000, 7, &.{}, try gpa.dupe(u8, "+"), false, .none, .{ .like = note });
+    main.requestRemoteSign(gpa, 1_800_000_001, 1, &.{}, try gpa.dupe(u8, "the refused note"), true, .none, .none);
+    main.scanPendingRemoteForTest(&model, &fx);
+
+    try testing.expect(!main.isLikedForTest(note));
+    try testing.expectEqualStrings("typing the next one", model.draft());
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("the refused note", main.refusedTextForTest(0).?);
+}

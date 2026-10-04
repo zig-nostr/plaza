@@ -17,6 +17,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const unstored_toast = main.unstored_toast;
+const signer_busy_toast = main.signer_busy_toast;
 const setToast = main.setToast;
 const ownWriteUnstored = main.ownWriteUnstored;
 const heldOwnRecord = main.heldOwnRecord;
@@ -713,12 +714,21 @@ fn ownProfileWorker(pk: [32]u8) void {
 /// the destructive shape is the one where a name is published as the WHOLE
 /// profile, and having exactly one path here means that shape cannot come back
 /// the next time somebody reaches for this function.
-pub fn publishName(model: *Model, fx: *Effects) void {
+///
+/// Returns false when the write was refused and the toast says why, so the
+/// beat stays open for another press.
+pub fn publishName(model: *Model, fx: *Effects) bool {
     const raw = trimmedField(model.name_buffer.text());
-    if (raw.len == 0) return;
+    if (raw.len == 0) return true;
+    // Gated like every other write: a sign the signer cannot take would leave
+    // the name on screen and on nobody's relays.
+    if (!signerReady()) {
+        setToast(model, signer_busy_toast);
+        return false;
+    }
     if (ownWriteUnstored(0)) {
         setToast(model, unstored_toast);
-        return;
+        return false;
     }
     const gpa = std.heap.page_allocator;
 
@@ -735,19 +745,20 @@ pub fn publishName(model: *Model, fx: *Effects) void {
     // Quotes and backslashes are ESCAPED, not dropped: a name is prose, and the
     // serializer knows how to carry prose. (Dropping them was a fixed 64-byte
     // buffer away from a longer field overflowing it.)
-    const json = mergeNameJson(gpa, if (existing) |e| e.json else "{}", raw) orelse return;
+    const json = mergeNameJson(gpa, if (existing) |e| e.json else "{}", raw) orelse return true;
     // The TAGS come forward, the same as the sheet's save. The beat only arms on
     // a key this app just minted, which has no kind:0 and therefore no NIP-39
     // proofs to lose, so this is not a bug being fixed: it is the one line that
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
-    const tags = dupeTags(gpa, prev_tags) orelse return;
+    const tags = dupeTags(gpa, prev_tags) orelse return true;
     signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false, .profile, null);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
         if (upsertProfile(pk)) |prof| parseMetadataInto(prof, json);
     }
     model.name_buffer.clear();
+    return true;
 }
 
 /// The name beat's one-field merge: the same read-modify-write as the sheet's,
@@ -839,7 +850,7 @@ pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, mod
 /// Drives the name beat's whole write, not just its merge. The tags it forwards
 /// are invisible to `mergeNameJsonForTest`, which only sees the content.
 pub fn publishNameForTest(model: *Model, fx: *Effects) void {
-    publishName(model, fx);
+    _ = publishName(model, fx);
 }
 
 pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {

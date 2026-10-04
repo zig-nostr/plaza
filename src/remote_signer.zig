@@ -240,6 +240,10 @@ pub fn plausibleSealForTest(ciphertext: []const u8, plain_len: usize) bool {
 
 var g_pending_lock = std.atomic.Value(bool).init(false);
 pub var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
+/// Failed signs with no room left in `g_pending`, for the tick to retire the
+/// same way. Under the same lock. Only `parkFailedSign` fills it, and nothing
+/// matches an answer against it.
+var g_pending_overflow: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
 
 pub fn pendingLock() void {
     while (g_pending_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -409,8 +413,19 @@ fn parkFailedSign(taken: PendingRemote, wrong_key: bool) void {
         slot.wrong_key = wrong_key;
         return;
     }
-    // The table filled up in between. Nowhere to park it: free what it owns
-    // rather than leak it.
+    // The table filled up in between (a press took the slot this answer
+    // freed). Freed here, the draft was gone and the press stayed as it was,
+    // with nothing said, so it waits beside the table instead. That holds as
+    // many as the table and the tick empties it, so it does not fill in
+    // practice; if it ever did, what it owns is freed rather than leaked.
+    for (&g_pending_overflow) |*slot| {
+        if (slot.active) continue;
+        slot.* = taken;
+        slot.active = true;
+        slot.failed = true;
+        slot.wrong_key = wrong_key;
+        return;
+    }
     if (taken.content) |c| std.heap.page_allocator.free(c);
     releaseUndo(taken.undo);
 }
@@ -436,11 +451,13 @@ pub fn clearPending() void {
     const gpa = std.heap.page_allocator;
     pendingLock();
     defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (!slot.active) continue;
-        if (slot.content) |c| gpa.free(c);
-        releaseUndo(slot.undo);
-        slot.* = .{};
+    for ([_][]PendingRemote{ &g_pending, &g_pending_overflow }) |table| {
+        for (table) |*slot| {
+            if (!slot.active) continue;
+            if (slot.content) |c| gpa.free(c);
+            releaseUndo(slot.undo);
+            slot.* = .{};
+        }
     }
 }
 // ------------------------------------------------------- remote signer (NIP-46)
@@ -1068,13 +1085,13 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     const gpa = std.heap.page_allocator;
     const generation = g_remote_generation.load(.acquire);
     // Every refused note, given back after the lock is released.
-    var restores: [max_pending_remote][]const u8 = undefined;
-    var restore_warns: [max_pending_remote]WarnCarry = undefined;
+    var restores: [2 * max_pending_remote][]const u8 = undefined;
+    var restore_warns: [2 * max_pending_remote]WarnCarry = undefined;
     var restores_len: usize = 0;
     var sign_failed = false;
     var signed_by_another_key = false;
     // Each failed sign's own record, put back after the lock is released.
-    var undos: [max_pending_remote]PendingUndo = undefined;
+    var undos: [2 * max_pending_remote]PendingUndo = undefined;
     var undos_len: usize = 0;
     var connect_failed = false;
     var seal_failed = false;
@@ -1082,96 +1099,99 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var upload_sign_failed = false;
 
     pendingLock();
-    for (&g_pending) |*slot| {
-        if (!slot.active) continue;
-        const stale = slot.generation != generation;
-        const due = slot.failed or now >= slot.deadline_s;
-        if (!stale and !due) continue;
-        const method = slot.method;
-        const content = slot.content;
-        const slot_half = slot.half_index;
-        const slot_half_id = slot.half_id;
-        const slot_explicit = slot.failed;
-        const slot_restorable = slot.restorable;
-        const slot_warn = slot.warn;
-        const slot_undo = slot.undo;
-        const slot_wrong_key = slot.wrong_key;
-        slot.* = .{};
-        if (stale) {
-            if (content) |c| gpa.free(c);
-            // The session it belonged to is gone, and the state it would put
-            // back went with it.
-            releaseUndo(slot_undo);
-            // An ask that died with its session leaves the half "asking"
-            // forever, and nothing would ask again: the reader's list would
-            // stay read-only until a restart. Back to idle, so the next tick
-            // asks. Only the half that ask was about: the slot may belong to
-            // another list by now.
-            if (method == .nip44_decrypt or method == .nip04_decrypt) {
-                if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
+    // The overflow too: signs parked failed while the table was full.
+    for ([_][]PendingRemote{ &g_pending, &g_pending_overflow }) |table| {
+        for (table) |*slot| {
+            if (!slot.active) continue;
+            const stale = slot.generation != generation;
+            const due = slot.failed or now >= slot.deadline_s;
+            if (!stale and !due) continue;
+            const method = slot.method;
+            const content = slot.content;
+            const slot_half = slot.half_index;
+            const slot_half_id = slot.half_id;
+            const slot_explicit = slot.failed;
+            const slot_restorable = slot.restorable;
+            const slot_warn = slot.warn;
+            const slot_undo = slot.undo;
+            const slot_wrong_key = slot.wrong_key;
+            slot.* = .{};
+            if (stale) {
+                if (content) |c| gpa.free(c);
+                // The session it belonged to is gone, and the state it would put
+                // back went with it.
+                releaseUndo(slot_undo);
+                // An ask that died with its session leaves the half "asking"
+                // forever, and nothing would ask again: the reader's list would
+                // stay read-only until a restart. Back to idle, so the next tick
+                // asks. Only the half that ask was about: the slot may belong to
+                // another list by now.
+                if (method == .nip44_decrypt or method == .nip04_decrypt) {
+                    if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
+                }
+                // A seal that died with its session is over. Left active, every
+                // private bookmark after it read as "your signer is busy".
+                if (method == .nip44_encrypt) stale_seal = true;
+                continue;
             }
-            // A seal that died with its session is over. Left active, every
-            // private bookmark after it read as "your signer is busy".
-            if (method == .nip44_encrypt) stale_seal = true;
-            continue;
-        }
-        switch (method) {
-            .sign_event => {
-                // Every restorable one is given back, not only the first. A
-                // reaction's content is not restorable, so it is freed and its
-                // failure stays silent.
-                if (content) |c| {
-                    if (slot_restorable) {
-                        restores[restores_len] = c;
-                        restore_warns[restores_len] = slot_warn;
-                        restores_len += 1;
-                    } else gpa.free(c);
-                }
-                if (slot_restorable) sign_failed = true;
-                // Any failed signature, restorable or not, may have been a
-                // follow press whose list already moved: this one's own.
-                undos[undos_len] = slot_undo;
-                undos_len += 1;
-                if (slot_wrong_key) signed_by_another_key = true;
-            },
-            .connect => {
-                if (content) |c| gpa.free(c);
-                connect_failed = true;
-            },
-            // A token the bunker refused or never answered. The upload card says
-            // so; there is no draft to give back.
-            .sign_upload_auth => {
-                if (content) |c| gpa.free(c);
-                upload_sign_failed = true;
-            },
-            // Refused or never answered. NOT "the half is empty": that
-            // distinction is the whole reason this cache exists, and collapsing
-            // the two is what publishes an empty content over somebody's
-            // private list.
-            //
-            // An error from the bunker is a "no" and waits for a press. A
-            // deadline that passed is a silence: the prompt may be sitting
-            // unseen on a phone, or the answer lost on the way, so the half
-            // is asked again once `private_half_retry_s` has passed.
-            .nip44_decrypt, .nip04_decrypt => {
-                if (content) |c| gpa.free(c);
-                if (halfAwaiting(slot_half, slot_half_id)) |h| {
-                    h.state = .refused;
-                    h.retry_at_s = if (slot_explicit) 0 else now + private_half_retry_s;
-                }
-            },
-            // A seal the bunker refused or never answered. The list is left
-            // exactly as it was, which is the only safe outcome: the reader
-            // still has every private bookmark they had.
-            .nip44_encrypt => {
-                if (content) |c| gpa.free(c);
-                seal_failed = true;
-            },
-            // The relay's challenge goes unanswered and the row says so.
-            .sign_auth => {
-                if (content) |c| gpa.free(c);
-                authFailSigning(slot_half);
-            },
+            switch (method) {
+                .sign_event => {
+                    // Every restorable one is given back, not only the first. A
+                    // reaction's content is not restorable, so it is freed and its
+                    // failure stays silent.
+                    if (content) |c| {
+                        if (slot_restorable) {
+                            restores[restores_len] = c;
+                            restore_warns[restores_len] = slot_warn;
+                            restores_len += 1;
+                        } else gpa.free(c);
+                    }
+                    if (slot_restorable) sign_failed = true;
+                    // Any failed signature, restorable or not, may have been a
+                    // follow press whose list already moved: this one's own.
+                    undos[undos_len] = slot_undo;
+                    undos_len += 1;
+                    if (slot_wrong_key) signed_by_another_key = true;
+                },
+                .connect => {
+                    if (content) |c| gpa.free(c);
+                    connect_failed = true;
+                },
+                // A token the bunker refused or never answered. The upload card says
+                // so; there is no draft to give back.
+                .sign_upload_auth => {
+                    if (content) |c| gpa.free(c);
+                    upload_sign_failed = true;
+                },
+                // Refused or never answered. NOT "the half is empty": that
+                // distinction is the whole reason this cache exists, and collapsing
+                // the two is what publishes an empty content over somebody's
+                // private list.
+                //
+                // An error from the bunker is a "no" and waits for a press. A
+                // deadline that passed is a silence: the prompt may be sitting
+                // unseen on a phone, or the answer lost on the way, so the half
+                // is asked again once `private_half_retry_s` has passed.
+                .nip44_decrypt, .nip04_decrypt => {
+                    if (content) |c| gpa.free(c);
+                    if (halfAwaiting(slot_half, slot_half_id)) |h| {
+                        h.state = .refused;
+                        h.retry_at_s = if (slot_explicit) 0 else now + private_half_retry_s;
+                    }
+                },
+                // A seal the bunker refused or never answered. The list is left
+                // exactly as it was, which is the only safe outcome: the reader
+                // still has every private bookmark they had.
+                .nip44_encrypt => {
+                    if (content) |c| gpa.free(c);
+                    seal_failed = true;
+                },
+                // The relay's challenge goes unanswered and the row says so.
+                .sign_auth => {
+                    if (content) |c| gpa.free(c);
+                    authFailSigning(slot_half);
+                },
+            }
         }
     }
     // Answers that came back while the listener held them. Applied here so

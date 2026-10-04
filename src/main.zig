@@ -4327,7 +4327,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 replayPending(model);
                 return;
             }
-            publishName(model, fx);
+            // Refused, the beat stays, with the reason, for another press.
+            if (!publishName(model, fx)) {
+                model.naming = true;
+                return;
+            }
             setToast(model, "Name set");
             replayPending(model);
         },
