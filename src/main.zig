@@ -6616,6 +6616,12 @@ pub const SearchInput = enum {
     /// `name@domain`. The domain is the authority on who that is, so it is asked
     /// rather than searched for.
     nip05,
+    /// A secret key (`nsec1`, `ncryptsec1`), a signer link (`bunker://`,
+    /// `nostrconnect://`, which carry a secret of their own), or 64 hex digits,
+    /// which may be a secret key written out raw. None of these is a name, and
+    /// the cost of treating one as a name is putting it to three strangers, so
+    /// nothing is done with it at all: not matched, not looked up, not sent.
+    key,
     /// Anything else, which is a name.
     term,
 };
@@ -6630,13 +6636,31 @@ pub const SearchInput = enum {
 /// decision on the reader, and the strings are not ambiguous: a bech32 prefix and
 /// an `@` between two names are not how anybody spells a person.
 pub fn classifySearch(raw: []const u8) SearchInput {
-    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return .blank;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .blank;
+    // Checked anywhere in the string and in either case, before anything else:
+    // `my key is NSEC1...` is still a key, and a name never contains one.
+    for ([_][]const u8{ "nsec1", "ncryptsec1", "bunker://", "nostrconnect://" }) |marker| {
+        if (search.indexOfFold(trimmed, marker) != null) return .key;
+    }
+    if (trimmed.len == 64 and isHexString(trimmed)) return .key;
     const text = addressCandidate(raw);
     for ([_][]const u8{ "npub1", "nprofile1", "note1", "nevent1", "naddr1" }) |prefix| {
         if (std.mem.startsWith(u8, text, prefix)) return .address;
     }
+    // A link that does not end in a Nostr address is still a link, not a name.
+    // It goes to the address reader, which says it cannot read it, rather than
+    // to the search relays with whatever its path and query carry.
+    if (std.mem.indexOf(u8, trimmed, "://") != null) return .address;
     if (nip05Address(raw) != null) return .nip05;
     return .term;
+}
+
+fn isHexString(text: []const u8) bool {
+    for (text) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
 }
 
 /// A NIP-05 address split and lowercased, in buffers of its own.
@@ -12195,6 +12219,7 @@ pub const Model = struct {
             .none => switch (classifySearch(self.address_buffer.text())) {
                 .blank => "",
                 .address => "An address. Enter opens it.",
+                .key => "That looks like a key or a signer link. It is not searched for, and it stays on this device.",
                 .nip05 => if (g_nip05_ask != null) "Asking the domain who that is." else "A NIP-05 address. Enter asks its domain who that is.",
                 .term => "Enter asks the search relays now.",
             },
@@ -12207,7 +12232,7 @@ pub const Model = struct {
     /// What the field's one button does with what is in it.
     pub fn address_action(self: *const Model) []const u8 {
         return switch (classifySearch(self.address_buffer.text())) {
-            .blank, .address => "Open",
+            .blank, .address, .key => "Open",
             .nip05 => "Look up",
             .term => "Search relays",
         };
@@ -19590,7 +19615,7 @@ fn addressSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             else
                 ui.spacer(0),
             searchBody(ui, kind),
-            ui.button(.{ .variant = .primary, .disabled = model.address_empty(), .on_press = .address_submit }, model.address_action()),
+            ui.button(.{ .variant = .primary, .disabled = model.address_empty() or kind == .key, .on_press = .address_submit }, model.address_action()),
             vgap(ui, 5),
         })),
     }));
@@ -19601,8 +19626,9 @@ fn addressSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 fn searchBody(ui: *AppUi, kind: SearchInput) AppUi.Node {
     const p = theme.palette;
     if (kind == .blank) return ui.column(.{ .height = search_empty_height }, .{searchEmpty(ui)});
-    // An address is opened, not searched for, so there is nothing to list.
-    if (kind == .address) return ui.spacer(0);
+    // An address is opened, not searched for, so there is nothing to list, and
+    // a key is not searched for at all.
+    if (kind == .address or kind == .key) return ui.spacer(0);
 
     const rows = g_search_rows[0..g_search_len];
     var nodes: [search_rows_max + 2]AppUi.Node = undefined;
@@ -38053,7 +38079,7 @@ fn awakeMs() i64 {
 /// The term on screen, cleaned, or null when the field holds no name.
 fn searchTermOf(model: *const Model, out: *[search.term_max]u8) ?[]const u8 {
     return switch (classifySearch(model.address_buffer.text())) {
-        .blank, .address => null,
+        .blank, .address, .key => null,
         .nip05, .term => search.cleanTerm(out, model.address_buffer.text()),
     };
 }
@@ -38503,7 +38529,8 @@ fn searchPick(model: *Model, pubkey: [32]u8) void {
 /// What Enter does with what is in the field.
 fn submitAddress(model: *Model, fx: *Effects) void {
     switch (classifySearch(model.address_buffer.text())) {
-        .blank => {},
+        // Nothing is done with a key, on purpose. See `SearchInput.key`.
+        .blank, .key => {},
         .address => openAddress(model, fx),
         .nip05 => lookupNip05(model, fx),
         // Straight to the relays: pressing Enter is asking now, not after the

@@ -29158,6 +29158,56 @@ test "typing asks the relays once the typing stops, once" {
     try testing.expect(!main.searchAskedForTest());
 }
 
+test "a key, a signer link or a web link typed into search never leaves the machine" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    const nsec = try nostr.nip19.encodeNsec(arena, [_]u8{0x5a} ** 32);
+    const upper = try std.ascii.allocUpperString(arena, nsec);
+    const keys = [_][]const u8{
+        nsec,
+        upper,
+        try std.fmt.allocPrint(arena, "nostr:{s}", .{nsec}),
+        try std.fmt.allocPrint(arena, "my key is {s}", .{nsec}),
+        "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p",
+        "bunker://" ++ "ab" ** 32 ++ "?relay=wss://relay.example.com&secret=hunter2",
+        "nostrconnect://" ++ "ab" ** 32 ++ "?relay=wss://relay.example.com&secret=hunter2",
+        "5a" ** 32,
+    };
+    for (keys) |text| {
+        try testing.expectEqual(main.SearchInput.key, main.classifySearch(text));
+        var model = main.initialModel();
+        model.stage = .ready;
+        var fx: main.EffectsForTest = undefined;
+        typeIntoSearch(&model, text);
+        // Long past the pause that sends a name, and Enter pressed too.
+        main.searchTickForTest(&model, 100_000);
+        main.update(&model, Msg.address_submit, &fx);
+        main.searchTickForTest(&model, 200_000);
+        try testing.expect(!main.searchAskedForTest());
+        try testing.expect(!main.nip05AskedForTest());
+        try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+        // The field is left as it was, and its button does nothing.
+        try testing.expect(model.address_open);
+        try testing.expect(model.viewing_profile == null);
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContainingText(tree.root, "It is not searched for") != null);
+    }
+
+    // A link that is not a Nostr address is something to open, not a name, and
+    // what its path and query carry is not put to the relays either.
+    var link = main.initialModel();
+    link.stage = .ready;
+    const url = "https://docs.example.com/d/1x2y3z?token=abc";
+    try testing.expectEqual(main.SearchInput.address, main.classifySearch(url));
+    typeIntoSearch(&link, url);
+    main.searchTickForTest(&link, 100_000);
+    try testing.expect(!main.searchAskedForTest());
+}
+
 test "people the relays name are folded in, marked with who named them, and counted once" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
