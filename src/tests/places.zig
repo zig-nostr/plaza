@@ -2468,6 +2468,24 @@ test "a plaza link leaves Settings and the notifications sheet, and says it is l
     main.drainPendingLinkForTest(&f.model, &f.fx);
     try testing.expect(main.placeFetchArmedForTest());
     try testing.expect(f.model.stage == .ready);
+
+    // Held past the point it is still news: the sheet stayed up longer than a
+    // link on disk is trusted for. Closing it later must not open a room the
+    // reader asked for minutes ago, on its own.
+    main.resetPlacesForTest();
+    main.forgetPlaceFetchForTest();
+    main.update(&f.model, .open_settings, &f.fx);
+    f.model.editing_profile = true;
+    main.captureArgvLinkForTest(link);
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    main.ageHeldLinkForTest(main.pending_link_stale_s + 1);
+    f.model.editing_profile = false;
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(!main.placeFetchArmedForTest());
+    try testing.expect(f.model.stage == .settings);
+    // And it is gone, not waiting for the next tick.
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(!main.placeFetchArmedForTest());
 }
 
 test "a place that turns up retires the looking toast" {

@@ -116,7 +116,7 @@ const pending_link_file = "pending-link";
 /// How long a link on disk is still worth opening. A file left by a crash is
 /// not something the reader just clicked, and opening a room they asked for
 /// yesterday is worse than doing nothing.
-const pending_link_stale_s: i64 = 120;
+pub const pending_link_stale_s: i64 = 120;
 
 /// Reads the command line once, at startup, before any window exists.
 pub fn captureArgvLink(args: std.process.Args) void {

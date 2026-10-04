@@ -17,6 +17,8 @@ const isAuthRequired = main.isAuthRequired;
 const handlePlazaLink = main.handlePlazaLink;
 const isPublicMediaUrl = main.isPublicMediaUrl;
 const takePendingLink = main.takePendingLink;
+const nowSeconds = main.nowSeconds;
+const pending_link_stale_s = main.pending_link_stale_s;
 const Effects = main.Effects;
 const Model = main.Model;
 const askPool = main.askPool;
@@ -2104,17 +2106,53 @@ pub fn resumeVisitForTest() void {
     resumeVisit();
 }
 
+/// A link that came in while the Edit profile sheet was up, and when it came.
+///
+/// It used to stay wherever it had arrived. On disk it carried its own stamp,
+/// but the macOS slot carries none, so a link clicked at the start of a long
+/// edit opened a room whenever the sheet finally closed, however much later
+/// that was; and a link that went stale on disk in the meantime was dropped
+/// with nothing to show for it. Taking it off its source at once and stamping
+/// it here gives every link the same rule.
+var g_held_link_buf: [2048]u8 = undefined;
+var g_held_link_len: usize = 0;
+var g_held_link_at: i64 = 0;
+
 pub fn drainPendingLink(model: *Model, fx: *Effects) void {
-    // Not while the Edit profile sheet is up. Following the link leaves
-    // Settings, which hides the sheet and what was typed in it, so the link
-    // stays where it is until the sheet closes.
-    if (model.stage == .settings and model.editing_profile) return;
     var link_buf: [2048]u8 = undefined;
-    if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+    // Not while the Edit profile sheet is up. Following the link leaves
+    // Settings, which hides the sheet and what was typed in it, so the link is
+    // held until the sheet closes. A newer one replaces it: if two arrive, the
+    // later is the one the reader meant.
+    if (model.stage == .settings and model.editing_profile) {
+        if (takePendingLink(&link_buf)) |link| {
+            g_held_link_len = copyBounded(&g_held_link_buf, link);
+            g_held_link_at = nowSeconds();
+        }
+        return;
+    }
+    if (takePendingLink(&link_buf)) |link| {
+        g_held_link_len = 0;
+        handlePlazaLink(model, fx, link);
+        return;
+    }
+    if (g_held_link_len == 0) return;
+    const n = g_held_link_len;
+    g_held_link_len = 0;
+    // Only while it is still something the reader just asked for. A room
+    // opening minutes after the click, on its own, is worse than none.
+    if (nowSeconds() - g_held_link_at > pending_link_stale_s) return;
+    @memcpy(link_buf[0..n], g_held_link_buf[0..n]);
+    handlePlazaLink(model, fx, link_buf[0..n]);
 }
 
 pub fn drainPendingLinkForTest(model: *Model, fx: *Effects) void {
     drainPendingLink(model, fx);
+}
+
+/// Moves the held link's stamp back, as if the sheet had stayed up that long.
+pub fn ageHeldLinkForTest(seconds: i64) void {
+    g_held_link_at -= seconds;
 }
 pub const place_looking_toast_for_test = place_looking_toast;
 /// Gives the open place one write relay of its own, the way a parsed document
