@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const forgetStaleReturn = main.forgetStaleReturn;
 const Model = main.Model;
 const RelayHints = main.RelayHints;
 const Standing = main.Standing;
@@ -587,6 +588,7 @@ pub fn refreshAddressFetch(model: *Model) void {
     // back, the same rule the note fetch follows.
     if (!want.from.eql(standingNow(model))) {
         g_address_want = null;
+        forgetStaleReturn(model);
         return;
     }
     const store = main.g_store orelse return;
@@ -640,7 +642,10 @@ pub fn refreshAddressFetch(model: *Model) void {
     g_address_want.?.waited +|= 1;
     if (g_address_want.?.waited > address_fetch_ticks) {
         g_address_want = null;
-        if (!want.shown) setToast(model, "That article did not turn up.");
+        if (!want.shown) {
+            forgetStaleReturn(model);
+            setToast(model, "That article did not turn up.");
+        }
     }
 }
 

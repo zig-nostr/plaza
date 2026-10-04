@@ -501,6 +501,11 @@ pub fn openAddress(model: *Model, fx: *Effects) void {
     // under it. Leave Settings first, or the reader presses Open and sees
     // nothing happen.
     if (model.stage == .settings) leaveSettings(model);
+    // And the notifications sheet, for every target and not only a person:
+    // a thread, an article or a room opened under the sheet is a press that
+    // seems to do nothing. Once, here, because a second call would read the
+    // sheet as already closed and forget that it was the way back.
+    leaveNotifications(model);
     switch (hit.target) {
         // The hints go in FIRST, so that if the note is not held the fetch
         // `openEvent` starts already knows where to look. `wantQuote` inside
@@ -511,7 +516,7 @@ pub fn openAddress(model: *Model, fx: *Effects) void {
         },
         .person => |pk| {
             wantProfileHinted(pk, hit.hints);
-            openPerson(model, pk);
+            enterProfile(model, pk);
         },
         .place => |pl| {
             var want: @TypeOf(places.g_place_want.?) = .{ .pubkey = pl.pubkey, .ident_buf = @splat(0), .ident_len = 0 };
@@ -527,6 +532,9 @@ pub fn openAddress(model: *Model, fx: *Effects) void {
             if (places.g_place_want) |w| {
                 if (!w.applied and !samePlace(w)) setToast(model, place_looking_toast);
             }
+            // A room is not a level, so there is no Back that could return to
+            // the sheet through it.
+            if (!model.levelOpen()) model.notifications_return = false;
         },
         .article => |art| {
             // Cannot fail: `parseAddress` only returns this for an address that
@@ -655,6 +663,7 @@ pub fn refreshEventFetch(model: *Model) void {
     // place fetch follows when the reader steps sideways out of a linked room.
     if (!want.from.eql(standingNow(model))) {
         g_event_want = null;
+        forgetStaleReturn(model);
         return;
     }
     const store = main.g_store orelse return;
@@ -675,8 +684,17 @@ pub fn refreshEventFetch(model: *Model) void {
     g_event_want.?.waited +|= 1;
     if (g_event_want.?.waited > event_fetch_ticks) {
         g_event_want = null;
+        forgetStaleReturn(model);
         setToast(model, "That note did not turn up.");
     }
+}
+
+/// A fetch asked for from the notifications sheet closed the sheet and noted it
+/// as the way back. When the fetch ends without opening a level, nothing is
+/// left to go back from, and kept, the note would make some later thread's Back
+/// say Notifications and reopen a sheet the reader closed long ago.
+pub fn forgetStaleReturn(model: *Model) void {
+    if (!model.levelOpen()) model.notifications_return = false;
 }
 
 /// How many ticks a note fetch may go unanswered. The same window a place gets,

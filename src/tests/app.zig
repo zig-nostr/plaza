@@ -2484,6 +2484,75 @@ test "opening an address puts the field away before it navigates" {
     try testing.expect(main.quoteHintCountForTest(id) != null);
 }
 
+test "an address opened over Notifications leaves the sheet, and a miss forgets it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3d} ** 32);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/overnotif.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetQuotesForTest();
+    main.forgetEventFetchForTest();
+    defer main.forgetEventFetchForTest();
+
+    const held = try signedNote(arena, signer, kp, 1_800_000_000, "a note this machine holds");
+    _ = try main.plazaIngestVerifiedForTest(arena, held, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // A note's address, typed with the notifications sheet up. The thread opens
+    // on top, not under the sheet, and Back goes to the sheet.
+    model.notifications_open = true;
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, held.id) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &held.id));
+    try testing.expect(!model.notifications_open);
+    try testing.expect(model.notifications_return);
+    main.closeThreadForTest(&model);
+    try testing.expect(model.notifications_open);
+
+    // A note nobody has. The sheet goes, the fetch gives up, and the way back
+    // to the sheet goes with it.
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, [_]u8{0x6e} ** 32) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expect(!model.notifications_open);
+    for (0..20) |_| main.refreshEventFetchForTest(&model);
+    try testing.expectEqualStrings("That note did not turn up.", model.toast_text());
+    try testing.expect(!model.notifications_return);
+
+    // So a thread opened later says where Back really goes.
+    var root = main.Note{};
+    root.id = 0xC1;
+    main.enterThreadForTest(&model, root);
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, "Back") != null);
+    try testing.expect(findAnyText(tree.root, "Notifications") == null);
+    main.closeThreadForTest(&model);
+    try testing.expect(!model.notifications_open);
+
+    // The same when the reader walks away while it is still looking.
+    model.notifications_open = true;
+    main.update(&model, Msg.open_address, &fx);
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = try nostr.nip19.encodeNote(arena, [_]u8{0x6f} ** 32) } }, &fx);
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expect(model.notifications_return);
+    main.update(&model, .open_settings, &fx);
+    main.refreshEventFetchForTest(&model);
+    try testing.expect(!model.notifications_return);
+}
+
 test "the relays an address named reach the fetch that goes looking" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

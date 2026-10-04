@@ -6752,6 +6752,7 @@ pub const roundReach = profile_notes.roundReach;
 pub const writeRelaysOf = profile_notes.writeRelaysOf;
 
 // re-exports: navigation.zig
+pub const forgetStaleReturn = navigation.forgetStaleReturn;
 pub const closeThreadForTest = navigation.closeThreadForTest;
 pub const enterProfileForTest = navigation.enterProfileForTest;
 pub const enterThreadForTest = navigation.enterThreadForTest;
