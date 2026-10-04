@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const own_lists = @import("own_lists.zig");
 const session = @import("session.zig");
 const store_glue = @import("store_glue.zig");
+const uploads = @import("uploads.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -190,7 +191,7 @@ pub fn openProfileEdit(model: *Model) void {
         return;
     }
     model.editing_profile = true;
-    main.g_profile_upload_unsaved = false;
+    uploads.g_profile_upload_unsaved = false;
     model.profile_confirm_new = false;
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
