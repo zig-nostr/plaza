@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const blossom = @import("blossom.zig");
+const follows = @import("follows.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -318,7 +319,7 @@ pub fn retryOwnListsRead() void {
     g_own_lists_since_for = pk;
     // The open subscriptions re-ask on this counter, which is what makes every
     // relay send its stored answer (and its end-of-stored-events) again.
-    _ = main.g_follow_gen.fetchAdd(1, .monotonic);
+    _ = follows.g_follow_gen.fetchAdd(1, .monotonic);
 }
 
 /// The lists a write can replace.
@@ -392,7 +393,7 @@ pub fn needsFreshConsent(kind: ListKind) bool {
 /// Whether a copy of `kind` is held here, so a write splices onto it.
 pub fn listHeld(kind: ListKind) bool {
     return switch (kind) {
-        .follows => main.g_pending_follow_tags != null or haveOwnContactList(),
+        .follows => follows.g_pending_follow_tags != null or haveOwnContactList(),
         .mutes => ownRecordExists(mute_list_kind),
         .bookmarks => ownRecordExists(bookmark_list_kind),
         .profile => ownRecordExists(0),

@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const follows = @import("follows.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -130,7 +131,7 @@ pub fn setHidden(what: Hideable, off: bool) void {
     // this, turning reactions off stops the counts being drawn and leaves every
     // relay still sending them, which is the cosmetic version of this feature
     // and the one it exists not to be.
-    _ = main.g_follow_gen.fetchAdd(1, .monotonic);
+    _ = follows.g_follow_gen.fetchAdd(1, .monotonic);
     // The author set moved, so whatever was concluded about the end of their
     // history was concluded about a different question.
     resetFeedEnd();

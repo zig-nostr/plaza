@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const hiding = @import("hiding.zig");
 const updates = @import("updates.zig");
 const places = @import("places.zig");
+const follows = @import("follows.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -217,8 +218,8 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // their own follows.
         if (std.mem.eql(u8, line[0..eq], "home_scope")) {
             const val = line[eq + 1 ..];
-            if (std.mem.eql(u8, val, "starter_pack")) main.g_home_scope = .starter_pack;
-            if (std.mem.eql(u8, val, "following")) main.g_home_scope = .following;
+            if (std.mem.eql(u8, val, "starter_pack")) follows.g_home_scope = .starter_pack;
+            if (std.mem.eql(u8, val, "following")) follows.g_home_scope = .following;
         }
         if (std.mem.eql(u8, line[0..eq], "post_delay")) {
             // Anything unreadable keeps the default rather than turning the
@@ -258,7 +259,7 @@ pub fn saveSettings() void {
         if (places.g_rail_open) "on" else "off",
         place,
         main.g_post_delay_s,
-        @tagName(main.g_home_scope),
+        @tagName(follows.g_home_scope),
         if (updates.g_update_check) "on" else "off",
         if (g_show_sensitive) "on" else "off",
     }) catch return;
