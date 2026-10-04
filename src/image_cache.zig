@@ -7,11 +7,15 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const prefs = @import("prefs.zig");
+const profile_cache = @import("profile_cache.zig");
+const feed_media = @import("feed_media.zig");
+const view_profile = @import("view_profile.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const rememberHostRefusal = main.rememberHostRefusal;
 const warmedAlready = main.warmedAlready;
 const Effects = main.Effects;
 const avatar_target_px = main.avatar_target_px;
@@ -180,7 +184,7 @@ pub fn feedImageUrl(buf: []u8, src: []const u8) []const u8 {
 /// lives, so those faces never arrive at all without this. The picture is
 /// still resized by us afterwards, the same as a feed image fetched direct.
 pub fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct or proxyRefusesHost(src)) return src;
+    if (directAllowed(src, direct)) return src;
     return mediaUrl(buf, src, avatar_target_px, .square);
 }
 
@@ -190,12 +194,35 @@ pub fn avatarUrl(buf: []u8, src: []const u8, direct: bool) []const u8 {
 /// anything over the registry's budget. What a direct fetch costs is the bytes
 /// on the way in, since the proxy would have shrunk them first.
 pub fn feedImageUrlDirect(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    if (direct or proxyRefusesHost(src)) return src;
+    if (directAllowed(src, direct)) return src;
     return if (isGifUrl(src))
         mediaUrl(buf, src, gif_target_px, .animation)
     else
         mediaUrl(buf, src, media_target_px, .inside);
 }
+
+/// Whether a picture the proxy refused is fetched from its own host: only while
+/// the reader allows it. A picture already marked direct, or on a host the proxy
+/// refused, otherwise kept going direct after the setting was turned off.
+pub fn directAllowed(src: []const u8, direct: bool) bool {
+    return prefs.g_media_direct_fallback and (direct or proxyRefusesHost(src));
+}
+
+/// Unmarks every face, picture and banner that was going to load direct.
+pub fn forgetDirectFallbacks() void {
+    for (&profile_cache.g_profiles) |*p| p.avatar_direct = false;
+    for (&feed_media.g_media) |*m| m.direct = false;
+    view_profile.g_banner_direct = false;
+}
+
+pub fn feedImageUrlDirectForTest(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    return feedImageUrlDirect(buf, src, direct);
+}
+
+pub fn rememberHostRefusalForTest(host: []const u8) void {
+    rememberHostRefusal(host);
+}
+
 /// Whether the disk cache already holds this URL's bytes. Cheaper than loading
 /// them: warming only needs to know whether to ask the network, and decoding is
 /// the expensive half.

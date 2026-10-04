@@ -28,6 +28,7 @@ const backLabel = main.backLabel;
 const banner_target_px = main.banner_target_px;
 const bookmarkCount = main.bookmarkCount;
 const decodeAndRegister = main.decodeAndRegister;
+const directAllowed = main.directAllowed;
 const elide = main.elide;
 const feed_column_width = main.feed_column_width;
 const feed_row_chrome = main.feed_row_chrome;
@@ -146,7 +147,7 @@ var g_banner_host_buf: [96]u8 = undefined;
 var g_banner_host_len: u8 = 0;
 /// Ask the banner's own host rather than the proxy, for the same reason a face
 /// does. Cleared whenever the banner is started for somebody else.
-var g_banner_direct: bool = false;
+pub var g_banner_direct: bool = false;
 
 fn bannerUrl() []const u8 {
     return g_banner_url_buf[0..g_banner_url_len];
@@ -190,7 +191,7 @@ pub fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     const raw = personBanner(pubkey);
     if (raw.len == 0) return;
     var url_buf: [1024]u8 = undefined;
-    const url = if (g_banner_direct or proxyRefusesHost(raw)) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
+    const url = if (directAllowed(raw, g_banner_direct)) raw else mediaUrl(&url_buf, raw, banner_target_px, .inside);
     const bhost = hostOf(raw);
     const bn = @min(bhost.len, g_banner_host_buf.len);
     @memcpy(g_banner_host_buf[0..bn], bhost[0..bn]);

@@ -94,6 +94,42 @@ test "the proxy is never skipped, and the width shortcut reads the host, not the
         try testing.expectEqualStrings(src, main.mediaUrl(&buf, src, 512, .inside));
     }
 }
+
+test "turning off the direct fallback stops every direct fetch at once" {
+    const saved = main.mediaProxy();
+    var saved_buf: [200]u8 = undefined;
+    @memcpy(saved_buf[0..saved.len], saved);
+    const saved_len = saved.len;
+    defer main.setMediaProxy(saved_buf[0..saved_len]);
+    const was_on = main.mediaProxyOn();
+    defer main.setMediaProxyOn(was_on);
+    const fallback_was = main.mediaDirectFallback();
+    defer main.setMediaDirectFallback(fallback_was);
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    main.setMediaProxy("https://wsrv.nl/");
+    main.setMediaProxyOn(true);
+    main.setMediaDirectFallback(true);
+    var buf: [1024]u8 = undefined;
+    const src = "https://blocked.example/a.png";
+
+    // Allowed: the proxy refused the host, so its pictures load from it.
+    main.rememberHostRefusalForTest("blocked.example");
+    try testing.expectEqualStrings(src, main.avatarUrlForTest(&buf, src, false));
+    try testing.expectEqualStrings(src, main.feedImageUrlDirectForTest(&buf, src, false));
+    const p = main.upsertProfile([_]u8{0x76} ** 32).?;
+    p.avatar_direct = true;
+
+    // Turned off: the remembered host, a picture already marked direct and a
+    // face already marked direct all go back through the proxy.
+    main.setMediaDirectFallback(false);
+    try testing.expectEqual(@as(usize, 0), main.proxyRefusedCountForTest());
+    try testing.expect(!p.avatar_direct);
+    main.rememberHostRefusalForTest("blocked.example");
+    try testing.expect(std.mem.startsWith(u8, main.avatarUrlForTest(&buf, src, true), "https://wsrv.nl/?url="));
+    try testing.expect(std.mem.startsWith(u8, main.feedImageUrlDirectForTest(&buf, src, true), "https://wsrv.nl/?url="));
+}
 test "gif sources are recognised so their frames are kept" {
     try testing.expect(main.isGifUrl("https://x.com/a.gif"));
     try testing.expect(main.isGifUrl("https://x.com/a.GIF?v=1"));

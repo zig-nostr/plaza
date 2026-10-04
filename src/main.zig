@@ -6054,9 +6054,13 @@ pub const welcomeInboxArrivalsForTest = inbox.welcomeInboxArrivalsForTest;
 
 // re-exports: image_cache.zig
 pub const avatarUrlForTest = image_cache.avatarUrlForTest;
+pub const directAllowed = image_cache.directAllowed;
+pub const feedImageUrlDirectForTest = image_cache.feedImageUrlDirectForTest;
 pub const feedImageUrlForTest = image_cache.feedImageUrlForTest;
+pub const forgetDirectFallbacks = image_cache.forgetDirectFallbacks;
 pub const mediaUrlForTest = image_cache.mediaUrlForTest;
 pub const pictureWarmedForTest = image_cache.pictureWarmedForTest;
+pub const rememberHostRefusalForTest = image_cache.rememberHostRefusalForTest;
 pub const stbCanDecodeForTest = image_cache.stbCanDecodeForTest;
 pub const MediaFit = image_cache.MediaFit;
 pub const avatarUrl = image_cache.avatarUrl;

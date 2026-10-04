@@ -19,6 +19,7 @@ const geometry = native_sdk.geometry;
 const activePlaceLine = main.activePlaceLine;
 const applyActivePlaceLine = main.applyActivePlaceLine;
 const applyHiddenLine = main.applyHiddenLine;
+const forgetDirectFallbacks = main.forgetDirectFallbacks;
 const forgetProxyRefusals = main.forgetProxyRefusals;
 const hiddenLine = main.hiddenLine;
 const plazaDir = main.plazaDir;
@@ -148,6 +149,12 @@ pub fn mediaDirectFallback() bool {
 
 pub fn setMediaDirectFallback(on: bool) void {
     g_media_direct_fallback = on;
+    // Off means off from now, not from the next refusal: every host and every
+    // picture already marked to load direct goes back through the proxy.
+    if (!on) {
+        forgetProxyRefusals();
+        forgetDirectFallbacks();
+    }
 }
 
 /// Whether a typed proxy base is one this app can build a request from: an
