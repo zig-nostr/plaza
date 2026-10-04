@@ -225,7 +225,10 @@ fn blossomProbeWorker(pk: [32]u8) void {
         asked += 1;
         var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        // Watched, or not asked: an unwatched `receive` has no deadline, and a
+        // relay that went quiet would hold this worker, and the probe at
+        // "asking", for good. Skipped, the relay counts as not answered.
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe("plaza-bl", &filters) catch continue;
         var seen: usize = 0;
