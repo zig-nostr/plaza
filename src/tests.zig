@@ -9745,6 +9745,87 @@ test "the client-tag switch is wired, and flipping it sticks" {
     try testing.expect(!main.clientTag());
 }
 
+/// Whether the widget `id`, or an ancestor of it below the note card, answers a
+/// press. A press hit-tests to the deepest widget and walks UP to the nearest
+/// ancestor that claims one, so a plain label inside a pressable row is
+/// pressable too. The card itself opens the thread, so the walk stops there.
+fn pressOnPathTo(tree: AppUi.Tree, widget: canvas.Widget, id: anytype) bool {
+    return pressOnPath(tree, widget, id) orelse false;
+}
+
+fn pressOnPath(tree: AppUi.Tree, widget: canvas.Widget, id: anytype) ?bool {
+    var here = false;
+    if (!std.mem.eql(u8, widget.semantics.label, "Open thread")) {
+        for (tree.handlers) |h| {
+            if (h.id == widget.id and h.event == .press) here = true;
+        }
+    }
+    if (widget.id == id) return here;
+    for (widget.children) |child| {
+        if (pressOnPath(tree, child, id)) |below| return here or below;
+    }
+    return null;
+}
+
+test "a zap total is a plain figure in the verb row, not a control" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    defer for (0..main.hideables.len) |i| main.setHidden(@enumFromInt(i), false);
+    main.resetEngagementForTest();
+    defer main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x78} ** 32);
+    defer main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var target = [_]u8{0} ** 32;
+    target[0] = 0x51;
+    target[7] = 0x22;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].event_id = target;
+    model.notes[0].id = @intCast(std.mem.readInt(u64, target[0..8], .big) & std.math.maxInt(i64));
+    model.notes_len = 1;
+
+    // No zaps: nothing is drawn for them, rather than a bolt over a blank or a
+    // "0 sats".
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContainingText(tree.root, "sat") == null);
+    }
+
+    main.setZapMsatForTest(model.notes[0].id, 21_000);
+    const tree = try buildTree(arena, &model);
+    const figure = findAnyText(tree.root, "21 sats") orelse return error.ZapTotalMissing;
+    // Text, and only text: no press, no role and no label for a reader to try.
+    try testing.expect(figure.semantics.role != .button);
+    try testing.expectEqual(@as(usize, 0), figure.semantics.label.len);
+    try testing.expect(!canvas.semanticActions(figure).press);
+    try testing.expect(!pressOnPathTo(tree, tree.root, figure.id));
+
+    // And no bolt beside the verbs.
+    const p = try painted.Painted.render(arena, &model);
+    for (p.layout.nodes) |node| {
+        const by_channel = node.widget.icon.len > 0 and std.mem.eql(u8, node.widget.icon, "zap");
+        const by_text = node.widget.kind == .icon and std.mem.eql(u8, node.widget.text, "zap");
+        try testing.expect(!by_channel and !by_text);
+    }
+
+    // One sat reads as one, and the total goes with the preference.
+    main.setZapMsatForTest(model.notes[0].id, 1_000);
+    {
+        const one = try buildTree(arena, &model);
+        try testing.expect(findAnyText(one.root, "1 sat") != null);
+    }
+    main.setHidden(.zap_totals, true);
+    {
+        const hidden = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContainingText(hidden.root, " sat") == null);
+    }
+}
+
 test "a zap total no invoice could hold does not take the screen down with it" {
     // A zap total is a saturating u64, and the action bar narrowed it into a u32
     // to draw it: an abort in a safety build, a silently wrong number in the
@@ -12718,14 +12799,13 @@ test "every verb people expect is under a note" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Show them all, including the ones with nothing behind them yet: a row
-    // missing repost reads as a client that lost it, not one that has not
-    // written it. None of the unfinished ones takes a press, so nothing here
-    // answers a click with silence.
+    // Show them all: a row missing repost reads as a client that lost it, not
+    // one that has not written it. Every one of them takes a press, so nothing
+    // here answers a click with silence.
     //
-    // Four, not six. A bookmark that could only ever disappoint whoever pressed
-    // it is not a verb people expect, and the ellipsis beside it opened a menu a
-    // right-click already opens.
+    // Three, not six. A bookmark that could only ever disappoint whoever pressed
+    // it is not a verb people expect, the ellipsis beside it opened a menu a
+    // right-click already opens, and the bolt had no zap behind it.
     main.setIdentityForTest([_]u8{0x77} ** 32);
     defer main.clearIdentityForTest();
 
@@ -12737,7 +12817,7 @@ test "every verb people expect is under a note" {
 
     const p = try painted.Painted.render(arena, &model);
     var found: usize = 0;
-    for ([_][]const u8{ "reply", "repeat", "like", "zap" }) |name| {
+    for ([_][]const u8{ "reply", "repeat", "like" }) |name| {
         for (p.layout.nodes) |node| {
             // Two channels, because the SDK has two icon builders: `appIcon`
             // puts the name in `Widget.icon` (so a missing app glyph draws the
@@ -12754,10 +12834,12 @@ test "every verb people expect is under a note" {
             return error.MissingVerb;
         }
     }
-    try testing.expectEqual(@as(usize, 4), found);
+    try testing.expectEqual(@as(usize, 3), found);
 
-    // And the two that went are really gone, by the same two channels.
-    for ([_][]const u8{ "bookmark", "ellipsis" }) |name| {
+    // And the ones that went are really gone, by the same two channels. The bolt
+    // is among them: Plaza cannot send a zap, so a bolt that answers a press with
+    // nothing is a control that can only disappoint.
+    for ([_][]const u8{ "bookmark", "ellipsis", "zap" }) |name| {
         for (p.layout.nodes) |node| {
             const by_channel = node.widget.icon.len > 0 and std.mem.eql(u8, node.widget.icon, name);
             const by_text = node.widget.kind == .icon and std.mem.eql(u8, node.widget.text, name);

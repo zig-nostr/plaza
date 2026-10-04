@@ -3484,7 +3484,7 @@ pub const hideables = [_]HideableInfo{
     .{
         .id = "zaps",
         .label = "Zapping",
-        .detail = "The zap verb itself. Hiding it takes the total with it and stops the feed asking relays for zap receipts.",
+        .detail = "Zaps on notes. Hiding it takes the total with it and stops the feed asking relays for zap receipts.",
         .drops = &.{9735},
     },
     .{
@@ -30212,8 +30212,9 @@ const verb_slot_width: f32 = 64;
 const verb_slot_height: f32 = 30;
 const verb_icon_size: f32 = 15;
 
-/// The engagement row: reply, repost, like, zap, in that fixed order, each an
-/// icon and its crowd count (the count omitted at zero).
+/// The engagement row: reply, repost and like, in that fixed order, each an icon
+/// and its crowd count (the count omitted at zero), then the note's zap total as
+/// a plain figure.
 ///
 /// It used to carry two more. A bookmark, which had nothing behind it and was
 /// drawn quiet to say so, and an ellipsis that opened the note's menu. Both are
@@ -30223,9 +30224,9 @@ const verb_icon_size: f32 = 15;
 /// hit target to get there. The right-click menu is the door now
 /// (`noteContextItems`), on every row and on the focal note.
 ///
-/// Reply and like work. Repost and zap carry REAL counts and no action, so they
-/// keep the full tint: dimming them would misreport the crowd in order to say
-/// something about the app.
+/// Reply, repost and like work. The zap total is only a figure: Plaza cannot
+/// send a zap yet, so it is drawn as text rather than as a control that
+/// answers a press with nothing.
 fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
     if (!anyVerbShown()) return ui.spacer(0);
     return engagementRowAt(ui, note, true);
@@ -30233,13 +30234,12 @@ fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
 
 /// Whether the verb row has anything left to draw.
 ///
-/// Four verbs, each removable in Settings, and nothing else in the row since the
-/// bookmark and the ellipsis went. Turning all four off used to leave the gap
-/// above the row and the row's own height behind, so the bottom of every note
-/// kept a band of nothing where the verbs had been.
+/// Three verbs, each removable in Settings. The zap total is not one of them: it
+/// is a figure that exists on some notes and not others, so counting it here
+/// would keep an empty row, and the band of nothing above it, on every note
+/// that has none.
 fn anyVerbShown() bool {
-    return !isTakenAway(.replies) or !isTakenAway(.reposts) or
-        !isTakenAway(.reactions) or !isTakenAway(.zaps);
+    return !isTakenAway(.replies) or !isTakenAway(.reposts) or !isTakenAway(.reactions);
 }
 
 /// The same row, told whether to carry its counts. The focal note in a thread
@@ -30261,9 +30261,20 @@ fn engagementRowAt(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
         })),
         if (isTakenAway(.reposts)) ui.spacer(0) else verbSlot(ui, repostAction(ui, note, c, counts)),
         if (isTakenAway(.reactions)) ui.spacer(0) else verbSlot(ui, likeAction(ui, note, counts)),
-        // The zap count is summed sats (msat / 1000); the action itself waits
-        // on a wallet.
-        if (isTakenAway(.zaps)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "zap"), if (counts and !countHidden(.zaps, .zap_totals)) c.zap_msat / 1000 else 0, p.text_metric, .{})),
+        // Plaza cannot send a zap yet, so the total is a figure and not a verb:
+        // no bolt, no hover, nothing to press. It is the summed sats (msat /
+        // 1000), and nothing at all when there are none or the count is hidden.
+        if (isTakenAway(.zaps) or !counts or countHidden(.zaps, .zap_totals)) ui.spacer(0) else zapTotal(ui, c.zap_msat / 1000),
+    });
+}
+
+/// What a note was zapped, as plain text in the verb row. Read-only on purpose:
+/// it carries no press, no hover and no role, and draws no icon, so it cannot be
+/// mistaken for the verbs beside it. Absent at zero rather than "0 sats".
+fn zapTotal(ui: *AppUi, sats: u64) AppUi.Node {
+    if (sats == 0) return ui.spacer(0);
+    return ui.row(.{ .height = verb_slot_height, .cross = .center, .gap = 0 }, .{
+        metaText(ui, ui.fmt("{s} {s}", .{ formatCount(ui.arena, sats), if (sats == 1) "sat" else "sats" }), theme.palette.text_metric),
     });
 }
 
