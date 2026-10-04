@@ -13,6 +13,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const isAuthRequired = main.isAuthRequired;
 const handlePlazaLink = main.handlePlazaLink;
 const takePendingLink = main.takePendingLink;
 const Effects = main.Effects;
@@ -765,7 +766,12 @@ fn placeIdsSnapshot(out: [][32]u8) usize {
 /// `no_feed` is a place with nothing to dial: no feed at all, or a feed that
 /// names no relay and a place that names none either. It is not a wait, and
 /// reading it as one left "Connecting to this place" up for good.
-pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay, no_feed };
+///
+/// `refused` is a relay that answered and closed the feed: most often a relay
+/// that wants to know who the reader is (NIP-42) before it shows anything. The
+/// socket was up, so it used to read as `connected` with an empty room, which
+/// says the place is quiet when it is shut.
+pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay, no_feed, refused };
 var g_place_link = std.atomic.Value(u8).init(@intFromEnum(PlaceLink.idle));
 
 pub fn placeLink() PlaceLink {
@@ -773,6 +779,52 @@ pub fn placeLink() PlaceLink {
 }
 pub fn setPlaceLink(state: PlaceLink) void {
     g_place_link.store(@intFromEnum(state), .monotonic);
+}
+
+/// What the room says when its relay closed the feed, written by the worker
+/// before it sets `refused` and read by the view after it sees that.
+var g_place_refusal_buf: [200]u8 = undefined;
+
+var g_place_refusal_len = std.atomic.Value(u8).init(0);
+
+pub fn placeRefusalLine() []const u8 {
+    return g_place_refusal_buf[0..g_place_refusal_len.load(.acquire)];
+}
+
+/// Records why the place's relay closed its feed, in words for the room. Only
+/// for the worker that still owns the room, like every other write here.
+fn notePlaceRefusal(gen: u32, reason: []const u8) void {
+    if (g_place_gen.load(.monotonic) != gen) return;
+    var line: []const u8 = undefined;
+    if (isAuthRequired(reason)) {
+        line = "This place's relay wants to know who you are before it shows anything.";
+        @memcpy(g_place_refusal_buf[0..line.len], line);
+    } else {
+        // A stranger's words on screen: control bytes become spaces, and the
+        // length is capped on a character boundary.
+        const lead = "This place's relay closed its feed";
+        var n: usize = lead.len;
+        @memcpy(g_place_refusal_buf[0..n], lead);
+        const said = std.mem.trim(u8, reason, " \t\r\n");
+        if (said.len == 0) {
+            const tail = " without saying why.";
+            @memcpy(g_place_refusal_buf[n..][0..tail.len], tail);
+            n += tail.len;
+        } else {
+            const mid = ": ";
+            @memcpy(g_place_refusal_buf[n..][0..mid.len], mid);
+            n += mid.len;
+            var take = @min(said.len, g_place_refusal_buf.len - n);
+            while (take > 0 and take < said.len and (said[take] & 0xC0) == 0x80) take -= 1;
+            for (said[0..take]) |c| {
+                g_place_refusal_buf[n] = if (c < 0x20 or c == 0x7f) ' ' else c;
+                n += 1;
+            }
+        }
+        line = g_place_refusal_buf[0..n];
+    }
+    g_place_refusal_len.store(@intCast(line.len), .release);
+    setPlaceLink(.refused);
 }
 
 pub fn clearPlaceFeed() void {
@@ -891,29 +943,51 @@ pub fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: 
     while (g_place_gen.load(.monotonic) == gen) {
         var msg = (relay.receive() catch break) orelse break;
         defer msg.deinit();
-        switch (msg.value) {
-            .event => |e| {
-                _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url_buf[0..url_len]) catch continue;
-                // The reader left, or moved: this thread's list is not the one
-                // being shown any more, so it stops rather than writing into it.
-                if (g_place_gen.load(.monotonic) != gen) break;
-                wantProfile(e.event.pubkey);
-                lockPlaceIds();
-                defer unlockPlaceIds();
-                if (g_place_ids_len < g_place_ids.len) {
-                    g_place_ids[g_place_ids_len] = e.event.id;
-                    g_place_ids_len += 1;
-                    _ = g_place_rev.fetchAdd(1, .monotonic);
-                }
-            },
-            // NOT closed at EOSE: a place is somewhere you sit, so the socket
-            // stays open and new notes arrive while the reader is looking.
-            else => {},
+        switch (placeFeedStep(gpa, signer, url_buf[0..url_len], gen, msg.value)) {
+            .more => {},
+            .left => break,
+            .done => return,
         }
     }
     // The loop only ends when the socket died or the reader left. The first is
     // worth saying out loud; the second already reset this.
     if (g_place_gen.load(.monotonic) == gen) setPlaceLink(.unreachable_relay);
+}
+
+/// What one message from the place's relay does to the room.
+const PlaceFeedStep = enum { more, left, done };
+
+fn placeFeedStep(gpa: std.mem.Allocator, signer: nostr.keys.Signer, url: []const u8, gen: u32, value: nostr.message.RelayMessage) PlaceFeedStep {
+    switch (value) {
+        .event => |e| {
+            _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch return .more;
+            // The reader left, or moved: this thread's list is not the one
+            // being shown any more, so it stops rather than writing into it.
+            if (g_place_gen.load(.monotonic) != gen) return .left;
+            wantProfile(e.event.pubkey);
+            lockPlaceIds();
+            defer unlockPlaceIds();
+            if (g_place_ids_len < g_place_ids.len) {
+                g_place_ids[g_place_ids_len] = e.event.id;
+                g_place_ids_len += 1;
+                _ = g_place_rev.fetchAdd(1, .monotonic);
+            }
+            return .more;
+        },
+        // The relay ended the feed, and nothing more will come down it.
+        // Said in the room, rather than left as a connected socket over an
+        // empty list. Answering a NIP-42 challenge here is not done: this
+        // socket is a visitor's, and signing in to a stranger's relay is the
+        // reader's call, not a side effect of walking in.
+        .closed => |c| {
+            if (!std.mem.eql(u8, c.subscription_id, "plaza-place")) return .more;
+            notePlaceRefusal(gen, c.message);
+            return .done;
+        },
+        // NOT closed at EOSE: a place is somewhere you sit, so the socket
+        // stays open and new notes arrive while the reader is looking.
+        else => return .more,
+    }
 }
 
 /// Whether the places rail is out. One boolean, persisted, and that is the
@@ -1869,6 +1943,15 @@ pub fn savePlacesForTest() void {
 
 pub fn setPlaceLinkForTest(state: PlaceLink) void {
     setPlaceLink(state);
+}
+
+/// One message through the feed worker's own step, for the room it belongs to
+/// or, `stale`, for one already left. Returns the step's name.
+pub fn placeFeedStepForTest(stale: bool, value: nostr.message.RelayMessage) []const u8 {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const gen = g_place_gen.load(.monotonic) -% @as(u32, if (stale) 1 else 0);
+    return @tagName(placeFeedStep(std.heap.page_allocator, signer, "wss://place.example", gen, value));
 }
 
 /// Runs a feed worker that belongs to a room already left, against a url that

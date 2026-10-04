@@ -603,7 +603,7 @@ pub const AuthReaction = struct {
     resend: OwedSubs = .{},
 };
 
-fn isAuthRequired(reason: []const u8) bool {
+pub fn isAuthRequired(reason: []const u8) bool {
     // NIP-01's machine-readable prefix, matched the way both reference clients
     // match it: by the start of the reason, nothing after the colon.
     return std.mem.startsWith(u8, reason, "auth-required");

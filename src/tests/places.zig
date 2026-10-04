@@ -19,6 +19,9 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const findAnyTextContaining = harness.findAnyTextContaining;
+const buildTree = harness.buildTree;
+const closedMsg = harness.closedMsg;
 const AddressFixture = harness.AddressFixture;
 const expectKeyboardReach = harness.expectKeyboardReach;
 const frameOfText = harness.frameOfText;
@@ -2040,6 +2043,45 @@ test "an empty place says what its own relay is doing, not the pool's" {
 
     main.setPlaceLinkForTest(.connected);
     try testing.expectEqualStrings("Nothing here yet.", model.empty_text());
+}
+
+test "a place whose relay closes the feed says so, rather than that it is empty" {
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.visitPlaceWithFeedForTest([_]u8{0x5e} ** 32, "gated", "Members Only", "The relay");
+    main.setPlaceLinkForTest(.connected);
+
+    // Another subscription's CLOSED is not the room's.
+    try testing.expectEqualStrings("more", main.placeFeedStepForTest(false, closedMsg("plaza-feed", "auth-required: no")));
+    try testing.expectEqual(main.PlaceLink.connected, main.placeLink());
+
+    // A relay that wants to know who the reader is. The worker stops, and the
+    // room says that instead of "Nothing here yet."
+    try testing.expectEqualStrings("done", main.placeFeedStepForTest(false, closedMsg("plaza-place", "auth-required: members only")));
+    try testing.expectEqual(main.PlaceLink.refused, main.placeLink());
+    try testing.expectEqualStrings("This place's relay wants to know who you are before it shows anything.", model.empty_text());
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContaining(tree.root, "wants to know who you are"));
+    try testing.expect(findAnyTextContaining(tree.root, "feed closed by its relay"));
+
+    // Any other reason is shown as the relay gave it, without its control bytes.
+    main.setPlaceLinkForTest(.connected);
+    _ = main.placeFeedStepForTest(false, closedMsg("plaza-place", "error: shutting\x07down\n"));
+    try testing.expectEqualStrings("This place's relay closed its feed: error: shutting down", model.empty_text());
+    main.setPlaceLinkForTest(.connected);
+    _ = main.placeFeedStepForTest(false, closedMsg("plaza-place", ""));
+    try testing.expectEqualStrings("This place's relay closed its feed without saying why.", model.empty_text());
+
+    // A worker for a room already left paints nothing.
+    main.setPlaceLinkForTest(.connected);
+    _ = main.placeFeedStepForTest(true, closedMsg("plaza-place", "auth-required: x"));
+    try testing.expectEqual(main.PlaceLink.connected, main.placeLink());
 }
 
 test "a smaller line is asked for by its size, not by scaling every span" {

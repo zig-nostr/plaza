@@ -13,6 +13,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const feed_column_width = main.feed_column_width;
 const AppUi = main.AppUi;
 const Model = main.Model;
 const activePlace = main.activePlace;
@@ -227,7 +228,9 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (activePlace()) |m| placeHeader(ui, model, m) else scopeHeader(ui, model),
         if (model.notes_len == 0)
             ui.column(.{ .gap = 12, .main = .center, .cross = .center, .grow = 1, .padding = 24 }, .{
-                ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, model.empty_text()),
+                // Wrapped and centred in the feed's column: a refusal can carry
+                // the relay's own words, and one line elided them mid-sentence.
+                ui.text(.{ .style_tokens = .{ .foreground = .text_muted }, .wrap = true, .width = feed_column_width, .text_alignment = .center }, model.empty_text()),
             })
         else
             // The list owns its scroll state, keyed by the id in `feedOptions`,

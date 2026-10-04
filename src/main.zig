@@ -1691,6 +1691,7 @@ pub const Model = struct {
                 .unreachable_relay => if (p) |m| (if (m.lostLine().len > 0) m.lostLine() else "Can't reach this place. Retrying…") else "Can't reach this place. Retrying…",
                 .connected => if (p) |m| (if (m.emptyLine().len > 0) m.emptyLine() else "Nothing here yet.") else "Nothing here yet.",
                 .no_feed => "This place has no feed to read.",
+                .refused => placeRefusalLine(),
             };
         }
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
@@ -5306,6 +5307,8 @@ pub const nip05Resolve = login.nip05Resolve;
 pub const parseAddress = login.parseAddress;
 
 // re-exports: places.zig
+pub const placeFeedStepForTest = places.placeFeedStepForTest;
+pub const placeRefusalLine = places.placeRefusalLine;
 pub const drainPendingLinkForTest = places.drainPendingLinkForTest;
 pub const forgetPlaceFetchForTest = places.forgetPlaceFetchForTest;
 pub const drainPendingLink = places.drainPendingLink;
@@ -6810,6 +6813,7 @@ pub const swapThreadRoot = navigation.swapThreadRoot;
 pub const topicFilter = navigation.topicFilter;
 
 // re-exports: relay_auth.zig
+pub const isAuthRequired = relay_auth.isAuthRequired;
 pub const AuthReactionForTest = relay_auth.AuthReactionForTest;
 pub const AuthSessionForTest = relay_auth.AuthSessionForTest;
 pub const answerHelperAuthForTest = relay_auth.answerHelperAuthForTest;

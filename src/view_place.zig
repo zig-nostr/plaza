@@ -500,6 +500,10 @@ pub fn placeHeader(ui: *AppUi, model: *const Model, m: *const Place) AppUi.Node 
                     .{ .style = .{ .foreground = p.status_warning } },
                     &.{.{ .text = "cannot reach this place", .monospace = true, .scale = mono_meta_scale }},
                 ),
+                .refused => ui.paragraph(
+                    .{ .style = .{ .foreground = p.status_warning } },
+                    &.{.{ .text = "feed closed by its relay", .monospace = true, .scale = mono_meta_scale }},
+                ),
                 else => ui.spacer(0),
             },
             ui.spacer(1),
