@@ -471,6 +471,60 @@ test "the name beat forwards the tags it read, the same as the sheet's save" {
     try testing.expect(std.mem.indexOf(u8, written, "github:someone") != null);
     try testing.expect(std.mem.indexOf(u8, written, "mastodon:someone@example.social") != null);
 }
+test "the name beat says so when it cannot build the write, and sends nothing" {
+    // Out of memory in the merge or the tag copy used to return true, so the
+    // caller said "Name set" for a name nothing had been sent for. Every
+    // allocation the build makes is failed in turn, with a stored profile that
+    // has tags so both the merge and the tag copy are reached.
+    defer main.resetOutboxForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x5d} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/namefail.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    main.setIdentityForTest([_]u8{0x5d} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &.{ "i", "github:someone", "a-proof-url" },
+        &.{ "i", "mastodon:someone@example.social", "another-proof" },
+    };
+    const before = try nostr.event.create(arena, signer, kp, 1_800_000_000, 0, &tags, "{\"about\":\"kept\"}", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, before, signer);
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    var fail_index: usize = 0;
+    var refused: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        model.name_buffer.set("Bob");
+        model.toast_len = 0;
+        var failing = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = fail_index });
+        if (main.publishNameWithForTest(&model, &fx, failing.allocator())) break;
+        refused += 1;
+        try testing.expectEqualStrings("Name not set. Try again.", model.toast_text());
+        try testing.expectEqualStrings("Bob", model.name_buffer.text());
+        try testing.expect(main.lastPublishedForTest() == null);
+    }
+    // Both the merge and the tag copy were refused before one went through.
+    try testing.expect(refused >= 2);
+    try testing.expect(fail_index < 64);
+    try testing.expect(main.lastPublishedForTest() != null);
+}
 test "the name beat waits for a busy signer and says so" {
     // It signed without asking, and said "Name set" for a name a busy signer
     // never took.

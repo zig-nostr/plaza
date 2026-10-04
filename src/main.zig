@@ -6632,6 +6632,7 @@ pub const ownProfileAnsweredForTest = own_profile.ownProfileAnsweredForTest;
 pub const ownRecordContentForTest = own_profile.ownRecordContentForTest;
 pub const ownRecordTagsJoinedForTest = own_profile.ownRecordTagsJoinedForTest;
 pub const publishNameForTest = own_profile.publishNameForTest;
+pub const publishNameWithForTest = own_profile.publishNameWithForTest;
 pub const recordOwnProfileAnswerForTest = own_profile.recordOwnProfileAnswerForTest;
 pub const replayPendingForTest = own_profile.replayPendingForTest;
 pub const seedProfileFieldsForTest = own_profile.seedProfileFieldsForTest;

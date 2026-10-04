@@ -722,6 +722,13 @@ fn ownProfileWorker(pk: [32]u8) void {
 /// Returns false when the write was refused and the toast says why, so the
 /// beat stays open for another press.
 pub fn publishName(model: *Model, fx: *Effects) bool {
+    return publishNameWith(model, fx, std.heap.page_allocator);
+}
+
+/// `publishName` with the allocator for the two copies the write is built from.
+/// It has to be the allocator the write seam frees with; the seam exists so a
+/// test can make those copies fail.
+fn publishNameWith(model: *Model, fx: *Effects, build: std.mem.Allocator) bool {
     const raw = trimmedField(model.name_buffer.text());
     if (raw.len == 0) return true;
     // Gated like every other write: a sign the signer cannot take would leave
@@ -749,13 +756,19 @@ pub fn publishName(model: *Model, fx: *Effects) bool {
     // Quotes and backslashes are ESCAPED, not dropped: a name is prose, and the
     // serializer knows how to carry prose. (Dropping them was a fixed 64-byte
     // buffer away from a longer field overflowing it.)
-    const json = mergeNameJson(gpa, if (existing) |e| e.json else "{}", raw) orelse return true;
+    //
+    // Out of memory here is a refusal, not a skip: returning true said "Name
+    // set" with nothing sent.
+    const json = mergeNameJson(build, if (existing) |e| e.json else "{}", raw) orelse return nameNotSet(model);
     // The TAGS come forward, the same as the sheet's save. The beat only arms on
     // a key this app just minted, which has no kind:0 and therefore no NIP-39
     // proofs to lose, so this is not a bug being fixed: it is the one line that
     // stopped the doc comment above from being true, and the read of the stored
     // profile two lines up says plainly that somebody already expected one.
-    const tags = dupeTags(gpa, prev_tags) orelse return true;
+    const tags = dupeTags(build, prev_tags) orelse {
+        build.free(json);
+        return nameNotSet(model);
+    };
     signAndPublish(fx, gpa, @max(nowSeconds(), prev_created_at + 1), 0, tags, json, false, .profile, null);
     // Seed the cache: the composer line and the feed show the name at once.
     if (activePubkey()) |pk| {
@@ -763,6 +776,15 @@ pub fn publishName(model: *Model, fx: *Effects) bool {
     }
     model.name_buffer.clear();
     return true;
+}
+
+const name_not_set_toast = "Name not set. Try again.";
+
+/// A name that could not be built into a write. The beat stays open for another
+/// press, the same as for a busy signer.
+fn nameNotSet(model: *Model) bool {
+    setToast(model, name_not_set_toast);
+    return false;
 }
 
 /// The name beat's one-field merge: the same read-modify-write as the sheet's,
@@ -855,6 +877,11 @@ pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, mod
 /// are invisible to `mergeNameJsonForTest`, which only sees the content.
 pub fn publishNameForTest(model: *Model, fx: *Effects) void {
     _ = publishName(model, fx);
+}
+
+/// `publishNameForTest` with the copies built from `build`, and the verdict.
+pub fn publishNameWithForTest(model: *Model, fx: *Effects, build: std.mem.Allocator) bool {
+    return publishNameWith(model, fx, build);
 }
 
 pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
