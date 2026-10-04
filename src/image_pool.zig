@@ -10,6 +10,7 @@ const inbox = @import("inbox.zig");
 const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
 const feed_media = @import("feed_media.zig");
+const view_place = @import("view_place.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -149,8 +150,8 @@ pub fn imageIdOwners() [image_registry_slots + 1]IdOwner {
     if (main.g_banner_image_id >= 1 and main.g_banner_image_id <= image_registry_slots) {
         owners[@intCast(main.g_banner_image_id)] = .banner;
     }
-    if (main.g_place_logo_id >= 1 and main.g_place_logo_id <= image_registry_slots) {
-        owners[@intCast(main.g_place_logo_id)] = .place_logo;
+    if (view_place.g_place_logo_id >= 1 and view_place.g_place_logo_id <= image_registry_slots) {
+        owners[@intCast(view_place.g_place_logo_id)] = .place_logo;
     }
     for (&profile_cache.g_profiles) |*p| {
         if (p.used and p.image_id >= 1 and p.image_id <= image_registry_slots) {
@@ -178,7 +179,7 @@ pub fn imageIdSeen(owner: IdOwner) ?u64 {
         .avatar => |p| if (p.avatar_clock == profile_cache.g_image_clock or p.avatar_state == .fetching) null else p.avatar_clock,
         .media => |m| if (m.last_used == profile_cache.g_image_clock or m.state == .fetching) null else m.last_used,
         .banner => if (main.g_banner_seen == profile_cache.g_image_clock) null else main.g_banner_seen,
-        .place_logo => if (main.g_place_logo_seen == profile_cache.g_image_clock or main.g_place_logo_state == .fetching) null else main.g_place_logo_seen,
+        .place_logo => if (view_place.g_place_logo_seen == profile_cache.g_image_clock or view_place.g_place_logo_state == .fetching) null else view_place.g_place_logo_seen,
     };
 }
 
@@ -203,8 +204,8 @@ fn releaseImageId(fx: *Effects, owner: IdOwner, id: u64) void {
             main.g_banner_state = .idle;
         },
         .place_logo => {
-            main.g_place_logo_id = 0;
-            main.g_place_logo_state = .idle;
+            view_place.g_place_logo_id = 0;
+            view_place.g_place_logo_state = .idle;
         },
     }
 }
