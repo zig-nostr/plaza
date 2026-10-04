@@ -15,6 +15,7 @@ const tests_feed_media = @import("tests/feed_media.zig");
 const tests_feed_state = @import("tests/feed_state.zig");
 const tests_follows = @import("tests/follows.zig");
 const tests_hiding = @import("tests/hiding.zig");
+const tests_image_cache = @import("tests/image_cache.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -497,37 +498,6 @@ test "image links are recognised by extension only" {
     );
 }
 
-test "media URLs route through the proxy, the host, or neither" {
-    const saved = main.mediaProxy();
-    var saved_buf: [200]u8 = undefined;
-    @memcpy(saved_buf[0..saved.len], saved);
-    const saved_len = saved.len;
-    defer main.setMediaProxy(saved_buf[0..saved_len]);
-
-    var buf: [1024]u8 = undefined;
-
-    // With a proxy configured, the source is percent-encoded into it.
-    main.setMediaProxy("https://wsrv.nl/");
-    const proxied = main.mediaUrl(&buf, "https://host.example/a b.jpg", 512, .inside);
-    try testing.expect(std.mem.startsWith(u8, proxied, "https://wsrv.nl/?url="));
-    try testing.expect(std.mem.indexOf(u8, proxied, "https%3A%2F%2Fhost.example%2Fa%20b.jpg") != null);
-    try testing.expect(std.mem.indexOf(u8, proxied, "w=512") != null);
-
-    // Avatars ask for a square crop at their own size.
-    const square = main.mediaUrl(&buf, "https://host.example/a.jpg", 128, .square);
-    try testing.expect(std.mem.indexOf(u8, square, "fit=cover") != null);
-    try testing.expect(std.mem.indexOf(u8, square, "h=128") != null);
-
-    // A host that resizes for itself skips the proxy entirely.
-    const native_resize = main.mediaUrl(&buf, "https://blossom.nostr.build/abc.jpg", 512, .inside);
-    try testing.expectEqualStrings("https://blossom.nostr.build/abc.jpg?w=512", native_resize);
-
-    // No proxy configured: load the original, untouched.
-    main.setMediaProxy("");
-    const direct = main.mediaUrl(&buf, "https://host.example/a.jpg", 512, .inside);
-    try testing.expectEqualStrings("https://host.example/a.jpg", direct);
-}
-
 test "an empty display_name falls through to the name" {
     main.resetProfilesForTest();
     defer main.resetProfilesForTest();
@@ -755,12 +725,6 @@ test "only plain http(s) links are handed to the opener" {
     try testing.expect(!main.isSafeExternalUrl("https://example.com/a b"));
     try testing.expect(!main.isSafeExternalUrl("https://example.com/a\nb"));
     try testing.expect(!main.isSafeExternalUrl(""));
-}
-
-test "gif sources are recognised so their frames are kept" {
-    try testing.expect(main.isGifUrl("https://x.com/a.gif"));
-    try testing.expect(main.isGifUrl("https://x.com/a.GIF?v=1"));
-    try testing.expect(!main.isGifUrl("https://x.com/a.jpg"));
 }
 
 test "imeta dimensions parse, including float forms" {
@@ -4533,27 +4497,6 @@ test "how new the saved pool is survives a restart" {
     main.stageOwnRelayListForTest(newer);
     try testing.expect(main.adoptRelayListForTest());
     try testing.expectEqualStrings("wss://changed-elsewhere.example.com", main.relayUrlAt(0));
-}
-
-test "a warmed picture is asked for at the address the row will look up" {
-    // The disk cache is keyed by the URL, and two callers want one: the row that
-    // holds a slot, and the warm pass that does not. Ask for a different size, or
-    // forget the GIF branch, and the warmed bytes land under a name nothing looks
-    // up, so the download happens twice and the row still waits.
-    //
-    // They share one builder, so there are not two spellings to drift. What is
-    // worth pinning is that the builder still tells a GIF from a still: the sizes
-    // differ, so getting that wrong would reintroduce the same miss.
-    var a: [1024]u8 = undefined;
-    var b: [1024]u8 = undefined;
-    const gif = main.feedImageUrlForTest(&a, "https://example.com/a.gif");
-    const still = main.feedImageUrlForTest(&b, "https://example.com/a.jpg");
-    try testing.expect(gif.len > 0 and still.len > 0);
-    try testing.expect(!std.mem.eql(u8, gif, still));
-    // And a query string does not hide the extension from it.
-    var c: [1024]u8 = undefined;
-    const gif_q = main.feedImageUrlForTest(&c, "https://example.com/a.gif?w=1");
-    try testing.expect(std.mem.indexOf(u8, gif_q, "a.gif") != null);
 }
 
 test "a follow's relay list is a suggestion, and only where they write" {
@@ -15075,31 +15018,6 @@ test "pressing a mention opens that profile, and pressing a link does not" {
     try testing.expectEqualSlices(u8, &pk, &model.viewing_profile.?);
 }
 
-test "a decoded image is refused by size before anything multiplies it" {
-    // Ordinary pictures, including a large photograph.
-    try testing.expect(main.imageSizeUsable(1, 1));
-    try testing.expect(main.imageSizeUsable(4032, 3024));
-    try testing.expect(main.imageSizeUsable(8000, 4000));
-
-    // Nothing to decode.
-    try testing.expect(!main.imageSizeUsable(0, 100));
-    try testing.expect(!main.imageSizeUsable(100, 0));
-
-    // A single dimension past the cap, which is what keeps the area check from
-    // being computed on numbers that could wrap.
-    try testing.expect(!main.imageSizeUsable(20000, 4));
-    try testing.expect(!main.imageSizeUsable(4, 20000));
-
-    // Both dimensions plausible on their own, and their product is not: this is
-    // the shape a file built to make an app allocate takes, and it is the one a
-    // per-dimension limit alone lets through.
-    try testing.expect(!main.imageSizeUsable(16000, 16000));
-
-    // The largest thing stb itself will hand back. Reached only through the
-    // dimension check, which is the point: the area check never runs on it.
-    try testing.expect(!main.imageSizeUsable(1 << 24, 1 << 24));
-}
-
 // -- Reposting ----------------------------------------------------------------
 
 test "a repost carries the tags other clients read it by" {
@@ -16480,31 +16398,6 @@ test "a whole batch arriving at once keeps the order it arrived in" {
             return error.TiesReordered;
         }
     }
-}
-
-test "the vendored decoder cannot read WEBP, which is why avatars need the platform" {
-    // This is the fact the avatar path rests on, and it is worth a test because
-    // getting it wrong broke every face in the app.
-    //
-    // src/stb_impl.c builds stb for JPEG, PNG and GIF only. The image proxy
-    // hands back WEBP: 327 of the 400 files in my own media cache. So a decode
-    // path that sends small images to stb ALONE sends them to a decoder that
-    // cannot read the format they arrive in, and every avatar falls back to
-    // initials. `decodeAndRegister` therefore keeps the platform decoder as a
-    // format fallback for the small consumers, even though it returns a larger
-    // image than they asked for.
-    //
-    // A bare RIFF/WEBP signature is enough: stb refusing it proves no WEBP
-    // decoder is compiled in. If somebody later enables one, or vendors
-    // libwebp, this goes red and the fallback can be revisited on purpose
-    // rather than deleted by accident.
-    const webp_signature = "RIFF\x24\x00\x00\x00WEBPVP8 ";
-    try testing.expect(!main.stbCanDecodeForTest(webp_signature));
-
-    // The formats it IS built for still decode, so the assertion above is about
-    // WEBP and not about the buffer being short.
-    const png_1x1 = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0aIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB\x60\x82";
-    try testing.expect(main.stbCanDecodeForTest(png_1x1));
 }
 
 test "a reply in the feed says what it answers" {
@@ -26610,6 +26503,7 @@ test {
     _ = tests_feed_state;
     _ = tests_follows;
     _ = tests_hiding;
+    _ = tests_image_cache;
 }
 
 // re-exports: tests/feed_media.zig
