@@ -21324,11 +21324,13 @@ fn freshListConfirm(ui: *AppUi, ask: FreshAsk) AppUi.Node {
         .follow => "follow list",
         .mute => "mute list",
         .bookmark, .bookmark_privately => "bookmark list",
+        .add_media_server => "media server list",
     };
     const holds = switch (ask.action) {
         .follow => "this one person",
         .mute => "this one person",
         .bookmark, .bookmark_privately => "this one note",
+        .add_media_server => "this one server",
     };
     // A set width, and the panel drawn by a card that pads itself around one
     // column, like the join sheet. The dialog sizes what it holds as if a
@@ -25173,7 +25175,7 @@ fn retryOwnListsRead() void {
 }
 
 /// The lists a write can replace.
-pub const ListKind = enum { follows, mutes, bookmarks, profile };
+pub const ListKind = enum { follows, mutes, bookmarks, profile, media_servers };
 
 /// Which lists the reader has said, with every relay finished, are new for this
 /// account. Keyed by the pubkey it was said about, like every conclusion about
@@ -25247,6 +25249,7 @@ fn listHeld(kind: ListKind) bool {
         .mutes => ownRecordExists(mute_list_kind),
         .bookmarks => ownRecordExists(bookmark_list_kind),
         .profile => ownRecordExists(0),
+        .media_servers => ownRecordExists(blossom_list_kind),
     };
 }
 
@@ -35182,6 +35185,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         else => |outcome| sayBookmarkWrite(model, outcome, true),
                     }
                 },
+                .add_media_server => sayBlossomAdd(model, writeBlossomServers(fx, ask.server(), null)),
             }
         },
         .delete_note_confirm => {
@@ -35960,15 +35964,29 @@ pub const FreshAsk = struct {
     who: [32]u8 = [_]u8{0} ** 32,
     /// The note to bookmark.
     note_id: i64 = 0,
+    /// The media server to add, normalized.
+    server_buf: [blossom.max_server_len]u8 = undefined,
+    server_len: u8 = 0,
 
-    pub const Action = enum { follow, mute, bookmark, bookmark_privately };
+    pub const Action = enum { follow, mute, bookmark, bookmark_privately, add_media_server };
 
     pub fn kind(self: FreshAsk) ListKind {
         return switch (self.action) {
             .follow => .follows,
             .mute => .mutes,
             .bookmark, .bookmark_privately => .bookmarks,
+            .add_media_server => .media_servers,
         };
+    }
+
+    fn mediaServer(url: []const u8) FreshAsk {
+        var ask = FreshAsk{ .action = .add_media_server };
+        ask.server_len = @intCast(copyBounded(&ask.server_buf, url));
+        return ask;
+    }
+
+    fn server(self: *const FreshAsk) []const u8 {
+        return self.server_buf[0..self.server_len];
     }
 };
 
@@ -38373,27 +38391,19 @@ fn blossomProbeWorker(pk: [32]u8) void {
     }
 }
 
-fn blossomProbeClean() bool {
-    const pk = activePubkey() orelse return false;
-    lockBlossom();
-    defer unlockBlossom();
-    const asked = g_blossom_probe_for orelse return false;
-    if (!std.mem.eql(u8, &asked, &pk)) return false;
-    return g_blossom_probe_state.load(.acquire) == probe_clean;
-}
-
 fn blossomProbeAsking() bool {
     return g_blossom_probe_state.load(.acquire) == probe_asking;
 }
 
 /// Whether the account's server list may be published. Either it is here, so an
 /// edit splices onto it and loses nothing, or the key was made in this app a
-/// moment ago, or every relay was asked and none has one.
+/// moment ago, or every relay the reader writes to has finished without one, in
+/// which case the first Add asks before it starts a list.
 fn canWriteBlossomList() bool {
     if (activePubkey() == null) return false;
     if (haveOwnBlossomList()) return true;
     if (g_identity_minted_here) return true;
-    return blossomProbeClean();
+    return ownRelaysAllFinished();
 }
 
 pub const BlossomWrite = enum {
@@ -38433,8 +38443,13 @@ fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]const 
     // With nothing stored to splice onto, only proof that there is nothing to
     // lose licenses a write. A list held in memory is not that proof: it is a
     // copy of a stored record, and a stored record that has gone is the case
-    // where writing from nothing replaces it with one server.
-    if (previous == null and !(g_identity_minted_here or blossomProbeClean())) return .no_list_yet;
+    // where writing from nothing replaces it with one server. Nor is every relay
+    // in the pool answering without one: on a cold import the pool is the
+    // bootstrap relays, and the list lives on the relays the reader writes to.
+    // The proof is the follow list's: the key was made here, or the reader said
+    // to start one after every relay they write to had finished without it, and
+    // that yes is spent by this write.
+    if (previous == null and !g_identity_minted_here and !takeFresh(.media_servers)) return .no_list_yet;
 
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
@@ -38520,7 +38535,15 @@ fn blossomAdd(model: *Model, fx: *Effects) void {
         model.blossom_error = .invalid;
         return;
     };
-    switch (writeBlossomServers(fx, norm, null)) {
+    // No list held and every write relay finished without one: the reader is
+    // asked before a list of one is published over anything Plaza has not seen.
+    if (askFreshFirst(model, FreshAsk.mediaServer(norm))) return;
+    sayBlossomAdd(model, writeBlossomServers(fx, norm, null));
+}
+
+/// What an Add did, under the field.
+fn sayBlossomAdd(model: *Model, outcome: BlossomWrite) void {
+    switch (outcome) {
         .published => model.blossom_buffer.clear(),
         .nothing_to_do => model.blossom_buffer.clear(),
         .signer_busy => model.blossom_error = .busy,

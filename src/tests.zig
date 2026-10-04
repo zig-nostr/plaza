@@ -32241,7 +32241,7 @@ test "the server list is spliced, not rebuilt, and is never written over a list 
     try testing.expectEqual(main.BlossomWrite.nothing_to_do, main.writeBlossomServersForTest(&fx, null, "https://nowhere.example"));
 }
 
-test "with no list read, nothing is written; once every relay has said there is none, a first list can be" {
+test "with no list read, nothing is written, not even once every relay in the pool has said there is none" {
     main.forgetBlossomForTest();
     defer {
         main.forgetBlossomForTest();
@@ -32270,12 +32270,61 @@ test "with no list read, nothing is written; once every relay has said there is 
     main.markBlossomProbeCleanForTest(false);
     try testing.expectEqual(main.BlossomWrite.no_list_yet, main.writeBlossomServersForTest(&fx, "https://one.example", null));
 
-    // Every relay answered and none had one: now the first list can be made.
+    // Every relay in the pool answered and none had one: still not proof. On a
+    // cold import the pool is the bootstrap relays, and the list lives on the
+    // relays the reader writes to. Writing here would publish a list of one
+    // over the reader's real one.
     main.markBlossomProbeCleanForTest(true);
-    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, "https://one.example", null));
-    const tags = main.ownRecordTagsJoinedForTest(arena, 10063).?;
+    try testing.expectEqual(main.BlossomWrite.no_list_yet, main.writeBlossomServersForTest(&fx, "https://one.example", null));
+    try testing.expect(main.ownRecordTagsJoinedForTest(arena, 10063) == null);
+}
+
+test "a first media server list waits for the relays the reader writes to, and for a yes" {
+    // The follow list's rule, for the same reason: no server list in hand is
+    // only an absence once every relay the reader's own kind:10002 names for
+    // writing has finished without one, and even then a press asks before a
+    // list of one goes out over anything Plaza has not looked at.
+    var fs: FreshStore = undefined;
+    try fs.open("firstservers");
+    defer fs.close();
+    main.forgetBlossomForTest();
+    defer main.forgetBlossomForTest();
+    const me = signInNothingFound(0x6e);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    var fx: main.EffectsForTest = undefined;
+
+    // Some write relays still answering: nothing to ask about, and nothing sent.
+    main.retryOwnListsReadForTest();
+    for (0..2) |i| main.noteContactsAnsweredByForTest(i, me);
+    model.blossom_buffer.set("https://one.example");
+    main.update(&model, .blossom_add, &fx);
+    try testing.expect(model.fresh_ask == null);
+    try testing.expect(main.ownRecordTagsJoinedForTest(arena, 10063) == null);
+    try testing.expectEqualStrings("Plaza has not read your server list yet, so it will not replace it.", model.blossom_status());
+
+    // All of them finished without one: the press asks, and a no sends nothing.
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    model.blossom_error = .none;
+    main.update(&model, .blossom_add, &fx);
+    try testing.expect(model.fresh_ask != null);
+    try testing.expectEqual(main.FreshAsk.Action.add_media_server, model.fresh_ask.?.action);
+    main.update(&model, .fresh_list_cancel, &fx);
+    try testing.expect(main.ownRecordTagsJoinedForTest(arena, 10063) == null);
+
+    // A yes starts the list with that one server, and spends itself: a later
+    // write with nothing stored is refused rather than read as a second start.
+    main.update(&model, .blossom_add, &fx);
+    main.update(&model, .fresh_list_confirm, &fx);
+    const tags = main.ownRecordTagsJoinedForTest(arena, 10063) orelse return error.NothingWritten;
     try testing.expect(std.mem.indexOf(u8, tags, "server https://one.example") != null);
-    try testing.expect(main.blossomOwnListForTest());
+    try testing.expect(!main.needsFreshConsentForTest(.media_servers));
 }
 
 test "a relay that declines to look, or a list only held in memory, never licenses writing a first list" {
