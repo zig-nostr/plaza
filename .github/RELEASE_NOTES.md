@@ -1,5 +1,73 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.25.0
+
+**Notes their authors marked sensitive are covered.** A note with a content warning (NIP-36) now shows one line, "Content warning" and the reason if there is one, with a Show press, in place of its words, pictures and link preview. Nothing in it is fetched until you press Show, and Show uncovers that one note for the session. That covers the picture of a note it quotes, and an article with a warning opens covered too, with no title, cover or body until you press Show. "Show sensitive notes without a warning" in Settings turns the covering off. When you write a note, "Add a content warning" in the composer adds one, with an optional reason.
+
+**Long-form articles open in a reader.** Opening an article used to land on a thread that held only its title. It now shows the byline, title, summary, cover and date with a reading time, then the article itself, with its hashtags as pressable topics. An `naddr` for an article, in a note, a quote or the search field, opens it too, asking the relays it names and the author's own. A draft is not opened.
+
+**Search finds people by name.** The Search tile in the rail, or Cmd+L, takes a name and lists matching profiles. People already on your machine answer first, with the network off and the people you follow at the top. Once you stop typing, three search relays are asked as well, each result says where it came from, and each relay gets a line saying what it did. The field still opens an address, and now takes a `name@domain` address too. A secret key or a signer link typed into it is never sent anywhere, even with quotes, a `0x` or a few words around the key.
+
+**Add a picture from a file.** The composer has Add picture, and the profile editor has an Upload link beside Picture and Banner. A card names the file, its size and the servers it will go to, and nothing is sent until you press Upload. Location and camera details are removed from the file first, and so are the comments and XMP in a GIF. It goes to the first server in your published list that takes it, or to one of two built in when you have none, and the Media servers section of Settings shows and edits that list.
+
+**Relays that ask who you are can be answered.** Some relays refuse to serve until you identify yourself (NIP-42), and Plaza used to keep reconnecting to them without getting anywhere. It now asks you once per relay, for each account: Allow or Don't allow. It asks only when a relay has actually refused something, so a relay that sends a challenge and gates nothing is never asked about. A relay's row in Settings shows your choice (ask first, identify or anonymous) and pressing it changes the choice.
+
+**A quote card shows the quoted note's picture.** It used to say `Picture from <host>` and leave the picture to the note behind the press.
+
+**Notes say where they can be found.** An address Plaza copies, and the reply, quote, repost and like it publishes, now name a relay the note was seen on or one its author writes to, and name none when Plaza does not know one. The account menu gains Copy profile address, which names the relays you write to. A relay hint in somebody else's note that points at a private or local address is no longer dialled.
+
+**Rows and controls that answer a click can be reached from the keyboard.** Many answered a click and nothing else. Tab now stops on them, draws the focus ring and presses on Return or Space, including Create identity, Reply, Show more, and Allow and Don't allow.
+
+**Hashtags work.** A hashtag page now shows its notes, stops saying it is looking when the relays have answered, and has a Back. Pressing a hashtag opens the tag you pressed, where on a screen with many tags an early one could open a later tag's page. Hashtags take the violet used for people and links, since they go somewhere too.
+
+**A profile loads older notes.** Reaching the end of a person's page asks for the next page, from your machine first and then from the relays they write to, and says when that is everything they have.
+
+**Notifications name the person.** A mention in a notification preview shows their name instead of a long `npub`, and a reference to a note reads `[Note]`.
+
+**A reply half written survives leaving the thread.** The text is kept for that thread, for up to eight threads in a session, and is never sent, or put back, in a different one.
+
+**Back says where it goes** when a thread or profile was opened from Notifications, and still leads there a level deeper.
+
+**Signing in with a bunker link tells the truth.** Pasting a link no longer signs you in at once. The sheet says it is connecting and signs you in when the signer answers, and if it cannot be reached or refuses, it says so. A pairing you do not use is taken down whole. When a bunker declines to open your private mutes or bookmarks, the next press asks it again, and a refusal is told apart from a list that cannot be read.
+
+**Settings checks what it is given.** The media proxy takes only an http or https address and keeps what you typed when it refuses. A relay address with a space or control character is refused, and the last relay cannot be removed. Paused relays show a quiet strip with Resume, the Log out question scrolls into view, and Copy npub says "npub copied".
+
+**Places say what went wrong.** An address for a place no relay has says "That place did not turn up.", and a place with no feed says "This place has no feed to read." instead of connecting forever. Opening an address over Settings now leaves Settings.
+
+**Follow, Mute and Bookmark say what is wrong.** When Plaza cannot read your lists it says why and offers Try again. An account with no list on any relay can start one, after a question that says what it would replace, and only once the relays you write to have finished. A list Plaza has not read is still never written over.
+
+**Smaller fixes.** A note's zap total is plain text and no longer a bolt that looks pressable. A thread with no replies stops showing loading rows once the relays have answered. The refresh chip answers with "Feed refreshed".
+
+**Private bookmarks are never cut or lost.** A private bookmark list past about 4 KB (around thirty-six bookmarks) read as unreadable, and adding to it through a bunker published it cut short, which no app could open. Large lists are now read and sealed whole, a seal that comes back damaged publishes nothing and says so, and entries with line breaks or other control characters in them are kept as they were.
+
+**A list is never replaced because one relay's copy could not be read.** A relay that sent your list when Plaza could not keep it no longer counts as having none, so the question about starting a new list is not asked over a list that exists. A change to your mutes, bookmarks, media servers or profile waits ("Last change not read back yet. Try again soon.") while the one before it is not yet read back, and a first profile is asked about again rather than published twice.
+
+**Two quick changes with a bunker no longer erase each other.** Muting, bookmarking or adding a media server twice inside one round trip to a bunker published the second list without the first. The second press now waits, with the busy message, until the first is stored.
+
+**A refused reply or note is never lost.** What you typed since stays first and the refused text goes under it. If both do not fit, the refused text is copied to the clipboard and the message says so. A refused note keeps its content warning, and a like is taken back only when its own signature fails, not another press's. A signer answer that cannot be used, such as one signed by a different key, says so and hands the press back.
+
+**Notes written in a place reach the place.** A note Notary signed in a place that writes only to its own relays went to your public relays instead. A place whose relay closes its feed now says so, where before it looked empty.
+
+**Pages answer their presses.** A note on a hashtag page or in Bookmarks can be opened, liked, quoted, copied and expanded, and a note that lands late no longer pulls you off either page. A fetch for a page you already left no longer stalls the open profile, and a profile with no notes stops saying it is loading. A quote card for an `naddr` keeps filling and opens when many addresses have been seen. Quoting a note leaves the open thread where it is.
+
+**Opening an address leaves what is in the way.** A `plaza://` link and an address typed into the search field leave Settings and the notifications sheet, say they are looking, and Back after a miss no longer names Notifications. Cmd+, and Cmd+L leave the Edit profile sheet and what you typed in it alone, and the new-list question asked from Settings stands over Settings.
+
+**Post waits for the picture.** Post waits for the composer's picture to land, a second pick never drops the first, and the unsaved picture notice in Edit profile stays until Save really sends.
+
+**Pictures and avatars are never fetched from your local network, and the media proxy is not bypassed.** An address on a loopback or LAN host is never requested for a note's picture, an avatar, a banner, an article cover or a place's logo. With the proxy on, pictures go through it, a place's logo included, and turning off "Ask the host when the proxy refuses" stops direct fetches at once. A relay named by somebody else's relay list, a reply's recipients or a place is dialled only when it is public.
+
+**GIF uploads are stripped.** Comments and XMP, which can carry a location, are removed from a GIF before it is sent, as for other pictures. A damaged GIF is refused rather than half stripped.
+
+**Covered notes and articles fetch nothing until shown.** A covered note no longer fetches the picture of the note it quotes, and the article reader keeps an article's content warning.
+
+**A key pasted into search is never sent.** Any run of sixty or more hex digits is refused wherever it sits in the field. A search relay that ignores its limit cannot flood the list, each relay gets one search thread at most, and a term you already replaced is not sent.
+
+**Relay hints never carry another account's relays.** After a sign-out or a switch, the relays one account read through are not named in the next account's likes, quotes and copied addresses, and routed relays stop asking about the old follows. A bunker pairing that ends releases its connection and its key.
+
+**Profile paging no longer stalls.** Every fetch of notes, relay lists, replies, hashtags and your own profile has a time limit, so a relay that goes quiet cannot hold a page for good, and the media server probe ends as unknown instead of asking forever.
+
+**Plaza carries nostr 0.14.9 and Notary 0.11.2.** In the library, a relay that pings and stops reading no longer holds a connection past its time limit, a reader that is cancelled now ends, a long follow list is read from disk faster, and a few malformed addresses no longer crash it. Notary 0.11.2 brings a request back when its answer did not reach the signer, and gives every answer in flight its own key. Notary 0.11.0 keeps a standalone Notary in the macOS menu bar when its window closes. The Notary window Plaza opens behaves as before.
+
 ### What's new in v0.24.0
 
 **Reposts from people you follow show up in your feed.** Plaza could repost a note and could count other people's reposts, and it never showed one. A repost now appears as the note itself, with its author and its words. If several people you follow repost the same note, it shows once, and if you already had it on screen it is not drawn twice. The note is always read from what its author signed, never from the copy inside the repost, so a repost cannot put words in somebody's mouth.
