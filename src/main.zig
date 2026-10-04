@@ -1861,6 +1861,17 @@ fn isOwnList(kind: u16) bool {
         kind == mute_list_kind or kind == bookmark_list_kind;
 }
 
+/// `plazaIngest` for an event a relay just delivered, which also remembers WHICH
+/// relay delivered it. A relay that sent a note holds it, and that is the best
+/// thing Plaza knows when it later has to name a relay for that note (see
+/// `hintsFor`). An event that does not verify is not remembered: it proves
+/// nothing about where anything lives.
+fn plazaIngestFrom(gpa: std.mem.Allocator, ev: nostr.event.Event, options: nostr.store.IngestOptions, relay_url: []const u8) !nostr.store.IngestResult {
+    const result = try plazaIngest(gpa, ev, options);
+    if (result != .invalid) recordSeenOn(ev, relay_url);
+    return result;
+}
+
 /// The one door into the store.
 ///
 /// Every `store.ingest` in this app goes through here, because the backup has to
@@ -2026,6 +2037,11 @@ pub fn setStoreForTest(store: ?*nostr.store.Store) void {
 
 pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
     return plazaIngest(gpa, ev, .{});
+}
+
+/// The relay-fed funnel: verified, and remembering which relay delivered it.
+pub fn plazaIngestFromForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer, relay_url: []const u8) !nostr.store.IngestResult {
+    return plazaIngestFrom(gpa, ev, .{ .verify_with = signer }, relay_url);
 }
 
 /// Drives the funnel with verification ON, the way every relay-fed path does.
@@ -3616,6 +3632,7 @@ else
 // effects share the effect key space, so these stay distinct from the timer key.
 const copy_npub_key: u64 = 100;
 const copy_nevent_key: u64 = 103;
+const copy_nprofile_key: u64 = 105;
 const copy_note_text_key: u64 = 104;
 // The update check. One at a time, so one key rather than a base.
 const update_check_key: u64 = 110;
@@ -7557,8 +7574,9 @@ fn dialAddress(addr: Address, hints: []const []const u8) void {
 }
 
 /// Sends the address query down one open connection and ingests what comes
-/// back, until the relay says it has nothing more.
-fn askAddressOn(gpa: std.mem.Allocator, relay: *nostr.relay.Relay, signer: nostr.keys.Signer, addr: *const Address) void {
+/// back, until the relay says it has nothing more. `url` is the relay's, so an
+/// article that arrives remembers where it can be found, like any other note.
+fn askAddressOn(gpa: std.mem.Allocator, relay: *nostr.relay.Relay, url: []const u8, signer: nostr.keys.Signer, addr: *const Address) void {
     var q: AddressQuery = undefined;
     q.init(addr);
     const filters = [_]nostr.filter.Filter{q.filter(8)};
@@ -7568,7 +7586,7 @@ fn askAddressOn(gpa: std.mem.Allocator, relay: *nostr.relay.Relay, signer: nostr
         var msg = (relay.receive() catch break) orelse break;
         defer msg.deinit();
         switch (msg.value) {
-            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .event => |e| _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch {},
             .eose, .closed => break,
             else => {},
         }
@@ -7593,7 +7611,7 @@ fn askAddressAt(url_buf: [place_relay_cap]u8, url_len: usize, addr: Address) voi
     // thread for good.
     const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse return;
     defer releaseOneShot(watched);
-    askAddressOn(gpa, relay, signer, &addr);
+    askAddressOn(gpa, relay, url_buf[0..url_len], signer, &addr);
 }
 
 /// The relays an author writes to, from the relay list the store holds, copied
@@ -7689,7 +7707,7 @@ fn askAddressOutbox(addr: Address, skip: DialedHints) void {
         defer relay.deinit();
         const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse return;
         defer releaseOneShot(watched);
-        askAddressOn(gpa, relay, signer, &addr);
+        askAddressOn(gpa, relay, url, signer, &addr);
     }
 }
 
@@ -8856,7 +8874,7 @@ fn askQuoteAt(url_buf: [place_relay_cap]u8, url_len: usize, id: [32]u8) void {
         var msg = (relay.receive() catch break) orelse break;
         defer msg.deinit();
         switch (msg.value) {
-            .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
+            .event => |e| _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url_buf[0..url_len]) catch {},
             .eose => break,
             // A CLOSED ends this relay's part, and no EOSE is coming after it.
             .closed => break,
@@ -10327,6 +10345,386 @@ fn engagementUnlock() void {
 /// The u64 dedup key for an event id (its first 8 bytes, big-endian).
 fn idPrefix(id: [32]u8) u64 {
     return std.mem.readInt(u64, id[0..8], .big);
+}
+
+// -------------------------------------------------------- where a note can be found
+//
+// A relay hint is a claim, written into something other people will read, about
+// where a thing can be asked for. Plaza has taken hints since an `nevent1` that
+// names relays started getting those relays asked, and wrote none of its own:
+// the address it copied, the `e` tag under a reply and the `q` tag under a quote
+// all left the slot empty, so every other client was handed the problem Plaza
+// itself had been given a way to solve.
+//
+// Two things are known about where a note lives, and they prove different
+// amounts. A relay that DELIVERED the note holds it, because it just sent it. A
+// relay the AUTHOR lists as a write relay (their kind:10002) is where they say
+// they publish, which is likely and not verified. The order follows that:
+//
+//   1. a relay that delivered it and is also one of the author's write relays
+//   2. a relay that delivered it
+//   3. one of the author's write relays
+//
+// That is Amethyst's `Note.relayHintUrl`: the delivering relay that is in the
+// author's outbox set, then the first delivering relay, then the author's own
+// first outbox relay. Jumble's `getEventHint` is the second rule alone. The
+// third rule is only reached when nothing is known to have delivered the note,
+// which is a note read straight off disk after a restart.
+//
+// When none of the three applies the hint is EMPTY, and that is a considered
+// answer rather than a gap: a wrong hint costs every reader a socket to a relay
+// that does not have the note, and an empty one costs them nothing they were not
+// already paying.
+//
+// A relay is only offered when a stranger could dial it. `ws://` is cleartext,
+// and a private or loopback address in a published tag is useless to everyone
+// else and says something about the publisher's network that nobody asked them
+// to say. Jumble drops its own local-network relays from every hint for the
+// same reason (`getEventHints`, `isLocalNetworkUrl`).
+
+/// How many relays go into an address Plaza hands out. Jumble's number
+/// (`getNoteBech32Id` slices to two): each hint a reader follows is a socket.
+const hint_cap = 2;
+/// How many delivering relays are read back for one note.
+const seen_read_cap = 8;
+
+/// A bounded, de-duplicated list of relay URLs, each already fit to publish.
+fn UrlList(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        buf: [cap][96]u8 = undefined,
+        len: [cap]u8 = @splat(0),
+        count: usize = 0,
+
+        /// Adds `url_in` when a stranger could dial it and the list does not
+        /// already hold it. Stored without a trailing slash, which is how every
+        /// client writes a relay into a tag. True when it was added.
+        fn add(self: *Self, url_in: []const u8) bool {
+            if (self.count >= cap) return false;
+            const url = std.mem.trimEnd(u8, std.mem.trim(u8, url_in, " \t\r\n"), "/");
+            if (!isHintableRelay(url)) return false;
+            if (self.has(url)) return false;
+            @memcpy(self.buf[self.count][0..url.len], url);
+            self.len[self.count] = @intCast(url.len);
+            self.count += 1;
+            return true;
+        }
+
+        fn has(self: *const Self, url: []const u8) bool {
+            for (0..self.count) |i| {
+                if (relayUrlEql(self.at(i), url)) return true;
+            }
+            return false;
+        }
+
+        pub fn at(self: *const Self, i: usize) []const u8 {
+            return self.buf[i][0..self.len[i]];
+        }
+    };
+}
+
+pub const HintList = UrlList(hint_cap);
+
+/// Whether a relay URL can be written into something other people read.
+///
+/// `isRelayUrl` already refuses `ws://`, a host with no dot and a login in front
+/// of the host. What it lets through, and this refuses, is an address only the
+/// publisher can reach, and a URL with a query or a fragment: a relay address
+/// that carries one is usually carrying an access token, and a hint would hand
+/// that token to every reader.
+fn isHintableRelay(url: []const u8) bool {
+    if (!isRelayUrl(url)) return false;
+    if (std.mem.indexOfAny(u8, url, "?#") != null) return false;
+    const rest = url["wss://".len..];
+    const host_end = std.mem.indexOfAny(u8, rest, "/:") orelse rest.len;
+    return !isPrivateHost(rest[0..host_end]);
+}
+
+fn isPrivateHost(host_in: []const u8) bool {
+    // A bracketed literal is IPv6, which has no business in a relay hint.
+    if (host_in.len == 0 or host_in[0] == '[') return true;
+    // `relay.local.` is `relay.local`. The trailing dot only marks the name as
+    // absolute, and left on it would carry any name past the suffix check.
+    const host = std.mem.trimEnd(u8, host_in, ".");
+    if (host.len == 0) return true;
+    // `.onion` and `.i2p` resolve only inside Tor or I2P, so a reader without
+    // one cannot dial them, and the name says which network the publisher uses.
+    const private_suffixes = [_][]const u8{ ".localhost", ".local", ".internal", ".lan", ".home.arpa", ".onion", ".i2p" };
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    for (private_suffixes) |suffix| {
+        if (std.ascii.endsWithIgnoreCase(host, suffix)) return true;
+    }
+    // An address, not a name: no top-level domain is all digits, so a host whose
+    // last label is digits is an IP literal. Only the plain dotted quad is read.
+    // The short and hex forms (`127.1`, `0x7f.0.0.1`) dial loopback through
+    // most resolvers, and are refused rather than parsed.
+    const last = host[(if (std.mem.lastIndexOfScalar(u8, host, '.')) |d| d + 1 else 0)..];
+    for (last) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    var octets: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var n: usize = 0;
+    while (parts.next()) |part| : (n += 1) {
+        if (n == 4 or part.len == 0 or part.len > 3) return true;
+        octets[n] = std.fmt.parseInt(u8, part, 10) catch return true;
+    }
+    if (n != 4) return true;
+    // Some ranges are nobody's: this host, private networks, shared address
+    // space, link-local, and multicast and reserved from 224 up.
+    return switch (octets[0]) {
+        0, 10, 127 => true,
+        100 => octets[1] >= 64 and octets[1] <= 127,
+        169 => octets[1] == 254,
+        172 => octets[1] >= 16 and octets[1] <= 31,
+        192 => octets[1] == 168,
+        224...255 => true,
+        else => false,
+    };
+}
+
+/// Kinds worth remembering a delivering relay for: the ones a reader can reply
+/// to, quote, repost or react to. Profiles, lists, reactions and zaps are most
+/// of what a relay sends and none of it is ever the target of a hint, so
+/// recording them would only push the notes out of the table.
+fn hintWorthyKind(kind: u16) bool {
+    return switch (kind) {
+        0, 3, 5, 7, 9735 => false,
+        10000...29999 => false,
+        else => true,
+    };
+}
+
+/// Which relays delivered which note, remembered for the length of the session.
+///
+/// Direct-mapped on the id's low bits and checked against the whole prefix, so a
+/// collision costs the older note its answer (falling back to the author's
+/// relays) and never gives a note another note's relay. One word of relay
+/// bits per note, indexed into a small table of the distinct URLs seen, because
+/// a URL per note would cost ninety-six bytes for something the table repeats
+/// eight times over.
+///
+/// Not the engagement table's `relays_seen`, which is keyed to the pool's slots
+/// and only exists for notes already on screen. The relays that carry most of a
+/// feed are the routed ones, which are not in the pool at all.
+const seen_on_slots = 1 << 13;
+const seen_url_cap = 64;
+const SeenOn = struct { prefix: u64 = 0, mask: u64 = 0 };
+var g_seen_on = [_]SeenOn{.{}} ** seen_on_slots;
+var g_seen_url = [_][96]u8{[_]u8{0} ** 96} ** seen_url_cap;
+var g_seen_url_len = [_]u8{0} ** seen_url_cap;
+var g_seen_url_n: usize = 0;
+var g_seen_on_lock = std.atomic.Value(bool).init(false);
+
+fn seenOnLock() void {
+    while (g_seen_on_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn seenOnUnlock() void {
+    g_seen_on_lock.store(false, .release);
+}
+
+/// Notes that `url` delivered `ev`. Called from each ingest thread as an event
+/// lands, after it has been verified.
+fn recordSeenOn(ev: nostr.event.Event, url: []const u8) void {
+    if (!hintWorthyKind(ev.kind)) return;
+    recordSeenOnId(ev.id, url);
+}
+
+fn recordSeenOnId(id: [32]u8, url_in: []const u8) void {
+    const prefix = idPrefix(id);
+    // Zero marks an empty slot, so the one-in-2^64 all-zero prefix just is not
+    // remembered, which is the engagement dedup's convention too.
+    if (prefix == 0) return;
+    const url = std.mem.trimEnd(u8, url_in, "/");
+    seenOnLock();
+    defer seenOnUnlock();
+    var idx: ?usize = null;
+    for (0..g_seen_url_n) |i| {
+        if (relayUrlEql(g_seen_url[i][0..g_seen_url_len[i]], url)) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == null) {
+        // Checked only for a relay not in the table, so for one already met the
+        // hot path is the short scan above. A relay the rule refuses is never
+        // added and is checked again on its next event, which is a few compares.
+        var probe: UrlList(1) = .{};
+        if (!probe.add(url)) return;
+        if (g_seen_url_n == seen_url_cap) {
+            // More distinct relays than the table holds in one session. Start
+            // over rather than refuse every new one: what is forgotten falls
+            // back to the author's relays, and what is current is still true.
+            for (&g_seen_on) |*e| e.* = .{};
+            g_seen_url_n = 0;
+        }
+        const i = g_seen_url_n;
+        @memcpy(g_seen_url[i][0..probe.len[0]], probe.at(0));
+        g_seen_url_len[i] = probe.len[0];
+        g_seen_url_n += 1;
+        idx = i;
+    }
+    const bit = @as(u64, 1) << @intCast(idx.?);
+    const slot = &g_seen_on[@intCast(prefix & (seen_on_slots - 1))];
+    if (slot.prefix == prefix) {
+        slot.mask |= bit;
+    } else {
+        slot.* = .{ .prefix = prefix, .mask = bit };
+    }
+}
+
+/// The relays that delivered `id`, in the order they were first met.
+fn seenOnFor(id: [32]u8, out: *UrlList(seen_read_cap)) void {
+    const prefix = idPrefix(id);
+    if (prefix == 0) return;
+    seenOnLock();
+    defer seenOnUnlock();
+    const slot = g_seen_on[@intCast(prefix & (seen_on_slots - 1))];
+    if (slot.prefix != prefix) return;
+    for (0..g_seen_url_n) |i| {
+        if (slot.mask & (@as(u64, 1) << @intCast(i)) == 0) continue;
+        _ = out.add(g_seen_url[i][0..g_seen_url_len[i]]);
+    }
+}
+
+/// The first few write relays `author` lists in their kind:10002, by the same
+/// selection the outbox routes with. Empty when the list is not in the store.
+fn authorWriteRelays(author: [32]u8, out: *UrlList(outbox_relays_per_author)) void {
+    const store = g_store orelse return;
+    const kinds = [_]u16{relay_list_kind};
+    const authors = [_][32]u8{author};
+    var result = store.query(std.heap.page_allocator, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return;
+    defer result.deinit();
+    if (result.events.len == 0) return;
+    var raw: [32][]const u8 = undefined;
+    var selected: [outbox_relays_per_author][]const u8 = undefined;
+    const chosen = selectWriteRelays(raw[0..writeTagUrls(result.events[0], &raw)], &selected);
+    for (selected[0..chosen]) |url| _ = out.add(url);
+}
+
+/// The three rules above, in order, into `out`.
+fn orderHints(seen: *const UrlList(seen_read_cap), writes: *const UrlList(outbox_relays_per_author), out: anytype) void {
+    for (0..seen.count) |i| {
+        if (writes.has(seen.at(i))) _ = out.add(seen.at(i));
+    }
+    for (0..seen.count) |i| _ = out.add(seen.at(i));
+    for (0..writes.count) |i| _ = out.add(writes.at(i));
+}
+
+/// The relays to name for the note `id` by `author`, best first. Empty when
+/// nothing is known, which callers write as an empty hint.
+fn hintsFor(id: [32]u8, author: ?[32]u8, out: *HintList) void {
+    var seen: UrlList(seen_read_cap) = .{};
+    seenOnFor(id, &seen);
+    var writes: UrlList(outbox_relays_per_author) = .{};
+    if (author) |pk| authorWriteRelays(pk, &writes);
+    orderHints(&seen, &writes, out);
+}
+
+/// Where to look for a PERSON: the first relay they list as a write relay.
+///
+/// Not the relay a note of theirs happened to arrive on. That says where one
+/// note was, and a `p` tag is about the account; Amethyst fills the repost's
+/// `p` slot from the author's home relay for the same reason.
+fn profileHint(pubkey: [32]u8) UrlList(1) {
+    var writes: UrlList(outbox_relays_per_author) = .{};
+    authorWriteRelays(pubkey, &writes);
+    var out: UrlList(1) = .{};
+    if (writes.count > 0) _ = out.add(writes.at(0));
+    return out;
+}
+
+/// `["p", pubkey]`, or `["p", pubkey, relay]` when the account's own relay list
+/// says where they publish. Process-lifetime, like every tag the sign paths hold.
+fn pTagFor(gpa: std.mem.Allocator, pubkey: [32]u8) ?nostr.event.Tag {
+    const hex = hexAlloc(gpa, pubkey) orelse return null;
+    const hint = profileHint(pubkey);
+    if (hint.count == 0) return gpa.dupe([]const u8, &.{ "p", hex }) catch null;
+    const relay = gpa.dupe(u8, hint.at(0)) catch return null;
+    return gpa.dupe([]const u8, &.{ "p", hex, relay }) catch null;
+}
+
+/// The relay for slot 3 of an `e` or `q` tag: the best of `hints`, or the empty
+/// string, which keeps the slots after it where a reader expects them.
+fn hintOrEmpty(gpa: std.mem.Allocator, hints: *const HintList) ?[]const u8 {
+    if (hints.count == 0) return "";
+    return gpa.dupe(u8, hints.at(0)) catch null;
+}
+
+const note_address_cap = 640;
+
+/// The `nevent1` for a note, naming up to `relays_wanted` of the relays it can
+/// be found on. With nothing known it is the bare address it always was.
+fn noteAddress(out: *[note_address_cap]u8, note: *const Note, relays_wanted: usize) ?[]const u8 {
+    var hints: HintList = .{};
+    hintsFor(note.event_id, note.pubkey, &hints);
+    var named: [hint_cap][]const u8 = undefined;
+    const n = @min(relays_wanted, hints.count);
+    for (0..n) |i| named[i] = hints.at(i);
+    // Bech32 grows a list and then copies it out, so a fixed buffer is spent
+    // several times over by a short result.
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, named[0..n], note.pubkey, note.kind) catch return null;
+    if (addr.len > out.len) return null;
+    @memcpy(out[0..addr.len], addr);
+    return out[0..addr.len];
+}
+
+/// The `nprofile1` for the signed-in account, naming the relays they publish to,
+/// or their `npub1` when they have none worth naming.
+///
+/// The relays are the pool's write relays: Plaza sends a note to exactly those,
+/// so they are where this account's notes are, whether or not a kind:10002 has
+/// been published yet.
+fn profileAddress(out: *[note_address_cap]u8, pubkey: [32]u8) ?[]const u8 {
+    var named: HintList = .{};
+    for (0..relaySlots()) |i| {
+        var url_buf: [96]u8 = undefined;
+        const dial = relaySnapshot(i, &url_buf) orelse continue;
+        if (!dial.write) continue;
+        _ = named.add(dial.url);
+    }
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var slices: [hint_cap][]const u8 = undefined;
+    for (0..named.count) |i| slices[i] = named.at(i);
+    const addr = if (named.count == 0)
+        nostr.nip19.encodeNpub(fba.allocator(), pubkey) catch return null
+    else
+        nostr.nip19.encodeNprofile(fba.allocator(), pubkey, slices[0..named.count]) catch return null;
+    if (addr.len > out.len) return null;
+    @memcpy(out[0..addr.len], addr);
+    return out[0..addr.len];
+}
+
+pub fn noteAddressForTest(out: *[note_address_cap]u8, note: *const Note, relays_wanted: usize) ?[]const u8 {
+    return noteAddress(out, note, relays_wanted);
+}
+pub fn profileAddressForTest(out: *[note_address_cap]u8, pubkey: [32]u8) ?[]const u8 {
+    return profileAddress(out, pubkey);
+}
+pub const note_address_cap_for_test = note_address_cap;
+pub fn recordSeenOnForTest(id: [32]u8, url: []const u8) void {
+    recordSeenOnId(id, url);
+}
+pub fn resetSeenOnForTest() void {
+    seenOnLock();
+    defer seenOnUnlock();
+    for (&g_seen_on) |*e| e.* = .{};
+    g_seen_url_n = 0;
+}
+pub fn hintsForTest(id: [32]u8, author: ?[32]u8) HintList {
+    var out: HintList = .{};
+    hintsFor(id, author, &out);
+    return out;
+}
+pub fn isHintableRelayForTest(url: []const u8) bool {
+    return isHintableRelay(url);
+}
+pub fn seenUrlCountForTest() usize {
+    return g_seen_url_n;
 }
 
 /// Whether `prefix` is already in the seen set. Caller holds the lock. The probe
@@ -17151,6 +17549,9 @@ pub const Msg = union(enum) {
     /// Reveal (or hide) the local secret key for backup.
     /// Copy the signed-in npub to the clipboard.
     copy_npub,
+    /// Copy the signed-in account's nprofile, which names the relays it
+    /// publishes to, to the clipboard.
+    copy_nprofile,
     /// Copy the local secret key (nsec) to the clipboard.
     /// Ask to log out: show the confirmation.
     logout_request,
@@ -17348,6 +17749,7 @@ pub const Msg = union(enum) {
         "close_profile_edit",
         "close_settings",
         "copy_nevent",
+        "copy_nprofile",
         "copy_npub",
         "delete_note_cancel",
         "delete_note_confirm",
@@ -27750,7 +28152,9 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // means another boolean and another term, in the same expression.
     const show_notary = openNotaryAvailable();
     const show_bookmarks = activePubkey() != null;
-    const row_count: usize = 4 + @as(usize, @intFromBool(show_notary)) + @as(usize, @intFromBool(show_bookmarks));
+    const show_profile_address = activePubkey() != null;
+    const row_count: usize = 4 + @as(usize, @intFromBool(show_notary)) + @as(usize, @intFromBool(show_bookmarks)) +
+        @as(usize, @intFromBool(show_profile_address));
     const rows = ui.arena.alloc(AppUi.Node, row_count) catch return ui.spacer(0);
     rows[0] = ui.row(.{ .cross = .center, .gap = 0 }, .{
         hgap(ui, 9),
@@ -27784,6 +28188,12 @@ fn accountMenu(ui: *AppUi) AppUi.Node {
     // list, and a row that opens an empty screen is a worse answer than no row.
     if (show_bookmarks) {
         rows[n] = menuRow(ui, ui.fmt("Bookmarks ({d})", .{bookmarkCount()}), null, null, .open_bookmarks);
+        n += 1;
+    }
+    // The account's address with the relays it publishes to in it. Signed-in
+    // only: a guest has no account to address. Settings keeps the bare npub.
+    if (show_profile_address) {
+        rows[n] = menuRow(ui, "Copy profile address", null, null, .copy_nprofile);
         n += 1;
     }
     // No glyph. "Open Notary" carries none either, and one icon among two reads
@@ -31219,7 +31629,7 @@ fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [pla
         defer msg.deinit();
         switch (msg.value) {
             .event => |e| {
-                _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url_buf[0..url_len]) catch continue;
                 // The reader left, or moved: this thread's list is not the one
                 // being shown any more, so it stops rather than writing into it.
                 if (g_place_gen.load(.monotonic) != gen) break;
@@ -32871,10 +33281,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .copy_nevent => |id| {
             const note = model.noteById(id) orelse return;
-            var scratch: [1024]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
-            fx.writeClipboard(.{ .key = copy_nevent_key, .text = addr });
+            var addr_buf: [note_address_cap]u8 = undefined;
+            const addr = noteAddress(&addr_buf, note, hint_cap) orelse return;
+            writeClipboardText(fx, copy_nevent_key, addr);
             setToast(model, "Address copied");
         },
         // njump renders any nostr event as a web page, which is how a note is
@@ -32902,9 +33311,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_web => |id| {
             const note = model.noteById(id) orelse return;
-            var scratch: [1024]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
+            var addr_buf: [note_address_cap]u8 = undefined;
+            const addr = noteAddress(&addr_buf, note, hint_cap) orelse return;
             // The base is validated at parse time (`isSafeShareUrl`) and the
             // menu row already named the host, so by here the only question
             // left is whether it ends in the separator.
@@ -32927,14 +33335,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             const note = model.noteById(id) orelse return;
-            var scratch: [1024]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&scratch);
-            const addr = nostr.nip19.encodeNevent(fba.allocator(), note.event_id, &.{}, note.pubkey, note.kind) catch return;
+            // One relay, not two: this address is typed into the draft and
+            // stays there as text, and the `q` tag derived from it carries one.
+            var addr_buf: [note_address_cap]u8 = undefined;
+            const addr = noteAddress(&addr_buf, note, 1) orelse return;
             // Appended, not overwritten. Something half-written in the composer
             // is the reader's, and a quote arriving on top of it would be this
             // app deciding their draft was worth less than its own convenience.
             const existing = model.draft_buffer.text();
-            var line: [256]u8 = undefined;
+            var line: [compose_capacity]u8 = undefined;
             const sep: []const u8 = if (existing.len == 0) "" else "\n\n";
             const text = std.fmt.bufPrint(&line, "{s}{s}nostr:{s}", .{ existing, sep, addr }) catch return;
             model.draft_buffer.set(text);
@@ -33250,12 +33659,23 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.logout_pending = false;
             model.stage = .ready;
         },
+        // The bare npub stays an npub. It is the account's identifier and the
+        // form every tool that takes a key accepts, so it carries no relays; the
+        // form that does is `copy_nprofile`, from the account menu.
         .copy_npub => {
             const pk = activePubkey() orelse return;
             var scratch: [1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
             const npub = nostr.nip19.encodeNpub(fba.allocator(), pk) catch return;
-            fx.writeClipboard(.{ .key = copy_npub_key, .text = npub });
+            writeClipboardText(fx, copy_npub_key, npub);
+        },
+        .copy_nprofile => {
+            const pk = activePubkey() orelse return;
+            var addr_buf: [note_address_cap]u8 = undefined;
+            const addr = profileAddress(&addr_buf, pk) orelse return;
+            writeClipboardText(fx, copy_nprofile_key, addr);
+            model.menu = .none;
+            setToast(model, "Profile address copied");
         },
         .logout_request => model.logout_pending = true,
         .logout_cancel => model.logout_pending = false,
@@ -33342,6 +33762,22 @@ pub fn sayMuteWriteForTest(model: *Model, outcome: MuteWrite, muting: bool) void
 
 pub fn sayBookmarkWriteForTest(model: *Model, outcome: BookmarkWrite, adding: bool) void {
     sayBookmarkWrite(model, outcome, adding);
+}
+
+/// Puts `text` on the clipboard. A test build records it instead, because the
+/// effect queue behind `fx` does not exist there and the text is the thing worth
+/// checking: what Plaza hands another client.
+fn writeClipboardText(fx: *Effects, key: u64, text: []const u8) void {
+    if (builtin.is_test) {
+        g_last_clipboard_len = copyBounded(&g_last_clipboard, text);
+        return;
+    }
+    fx.writeClipboard(.{ .key = key, .text = text });
+}
+var g_last_clipboard: [note_address_cap]u8 = undefined;
+var g_last_clipboard_len: usize = 0;
+pub fn lastClipboardForTest() []const u8 {
+    return g_last_clipboard[0..g_last_clipboard_len];
 }
 
 fn setToast(model: *Model, text: []const u8) void {
@@ -34651,9 +35087,14 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     const gpa = std.heap.page_allocator;
     const content = gpa.dupe(u8, text) catch return;
     const id_hex = hexAlloc(gpa, root.event_id) orelse return;
-    const author_hex = hexAlloc(gpa, root.pubkey) orelse return;
-    const e_tag = gpa.dupe([]const u8, &.{ "e", id_hex, "", "root" }) catch return;
-    const p_tag = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return;
+    // Where the root can be found, so the next reader of this reply does not have
+    // to guess. Empty, not absent, when nothing is known: the marker sits in the
+    // slot after it.
+    var root_hints: HintList = .{};
+    hintsFor(root.event_id, root.pubkey, &root_hints);
+    const root_hint = hintOrEmpty(gpa, &root_hints) orelse return;
+    const e_tag = gpa.dupe([]const u8, &.{ "e", id_hex, root_hint, "root" }) catch return;
+    const p_tag = pTagFor(gpa, root.pubkey) orelse return;
 
     // Everybody already in the conversation, not only the person being answered.
     // A reply that tags one author is a reply the rest of the thread never hears
@@ -34687,8 +35128,7 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     thread[1] = p_tag;
     var filled: usize = 2;
     for (participants[0..participants_len]) |pubkey| {
-        const hex = hexAlloc(gpa, pubkey) orelse break;
-        thread[filled] = gpa.dupe([]const u8, &.{ "p", hex }) catch break;
+        thread[filled] = pTagFor(gpa, pubkey) orelse break;
         filled += 1;
     }
     // The threading tags first, then whatever the reply's own text implies. A
@@ -34938,7 +35378,7 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
     var topics_len: usize = 0;
     var mentions: [max_mention_tags][32]u8 = undefined;
     var mentions_len: usize = 0;
-    var quotes: [max_quote_tags]struct { id: [32]u8, author: ?[32]u8 } = undefined;
+    var quotes: [max_quote_tags]struct { id: [32]u8, author: ?[32]u8, relay: UrlList(1) } = undefined;
     var quotes_len: usize = 0;
     var images: [max_imeta_tags][]const u8 = undefined;
     var images_len: usize = 0;
@@ -35016,10 +35456,17 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
                     const arena = fba.allocator();
                     var id: ?[32]u8 = null;
                     var author: ?[32]u8 = null;
+                    // The relay the pointer itself names, first, because whoever
+                    // wrote it chose it. Copied here: the decode's arena is the
+                    // scratch buffer, reused on the next token.
+                    var named: UrlList(1) = .{};
                     if (std.mem.startsWith(u8, token, "nevent1")) {
                         if (nostr.nip19.decodeNevent(arena, token)) |ptr| {
                             id = ptr.id;
                             author = ptr.author;
+                            for (ptr.relays) |r| {
+                                if (named.add(r)) break;
+                            }
                         } else |_| {}
                     } else if (nostr.nip19.decodeNote(arena, token)) |note_id| {
                         id = note_id;
@@ -35034,7 +35481,7 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
                             // `note1` carries none, and slot 4 is a notification
                             // target, so a guess there tells the wrong person
                             // they were quoted. Absent beats wrong.
-                            quotes[quotes_len] = .{ .id = event_id, .author = author };
+                            quotes[quotes_len] = .{ .id = event_id, .author = author, .relay = named };
                             quotes_len += 1;
                         }
                         i = body_start + j;
@@ -35107,18 +35554,31 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
         out.appendAssumeCapacity(tag);
     }
     for (mentions[0..mentions_len]) |pubkey| {
-        const hex = hexAlloc(gpa, pubkey) orelse break;
-        const tag = gpa.dupe([]const u8, &.{ "p", hex }) catch break;
+        const tag = pTagFor(gpa, pubkey) orelse break;
         out.appendAssumeCapacity(tag);
     }
     for (quotes[0..quotes_len]) |q| {
         const id_hex = hexAlloc(gpa, q.id) orelse break;
+        // The pointer's own relay, else the best Plaza knows (`hintsFor`), as
+        // Jumble's `extractQuoteTags` does with `data.relays?.[0] ?? getEventHint`.
+        // Empty when neither exists, because the author sits after it.
+        const relay: []const u8 = if (q.relay.count > 0)
+            gpa.dupe(u8, q.relay.at(0)) catch break
+        else blk: {
+            var hints: HintList = .{};
+            hintsFor(q.id, q.author, &hints);
+            break :blk hintOrEmpty(gpa, &hints) orelse break;
+        };
         // Positional, so an author can only be read out of slot 4. With no
-        // author the tag stops at the id rather than shipping empty slots.
+        // author the tag stops at the relay, or at the id when there is none,
+        // rather than shipping empty slots.
         const tag = if (q.author) |author| blk: {
             const author_hex = hexAlloc(gpa, author) orelse break :blk gpa.dupe([]const u8, &.{ "q", id_hex }) catch break;
-            break :blk gpa.dupe([]const u8, &.{ "q", id_hex, "", author_hex }) catch break;
-        } else gpa.dupe([]const u8, &.{ "q", id_hex }) catch break;
+            break :blk gpa.dupe([]const u8, &.{ "q", id_hex, relay, author_hex }) catch break;
+        } else if (relay.len > 0)
+            gpa.dupe([]const u8, &.{ "q", id_hex, relay }) catch break
+        else
+            gpa.dupe([]const u8, &.{ "q", id_hex }) catch break;
         out.appendAssumeCapacity(tag);
     }
     for (images[0..images_len]) |url| {
@@ -35139,13 +35599,19 @@ fn contentTags(gpa: std.mem.Allocator, content: []const u8, base: []const nostr.
     return out.toOwnedSlice(gpa) catch base;
 }
 
-/// The NIP-25 like tags for a note: `["e", id]`, `["p", author]`, `["k", "1"]`.
-/// Process-lifetime (the sign paths reference them); null on OOM.
+/// The NIP-25 like tags for a note: `["e", id, relay]`, `["p", author, relay]`,
+/// `["k", "1"]`. Each relay is left off, not blanked, when nothing is known:
+/// NIP-25 puts the hint last in both tags, so there is nothing to hold a place
+/// for. Process-lifetime (the sign paths reference them); null on OOM.
 fn buildLikeTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event.Tag {
     const id_hex = hexAlloc(gpa, note.event_id) orelse return null;
-    const author_hex = hexAlloc(gpa, note.pubkey) orelse return null;
-    const e = gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null;
-    const p = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return null;
+    var hints: HintList = .{};
+    hintsFor(note.event_id, note.pubkey, &hints);
+    const e = if (hints.count == 0)
+        gpa.dupe([]const u8, &.{ "e", id_hex }) catch return null
+    else
+        gpa.dupe([]const u8, &.{ "e", id_hex, hintOrEmpty(gpa, &hints) orelse return null }) catch return null;
+    const p = pTagFor(gpa, note.pubkey) orelse return null;
     const k = gpa.dupe([]const u8, &.{ "k", "1" }) catch return null;
     const tags = gpa.alloc(nostr.event.Tag, 3) catch return null;
     tags[0] = e;
@@ -35163,14 +35629,20 @@ fn buildLikeTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event
 /// no `k` for a kind:1, which is every note Plaza's feed holds, so there is no
 /// `k` here and no kind:16.
 ///
-/// The empty third field is the relay hint. It is empty rather than absent
-/// because the author sits in the fourth, and dropping the hint would move the
-/// pubkey into the hint's place and tell every reader to dial it as a relay.
+/// The third field is the relay hint, where the reposted note can be found
+/// (`hintsFor`). It is empty rather than absent when nothing is known because
+/// the author sits in the fourth, and dropping the hint would move the pubkey
+/// into the hint's place and tell every reader to dial it as a relay. Jumble's
+/// `buildETag` fills the same slot from `getEventHint`, and Amethyst's
+/// `RepostEvent.build` from the hint bundle's relay.
 fn buildRepostTags(gpa: std.mem.Allocator, note: *const Note) ?[]const nostr.event.Tag {
     const id_hex = hexAlloc(gpa, note.event_id) orelse return null;
     const author_hex = hexAlloc(gpa, note.pubkey) orelse return null;
-    const e = gpa.dupe([]const u8, &.{ "e", id_hex, "", author_hex }) catch return null;
-    const p = gpa.dupe([]const u8, &.{ "p", author_hex }) catch return null;
+    var hints: HintList = .{};
+    hintsFor(note.event_id, note.pubkey, &hints);
+    const hint = hintOrEmpty(gpa, &hints) orelse return null;
+    const e = gpa.dupe([]const u8, &.{ "e", id_hex, hint, author_hex }) catch return null;
+    const p = pTagFor(gpa, note.pubkey) orelse return null;
     const tags = gpa.alloc(nostr.event.Tag, 2) catch return null;
     tags[0] = e;
     tags[1] = p;
@@ -36770,7 +37242,7 @@ fn fetchOlderWorker(until: i64) void {
             defer msg.deinit();
             switch (msg.value) {
                 .event => |e| {
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, entry.url) catch continue;
                     if (result == .added) added += 1;
                 },
                 .eose => {
@@ -37298,7 +37770,7 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
             switch (msg.value) {
                 .event => |e| {
                     if (e.event.kind != 1) continue;
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, entry.url) catch continue;
                     if (result == .invalid) continue;
                 },
                 .eose => break,
@@ -37377,7 +37849,7 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                             countEngagement(e.event, watch[0..watch_len]);
                         continue;
                     }
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, entry.url) catch continue;
                     if (result == .invalid) continue;
                     if (e.event.kind == 1 and id_count < ids.len) {
                         hexLower(&ids[id_count], e.event.id);
@@ -37709,7 +38181,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
             defer msg.deinit();
             switch (msg.value) {
                 .event => |e| {
-                    _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {};
+                    _ = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, entry.url) catch {};
                     // Queue the replier's profile so a name and face resolve.
                     wantProfile(e.event.pubkey);
                     if (id_count < thread_reply_cap) {
@@ -40027,7 +40499,7 @@ fn discoveredOnce(
                     // Verified before it is stored. This is a relay the reader
                     // never chose, reached because a follow named it, so it gets
                     // less trust than the pool rather than more.
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch continue;
                     if (result == .invalid) continue;
                     if (e.event.kind == 1) {
                         noteFeedNewest(e.event.created_at);
@@ -41315,7 +41787,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // Verified before it counts: a relay can send anything down
                     // any subscription, and an inbox is the one surface where a
                     // stranger chooses what the reader sees.
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch continue;
                     if (result == .invalid) continue;
                     if (inboxAdd(e.event, nowSeconds())) markInboxDirty();
                     continue;
@@ -41326,7 +41798,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // forged event does not throw, it comes back saying it did
                     // not verify. Reading only the error channel let a relay
                     // hand this reader a relay list signed by nobody.
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch continue;
                     if (result == .invalid) continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
@@ -41350,7 +41822,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // Without it a one-shot's events fall into the engagement
                     // arm below and every profile fetched gets counted as
                     // somebody reacting to a note.
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch continue;
                     if (result == .invalid) continue;
                     if (e.event.kind == 1) noteFeedNewest(e.event.created_at);
                 } else {

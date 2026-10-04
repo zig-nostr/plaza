@@ -24,7 +24,7 @@ client.
 > by a round-trip to an external signer), stores it at once and publishes it to
 > the pool. Paste an address (Cmd+L) and Plaza opens what it names: a note, a
 > person, or a place, including one on relays you do not read, because an
-> address that carries relay hints is asked there too. A `plaza://place/` link
+> address that carries relay hints is asked there too. Plaza gives hints back: an address it copies, and the reply, quote, repost and like it publishes, name a relay the note was seen on or one its author writes to, and name none when it knows of none. A `plaza://place/` link
 > opens somebody else's corner of Nostr: their relay, and whatever it serves,
 > without disturbing your own. Plaza also says when a newer version of itself is
 > out, with one press to the release page. It tells you rather than replacing

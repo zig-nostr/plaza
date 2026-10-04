@@ -27946,3 +27946,554 @@ test "a quote card's address is never evicted from under it" {
     // The card still knows what it names, so it can still be asked for and opened.
     try testing.expect(main.addressRegisteredForTest(card.quote.id));
 }
+
+// ------------------------------------------------------------------ relay hints
+//
+// What Plaza writes into the relay slot of the tags and addresses it publishes.
+// The reading half (an `nevent1` that names relays gets them asked) has its own
+// tests; these pin the writing half, where a wrong answer is worse than none.
+
+const hint_a = "wss://relay.alpha.example";
+const hint_b = "wss://relay.bravo.example";
+const hint_c = "wss://relay.charlie.example";
+
+/// Resets the delivered-by table around a test, because it is process-wide and
+/// the suite shares one process.
+fn freshHints() void {
+    main.resetSeenOnForTest();
+}
+
+fn nodeForHints(event_id: [32]u8, pubkey: [32]u8) main.Note {
+    var note = main.Note{ .created_at = 1_800_000_000 };
+    note.id = 4242;
+    note.event_id = event_id;
+    note.pubkey = pubkey;
+    return note;
+}
+
+/// A kind:10002 for `kp`, writing to each of `urls`.
+fn relayListFor(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, urls: []const []const u8) !nostr.event.Event {
+    const tags = try arena.alloc(nostr.event.Tag, urls.len);
+    for (urls, 0..) |u, i| {
+        const t = try arena.alloc([]const u8, 3);
+        t[0] = "r";
+        t[1] = u;
+        t[2] = "write";
+        tags[i] = t;
+    }
+    return signedKind(arena, signer, kp, 1_800_000_000, 10002, tags, "");
+}
+
+test "a relay is only named when a stranger could dial it" {
+    try testing.expect(main.isHintableRelayForTest("wss://relay.damus.io"));
+    try testing.expect(main.isHintableRelayForTest("wss://relay.example.com:7777/path"));
+    try testing.expect(main.isHintableRelayForTest("wss://172.32.0.1"));
+    // Cleartext, and a name with no dot.
+    try testing.expect(!main.isHintableRelayForTest("ws://relay.damus.io"));
+    try testing.expect(!main.isHintableRelayForTest("wss://localhost"));
+    // Addresses only the publisher can reach, which a published tag would leak.
+    try testing.expect(!main.isHintableRelayForTest("wss://127.0.0.1"));
+    try testing.expect(!main.isHintableRelayForTest("wss://127.0.0.1:7777"));
+    try testing.expect(!main.isHintableRelayForTest("wss://10.0.0.5"));
+    try testing.expect(!main.isHintableRelayForTest("wss://192.168.1.20"));
+    try testing.expect(!main.isHintableRelayForTest("wss://172.16.4.4"));
+    try testing.expect(!main.isHintableRelayForTest("wss://169.254.1.1"));
+    try testing.expect(!main.isHintableRelayForTest("wss://relay.local"));
+    try testing.expect(!main.isHintableRelayForTest("wss://nas.lan"));
+    try testing.expect(!main.isHintableRelayForTest("wss://[::1]"));
+}
+
+test "a hint never carries a token, a hidden-network name or a disguised local address" {
+    // A query or fragment on a relay address is usually an access token, and a
+    // hint would copy it to every reader.
+    try testing.expect(!main.isHintableRelayForTest("wss://relay.example.com/?token=s3cret"));
+    try testing.expect(!main.isHintableRelayForTest("wss://relay.example.com?auth=abc"));
+    try testing.expect(!main.isHintableRelayForTest("wss://relay.example.com/#key"));
+    // A login in front of the host.
+    try testing.expect(!main.isHintableRelayForTest("wss://me:pw@relay.example.com"));
+    // Reachable only through Tor or I2P.
+    try testing.expect(!main.isHintableRelayForTest("wss://abcdefghijklmnop.onion"));
+    try testing.expect(!main.isHintableRelayForTest("wss://relay.i2p"));
+    // A trailing dot does not carry a private name past the check.
+    try testing.expect(!main.isHintableRelayForTest("wss://localhost."));
+    try testing.expect(!main.isHintableRelayForTest("wss://nas.local."));
+    try testing.expect(!main.isHintableRelayForTest("wss://192.168.1.20."));
+    // Short and hex forms of loopback, and the ranges nobody routes to.
+    try testing.expect(!main.isHintableRelayForTest("wss://127.1"));
+    try testing.expect(!main.isHintableRelayForTest("wss://0x7f.0.0.1"));
+    try testing.expect(!main.isHintableRelayForTest("wss://1.2.3.4.5"));
+    try testing.expect(!main.isHintableRelayForTest("wss://239.1.2.3"));
+    // A public address, a public name with a path, and a name with digits in it
+    // all still pass.
+    try testing.expect(main.isHintableRelayForTest("wss://203.0.114.7"));
+    try testing.expect(main.isHintableRelayForTest("wss://filter.nostr.wine/npub1abc"));
+    try testing.expect(main.isHintableRelayForTest("wss://relay2.example.com"));
+}
+
+test "the relay that delivered a note is the hint, and one the author writes to beats one they do not" {
+    freshHints();
+    defer freshHints();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x71} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/hints.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const note_id = [_]u8{0x31} ** 32;
+
+    // Nothing known: no hint, which is an answer.
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(note_id, kp.public_key).count);
+
+    // Delivered by A and then B. Nothing about the author yet, so the first one
+    // to deliver it leads.
+    main.recordSeenOnForTest(note_id, hint_a);
+    main.recordSeenOnForTest(note_id, hint_b);
+    {
+        const h = main.hintsForTest(note_id, kp.public_key);
+        try testing.expectEqual(@as(usize, 2), h.count);
+        try testing.expectEqualStrings(hint_a, h.at(0));
+        try testing.expectEqualStrings(hint_b, h.at(1));
+    }
+
+    // The author says they write to B and C. B is both delivered and written to,
+    // so it leads; A still follows, and C is cut by the cap of two.
+    _ = try main.plazaIngestForTest(arena, try relayListFor(arena, signer, kp, &.{ hint_b, hint_c }));
+    {
+        const h = main.hintsForTest(note_id, kp.public_key);
+        try testing.expectEqual(@as(usize, 2), h.count);
+        try testing.expectEqualStrings(hint_b, h.at(0));
+        try testing.expectEqualStrings(hint_a, h.at(1));
+    }
+
+    // A note nobody is known to have delivered (read off disk after a restart)
+    // falls back to where its author says they write.
+    {
+        const h = main.hintsForTest([_]u8{0x32} ** 32, kp.public_key);
+        try testing.expectEqual(@as(usize, 2), h.count);
+        try testing.expectEqualStrings(hint_b, h.at(0));
+        try testing.expectEqualStrings(hint_c, h.at(1));
+    }
+    // And with no author to ask, the same note has nothing to say.
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest([_]u8{0x32} ** 32, null).count);
+}
+
+test "a relay nobody else can reach is never remembered as a hint" {
+    freshHints();
+    defer freshHints();
+    const note_id = [_]u8{0x33} ** 32;
+    main.recordSeenOnForTest(note_id, "wss://127.0.0.1:7777");
+    main.recordSeenOnForTest(note_id, "ws://relay.alpha.example");
+    main.recordSeenOnForTest(note_id, "wss://192.168.0.9");
+    main.recordSeenOnForTest(note_id, "wss://relay.paid.example/?token=s3cret");
+    main.recordSeenOnForTest(note_id, "wss://abcdefghijklmnop.onion");
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(note_id, null).count);
+    try testing.expectEqual(@as(usize, 0), main.seenUrlCountForTest());
+    main.recordSeenOnForTest(note_id, hint_a ++ "/");
+    // Without the trailing slash, which is how a relay is written into a tag.
+    try testing.expectEqualStrings(hint_a, main.hintsForTest(note_id, null).at(0));
+}
+
+test "a note that collides with another's slot never borrows its relay" {
+    freshHints();
+    defer freshHints();
+    // Same low bits, so the same slot, and different ids.
+    var first = [_]u8{0} ** 32;
+    first[0] = 0x44;
+    first[7] = 0x05;
+    var second = first;
+    second[0] = 0x45;
+    main.recordSeenOnForTest(first, hint_a);
+    main.recordSeenOnForTest(second, hint_b);
+    try testing.expectEqualStrings(hint_b, main.hintsForTest(second, null).at(0));
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(first, null).count);
+}
+
+test "the funnel records the relay that delivered an event, and only a verified one" {
+    freshHints();
+    defer freshHints();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x72} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/funnel.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const note = try signedNote(arena, signer, kp, 1_800_000_000, "carried by two relays");
+    _ = try main.plazaIngestFromForTest(arena, note, signer, hint_a);
+    _ = try main.plazaIngestFromForTest(arena, note, signer, hint_b);
+    const h = main.hintsForTest(note.id, null);
+    try testing.expectEqual(@as(usize, 2), h.count);
+    try testing.expectEqualStrings(hint_a, h.at(0));
+    try testing.expectEqualStrings(hint_b, h.at(1));
+
+    // A forged event proves nothing about where anything lives.
+    var forged = try signedNote(arena, signer, kp, 1_800_000_001, "not what it claims");
+    forged.sig = [_]u8{0x11} ** 64;
+    _ = try main.plazaIngestFromForTest(arena, forged, signer, hint_c);
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(forged.id, null).count);
+
+    // Reactions are most of what a relay sends and nobody hints at one.
+    const before = main.seenUrlCountForTest();
+    const like = try signedKind(arena, signer, kp, 1_800_000_002, 7, &.{}, "+");
+    _ = try main.plazaIngestFromForTest(arena, like, signer, "wss://relay.delta.example");
+    try testing.expectEqual(before, main.seenUrlCountForTest());
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(like.id, null).count);
+}
+
+test "every relay-fed note ingest remembers which relay it came from" {
+    // The helper being right is half of it. A new fetch path that ingests with the
+    // bare funnel quietly stops teaching the hint table, and nothing else fails:
+    // notes from it just publish with an empty hint. The five left on the bare
+    // funnel read profiles, places and relay lists, which are never hinted at.
+    // An article fetched by its address is a note like any other and is counted
+    // with the rest.
+    const source = @embedFile("main.zig");
+    var bare: usize = 0;
+    var from: usize = 0;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "plazaIngest(gpa, e.event, .{ .verify_with = signer })") != null) bare += 1;
+        if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, ") != null) from += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), bare);
+    try testing.expectEqual(@as(usize, 11), from);
+}
+
+test "a copied note address names where the note can be found" {
+    freshHints();
+    defer freshHints();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const event_id = [_]u8{0x51} ** 32;
+    const pubkey = [_]u8{0x52} ** 32;
+    const note = nodeForHints(event_id, pubkey);
+    var buf: [main.note_address_cap_for_test]u8 = undefined;
+
+    // Nothing known: the bare address it always was.
+    {
+        const addr = main.noteAddressForTest(&buf, &note, 2) orelse return error.NoAddress;
+        const ptr = try nostr.nip19.decodeNevent(arena, addr);
+        try testing.expectEqual(@as(usize, 0), ptr.relays.len);
+        try testing.expectEqualSlices(u8, &event_id, &ptr.id);
+    }
+
+    main.recordSeenOnForTest(event_id, hint_a);
+    main.recordSeenOnForTest(event_id, hint_b);
+    main.recordSeenOnForTest(event_id, hint_c);
+    {
+        const addr = main.noteAddressForTest(&buf, &note, 2) orelse return error.NoAddress;
+        const ptr = try nostr.nip19.decodeNevent(arena, addr);
+        try testing.expectEqual(@as(usize, 2), ptr.relays.len);
+        try testing.expectEqualStrings(hint_a, ptr.relays[0]);
+        try testing.expectEqualStrings(hint_b, ptr.relays[1]);
+        // The rest of the pointer is untouched.
+        try testing.expectEqualSlices(u8, &event_id, &ptr.id);
+        try testing.expectEqualSlices(u8, &pubkey, &(ptr.author orelse return error.NoAuthor));
+        try testing.expectEqual(@as(?u32, 1), ptr.kind);
+    }
+    // The quote draft keeps its address short.
+    {
+        const addr = main.noteAddressForTest(&buf, &note, 1) orelse return error.NoAddress;
+        const ptr = try nostr.nip19.decodeNevent(arena, addr);
+        try testing.expectEqual(@as(usize, 1), ptr.relays.len);
+    }
+}
+
+test "the three ways to hand out a note address all carry the hint" {
+    freshHints();
+    defer freshHints();
+    var model = main.initialModel();
+    oneNoteFeed(&model);
+    main.recordSeenOnForTest(model.notes[0].event_id, hint_a);
+    var fx: main.EffectsForTest = undefined;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Copy note address.
+    main.update(&model, Msg{ .copy_nevent = model.notes[0].id }, &fx);
+    {
+        const ptr = try nostr.nip19.decodeNevent(arena, main.lastClipboardForTest());
+        try testing.expectEqual(@as(usize, 1), ptr.relays.len);
+        try testing.expectEqualStrings(hint_a, ptr.relays[0]);
+    }
+
+    // Quote: the address is typed into the draft after `nostr:`.
+    main.setIdentityForTest([_]u8{0x53} ** 32);
+    defer main.clearIdentityForTest();
+    main.update(&model, Msg{ .quote_note = model.notes[0].id }, &fx);
+    {
+        const text = model.draft_buffer.text();
+        try testing.expect(std.mem.startsWith(u8, text, "nostr:nevent1"));
+        const ptr = try nostr.nip19.decodeNevent(arena, text["nostr:".len..]);
+        try testing.expectEqual(@as(usize, 1), ptr.relays.len);
+        try testing.expectEqualStrings(hint_a, ptr.relays[0]);
+    }
+}
+
+test "copying your profile address names the relays you publish to" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pk = [_]u8{0x54} ** 32;
+    main.setIdentityForTest(pk);
+    defer main.clearIdentityForTest();
+    const mine = main.activePubkeyForTest() orelse return error.NoIdentity;
+
+    // The pool is whatever the process holds: pin it to two write relays, one
+    // read-only relay and one nobody else could reach.
+    main.clearRelaysForTest();
+    defer main.resetRelaysForTest();
+    _ = main.addRelayForTest(hint_a, true, true);
+    _ = main.addRelayForTest(hint_b, true, false);
+    _ = main.addRelayForTest("wss://127.0.0.1:7777", true, true);
+    _ = main.addRelayForTest(hint_c, false, true);
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg.copy_nprofile, &fx);
+    const ptr = try nostr.nip19.decodeNprofile(arena, main.lastClipboardForTest());
+    try testing.expectEqualSlices(u8, &mine, &ptr.pubkey);
+    try testing.expectEqual(@as(usize, 2), ptr.relays.len);
+    try testing.expectEqualStrings(hint_a, ptr.relays[0]);
+    try testing.expectEqualStrings(hint_c, ptr.relays[1]);
+
+    // Settings still copies the bare npub, which is what a tool that takes a key
+    // wants.
+    main.update(&model, Msg.copy_npub, &fx);
+    try testing.expect(std.mem.startsWith(u8, main.lastClipboardForTest(), "npub1"));
+}
+
+test "a like, a repost and a reply name where the note lives" {
+    freshHints();
+    defer freshHints();
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x55} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x56} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/tags.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "worth answering");
+    // The author writes to B, and A is where this reader got the note.
+    _ = try main.plazaIngestForTest(arena, ev);
+    _ = try main.plazaIngestForTest(arena, try relayListFor(arena, signer, kp, &.{hint_b}));
+    main.recordSeenOnForTest(ev.id, hint_a);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+    var fx: main.EffectsForTest = undefined;
+
+    // Like: the hint closes both tags, per NIP-25.
+    main.clearLastPublishedTagsForTest();
+    main.update(&model, Msg{ .like = id }, &fx);
+    {
+        const tags = main.lastPublishedTagsForTest();
+        const e = tagNamed(tags, "e") orelse return error.NoETag;
+        const p = tagNamed(tags, "p") orelse return error.NoPTag;
+        try testing.expectEqual(@as(usize, 3), e.len);
+        try testing.expectEqualStrings(hint_a, e[2]);
+        // The person's tag points at where THEY publish, not at where one note was.
+        try testing.expectEqual(@as(usize, 3), p.len);
+        try testing.expectEqualStrings(hint_b, p[2]);
+    }
+
+    // Repost: the hint fills the empty third slot and the author stays fourth.
+    main.clearLastPublishedTagsForTest();
+    main.update(&model, Msg{ .repost = id }, &fx);
+    {
+        const tags = main.lastPublishedTagsForTest();
+        const e = tagNamed(tags, "e") orelse return error.NoETag;
+        const p = tagNamed(tags, "p") orelse return error.NoPTag;
+        try testing.expectEqual(@as(usize, 4), e.len);
+        try testing.expectEqualStrings(hint_a, e[2]);
+        var author_hex: [64]u8 = undefined;
+        _ = try std.fmt.bufPrint(&author_hex, "{x}", .{ev.pubkey});
+        try testing.expectEqualStrings(&author_hex, e[3]);
+        try testing.expectEqualStrings(hint_b, p[2]);
+    }
+
+    // Reply: the root marker stays in slot four.
+    main.clearLastPublishedTagsForTest();
+    model.viewing_thread = id;
+    model.thread_root = model.notes[0];
+    model.reply_buffer.set("agreed");
+    main.update(&model, Msg.reply_submit, &fx);
+    {
+        const tags = main.lastPublishedTagsForTest();
+        const e = tagNamed(tags, "e") orelse return error.NoETag;
+        const p = tagNamed(tags, "p") orelse return error.NoPTag;
+        try testing.expectEqual(@as(usize, 4), e.len);
+        try testing.expectEqualStrings(hint_a, e[2]);
+        try testing.expectEqualStrings("root", e[3]);
+        try testing.expectEqualStrings(hint_b, p[2]);
+    }
+}
+
+test "with nothing known the tags are exactly what they were" {
+    freshHints();
+    defer freshHints();
+    main.resetEngagementForTest();
+    main.setIdentityForTest([_]u8{0x57} ** 32);
+    defer {
+        main.resetEngagementForTest();
+        main.clearIdentityForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x58} ** 32);
+    const ev = try signedNote(arena_state.allocator(), signer, kp, 1_800_000_000, "no one has said where");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_000);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+    var fx: main.EffectsForTest = undefined;
+
+    main.clearLastPublishedTagsForTest();
+    main.update(&model, Msg{ .like = id }, &fx);
+    {
+        const tags = main.lastPublishedTagsForTest();
+        try testing.expectEqual(@as(usize, 2), (tagNamed(tags, "e") orelse return error.NoETag).len);
+        try testing.expectEqual(@as(usize, 2), (tagNamed(tags, "p") orelse return error.NoPTag).len);
+    }
+    main.clearLastPublishedTagsForTest();
+    main.update(&model, Msg{ .repost = id }, &fx);
+    {
+        const e = tagNamed(main.lastPublishedTagsForTest(), "e") orelse return error.NoETag;
+        try testing.expectEqual(@as(usize, 4), e.len);
+        try testing.expectEqualStrings("", e[2]);
+    }
+    main.clearLastPublishedTagsForTest();
+    model.viewing_thread = id;
+    model.thread_root = model.notes[0];
+    model.reply_buffer.set("agreed");
+    main.update(&model, Msg.reply_submit, &fx);
+    {
+        const e = tagNamed(main.lastPublishedTagsForTest(), "e") orelse return error.NoETag;
+        try testing.expectEqualStrings("", e[2]);
+        try testing.expectEqualStrings("root", e[3]);
+    }
+}
+
+test "a quoted note and a mentioned person carry the hints Plaza knows" {
+    freshHints();
+    defer freshHints();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x59} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quote.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    _ = try main.plazaIngestForTest(gpa, try relayListFor(gpa, signer, kp, &.{hint_b}));
+
+    const quoted_id = [_]u8{0x61} ** 32;
+    main.recordSeenOnForTest(quoted_id, hint_a);
+
+    // A pointer that names no relay: the one Plaza saw it on fills the slot, and
+    // the author the pointer carries keeps its place after it.
+    {
+        const nevent = try nostr.nip19.encodeNevent(gpa, quoted_id, &.{}, kp.public_key, 1);
+        const body = try std.fmt.allocPrint(gpa, "look at nostr:{s}", .{nevent});
+        const tags = main.contentTagsForTest(gpa, body);
+        const q = tagNamed(tags, "q") orelse return error.NoQuoteTag;
+        try testing.expectEqual(@as(usize, 4), q.len);
+        try testing.expectEqualStrings(hint_a, q[2]);
+        var author_hex: [64]u8 = undefined;
+        _ = try std.fmt.bufPrint(&author_hex, "{x}", .{kp.public_key});
+        try testing.expectEqualStrings(&author_hex, q[3]);
+        // The quoted author is mentioned, and their `p` tag says where they publish.
+        const p = tagNamed(tags, "p") orelse return error.NoMention;
+        try testing.expectEqual(@as(usize, 3), p.len);
+        try testing.expectEqualStrings(hint_b, p[2]);
+    }
+
+    // A pointer that names a relay of its own: that choice wins, as it does in
+    // Jumble's `extractQuoteTags`.
+    {
+        const nevent = try nostr.nip19.encodeNevent(gpa, quoted_id, &.{hint_c}, null, 1);
+        const body = try std.fmt.allocPrint(gpa, "nostr:{s}", .{nevent});
+        const q = tagNamed(main.contentTagsForTest(gpa, body), "q") orelse return error.NoQuoteTag;
+        try testing.expectEqual(@as(usize, 3), q.len);
+        try testing.expectEqualStrings(hint_c, q[2]);
+    }
+
+    // A pointer naming a relay nobody could reach is not copied into a tag.
+    {
+        const nevent = try nostr.nip19.encodeNevent(gpa, quoted_id, &.{"wss://192.168.1.2"}, null, 1);
+        const body = try std.fmt.allocPrint(gpa, "nostr:{s}", .{nevent});
+        const q = tagNamed(main.contentTagsForTest(gpa, body), "q") orelse return error.NoQuoteTag;
+        try testing.expectEqualStrings(hint_a, q[2]);
+    }
+
+    // Nothing known and no author: the tag stops at the id, as before.
+    {
+        const other = [_]u8{0x62} ** 32;
+        const nevent = try nostr.nip19.encodeNevent(gpa, other, &.{}, null, 1);
+        const body = try std.fmt.allocPrint(gpa, "nostr:{s}", .{nevent});
+        const q = tagNamed(main.contentTagsForTest(gpa, body), "q") orelse return error.NoQuoteTag;
+        try testing.expectEqual(@as(usize, 2), q.len);
+    }
+
+    // A plain mention of somebody whose list is known carries their relay.
+    {
+        const npub = try nostr.nip19.encodeNpub(gpa, kp.public_key);
+        const body = try std.fmt.allocPrint(gpa, "thanks nostr:{s}", .{npub});
+        const p = tagNamed(main.contentTagsForTest(gpa, body), "p") orelse return error.NoMention;
+        try testing.expectEqual(@as(usize, 3), p.len);
+        try testing.expectEqualStrings(hint_b, p[2]);
+    }
+}
