@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const compose = @import("compose.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -48,8 +49,8 @@ var g_reply_draft_clock: u64 = 0;
 /// box, and nobody would have pressed Reply on it.
 pub fn parkReplyDraft(model: *Model) void {
     defer model.reply_buffer.clear();
-    const held = main.g_reply_due_s != 0;
-    main.g_reply_due_s = 0;
+    const held = compose.g_reply_due_s != 0;
+    compose.g_reply_due_s = 0;
     const text = model.reply_buffer.text();
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
     keepReplyDraft(model.thread_root.event_id, text, true);

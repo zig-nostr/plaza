@@ -11,6 +11,7 @@ const keyholder = @import("keyholder.zig");
 const login = @import("login.zig");
 const own_lists = @import("own_lists.zig");
 const remote_signer = @import("remote_signer.zig");
+const compose = @import("compose.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -285,8 +286,8 @@ pub fn performLogout(model: *Model, fx: *Effects) void {
     // And a note this account was about to sign. It is held on the near side of
     // the signature precisely so it can still be taken back, and a session
     // ending is the clearest possible instance of taking it back.
-    main.g_post_due_s = 0;
-    main.g_reply_due_s = 0;
+    compose.g_post_due_s = 0;
+    compose.g_reply_due_s = 0;
     model.notifications_open = false;
     model.editing_profile = false;
     model.profile_seeded = false;

@@ -10,6 +10,7 @@ const hiding = @import("hiding.zig");
 const updates = @import("updates.zig");
 const places = @import("places.zig");
 const follows = @import("follows.zig");
+const compose = @import("compose.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -225,9 +226,9 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
             // Anything unreadable keeps the default rather than turning the
             // pause off: a corrupt line should not quietly remove a safeguard.
             const n = std.fmt.parseInt(i64, line[eq + 1 ..], 10) catch continue;
-            main.g_post_delay_s = switch (n) {
+            compose.g_post_delay_s = switch (n) {
                 0, 5, 10 => n,
-                else => main.g_post_delay_s,
+                else => compose.g_post_delay_s,
             };
         }
         // An empty value is meaningful here too: it is your own Plaza.
@@ -258,7 +259,7 @@ pub fn saveSettings() void {
         if (g_media_direct_fallback) "on" else "off",
         if (places.g_rail_open) "on" else "off",
         place,
-        main.g_post_delay_s,
+        compose.g_post_delay_s,
         @tagName(follows.g_home_scope),
         if (updates.g_update_check) "on" else "off",
         if (g_show_sensitive) "on" else "off",

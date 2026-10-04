@@ -26909,6 +26909,7 @@ const app_sources = [_]AppSource{
     .{ .name = "uploads.zig", .text = @embedFile("uploads.zig") },
     .{ .name = "media_servers.zig", .text = @embedFile("media_servers.zig") },
     .{ .name = "view_upload.zig", .text = @embedFile("view_upload.zig") },
+    .{ .name = "compose.zig", .text = @embedFile("compose.zig") },
 };
 
 test "no thread that dials a relay is spawned without a gate above it" {
