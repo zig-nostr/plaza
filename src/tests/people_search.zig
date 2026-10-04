@@ -293,6 +293,58 @@ test "a key, a signer link or a web link typed into search never leaves the mach
     try testing.expect(!main.searchAskedForTest());
 }
 
+test "a key pasted with a character too many still never leaves the machine" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    const hex = "5a" ** 32;
+    const nsec = try nostr.nip19.encodeNsec(arena, [_]u8{0x5a} ** 32);
+    const upper = try std.ascii.allocUpperString(arena, nsec);
+    const keys = [_][]const u8{
+        // A raw key with what a paste brings along. Each of these used to be a
+        // name, and 62 to 64 of the key's digits went to the search relays.
+        "\"" ++ hex ++ "\"",
+        "'" ++ hex ++ "'",
+        "0x" ++ hex,
+        "0X" ++ hex,
+        "@" ++ hex,
+        hex ++ ".",
+        hex ++ ",",
+        "my key: " ++ hex ++ ", thanks",
+        // Cut short by a character or two, it is still most of a key.
+        hex[0..62],
+        hex[0..60],
+        // The bech32 forms, wrapped the same ways and in either case.
+        try std.fmt.allocPrint(arena, "\"{s}\"", .{nsec}),
+        try std.fmt.allocPrint(arena, "@{s}.", .{upper}),
+        try std.fmt.allocPrint(arena, "({s}),", .{nsec}),
+        "\"ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p\"",
+        "@BUNKER://" ++ "AB" ** 32 ++ "?relay=wss://relay.example.com&secret=hunter2",
+        "<NostrConnect://" ++ "ab" ** 32 ++ "?secret=hunter2>",
+    };
+    for (keys) |text| {
+        try testing.expectEqual(main.SearchInput.key, main.classifySearch(text));
+        var model = main.initialModel();
+        model.stage = .ready;
+        var fx: main.EffectsForTest = undefined;
+        typeIntoSearch(&model, text);
+        main.searchTickForTest(&model, 100_000);
+        main.update(&model, Msg.address_submit, &fx);
+        main.searchTickForTest(&model, 200_000);
+        try testing.expect(!main.searchAskedForTest());
+        try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContainingText(tree.root, "It is not searched for") != null);
+    }
+
+    // A name with some hex in it is still a name.
+    try testing.expectEqual(main.SearchInput.term, main.classifySearch("deadbeef cafe"));
+    try testing.expectEqual(main.SearchInput.term, main.classifySearch(hex[0..59]));
+}
+
 test "people the relays name are folded in, marked with who named them, and counted once" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

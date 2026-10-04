@@ -123,8 +123,9 @@ pub const SearchInput = enum {
     /// rather than searched for.
     nip05,
     /// A secret key (`nsec1`, `ncryptsec1`), a signer link (`bunker://`,
-    /// `nostrconnect://`, which carry a secret of their own), or 64 hex digits,
-    /// which may be a secret key written out raw. None of these is a name, and
+    /// `nostrconnect://`, which carry a secret of their own), or a run of
+    /// `secret_hex_run` or more hex digits anywhere, which may be a secret key
+    /// written out raw. None of these is a name, and
     /// the cost of treating one as a name is putting it to three strangers, so
     /// nothing is done with it at all: not matched, not looked up, not sent.
     key,
@@ -149,7 +150,7 @@ pub fn classifySearch(raw: []const u8) SearchInput {
     for ([_][]const u8{ "nsec1", "ncryptsec1", "bunker://", "nostrconnect://" }) |marker| {
         if (search.indexOfFold(trimmed, marker) != null) return .key;
     }
-    if (trimmed.len == 64 and isHexString(trimmed)) return .key;
+    if (holdsHexRun(trimmed, secret_hex_run)) return .key;
     const text = addressCandidate(raw);
     for ([_][]const u8{ "npub1", "nprofile1", "note1", "nevent1", "naddr1" }) |prefix| {
         if (std.mem.startsWith(u8, text, prefix)) return .address;
@@ -162,11 +163,27 @@ pub fn classifySearch(raw: []const u8) SearchInput {
     return .term;
 }
 
-fn isHexString(text: []const u8) bool {
+/// The shortest run of hex digits that is refused as a possible secret key.
+///
+/// Not 64. A key pasted with one character too many (quotes around it, `0x` in
+/// front, an `@`, a full stop or a comma after it) is not 64 characters, and the
+/// term sent for it was 62 to 64 of its digits. Nor does a key cut short by a
+/// character or two stop being most of a key. No name has sixty hex digits in a
+/// row, so the margin costs nobody a search.
+const secret_hex_run = 60;
+
+/// Whether `text` holds `min` or more hex digits in a row, anywhere. Whatever
+/// sits around the run (quotes, punctuation, `0x`, `@`, words) only ends it, so
+/// the run is found however the key was wrapped.
+fn holdsHexRun(text: []const u8, min: usize) bool {
+    var run: usize = 0;
     for (text) |c| {
-        if (!std.ascii.isHex(c)) return false;
+        if (std.ascii.isHex(c)) {
+            run += 1;
+            if (run >= min) return true;
+        } else run = 0;
     }
-    return true;
+    return false;
 }
 
 /// A NIP-05 address split and lowercased, in buffers of its own.
