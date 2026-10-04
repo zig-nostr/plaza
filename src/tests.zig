@@ -55,6 +55,7 @@ const tests_view_compose = @import("tests/view_compose.zig");
 const tests_view_media = @import("tests/view_media.zig");
 const tests_view_note = @import("tests/view_note.zig");
 const tests_view_place = @import("tests/view_place.zig");
+const tests_view_rail = @import("tests/view_rail.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -1848,17 +1849,6 @@ test "the mark in the rail goes home" {
     model.joining = true;
     main.update(&model, .go_home, &fx);
     try testing.expect(model.joining);
-}
-
-test "the window is square where the reading happens" {
-    // A feed is a column of rows. The wide-and-short default spent its extra
-    // width on margin while showing four notes at a time.
-    //
-    // The square is the READING AREA, not the window. It was the same thing
-    // until the second rail existed; now the window carries 238pt of chrome
-    // down its left side, and asserting the window itself would either shrink
-    // the room by that much or quietly stop meaning anything.
-    try testing.expectEqual(main.window_width - main.rails_width, main.window_height);
 }
 
 // ---- P1: a click outside a modal closes it ----------------------------------
@@ -4331,6 +4321,7 @@ test {
     _ = tests_view_media;
     _ = tests_view_note;
     _ = tests_view_place;
+    _ = tests_view_rail;
 }
 
 // re-exports: tests/feed_media.zig
