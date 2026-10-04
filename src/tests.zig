@@ -33726,3 +33726,66 @@ test "a re-issued feed that a relay refuses for want of AUTH is asked again once
     try testing.expect(!ok.resend.inbox);
     try testing.expect(!ok.resend.engagement);
 }
+
+test "every toast the app can show fits the toast whole" {
+    // The toast is one line of text over a 48-byte buffer, and `setToast` cuts
+    // at the buffer, so a longer sentence reaches the reader as the first half of
+    // one: "Could not read your follow list from your relays", and the rest of
+    // what it meant gone. The limit is the buffer and not the width: 48 bytes of
+    // the toast's text size is far narrower than the window at its minimum.
+    const cap = main.initialModel().toast_buf.len;
+
+    // Every string literal handed to `setToast`, read out of the source, so a new
+    // toast is checked the day it is written rather than when somebody notices.
+    const source = @embedFile("main.zig");
+    var calls: usize = 0;
+    var too_long: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, source, at, "setToast(")) |start| {
+        at = start + "setToast(".len;
+        // The call's own text, to its closing parenthesis, skipping string
+        // contents so a ")" inside a sentence does not end it early.
+        var depth: usize = 1;
+        var i = at;
+        var in_string = false;
+        while (i < source.len and depth > 0) : (i += 1) {
+            const c = source[i];
+            if (in_string) {
+                if (c == '\\') {
+                    i += 1;
+                } else if (c == '"') in_string = false;
+            } else if (c == '"') {
+                in_string = true;
+            } else if (c == '(') {
+                depth += 1;
+            } else if (c == ')') depth -= 1;
+        }
+        const call = source[at..i];
+        if (std.mem.startsWith(u8, call, "model: *Model")) continue; // the definition
+        calls += 1;
+        var j: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, call, j, '"')) |open| {
+            const close = std.mem.indexOfScalarPos(u8, call, open + 1, '"') orelse break;
+            const text = call[open + 1 .. close];
+            j = close + 1;
+            // An argument to a helper (`noListToast("bookmarks")`) is not itself
+            // shown; the helper's sentences are checked below.
+            if (std.mem.indexOf(u8, call[0..open], "noListToast(") != null) continue;
+            if (text.len > cap) {
+                std.debug.print("\ntoo long for the toast ({d} bytes): {s}\n", .{ text.len, text });
+                too_long += 1;
+            }
+        }
+    }
+    // The walk found the calls, and is not passing because it read nothing.
+    try testing.expect(calls > 50);
+
+    for (main.noListToastsForTest()) |text| {
+        if (text.len > cap) {
+            std.debug.print("\ntoo long for the toast ({d} bytes): {s}\n", .{ text.len, text });
+            too_long += 1;
+        }
+    }
+    try testing.expect(main.place_looking_toast_for_test.len <= cap);
+    try testing.expectEqual(@as(usize, 0), too_long);
+}

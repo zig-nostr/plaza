@@ -23633,19 +23633,19 @@ fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.EffectRes
     if (!g_private_seal.active) return;
     if (response.outcome != .ok or response.status != 200) {
         g_private_seal = .{};
-        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
         g_private_seal = .{};
-        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     };
     defer parsed.deinit();
     if (parsed.value.items.len == 0) {
         g_private_seal = .{};
-        setToast(model, "Your keyholder could not seal that, so nothing was published.");
+        setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
     finishPrivateBookmark(model, fx, parsed.value.items[0]);
@@ -23672,7 +23672,7 @@ fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) vo
     // has landed since (the real list, arriving late), it carries a private half
     // this seal never saw, and publishing would erase it.
     if (!sameRecord(previous, seal.base)) {
-        setToast(model, "Your bookmarks changed while that was being sealed, so nothing was changed. Try again.");
+        setToast(model, "Your bookmarks just changed. Nothing was sent.");
         return;
     }
     if (previous == null and !g_identity_minted_here and !takeFresh(.bookmarks)) {
@@ -35165,7 +35165,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // is left armed to start one from nothing later.
             const arrived = still_me and listHeld(ask.kind());
             if (!still_me or (!arrived and !confirmStartFresh(ask.kind()))) {
-                setToast(model, "Your relays changed while you were deciding, so nothing was changed.");
+                setToast(model, "Your relays changed meanwhile. Nothing changed.");
                 return;
             }
             switch (ask.action) {
@@ -35250,7 +35250,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // No fallback to a Plaza field. There is no field in this app that
             // can take a key, so dropping to one would be offering a screen
             // that refuses whatever is typed into it.
-            if (!ceremonyCanTakeKey()) setToast(model, "Notary is missing from this install.") else if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is still starting. Try that again in a moment.");
+            if (!ceremonyCanTakeKey()) setToast(model, "Notary is missing from this install.") else if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is starting. Try again shortly.");
         },
         .keep_browsing => {
             model.stage = .ready;
@@ -35479,7 +35479,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // other app on the machine can read what this one writes down.
                 .nsec => {
                     g_login_error.store(@intFromEnum(LoginError.key_goes_to_notary), .release);
-                    if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is still starting. Try that again in a moment.");
+                    if (!spawnNotaryWindow(fx, .import_key)) setToast(model, "Your keyholder is starting. Try again shortly.");
                 },
                 // Pair with the external signer from the bunker URL; on success
                 // the feed comes up and posts route through it. A bad URL keeps
@@ -35635,7 +35635,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanMediaFetches(fx, model);
         },
         .close_image => model.expanded_note = null,
-        .open_notary_window => if (!spawnNotaryWindow(fx, .status)) setToast(model, "Your keyholder is still starting. Try that again in a moment."),
+        .open_notary_window => if (!spawnNotaryWindow(fx, .status)) setToast(model, "Your keyholder is starting. Try again shortly."),
         // Deliberately empty: see `Msg.absorb_press`. The press has already done
         // its work by the time it arrives here, which was to stop somewhere.
         .absorb_press => {},
@@ -35787,7 +35787,7 @@ fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
         // The guard fired, which means the list this app was about to publish
         // was not the list it meant to. Saying "try again" would be wrong: the
         // right move is to leave it alone until the real list is back.
-        .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .would_shrink => setToast(model, "That would change several names. Nothing sent."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -35828,7 +35828,7 @@ fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
         .private_half_waiting => setToast(model, "Opening your private mutes. Try again shortly."),
         .private_half_declined => setToast(model, "Signer declined. Asked again, approve it there."),
         .private_half_unreadable => setToast(model, "Cannot read your private mutes. Nothing changed."),
-        .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
+        .would_shrink => setToast(model, "That would change several names. Nothing sent."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -35872,12 +35872,31 @@ fn askFreshFirst(model: *Model, ask: FreshAsk) bool {
 /// refusal is the same every time (nothing was changed); what the reader can do
 /// about it is not.
 fn noListToast(comptime what: []const u8) []const u8 {
-    return switch (ownListsRead()) {
-        .reading => "Still fetching your " ++ what ++ ". Try again in a moment.",
-        .incomplete => "Could not read your " ++ what ++ " from your relays, so nothing was changed.",
-        .none_found => "No " ++ what ++ " was found on your relays, so nothing was changed.",
+    return noListToastIn(what, ownListsRead());
+}
+
+fn noListToastIn(comptime what: []const u8, read: OwnListsRead) []const u8 {
+    return switch (read) {
+        .reading => "Still reading your " ++ what ++ ". Try again soon.",
+        .incomplete => "Can't read your " ++ what ++ ". Nothing changed.",
+        .none_found => "No " ++ what ++ " on your relays. Nothing changed.",
     };
 }
+
+/// Every sentence `noListToast` can say, for the test that checks each fits.
+pub fn noListToastsForTest() [9][]const u8 {
+    var out: [9][]const u8 = undefined;
+    var n: usize = 0;
+    inline for (.{ "follow list", "mute list", "bookmarks" }) |what| {
+        for ([_]OwnListsRead{ .reading, .incomplete, .none_found }) |read| {
+            out[n] = noListToastIn(what, read);
+            n += 1;
+        }
+    }
+    return out;
+}
+
+pub const place_looking_toast_for_test = place_looking_toast;
 
 fn setToast(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.toast_buf.len);
@@ -36910,7 +36929,7 @@ fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     // process.
     if (!submitPost(model, fx, route)) {
         setToast(model, if (!outboxHasRoom())
-            "Still trying to send your last notes. This one is kept here."
+            "Still sending your last notes. This one is kept."
         else
             "Notary is busy for a moment. Try again.");
         return false;
@@ -43919,7 +43938,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
     if (seal_failed) {
         g_private_seal = .{};
-        setToast(model, "Your signer did not seal that, so nothing was published.");
+        setToast(model, "Your signer did not seal that. Nothing was sent.");
     }
     if (opened) {
         // The set was read with this half closed, so it is short by whatever
