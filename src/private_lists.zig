@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const keyholder = @import("keyholder.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -210,7 +211,7 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     // Notary's own door opens NIP-44 and nothing else, so a NIP-04 half is not
     // something it can be asked for. No slot: the half reads as unreadable, which
     // is the truth, rather than as a refusal that a press would keep re-asking.
-    if (main.g_signer_kind == .helper and isNip04Payload(content)) return null;
+    if (keyholder.g_signer_kind == .helper and isNip04Payload(content)) return null;
     g_private_halves[i] = .{ .used = true, .state = .idle, .id = id };
     @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
     g_private_ciphertext[i].len = @intCast(content.len);
@@ -219,7 +220,7 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     // which is the whole reason this is a cache and not a call. A bunker never
     // answers inline, in a test or out of one: its answer is parked by the
     // listener and applied by the sweep.
-    if (builtin.is_test and main.g_signer_kind == .helper) {
+    if (builtin.is_test and keyholder.g_signer_kind == .helper) {
         answerPrivateHalfForTest(std.heap.page_allocator, i, content);
         if (g_private_halves[i].state == .open) return g_private_halves[i].plain();
     }
@@ -279,7 +280,7 @@ pub fn scanPrivateHalves(fx: *Effects) void {
         // A bunker answers over NIP-46, not over the keyholder's HTTP door.
         // This used to fall through to `helperFetch` regardless, so a reader on
         // an external signer asked a daemon that does not hold their key.
-        if (main.g_signer_kind == .remote) {
+        if (keyholder.g_signer_kind == .remote) {
             h.state = .asking;
             if (!requestRemoteDecrypt(gpa, i, content)) {
                 // Nothing was sent (no room to track it, no id): a delay and

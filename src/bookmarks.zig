@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const own_lists = @import("own_lists.zig");
 const private_lists = @import("private_lists.zig");
+const keyholder = @import("keyholder.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -335,7 +336,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
 
     private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null };
 
-    if (main.g_signer_kind == .remote) {
+    if (keyholder.g_signer_kind == .remote) {
         private_lists.g_private_seal.awaiting_remote = true;
         if (!requestRemoteEncrypt(gpa, plaintext)) {
             private_lists.g_private_seal = .{};
