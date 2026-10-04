@@ -7902,6 +7902,36 @@ test "a new key keeps reading the starter pack after its first follow" {
     try testing.expectEqual(main.starterPackLenForTest(), main.followSet().len);
 }
 
+test "the feed menu says why there is one feed, and the refresh chip answers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{106} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // One feed: the menu is the word already on screen, so it also says what
+    // would make there be a second.
+    model.menu = .scope;
+    const hint = "Follow someone to add your Following feed.";
+    try testing.expect(findAnyTextContainingText((try buildTree(arena, &model)).root, hint) != null);
+
+    // With a follow list there is a real choice and the line has nothing to add.
+    const one = [_][32]u8{[_]u8{0xc2} ** 32};
+    _ = main.setFollowsForTest(&one, 1_800_000_000);
+    try testing.expect(findAnyTextContainingText((try buildTree(arena, &model)).root, hint) == null);
+
+    // The refresh chip says it did something.
+    try testing.expectEqual(@as(usize, 0), model.toast_len);
+    main.update(&model, .jump_to_newest, &fx);
+    try testing.expectEqualStrings("Feed refreshed", model.toast_buf[0..model.toast_len]);
+}
+
 test "one relay's silence never authorizes replacing a contact list" {
     // The failure this whole feature is built to avoid, and the one my first
     // gate let through. EOSE means "that is all I have", not "you have none".

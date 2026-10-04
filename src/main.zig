@@ -28804,9 +28804,21 @@ fn scopeMenu(ui: *AppUi, scope: []const u8) AppUi.Node {
     // and a menu offering a feed with nobody in it is a promise Home cannot
     // keep.
     if (!homeScopeSwitchable()) {
-        const rows = ui.arena.alloc(AppUi.Node, 1) catch return ui.spacer(0);
+        const rows = ui.arena.alloc(AppUi.Node, 2) catch return ui.spacer(0);
         rows[0] = menuRow(ui, scope, "check", null, .close_menu);
-        return menuSurfacePlaced(ui, 200, .below, .start, rows);
+        // Why there is nothing to choose, and what would change that, so the
+        // menu is not a chevron that opens onto the word already on screen. One
+        // line, because a wrapped paragraph is not counted in the surface's
+        // height and the second line would hang out of the bottom of it.
+        rows[1] = ui.row(.{ .cross = .center, .gap = 0 }, .{
+            hgap(ui, 9),
+            vgap(ui, 25),
+            ui.paragraph(
+                .{ .style = .{ .foreground = theme.palette.text_label } },
+                &.{.{ .text = "Follow someone to add your Following feed.", .scale = mono_hint_scale }},
+            ),
+        });
+        return menuSurfacePlaced(ui, 280, .below, .start, rows);
     }
     const rows = ui.arena.alloc(AppUi.Node, 2) catch return ui.spacer(0);
     const on_pack = homeReadsPack();
@@ -34633,6 +34645,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .jump_to_newest => {
             invalidateFeed();
             model.menu = .none;
+            // The press rebuilds the feed from what the store holds, which is
+            // instant and changes nothing a reader can see when they are already
+            // caught up. Without a word that reads as a button that did nothing.
+            setToast(model, "Feed refreshed");
         },
         .copy_nevent => |id| {
             const note = model.noteById(id) orelse return;
