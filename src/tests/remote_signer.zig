@@ -412,6 +412,47 @@ test "a bunker pairing that is taken back leaves its secret nowhere" {
     try testing.expect(!main.remoteSecretHeldForTest("pairing-secret-one"));
 }
 
+test "an ended bunker pairing takes its listener's socket down" {
+    // The listener is parked in a `receive` with no deadline, and the keeper's
+    // pings keep that socket busy, so bumping the generation never reached it:
+    // every abandoned pairing kept a thread, a socket, a live subscription and
+    // the client key until the process ended.
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // Dropped.
+    var before = main.bunkerListenerShutdownsForTest();
+    main.offerBunkerListenerForTest(0x1000);
+    main.resetBunkerConnectForTest();
+    try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
+    try testing.expectEqual(before + 1, main.bunkerListenerShutdownsForTest());
+
+    // Signed out of.
+    before = main.bunkerListenerShutdownsForTest();
+    main.offerBunkerListenerForTest(0x2000);
+    main.performLogoutForTest(&model, &fx);
+    try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
+    try testing.expectEqual(before + 1, main.bunkerListenerShutdownsForTest());
+
+    // Replaced by a new pairing.
+    before = main.bunkerListenerShutdownsForTest();
+    main.offerBunkerListenerForTest(0x3000);
+    main.bumpRemoteGenerationForTest();
+    try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
+    try testing.expectEqual(before + 1, main.bunkerListenerShutdownsForTest());
+
+    // And an old listener unwinding late leaves the new one's registration be.
+    main.offerBunkerListenerForTest(0x4000);
+    main.withdrawBunkerListenerForTest(0x3000);
+    try testing.expectEqual(@as(usize, 0x4000), main.bunkerListenerForTest());
+    main.withdrawBunkerListenerForTest(0x4000);
+    try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
+}
+
 test "a key adopted while a bunker link waits takes the link down with it" {
     defer main.resetBunkerConnectForTest();
     defer main.clearIdentityForTest();

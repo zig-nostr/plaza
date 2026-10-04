@@ -17,6 +17,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const takeDownBunkerListener = main.takeDownBunkerListener;
 const forgetSeenOn = main.forgetSeenOn;
 const wipeRemoteSecrets = main.wipeRemoteSecrets;
 const forgetPrivateSeal = main.forgetPrivateSeal;
@@ -259,6 +260,7 @@ pub fn performLogout(model: *Model, fx: *Effects) void {
     // listener from processing into the next session, and the pending table is
     // emptied so no in-flight request survives the logout.
     _ = remote_signer.g_remote_generation.fetchAdd(1, .monotonic);
+    takeDownBunkerListener();
     clearPending();
     remote_signer.g_remote_sign_notice.store(false, .release);
     // And the built-in signer's slot, for the same reason: it holds the leaving

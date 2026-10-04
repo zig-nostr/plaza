@@ -137,6 +137,67 @@ pub fn offerLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
     g_relay_pinged_ms[index] = 0;
 }
 
+/// Withdraws `relay` from slot `index`, and only `relay`. The bunker's slot
+/// changes hands when a new link is pasted while the old listener is still
+/// unwinding, and a blind withdraw from the old one would take the new
+/// listener's registration with it, leaving the live session with no keepalive.
+pub fn withdrawLiveRelay(index: usize, relay: *nostr.relay.Relay) void {
+    lockLiveRelay(index);
+    defer unlockLiveRelay(index);
+    if (g_relay_live[index] != relay) return;
+    g_relay_live[index] = null;
+    g_relay_pinged_ms[index] = 0;
+}
+
+/// Takes the bunker listener's socket down, the way the keeper gives up on a
+/// silent one: half-closed under the slot's lock, so the listener's blocked
+/// `receive` returns and, its generation gone, it exits and frees what it held.
+///
+/// A generation bump alone does not reach it. The listener is parked in a
+/// `receive` with no deadline, and the keeper's pings keep that socket busy
+/// forever, so every abandoned pairing kept a thread, a socket, a live
+/// subscription and the client key for the life of the process.
+pub fn takeDownBunkerListener() void {
+    lockLiveRelay(bunker_watch_slot);
+    defer unlockLiveRelay(bunker_watch_slot);
+    const relay = g_relay_live[bunker_watch_slot] orelse return;
+    if (builtin.is_test) {
+        // A test has no relay to dial, so the slot holds a stand-in that must
+        // not be touched. What it can check is that the slot is taken down.
+        g_test_listener_shutdowns += 1;
+    } else if (main.g_io) |io| {
+        relay.shutdown(io);
+    } else {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        relay.shutdown(threaded.io());
+    }
+    g_relay_live[bunker_watch_slot] = null;
+    g_relay_pinged_ms[bunker_watch_slot] = 0;
+}
+
+var g_test_listener_shutdowns: usize = 0;
+
+/// Puts a stand-in in the bunker listener's slot, as a dialled listener would.
+pub fn offerBunkerListenerForTest(stand_in: usize) void {
+    offerLiveRelay(bunker_watch_slot, @ptrFromInt(stand_in));
+}
+
+pub fn withdrawBunkerListenerForTest(stand_in: usize) void {
+    withdrawLiveRelay(bunker_watch_slot, @ptrFromInt(stand_in));
+}
+
+/// The bunker slot's stand-in, or 0, and how many times one was taken down.
+pub fn bunkerListenerForTest() usize {
+    lockLiveRelay(bunker_watch_slot);
+    defer unlockLiveRelay(bunker_watch_slot);
+    return if (g_relay_live[bunker_watch_slot]) |r| @intFromPtr(r) else 0;
+}
+
+pub fn bunkerListenerShutdownsForTest() usize {
+    return g_test_listener_shutdowns;
+}
+
 // -- A question that cannot be asked forever ---------------------------------
 //
 // Every fetch that is not the feed dials its own socket, asks one question and

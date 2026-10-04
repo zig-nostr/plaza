@@ -14,6 +14,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const withdrawLiveRelay = main.withdrawLiveRelay;
+const takeDownBunkerListener = main.takeDownBunkerListener;
 const parkHalfAnswer = main.parkHalfAnswer;
 const parkSealAnswer = main.parkSealAnswer;
 const forgetPrivateSeal = main.forgetPrivateSeal;
@@ -87,7 +89,11 @@ pub var g_remote_generation = std.atomic.Value(u64).init(0);
 /// outright and has nothing to re-ask.
 pub fn newRemoteGeneration() u64 {
     rearmPrivateHalves(0, true);
-    return g_remote_generation.fetchAdd(1, .monotonic) + 1;
+    const generation = g_remote_generation.fetchAdd(1, .monotonic) + 1;
+    // The previous listener, if one is parked on its socket: a link pasted over
+    // a live pairing would otherwise leave it there for good.
+    takeDownBunkerListener();
+    return generation;
 }
 // A remote sign that never came back, surfaced once in the composer identity
 // line so a restored draft is explained rather than silently reappearing.
@@ -524,6 +530,7 @@ fn dropRemoteConnection() void {
     // Bumped first, so the detached listener stops processing before the state
     // it reads is taken away.
     _ = g_remote_generation.fetchAdd(1, .monotonic);
+    takeDownBunkerListener();
     clearPending();
     forgetPrivateSeal();
     g_remote_confirming.store(false, .release);
@@ -811,7 +818,10 @@ pub fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
     const io = threaded.io();
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
-    const client_kp = g_remote_client_kp orelse return;
+    // This thread's copy of the client key, wiped when it exits, as the global
+    // is when the pairing ends.
+    var client_kp = g_remote_client_kp orelse return;
+    defer std.crypto.secureZero(u8, &client_kp.secret_key);
 
     while (generation == g_remote_generation.load(.acquire)) {
         nip46ReceiveOnce(gpa, io, signer, client_kp, generation) catch |err| {
@@ -828,10 +838,14 @@ pub fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
 fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, generation: u64) !void {
     var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
     // Withdrawn before the connection is freed: declared after `deinit`, so it
-    // runs before it.
+    // runs before it. Only this listener's own registration: a newer one may
+    // hold the slot by now.
     defer relay.deinit();
     offerLiveRelay(bunker_watch_slot, relay);
-    defer offerLiveRelay(bunker_watch_slot, null);
+    defer withdrawLiveRelay(bunker_watch_slot, relay);
+    // Offered first, then checked: a pairing ended before the offer bumped the
+    // generation already, and one ended after it finds this socket to take down.
+    if (generation != g_remote_generation.load(.acquire)) return;
 
     var client_hex: [64]u8 = undefined;
     hexLower(&client_hex, client_kp.public_key);
