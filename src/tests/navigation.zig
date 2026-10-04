@@ -19,6 +19,8 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const bookmarkFixture = harness.bookmarkFixture;
+const countPressesOf = harness.countPressesOf;
 const articleStore = harness.articleStore;
 const bareRoot = harness.bareRoot;
 const buildTree = harness.buildTree;
@@ -331,6 +333,69 @@ test "a note pressed on a hashtag page opens, and Back returns to the page" {
     try testing.expectEqualStrings("planetdyne", model.viewingTopic() orelse return error.TopicLost);
     main.closeThreadForTest(&model);
     try testing.expect(!model.levelOpen());
+}
+
+test "a note on a hashtag page or the bookmark list opens and copies from its own row" {
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/levelpress.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    // A tagged note that is on neither the feed nor any thread: the page's
+    // own rows are the only place it lives.
+    const author = try signer.keyPairFromSecretKey([_]u8{0x49} ** 32);
+    const tag = [_]nostr.event.Tag{&.{ "t", "planetdyne" }};
+    const ev = try nostr.event.create(arena, signer, author, 1_800_000_031, 1, &tag, "only on the tag page", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    try testing.expectEqual(@as(usize, 0), model.notes_len);
+
+    // The hashtag page, opened the way a press on `#planetdyne` opens it.
+    main.update(&model, Msg{ .open_url = "t\x00planetdyne" }, &fx);
+    try testing.expectEqual(@as(usize, 1), model.thread_notes_len);
+    const id = model.thread_notes[0].id;
+    const topic_tree = try buildTree(arena, &model);
+    try testing.expect(countPressesOf(topic_tree, topic_tree.root, Msg{ .open_thread = id }) > 0);
+    main.update(&model, Msg{ .copy_nevent = id }, &fx);
+    try testing.expectEqualStrings("Address copied", model.toast_text());
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    try testing.expectEqual(id, model.viewing_thread);
+    main.closeThreadForTest(&model);
+    main.closeThreadForTest(&model);
+    try testing.expect(!model.levelOpen());
+
+    // The bookmark list, holding the same note.
+    var id_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&id_hex, "{x}", .{ev.id});
+    const saved = [_]nostr.event.Tag{&.{ "e", &id_hex }};
+    _ = try bookmarkFixture(arena, &signer, &store, &saved, "");
+    main.update(&model, .open_bookmarks, &fx);
+    try testing.expectEqual(@as(usize, 1), model.thread_notes_len);
+    try testing.expectEqual(id, model.thread_notes[0].id);
+    const bm_tree = try buildTree(arena, &model);
+    try testing.expect(countPressesOf(bm_tree, bm_tree.root, Msg{ .open_thread = id }) > 0);
+    model.toast_len = 0;
+    main.update(&model, Msg{ .copy_nevent = id }, &fx);
+    try testing.expectEqualStrings("Address copied", model.toast_text());
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    try testing.expectEqual(id, model.viewing_thread);
 }
 test "every engagement query asks the same bounded question" {
     // Three screens ask for replies, reposts, likes and zaps over a list of note

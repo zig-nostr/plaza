@@ -20,6 +20,7 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const bookmarkFixture = harness.bookmarkFixture;
 const buildTree = harness.buildTree;
 const findAnyText = harness.findAnyText;
 const findAnyTextContainingText = harness.findAnyTextContainingText;
@@ -46,22 +47,6 @@ test "what the private-half refusals say fits the toast whole" {
         if (outcome == .private_half_declined) try testing.expectEqualStrings(declined_toast, model.toast_text());
         model.toast_len = 0;
     }
-}
-fn bookmarkFixture(
-    arena: std.mem.Allocator,
-    signer: *nostr.keys.Signer,
-    store: *nostr.store.Store,
-    tags: []const nostr.event.Tag,
-    content: []const u8,
-) !nostr.keys.KeyPair {
-    const secret = [_]u8{0x84} ** 32;
-    const kp = try signer.keyPairFromSecretKey(secret);
-    main.setIdentityForTest(secret);
-    main.setStoreForTest(store);
-    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10003, tags, content, null);
-    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
-    main.loadBookmarksFromStoreForTest();
-    return kp;
 }
 
 test "an empty bookmark list says whether anything is saved" {

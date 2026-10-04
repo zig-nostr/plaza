@@ -1097,6 +1097,23 @@ pub fn seedAuthorNotes(store: *nostr.store.Store, arena: std.mem.Allocator, auth
 
 // ---- settings, relays and signing in: the dead ends --------------------------
 
+pub fn bookmarkFixture(
+    arena: std.mem.Allocator,
+    signer: *nostr.keys.Signer,
+    store: *nostr.store.Store,
+    tags: []const nostr.event.Tag,
+    content: []const u8,
+) !nostr.keys.KeyPair {
+    const secret = [_]u8{0x84} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    main.setStoreForTest(store);
+    const ev = try nostr.event.create(arena, signer.*, kp, 1_800_000_000, 10003, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
+    main.loadBookmarksFromStoreForTest();
+    return kp;
+}
+
 test {
     _ = tests_addresses;
     _ = tests_bookmarks;

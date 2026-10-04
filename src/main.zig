@@ -1779,12 +1779,15 @@ pub const Model = struct {
         for (self.notes[0..self.notes_len]) |*note| {
             if (note.id == note_id) return note;
         }
-        // A profile's rows live in the same buffer, so they resolve the same way.
-        // Without this every press on a profile row (open, like, expand a
-        // picture) is a silent no-op, which is worse than an inert control
-        // because it looks live.
+        // A profile's rows live in the same buffer, and so do a hashtag page's
+        // and the bookmark list's, so they resolve the same way. Without this
+        // every press on one of those rows (open, like, expand a picture) is a
+        // silent no-op, which is worse than an inert control because it looks
+        // live.
         if (self.viewing_thread != 0 or self.viewing_profile != null) {
             if (self.thread_root.id == note_id) return &self.thread_root;
+        }
+        if (self.levelOpen()) {
             for (self.thread_notes[0..self.thread_notes_len]) |*note| {
                 if (note.id == note_id) return note;
             }
