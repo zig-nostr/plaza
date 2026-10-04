@@ -376,6 +376,29 @@ test "a search relay whose handshake never ends is taken over by a later term" {
     main.releaseSearchSlotForTest(0, 7);
 }
 
+test "a search relay that never finishes a handshake has at most two threads out" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    const budget = main.one_shot_budget_ms;
+
+    // A term's dial hangs, and a later term takes the relay over once the
+    // budget has passed. Two threads are out now, both parked.
+    const at: i64 = 50_000;
+    try testing.expect(main.claimSearchSlotForTest(0, 5, at));
+    try testing.expect(main.claimSearchSlotForTest(0, 6, at + budget + 1));
+
+    // The second hangs as well. However long the reader goes on typing, no
+    // third thread is sent after them.
+    try testing.expect(!main.claimSearchSlotForTest(0, 7, at + 2 * budget + 2));
+    try testing.expect(!main.claimSearchSlotForTest(0, 8, at + 10 * budget));
+
+    // One of them ends, so the newest term may take the relay over again.
+    main.releaseSearchSlotForTest(0, 5);
+    try testing.expect(main.claimSearchSlotForTest(0, 8, at + 10 * budget));
+    main.releaseSearchSlotForTest(0, 6);
+    main.releaseSearchSlotForTest(0, 8);
+}
+
 test "a short term sent with Enter is put again to a relay that was busy" {
     main.searchResetForTest();
     defer main.searchResetForTest();

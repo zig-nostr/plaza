@@ -112,6 +112,14 @@ var g_search_claim: [search.relays_max]std.atomic.Value(u64) = @splat(std.atomic
 /// When each claim was taken, on the awake clock. Every claim is made on the UI
 /// thread, and only a claim reads it, so it needs no lock.
 var g_search_claimed_ms: [search.relays_max]i64 = @splat(0);
+/// How many threads are out for each search relay, the one holding the claim
+/// and any it took over from that have not ended yet.
+var g_search_workers: [search.relays_max]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0));
+/// The most threads one search relay may have out. A takeover leaves the old
+/// thread parked in its dial, so without a ceiling a relay that takes the TCP
+/// connection and never finishes the handshake gained a stuck thread and a
+/// socket every `one_shot_budget_ms` for as long as the reader typed.
+const search_workers_max = 2;
 
 fn searchClaimToken(gen: u32) u64 {
     return @as(u64, gen) + 1;
@@ -123,9 +131,12 @@ fn searchClaimToken(gen: u32) u64 {
 ///
 /// A thread out longer than `one_shot_budget_ms` for an earlier term is taken
 /// over. Its dial has no deadline, so a handshake that never finishes held the
-/// relay for the rest of the session, and no later term reached it.
+/// relay for the rest of the session, and no later term reached it. A relay
+/// that already has `search_workers_max` threads out is not taken over again
+/// until one of them ends.
 fn claimSearchSlot(i: usize, gen: u32, now_ms: i64) bool {
     if (g_search_slot_asked[i] == gen) return false;
+    if (g_search_workers[i].load(.acquire) >= search_workers_max) return false;
     const held = g_search_claim[i].load(.acquire);
     if (held != 0) {
         if (held >= searchClaimToken(gen)) return false;
@@ -134,14 +145,17 @@ fn claimSearchSlot(i: usize, gen: u32, now_ms: i64) bool {
     if (g_search_claim[i].cmpxchgStrong(held, searchClaimToken(gen), .acq_rel, .acquire) != null) return false;
     g_search_claimed_ms[i] = now_ms;
     g_search_slot_asked[i] = gen;
+    _ = g_search_workers[i].fetchAdd(1, .acq_rel);
     return true;
 }
 
 /// Lets go of relay `i`, but only the claim generation `gen` made. A thread
 /// whose claim was taken over ends late, and freeing the slot then would let a
-/// second thread in beside the one that holds it now.
+/// second thread in beside the one that holds it now. Either way the thread is
+/// no longer out: every successful claim is released exactly once.
 fn releaseSearchSlot(i: usize, gen: u32) void {
     _ = g_search_claim[i].cmpxchgStrong(searchClaimToken(gen), 0, .acq_rel, .monotonic);
+    _ = g_search_workers[i].fetchSub(1, .acq_rel);
 }
 
 /// A person a relay returned, on its way from the thread that read it to the one
@@ -738,6 +752,7 @@ pub fn searchResetForTest() void {
     g_search_slot_asked = @splat(0);
     for (&g_search_claim) |*claim| claim.store(0, .release);
     g_search_claimed_ms = @splat(0);
+    for (&g_search_workers) |*workers| workers.store(0, .release);
     g_search_typed_ms = 0;
     g_nip05_ask = null;
 }
