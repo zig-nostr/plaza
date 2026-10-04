@@ -199,9 +199,20 @@ const PickRefused = struct { target: UploadTarget, why: []const u8 };
 
 var g_pick_refused: ?PickRefused = null;
 
+/// Only while the job that caused it is still in the way. A send that ends
+/// failed frees the slot for the next pick, and the reason went on saying
+/// another picture was still uploading.
 pub fn pickRefusedFor(target: UploadTarget) ?[]const u8 {
     const r = g_pick_refused orelse return null;
+    const job = g_upload orelse return null;
+    if (job.phase() == .failed) return null;
     return if (r.target == target) r.why else null;
+}
+
+/// Forgets a refused pick, for a sheet that opens or closes: the reason belongs
+/// to the press that was refused, not to the next time the sheet is up.
+pub fn clearPickRefused() void {
+    g_pick_refused = null;
 }
 
 pub fn pickRefusedForTest(target: u8) ?[]const u8 {

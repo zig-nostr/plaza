@@ -254,6 +254,64 @@ test "Post waits for the composer's picture, and a second pick never drops the f
     try testing.expect(canvas.semanticActions(post).press);
 }
 
+test "a refused pick is said only while its reason holds" {
+    // The reason outlived the job that caused it: a send that ended failed left
+    // "still uploading" beside a control that would now work, and closing and
+    // reopening the sheet brought it back.
+    main.forgetBlossomForTest();
+    main.setIdentityForTest([_]u8{0x4f} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetBlossomForTest();
+    defer main.setPickPathForTest(null);
+    defer main.dropUploadForTest();
+    const path = try writeTestPicture("upload-test-refused-pick.png", 8, 8, "");
+    defer testing.allocator.free(path);
+    const srv = try blossom.TestServer.start(testing.io, .refuse_put, 2);
+    defer srv.stop(testing.io);
+    var url_buf: [64]u8 = undefined;
+    main.setBlossomServersForTest(&.{srv.url(&url_buf)});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    var sheet = main.initialModel();
+    sheet.stage = .settings;
+    sheet.editing_profile = true;
+    sheet.profile_stage = .have;
+    var fx: main.EffectsForTest = undefined;
+
+    // The note's picture is on its way, so an avatar pick is refused.
+    main.setPickPathForTest(path);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.update(&model, .upload_go, &fx);
+    main.update(&sheet, .{ .upload_pick = 1 }, &fx);
+    try testing.expect(main.pickRefusedForTest(1) != null);
+
+    // The send fails. Nothing is in the way any more.
+    main.driveUploadForTest(&model);
+    try awaitUpload("failed");
+    try testing.expect(main.pickRefusedForTest(1) == null);
+
+    // A picture waiting in the composer refuses the pick again, and the sheet
+    // closing puts the reason away with it.
+    main.update(&model, .upload_cancel, &fx);
+    main.update(&model, .{ .upload_pick = 0 }, &fx);
+    try awaitUpload("ready");
+    main.update(&sheet, .{ .upload_pick = 1 }, &fx);
+    try testing.expect(main.pickRefusedForTest(1) != null);
+    main.update(&sheet, .close_profile_edit, &fx);
+    try testing.expect(main.pickRefusedForTest(1) == null);
+
+    // And opening it does too: the next sheet has not been refused anything.
+    sheet.stage = .settings;
+    sheet.editing_profile = true;
+    main.update(&sheet, .{ .upload_pick = 1 }, &fx);
+    try testing.expect(main.pickRefusedForTest(1) != null);
+    main.update(&sheet, .open_profile_edit, &fx);
+    try testing.expect(main.pickRefusedForTest(1) == null);
+}
+
 test "a failed upload keeps the draft, says why in plain words, and can be tried again" {
     main.forgetBlossomForTest();
     main.setIdentityForTest([_]u8{0x4b} ** 32);

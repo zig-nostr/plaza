@@ -3831,6 +3831,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_profile_edit => {
             model.editing_profile = false;
             uploads.g_profile_upload_unsaved = false;
+            uploads.clearPickRefused();
             // A picture on its way to the avatar or banner has nowhere to go
             // once the sheet is closed.
             if (uploads.g_upload) |job| {

@@ -206,6 +206,7 @@ pub fn openProfileEdit(model: *Model) void {
     }
     model.editing_profile = true;
     uploads.g_profile_upload_unsaved = false;
+    uploads.clearPickRefused();
     model.profile_confirm_new = false;
     model.profile_name_buffer.clear();
     model.profile_about_buffer.clear();
