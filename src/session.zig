@@ -17,6 +17,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const wipeRemoteSecrets = main.wipeRemoteSecrets;
+const forgetPrivateSeal = main.forgetPrivateSeal;
 const Effects = main.Effects;
 const LoginError = main.LoginError;
 const Model = main.Model;
@@ -263,12 +265,17 @@ pub fn performLogout(model: *Model, fx: *Effects) void {
     releaseHelperSign();
     keyholder.g_helper_sign_notice.store(false, .release);
 
+    // And a private bookmark that was being sealed for them.
+    forgetPrivateSeal();
+
     keyholder.g_identity_npub_len = 0;
     keyholder.g_helper_has_identity = false;
     keyholder.g_signer_kind = .helper;
-    remote_signer.g_remote_client_kp = null;
+    // Wiped, the way dropping a bunker wipes them: the pairing secret and the
+    // client key are what let this machine ask the leaving reader's signer
+    // for signatures.
+    wipeRemoteSecrets();
     remote_signer.g_remote_relay_len = 0;
-    remote_signer.g_remote_secret_len = 0;
     remote_signer.g_remote_status.store(0, .release);
     login.g_login_error.store(@intFromEnum(LoginError.none), .release);
     invalidateFeed();

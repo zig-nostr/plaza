@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const forgetPrivateSeal = main.forgetPrivateSeal;
 const PendingUndo = main.PendingUndo;
 const slotIdForTest = main.slotIdForTest;
 const Effects = main.Effects;
@@ -172,7 +173,7 @@ const SealInbox = struct {
     buf: [4096]u8 = undefined,
     len: u16 = 0,
 };
-var g_seal_inbox: SealInbox = .{};
+pub var g_seal_inbox: SealInbox = .{};
 
 var g_pending_lock = std.atomic.Value(bool).init(false);
 pub var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
@@ -415,14 +416,32 @@ fn dropRemoteConnection() void {
     // it reads is taken away.
     _ = g_remote_generation.fetchAdd(1, .monotonic);
     clearPending();
+    forgetPrivateSeal();
     g_remote_confirming.store(false, .release);
     g_remote_sign_notice.store(false, .release);
+    wipeRemoteSecrets();
+    g_remote_relay_len = 0;
+    g_remote_status.store(0, .release);
+}
+
+/// The pairing secret and the client key, wiped rather than forgotten: a length
+/// of zero or a null leaves the bytes where they were.
+pub fn wipeRemoteSecrets() void {
     std.crypto.secureZero(u8, &g_remote_secret_buf);
     g_remote_secret_len = 0;
     if (g_remote_client_kp) |*kp| std.crypto.secureZero(u8, &kp.secret_key);
     g_remote_client_kp = null;
-    g_remote_relay_len = 0;
-    g_remote_status.store(0, .release);
+}
+
+/// The client key's secret, so a test can look for it after it should be gone.
+pub fn remoteClientSecretForTest() ?[32]u8 {
+    const kp = g_remote_client_kp orelse return null;
+    return kp.secret_key;
+}
+
+/// Whether `secret` is still in the storage that held the client key.
+pub fn remoteClientSecretLingersForTest(secret: [32]u8) bool {
+    return std.mem.indexOf(u8, std.mem.asBytes(&g_remote_client_kp), &secret) != null;
 }
 
 /// Takes back a bunker connection that never became a sign-in: the connection
@@ -902,6 +921,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var undos_len: usize = 0;
     var connect_failed = false;
     var seal_failed = false;
+    var stale_seal = false;
     var upload_sign_failed = false;
 
     pendingLock();
@@ -933,6 +953,9 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
             if (method == .nip44_decrypt or method == .nip04_decrypt) {
                 if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
             }
+            // A seal that died with its session is over. Left active, every
+            // private bookmark after it read as "your signer is busy".
+            if (method == .nip44_encrypt) stale_seal = true;
             continue;
         }
         switch (method) {
@@ -1026,6 +1049,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         g_seal_inbox = .{};
     }
     pendingUnlock();
+    if (stale_seal) forgetPrivateSeal();
     if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
     if (seal_failed) {
         private_lists.g_private_seal = .{};

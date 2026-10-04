@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const privateSealKey = main.privateSealKey;
 const sayBookmarkWrite = main.sayBookmarkWrite;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -337,7 +338,9 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     };
     defer gpa.free(plaintext);
 
-    private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null };
+    private_lists.g_seal_ask_seq +%= 1;
+    if (private_lists.g_seal_ask_seq == 0) private_lists.g_seal_ask_seq = 1;
+    private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null, .account = me, .ask_seq = private_lists.g_seal_ask_seq };
 
     if (keyholder.g_signer_kind == .remote) {
         private_lists.g_private_seal.awaiting_remote = true;
@@ -364,15 +367,16 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
         sealPrivateBookmarkForTest(gpa, plaintext);
         return .published;
     }
-    helperFetch(fx, private_seal_key, "/nip44/encrypt", body, Effects.responseMsg(.private_seal));
+    helperFetch(fx, privateSealKey(private_lists.g_private_seal.ask_seq), "/nip44/encrypt", body, Effects.responseMsg(.private_seal));
     return .published;
 }
 
 /// Notary's answer to a seal. The ciphertext, or a refusal that leaves the list
 /// exactly as it was.
 pub fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.EffectResponse) void {
-    if (response.key != private_seal_key) return;
     if (!private_lists.g_private_seal.active) return;
+    // Only the ask this seal is waiting on.
+    if (response.key != privateSealKey(private_lists.g_private_seal.ask_seq)) return;
     if (response.outcome != .ok or response.status != 200) {
         private_lists.g_private_seal = .{};
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
@@ -403,6 +407,9 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     const seal = private_lists.g_private_seal;
     private_lists.g_private_seal = .{};
     if (!seal.active) return;
+    // Sealed for the account that pressed, and published only as that account.
+    const me = activePubkey() orelse return;
+    if (!std.mem.eql(u8, &me, &seal.account)) return;
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;

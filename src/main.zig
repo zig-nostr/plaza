@@ -6253,6 +6253,12 @@ pub const writeBookmark = bookmarks.writeBookmark;
 pub const writePrivateBookmark = bookmarks.writePrivateBookmark;
 
 // re-exports: private_lists.zig
+pub const deliverPrivateSealForTest = private_lists.deliverPrivateSealForTest;
+pub const privateSealKeyForTest = private_lists.privateSealKeyForTest;
+pub const privateSealActiveForTest = private_lists.privateSealActiveForTest;
+pub const forgetPrivateSealForTest = private_lists.forgetPrivateSealForTest;
+pub const forgetPrivateSeal = private_lists.forgetPrivateSeal;
+pub const privateSealKey = private_lists.privateSealKey;
 pub const answerPrivateHalfForTest = private_lists.answerPrivateHalfForTest;
 pub const askPrivateHalfForTest = private_lists.askPrivateHalfForTest;
 pub const claimPrivateHalfPendingForTest = private_lists.claimPrivateHalfPendingForTest;
@@ -6385,6 +6391,9 @@ pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
 
 // re-exports: remote_signer.zig
+pub const remoteClientSecretLingersForTest = remote_signer.remoteClientSecretLingersForTest;
+pub const wipeRemoteSecrets = remote_signer.wipeRemoteSecrets;
+pub const remoteClientSecretForTest = remote_signer.remoteClientSecretForTest;
 pub const pendingSignIdForTest = remote_signer.pendingSignIdForTest;
 pub const RemoteMethodForTest = remote_signer.RemoteMethodForTest;
 pub const answerBunkerConnectForTest = remote_signer.answerBunkerConnectForTest;

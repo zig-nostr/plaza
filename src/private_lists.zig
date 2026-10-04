@@ -14,6 +14,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const handlePrivateSeal = main.handlePrivateSeal;
+const Model = main.Model;
 const no_half_id = main.no_half_id;
 const Effects = main.Effects;
 const OwnProfile = main.OwnProfile;
@@ -136,9 +138,17 @@ pub fn rearmPrivateHalves(now: i64, all: bool) void {
     }
 }
 /// And one for the encrypt, of which there is only ever one in flight: it is
-/// driven by a press, and `signerReady` already refuses a second press while a
-/// signature is out.
+/// driven by a press, and `g_private_seal.active` refuses a second press while
+/// one is out. The key carries the ask's number above it, the same way a
+/// decrypt's does, so a late answer to a seal that a sign-out abandoned cannot
+/// complete the next one.
 pub const private_seal_key: u64 = 64;
+
+pub var g_seal_ask_seq: u32 = 0;
+
+pub fn privateSealKey(seq: u32) u64 {
+    return (@as(u64, seq) << 16) | private_seal_key;
+}
 
 /// A private bookmark write, waiting for its ciphertext.
 ///
@@ -162,8 +172,47 @@ const PrivateSeal = struct {
     /// The id of the list the new private half was built from, or null when
     /// there was none. The finish publishes only over that same record.
     base: ?[32]u8 = null,
+    /// The account that pressed. A seal is a list encrypted to one key, and
+    /// finishing it under another account would publish that account a list
+    /// it cannot read.
+    account: [32]u8 = [_]u8{0} ** 32,
+    /// Which ask over Notary's door this is, carried in the effect key.
+    ask_seq: u32 = 0,
 };
 pub var g_private_seal: PrivateSeal = .{};
+
+/// Abandons a seal in flight, and any answer the listener parked for it. On
+/// every path that ends the session it was asked in: a sign-out, a dropped
+/// bunker, and a bunker ask that died with its generation. Left set, it refused
+/// every private bookmark for the rest of the run, and an answer still on its
+/// way could complete it under whoever signed in next.
+pub fn forgetPrivateSeal() void {
+    g_private_seal = .{};
+    pendingLock();
+    defer pendingUnlock();
+    remote_signer.g_seal_inbox = .{};
+}
+
+pub fn privateSealActiveForTest() bool {
+    return g_private_seal.active;
+}
+
+pub fn forgetPrivateSealForTest() void {
+    forgetPrivateSeal();
+}
+
+/// The effect key the seal in flight was asked under.
+pub fn privateSealKeyForTest() u64 {
+    return privateSealKey(g_private_seal.ask_seq);
+}
+
+/// Notary's answer to a seal, delivered under `key` the way the runtime would.
+pub fn deliverPrivateSealForTest(model: *Model, fx: *Effects, key: u64, ciphertext: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const body = (nostr.signer_ipc.CipherResult{ .items = &.{ciphertext} }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handlePrivateSeal(model, fx, .{ .key = key, .outcome = .ok, .status = 200, .body = body });
+}
 
 /// Whether `now` is the record whose id was `then` (both absent counts).
 pub fn sameRecord(now: ?OwnProfile, then: ?[32]u8) bool {

@@ -545,6 +545,140 @@ test "a private bookmark is not published over a list that landed while it was s
     defer testing.allocator.free(content);
     try testing.expectEqualStrings("a-private-half-this-seal-never-saw", content);
 }
+
+test "a private bookmark being sealed ends with the session it was pressed in" {
+    // The seal in flight was cleared only by its own answer. Cut off by a
+    // sign-out, a dropped bunker or a bunker ask that died with its session, it
+    // stayed set, and every private bookmark after it read as "your signer is
+    // busy" for the rest of the run.
+    main.forgetPrivateSealForTest();
+    defer main.forgetPrivateSealForTest();
+    main.forgetBookmarksForTest();
+    defer main.forgetBookmarksForTest();
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    defer main.setIdentityMintedForTest(false);
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const note = [_]u8{0xc5} ** 32;
+
+    // A sign-out.
+    main.setIdentityForTest([_]u8{0x7c} ** 32);
+    main.setIdentityMintedForTest(true);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, note, true));
+    try testing.expect(main.privateSealActiveForTest());
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(!main.privateSealActiveForTest());
+
+    // A bunker ask whose session was replaced before it was answered.
+    main.setIdentityForTest([_]u8{0x7d} ** 32);
+    main.setIdentityMintedForTest(true);
+    main.setSignerKindForTest("remote");
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, note, true));
+    try testing.expect(main.privateSealActiveForTest());
+    main.bumpRemoteGenerationForTest();
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(!main.privateSealActiveForTest());
+
+    // A bunker connection taken down.
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, note, true));
+    try testing.expect(main.privateSealActiveForTest());
+    main.resetBunkerConnectForTest();
+    try testing.expect(!main.privateSealActiveForTest());
+}
+
+test "a private bookmark sealed for one account is never published as another" {
+    // The ciphertext is a list encrypted to the account that pressed. Finished
+    // under somebody else it would be published as THEIR bookmark list, which
+    // they cannot read and which replaces whatever they had.
+    main.forgetPrivateSealForTest();
+    defer main.forgetPrivateSealForTest();
+    main.forgetBookmarksForTest();
+    defer main.forgetBookmarksForTest();
+    defer main.setIdentityMintedForTest(false);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.setIdentityForTest([_]u8{0x7e} ** 32);
+    main.setIdentityMintedForTest(true);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xc6} ** 32, true));
+    try testing.expect(main.lastSealedForTest().len > 0);
+
+    // Another account is in the seat when the ciphertext lands.
+    main.setIdentityForTest([_]u8{0x7f} ** 32);
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
+test "Notary's late answer to an abandoned seal does not finish the next one" {
+    // Every seal used to go out under one effect key, so an answer still on its
+    // way when the reader signed out arrived looking exactly like the answer to
+    // the next seal they asked for, and was published as it.
+    main.forgetPrivateSealForTest();
+    defer main.forgetPrivateSealForTest();
+    main.forgetBookmarksForTest();
+    defer main.forgetBookmarksForTest();
+    defer main.setIdentityMintedForTest(false);
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const secret = [_]u8{0x7b} ** 32;
+
+    main.setIdentityForTest(secret);
+    main.setIdentityMintedForTest(true);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xc7} ** 32, true));
+    const abandoned = main.privateSealKeyForTest();
+    var old_sealed: [8192]u8 = undefined;
+    const old_len = main.lastSealedForTest().len;
+    @memcpy(old_sealed[0..old_len], main.lastSealedForTest());
+    main.performLogoutForTest(&model, &fx);
+
+    // The same reader, back, bookmarking something else privately.
+    main.clearLoggedOutLatchForTest();
+    main.setIdentityForTest(secret);
+    main.setIdentityMintedForTest(true);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xc8} ** 32, true));
+    main.forgetLastPublishedForTest();
+
+    main.deliverPrivateSealForTest(&model, &fx, abandoned, old_sealed[0..old_len]);
+    try testing.expect(main.lastPublishedForTest() == null);
+    try testing.expect(main.privateSealActiveForTest());
+}
+
+test "signing out wipes the bunker's pairing secret and client key" {
+    // Dropping a bunker connection wiped both. Signing out only set a length to
+    // zero and the key to null, which leaves every byte where it was.
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    main.setIoForTest(testing.io);
+    defer main.setIoForTest(null);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+
+    model.login_buffer.set("bunker://" ++ "ab" ** 32 ++ "?relay=wss://127.0.0.1:1&secret=pairing-secret-three");
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.remoteSecretHeldForTest("pairing-secret-three"));
+    const client_secret = main.remoteClientSecretForTest() orelse return error.NoClientKey;
+
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(!main.remoteSecretHeldForTest("pairing-secret-three"));
+    try testing.expect(!main.remoteClientSecretLingersForTest(client_secret));
+}
 test "a CLOSED is a finished question and never an answer" {
     // The kind:0 check read `.eose, .closed` as one outcome. An auth-required
     // CLOSED is a relay declining to look, and counting it as "this account has
