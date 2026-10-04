@@ -31296,10 +31296,12 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
 /// Splits rendered note text into styled runs so a note reads like a note.
 /// Every interactive run takes the identity violet, because each one names a
 /// person or something they wrote: an `@mention` (one weight up, the way a name
-/// is set), a `#hashtag`, a bare `nostr:` event reference, and a web link, which
-/// alone carries a pressable payload. The design shows no hashtag, so their
-/// color follows the redesign's stated rule ("violet for identity and content")
-/// rather than a shot.
+/// is set), a `#hashtag`, a bare `nostr:` event reference, and a web link. A
+/// link and a hashtag carry a pressable payload (the URL, the topic), and a
+/// recorded mention gets one in `contentSpansIn`. A hashtag too long to be a
+/// topic carries none and stays muted rather than look pressable. The design
+/// shows no hashtag, so their color follows the redesign's stated rule ("violet
+/// for identity and content") rather than a shot.
 /// Every span's text is a subslice of the note's own content, so nothing is
 /// copied. A paragraph holds at most 32 runs, so a link-heavy note keeps its
 /// tail as one plain run rather than losing it.
@@ -31396,19 +31398,18 @@ pub fn contentSpansIn(ui: *AppUi, text: []const u8, mentions: []const MentionRef
         // `underline` unset stated the intent and got a hairline anyway. SDK
         // 0.9.2 made the flag mean what it says, so the intent and the pixels
         // finally agree. Mentions are marked by weight and colour, not a rule.
-        // A topic is neither a person nor a web link, and it used to be painted
-        // as though it were both: the same identity violet as a mention and a
-        // URL, carrying no payload, so the one run that looked most pressable
-        // was the only one that did nothing. It now reads as its own thing, in
-        // the muted-secondary token rather than the identity colour, and it
-        // carries where it goes.
+        // A hashtag opens its topic, so it takes the same violet as the other
+        // runs that go somewhere. Only one that carries the topic does: a tag
+        // too long to be a topic (`contentTags` drops it too) has nowhere to go,
+        // and the violet on a run that does nothing when pressed is the trap
+        // this colour must never set, so that one stays muted.
         spans[n] = if (is_url)
             .{ .text = run, .color = .info, .link = run }
         else if (is_mention)
             .{ .text = run, .color = .info, .weight = .medium }
         else if (is_hashtag) blk: {
             const link = topicLinkFor(run[1..]) orelse break :blk canvas.TextSpan{ .text = run, .color = .text_muted };
-            break :blk canvas.TextSpan{ .text = run, .color = .text_muted, .link = link };
+            break :blk canvas.TextSpan{ .text = run, .color = .info, .link = link };
         } else .{ .text = run, .color = .info };
         n += 1;
         i = j;

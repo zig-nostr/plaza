@@ -1040,7 +1040,7 @@ test "note text splits into link, mention, and plain runs, colored by the identi
     try testing.expectEqual(@as(usize, 0), spans[0].link.len);
 }
 
-test "a hashtag reads as its own thing and carries where it goes" {
+test "a hashtag takes the identity violet only when it carries where it goes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = main.AppUi.init(arena_state.allocator());
@@ -1048,10 +1048,9 @@ test "a hashtag reads as its own thing and carries where it goes" {
     const spans = main.contentSpans(&ui, "gm #Nostr build C# code #zig!");
     try testing.expectEqual(@as(usize, 5), spans.len);
     try testing.expectEqualStrings("#Nostr", spans[1].text);
-    // NOT the identity violet. That colour means a person or a web link, and a
-    // topic is neither; painting all three alike made the one run that looked
-    // most pressable the only one that did nothing.
-    try testing.expect(spans[1].color != null and spans[1].color.? != .info);
+    // The identity violet, the same as a mention and a link: it opens its topic,
+    // so it is coloured like the other runs that go somewhere.
+    try testing.expect(spans[1].color != null and spans[1].color.? == .info);
     // And it goes somewhere now. The payload is lowercased, because
     // `contentTags` lowercases on the way out, so `#Nostr` and `#nostr` have to
     // be one topic in both directions.
@@ -1066,6 +1065,15 @@ test "a hashtag reads as its own thing and carries where it goes" {
     // topic where a URL belongs.
     const links = main.contentSpans(&ui, "see https://example.com/x");
     try testing.expectEqual(@as(?[]const u8, null), main.topicLinkValueForTest(links[1].link));
+
+    // A tag longer than a topic can be carries no payload, so it must not wear
+    // the colour that says "press me": violet on a run that does nothing.
+    const long_tag = "#" ++ "a" ** 65;
+    const long = main.contentSpans(&ui, "see " ++ long_tag ++ " ok");
+    try testing.expectEqual(@as(usize, 3), long.len);
+    try testing.expectEqualStrings(long_tag, long[1].text);
+    try testing.expectEqual(@as(usize, 0), long[1].link.len);
+    try testing.expect(long[1].color == null or long[1].color.? != .info);
 }
 
 test "findQuoteRef captures the first note/nevent ref and ignores others" {
