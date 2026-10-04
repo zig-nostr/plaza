@@ -26859,6 +26859,19 @@ test "a quoted note in a note body keeps the relays its address named" {
     try testing.expectEqual(@as(?u8, 1), main.quoteHintCountForTest(id));
 }
 
+/// The app's own Zig files, for the tests that read the source rather than run
+/// it. Listed by hand because `@embedFile` needs a literal path; the network
+/// gate test fails when main.zig imports a file that is not on this list.
+const AppSource = struct { name: []const u8, text: []const u8 };
+const app_sources = [_]AppSource{
+    .{ .name = "main.zig", .text = @embedFile("main.zig") },
+    .{ .name = "theme.zig", .text = @embedFile("theme.zig") },
+    .{ .name = "plaza_icons.zig", .text = @embedFile("plaza_icons.zig") },
+    .{ .name = "search.zig", .text = @embedFile("search.zig") },
+    .{ .name = "article.zig", .text = @embedFile("article.zig") },
+    .{ .name = "blossom.zig", .text = @embedFile("blossom.zig") },
+};
+
 test "no thread that dials a relay is spawned without a gate above it" {
     // The September segfault was a detached worker dialling real relays from a
     // unit test and writing into a store the test was tearing down. The fix
@@ -26871,11 +26884,36 @@ test "no thread that dials a relay is spawned without a gate above it" {
     // place one of them is spawned, and requires a gate between the start of
     // the spawning function and the spawn itself. Add a network worker with no
     // gate and this fails by name, whether or not a test happens to reach it.
-    const src = @embedFile("main.zig");
+    // The scan below is only as good as its list of files.
+    var lines = std.mem.splitScalar(u8, app_sources[0].text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "const ")) continue;
+        const open = "= @import(\"";
+        const at = std.mem.indexOf(u8, line, open) orelse continue;
+        const rest = line[at + open.len ..];
+        const file = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse continue];
+        if (!std.mem.endsWith(u8, file, ".zig")) continue;
+        for (app_sources) |s| {
+            if (std.mem.eql(u8, s.name, file)) break;
+        } else {
+            std.debug.print("\n  main.zig imports {s}, which app_sources in tests.zig does not list.\n", .{file});
+            return error.UnlistedSource;
+        }
+    }
+
     const alloc = testing.allocator;
 
+    // Every file of the app, joined: a worker and the code that spawns it can
+    // sit in different files, and both have to be seen.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    for (app_sources) |s| {
+        try joined.append(alloc, '\n');
+        try joined.appendSlice(alloc, s.text);
+    }
+
     // `pub fn` folded into `fn` so one split finds both.
-    const flat = try std.mem.replaceOwned(u8, alloc, src, "\npub fn ", "\nfn ");
+    const flat = try std.mem.replaceOwned(u8, alloc, joined.items, "\npub fn ", "\nfn ");
     defer alloc.free(flat);
 
     // Every function whose body reaches the network. Derived, not listed: a
@@ -30400,13 +30438,14 @@ test "every relay-fed note ingest remembers which relay it came from" {
     // are never hinted at.
     // An article fetched by its address is a note like any other and is counted
     // with the rest.
-    const source = @embedFile("main.zig");
     var bare: usize = 0;
     var from: usize = 0;
-    var it = std.mem.splitScalar(u8, source, '\n');
-    while (it.next()) |line| {
-        if (std.mem.indexOf(u8, line, "plazaIngest(gpa, e.event, .{ .verify_with = signer })") != null) bare += 1;
-        if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, ") != null) from += 1;
+    for (app_sources) |s| {
+        var it = std.mem.splitScalar(u8, s.text, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, "plazaIngest(gpa, e.event, .{ .verify_with = signer })") != null) bare += 1;
+            if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, ") != null) from += 1;
+        }
     }
     try testing.expectEqual(@as(usize, 6), bare);
     try testing.expectEqual(@as(usize, 11), from);
@@ -33786,7 +33825,14 @@ test "every toast the app can show fits the toast whole" {
 
     // Every string literal handed to `setToast`, read out of the source, so a new
     // toast is checked the day it is written rather than when somebody notices.
-    const source = @embedFile("main.zig");
+    // Every file of the app, joined, so a toast is found wherever its call sits.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(testing.allocator);
+    for (app_sources) |s| {
+        try joined.append(testing.allocator, '\n');
+        try joined.appendSlice(testing.allocator, s.text);
+    }
+    const source = joined.items;
     var calls: usize = 0;
     var too_long: usize = 0;
     var at: usize = 0;
