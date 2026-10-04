@@ -245,3 +245,35 @@ test "a video is not fetched as a web page" {
     try testing.expect(!main.shouldPreviewLink(false, "http://example.com/post"));
     try testing.expect(!main.shouldPreviewLink(false, "https://localhost/post"));
 }
+
+test "a picture URL on the reader's own network is not one this app fetches" {
+    for ([_][]const u8{
+        "https://image.example.com/a.jpg",
+        "http://image.example.com/a.jpg",
+        "https://93.184.216.34/a.png",
+    }) |url| try testing.expect(main.isPublicMediaUrl(url));
+    for ([_][]const u8{
+        "http://127.0.0.1/a.png",
+        "http://127.1/a.png",
+        "http://0x7f.1/a.png",
+        "http://192.168.1.1/admin#.png",
+        "http://10.0.0.7/a.png",
+        "http://169.254.169.254/latest#.jpg",
+        "http://localhost/a.png",
+        "http://nas.local/a.png",
+        "http://router.lan/a.png",
+        "https://image.example.com:8443/a.png",
+        "https://user@image.example.com/a.png",
+        "http://[::1]/a.png",
+        "ftp://image.example.com/a.png",
+    }) |url| {
+        if (main.isPublicMediaUrl(url)) {
+            std.debug.print("\naccepted a private picture: {s}\n", .{url});
+            return error.PrivatePictureAccepted;
+        }
+    }
+    // The last check before any request: a direct fetch from a private host is
+    // refused whatever path built it.
+    try testing.expect(!main.mediaFetchAllowedForTest("http://127.0.0.1:9/shot.png"));
+    try testing.expect(main.mediaFetchAllowedForTest("https://image.example.com/b.png"));
+}

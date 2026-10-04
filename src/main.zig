@@ -5911,6 +5911,7 @@ pub const addressPoolBatchForTest = addresses.addressPoolBatchForTest;
 pub const addressPoolFiltersForTest = addresses.addressPoolFiltersForTest;
 pub const addressRegisteredForTest = addresses.addressRegisteredForTest;
 pub const forgetAddressFetchForTest = addresses.forgetAddressFetchForTest;
+pub const isDottedQuad = addresses.isDottedQuad;
 pub const newestAddressIdForTest = addresses.newestAddressIdForTest;
 pub const openAddressedArticleForTest = addresses.openAddressedArticleForTest;
 pub const refreshAddressFetchForTest = addresses.refreshAddressFetchForTest;
@@ -5934,7 +5935,10 @@ pub const storedWriteRelays = addresses.storedWriteRelays;
 
 // re-exports: link_preview.zig
 pub const clearLinkPreviewsForTest = link_preview.clearLinkPreviewsForTest;
+pub const isPublicMediaUrl = link_preview.isPublicMediaUrl;
 pub const linkRequestedForTest = link_preview.linkRequestedForTest;
+pub const mediaFetchAllowed = link_preview.mediaFetchAllowed;
+pub const mediaFetchAllowedForTest = link_preview.mediaFetchAllowedForTest;
 pub const scanLinkFetchesForTest = link_preview.scanLinkFetchesForTest;
 pub const seedLinkForTest = link_preview.seedLinkForTest;
 pub const setLinkPreviewForTest = link_preview.setLinkPreviewForTest;

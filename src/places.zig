@@ -15,6 +15,7 @@ const geometry = native_sdk.geometry;
 // ---- from main.zig
 const isAuthRequired = main.isAuthRequired;
 const handlePlazaLink = main.handlePlazaLink;
+const isPublicMediaUrl = main.isPublicMediaUrl;
 const takePendingLink = main.takePendingLink;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -485,7 +486,7 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
     // address the app will FETCH, and a logo has no business carrying a query.
     // A relative path is refused rather than guessed at, since the document
     // says nothing about which website it came from.
-    if (isSafeShareUrl(w.logoUrl)) m.logo_len = @intCast(copyBounded(&m.logo_buf, w.logoUrl));
+    if (isSafeShareUrl(w.logoUrl) and isPublicMediaUrl(w.logoUrl)) m.logo_len = @intCast(copyBounded(&m.logo_buf, w.logoUrl));
 
     // The three lines a room says about itself.
     //

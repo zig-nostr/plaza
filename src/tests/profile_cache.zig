@@ -26,6 +26,7 @@ const findAnyTextContainingText = harness.findAnyTextContainingText;
 const findByLabel = harness.findByLabel;
 const frameOfTextContaining = harness.frameOfTextContaining;
 const inboxEvent = harness.inboxEvent;
+const signedKind = harness.signedKind;
 const signedNote = harness.signedNote;
 const threadNote = harness.threadNote;
 
@@ -1243,4 +1244,32 @@ test "a face assembles from slices too, and never outlives its fetch" {
     try testing.expectEqual(@as(usize, 1), main.avatarPartialCountForTest());
     main.deliverAvatarResponseForTest(&fx, pk, .rejected, 0, "");
     try testing.expectEqual(@as(usize, 0), main.avatarPartialCountForTest());
+}
+
+test "a face on a private host is not drawn" {
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    const p = main.upsertProfile([_]u8{0x73} ** 32).?;
+    main.parseMetadataInto(p, "{\"name\":\"inward\",\"picture\":\"http://127.0.0.1:8080/face.png\"}");
+    try testing.expectEqual(@as(usize, 0), @as(usize, p.picture_len));
+}
+
+test "a banner on a private host is not drawn" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x75} ** 32);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/banner.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    const meta = try signedKind(arena, signer, kp, 1_800_000_000, 0, &.{}, "{\"name\":\"inward\",\"banner\":\"https://10.1.2.3/banner.jpg\"}");
+    _ = try store.ingest(arena, meta, .{});
+    try testing.expectEqualStrings("", main.personBanner(kp.public_key));
 }

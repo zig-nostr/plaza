@@ -347,7 +347,7 @@ pub fn isPublicRelayUrl(url: []const u8) bool {
 }
 
 /// Four decimal numbers, each 0 to 255, and nothing else.
-fn isDottedQuad(host: []const u8) bool {
+pub fn isDottedQuad(host: []const u8) bool {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, host, '.');
     while (it.next()) |part| {

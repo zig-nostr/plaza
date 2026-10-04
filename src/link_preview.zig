@@ -18,7 +18,9 @@ const Note = main.Note;
 const cacheName = main.cacheName;
 const classifyMedia = main.classifyMedia;
 const imetaFor = main.imetaFor;
+const isDottedQuad = main.isDottedQuad;
 const link_fetch_key_base = main.link_fetch_key_base;
+const mediaProxy = main.mediaProxy;
 const noteCovered = main.noteCovered;
 const utf8SafeLen = main.utf8SafeLen;
 
@@ -155,6 +157,70 @@ pub fn previewableUrl(url: []const u8) bool {
         std.ascii.endsWithIgnoreCase(host, ".internal") or
         std.ascii.endsWithIgnoreCase(host, ".localhost")) return false;
     return !isPrivateAddress(host);
+}
+
+/// Whether a picture URL may be fetched: `http` or `https`, and a host on the
+/// public internet by the lines `previewableUrl` draws for a link (no userinfo,
+/// no port, no bare or `.local`-style name, no private or loopback address),
+/// plus the loose numeric spellings a resolver accepts for one (`127.1`,
+/// `0x7f.1`), which only the plain four-number form is taken past.
+///
+/// Every picture is fetched with nobody pressing anything: a note, a profile, an
+/// article or a place names it and it loads as it scrolls into view. Without
+/// this a stranger could have every reader's machine request a URL on its own
+/// loopback or LAN, and an extension check is no obstacle (`/admin#.png`).
+/// A picture that fails it is not drawn.
+pub fn isPublicMediaUrl(url: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, url, "https://"))
+        url["https://".len..]
+    else if (std.mem.startsWith(u8, url, "http://"))
+        url["http://".len..]
+    else
+        return false;
+    if (url.len > 2048) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (authority.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    if (std.mem.indexOfScalar(u8, authority, ':') != null) return false;
+    if (authority[0] == '[') return false;
+    const host = std.mem.trimEnd(u8, authority, ".");
+    for (host) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') return false;
+    }
+    const dot = std.mem.lastIndexOfScalar(u8, host, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= host.len) return false;
+    const suffixes = [_][]const u8{ ".local", ".internal", ".localhost", ".onion", ".lan", ".home.arpa" };
+    for (suffixes) |suffix| {
+        if (std.ascii.endsWithIgnoreCase(host, suffix)) return false;
+    }
+    for (host[dot + 1 ..]) |c| {
+        if (std.ascii.isDigit(c)) return isDottedQuad(host) and !isPrivateAddress(host);
+    }
+    return true;
+}
+
+/// Whether `url` is a request to the reader's own media proxy, which is theirs
+/// to point anywhere, their own network included.
+fn isProxiedUrl(url: []const u8) bool {
+    const proxy = mediaProxy();
+    if (!prefs.g_media_proxy_on or proxy.len == 0) return false;
+    if (!std.mem.startsWith(u8, url, proxy)) return false;
+    if (std.mem.endsWith(u8, proxy, "/")) return true;
+    return url.len > proxy.len and (url[proxy.len] == '/' or url[proxy.len] == '?');
+}
+
+/// The last check before a picture is requested: through the reader's proxy, or
+/// straight from a public host. Upstream every picture URL is already gated when
+/// it is read, so this only catches a path that forgot.
+pub fn mediaFetchAllowed(url: []const u8) bool {
+    return isProxiedUrl(url) or isPublicMediaUrl(url);
+}
+
+pub fn mediaFetchAllowedForTest(url: []const u8) bool {
+    return mediaFetchAllowed(url);
 }
 
 /// Whether a host is a literal address inside a range that belongs to the

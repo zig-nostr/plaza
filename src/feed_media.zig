@@ -39,6 +39,7 @@ const max_note_images = main.max_note_images;
 const max_playing_gifs = main.max_playing_gifs;
 const max_registered_image_bytes = main.max_registered_image_bytes;
 const mediaCacheDir = main.mediaCacheDir;
+const mediaFetchAllowed = main.mediaFetchAllowed;
 const media_fetch_key_base = main.media_fetch_key_base;
 const media_target_px = main.media_target_px;
 const noteCovered = main.noteCovered;
@@ -561,6 +562,7 @@ fn fetchMediaSlice(fx: *Effects, slot: *MediaSlot, offset: usize) void {
 
 /// One slice of one image, whoever wants it.
 pub fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_response: anytype) void {
+    if (!mediaFetchAllowed(url)) return;
     var range_buf: [64]u8 = undefined;
     const range = rangeHeader(&range_buf, offset) orelse return;
     fx.fetch(.{

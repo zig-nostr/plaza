@@ -22,6 +22,7 @@ const countPeople = main.countPeople;
 const dupeTags = main.dupeTags;
 const freeOwnProfile = main.freeOwnProfile;
 const hexLower = main.hexLower;
+const isPublicMediaUrl = main.isPublicMediaUrl;
 const lookupProfile = main.lookupProfile;
 const renderContent = main.renderContent;
 const stringField = main.stringField;
@@ -193,7 +194,7 @@ fn parsePersonMetadata(card: *PersonCard, json: []const u8) void {
         // https only, and only what fits: a banner is a picture fetched
         // unattended from a host the subject named, so it goes through the same
         // gate every other unattended fetch does.
-        if (v.len <= card.banner_buf.len and std.mem.startsWith(u8, v, "https://")) {
+        if (v.len <= card.banner_buf.len and std.mem.startsWith(u8, v, "https://") and isPublicMediaUrl(v)) {
             @memcpy(card.banner_buf[0..v.len], v);
             card.banner_len = @intCast(v.len);
         }

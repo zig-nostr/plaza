@@ -2627,3 +2627,12 @@ test "a place cannot send its visitors to their own network" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("wss://hint.example", chosen[0]);
 }
+
+test "a place logo on a private host is not drawn" {
+    const doc =
+        \\{"appName": "Inward", "logoUrl": "https://printer.local/logo.png",
+        \\ "hardcodedFeeds": [{"name": "x", "relays": ["wss://ok.example"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+    try testing.expectEqual(@as(usize, 0), place.logo().len);
+}

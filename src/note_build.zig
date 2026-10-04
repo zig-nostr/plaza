@@ -19,6 +19,7 @@ const clientOf = main.clientOf;
 const clipToChars = main.clipToChars;
 const contentWarningOf = main.contentWarningOf;
 const firstLinkUrl = main.firstLinkUrl;
+const isPublicMediaUrl = main.isPublicMediaUrl;
 const lookupProfile = main.lookupProfile;
 const max_note_images = main.max_note_images;
 const noteIdOf = main.noteIdOf;
@@ -119,7 +120,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
             // note carries, so the reader draws it through the same path every
             // other picture takes (its slot, its disk cache, its placeholder).
             const meta = article.metaOf(ev);
-            if (article.isWebUrl(meta.image) and meta.image.len <= note.images[0].url_buf.len) {
+            if (article.isWebUrl(meta.image) and isPublicMediaUrl(meta.image) and meta.image.len <= note.images[0].url_buf.len) {
                 note.images[0].set(meta.image, imetaFor(ev.tags, meta.image));
                 // A cover with no declared shape is held to a wide one, so the
                 // head does not reserve a portrait-sized box for a banner.
@@ -546,8 +547,12 @@ pub fn firstImageUrl(content: []const u8) ?[]const u8 {
         // Ignore a trailing bare query string when matching the extension.
         const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
         const path = url[0..path_end];
-        for (exts) |ext| {
-            if (std.ascii.endsWithIgnoreCase(path, ext)) return url;
+        // A host this app will not fetch from is not a picture: the URL stays
+        // the text it was.
+        if (isPublicMediaUrl(url)) {
+            for (exts) |ext| {
+                if (std.ascii.endsWithIgnoreCase(path, ext)) return url;
+            }
         }
         i = j;
     }
@@ -572,6 +577,12 @@ pub fn collectImageUrls(content: []const u8, out: [][]const u8) usize {
         const url = content[i..j];
         const path_end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
         const path = url[0..path_end];
+        // A host this app will not fetch from is not a picture: the URL stays
+        // the text it was.
+        if (!isPublicMediaUrl(url)) {
+            i = j;
+            continue;
+        }
         for (exts) |ext| {
             if (std.ascii.endsWithIgnoreCase(path, ext)) {
                 out[found] = url;

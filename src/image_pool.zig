@@ -18,6 +18,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const mediaFetchAllowed = main.mediaFetchAllowed;
 const wantProfilesAhead = main.wantProfilesAhead;
 const Effects = main.Effects;
 const InboxItem = main.InboxItem;
@@ -320,6 +321,7 @@ fn warmAvatar(fx: *Effects, p: *Profile) bool {
 
     var url_buf: [1024]u8 = undefined;
     const url = avatarUrl(&url_buf, p.picture(), p.avatar_direct);
+    if (!mediaFetchAllowed(url)) return false;
     if (cachedImageExists(url)) {
         p.warm_state = .done;
         return false;
@@ -341,6 +343,7 @@ fn warmPicture(fx: *Effects, note: *const Note) bool {
     if (raw.len == 0) return false;
     var url_buf: [1024]u8 = undefined;
     const url = feedImageUrl(&url_buf, raw);
+    if (!mediaFetchAllowed(url)) return false;
     if (warmedAlready(url)) return false;
     if (cachedImageExists(url)) {
         _ = rememberWarmed(url);

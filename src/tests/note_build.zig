@@ -1011,3 +1011,32 @@ test "an article title too long for a card is cut at a word and says so" {
     try testing.expect(k > 90);
     try testing.expect(std.mem.endsWith(u8, buf[0..k], "\u{2026}"));
 }
+
+test "a note's picture on a private host is left as text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x72} ** 32);
+    const note_ev = try signedNote(arena, signer, kp, 1_800_000_000, "look http://192.168.1.1/cam.png and https://image.example.com/b.png");
+    const note = main.noteFrom(note_ev, 1_800_000_000);
+    try testing.expectEqual(@as(usize, 1), note.imageCount());
+    try testing.expectEqualStrings("https://image.example.com/b.png", note.imageAt(0).url());
+    try testing.expectEqual(@as(?[]const u8, null), main.firstImageUrl("only http://10.0.0.7/x.jpg here"));
+}
+
+test "an article cover on a private host is not drawn" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x74} ** 32);
+    const cover_tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "title", "Inward" },
+        &[_][]const u8{ "image", "http://192.168.0.2/cover.jpg" },
+    };
+    const art = main.noteFrom(try signedKind(arena, signer, kp, 1_800_000_000, 30023, &cover_tags, "Words."), 1_800_000_000);
+    try testing.expectEqual(@as(usize, 0), art.imageCount());
+}

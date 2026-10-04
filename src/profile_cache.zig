@@ -27,6 +27,7 @@ const copyBounded = main.copyBounded;
 const copyDisplayText = main.copyDisplayText;
 const hydrateProfiles = main.hydrateProfiles;
 const inbox_cap = main.inbox_cap;
+const isPublicMediaUrl = main.isPublicMediaUrl;
 const isPublicRelayUrl = main.isPublicRelayUrl;
 const networkAllowed = main.networkAllowed;
 const nip05_fetch_key_base = main.nip05_fetch_key_base;
@@ -569,7 +570,7 @@ pub fn parseMetadataInto(profile: *Profile, content: []const u8) void {
     }
     if (md.picture) |pic| {
         const trimmed = std.mem.trim(u8, pic, " \t\r\n");
-        if (trimmed.len <= profile.picture_buf.len and (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://"))) {
+        if (trimmed.len <= profile.picture_buf.len and isPublicMediaUrl(trimmed)) {
             // A changed picture URL means the old avatar is stale: refetch it
             // into the same image slot.
             if (!std.mem.eql(u8, trimmed, profile.picture())) {
