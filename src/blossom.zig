@@ -600,7 +600,8 @@ fn stripWebp(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
 /// after it, and nothing past that point is sent. Plenty of encoders leave the
 /// trailer off, or a stray byte before it. A block cut off partway is refused
 /// rather than half stripped, since how much of it was meant to be there is
-/// unknown.
+/// unknown. So is a file in which no picture was kept: whatever it ends up as,
+/// it is not a GIF anybody can see.
 fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
     if (b.len < 13) return null;
     if (!std.mem.eql(u8, b[0..6], "GIF87a") and !std.mem.eql(u8, b[0..6], "GIF89a")) return null;
@@ -612,6 +613,7 @@ fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
     defer keep.list.deinit(gpa);
     try keep.add(gpa, 0, pos);
     var trailer = false;
+    var images: usize = 0;
     while (pos < b.len) {
         const start = pos;
         switch (b[pos]) {
@@ -631,6 +633,7 @@ fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
                 pos += 1;
                 pos = gifSubBlocksEnd(b, pos) orelse return null;
                 try keep.add(gpa, start, pos);
+                images += 1;
             },
             // Extension: a label, then sub-blocks.
             0x21 => {
@@ -649,6 +652,9 @@ fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
             else => break,
         }
     }
+    // A stray byte where the first block should be left nothing but the header,
+    // and that would go out as a GIF with no picture in it.
+    if (images == 0) return null;
     const bytes = try assemble(gpa, b, keep.list.items);
     if (trailer) return .{ .bytes = bytes, .orientation = 0 };
     const ended = gpa.realloc(bytes, bytes.len + 1) catch |err| {
@@ -1650,6 +1656,22 @@ test "a gif with no trailer, or a stray byte before it, ends where its blocks en
         try std.testing.expectEqual(@as(u32, 1), prepared.width);
         try std.testing.expect(prepared.blurhash_len > 0);
     }
+}
+
+test "a gif with no picture left in it is refused" {
+    const gpa = std.testing.allocator;
+    const clean = try testGif(gpa, "");
+    defer gpa.free(clean);
+    // 13 bytes of screen descriptor and a six byte colour table, then the
+    // first block. A stray byte there ended the walk before any picture.
+    const head = clean[0..19];
+    for ([_][]const u8{ "\x00", "\x99\x2c", "\x3b", "" }) |rest| {
+        const file = try std.mem.concat(gpa, u8, &.{ head, rest });
+        try std.testing.expectError(error.Damaged, prepare(gpa, file));
+    }
+    // Extensions and no picture are refused the same way.
+    const no_picture = try std.mem.concat(gpa, u8, &.{ head, gif_loop, "\x3b" });
+    try std.testing.expectError(error.Damaged, prepare(gpa, no_picture));
 }
 
 test "a gif keeps its colour profile" {
