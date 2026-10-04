@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const blossom = @import("blossom.zig");
 const follows = @import("follows.zig");
+const own_profile = @import("own_profile.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -187,7 +188,7 @@ const OutboxRead = enum {
 fn relayAnswers(pk: [32]u8) RelayAnswers {
     lockOwnProfile();
     defer unlockOwnProfile();
-    const mine = if (main.g_own_contacts_asked_for) |asked| std.mem.eql(u8, &asked, &pk) else false;
+    const mine = if (own_profile.g_own_contacts_asked_for) |asked| std.mem.eql(u8, &asked, &pk) else false;
     var out = RelayAnswers{ .answered = 0, .readable = 0 };
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
@@ -312,7 +313,7 @@ pub fn retryOwnListsRead() void {
     {
         lockOwnProfile();
         defer unlockOwnProfile();
-        main.g_own_contacts_asked_for = pk;
+        own_profile.g_own_contacts_asked_for = pk;
         g_contacts_answered_by = [_]bool{false} ** max_relays;
     }
     g_own_lists_since = nowSeconds();
@@ -456,12 +457,12 @@ pub fn noteContactsAnsweredBy(index: usize, url: []const u8, pk: [32]u8) void {
     if (url.len == 0 or url.len > g_contacts_answered_url[index].len) return;
     lockOwnProfile();
     defer unlockOwnProfile();
-    if (main.g_own_contacts_asked_for) |asked| {
+    if (own_profile.g_own_contacts_asked_for) |asked| {
         if (!std.mem.eql(u8, &asked, &pk)) {
             g_contacts_answered_by = [_]bool{false} ** max_relays;
         }
     }
-    main.g_own_contacts_asked_for = pk;
+    own_profile.g_own_contacts_asked_for = pk;
     g_contacts_answered_by[index] = true;
     @memcpy(g_contacts_answered_url[index][0..url.len], url);
     g_contacts_answered_url_len[index] = @intCast(url.len);
