@@ -11643,25 +11643,60 @@ pub const noteMaxMentionsForTest = note_max_mentions;
 /// A mention's sits in `MentionRef.link_buf`, part of the model-owned `Note`,
 /// precisely because `ui.arena` is reset every frame and a press is dispatched
 /// after the frame that built it. A topic has no `Note` field to live in, so it
-/// gets a small ring: written while the spans are built, reused each frame, and
-/// stable for as long as any press can still be delivered.
-const topic_ring_slots = 16;
-var g_topic_ring: [topic_ring_slots][topic_link_tag.len + max_topic_bytes]u8 = undefined;
-var g_topic_ring_len: [topic_ring_slots]u8 = [_]u8{0} ** topic_ring_slots;
-var g_topic_ring_next: usize = 0;
+/// gets a table of its own, and a slot in it is only ever written over once no
+/// tree a press can still reach refers to it.
+///
+/// That rule is the whole point. This used to be a ring of sixteen that every
+/// hashtag drawn took the next slot of, so a screen with more than sixteen tags
+/// on it wrote the later ones over the earlier ones' payloads, and pressing an
+/// early tag opened somebody else's.
+const topic_slots = 64;
+const TopicSlot = struct {
+    buf: [topic_link_tag.len + max_topic_bytes]u8 = undefined,
+    len: u8 = 0,
+    /// The last view build that handed this payload to a span.
+    build: u64 = 0,
+};
+var g_topic_slots: [topic_slots]TopicSlot = [_]TopicSlot{.{}} ** topic_slots;
+
+/// Counts view builds. A press is answered against the tree of the build before
+/// the one under way at worst, so a payload drawn in either is still in use.
+var g_view_build: u64 = 0;
 
 /// Stores `word` (a hashtag without its `#`) and returns the payload to hang on
 /// the span, lowercased so `#Nostr` and `#nostr` are one topic. `contentTags`
 /// lowercases on the way out too, so the two halves agree.
+///
+/// Null when every slot is still in use: the run is then drawn as one that goes
+/// nowhere, which is a tag that cannot be pressed this frame rather than a press
+/// that opens a different tag.
 fn topicLinkFor(word: []const u8) ?[]const u8 {
     if (word.len == 0 or word.len > max_topic_bytes) return null;
-    const slot = g_topic_ring_next % topic_ring_slots;
-    g_topic_ring_next +%= 1;
-    const buf = &g_topic_ring[slot];
-    @memcpy(buf[0..topic_link_tag.len], topic_link_tag);
-    for (word, 0..) |c, i| buf[topic_link_tag.len + i] = std.ascii.toLower(c);
-    g_topic_ring_len[slot] = @intCast(topic_link_tag.len + word.len);
-    return buf[0..g_topic_ring_len[slot]];
+    var payload: [topic_link_tag.len + max_topic_bytes]u8 = undefined;
+    @memcpy(payload[0..topic_link_tag.len], topic_link_tag);
+    for (word, 0..) |c, i| payload[topic_link_tag.len + i] = std.ascii.toLower(c);
+    const want = payload[0 .. topic_link_tag.len + word.len];
+    // The same tag already held: its bytes are exactly what this span needs.
+    for (&g_topic_slots) |*slot| {
+        if (slot.len == want.len and std.mem.eql(u8, slot.buf[0..slot.len], want)) {
+            slot.build = g_view_build;
+            return slot.buf[0..slot.len];
+        }
+    }
+    for (&g_topic_slots) |*slot| {
+        if (slot.len != 0 and slot.build + 1 >= g_view_build) continue;
+        @memcpy(slot.buf[0..want.len], want);
+        slot.len = @intCast(want.len);
+        slot.build = g_view_build;
+        return slot.buf[0..slot.len];
+    }
+    return null;
+}
+
+/// Starts a view build the way `appView` does, for a test that draws spans
+/// without building a whole tree.
+pub fn beginViewBuildForTest() void {
+    g_view_build +%= 1;
 }
 
 /// The topic inside a payload, or null when this link is not one.
@@ -19233,6 +19268,8 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The root view: one screen at a time, chosen by the stage, with an expanded
 /// picture layered over it when one is open.
 pub fn appView(ui: *AppUi, model: *const Model) AppUi.Node {
+    // A new tree, so the payloads the one before last handed out are free.
+    g_view_build +%= 1;
     const view = appViewLayers(ui, model);
     return view;
 }

@@ -31496,3 +31496,54 @@ test "a short page does not page while its own first fetch is still out" {
     main.loadOlderProfileForTest(&model);
     try testing.expect(main.profileOlderAskForTest() != null);
 }
+
+test "a pressed hashtag opens the tag that was pressed, however many were drawn after it" {
+    // A hashtag's payload has to outlive the build that made it, because the
+    // press is delivered against that build's tree. It used to sit in a ring of
+    // sixteen that every hashtag drawn took the next slot of, so the seventeenth
+    // tag on screen wrote over the first, and pressing the first opened the
+    // seventeenth's page.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.AppUi.init(arena_state.allocator());
+    var buf: [32]u8 = undefined;
+
+    // Two builds away from whatever earlier tests drew, so the room is all free.
+    main.beginViewBuildForTest();
+    main.beginViewBuildForTest();
+    const first = main.contentSpans(&ui, "#First")[0].link;
+    // Twenty more distinct tags in the same build, more than the old ring held.
+    for (0..20) |i| {
+        const text = try std.fmt.bufPrint(&buf, "#later{d}", .{i});
+        const spans = main.contentSpans(&ui, text);
+        try testing.expectEqualStrings(text[1..], main.topicLinkValueForTest(spans[0].link) orelse return error.NoTopic);
+    }
+    try testing.expectEqualStrings("first", main.topicLinkValueForTest(first) orelse return error.NoTopic);
+
+    // The next build may still be answering a press on the last one, so what the
+    // last one drew is kept through it, even when this one draws more tags than
+    // there is room for. One that finds no room is drawn without a payload: a
+    // run that opens nothing, never one that opens another tag.
+    main.beginViewBuildForTest();
+    for (0..100) |i| {
+        const text = try std.fmt.bufPrint(&buf, "#flood{d}", .{i});
+        const link = main.contentSpans(&ui, text)[0].link;
+        if (main.topicLinkValueForTest(link)) |topic| try testing.expectEqualStrings(text[1..], topic);
+    }
+    try testing.expectEqualStrings("first", main.topicLinkValueForTest(first) orelse return error.NoTopic);
+
+    // And the press itself lands on the tag that was pressed.
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .open_url = first }, &fx);
+    try testing.expectEqualStrings("first", model.viewingTopic() orelse return error.NoTopic);
+    main.closeThreadForTest(&model);
+
+    // Two builds on, nothing can press the old payloads any more, and the room
+    // they held is given out again.
+    main.beginViewBuildForTest();
+    main.beginViewBuildForTest();
+    const fresh = main.contentSpans(&ui, "#fresh")[0].link;
+    try testing.expectEqualStrings("fresh", main.topicLinkValueForTest(fresh) orelse return error.NoTopic);
+}
