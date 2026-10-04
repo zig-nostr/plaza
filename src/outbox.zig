@@ -626,7 +626,7 @@ pub fn drainOutbox(gpa: std.mem.Allocator) void {
 
 /// A process-lifetime copy of an event, for handing to a detached publisher.
 /// Returns null when the copy cannot be made, in which case nothing is spawned.
-fn dupeEventForPublish(ev: nostr.event.Event) ?nostr.event.Event {
+pub fn dupeEventForPublish(ev: nostr.event.Event) ?nostr.event.Event {
     const gpa = std.heap.page_allocator;
     var out = ev;
     out.content = gpa.dupe(u8, ev.content) catch return null;
@@ -662,7 +662,7 @@ fn dupeEventForPublish(ev: nostr.event.Event) ?nostr.event.Event {
 }
 
 /// Frees what `dupeEventForPublish` allocated.
-fn freePublishedEvent(ev: nostr.event.Event) void {
+pub fn freePublishedEvent(ev: nostr.event.Event) void {
     const gpa = std.heap.page_allocator;
     for (ev.tags) |t| {
         for (t) |field| gpa.free(field);

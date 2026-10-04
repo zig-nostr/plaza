@@ -3585,6 +3585,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (keyholder.g_signer_kind == .helper) scanHelperSign(model);
+                // A record of the reader's own that went out and did not reach
+                // the store, offered to it again.
+                retryUnstoredOwnWrites(model, now);
                 // A refused reply with no room left to go back into.
                 flushRefusedReplyClip(fx);
                 // A relay that asked who the reader is, and was told yes: get
@@ -6207,6 +6210,8 @@ pub const startedFresh = own_lists.startedFresh;
 pub const takeFresh = own_lists.takeFresh;
 
 // re-exports: follows.zig
+pub const retryUnstoredOwnWrites = follows.retryUnstoredOwnWrites;
+pub const unstored_lost_toast = follows.unstored_lost_toast;
 pub const ownWriteUnstoredForTest = follows.ownWriteUnstoredForTest;
 pub const noteOwnRecordStored = follows.noteOwnRecordStored;
 pub const failIngestForTest = follows.failIngestForTest;
@@ -6740,6 +6745,8 @@ pub const withClientTag = compose.withClientTag;
 pub const withContentWarning = compose.withContentWarning;
 
 // re-exports: outbox.zig
+pub const dupeEventForPublish = outbox.dupeEventForPublish;
+pub const freePublishedEvent = outbox.freePublishedEvent;
 pub const clearOutboxOwnerForTest = outbox.clearOutboxOwnerForTest;
 pub const collectOutboxDueForTest = outbox.collectOutboxDueForTest;
 pub const enqueueOutboxForTest = outbox.enqueueOutboxForTest;

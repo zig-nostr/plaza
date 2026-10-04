@@ -860,6 +860,54 @@ test "a list published but not stored holds the next write until it is read back
     try testing.expect(std.mem.indexOf(u8, tags, "f2" ** 32) != null);
 }
 
+test "a list published but not stored is stored by the tick, or let go and said" {
+    // Nothing tried the store again, so a refusal that no relay ever answered
+    // kept every write of that kind refused for the session.
+    var fs: FreshStore = undefined;
+    try fs.open("unstored-retry");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x8e} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    defer main.forgetMutesForTest();
+    defer main.failIngestForTest(false);
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    const first = [_]u8{0xf3} ** 32;
+    const second = [_]u8{0xf4} ** 32;
+    const third = [_]u8{0xf5} ** 32;
+    var now: i64 = 1_800_000_000;
+
+    // Refused once, and stored by the next try.
+    main.failIngestForTest(true);
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, first, true));
+    main.failIngestForTest(false);
+    try testing.expect(main.ownWriteUnstoredForTest(10000));
+    main.retryUnstoredOwnWrites(&model, now);
+    try testing.expect(!main.ownWriteUnstoredForTest(10000));
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, second, true));
+    const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingStored;
+    defer testing.allocator.free(tags);
+    try testing.expect(std.mem.indexOf(u8, tags, "f3" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, tags, "f4" ** 32) != null);
+
+    // Refused every time: held while it is tried, then let go, and said.
+    main.failIngestForTest(true);
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, third, true));
+    var tries: usize = 0;
+    while (main.ownWriteUnstoredForTest(10000)) : (tries += 1) {
+        if (tries > 100) return error.HeldForever;
+        try testing.expect(model.toast_len == 0 or !std.mem.eql(u8, model.toast_text(), main.unstored_lost_toast));
+        now += 1;
+        main.retryUnstoredOwnWrites(&model, now);
+    }
+    try testing.expect(tries > 1);
+    try testing.expectEqualStrings(main.unstored_lost_toast, model.toast_text());
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes

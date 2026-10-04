@@ -16,6 +16,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const plazaIngestFrom = main.plazaIngestFrom;
+const plazaIngest = main.plazaIngest;
 const putBackRefusedReply = main.putBackRefusedReply;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -23,11 +24,13 @@ const OwnProfile = main.OwnProfile;
 const activePubkey = main.activePubkey;
 const blossom_list_kind = main.blossom_list_kind;
 const clearRepostedByMe = main.clearRepostedByMe;
+const dupeEventForPublish = main.dupeEventForPublish;
 const dupeTags = main.dupeTags;
 const feed_request_limit = main.feed_request_limit;
 const forgetFresh = main.forgetFresh;
 const forgetLike = main.forgetLike;
 const forgetOwnListMemo = main.forgetOwnListMemo;
+const freePublishedEvent = main.freePublishedEvent;
 const freeOwnProfile = main.freeOwnProfile;
 const generic_repost_kind = main.generic_repost_kind;
 const haveOwnContactList = main.haveOwnContactList;
@@ -198,7 +201,31 @@ pub const SelfReadForTest = SelfRead;
 /// reason until then.
 var g_unstored_for: ?[32]u8 = null;
 
-var g_unstored_at: [self_filter_kinds.len]i64 = @splat(0);
+/// Cleared by whichever thread stores the record, so atomic.
+var g_unstored_at: [self_filter_kinds.len]std.atomic.Value(i64) = @splat(std.atomic.Value(i64).init(0));
+
+/// A copy of each held record, so the tick can put it in the store itself
+/// rather than wait on a relay to send it back, which may never happen: with
+/// nothing retrying, a store that refused once kept that kind of write refused
+/// for the session. Owned, and touched on the UI thread only.
+var g_unstored_copy: [self_filter_kinds.len]?nostr.event.Event = @splat(null);
+var g_unstored_tries: [self_filter_kinds.len]u8 = @splat(0);
+var g_unstored_retry_at: [self_filter_kinds.len]i64 = @splat(0);
+
+/// How often a held record is offered to the store again, and how many times
+/// before the hold is let go.
+const unstored_retry_s: i64 = 2;
+const unstored_max_tries: u8 = 15;
+
+/// What the reader is told when the hold is let go without the record stored.
+pub const unstored_lost_toast = "Published, but this machine could not keep it.";
+
+fn dropUnstoredCopy(i: usize) void {
+    if (g_unstored_copy[i]) |copy| freePublishedEvent(copy);
+    g_unstored_copy[i] = null;
+    g_unstored_tries[i] = 0;
+    g_unstored_retry_at[i] = 0;
+}
 
 fn selfKindIndex(kind: u16) ?usize {
     return std.mem.indexOfScalar(u16, &self_filter_kinds, kind);
@@ -210,10 +237,17 @@ pub fn noteOwnWriteUnstored(ev: nostr.event.Event) void {
     const me = activePubkey() orelse return;
     if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
     if (g_unstored_for) |who| {
-        if (!std.mem.eql(u8, &who, &me)) g_unstored_at = @splat(0);
+        if (!std.mem.eql(u8, &who, &me)) forgetOwnWritesUnstored();
     }
     g_unstored_for = me;
-    g_unstored_at[i] = @max(g_unstored_at[i], ev.created_at);
+    _ = g_unstored_at[i].fetchMax(ev.created_at, .acq_rel);
+    // The newest record of the kind is the one to store. One that cannot be
+    // copied still holds, and the tick lets it go after the same tries.
+    if (g_unstored_copy[i]) |held| {
+        if (held.created_at > ev.created_at) return;
+    }
+    dropUnstoredCopy(i);
+    g_unstored_copy[i] = dupeEventForPublish(ev);
 }
 
 /// A record of the reader's own, of `kind` and stamped `created_at`, is in the
@@ -222,7 +256,38 @@ pub fn noteOwnRecordStored(pubkey: [32]u8, kind: u16, created_at: i64) void {
     const i = selfKindIndex(kind) orelse return;
     const who = g_unstored_for orelse return;
     if (!std.mem.eql(u8, &who, &pubkey)) return;
-    if (created_at >= g_unstored_at[i]) g_unstored_at[i] = 0;
+    const held = g_unstored_at[i].load(.acquire);
+    if (held != 0 and created_at >= held) _ = g_unstored_at[i].cmpxchgStrong(held, 0, .acq_rel, .acquire);
+}
+
+/// The tick's half of the hold: each held record is offered to the store again
+/// every few seconds, and the hold goes as soon as one at least as new is in.
+/// After `unstored_max_tries` the hold is let go and the reader is told the
+/// change went out but is not on this machine. Writes of that kind then work
+/// again, on the older record the store still has.
+pub fn retryUnstoredOwnWrites(model: *Model, now: i64) void {
+    const gpa = std.heap.page_allocator;
+    for (&g_unstored_at, 0..) |*at, i| {
+        if (at.load(.acquire) == 0) {
+            // Read back, by a relay or by an earlier try.
+            if (g_unstored_copy[i] != null or g_unstored_tries[i] != 0) dropUnstoredCopy(i);
+            continue;
+        }
+        if (now < g_unstored_retry_at[i]) continue;
+        if (g_unstored_copy[i]) |copy| _ = plazaIngest(gpa, copy, .{}) catch {};
+        if (at.load(.acquire) == 0) {
+            dropUnstoredCopy(i);
+            continue;
+        }
+        g_unstored_tries[i] += 1;
+        if (g_unstored_tries[i] >= unstored_max_tries) {
+            at.store(0, .release);
+            dropUnstoredCopy(i);
+            setToast(model, unstored_lost_toast);
+            continue;
+        }
+        g_unstored_retry_at[i] = now + unstored_retry_s;
+    }
 }
 
 /// Whether a write of `kind` must wait for a published record to be read back.
@@ -231,12 +296,15 @@ pub fn ownWriteUnstored(kind: u16) bool {
     const me = activePubkey() orelse return false;
     const who = g_unstored_for orelse return false;
     if (!std.mem.eql(u8, &who, &me)) return false;
-    return g_unstored_at[i] != 0;
+    return g_unstored_at[i].load(.acquire) != 0;
 }
 
 fn forgetOwnWritesUnstored() void {
     g_unstored_for = null;
-    g_unstored_at = @splat(0);
+    for (&g_unstored_at, 0..) |*at, i| {
+        at.store(0, .release);
+        dropUnstoredCopy(i);
+    }
 }
 
 pub fn ownWriteUnstoredForTest(kind: u16) bool {
