@@ -31937,3 +31937,108 @@ test "creating an identity with no key window says so instead of queueing a mint
     main.update(&model, .join_create, &fx);
     try testing.expectEqualStrings("Notary is missing from this install.", model.toast_text());
 }
+
+test "a bunker pairing that is taken back leaves its secret nowhere" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    main.setIoForTest(testing.io);
+    defer main.setIoForTest(null);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+    const link = "bunker://" ++ "ab" ** 32 ++ "?relay=wss://127.0.0.1:1&secret=pairing-secret-one";
+
+    // The signer refuses, or the relay never carried the request.
+    model.login_buffer.set(link);
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.bunkerConnecting());
+    try testing.expect(main.remoteSecretHeldForTest("pairing-secret-one"));
+    var id_buf: [24]u8 = undefined;
+    const id = main.pendingConnectIdForTest(&id_buf) orelse return error.NoConnectRequest;
+    try testing.expect(main.failPendingForTest(id));
+    main.scanPendingRemoteForTest(&model, &fx);
+    main.driveBunkerConnectForTest(&model);
+    try testing.expect(!main.bunkerConnecting());
+    // A length of zero is not the same as gone: the bytes are wiped, and the
+    // client key with them.
+    try testing.expect(!main.remoteSecretHeldForTest("pairing-secret-one"));
+
+    // And the same when the reader backs out while it waits.
+    model.login_buffer.set(link);
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.remoteSecretHeldForTest("pairing-secret-one"));
+    main.update(&model, .close_bunker, &fx);
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(!main.remoteSecretHeldForTest("pairing-secret-one"));
+}
+
+test "a key adopted while a bunker link waits takes the link down with it" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    main.setIoForTest(testing.io);
+    defer main.setIoForTest(null);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+
+    model.login_buffer.set("bunker://" ++ "ab" ** 32 ++ "?relay=wss://127.0.0.1:1&secret=pairing-secret-two");
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.bunkerConnecting());
+    const generation = main.remoteGenerationForTest();
+
+    // An import finished in Notary meanwhile, and the keyholder's key was
+    // adopted. That account is the reader's now.
+    main.setIdentityForTest([_]u8{0x6A} ** 32);
+    main.driveBunkerConnectForTest(&model);
+
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(!model.is_guest());
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+    // The pairing went with it: its listener was told to stop, nothing waits
+    // on its answer, and its secret is gone.
+    try testing.expect(main.remoteGenerationForTest() != generation);
+    var id_buf: [24]u8 = undefined;
+    try testing.expect(main.pendingConnectIdForTest(&id_buf) == null);
+    try testing.expect(!main.remoteSecretHeldForTest("pairing-secret-two"));
+}
+
+test "a connect answered by the signer is never read as one that never went out" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    // The listener takes an answer on its own thread while the tick asks
+    // whether the request is still out. Between "the slot is gone" and "the
+    // connection is up" there must be no moment the tick can see, or a signer
+    // that said yes is reported as silent and the reader is turned away.
+    const Listener = struct {
+        go: std.atomic.Value(u32) = .init(0),
+        done: std.atomic.Value(u32) = .init(0),
+        id: []const u8 = "",
+        fn run(self: *@This(), rounds: u32) void {
+            var round: u32 = 1;
+            while (round <= rounds) : (round += 1) {
+                while (self.go.load(.acquire) != round) std.atomic.spinLoopHint();
+                main.answerBunkerConnectForTest(self.id);
+                self.done.store(round, .release);
+            }
+        }
+    };
+    const rounds: u32 = 20_000;
+    var listener: Listener = .{};
+    var id_buf: [24]u8 = undefined;
+    const thread = try std.Thread.spawn(.{}, Listener.run, .{ &listener, rounds });
+    var misread: u32 = 0;
+    var round: u32 = 1;
+    while (round <= rounds) : (round += 1) {
+        listener.id = main.beginBunkerConnectForTest([_]u8{0x5E} ** 32, &id_buf);
+        listener.go.store(round, .release);
+        while (listener.done.load(.acquire) != round) {
+            if (main.connectWentQuietForTest()) misread += 1;
+        }
+    }
+    thread.join();
+    try testing.expectEqual(@as(u32, 0), misread);
+}

@@ -6509,6 +6509,25 @@ fn takePending(req_id: []const u8) ?PendingRemote {
     return null;
 }
 
+/// `takePending` for an answer from the signer, which also marks the connection
+/// up. Both happen under the table's lock: the tick decides a pasted link's
+/// `connect` never went out when it finds no slot and the status still at
+/// "connecting", and with the two done apart an answer that arrived between them
+/// read as exactly that, and a signer that said yes was reported as silent.
+fn takeAnswered(req_id: []const u8) ?PendingRemote {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
+            const taken = slot.*;
+            slot.* = .{};
+            g_remote_status.store(2, .release);
+            return taken;
+        }
+    }
+    return null;
+}
+
 /// Marks the pending request matching `req_id` failed, leaving it in the table
 /// for the UI tick to restore the draft and free the content. Returns whether a
 /// slot matched.
@@ -35954,8 +35973,24 @@ pub fn pendingConnectIdForTest(out: *[24]u8) ?[]const u8 {
 
 /// What the listener does with a `connect` answer from the signer. For tests.
 pub fn answerBunkerConnectForTest(id: []const u8) void {
-    _ = takePending(id);
-    g_remote_status.store(2, .release);
+    _ = takeAnswered(id);
+}
+
+/// Whether the pairing secret `needle` is still anywhere in the buffer that
+/// held it, or a client key is still held. For tests.
+pub fn remoteSecretHeldForTest(needle: []const u8) bool {
+    if (g_remote_client_kp != null) return true;
+    return std.mem.indexOf(u8, &g_remote_secret_buf, needle) != null;
+}
+
+/// Which listener generation is current, so a test can see one was stopped.
+/// For tests.
+pub fn remoteGenerationForTest() u64 {
+    return g_remote_generation.load(.acquire);
+}
+
+pub fn connectWentQuietForTest() bool {
+    return connectWentQuiet();
 }
 
 pub fn driveBunkerConnectForTest(model: *Model) void {
@@ -42318,34 +42353,48 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
 
 /// Request ids a unit test hands out, which has no io to draw them from.
 var g_test_request_seq: u32 = 0;
-/// Whether a `connect` request is still waiting for its answer in this
-/// generation.
-fn connectInFlight() bool {
+
+/// Whether this generation's `connect` is neither waiting for its answer nor
+/// answered: it never went out, so there is nothing left to wait for.
+fn connectWentQuiet() bool {
     const generation = g_remote_generation.load(.acquire);
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
-        if (slot.active and slot.method == .connect and slot.generation == generation and !slot.failed) return true;
+        if (slot.active and slot.method == .connect and slot.generation == generation and !slot.failed) return false;
     }
-    return false;
+    // Read under the same lock the listener takes an answer under (see
+    // `takeAnswered`), so a slot that is gone because it was ANSWERED is never
+    // mistaken for one that never went out.
+    return g_remote_status.load(.acquire) == 1;
 }
 
-/// Takes back a bunker connection that never became a sign-in: the listener is
-/// stopped, the request table emptied, and the reader is a guest again with the
-/// reason on the sheet they are still looking at.
-fn abandonRemoteSigner(why: LoginError) void {
+/// Takes down a bunker connection that is not going to be anybody's sign-in:
+/// the listener stops, every request in flight is dropped, and the pairing
+/// secret and the client key are wiped rather than left in memory. Who is
+/// signed in is not touched here (see `abandonRemoteSigner`).
+fn dropRemoteConnection() void {
     // Bumped first, so the detached listener stops processing before the state
     // it reads is taken away.
     _ = g_remote_generation.fetchAdd(1, .monotonic);
     clearPending();
     g_remote_confirming.store(false, .release);
     g_remote_sign_notice.store(false, .release);
-    g_identity_npub_len = 0;
-    g_signer_kind = .helper;
+    std.crypto.secureZero(u8, &g_remote_secret_buf);
+    g_remote_secret_len = 0;
+    if (g_remote_client_kp) |*kp| std.crypto.secureZero(u8, &kp.secret_key);
     g_remote_client_kp = null;
     g_remote_relay_len = 0;
-    g_remote_secret_len = 0;
     g_remote_status.store(0, .release);
+}
+
+/// Takes back a bunker connection that never became a sign-in: the connection
+/// is dropped, and the reader is a guest again with the reason on the sheet
+/// they are still looking at.
+fn abandonRemoteSigner(why: LoginError) void {
+    dropRemoteConnection();
+    g_identity_npub_len = 0;
+    g_signer_kind = .helper;
     g_login_error.store(@intFromEnum(why), .release);
 }
 
@@ -42365,8 +42414,11 @@ pub fn bunkerConnecting() bool {
 fn driveBunkerConnect(model: *Model) void {
     if (!g_remote_confirming.load(.acquire)) return;
     // Something else took the seat (a keyholder key adopted while waiting).
+    // The pairing is not theirs, so it goes: left up, its listener would hold
+    // the bunker relay for the rest of the run with the link's secret in
+    // memory, and a late answer would mark a signer nobody uses "connected".
     if (g_signer_kind != .remote) {
-        g_remote_confirming.store(false, .release);
+        dropRemoteConnection();
         return;
     }
     switch (g_remote_status.load(.acquire)) {
@@ -42384,7 +42436,7 @@ fn driveBunkerConnect(model: *Model) void {
         3 => abandonRemoteSigner(.signer_silent),
         // Connecting. If nothing is in flight any more there is nothing to wait
         // for: the request never went out.
-        else => if (!connectInFlight()) abandonRemoteSigner(.signer_silent),
+        else => if (connectWentQuiet()) abandonRemoteSigner(.signer_silent),
     }
 }
 
@@ -42683,10 +42735,10 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
 
     // Correlate to the request that asked. A missing slot means an unknown id
     // or one already handled: drop it (no double publish, no stray "connected").
-    const pending = takePending(resp.value.id) orelse return;
+    // Taking it also marks the connection up (see `takeAnswered`).
+    const pending = takeAnswered(resp.value.id) orelse return;
     defer if (pending.content) |c| gpa.free(c);
 
-    g_remote_status.store(2, .release);
     g_remote_sign_notice.store(false, .release);
 
     switch (pending.method) {
