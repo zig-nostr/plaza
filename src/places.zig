@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const feed_state = @import("feed_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1105,7 +1106,7 @@ pub fn openKeptPlace(i: usize) void {
     // The feed is about to mean something entirely different, and the
     // incremental path cannot express that: it merges arrivals into the list
     // already on screen.
-    main.g_feed_rebuild_all.store(true, .release);
+    feed_state.g_feed_rebuild_all.store(true, .release);
     saveSettings();
 }
 
@@ -1142,7 +1143,7 @@ pub fn resumeVisit() void {
     g_place_kept = false;
     showPlacesRail();
     startPlaceFeed(&g_place.?);
-    main.g_feed_rebuild_all.store(true, .release);
+    feed_state.g_feed_rebuild_all.store(true, .release);
     saveSettings();
 }
 
@@ -1172,7 +1173,7 @@ pub fn goToOwnPlaza() void {
     g_place_feed = 0;
     g_place_kept = false;
     clearPlaceFeed();
-    main.g_feed_rebuild_all.store(true, .release);
+    feed_state.g_feed_rebuild_all.store(true, .release);
     saveSettings();
 }
 
@@ -1482,7 +1483,7 @@ pub fn placeFetchStep() PlaceFetch {
     // incremental path cannot express that: it merges arrivals into the list
     // already on screen. Without this the reader enters a place and keeps
     // looking at their own follows, which is exactly what was reported.
-    main.g_feed_rebuild_all.store(true, .release);
+    feed_state.g_feed_rebuild_all.store(true, .release);
     // Which room is open is written down on every other way into one, and was
     // not on this one. A reader who opened a room from the rail and then
     // followed a link into another quit with the file still naming the first,
