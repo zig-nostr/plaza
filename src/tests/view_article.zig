@@ -79,6 +79,65 @@ test "opening an article by id opens a reader, and a long one builds only what i
     try testing.expect(countNodes(tree.root) < 600);
 }
 
+test "an article under a content warning shows the warning and nothing it covers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x64} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "covered");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    defer main.setShowSensitive(false);
+
+    const body = try longArticleBody(arena, 40);
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "covered-one" },
+        &[_][]const u8{ "title", "What the cover hides" },
+        &[_][]const u8{ "summary", "A summary is the article too." },
+        &[_][]const u8{ "content-warning", "graphic" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, body);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openEventForTest(&model, ev.id);
+    try testing.expectEqual(@as(u16, 30023), model.thread_root.kind);
+
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "Content warning: graphic"));
+        try testing.expect(findAnyTextContaining(tree.root, "Show"));
+        try testing.expect(findAnyTextContaining(tree.root, "min read"));
+        try testing.expect(!findAnyTextContaining(tree.root, "What the cover hides"));
+        try testing.expect(!findAnyTextContaining(tree.root, "A summary is the article too."));
+        try testing.expect(!findAnyTextContaining(tree.root, "Section 0"));
+        try testing.expect(!findAnyTextContaining(tree.root, "Paragraph number 0 says"));
+    }
+
+    // Show: the whole article, as it would have been.
+    main.uncoverNoteForTest(model.thread_root.id);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(!findAnyTextContaining(tree.root, "Content warning"));
+        try testing.expect(findAnyTextContaining(tree.root, "What the cover hides"));
+        try testing.expect(findAnyTextContaining(tree.root, "A summary is the article too."));
+        try testing.expect(findAnyTextContaining(tree.root, "Paragraph number 0 says"));
+    }
+}
+
 /// The first widget whose text contains `needle`.
 fn widgetContaining(widget: canvas.Widget, needle: []const u8) ?canvas.Widget {
     if (std.mem.indexOf(u8, widget.text, needle) != null) return widget;

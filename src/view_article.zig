@@ -22,11 +22,14 @@ const avatar_size = main.avatar_size;
 const avatar_to_text_gap = main.avatar_to_text_gap;
 const backControl = main.backControl;
 const backLabel = main.backLabel;
+const coverNotice = main.coverNotice;
+const cover_notice_height = main.cover_notice_height;
 const hgap = main.hgap;
 const identityBlock = main.identityBlock;
 const join_sub_scale = main.join_sub_scale;
 const mono_hint_scale = main.mono_hint_scale;
 const noteAvatar = main.noteAvatar;
+const noteCovered = main.noteCovered;
 const notePicture = main.notePicture;
 const pictureHeight = main.pictureHeight;
 const picture_column_width = main.picture_column_width;
@@ -138,6 +141,7 @@ pub fn isArticleRoot(root: *const Note) bool {
 /// wrapped lengths, the cover, and the date line.
 fn articleHeadHeight(root: *const Note, av: ?*const ArticleView) f32 {
     var h: f32 = 20 + avatar_size + 18 + 16 + 12 + 1 + 20;
+    if (noteCovered(root)) return h + cover_notice_height + 14 + 22;
     const title = if (av) |a| a.title else root.content();
     const title_lines = @max(@ceil(@as(f32, @floatFromInt(@max(title.len, 1))) / 39), 1);
     h += title_lines * 14.5 * article_title_scale * 1.3 + 10;
@@ -172,9 +176,17 @@ fn articleHeader(ui: *AppUi, model: *const Model) AppUi.Node {
 
 /// The byline, the title, the summary, the cover and the date: what the card in
 /// a feed would say, at the size of the thing being read.
+///
+/// An article under its author's content warning (NIP-36) shows the byline, the
+/// warning with Show, and the date, and nothing it covers: the title and the
+/// summary are the article as much as its body is, and the picture is not
+/// fetched while it is covered (`fireMediaAt`).
 fn articleHead(ui: *AppUi, root: *const Note, av: ?*const ArticleView) AppUi.Node {
     const p = theme.palette;
-    const title = if (av) |a| a.title else root.content();
+    const covered = noteCovered(root);
+    const title = if (covered) "" else if (av) |a| a.title else root.content();
+    const summary = if (covered) "" else if (av) |a| a.summary else "";
+    const picture = !covered and root.hasImage();
     return ui.column(.{ .width = article_text_width, .gap = 0 }, .{
         vgap(ui, 20),
         ui.row(.{ .gap = 0, .cross = .center }, .{
@@ -192,13 +204,15 @@ fn articleHead(ui: *AppUi, root: *const Note, av: ?*const ArticleView) AppUi.Nod
         else
             ui.spacer(0),
         if (title.len > 0) vgap(ui, 10) else ui.spacer(0),
-        if (av) |a| (if (a.summary.len > 0) ui.paragraph(
+        if (summary.len > 0) ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_muted } },
-            &.{.{ .text = a.summary, .scale = article_summary_scale }},
-        ) else ui.spacer(0)) else ui.spacer(0),
-        if (av) |a| (if (a.summary.len > 0) vgap(ui, 12) else ui.spacer(0)) else ui.spacer(0),
-        if (root.hasImage()) notePicture(ui, root) else ui.spacer(0),
-        if (root.hasImage()) vgap(ui, 14) else ui.spacer(0),
+            &.{.{ .text = summary, .scale = article_summary_scale }},
+        ) else ui.spacer(0),
+        if (summary.len > 0) vgap(ui, 12) else ui.spacer(0),
+        if (covered) coverNotice(ui, root.warning(), root.id) else ui.spacer(0),
+        if (covered) vgap(ui, 14) else ui.spacer(0),
+        if (picture) notePicture(ui, root) else ui.spacer(0),
+        if (picture) vgap(ui, 14) else ui.spacer(0),
         ui.paragraph(
             .{ .style = .{ .foreground = p.text_faint_alt } },
             &.{.{
@@ -285,14 +299,19 @@ const KindOfRow = enum(u64) { article = 40 };
 /// `occluded` levels build nothing and keep their place, exactly as a thread's do.
 pub fn articlePanel(ui: *AppUi, model: *const Model, root: *const Note, level_key: u64, level: usize, occluded: bool) AppUi.Node {
     const av = if (occluded) null else articleFor(root.event_id);
-    const total: usize = if (av) |a| a.rowCount() else 1;
+    // Covered, the head is the whole article: no body row is built until the
+    // reader presses Show, and the foot's hashtags wait with it.
+    const covered = noteCovered(root);
+    const total: usize = if (covered) 1 else if (av) |a| a.rowCount() else 1;
     const table = &view_thread.g_thread_extents[@min(level, view_thread.g_thread_extents.len - 1)];
     table.reset();
     if (!occluded) {
         table.push(articleHeadHeight(root, av));
         if (av) |a| {
-            for (a.chunks[0..a.chunk_count]) |c| table.push(c.height);
-            table.push(articleFootHeight(av));
+            if (!covered) {
+                for (a.chunks[0..a.chunk_count]) |c| table.push(c.height);
+                table.push(articleFootHeight(av));
+            }
         }
     }
     const options: AppUi.VirtualListOptions = .{
