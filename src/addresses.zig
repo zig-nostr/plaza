@@ -628,3 +628,65 @@ pub fn refreshAddressFetch(model: *Model) void {
         if (!want.shown) setToast(model, "That article did not turn up.");
     }
 }
+
+pub fn newestAddressIdForTest(store: *nostr.store.Store, kind: u16, pubkey: [32]u8, identifier: []const u8) ?[32]u8 {
+    const addr = Address.make(kind, pubkey, identifier) orelse return null;
+    return newestAddressId(store, &addr);
+}
+
+/// Empties the table. For tests, which share the process globals.
+pub fn resetAddressesForTest() void {
+    g_addresses = [_]AddressSlot{.{}} ** address_table_cap;
+    g_address_clock = 0;
+}
+
+/// The stand-in key an address is filed under, as a card or a pill carries it.
+pub fn addressKeyForTest(kind: u16, pubkey: [32]u8, identifier: []const u8) [32]u8 {
+    const a = Address.make(kind, pubkey, identifier) orelse return @splat(0);
+    return a.key();
+}
+
+pub fn addressRegisteredForTest(key: [32]u8) bool {
+    return addressFor(key) != null;
+}
+
+pub const addressPoolBatchForTest = address_pool_batch;
+
+/// The filters a pool message for these addresses carries, for a test to read.
+pub fn addressPoolFiltersForTest(addrs: []const Address, out: *[address_pool_batch + 1]nostr.filter.Filter) usize {
+    const held = struct {
+        var queries: [address_pool_batch]AddressQuery = undefined;
+        var authors: [address_pool_batch][32]u8 = undefined;
+    };
+    return addressPoolFilters(addrs, &held.queries, &held.authors, out);
+}
+
+pub fn addressForTest(kind: u16, pubkey: [32]u8, identifier: []const u8) ?Address {
+    return Address.make(kind, pubkey, identifier);
+}
+
+pub fn storedWriteRelaysForTest(pubkey: [32]u8, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
+    return storedWriteRelays(std.heap.page_allocator, pubkey, out, lens);
+}
+
+pub fn openAddressedArticleForTest(model: *Model, kind: u16, pubkey: [32]u8, identifier: []const u8) void {
+    const a = Address.make(kind, pubkey, identifier) orelse return;
+    openAddressedArticle(model, a, &.{});
+}
+
+pub fn refreshAddressFetchForTest(model: *Model) void {
+    refreshAddressFetch(model);
+}
+
+pub fn addressFetchArmedForTest() bool {
+    return g_address_want != null;
+}
+
+pub fn forgetAddressFetchForTest() void {
+    g_address_want = null;
+}
+/// Whether an address's relays have been dialled (or claimed for dialling).
+pub fn addressDialledForTest(key: [32]u8) bool {
+    const slot = addressFor(key) orelse return false;
+    return slot.outbox_asked;
+}

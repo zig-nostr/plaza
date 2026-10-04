@@ -263,3 +263,28 @@ pub fn ownRecordCreatedAt(kind: u16) i64 {
     if (result.events.len == 0) return 0;
     return result.events[0].created_at;
 }
+
+pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
+    return plazaIngest(gpa, ev, .{});
+}
+
+/// The relay-fed funnel: verified, and remembering which relay delivered it.
+pub fn plazaIngestFromForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer, relay_url: []const u8) !nostr.store.IngestResult {
+    return plazaIngestFrom(gpa, ev, .{ .verify_with = signer }, relay_url);
+}
+
+/// Drives the funnel with verification ON, the way every relay-fed path does.
+pub fn plazaIngestVerifiedForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer) !nostr.store.IngestResult {
+    return plazaIngest(gpa, ev, .{ .verify_with = signer });
+}
+
+pub fn ownRecordReadsForTest() usize {
+    return g_own_record_reads;
+}
+
+pub fn resetOwnRecordReadsForTest() void {
+    g_own_record_reads = 0;
+}
+pub fn ownRecordCreatedAtForTest(kind: u16) i64 {
+    return ownRecordCreatedAt(kind);
+}

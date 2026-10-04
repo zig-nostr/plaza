@@ -8,11 +8,14 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const prefs = @import("prefs.zig");
 const view_thread = @import("view_thread.zig");
+const view_place = @import("view_place.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const avatar_fetch_key_base = main.avatar_fetch_key_base;
+const handleAvatarFetched = main.handleAvatarFetched;
 const Download = main.Download;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -816,4 +819,181 @@ pub fn handleNip05Fetched(response: native_sdk.EffectResponse) void {
         return;
     }
     p.nip05_state = if (nip05Matches(p.nip05(), p.pubkey, response.body)) .verified else .failed;
+}
+
+/// The tags a body of text implies, for tests. Deliberately takes the finished
+/// string: that is exactly what the publish path passes, which is why a pasted
+/// note and a typed one cannot diverge.
+pub fn resetWantedProfilesForTest() void {
+    g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
+}
+
+pub fn wantProfileForTest(pubkey: [32]u8) void {
+    wantProfile(pubkey);
+}
+
+pub fn wantProfilesAheadForTest(model: *const Model) void {
+    wantProfilesAhead(model);
+}
+
+pub fn isProfileWantedForTest(pubkey: [32]u8) bool {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
+    }
+    return false;
+}
+
+pub fn wantedProfileCountForTest() usize {
+    var n: usize = 0;
+    for (&g_wanted) |*w| {
+        if (w.used) n += 1;
+    }
+    return n;
+}
+pub fn buildRoutedFiltersForTest(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
+    return buildRoutedFilters(authors, out);
+}
+/// Clears the profile cache. For tests, which share the process globals.
+pub fn resetProfilesForTest() void {
+    g_profiles = [_]Profile{.{}} ** profile_cap;
+    @memset(&g_profile_index, 0);
+    g_names_generation = 0;
+    main.g_notes_names_generation = 0;
+    g_image_clock = 0;
+}
+
+/// Marks `pubkey`'s profile as having (or not having) a kind:0 picture, so a
+/// test can exercise the avatar-id LRU without a real fetch.
+pub fn setProfilePictureForTest(pubkey: [32]u8, present: bool) void {
+    const p = upsertProfile(pubkey) orelse return;
+    p.picture_len = if (present) 8 else 0;
+    if (present) @memcpy(p.picture_buf[0..8], "http://x");
+}
+
+/// The registry image id currently lent to `pubkey`'s avatar (0 = none). For
+/// tests of the id LRU.
+/// Puts a profile in the state the avatar pipeline would leave it in, so a view
+/// test can ask what the widget does with it without a network round trip.
+pub fn setProfileAvatarForTest(pubkey: [32]u8, image_id: u64, state: enum { idle, fetching, loaded, failed }) void {
+    const p = upsertProfile(pubkey) orelse return;
+    p.image_id = image_id;
+    p.avatar_state = switch (state) {
+        .idle => .idle,
+        .fetching => .fetching,
+        .loaded => .loaded,
+        .failed => .failed,
+    };
+}
+
+/// Whether this face is idle, and whether it is now pinned to its own host
+/// rather than the proxy. Both are what the host-refusal fallback moves.
+pub fn avatarFallbackStateForTest(pubkey: [32]u8) ?struct { idle: bool, direct: bool } {
+    const p = lookupProfile(pubkey) orelse return null;
+    return .{ .idle = p.avatar_state == .idle, .direct = p.avatar_direct };
+}
+/// Gives `pubkey` a display name the way a landed kind:0 does, including the
+/// names generation moving, which is what tells the surfaces that baked an
+/// older label to bake it again.
+pub fn setProfileNameForTest(pubkey: [32]u8, name: []const u8) void {
+    const p = upsertProfile(pubkey) orelse return;
+    var buf: [160]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"name\":\"{s}\"}}", .{name}) catch return;
+    parseMetadataInto(p, json);
+    g_names_generation +%= 1;
+}
+
+/// Whether a kind:0 has been asked for on this pubkey's behalf.
+pub fn profileWantedForTest(pubkey: [32]u8) bool {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
+    }
+    return false;
+}
+
+pub fn forgetWantedProfilesForTest() void {
+    for (&g_wanted) |*w| w.* = .{};
+}
+/// Delivers one picture-fetch response for `note_id` the way the runtime would,
+/// so a test can drive the failure paths rather than the classifier alone.
+/// How many faces are holding a half-assembled picture. Zero at rest.
+pub fn avatarPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_profiles) |*p| {
+        if (p.used and p.down.buf != null) n += 1;
+    }
+    return n;
+}
+
+pub fn deliverAvatarResponseForTest(
+    fx: *Effects,
+    pubkey: [32]u8,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const p = lookupProfile(pubkey) orelse return;
+    const index = (@intFromPtr(p) - @intFromPtr(&g_profiles[0])) / @sizeOf(Profile);
+    handleAvatarFetched(fx, .{
+        .key = avatar_fetch_key_base + index,
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
+}
+pub fn markPlaceLogoSeenForTest() void {
+    view_place.g_place_logo_seen = g_image_clock;
+}
+
+pub fn agePlaceLogoForTest() void {
+    g_image_clock +%= 1;
+}
+
+pub fn imageClockForTest() u64 {
+    return g_image_clock;
+}
+
+pub fn markAvatarWantedForTest(pubkey: [32]u8) void {
+    markAvatarWanted(pubkey);
+}
+/// Puts a NIP-05 on a cached profile in a stated verification state, so a view
+/// test can ask what the page shows without a well-known round trip.
+pub fn setProfileNip05ForTest(pubkey: [32]u8, id: []const u8, verified: bool) void {
+    const p = upsertProfile(pubkey) orelse return;
+    const n = @min(id.len, p.nip05_buf.len);
+    @memcpy(p.nip05_buf[0..n], id[0..n]);
+    p.nip05_len = @intCast(n);
+    p.nip05_state = if (verified) .verified else .failed;
+}
+
+/// Fills a cached profile's text fields to whatever length is asked for, so a
+/// sweep can render the WORST case rather than a realistic one.
+///
+/// Every one of these is a stranger's string arriving over a relay, and the
+/// only thing bounding it is the buffer it is copied into. A row that fits a
+/// name is not the question; a row that fits a name of sixty-four characters
+/// is, because that is what the buffer allows and therefore what will
+/// eventually arrive.
+pub fn fillProfileTextForTest(pubkey: [32]u8, name: []const u8, username: []const u8, website: []const u8) void {
+    const p = upsertProfile(pubkey) orelse return;
+    const n = @min(name.len, p.name_buf.len);
+    @memcpy(p.name_buf[0..n], name[0..n]);
+    p.name_len = @intCast(n);
+    const u = @min(username.len, p.username_buf.len);
+    @memcpy(p.username_buf[0..u], username[0..u]);
+    p.username_len = @intCast(u);
+    const w = @min(website.len, p.website_buf.len);
+    @memcpy(p.website_buf[0..w], website[0..w]);
+    p.website_len = @intCast(w);
+}
+/// The same, for the person an `nprofile1` named.
+pub fn profileHintCountForTest(pubkey: [32]u8) ?u8 {
+    for (&g_wanted) |*w| {
+        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.hints.count;
+    }
+    return null;
+}
+/// The real fill path, over a real store: what a quote card knows about the
+/// note it draws comes from here and nowhere else.
+pub fn refreshProfilesForTest(store: *nostr.store.Store) void {
+    refreshProfiles(store);
 }

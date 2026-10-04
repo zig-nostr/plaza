@@ -508,3 +508,56 @@ pub fn loadAtProfileBottom(model: *Model) void {
     }
     loadOlderProfile(model);
 }
+
+pub fn roundReachForTest(seen: []ProfileSeen) ?i64 {
+    return roundReach(seen);
+}
+
+pub fn writeRelaysOfForTest(ev: nostr.event.Event, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
+    return writeRelaysOf(ev, out, lens);
+}
+
+pub fn profileTargetsForTest(pubkey: [32]u8, out: *[profile_round_targets][96]u8, lens: *[profile_round_targets]u8) usize {
+    return profileTargets(pubkey, out, lens);
+}
+
+pub fn profileEndReachedForTest(pubkey: [32]u8) bool {
+    return profileEndReached(pubkey);
+}
+
+pub fn setProfileEndForTest(pubkey: [32]u8) void {
+    g_profile_end.store(profileEndKey(pubkey), .monotonic);
+}
+
+pub fn resetProfileEndForTest() void {
+    resetProfileEnd();
+    g_profile_older_busy.store(false, .monotonic);
+    g_profile_older_ask = null;
+}
+
+pub fn profileOlderAskForTest() ?ProfileOlderAsk {
+    return g_profile_older_ask;
+}
+
+/// Records that a round for `pubkey` reached back to `at`, the way a relay
+/// answer does, for a test that has no relay.
+pub fn noteProfileReachForTest(pubkey: [32]u8, at: i64) void {
+    noteProfileReach(pubkey, at);
+}
+
+pub fn profileReachForTest(pubkey: [32]u8) ?i64 {
+    return profileReach(pubkey);
+}
+
+pub fn profileRoundEndedForTest(asked: usize, answered: usize, added: usize, older: usize) bool {
+    return profileRoundEnded(.{ .asked = asked, .answered = answered, .added = added, .older = older });
+}
+
+pub fn loadOlderProfileForTest(model: *Model) void {
+    loadOlderProfile(model);
+}
+
+pub fn loadAtProfileBottomForTest(model: *Model, bottom_in_view: bool) void {
+    g_profile_bottom_in_view = bottom_in_view;
+    loadAtProfileBottom(model);
+}

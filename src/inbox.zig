@@ -1070,3 +1070,72 @@ pub fn resetInbox() void {
     g_inbox_read_through = 0;
     g_inbox_dirty = false;
 }
+
+pub fn bakeBodyForTest(item: *InboxItem, ev: nostr.event.Event) void {
+    bakeBody(item, ev);
+}
+pub fn collapseEventRefsForTest(dst: []u8, src: []const u8) usize {
+    return collapseEventRefs(dst, src);
+}
+
+pub fn resolveInboxBodiesForTest() void {
+    resolveInboxBodies();
+}
+
+/// Forgets what the last pass saw, so a test with a store of its own is not
+/// skipped because an earlier test left the same event count behind.
+pub fn forgetInboxBodyStampForTest() void {
+    g_inbox_body_stamp = std.math.maxInt(usize);
+    g_inbox_body_names = std.math.maxInt(u64);
+}
+pub fn saveInboxForTest() void {
+    saveInbox();
+}
+
+pub fn loadInboxForTest() void {
+    loadInbox();
+}
+
+pub fn inboxAddForTest(ev: nostr.event.Event, now_s: i64) bool {
+    return inboxAdd(ev, now_s);
+}
+
+pub fn inboxVerbForTest(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
+    return inboxVerbFor(ev, me);
+}
+/// Files `count` unread notifications, so a view test can ask what the rail's
+/// badge does with a number without standing up relays.
+pub fn seedInboxUnreadForTest(count: usize) void {
+    const me = activePubkey() orelse return;
+    lockInbox();
+    defer unlockInbox();
+    resetInboxLocked(me);
+    var i: usize = 0;
+    while (i < count and g_inbox_len < g_inbox.len) : (i += 1) {
+        var id: [32]u8 = [_]u8{0} ** 32;
+        id[0] = @intCast(i % 251 + 1);
+        g_inbox[g_inbox_len] = .{
+            .used = true,
+            .id = id,
+            .author = id,
+            .target_id = [_]u8{0} ** 32,
+            .created_at = 1_800_000_000,
+            .verb = .reply,
+            .msat = 0,
+        };
+        g_inbox_len += 1;
+    }
+}
+pub fn resetInboxForTest() void {
+    lockInbox();
+    defer unlockInbox();
+    g_inbox_len = 0;
+    g_inbox_owner = null;
+    g_inbox_read_through = 0;
+}
+
+pub fn inboxLenForTest() usize {
+    lockInbox();
+    defer unlockInbox();
+    return g_inbox_len;
+}

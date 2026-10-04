@@ -180,133 +180,6 @@ pub const thread_column_width: f32 = feed_column_width;
 // when their list is re-sent. Reading it back is both simpler and correct by
 // construction.
 
-pub fn routeCoverageForTest() RouteCoverage {
-    return routing.g_route_coverage;
-}
-pub const routeCoverageTargetForTest = route_coverage_target;
-
-// -- Relays that will not have us ---------------------------------------------
-//
-// Coverage says which relays carry the people you follow. It does not say which
-// of them will talk to you, and those are not the same set. A paid relay refuses
-// the WEBSOCKET HANDSHAKE, before a single Nostr message is exchanged, so there
-// is no protocol answer to give it: no NIP-42 challenge arrives, and nothing to
-// authenticate with would help, because what it wants is a subscription.
-//
-// Found on my own account: `wss://nostr.wine` is the single best relay by
-// coverage, 50 of 257 follows write there, and it had a routed slot to itself
-// dialling and failing on a widening ladder forever. The coverage counter could
-// not see it. It reported those 50 people as reached.
-//
-// So a routed relay that will not have us gives up its slot and the greedy
-// spends it on the next relay down, which is a real one. This applies ONLY to
-// relays Plaza chose. A relay the reader added themselves keeps its seat and
-// keeps retrying however badly it behaves, because dropping somebody's own relay
-// quietly is the opposite of what they asked for.
-
-pub fn relayIsRefusedForTest(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
-    return relayIsRefused(strikes, at_ms, now_ms);
-}
-pub const routedRefusalStrikesForTest = routed_refusal_strikes;
-pub const routedRefusalMsForTest = routed_refusal_ms;
-
-pub fn refusedRelayCountForTest() usize {
-    var urls: [routed_refusal_slots][96]u8 = undefined;
-    var lens: [routed_refusal_slots]u8 = @splat(0);
-    return refusedRelays(&urls, &lens);
-}
-pub fn noteRelayRefusalAtForTest(url: []const u8, now: i64) bool {
-    return noteRelayRefusalAt(url, now);
-}
-pub fn clearRelayRefusalForTest(url: []const u8) void {
-    clearRelayRefusal(url);
-}
-pub fn forgetRefusedRelaysForTest() void {
-    lockRefused();
-    defer unlockRefused();
-    for (&routing.g_refused) |*e| {
-        e.url_len = 0;
-        e.strikes = 0;
-        e.at_ms = -1;
-    }
-}
-
-pub fn worthEvictingForTest(challenger_gain: usize, incumbent_gain: usize) bool {
-    return worthEvicting(challenger_gain, incumbent_gain);
-}
-
-pub fn sameRouteForTest(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
-    return sameRoute(url_a, authors_a, url_b, authors_b);
-}
-
-pub fn routeRecomputeDueForTest(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
-    return routeRecomputeDue(pending_ms, since_list_ms, since_run_ms);
-}
-pub const routeSettleMsForTest = route_settle_ms;
-pub const routeRecomputeMinMsForTest = route_recompute_min_ms;
-pub const routeSettleMaxMsForTest = route_settle_max_ms;
-
-pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
-    rankRelaySuggestions(store);
-}
-pub fn foldWriteRelaysForTest(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
-    return foldWriteRelays(table, len_in, urls);
-}
-pub const RelayRankForTest = RelayRank;
-pub fn relayRankWritersForTest(e: RelayRank) u16 {
-    return e.writers;
-}
-pub fn relayRankUrlForTest(e: *const RelayRank) []const u8 {
-    return e.urlSlice();
-}
-pub const outboxRelaysPerAuthorForTest = outbox_relays_per_author;
-pub const maxDiscoveredRelaysForTest = max_discovered_relays;
-pub const discoveredAuthorsCapForTest = discovered_authors_cap;
-pub const discoveredWatchBaseForTest = discovered_watch_base;
-pub const relayWatchSlotsForTest = relay_watch_slots;
-pub fn discoveredGenerationForTest(index: usize) u32 {
-    if (index >= routing.g_discovered_gen.len) return 0;
-    return routing.g_discovered_gen[index].load(.acquire);
-}
-
-pub fn relayListDueForTest(now_s: i64) bool {
-    return relayListDue(now_s);
-}
-
-pub fn relayListEditedForTest(now_s: i64) void {
-    relay_list.g_relays_are_mine = true;
-    relay_list.g_relay_list_dirty = true;
-    relay_list.g_relay_list_touched = now_s;
-}
-
-pub fn clearRelayListPublishForTest() void {
-    clearRelayListPublish();
-}
-
-/// Drives the settle-and-publish the frame tick drives, so a test can assert
-/// that a refused publish leaves the edit pending rather than losing it.
-pub fn flushRelayListForTest(fx: *Effects, now_s: i64) void {
-    flushRelayList(fx, now_s);
-}
-
-pub fn relayListPendingForTest() bool {
-    return relay_list.g_relay_list_dirty;
-}
-
-pub fn noteRelayRemovedForTest(url: []const u8) void {
-    noteRelayRemoved(url);
-}
-
-pub fn forgetRelayRemovalsForTest() void {
-    forgetRelayRemovals();
-}
-
-/// Whether publishing the pool would go out right now. The safety property is
-/// that it does NOT, until this account's own relay list has been read.
-pub fn publishRelayListForTest(fx: *Effects) bool {
-    return publishRelayListReporting(fx);
-}
-
 // ------------------------------------------------------- your own lists
 //
 // kind:0, kind:3 and kind:10002 are REPLACEABLE. The store enforces that the way
@@ -322,227 +195,6 @@ pub fn publishRelayListForTest(fx: *Effects) bool {
 //
 // So every ingest goes through one door, and that door keeps a copy of what is
 // about to be overwritten.
-
-/// Points the app's store at a test's own, so the funnel can be driven for real.
-pub fn setStoreForTest(store: ?*nostr.store.Store) void {
-    g_store = store;
-    if (store) |st| seedFeedNewest(st);
-}
-
-pub fn plazaIngestForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) !nostr.store.IngestResult {
-    return plazaIngest(gpa, ev, .{});
-}
-
-/// The relay-fed funnel: verified, and remembering which relay delivered it.
-pub fn plazaIngestFromForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer, relay_url: []const u8) !nostr.store.IngestResult {
-    return plazaIngestFrom(gpa, ev, .{ .verify_with = signer }, relay_url);
-}
-
-/// Drives the funnel with verification ON, the way every relay-fed path does.
-pub fn plazaIngestVerifiedForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer) !nostr.store.IngestResult {
-    return plazaIngest(gpa, ev, .{ .verify_with = signer });
-}
-
-pub fn canWriteRelayListForTest() bool {
-    return canWriteRelayList();
-}
-
-pub fn forgetOwnRecordAnswersForTest() void {
-    forgetOwnRecordAnswers();
-}
-
-pub fn ownRecordReadsForTest() usize {
-    return store_glue.g_own_record_reads;
-}
-
-pub fn resetOwnRecordReadsForTest() void {
-    store_glue.g_own_record_reads = 0;
-}
-
-/// How many relays the app is born with. Tests derive from this rather than
-/// naming a number, so changing the bootstrap list is one edit and not a hunt
-/// through the suite for every place that happened to say five.
-pub const bootstrap_relay_count_for_test = bootstrap_relays.len;
-
-/// The most relays a reader may have, which is what the ack mask can address.
-pub const max_relays_for_test = max_relays;
-
-/// Puts the pool back to the one the app was born with. For tests, which need a
-/// known pool: the real one is loaded from disk or from their kind:10002.
-pub fn resetRelaysForTest() void {
-    relay_table.g_relays = [_]RelayEntry{.{}} ** max_relays;
-    relay_table.g_relay_count.store(0, .release);
-    relay_list.g_relays_are_mine = false;
-    setRelayListStamp(0);
-    relay_list.g_relay_list_dirty = false;
-    forgetRelayRemovals();
-    relay_list.g_staged_ready.store(false, .release);
-    relay_table.g_suggested_count.store(0, .release);
-    forgetDiscovered();
-    forgetRefusedRelaysForTest();
-    seedBootstrapRelays();
-}
-
-/// The file this pool would be saved as, and reading one back. The stamp line
-/// is what carries "how new is what we hold" across a restart.
-pub fn formatRelaysFileForTest(buf: []u8) ?[]const u8 {
-    return formatRelaysFile(buf);
-}
-
-pub fn applyRelaysFileForTest(raw: []const u8) void {
-    applyRelaysFile(raw);
-}
-
-/// An EMPTY pool, the way a launch starts before the file is read. Distinct from
-/// `resetRelaysForTest`, which seeds the bootstrap list: a test that means to
-/// reproduce a restart must not have four relays already sitting in the seats
-/// the file is about to fill.
-pub fn clearRelaysForTest() void {
-    relay_table.g_relays = [_]RelayEntry{.{}} ** max_relays;
-    relay_table.g_relay_count.store(0, .release);
-    relay_list.g_relays_are_mine = false;
-    relay_list.g_relay_owner = null;
-    setRelayListStamp(0);
-    relay_list.g_relay_list_dirty = false;
-    forgetRelayRemovals();
-    relay_list.g_staged_ready.store(false, .release);
-    relay_table.g_suggested_count.store(0, .release);
-    forgetDiscovered();
-    forgetRefusedRelaysForTest();
-}
-
-pub fn relayListStampForTest() i64 {
-    return heldRelayListStamp();
-}
-
-pub fn setRelayListStampForTest(created_at: i64) void {
-    setRelayListStamp(created_at);
-}
-
-/// Applies a staged kind:10002 the way the frame loop does.
-pub fn adoptRelayListForTest() bool {
-    return adoptRelayList();
-}
-
-pub fn stageOwnRelayListForTest(ev: nostr.event.Event) void {
-    applyOwnRelayList(ev);
-}
-
-pub fn ingestRelayListForTest(ev: nostr.event.Event) void {
-    ingestRelayList(ev);
-}
-
-pub fn cycleRelayForTest(i: usize) void {
-    cycleRelay(i);
-}
-
-pub fn removeRelayForTest(i: usize) void {
-    removeRelay(i);
-}
-
-pub fn addRelayForTest(url: []const u8, read: bool, write: bool) ?usize {
-    return addRelay(url, read, write);
-}
-
-pub fn forgetOutboxAcksForTest() void {
-    forgetOutboxAcks();
-}
-
-/// One failed publish round, the way `markOutboxSending(false)` records it.
-pub fn markOutboxRoundForTest(id: [32]u8) void {
-    markOutboxSending(id, true);
-    markOutboxSending(id, false);
-}
-
-pub fn resetRelaysToBootstrapForTest() void {
-    resetRelaysToBootstrap();
-}
-
-pub fn relayBadgeTextForTest(i: usize) []const u8 {
-    const e = relayAt(i) orelse return "(removed)";
-    return relayBadgeText(e);
-}
-
-pub fn liveRelayCountForTest() usize {
-    return liveRelayCount();
-}
-
-pub fn setRelayStatusForTest(i: usize, connected: bool) void {
-    setRelayStatus(i, if (connected) .connected else .offline);
-}
-
-pub fn relayStatusConnectedForTest(i: usize) bool {
-    return connHolds(@enumFromInt(relay_conn.g_relay_status[i].load(.monotonic)));
-}
-
-pub fn setRelayQuietForTest(i: usize) void {
-    setRelayStatus(i, .quiet);
-}
-pub fn outboxWokeForTest() bool {
-    return relay_conn.g_outbox_woke_ever.load(.monotonic);
-}
-pub fn resetOutboxWokeForTest() void {
-    relay_conn.g_outbox_woke_ever.store(false, .monotonic);
-    relay_conn.g_outbox_woke_at.store(0, .monotonic);
-}
-pub fn relayStatusQuietForTest(i: usize) bool {
-    return @as(Conn, @enumFromInt(relay_conn.g_relay_status[i].load(.monotonic))) == .quiet;
-}
-/// Seats a deadline in the one-shot table without a socket, so what the keeper
-/// decides about it can be driven directly.
-pub fn seatOneShotForTest(slot: usize, deadline_ms: i64) void {
-    relay_conn.g_oneshot_deadline[slot] = deadline_ms;
-}
-pub fn clearOneShotsForTest() void {
-    for (0..one_shot_slots) |i| {
-        relay_conn.g_oneshot[i] = null;
-        relay_conn.g_oneshot_deadline[i] = 0;
-    }
-}
-pub fn expiredOneShotsForTest(now_ms: i64, out: []usize) usize {
-    var buf: [one_shot_slots]usize = undefined;
-    const n = expiredOneShots(now_ms, &buf);
-    const take = @min(n, out.len);
-    @memcpy(out[0..take], buf[0..take]);
-    return take;
-}
-pub fn markOneShotCutForTest(slot: usize) void {
-    relay_conn.g_oneshot_deadline[slot] = one_shot_already_cut;
-}
-pub const oneShotSlotsForTest = one_shot_slots;
-pub const oneShotBudgetMsForTest = one_shot_budget_ms;
-pub const bunkerWatchSlotForTest = bunker_watch_slot;
-pub const maxRelaysForTest = max_relays;
-
-pub fn isReaderNoteForTest(kind: u16) bool {
-    return isReaderNote(kind);
-}
-
-pub fn poolIsHealthyOfForTest(live: usize, total: usize) bool {
-    return poolIsHealthyOf(live, total);
-}
-
-pub fn markRelaysMineForTest() void {
-    relay_list.g_relays_are_mine = true;
-    relay_list.g_relay_owner = activePubkey();
-}
-
-pub fn relayListIsOwnedForTest() bool {
-    return relayListIsOwned();
-}
-
-pub fn relayOwnerForTest() ?[32]u8 {
-    return relay_list.g_relay_owner;
-}
-
-pub fn relayIsMineForTest() bool {
-    return relay_list.g_relays_are_mine;
-}
-
-pub fn relayReadWriteForTest(i: usize) ?RelayUse {
-    const e = relayAt(i) orelse return null;
-    return .{ .read = e.read, .write = e.write };
-}
 
 // ------------------------------------------------------------------- places
 //
@@ -566,10 +218,6 @@ pub fn relayReadWriteForTest(i: usize) ?RelayUse {
 // and never trusted for its length. The relay URL is the sharp one: it decides
 // where the app connects.
 
-/// So a test builds an address for the kind Plaza actually looks for, rather
-/// than repeating the number and agreeing with it by coincidence.
-pub const place_kind_for_test = place_kind;
-
 // -------------------------------------------------- things you can take away
 //
 // A client you can make quiet.
@@ -592,27 +240,6 @@ pub const place_kind_for_test = place_kind;
 // Subtractive on purpose. Taking things away cannot make the app ugly or slow;
 // rearranging can, and it would mean making the feed's layout data-driven, which
 // is an architectural change rather than a preference.
-
-pub fn engagementKindsForTest() []const u16 {
-    return engagementKinds();
-}
-pub const plaza_version_for_test = plaza_version;
-pub const settings_column_width_for_test = settings_column_width;
-pub const settings_content_width_for_test = settings_content_width;
-/// The same number, for a test that has to know where a row's disc lands.
-pub const thread_inset_for_test: f32 = thread_inset;
-pub const picture_column_width_for_test: f32 = picture_column_width;
-pub const compose_editor_width_for_test = compose_editor_width;
-pub const reply_editor_height_for_test = reply_editor_height;
-pub const link_card_height_for_test: f32 = link_card_height;
-pub const link_card_height_bare_for_test: f32 = link_card_height_bare;
-
-/// Files a preview as if a page had answered, for a test that renders the card.
-pub fn seedLinkForTest(url: []const u8, title: []const u8, desc: []const u8) void {
-    const slot = wantLink(url) orelse return;
-    storeLinkMeta(slot, .{ .title = title, .description = desc });
-    slot.state = .loaded;
-}
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_network };
 const shell_views = [_]native_sdk.ShellView{
@@ -650,26 +277,6 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub var g_store: ?*nostr.store.Store = null;
 
-/// A fresh arrival table, for a test that drives the real stamping.
-pub fn arrivalTableForTest() ArrivalTable {
-    return .{};
-}
-
-pub fn stampArrivalForTest(table: *ArrivalTable, notes: []Note, settled: bool) void {
-    stampArrival(table, notes, settled);
-}
-
-/// Records one round trip for relay `index`. Stored as milliseconds PLUS ONE, so
-/// a sub-millisecond answer (a warm or local relay, truncated to 0) is a reading
-/// rather than an empty slot.
-pub fn recordRelayRttForTest(index: usize, ms: u64) void {
-    recordRelayRtt(index, ms);
-}
-
-pub fn clearRelayRttForTest(index: usize) void {
-    clearRelayRtt(index);
-}
-
 /// The pool's latency: the median across every relay that has answered. The
 /// redesign asks for the median WRITE relay, the number that predicts how fast a
 /// post lands; until a relay list with read/write markers exists, every relay in// The UI thread's Io, for wall-clock time when rendering relative timestamps
@@ -680,7 +287,7 @@ pub var g_io: ?std.Io = null;
 pub var g_environ: ?*const std.process.Environ.Map = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
-var g_last_count: usize = std.math.maxInt(usize);
+pub var g_last_count: usize = std.math.maxInt(usize);
 /// The same, for whichever level is open. Separate from `g_last_count` because
 /// the feed consumes that one, and a level opened after a feed rebuild would
 /// otherwise see an unchanged count and never fill.
@@ -703,90 +310,6 @@ var g_last_level_count: usize = std.math.maxInt(usize);
 // carried across the thread boundary and the events read back by id, which is a
 // direct read each rather than a walk of the follow list.
 
-/// Delivers one /pubkey answer the way the runtime would.
-pub fn deliverHelperPubkeyForTest(model: *Model, body: []const u8) void {
-    handleHelperPubkey(model, .{ .key = helper_poll_key, .outcome = .ok, .status = 200, .body = body });
-}
-
-pub fn helperSetupPendingForTest() bool {
-    return keyholder.g_helper_setup != .none;
-}
-
-pub fn helperStateForTest() HelperState {
-    return helperState();
-}
-
-pub fn helperTokenForTest() []const u8 {
-    return helperToken();
-}
-
-/// Puts the daemon into the "answering and holding a key" state, so a test can
-/// ask what the OTHER conditions do.
-pub fn setHelperReadyForTest() void {
-    keyholder.g_helper_state.store(2, .release);
-}
-
-pub fn helperReachableForTest() bool {
-    return helperReachable();
-}
-
-pub fn helperPortForTest() u16 {
-    return keyholder.g_helper_port;
-}
-
-pub fn setHelperPortForTest(port: u16) void {
-    keyholder.g_helper_port = port;
-}
-
-pub fn helperSecretForTest() []const u8 {
-    return keyholder.g_helper_secret_buf[0..keyholder.g_helper_secret_len];
-}
-
-pub fn mintHelperSecretForTest(io: std.Io) void {
-    var raw: [24]u8 = undefined;
-    io.randomSecure(&raw) catch return;
-    const written = std.fmt.bufPrint(&keyholder.g_helper_secret_buf, "{x}\n", .{raw}) catch return;
-    keyholder.g_helper_secret_len = written.len;
-}
-
-/// `false` restores the unprobed state rather than claiming a keyholder was
-/// found, because in a test nothing has looked for one.
-pub fn setKeyholderMissingForTest(missing: bool) void {
-    keyholder.g_keyholder = if (missing) .missing else .unprobed;
-}
-
-pub fn resolveSiblingForTest(io: std.Io, out: []u8, dir: []const u8, name: []const u8) usize {
-    return resolveSibling(io, out, dir, name);
-}
-
-pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
-    return exeDir(io, buf);
-}
-
-/// Adopts the Notary signer kind for the active test identity, so the status
-/// line can be asked what it says about a daemon that is not there.
-/// Says that this test drives the keyholder's answers itself.
-///
-/// A test that reaches for this one is asking about what happens WHILE a
-/// signature is out, or when the answer is a 401, or when none comes at all.
-/// The stand-in keyholder that answers every other test instantly would give
-/// it a success before it could look, so switching kind here silences it.
-pub fn setSignerKindHelperForTest() void {
-    keyholder.g_signer_kind = .helper;
-    keyholder.g_test_signer_silent = true;
-}
-
-/// Hands the keyholder back to the stand-in, for a test that took it.
-pub fn setSignerKindLocalForTest() void {
-    keyholder.g_signer_kind = .helper;
-    keyholder.g_test_signer_silent = false;
-}
-
-/// Which kind of signer this app is using, by name.
-pub fn signerKindNameForTest() []const u8 {
-    return @tagName(keyholder.g_signer_kind);
-}
-
 /// Whether a secret key is sitting in THIS process.
 ///
 /// A constant false, and that is the assertion rather than a stub: there is no
@@ -794,247 +317,6 @@ pub fn signerKindNameForTest() []const u8 {
 /// this is what keeps that true, by failing the day somebody adds one back.
 pub fn holdsKeyInProcessForTest() bool {
     return false;
-}
-
-pub fn signerStatusLabelForTest() []const u8 {
-    return signerStatus().label;
-}
-
-pub fn ceremonyCanTakeKeyForTest() bool {
-    return ceremonyCanTakeKey();
-}
-
-/// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
-/// Pretends this session connected to `pubkey`'s bunker.
-pub fn setRemotePubkeyForTest(pubkey: [32]u8) void {
-    remote_signer.g_remote_pubkey = pubkey;
-}
-
-/// Hands one NIP-46 response event to the listener's handler, as a relay would.
-/// The generation is the live one, so only the checks under test can reject it.
-pub fn deliverNip46ResponseForTest(
-    signer: nostr.keys.Signer,
-    client_kp: nostr.keys.KeyPair,
-    ev: nostr.event.Event,
-) void {
-    handleNip46Response(
-        std.heap.page_allocator,
-        signer,
-        client_kp,
-        ev,
-        remote_signer.g_remote_generation.load(.acquire),
-    );
-}
-
-pub fn setSignerKindForTest(kind: []const u8) void {
-    keyholder.g_signer_kind = if (std.mem.eql(u8, kind, "remote")) .remote else .helper;
-}
-
-/// Pretends the ceremony window was (or was not) found beside Plaza.
-pub fn setNotaryWindowFoundForTest(found: bool) void {
-    keyholder.g_notary_win_len = if (found) "/nonexistent/notary".len else 0;
-    if (found) @memcpy(keyholder.g_notary_win_buf[0.."/nonexistent/notary".len], "/nonexistent/notary");
-}
-
-/// Whether a helper setup is sitting queued, waiting for the daemon to answer.
-pub fn helperSetupQueuedForTest() bool {
-    return keyholder.g_helper_setup != .none;
-}
-
-pub fn helperSetupMayFireForTest(queued: bool, state: HelperState) bool {
-    return helperSetupMayFire(queued, state);
-}
-
-pub fn helperSignTimeoutSecondsForTest() i64 {
-    return helper_sign_timeout_s;
-}
-
-pub fn helperSignTimeoutMillisForTest() u32 {
-    return helper_sign_timeout_ms;
-}
-
-/// Drives one helper sign the way `signAndPublish` does, without needing a live
-/// daemon behind it. The fetch itself goes nowhere in a test; what is under test
-/// is what happens to the note when it does not come back.
-/// Drives the whole post, from the composer down through the signer dispatch.
-/// The dispatch is the part that mattered: it forwarded `restorable` to the
-/// bunker and dropped it on the way to the built-in signer, so the flag arriving
-/// intact is not something a test of `requestHelperSign` alone can see.
-pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
-    return submitPost(model, fx, null);
-}
-
-/// The tags a body of text implies, for tests. Deliberately takes the finished
-/// string: that is exactly what the publish path passes, which is why a pasted
-/// note and a typed one cannot diverge.
-pub fn resetWantedProfilesForTest() void {
-    profile_cache.g_wanted = [_]WantedProfile{.{}} ** wanted_profiles_cap;
-}
-
-pub fn wantProfileForTest(pubkey: [32]u8) void {
-    wantProfile(pubkey);
-}
-
-pub fn wantProfilesAheadForTest(model: *const Model) void {
-    wantProfilesAhead(model);
-}
-
-pub fn isProfileWantedForTest(pubkey: [32]u8) bool {
-    for (&profile_cache.g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
-    }
-    return false;
-}
-
-pub fn wantedProfileCountForTest() usize {
-    var n: usize = 0;
-    for (&profile_cache.g_wanted) |*w| {
-        if (w.used) n += 1;
-    }
-    return n;
-}
-
-pub fn dupeTagsForTest(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
-    return dupeTags(gpa, tags);
-}
-
-pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
-    return contentTags(gpa, content, &.{}, &.{});
-}
-
-/// The tag set of the last event handed to a signer, for tests.
-pub fn lastPublishedTagsForTest() []const nostr.event.Tag {
-    return keyholder.g_last_published_tags;
-}
-
-pub fn lastPublishedForTest() ?nostr.event.Event {
-    return keyholder.g_last_published;
-}
-
-pub fn forgetLastPublishedForTest() void {
-    keyholder.g_last_published = null;
-}
-
-pub fn clearLastPublishedTagsForTest() void {
-    keyholder.g_last_published_tags = &.{};
-}
-
-pub fn helperSignRestorableForTest() bool {
-    return keyholder.g_helper_sign.active and keyholder.g_helper_sign.restorable;
-}
-
-pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
-    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none);
-}
-
-pub fn handleHelperSignedForTest(response: native_sdk.EffectResponse) void {
-    handleHelperSigned(response);
-}
-
-pub fn releaseHelperSignForTest() void {
-    releaseHelperSign();
-}
-
-/// Puts the pending sign past its deadline, for the case where no terminal ever
-/// arrives: a daemon that accepts the socket and then says nothing.
-pub fn expireHelperSignForTest() void {
-    keyholder.g_helper_sign.deadline_s = 0;
-}
-
-pub fn scanHelperSignForTest(model: *Model) void {
-    scanHelperSign(model);
-}
-
-pub fn helperSignNoticeForTest() bool {
-    return keyholder.g_helper_sign_notice.load(.acquire);
-}
-
-pub fn signerReadyForTest() bool {
-    return signerReady();
-}
-
-pub fn silenceTestSignerForTest(silent: bool) void {
-    keyholder.g_test_signer_silent = silent;
-}
-
-pub fn holdHelperSignForTest() void {
-    keyholder.g_signer_kind = .helper;
-    keyholder.g_helper_sign.active = true;
-}
-
-pub fn helperSignPendingForTest() bool {
-    return keyholder.g_helper_sign.active;
-}
-
-/// Ingests and publishes a signed event returned by the daemon. Trusted: it
-/// came from our own daemon over authenticated loopback. A kind:0 seeds the
-/// profile cache so the name shows at once.
-/// The keyholder a test has: signs what was asked for and answers exactly as
-/// the daemon would, so `handleHelperSigned` runs for real.
-///
-/// Only compiled into a test binary. It exists so that the four hundred tests
-/// that "are somebody" drive the path that ships rather than one that does not,
-/// which is worth more than the shortcut it replaces.
-pub fn answerHelperSignForTest(gpa: std.mem.Allocator, unsigned_json: []const u8) void {
-    const secret = feed_state.g_test_secret orelse return;
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const kp = signer.keyPairFromSecretKey(secret) catch return;
-    var parsed = nostr.event.fromJson(gpa, unsigned_json) catch return;
-    defer parsed.deinit();
-    const ev = parsed.value;
-    const signed = nostr.event.create(gpa, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
-    const signed_json = nostr.event.toJson(gpa, signed) catch return;
-    defer gpa.free(signed_json);
-    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(gpa) catch return;
-    defer gpa.free(body);
-    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
-}
-
-/// Delivers one signed-event answer the way the runtime would, so a test can
-/// hand the app an event it did NOT ask for.
-pub fn deliverHelperSignedForTest(body: []const u8) void {
-    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
-}
-
-// Test seams for the NIP-46 pending-request table (the correlation and teardown
-// logic), exercised without threads or a live bunker.
-pub const RemoteMethodForTest = RemoteMethod;
-pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null, .none, 0, no_half_id, .{});
-}
-pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
-    const taken = takePending(req_id) orelse return null;
-    return .{ .method = taken.method, .content = taken.content };
-}
-pub fn failPendingForTest(req_id: []const u8) bool {
-    return failPending(req_id);
-}
-pub fn clearPendingForTest() void {
-    clearPending();
-}
-/// Marks the pending sign whose draft is `content` failed, as a refusal or a
-/// timeout would, so a test can pick WHICH of several signs comes back.
-pub fn failPendingByContentForTest(content: []const u8) bool {
-    pendingLock();
-    defer pendingUnlock();
-    for (&remote_signer.g_pending) |*slot| {
-        if (!slot.active or slot.method != .sign_event) continue;
-        const c = slot.content orelse continue;
-        if (!std.mem.eql(u8, c, content)) continue;
-        slot.failed = true;
-        return true;
-    }
-    return false;
-}
-pub fn bumpRemoteGenerationForTest() void {
-    _ = newRemoteGeneration();
-}
-pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
-    scanPendingRemote(model, fx);
-}
-pub fn remoteSignNoticeForTest() bool {
-    return remote_signer.g_remote_sign_notice.load(.acquire);
 }
 
 /// Why a pasted address did not open anything.
@@ -1079,21 +361,6 @@ pub const AddressError = enum { none, unreadable, wrong_kind, not_found, lookup_
 // serialized inside the library (nostr v0.8.0), which is what makes it sound
 // while the owning thread is blocked reading the same socket.
 
-pub fn isFeedSubForTest(sub_id: []const u8) bool {
-    return isFeedSub(sub_id);
-}
-
-pub fn askPoolForTest(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
-    return askPool(sub_id, filters);
-}
-pub fn askableSlotsForTest(out: []usize) usize {
-    return askableSlots(out);
-}
-pub fn isOneShotSubForTest(sub_id: []const u8) bool {
-    return isOneShotSub(sub_id);
-}
-pub const oneShotSubPrefixForTest = one_shot_sub_prefix;
-
 // ------------------------------------------------------------------ profiles
 //
 // Kind:0 metadata gives each author a display name and an avatar. The pool
@@ -1104,21 +371,6 @@ pub const oneShotSubPrefixForTest = one_shot_sub_prefix;
 // just-loaded avatar shows on the next frame without a re-query. Avatars are
 // fetched (bounded, cap-aware) and registered as canvas images; the cache is
 // UI-thread-only, so no synchronisation is needed.
-
-pub fn buildRoutedFiltersForTest(authors: []const [32]u8, out: []nostr.filter.Filter) []nostr.filter.Filter {
-    return buildRoutedFilters(authors, out);
-}
-
-/// Stamps the newest note the feed has seen, so a test can put `feedSince` in
-/// the state that matters. Without this it returns null for want of any note at
-/// all, and a test asserting "no since" passes whether or not the code asks for
-/// one.
-pub fn setFeedNewestForTest(created_at: i64) void {
-    feed_state.g_feed_newest.store(created_at, .monotonic);
-}
-pub fn feedSinceForTest() ?i64 {
-    return feedSince();
-}
 
 // ---------------------------------------------------------------- addresses
 //
@@ -1135,63 +387,6 @@ pub fn feedSinceForTest() ?i64 {
 // one or the other. Jumble also accepts a newer copy arriving afterwards and
 // swaps it in (src/hooks/useFetchEvent.tsx:39-54), which `g_address_want` does.
 
-pub fn newestAddressIdForTest(store: *nostr.store.Store, kind: u16, pubkey: [32]u8, identifier: []const u8) ?[32]u8 {
-    const addr = Address.make(kind, pubkey, identifier) orelse return null;
-    return newestAddressId(store, &addr);
-}
-
-/// Empties the table. For tests, which share the process globals.
-pub fn resetAddressesForTest() void {
-    addresses.g_addresses = [_]AddressSlot{.{}} ** address_table_cap;
-    addresses.g_address_clock = 0;
-}
-
-/// The stand-in key an address is filed under, as a card or a pill carries it.
-pub fn addressKeyForTest(kind: u16, pubkey: [32]u8, identifier: []const u8) [32]u8 {
-    const a = Address.make(kind, pubkey, identifier) orelse return @splat(0);
-    return a.key();
-}
-
-pub fn addressRegisteredForTest(key: [32]u8) bool {
-    return addressFor(key) != null;
-}
-
-pub const addressPoolBatchForTest = address_pool_batch;
-
-/// The filters a pool message for these addresses carries, for a test to read.
-pub fn addressPoolFiltersForTest(addrs: []const Address, out: *[address_pool_batch + 1]nostr.filter.Filter) usize {
-    const held = struct {
-        var queries: [address_pool_batch]AddressQuery = undefined;
-        var authors: [address_pool_batch][32]u8 = undefined;
-    };
-    return addressPoolFilters(addrs, &held.queries, &held.authors, out);
-}
-
-pub fn addressForTest(kind: u16, pubkey: [32]u8, identifier: []const u8) ?Address {
-    return Address.make(kind, pubkey, identifier);
-}
-
-pub fn storedWriteRelaysForTest(pubkey: [32]u8, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
-    return storedWriteRelays(std.heap.page_allocator, pubkey, out, lens);
-}
-
-pub fn openAddressedArticleForTest(model: *Model, kind: u16, pubkey: [32]u8, identifier: []const u8) void {
-    const a = Address.make(kind, pubkey, identifier) orelse return;
-    openAddressedArticle(model, a, &.{});
-}
-
-pub fn refreshAddressFetchForTest(model: *Model) void {
-    refreshAddressFetch(model);
-}
-
-pub fn addressFetchArmedForTest() bool {
-    return addresses.g_address_want != null;
-}
-
-pub fn forgetAddressFetchForTest() void {
-    addresses.g_address_want = null;
-}
-
 /// Puts a loaded link preview in the cache, so a view test can render a card
 /// without a network round trip. The long-description case is the one that
 /// matters: it is what used to run off the side of the window.
@@ -1203,125 +398,6 @@ pub fn noteWithLinkForTest(url: []const u8) Note {
     @memcpy(n.link_url_buf[0..u], url[0..u]);
     n.link_url_len = @intCast(u);
     return n;
-}
-
-pub fn setLinkPreviewForTest(url: []const u8, domain: []const u8, title: []const u8, description: []const u8) void {
-    for (&link_preview.g_links) |*l| {
-        if (l.used) continue;
-        l.* = .{ .used = true, .state = .loaded };
-        const u = @min(url.len, l.url_buf.len);
-        @memcpy(l.url_buf[0..u], url[0..u]);
-        l.url_len = @intCast(u);
-        const d = @min(domain.len, l.domain_buf.len);
-        @memcpy(l.domain_buf[0..d], domain[0..d]);
-        l.domain_len = @intCast(d);
-        const t = @min(title.len, l.title_buf.len);
-        @memcpy(l.title_buf[0..t], title[0..t]);
-        l.title_len = @intCast(t);
-        const c = @min(description.len, l.desc_buf.len);
-        @memcpy(l.desc_buf[0..c], description[0..c]);
-        l.desc_len = @intCast(c);
-        return;
-    }
-}
-
-pub fn clearLinkPreviewsForTest() void {
-    for (&link_preview.g_links) |*l| l.* = .{};
-}
-
-/// Clears the quote cache. For tests, which share the process globals.
-pub fn resetQuotesForTest() void {
-    quote_cache.g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
-    quote_cache.g_quote_clock = 0;
-}
-
-pub const addressDialsPerRoundForTest = address_dials_per_round;
-
-/// Whether an address's relays have been dialled (or claimed for dialling).
-pub fn addressDialledForTest(key: [32]u8) bool {
-    const slot = addressFor(key) orelse return false;
-    return slot.outbox_asked;
-}
-
-/// Builds a Note over `content` and runs the quote-reference scan, so a test can
-/// assert what `findQuoteRef` captured (id/off/len) without a live event.
-pub fn findQuoteRefForTest(content: []const u8) Note {
-    var note = Note{};
-    const n = @min(content.len, note.content_buf.len);
-    @memcpy(note.content_buf[0..n], content[0..n]);
-    note.content_len = @intCast(n);
-    findQuoteRef(&note);
-    return note;
-}
-
-/// Clears the profile cache. For tests, which share the process globals.
-pub fn resetProfilesForTest() void {
-    profile_cache.g_profiles = [_]Profile{.{}} ** profile_cap;
-    @memset(&profile_cache.g_profile_index, 0);
-    profile_cache.g_names_generation = 0;
-    g_notes_names_generation = 0;
-    profile_cache.g_image_clock = 0;
-}
-
-/// Marks `pubkey`'s profile as having (or not having) a kind:0 picture, so a
-/// test can exercise the avatar-id LRU without a real fetch.
-pub fn setProfilePictureForTest(pubkey: [32]u8, present: bool) void {
-    const p = upsertProfile(pubkey) orelse return;
-    p.picture_len = if (present) 8 else 0;
-    if (present) @memcpy(p.picture_buf[0..8], "http://x");
-}
-
-/// The registry image id currently lent to `pubkey`'s avatar (0 = none). For
-/// tests of the id LRU.
-/// Puts a profile in the state the avatar pipeline would leave it in, so a view
-/// test can ask what the widget does with it without a network round trip.
-pub fn setProfileAvatarForTest(pubkey: [32]u8, image_id: u64, state: enum { idle, fetching, loaded, failed }) void {
-    const p = upsertProfile(pubkey) orelse return;
-    p.image_id = image_id;
-    p.avatar_state = switch (state) {
-        .idle => .idle,
-        .fetching => .fetching,
-        .loaded => .loaded,
-        .failed => .failed,
-    };
-}
-
-/// Whether this face is idle, and whether it is now pinned to its own host
-/// rather than the proxy. Both are what the host-refusal fallback moves.
-pub fn avatarFallbackStateForTest(pubkey: [32]u8) ?struct { idle: bool, direct: bool } {
-    const p = lookupProfile(pubkey) orelse return null;
-    return .{ .idle = p.avatar_state == .idle, .direct = p.avatar_direct };
-}
-
-pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
-    const p = lookupProfile(pubkey) orelse return 0;
-    return p.image_id;
-}
-
-/// Runs one avatar-id assignment pass, for tests.
-pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
-    wantProfilesAhead(model);
-    beginImagePass();
-    assignAvatarSlots(fx, model);
-}
-
-/// Clears the like table. For tests, which share the process globals.
-pub fn rememberLikeForTest(note_id: i64, reaction_id: [32]u8) void {
-    rememberLike(note_id, reaction_id);
-}
-
-pub fn likeReactionIdForTest(note_id: i64) ?[32]u8 {
-    const e = likeEntry(note_id) orelse return null;
-    return e.reaction_id;
-}
-
-pub fn resetLikesForTest() void {
-    engagement.g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
-}
-
-/// Whether this session has liked the note (for tests and the view).
-pub fn isLikedForTest(note_id: i64) bool {
-    return isLiked(note_id);
 }
 
 // ------------------------------------------------------------ engagement counts
@@ -1345,120 +421,6 @@ pub fn isLikedForTest(note_id: i64) bool {
 // One function decides three things at once: whether an event becomes an item,
 // which verb it is, and whether it counts toward the bell. Every client that
 // split those decisions ended up with a badge that disagreed with its own list.
-
-pub fn bakeBodyForTest(item: *InboxItem, ev: nostr.event.Event) void {
-    bakeBody(item, ev);
-}
-
-pub fn notificationRowForTest(ui: *AppUi, item: *const InboxItem) AppUi.Node {
-    return notificationRow(ui, item);
-}
-
-pub fn collapseEventRefsForTest(dst: []u8, src: []const u8) usize {
-    return collapseEventRefs(dst, src);
-}
-
-pub fn resolveInboxBodiesForTest() void {
-    resolveInboxBodies();
-}
-
-/// Forgets what the last pass saw, so a test with a store of its own is not
-/// skipped because an earlier test left the same event count behind.
-pub fn forgetInboxBodyStampForTest() void {
-    inbox.g_inbox_body_stamp = std.math.maxInt(usize);
-    inbox.g_inbox_body_names = std.math.maxInt(u64);
-}
-
-/// Gives `pubkey` a display name the way a landed kind:0 does, including the
-/// names generation moving, which is what tells the surfaces that baked an
-/// older label to bake it again.
-pub fn setProfileNameForTest(pubkey: [32]u8, name: []const u8) void {
-    const p = upsertProfile(pubkey) orelse return;
-    var buf: [160]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"name\":\"{s}\"}}", .{name}) catch return;
-    parseMetadataInto(p, json);
-    profile_cache.g_names_generation +%= 1;
-}
-
-pub fn saveInboxForTest() void {
-    saveInbox();
-}
-
-pub fn loadInboxForTest() void {
-    loadInbox();
-}
-
-pub fn inboxAddForTest(ev: nostr.event.Event, now_s: i64) bool {
-    return inboxAdd(ev, now_s);
-}
-
-pub fn inboxVerbForTest(ev: nostr.event.Event, me: [32]u8) ?InboxVerb {
-    return inboxVerbFor(ev, me);
-}
-
-/// A NIP-22 comment, for the inbox tests: same shape as the kind:1 builder
-/// there, with the kind that makes the other vocabulary apply.
-pub fn commentEventForTest(author: u8, tags: []const nostr.event.Tag) nostr.event.Event {
-    return .{
-        .id = [_]u8{author} ** 32,
-        .pubkey = [_]u8{author} ** 32,
-        .created_at = 100,
-        .kind = comment_kind,
-        .tags = tags,
-        .content = "a comment",
-        .sig = [_]u8{0} ** 64,
-    };
-}
-
-/// Files `count` unread notifications, so a view test can ask what the rail's
-/// badge does with a number without standing up relays.
-pub fn seedInboxUnreadForTest(count: usize) void {
-    const me = activePubkey() orelse return;
-    lockInbox();
-    defer unlockInbox();
-    resetInboxLocked(me);
-    var i: usize = 0;
-    while (i < count and inbox.g_inbox_len < inbox.g_inbox.len) : (i += 1) {
-        var id: [32]u8 = [_]u8{0} ** 32;
-        id[0] = @intCast(i % 251 + 1);
-        inbox.g_inbox[inbox.g_inbox_len] = .{
-            .used = true,
-            .id = id,
-            .author = id,
-            .target_id = [_]u8{0} ** 32,
-            .created_at = 1_800_000_000,
-            .verb = .reply,
-            .msat = 0,
-        };
-        inbox.g_inbox_len += 1;
-    }
-}
-
-/// Whether a kind:0 has been asked for on this pubkey's behalf.
-pub fn profileWantedForTest(pubkey: [32]u8) bool {
-    for (&profile_cache.g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return true;
-    }
-    return false;
-}
-
-pub fn forgetWantedProfilesForTest() void {
-    for (&profile_cache.g_wanted) |*w| w.* = .{};
-}
-
-pub fn resetInboxForTest() void {
-    lockInbox();
-    defer unlockInbox();
-    inbox.g_inbox_len = 0;
-    inbox.g_inbox_owner = null;
-    inbox.g_inbox_read_through = 0;
-}
-
-pub fn inboxLenForTest() usize {
-    lockInbox();
-    defer unlockInbox();
-    return inbox.g_inbox_len;
-}
 
 // -------------------------------------------------------- where a note can be found
 //
@@ -1494,58 +456,6 @@ pub fn inboxLenForTest() usize {
 // else and says something about the publisher's network that nobody asked them
 // to say. Jumble drops its own local-network relays from every hint for the
 // same reason (`getEventHints`, `isLocalNetworkUrl`).
-
-pub fn noteAddressForTest(out: *[note_address_cap]u8, note: *const Note, relays_wanted: usize) ?[]const u8 {
-    return noteAddress(out, note, relays_wanted);
-}
-pub fn profileAddressForTest(out: *[note_address_cap]u8, pubkey: [32]u8) ?[]const u8 {
-    return profileAddress(out, pubkey);
-}
-pub const note_address_cap_for_test = note_address_cap;
-pub fn recordSeenOnForTest(id: [32]u8, url: []const u8) void {
-    recordSeenOnId(id, url);
-}
-pub fn resetSeenOnForTest() void {
-    seenOnLock();
-    defer seenOnUnlock();
-    for (&relay_hints.g_seen_on) |*e| e.* = .{};
-    relay_hints.g_seen_url_n = 0;
-}
-pub fn hintsForTest(id: [32]u8, author: ?[32]u8) HintList {
-    var out: HintList = .{};
-    hintsFor(id, author, &out);
-    return out;
-}
-pub fn isHintableRelayForTest(url: []const u8) bool {
-    return isHintableRelay(url);
-}
-pub fn seenUrlCountForTest() usize {
-    return relay_hints.g_seen_url_n;
-}
-
-pub const zap_msat_ceiling_for_test = zap_msat_ceiling;
-
-/// Clears the engagement table and dedup set. For tests.
-/// Sets a note's zap total directly, for tests about what the RENDER does with
-/// a large number. Ingestion cannot produce one in a single step any more, and
-/// the two properties are worth testing apart: what is admitted, and what is
-/// survivable once admitted.
-pub fn setZapMsatForTest(id: i64, msat: u64) void {
-    engagementLock();
-    defer engagementUnlock();
-    if (ensureEngagement(id)) |row| row.counts.zap_msat = msat;
-}
-
-pub fn resetEngagementForTest() void {
-    engagement.g_engagement = [_]Engagement{.{}} ** engagement_cap;
-    engagement.g_seen = [_]u64{0} ** seen_engagement_cap;
-    engagement.g_seen_len = 0;
-}
-
-/// Folds an event into the counts, for tests (the ingest path without threads).
-pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void {
-    countEngagement(ev, feed_ids);
-}
 
 /// Wall-clock seconds on the UI thread, or 0 before `main` wires the clock.
 pub fn nowSeconds() i64 {
@@ -3467,7 +2377,7 @@ pub const Model = struct {
         for (self.notes[0..self.notes_len]) |*note| note.setTime(now_s);
     }
 
-    fn rebuildNotes(self: *Model, store: *nostr.store.Store, now_s: i64) void {
+    pub fn rebuildNotes(self: *Model, store: *nostr.store.Store, now_s: i64) void {
         // Whatever the feed ends up holding, the relays get told about it. On
         // every path out of here, including the two that return early.
         defer publishFeedWatch(self.notes[0..self.notes_len]);
@@ -3791,29 +2701,6 @@ pub const Model = struct {
     }
 };
 
-pub fn setIdentityForTest(secret: [32]u8) void {
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const kp = signer.keyPairFromSecretKey(secret) catch return;
-    feed_state.g_test_secret = secret;
-    adoptHelperIdentity(kp.public_key);
-}
-
-/// Clears the active identity again. For tests.
-pub fn clearIdentityForTest() void {
-    follows.g_home_scope = .following;
-    keyholder.g_identity_npub_len = 0;
-    keyholder.g_signer_kind = .helper;
-    feed_state.g_test_secret = null;
-    keyholder.g_helper_has_identity = false;
-}
-
-/// Forces the next reconcile to do the full work rather than take the
-/// unchanged-store fast path, so a benchmark measures a rebuild.
-pub fn invalidateFeedForTest() void {
-    invalidateFeed();
-}
-
 /// Reconciles profiles and notes against `store` directly, bypassing change
 /// detection entirely. For tests that drive the store themselves rather than
 /// through `plazaIngest`, which is where an arrival announces itself: without
@@ -3825,12 +2712,6 @@ pub fn invalidateFeedForTest() void {
 /// tick, which a test has no way to turn.
 pub fn refreshThreadNotesForTest(model: *Model, now_s: i64) void {
     model.refreshThreadNotes(now_s);
-}
-
-pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
-    invalidateFeed();
-    refreshProfiles(store);
-    model.rebuildNotes(store, now_s);
 }
 
 /// A tick as the app actually takes one, including the gate that decides
@@ -3858,62 +2739,14 @@ pub fn tickOpenLevelForTest(model: *Model, now_s: i64) void {
     refreshOpenLevel(model, now_s);
 }
 
-/// Marks a thread's reply fetch as finished, the way its worker does.
-pub fn markThreadFetchDoneForTest(seq: u64) void {
-    navigation.g_thread_done_seq.store(seq, .release);
-}
-
-/// Empties the arrival buffer and asks for a full read next time, so a test
-/// starts from a known place rather than from whatever the last one left.
-pub fn resetFeedChangeDetectionForTest() void {
-    clearFeedArrivals();
-    invalidateFeed();
-    feed_state.g_notes_limit = 0;
-    feed_state.g_notes_feed_limit = 0;
-    g_last_count = std.math.maxInt(usize);
-}
-
-/// Announces an id as newly arrived without storing anything. For the case the
-/// app is not supposed to produce and the splice guards against anyway.
-pub fn noteFeedArrivalForTest(id: [32]u8) void {
-    noteFeedArrival(id);
-}
-
-/// Fills the arrival buffer past its capacity, the way a backfill does.
-pub fn overflowFeedArrivalsForTest() void {
-    for (0..feed_arrival_cap + 1) |i| {
-        var id = [_]u8{0} ** 32;
-        std.mem.writeInt(u64, id[0..8], i, .big);
-        noteFeedArrival(id);
-    }
-}
-
-pub fn profileParsesForTest() usize {
-    return feed_state.g_profile_parses;
-}
-
 /// The refresh the tick runs when the store moved.
 pub fn refreshProfileNotesForTest(model: *Model) void {
     model.refreshProfileNotes(nowSeconds());
 }
 
-/// Makes room for `n` notes and re-points `model` at the grown buffer. For tests
-/// that fill the feed by hand rather than through the store: the app grows on
-/// its way through `rebuildNotes`, and writing past the end without that is the
-/// out-of-bounds it should be.
-/// One more page, the way the reader's scroll asks for it. For tests, so they
-/// page down through the real path rather than setting the limit by hand.
-pub fn loadOlderForTest(model: *Model) void {
-    model.feed_limit += feed_page;
-}
-
-pub fn reserveFeedForTest(model: *Model, n: usize) void {
-    _ = ensureFeedCapacity(n);
-    model.notes = feed_state.g_feed_notes;
-}
 // The names generation the current cards were parsed under (see
 // `g_names_generation`).
-var g_notes_names_generation: u64 = 0;
+pub var g_notes_names_generation: u64 = 0;
 
 /// True when the well-known JSON maps the identifier's name to `pubkey`. This is
 /// the whole trust test: a check is drawn on this and nothing weaker.
@@ -3934,19 +2767,6 @@ var g_notes_names_generation: u64 = 0;
 // already reads. One source of truth for what the newest release is, rather than
 // a second one to keep in step.
 
-pub fn updateNewsForTest(body: []const u8) void {
-    handleUpdateChecked(.{ .key = update_check_key, .outcome = .ok, .status = 200, .body = body, .truncated = false, .dropped_before = 0 });
-}
-
-pub fn resetUpdateStateForTest() void {
-    updates.g_update_check = true;
-    updates.g_update_version_len = 0;
-    updates.g_update_url_len = 0;
-    updates.g_update_asking = false;
-    updates.g_update_dismissed = false;
-    updates.g_update_next_at_ms = 0;
-}
-
 // --------------------------------------------------------------- image decode
 //
 // The canvas image registry decodes through the platform codec and refuses
@@ -3954,331 +2774,6 @@ pub fn resetUpdateStateForTest() void {
 // nearly every feed photo are larger than that, so Plaza decodes and resizes
 // them itself: the platform decoder is tried first (it knows every format the
 // OS does, WebP and HEIC included), and stb takes over when it refuses.
-
-/// Whether the vendored decoder can read `bytes` at all. Test seam: what makes
-/// the platform fallback in `decodeAndRegister` load-bearing is precisely which
-/// formats stb was NOT built for.
-pub fn stbCanDecodeForTest(bytes: []const u8) bool {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var comp: c_int = 0;
-    const px = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
-    stbi_image_free(px);
-    return true;
-}
-
-pub fn avatarUrlForTest(buf: []u8, src: []const u8, direct: bool) []const u8 {
-    return avatarUrl(buf, src, direct);
-}
-
-pub fn feedImageUrlForTest(buf: []u8, src: []const u8) []const u8 {
-    return feedImageUrl(buf, src);
-}
-
-pub const feed_prefetch_rows_for_test = feed_prefetch_rows;
-pub const gif_target_px_for_test = gif_target_px;
-pub const media_target_px_for_test = media_target_px;
-
-pub fn mediaUrlForTest(buf: []u8, src: []const u8, px: u32, fit: MediaFit) []const u8 {
-    return mediaUrl(buf, src, px, fit);
-}
-
-/// The address warming asks for, so a test can hold it against the one the row
-/// will look up. They are built in two places and must not drift.
-pub fn setVisibleRangeForTest(first: usize, last: usize) void {
-    feed_media.g_visible_first = first;
-    feed_media.g_visible_last = last;
-}
-
-// ---------------------------------------------------------------- feed media
-//
-// Feed images take the image ids the avatars do not, through a small LRU keyed
-// by note. Only the top of the feed loads for now: that is what the budget
-// holds and what is on screen at rest. Windowed visibility (load exactly what
-// is in view, evict what leaves) arrives with the virtual list.
-
-/// Clears the media cache. For tests, which share the process globals.
-/// Whether the slot for `note_id` was marked wanted by the most recent pass.
-/// This is the thing the claim pass reads to decide what it may evict, so it is
-/// the thing a test about "which pictures the level is spending its slots on"
-/// has to ask about.
-pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
-    const m = mediaSlotFor(note_id) orelse return null;
-    return m.last_used == profile_cache.g_image_clock;
-}
-
-pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
-    scanMediaFetches(fx, model);
-}
-
-pub fn warmAheadForTest(fx: *Effects, model: *const Model) void {
-    warmAhead(fx, model);
-}
-
-/// Whether warming has asked for this picture address, the way `warmPicture`
-/// builds it.
-pub fn pictureWarmedForTest(src: []const u8) bool {
-    var url_buf: [1024]u8 = undefined;
-    return warmedAlready(feedImageUrl(&url_buf, src));
-}
-
-pub fn resetWarmForTest() void {
-    image_pool.g_warm_ring = [_]WarmEntry{.{}} ** warm_ring_len;
-    image_pool.g_warm_ring_next = 0;
-}
-
-pub fn scanLinkFetchesForTest(fx: *Effects, model: *const Model) void {
-    scanLinkFetches(fx, model);
-}
-
-/// Whether the page behind `url` has been asked for (or is being).
-pub fn linkRequestedForTest(url: []const u8) bool {
-    const l = linkFor(url) orelse return false;
-    return l.state == .fetching or l.attempts > 0;
-}
-
-/// Pretends a build put exactly these notes on screen in the front level.
-pub fn recordVisibleNotesForTest(ids: []const i64) void {
-    const set = &view_thread.g_level_visible[0];
-    set.reset();
-    view_thread.g_visible_level = 0;
-    for (ids) |id| set.pushNote(id);
-}
-
-/// How many picture slots are currently held, and by which notes.
-pub fn mediaSlotNoteIdsForTest(out: []i64) usize {
-    var n: usize = 0;
-    for (&feed_media.g_media) |*m| {
-        if (!m.used or n == out.len) continue;
-        out[n] = m.note_id;
-        n += 1;
-    }
-    return n;
-}
-
-pub fn maxMediaImagesForTest() usize {
-    return max_media_images;
-}
-
-pub const quote_picture_width_for_test = quote_picture_width;
-
-/// Whether the pool could take this id back right now: held, and neither on
-/// screen this pass nor mid-fetch.
-pub fn imageIdTakeableForTest(id: u64) bool {
-    if (id < 1 or id > image_registry_slots) return false;
-    const owners = imageIdOwners();
-    return imageIdSeen(owners[@intCast(id)]) != null;
-}
-
-pub fn resetMediaForTest() void {
-    for (&feed_media.g_media) |*m| m.down.release();
-    feed_media.g_media = [_]MediaSlot{.{}} ** max_media_images;
-    profile_cache.g_image_clock = 0;
-}
-
-/// How many slots are holding a half-assembled picture. Zero at rest: a slice
-/// buffer belongs to one fetch and dies with it.
-pub fn mediaPartialCountForTest() usize {
-    var n: usize = 0;
-    for (&feed_media.g_media) |*m| {
-        if (m.down.buf != null) n += 1;
-    }
-    return n;
-}
-
-pub fn mediaKeyForTest(note_id: i64, index: usize) i64 {
-    return mediaKey(note_id, index);
-}
-
-pub fn markMediaFailedForTest(slot: *MediaSlot) void {
-    slot.state = .failed;
-}
-
-pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
-    const m = mediaSlotFor(note_id) orelse return null;
-    return m.attempts;
-}
-
-/// The host a slot's picture lives on, which `fireMediaAt` normally sets from
-/// the note. A test that drives the response handler directly never went
-/// through it.
-pub fn setMediaSlotHostForTest(note_id: i64, host: []const u8) void {
-    const m = mediaSlotFor(note_id) orelse return;
-    const n = @min(host.len, m.host_buf.len);
-    @memcpy(m.host_buf[0..n], host[0..n]);
-    m.host_len = @intCast(n);
-}
-
-pub fn mediaIdleForTest(note_id: i64) bool {
-    const m = mediaSlotFor(note_id) orelse return false;
-    return m.state == .idle;
-}
-
-/// Whether this note's picture is now pinned to its own host rather than the
-/// proxy, and whether it will be asked for again.
-pub fn mediaFallbackStateForTest(note_id: i64) ?struct { idle: bool, direct: bool } {
-    const m = mediaSlotFor(note_id) orelse return null;
-    return .{ .idle = m.state == .idle, .direct = m.direct };
-}
-
-/// Delivers one picture-fetch response for `note_id` the way the runtime would,
-/// so a test can drive the failure paths rather than the classifier alone.
-/// How many faces are holding a half-assembled picture. Zero at rest.
-pub fn avatarPartialCountForTest() usize {
-    var n: usize = 0;
-    for (&profile_cache.g_profiles) |*p| {
-        if (p.used and p.down.buf != null) n += 1;
-    }
-    return n;
-}
-
-/// Feeds one delivered slice to a profile's face, exactly as a 206 does.
-pub fn appendAvatarSliceForTest(pubkey: [32]u8, body: []const u8) ?SliceOutcome {
-    const p = lookupProfile(pubkey) orelse return null;
-    return p.down.append(body);
-}
-
-pub fn deliverAvatarResponseForTest(
-    fx: *Effects,
-    pubkey: [32]u8,
-    outcome: native_sdk.EffectFetchOutcome,
-    status: u16,
-    body: []const u8,
-) void {
-    const p = lookupProfile(pubkey) orelse return;
-    const index = (@intFromPtr(p) - @intFromPtr(&profile_cache.g_profiles[0])) / @sizeOf(Profile);
-    handleAvatarFetched(fx, .{
-        .key = avatar_fetch_key_base + index,
-        .outcome = outcome,
-        .status = status,
-        .body = body,
-    });
-}
-
-pub fn maxImageBytesForTest() usize {
-    return max_image_bytes;
-}
-
-pub fn maxImageDownloadBytesForTest() usize {
-    return max_image_download_bytes;
-}
-
-pub fn rangeHeaderForTest(buf: []u8, offset: usize) ?[]const u8 {
-    return rangeHeader(buf, offset);
-}
-
-/// Feeds one delivered slice to a note's slot, exactly as a 206 response does.
-pub fn appendMediaSliceForTest(note_id: i64, body: []const u8) ?SliceOutcome {
-    const m = mediaSlotFor(note_id) orelse return null;
-    return m.down.append(body);
-}
-
-/// What a note's slot has assembled so far, or null if it is holding nothing.
-pub fn mediaPartialForTest(note_id: i64) ?[]const u8 {
-    const m = mediaSlotFor(note_id) orelse return null;
-    return m.down.bytes();
-}
-
-pub fn deliverMediaResponseForTest(
-    fx: *Effects,
-    note_id: i64,
-    outcome: native_sdk.EffectFetchOutcome,
-    status: u16,
-    body: []const u8,
-) void {
-    const m = mediaSlotFor(note_id) orelse return;
-    handleMediaFetched(fx, .{
-        .key = media_fetch_key_base + mediaSlotIndex(m),
-        .outcome = outcome,
-        .status = status,
-        .body = body,
-    });
-}
-
-pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
-    return claimMediaSlot(fx, note_id);
-}
-
-pub fn touchMediaClockForTest() u64 {
-    beginImagePass();
-    return profile_cache.g_image_clock;
-}
-
-pub fn acquireImageIdForTest(fx: *Effects) ?u64 {
-    return acquireImageId(fx);
-}
-
-/// What the pool thinks holds an id. The bug this guards against is a slot the
-/// app holds and the pool calls `free`.
-pub fn imageIdOwnerNameForTest(id: u64) []const u8 {
-    if (id < 1 or id > image_registry_slots) return "out-of-range";
-    const owners = imageIdOwners();
-    return @tagName(owners[@intCast(id)]);
-}
-
-pub fn placeLogoUntouchableForTest() bool {
-    return imageIdSeen(.place_logo) == null;
-}
-
-pub fn setPlaceLogoIdForTest(id: u64) void {
-    view_place.g_place_logo_id = id;
-}
-
-pub fn markPlaceLogoSeenForTest() void {
-    view_place.g_place_logo_seen = profile_cache.g_image_clock;
-}
-
-pub fn agePlaceLogoForTest() void {
-    profile_cache.g_image_clock +%= 1;
-}
-
-/// The id the pool would hand out next, without taking it. Lets a test ask what
-/// the rule decides without an effects channel to drop pixels through.
-pub fn chooseImageIdForTest() ?u64 {
-    const owners = imageIdOwners();
-    const pick = chooseImageId(&owners) orelse return null;
-    return pick.id;
-}
-
-pub fn imageClockForTest() u64 {
-    return profile_cache.g_image_clock;
-}
-
-pub fn markAvatarWantedForTest(pubkey: [32]u8) void {
-    markAvatarWanted(pubkey);
-}
-
-pub fn beginImagePassForTest() void {
-    beginImagePass();
-}
-
-pub fn proxyRefusedCountForTest() usize {
-    return feed_media.g_proxy_refused_count;
-}
-
-pub fn hostOfForTest(url: []const u8) []const u8 {
-    return hostOf(url);
-}
-
-/// The same, recording where each mention's label landed into `mentions` when
-/// one is given. A note wants that table so the label can be pressed; a profile's
-/// "about" text is rendered the same way and has nowhere to put one.
-pub const note_content_cap_for_test = note_content_cap;
-pub fn noteContentCapForTest() usize {
-    return note_content_cap;
-}
-
-pub fn invisibleForDisplayForTest(cp: u21) bool {
-    return invisibleForDisplay(cp);
-}
-
-pub fn copyDisplayTextForTest(dst: []u8, src: []const u8) usize {
-    return copyDisplayText(dst, src);
-}
-
-pub fn foldMathAlnumForTest(cp: u21) ?u8 {
-    return foldMathAlnum(cp);
-}
 
 // -------------------------------------------------------------------- msg
 
@@ -4773,46 +3268,6 @@ pub const Msg = union(enum) {
 
 pub const AppUi = canvas.Ui(Msg);
 
-pub const notifications_column_width_for_test = notifications_column_width;
-
-pub fn insertMentionForTest(model: *Model, pubkey: [32]u8) void {
-    insertMention(model, pubkey);
-}
-
-pub const compose_capacity_for_test = compose_capacity;
-
-pub fn composeReachForTest(arena: std.mem.Allocator, written: usize, dropped: usize) []const u8 {
-    var ui = AppUi.init(arena);
-    return composeReach(&ui, written, dropped);
-}
-
-/// Pretends a build put exactly these authors on screen in the front level.
-pub fn recordVisibleAuthorsForTest(authors: []const [32]u8) void {
-    const set = &view_thread.g_level_visible[0];
-    set.reset();
-    view_thread.g_visible_level = 0;
-    for (authors) |pk| set.pushAuthor(pk);
-}
-
-/// The retained tables, for a test that drops the build arena and then reads
-/// them exactly as the SDK does.
-pub fn threadExtentTableForTest(level: usize) *const anyopaque {
-    return &view_thread.g_thread_extents[@min(level, view_thread.g_thread_extents.len - 1)];
-}
-
-pub fn profileExtentTableForTest(level: usize) *const anyopaque {
-    return &view_thread.g_profile_extents[@min(level, view_thread.g_profile_extents.len - 1)];
-}
-
-pub fn rowExtentFromTableForTest(context: ?*const anyopaque, index: u64) f32 {
-    return rowExtentFromTable(context, index);
-}
-
-pub fn extentTableLenForTest(context: ?*const anyopaque) usize {
-    const table: *const RowExtents = @ptrCast(@alignCast(context orelse return 0));
-    return table.len;
-}
-
 /// The thread header: a Back affordance (to the parent thread, or the feed), the
 /// "Thread" label, and the reply count (known from the crowd count up front, so
 /// it reads right before the replies are fetched).
@@ -4849,35 +3304,6 @@ pub fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
 // kilobytes. It is read from the store when the level is first drawn and kept
 // here, cut into rows (see `article.chunk`) so that only the rows near the
 // viewport are built, the way the feed and the thread are.
-
-/// Forgets the loaded article, for a test that opens several in turn.
-pub fn forgetArticleForTest() void {
-    if (view_article.g_article) |old| {
-        old.arena.deinit();
-        std.heap.page_allocator.destroy(old);
-    }
-    view_article.g_article = null;
-}
-
-/// How many rows the reader built for the article behind `event_id`, and how many
-/// the list was told about. The difference is the whole point of windowing.
-pub fn articleRowCountForTest(event_id: [32]u8) usize {
-    return if (articleFor(event_id)) |a| a.rowCount() else 0;
-}
-
-/// Row `index` of the article `root` names, built the way the reader builds it,
-/// so a test can read every row and not only the ones a viewport would mount.
-pub fn articleRowForTest(ui: *AppUi, root: *const Note, index: usize) AppUi.Node {
-    return articleRowAt(ui, root, articleFor(root.event_id), index);
-}
-
-pub fn splitByFollowGraphForTest(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) GraphSplit {
-    return splitByFollowGraph(ui, blocks, author);
-}
-
-pub fn followSetForTest() []const [32]u8 {
-    return followSet();
-}
 
 /// A profile's two tabs. "Notes" is what they wrote; "Replies" is what they
 /// wrote at somebody else.
@@ -4946,449 +3372,10 @@ pub const Screen = struct {
 
 // ------------------------------------------------------------- bookmarks
 
-/// The keyholder a test has, for the seal path.
-pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8) void {
-    const secret = feed_state.g_test_secret orelse {
-        private_lists.g_private_seal = .{};
-        return;
-    };
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const kp = signer.keyPairFromSecretKey(secret) catch {
-        private_lists.g_private_seal = .{};
-        return;
-    };
-    // A test binary has no runtime io, so it makes its own. The seal has to be
-    // real: the point of this path is that what gets published decrypts back.
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = g_io orelse threaded.io();
-    const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
-        private_lists.g_private_seal = .{};
-        return;
-    };
-    defer gpa.free(sealed);
-    bookmarks.g_test_sealed_len = @intCast(@min(sealed.len, bookmarks.g_test_sealed.len));
-    @memcpy(bookmarks.g_test_sealed[0..bookmarks.g_test_sealed_len], sealed[0..bookmarks.g_test_sealed_len]);
-}
-
-pub fn lastSealedForTest() []const u8 {
-    return bookmarks.g_test_sealed[0..bookmarks.g_test_sealed_len];
-}
-
-pub fn finishPrivateBookmarkForTest(model: *Model, fx: *Effects) void {
-    finishPrivateBookmark(model, fx, bookmarks.g_test_sealed[0..bookmarks.g_test_sealed_len]);
-}
-
-pub fn writePrivateBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
-    return writePrivateBookmark(fx, event_id, adding);
-}
-
-pub fn writeBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
-    return writeBookmark(fx, event_id, adding);
-}
-
-pub fn loadBookmarksFromStoreForTest() void {
-    loadBookmarksFromStore();
-}
-
-pub fn forgetBookmarksForTest() void {
-    forgetBookmarks();
-}
-
-/// Claims a private-half slot the way a reader hitting an encrypted list does,
-/// and returns its index, WITHOUT the test keyholder answering it. That is what
-/// a bunker reader's state actually looks like: the half is claimed and waiting
-/// on a signer that answers over the relay rather than over HTTP.
-pub fn claimPrivateHalfPendingForTest(content: []const u8) ?u8 {
-    const id = privateHalfId(content);
-    for (&private_lists.g_private_halves, 0..) |*h, i| {
-        if (h.used) continue;
-        if (content.len > private_lists.g_private_ciphertext[i].buf.len) return null;
-        h.* = .{ .used = true, .state = .asking, .id = id };
-        @memcpy(private_lists.g_private_ciphertext[i].buf[0..content.len], content);
-        private_lists.g_private_ciphertext[i].len = @intCast(content.len);
-        return @intCast(i);
-    }
-    return null;
-}
-
-/// What the listener thread does when the bunker answers a `nip44_decrypt`.
-pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
-    parkHalfAnswer(index, slotIdForTest(index), plain);
-}
-
-/// The same for an ask that was made about `ciphertext`, whoever holds the slot
-/// by the time the answer lands.
-pub fn parkRemoteHalfAnswerForCiphertextForTest(index: u8, ciphertext: []const u8, plain: []const u8) void {
-    parkHalfAnswer(index, privateHalfId(ciphertext), plain);
-}
-
-fn slotIdForTest(index: u8) [32]u8 {
-    if (index >= private_lists.g_private_halves.len) return no_half_id;
-    return private_lists.g_private_halves[index].id;
-}
-
-/// A decrypt the bunker refused or never answered, for the ask made about
-/// `ciphertext`.
-pub fn endRemoteHalfAskForTest(index: u8, ciphertext: []const u8, end: HalfAskEnd) bool {
-    return endHalfAsk(index, privateHalfId(ciphertext), end);
-}
-
-/// A `nip44_decrypt` the bunker refused: an explicit error.
-pub fn failRemoteHalfForTest(index: u8) bool {
-    return endHalfAsk(index, slotIdForTest(index), .failed);
-}
-
-/// A `nip44_decrypt` the bunker never answered before the deadline.
-pub fn timeoutRemoteHalfForTest(index: u8) bool {
-    return endHalfAsk(index, slotIdForTest(index), .timed_out);
-}
-
-/// Whether any parked bunker answer is still waiting for the tick, or still
-/// holds plaintext.
-pub fn halfInboxHoldsForTest() bool {
-    pendingLock();
-    defer pendingUnlock();
-    for (&remote_signer.g_half_inbox) |*box| {
-        if (box.used or box.plain_len != 0) return true;
-    }
-    return false;
-}
-
-/// What the tick does for every idle half when a bunker is the signer: the ask
-/// goes out and the half waits for it. The test has no relay to send to.
-pub fn markIdleHalvesAskedForTest() void {
-    for (&private_lists.g_private_halves) |*h| {
-        if (h.used and h.state == .idle) h.state = .asking;
-    }
-}
-
-/// A decrypt request registered for the half in `index`, with no outcome yet,
-/// as `requestRemoteDecrypt` does.
-pub fn registerRemoteHalfAskForTest(index: u8, method: RemoteMethod) bool {
-    return registerPending("halfask", method, null, false, .none, index, slotIdForTest(index), .{});
-}
-
-pub fn privateHalfRetryAtForTest(index: u8) i64 {
-    if (index >= private_lists.g_private_halves.len) return -1;
-    return private_lists.g_private_halves[index].retry_at_s;
-}
-
-pub fn privateHalfRetryDelayForTest() i64 {
-    return private_half_retry_s;
-}
-
-/// The sweep `scanPrivateHalves` runs each tick, with the clock stated.
-pub fn rearmPrivateHalvesForTest(now: i64) void {
-    rearmPrivateHalves(now, false);
-}
-
-pub fn privateHalfStateForTest(index: u8) []const u8 {
-    if (index >= private_lists.g_private_halves.len or !private_lists.g_private_halves[index].used) return "none";
-    return switch (private_lists.g_private_halves[index].state) {
-        .idle => "idle",
-        .asking => "asking",
-        .open => "open",
-        .refused => "refused",
-        .unreadable => "unreadable",
-    };
-}
-
-pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
-    const id = privateHalfId(content);
-    for (&private_lists.g_private_halves) |*h| {
-        if (!h.used or std.mem.eql(u8, &h.id, &id)) {
-            h.* = .{ .used = true, .state = .open, .id = id };
-            const n = @min(plain.len, h.plain_buf.len);
-            @memcpy(h.plain_buf[0..n], plain[0..n]);
-            h.plain_len = @intCast(n);
-            return;
-        }
-    }
-}
-
-/// The keyholder a test has, for the decrypt path. Only in a test binary.
-pub fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []const u8) void {
-    const secret = feed_state.g_test_secret orelse return;
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const kp = signer.keyPairFromSecretKey(secret) catch return;
-    const key = beginHelperAsk(i);
-    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, kp.public_key, content) catch {
-        // Notary would answer 422: it looked, and the ciphertext does not open.
-        handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 422, .body = "{\"error\":\"unreadable\"}" });
-        return;
-    };
-    defer gpa.free(plain);
-    const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
-    defer gpa.free(body);
-    handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 200, .body = body });
-}
-
 /// Delivers one decrypt answer for slot zero the way the runtime would, so a
 /// test can drive a keyholder that refuses.
 pub fn deliverPrivateHalfForTest(status: u16, body: []const u8) void {
     deliverPrivateHalfKeyedForTest(privateHalfAskKeyForTest(0), status, body);
-}
-
-/// The same under a stated key, so an answer can be delivered after the ask it
-/// belongs to is long gone.
-pub fn deliverPrivateHalfKeyedForTest(key: u64, status: u16, body: []const u8) void {
-    handlePrivateHalf(.{ .key = key, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
-}
-
-/// The key the ask now in flight on slot `index` went out under.
-pub fn privateHalfAskKeyForTest(index: u8) u64 {
-    return privateHalfKey(index, private_lists.g_private_halves[index].ask_seq);
-}
-
-/// Puts slot zero in the "asked, waiting" state for a given ciphertext.
-pub fn askPrivateHalfForTest(content: []const u8) void {
-    private_lists.g_private_halves[0] = .{ .used = true, .state = .idle, .id = privateHalfId(content) };
-    _ = beginHelperAsk(0);
-    const n = @min(content.len, private_lists.g_private_ciphertext[0].buf.len);
-    @memcpy(private_lists.g_private_ciphertext[0].buf[0..n], content[0..n]);
-    private_lists.g_private_ciphertext[0].len = @intCast(n);
-}
-
-pub fn privateMutesForTest(content: []const u8, out: [][32]u8) usize {
-    return privateMutes(std.heap.page_allocator, content, out);
-}
-
-pub fn privateHalfIsReadableForTest(content: []const u8) bool {
-    return privateHalfIsReadable(std.heap.page_allocator, content);
-}
-
-pub fn forgetPrivateHalvesForTest() void {
-    forgetPrivateHalves();
-}
-
-pub fn privateHalfGateNameForTest(content: []const u8) []const u8 {
-    return @tagName(privateHalfGate(std.heap.page_allocator, content));
-}
-
-pub fn writeMuteForTest(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
-    return writeMute(fx, pubkey, muting);
-}
-
-/// How many people are on the reader's OWN list, whichever feed is being read.
-/// The menu names both feeds at once, so it cannot ask `followTotal`: that one
-/// answers for the feed in front of you.
-pub fn setHomeScopeForTest(next: HomeScope) void {
-    setHomeScope(next);
-}
-
-pub fn starterPackLenForTest() usize {
-    return starter_pack.len;
-}
-
-pub fn forgetOwnListMemoForTest() void {
-    forgetOwnListMemo();
-}
-
-pub fn ownRelaysAllFinishedForTest() bool {
-    return ownRelaysAllFinished();
-}
-
-pub fn noteOwnOutboxForTest(ev: nostr.event.Event) void {
-    noteOwnOutbox(ev);
-}
-
-pub fn noHistoryKnownForTest(kind: ListKind) bool {
-    return noHistoryKnown(kind);
-}
-
-pub fn needsFreshConsentForTest(kind: ListKind) bool {
-    return needsFreshConsent(kind);
-}
-
-pub fn confirmStartFreshForTest(kind: ListKind) bool {
-    return confirmStartFresh(kind);
-}
-
-pub fn retryOwnListsReadForTest() void {
-    retryOwnListsRead();
-}
-
-/// Pretends the wait has run for `seconds`, for a test that cannot sleep.
-pub fn ownListsWaitedForTest(seconds: i64) void {
-    const pk = activePubkey() orelse return;
-    own_lists.g_own_lists_since = nowSeconds() - seconds;
-    own_lists.g_own_lists_since_for = pk;
-}
-
-/// What pressing "Create your identity" does to the sign-out latch: drops it
-/// before any new key exists. The pubkey latch is what has to hold after this.
-pub fn loggedOutForTest() bool {
-    return keyholder.g_logged_out;
-}
-
-pub fn clearLoggedOutLatchForTest() void {
-    keyholder.g_logged_out = false;
-}
-
-pub fn setIdentityMintedForTest(minted: bool) void {
-    own_lists.g_identity_minted_here = minted;
-}
-
-/// The relay now in slot `index` answered. Slots with no relay are ignored, as
-/// the ingest thread for an empty seat never dials anything.
-pub fn noteContactsAnsweredByForTest(index: usize, pk: [32]u8) void {
-    const e = relayAt(index) orelse return;
-    noteContactsAnsweredBy(index, e.url(), pk);
-}
-
-/// A relay answered from seat `index` at `url`, whatever sits there now: what an
-/// answer that arrived just before the seat changed hands leaves behind.
-pub fn noteContactsAnsweredFromForTest(index: usize, url: []const u8, pk: [32]u8) void {
-    noteContactsAnsweredBy(index, url, pk);
-}
-
-pub fn contactsConfirmedAbsentForTest() bool {
-    return contactsConfirmedAbsent();
-}
-
-pub fn haveOwnContactListForTest() bool {
-    return haveOwnContactList();
-}
-
-pub fn pendingUndoIsNoneForTest() bool {
-    return follows.g_pending_undo == .none;
-}
-
-/// Arms an undo directly, for the writes whose real path needs a live note, a
-/// live `Effects` or a relay behind it. Arming itself is not what these check:
-/// `signAndPublish` takes the record as an argument, so a write cannot reach
-/// the signer without one. What they check is that each record puts the right
-/// thing back.
-pub fn armUndoForTest(u: PendingUndo) void {
-    armUndo(u);
-}
-
-pub fn markRepostedByMeForTest(note_id: i64) void {
-    markRepostedByMe(note_id);
-}
-
-pub fn repostedByMeForTest(note_id: i64) bool {
-    return engagementFor(note_id).reposted_by_me;
-}
-
-pub fn armUnlikeUndoForTest(note_id: i64, reaction_id: [32]u8) void {
-    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
-}
-
-pub fn applyUndoForTest(model: *Model) void {
-    applyUndo(model);
-}
-
-/// Puts the app in the state a bunker or a Notary key leaves it in: a contact
-/// list signed, handed to the signer, and not yet in the store. That gap cannot
-/// be driven from a test, because the async paths need a live `Effects`, so the
-/// state they produce is set up directly and the write is then driven for real.
-pub fn setPendingFollowBaseForTest(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
-    setPendingFollowBase(tags, content, created_at);
-}
-
-pub fn clearPendingFollowBaseForTest() void {
-    clearPendingFollowBase();
-}
-
-pub fn pendingFollowCountForTest() ?usize {
-    const tags = follows.g_pending_follow_tags orelse return null;
-    return countPeople(tags);
-}
-
-pub fn countPeopleForTest(tags: []const nostr.event.Tag) usize {
-    return countPeople(tags);
-}
-
-pub fn shrinkAllowedForTest(before: usize, after: usize, following: bool) bool {
-    return shrinkAllowed(before, after, following);
-}
-
-pub fn writeFollowForTest(fx: *Effects, pubkey: [32]u8, following: bool) bool {
-    return writeFollow(fx, pubkey, following) == .published;
-}
-
-pub fn followsFromTagsForTest(tags: []const nostr.event.Tag, out: [][32]u8) usize {
-    return followsFromTags(tags, out);
-}
-
-pub fn setFollowsForTest(list: []const [32]u8, created_at: i64) bool {
-    return setFollows(list, created_at);
-}
-
-pub fn forgetFollowsForTest() void {
-    follows.g_home_scope = .following;
-    forgetFollows();
-}
-
-pub fn forgetMutesForTest() void {
-    forgetMutes();
-    forgetBookmarks();
-}
-
-pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
-    return setMutes(list, created_at);
-}
-
-pub fn loadMutesFromStoreForTest() void {
-    loadMutesFromStore();
-    loadBookmarksFromStore();
-}
-
-pub fn ingestMuteListForTest(ev: nostr.event.Event) void {
-    ingestMuteList(ev);
-}
-
-pub fn loadFollowsFromStoreForTest() void {
-    loadFollowsFromStore();
-}
-
-pub fn ingestContactListForTest(ev: nostr.event.Event) void {
-    ingestContactList(ev);
-}
-
-/// The ancestor row and one reply block, for a test that asserts what they PAINT
-/// (the rail between two discs is a grown separator, so it only exists when the
-/// row hands its avatar column a height, which is exactly what once went wrong).
-pub fn ancestorRowForTest(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
-    return ancestorRow(ui, ancestor, first);
-}
-
-pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
-    return replyBlock(ui, block, root_author, first, last);
-}
-
-/// The rows a level can hold whose height is a fixed constant, so a test can
-/// measure each one and hold its estimate to what it actually draws. Every
-/// constant here was hand-calibrated once and then drifted.
-pub fn ghostRowForTest(ui: *AppUi, capped: bool) AppUi.Node {
-    const ancestor: Ancestor = .{ .ghost = if (capped) .capped else .missing };
-    return ghostRow(ui, &ancestor, true);
-}
-
-pub fn listeningFooterForTest(ui: *AppUi) AppUi.Node {
-    return listeningFooter(ui);
-}
-
-pub fn outsideGraphRowForTest(ui: *AppUi, open: bool) AppUi.Node {
-    return outsideGraphRow(ui, 2, open);
-}
-
-pub fn showMoreRepliesForTest(ui: *AppUi) AppUi.Node {
-    return showMoreReplies(ui, 3);
-}
-
-pub const ghost_row_extent_for_test = ghost_row_extent;
-pub const listening_row_extent_for_test = listening_row_extent;
-pub const outside_row_extent_for_test = outside_row_extent;
-pub const show_more_extent_for_test = show_more_extent;
-pub const ancestor_row_chrome_for_test = ancestor_row_chrome;
-
-pub fn ancestorBodyLinesForTest(note: *const Note) f32 {
-    return ancestorBodyLines(note);
 }
 
 // ----------------------------------------------------------------- a person
@@ -5400,61 +3387,6 @@ pub fn ancestorBodyLinesForTest(note: *const Note) f32 {
 //
 // Cached per pubkey for the life of a level, because a virtual list rebuilds its
 // visible rows every frame and a JSON parse per frame is not free.
-
-/// The abbreviated npub exactly as the view renders it, so a test can count how
-/// many times a screen says it without hard-coding the truncation. For tests.
-pub fn npubShortForTest(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
-    return npubShortOf(arena, pubkey);
-}
-
-/// Puts a NIP-05 on a cached profile in a stated verification state, so a view
-/// test can ask what the page shows without a well-known round trip.
-pub fn setProfileNip05ForTest(pubkey: [32]u8, id: []const u8, verified: bool) void {
-    const p = upsertProfile(pubkey) orelse return;
-    const n = @min(id.len, p.nip05_buf.len);
-    @memcpy(p.nip05_buf[0..n], id[0..n]);
-    p.nip05_len = @intCast(n);
-    p.nip05_state = if (verified) .verified else .failed;
-}
-
-/// Fills a cached profile's text fields to whatever length is asked for, so a
-/// sweep can render the WORST case rather than a realistic one.
-///
-/// Every one of these is a stranger's string arriving over a relay, and the
-/// only thing bounding it is the buffer it is copied into. A row that fits a
-/// name is not the question; a row that fits a name of sixty-four characters
-/// is, because that is what the buffer allows and therefore what will
-/// eventually arrive.
-pub fn fillProfileTextForTest(pubkey: [32]u8, name: []const u8, username: []const u8, website: []const u8) void {
-    const p = upsertProfile(pubkey) orelse return;
-    const n = @min(name.len, p.name_buf.len);
-    @memcpy(p.name_buf[0..n], name[0..n]);
-    p.name_len = @intCast(n);
-    const u = @min(username.len, p.username_buf.len);
-    @memcpy(p.username_buf[0..u], username[0..u]);
-    p.username_len = @intCast(u);
-    const w = @min(website.len, p.website_buf.len);
-    @memcpy(p.website_buf[0..w], website[0..w]);
-    p.website_len = @intCast(w);
-}
-
-pub fn verifiedNip05ForTest(pubkey: [32]u8) []const u8 {
-    return verifiedNip05(pubkey);
-}
-
-pub fn profileFooterForTest(model: *const Model, pubkey: [32]u8, shown: usize) u8 {
-    return @intFromEnum(profileFooter(model, pubkey, shown));
-}
-
-pub fn placeTileColorsForTest(m: *const Place) struct { bg: canvas.Color, ink: canvas.Color } {
-    const c = placeTileColors(m);
-    return .{ .bg = c.bg, .ink = c.ink };
-}
-
-/// Whether the mark on screen belongs to the room on screen, for the test.
-pub fn placeLogoShownForTest() bool {
-    return view_place.g_place_logo_state == .loaded and view_place.g_place_logo_id != 0;
-}
 
 /// A real effect queue whose requests are only recorded, so a handler that asks
 /// for a clipboard write or a timer can run to its end in a test. The caller
@@ -5474,275 +3406,6 @@ pub fn inertEffectsForTest() Effects {
     // slot bookkeeping is the pool's, and this is not a test about the pool.
     fx.images = null;
     return fx;
-}
-
-/// A mark loaded and on screen for a given place, the way a finished fetch
-/// leaves it, so a test can walk out of that room and see what stays behind.
-pub fn setPlaceLogoLoadedForTest(id: u64, pubkey: [32]u8, ident: []const u8) void {
-    view_place.g_place_logo_id = id;
-    view_place.g_place_logo_for = pubkey;
-    view_place.g_place_logo_for_ident_len = @intCast(copyBounded(&view_place.g_place_logo_for_ident_buf, ident));
-    view_place.g_place_logo_state = .loaded;
-}
-
-pub fn scanPlaceLogoForTest(fx: *Effects, model: *const Model) void {
-    scanPlaceLogo(fx, model);
-}
-
-/// A fetch in flight, started by a given place.
-pub fn setPlaceLogoAskedForTest(pubkey: [32]u8, ident: []const u8) void {
-    view_place.g_place_logo_asked_for = pubkey;
-    view_place.g_place_logo_asked_ident_len = @intCast(copyBounded(&view_place.g_place_logo_asked_ident_buf, ident));
-    view_place.g_place_logo_state = .fetching;
-}
-
-pub fn placeLogoStateNameForTest() []const u8 {
-    return @tagName(view_place.g_place_logo_state);
-}
-
-/// Hands the logo pipeline a fetched body, the way the effect loop does.
-pub fn deliverPlaceLogoBodyForTest(fx: *Effects, body: []const u8) void {
-    handlePlaceLogoFetched(fx, .{
-        .key = place_logo_fetch_key,
-        .outcome = .ok,
-        .status = 200,
-        .body = body,
-    });
-}
-
-pub fn visibleLenForTest(line: []const u8) usize {
-    return visibleLen(line);
-}
-
-pub fn placeHomeHeightForTest(text: []const u8) f32 {
-    return placeHomeHeight(text);
-}
-
-pub fn stripEmptyImagesForTest(arena: std.mem.Allocator, src: []const u8) []const u8 {
-    return stripEmptyImages(arena, src);
-}
-
-pub fn lowerScopeForTest(scope: []const u8) []const u8 {
-    return lowerScope(scope);
-}
-
-pub fn pausedBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const u8 {
-    var ui = AppUi.init(arena);
-    return pausedBannerText(&ui, queued);
-}
-
-pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize, none_set: bool) []const u8 {
-    var ui = AppUi.init(arena);
-    return offlineBannerText(&ui, queued, none_set);
-}
-
-/// Whether the pool counts as healthy: MOST of it answering, not all of it. The
-/// redesign's at-rest bar reads "4/5 relays" in green while its working bar reads
-/// "3/5" in amber, so the line sits at four fifths. A relay pool always has a
-/// straggler, and a bar that goes amber for one is a bar nobody reads.
-pub fn poolIsHealthyForTest(live: usize) bool {
-    return poolIsHealthy(live);
-}
-
-pub fn askForMediaForTest(note_id: i64) void {
-    askForMedia(note_id);
-}
-
-pub fn forgetAskedMediaForTest() void {
-    view_note.g_media_asked = [_]i64{0} ** asked_cap;
-}
-
-/// The key a quote of `id` is uncovered by, which is the key the same note
-/// carries in the feed.
-pub fn feedKeyForTest(id: [32]u8) i64 {
-    return feedKeyOf(id);
-}
-
-pub fn uncoverNoteForTest(note_id: i64) void {
-    uncoverNote(note_id);
-}
-
-pub fn forgetUncoveredForTest() void {
-    view_note.g_uncovered = [_]i64{0} ** uncovered_cap;
-}
-
-pub fn firstLineOfForTest(text: []const u8, max: usize) []const u8 {
-    return firstLineOf(text, max);
-}
-
-/// Renders just the reply line and returns its concatenated text, so a test can
-/// read what a reader would see without standing up a whole feed.
-pub fn buildReplyContextForTest(arena: std.mem.Allocator, note: *const Note) ![]const u8 {
-    var ui = AppUi.init(arena);
-    const node = replyContext(&ui, note);
-    const tree = try ui.finalize(node);
-    var out: std.ArrayList(u8) = .empty;
-    try collectText(tree.root, arena, &out);
-    return out.items;
-}
-
-pub fn oneLineForTest(ui: *AppUi, text: []const u8) []const u8 {
-    return oneLine(ui, text);
-}
-
-/// Seeds a resolved quote, so a test can render the aside and price it without a
-/// relay. Returns the id it was filed under.
-pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []const u8) void {
-    wantQuote(id);
-    const e = quoteFor(id) orelse return;
-    e.pubkey = pubkey;
-    e.created_at = created_at;
-    // These fixtures were written before a quote entry carried a kind, and
-    // every one of them means "a note". Left at the 0 default they would each
-    // claim to hold an event of a kind nothing can draw.
-    e.kind = 1;
-    const keep = @min(text.len, e.text_buf.len);
-    @memcpy(e.text_buf[0..keep], text[0..keep]);
-    e.text_len = @intCast(keep);
-    e.state = .loaded;
-}
-
-/// Puts a resolved parent in the cache, as an answered fetch would.
-pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
-    wantQuote(id);
-    const q = quoteFor(id) orelse return;
-    q.state = .loaded;
-    q.pubkey = pubkey;
-    // These fixtures were written before a quote entry carried a kind, and
-    // every one of them means "a note". Left at the 0 default they would each
-    // claim to hold an event of a kind nothing can draw.
-    q.kind = 1;
-    const n = @min(text.len, q.text_buf.len);
-    @memcpy(q.text_buf[0..n], text[0..n]);
-    q.text_len = @intCast(n);
-}
-
-/// How many relay hints the cache entry for `id` is holding, or null when there
-/// is no entry. For asserting that a decoded address actually left its hints
-/// somewhere the fetch will find them.
-pub fn quoteHintCountForTest(id: [32]u8) ?u8 {
-    for (&quote_cache.g_quotes) |*q| {
-        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints.count;
-    }
-    return null;
-}
-
-/// The same, for the person an `nprofile1` named.
-pub fn profileHintCountForTest(pubkey: [32]u8) ?u8 {
-    for (&profile_cache.g_wanted) |*w| {
-        if (w.used and std.mem.eql(u8, &w.pubkey, &pubkey)) return w.hints.count;
-    }
-    return null;
-}
-
-pub fn wantQuoteForTest(id: [32]u8) void {
-    wantQuote(id);
-}
-
-/// Wants a quoted event the way an `nevent1` naming relays does.
-pub fn wantQuoteHintedForTest(id: [32]u8, hints: []const []const u8) void {
-    wantQuoteHinted(id, hints);
-}
-
-/// The relays a quote's fetch would dial, empty when it is not cached.
-pub fn quoteHintsForTest(id: [32]u8) RelayHints {
-    for (&quote_cache.g_quotes) |*q| {
-        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints;
-    }
-    return .{};
-}
-
-/// The real fill path, over a real store: what a quote card knows about the
-/// note it draws comes from here and nowhere else.
-pub fn refreshProfilesForTest(store: *nostr.store.Store) void {
-    refreshProfiles(store);
-}
-pub fn quoteTextForTest(id: [32]u8) ?[]const u8 {
-    const q = quoteFor(id) orelse return null;
-    if (q.state != .loaded) return null;
-    return q.text_buf[0..q.text_len];
-}
-pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
-    refreshQuotes(store);
-}
-
-pub fn requeueMissingQuotesForTest() void {
-    requeueMissingQuotes();
-}
-
-pub fn requestWantedQuotesForTest() void {
-    requestWantedQuotes();
-}
-
-pub fn advanceQuoteRoundForTest(rounds: u64) void {
-    quote_cache.g_quote_round +%= rounds;
-}
-
-pub fn rearmWantedQuotesForTest() void {
-    rearmWantedQuotes();
-}
-
-pub fn quoteBackoffRoundsForTest(attempts: u8) u64 {
-    return quoteBackoffRounds(attempts);
-}
-
-/// Marks a cached quote as one its author asked to have covered.
-pub fn warnQuoteForTest(id: [32]u8, reason: []const u8) void {
-    const q = quoteFor(id) orelse return;
-    q.warned = true;
-    @memcpy(q.warning_buf[0..reason.len], reason);
-    q.warning_len = @intCast(reason.len);
-}
-
-pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
-    return quoteFor(id);
-}
-
-pub fn dropQuoteForTest(id: [32]u8) void {
-    for (&quote_cache.g_quotes) |*q| {
-        if (q.used and std.mem.eql(u8, &q.id, &id)) q.* = .{};
-    }
-}
-
-pub fn quotingPillLabelForTest(ui: *AppUi, id: [32]u8) []const u8 {
-    return quotingPillLabel(ui, id);
-}
-
-pub fn quoteBodyLinesForTest(e: *const QuoteEntry) f32 {
-    return quoteBodyLines(e);
-}
-
-/// The media-slot key a quote's picture is filed under.
-pub fn quoteMediaKeyForTest(id: [32]u8) i64 {
-    return quoteMediaKey(id);
-}
-
-/// Where the slot filed under `key` is in its life, and the registry id it
-/// holds (0 for none), or null when no slot exists. Looks without claiming.
-pub fn mediaSlotStateForTest(key: i64) ?struct { state: []const u8, image_id: u64, url: []const u8 } {
-    const m = mediaSlotFor(key) orelse return null;
-    return .{ .state = @tagName(m.state), .image_id = m.image_id, .url = m.url() };
-}
-
-pub fn toggleExpandedForTest(note_id: i64) void {
-    toggleExpanded(note_id);
-}
-
-/// Leaves the slot under `key` the way a finished fetch would: a registry id
-/// taken from the pool, marked loaded at this size. The decode itself needs a
-/// platform codec a test does not have.
-pub fn markMediaLoadedForTest(fx: *Effects, key: i64, width: usize, height: usize) ?u64 {
-    const slot = claimMediaSlot(fx, key) orelse return null;
-    if (slot.image_id == 0) slot.image_id = acquireImageId(fx) orelse return null;
-    slot.state = .loaded;
-    slot.width = width;
-    slot.height = height;
-    rememberAspect(slot.note_id, width, height);
-    return slot.image_id;
-}
-
-pub fn noteRowEstimateForTest(note: *const Note, chrome: f32) f32 {
-    return noteRowEstimate(note, chrome);
 }
 
 const PlazaApp = native_sdk.UiApp(Model, Msg);
@@ -5801,247 +3464,6 @@ fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
 pub const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
 pub const EffectsForTest = Effects;
-
-pub fn writePendingLinkForTest(io: std.Io, dir: *std.Io.Dir, link: []const u8, now_s: i64) void {
-    writePendingLinkIn(io, dir, link, now_s);
-}
-
-pub fn takeWrittenLinkForTest(io: std.Io, dir: *std.Io.Dir, buf: []u8, now_s: i64) ?[]const u8 {
-    return takeWrittenLinkIn(io, dir, buf, now_s);
-}
-
-pub fn captureArgvLinkForTest(link: []const u8) void {
-    if (link.len > links.g_argv_link_buf.len) return;
-    @memcpy(links.g_argv_link_buf[0..link.len], link);
-    links.g_argv_link_len = link.len;
-}
-
-pub fn takePendingLinkForTest(buf: []u8) ?[]const u8 {
-    return takePendingLink(buf);
-}
-
-pub fn placeFeedIndexForTest() u8 {
-    return places.g_place_feed;
-}
-
-pub fn setPlaceInfoForTest(state: PlaceInfo) void {
-    places.g_place_info = state;
-}
-
-pub fn togglePlacesRailForTest() void {
-    togglePlacesRail();
-}
-pub fn setRailForTest(open: bool) void {
-    places.g_rail_open = open;
-}
-
-pub fn forgetPlacesForTest() void {
-    forgetPlaces();
-}
-
-/// The predicate above, for the test: the arrival path it guards needs a store,
-/// a relay and a link, and the decision it makes does not.
-pub fn samePlaceForTest(pubkey: [32]u8, ident: []const u8) bool {
-    var w: @TypeOf(places.g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
-    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
-    return samePlace(w);
-}
-
-/// How many remembered notes a place ARRIVING from a link inherits from the
-/// room already open. The consequence, not the predicate: those ids are saved
-/// onto the arriving place's row, so a room that inherits the wrong ones shows
-/// another place's notes on every later visit, from the rail, forever.
-pub fn arrivalInheritsRoomForTest(pubkey: [32]u8, ident: []const u8) u16 {
-    var m = Place{};
-    m.author = pubkey;
-    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
-    var w: @TypeOf(places.g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
-    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
-    _ = adoptOpenRoom(w, &m);
-    return m.seen_len;
-}
-
-/// Drives the REAL entry path. It spawns a worker that dials and fails without
-/// a relay, which is harmless: the seeding this asserts happens before it.
-pub fn startPlaceFeedForTest(i: usize) void {
-    startPlaceFeed(&places.g_places[i]);
-}
-
-/// Arms the fetch a `plaza://` link arms, without the link or the sockets.
-pub fn armPlaceFetchForTest(pubkey: [32]u8, ident: []const u8) void {
-    var want: @TypeOf(places.g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
-    want.ident_len = @intCast(copyBounded(&want.ident_buf, ident));
-    places.g_place_want = want;
-}
-
-/// One tick of the store-side half of that fetch.
-pub fn refreshPlaceFetchForTest() void {
-    _ = placeFetchStep();
-}
-
-/// The same tick with the reader's side of it: the toast a fetch that ends
-/// without a place leaves.
-pub fn refreshPlaceFetchNoticeForTest(model: *Model) void {
-    refreshPlaceFetch(model);
-}
-
-/// The link has been followed and a copy shown, which is the state the fetch
-/// window is in while it watches for a newer one.
-pub fn markPlaceFetchAppliedForTest() void {
-    if (places.g_place_want) |*w| w.applied = true;
-}
-
-/// Whether the window is still watching. Closed is what walking away must
-/// produce: an open window re-applies its place over the room on screen.
-pub fn placeFetchArmedForTest() bool {
-    return places.g_place_want != null;
-}
-pub fn savePlacesForTest() void {
-    savePlaces();
-}
-
-pub fn setPlaceLinkForTest(state: PlaceLink) void {
-    setPlaceLink(state);
-}
-
-/// Runs a feed worker that belongs to a room already left, against a url that
-/// fails before any socket is opened.
-pub fn runStalePlaceFeedWorkerForTest() void {
-    var url_buf: [place_relay_cap]u8 = undefined;
-    const url = "http://not-a-relay";
-    @memcpy(url_buf[0..url.len], url);
-    const stale = places.g_place_gen.load(.monotonic) -% 1;
-    placeFeedWorker(url_buf, url.len, undefined, 0, stale, undefined, 0);
-}
-
-/// Arrives in a place that has a named feed, which is the ordinary case.
-pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []const u8, feed: []const u8) void {
-    visitPlaceForTest(author, ident, name);
-    if (places.g_place) |*m| {
-        m.feeds[0].name_len = @intCast(copyBounded(&m.feeds[0].name_buf, feed));
-        m.feeds[0].relay_len = @intCast(copyBounded(&m.feeds[0].relay_buf, "wss://example.test"));
-        m.feeds_len = 1;
-    }
-}
-
-pub fn flushPlaceIdsForTest(now_s: i64) void {
-    flushPlaceIds(now_s);
-}
-pub fn setPlaceHomeForTest(text: []const u8) void {
-    if (places.g_place) |*m| m.home_len = @intCast(copyBounded(&m.home_buf, text));
-}
-pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
-    places.g_places[i].seen_len = n;
-}
-
-pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
-    seedPlaceFeed(ids);
-}
-pub fn clearPlaceFeedForTest() void {
-    clearPlaceFeed();
-}
-pub fn rememberPlaceIdsForTest() void {
-    rememberPlaceIds();
-}
-pub fn keptPlaceSeenLenForTest(i: usize) u16 {
-    return places.g_places[i].seen_len;
-}
-pub fn seedFromKeptPlaceForTest(i: usize) void {
-    seedPlaceFeed(places.g_places[i].seen[0..places.g_places[i].seen_len]);
-}
-
-pub fn resetPlacesForTest() void {
-    // The feed ids too, or one test's room leaks into the next one's.
-    clearPlaceFeed();
-    places.g_rail_open = false;
-    places.g_place_info = .closed;
-    places.g_place_flushed_at = 0;
-    places.g_place_flushed_rev = 0;
-    places.g_place = null;
-    places.g_place_feed = 0;
-    places.g_place_kept = false;
-    places.g_visited = null;
-    places.g_place_last = 0;
-    places.g_places = @splat(.{});
-    places.g_places_len = 0;
-}
-
-/// Arrives in a place the way a link does: in it, kept only if it already was.
-pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
-    var m = Place{};
-    m.author = author;
-    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
-    m.name_len = @intCast(copyBounded(&m.name_buf, name));
-    places.g_place = m;
-    places.g_place_feed = 0;
-    places.g_place_kept = placeIndexOf(m.author, m.ident()) != null;
-}
-
-/// Arrives in a place parsed from a real Hallway document.
-///
-/// The other visit helpers build a `Place` by hand, which cannot exercise the
-/// fields the PARSER resolves (the colour, the avatar shape, a feed's kinds),
-/// so a test using them would assert against whatever the test itself set.
-pub fn visitParsedPlaceForTest(gpa: std.mem.Allocator, content: []const u8) bool {
-    var m = parsePlace(gpa, content) orelse return false;
-    m.author = @splat(0x7a);
-    m.ident_len = @intCast(copyBounded(&m.ident_buf, "parsed"));
-    places.g_place = m;
-    places.g_place_feed = 0;
-    places.g_place_kept = placeIndexOf(m.author, m.ident()) != null;
-    return true;
-}
-
-pub fn clearActivePlaceForTest() void {
-    places.g_place = null;
-    places.g_place_feed = 0;
-    places.g_place_kept = false;
-}
-
-pub fn identityInkForTest() canvas.Color {
-    return identityInk();
-}
-
-pub fn roomVerbFillForTest() canvas.Color {
-    return roomVerbFill();
-}
-
-pub fn avatarRadiusForTest(size: f32) f32 {
-    return avatarRadius(size);
-}
-
-pub fn openKeptPlaceForTest(i: usize) void {
-    openKeptPlace(i);
-}
-pub fn goToOwnPlazaForTest() void {
-    goToOwnPlaza();
-}
-pub fn bouncePlaceForTest() void {
-    bouncePlace();
-}
-pub fn stepPlaceForTest(delta: i8) void {
-    stepPlace(delta);
-}
-pub fn activePlaceIndexForTest() ?usize {
-    return activePlaceIndex();
-}
-
-pub fn restoreOpenPlaceForTest() void {
-    restoreOpenPlace();
-}
-
-pub fn bootPlaceIndexForTest() ?usize {
-    return bootPlaceIndex();
-}
-pub fn applyActivePlaceLineForTest(value: []const u8) void {
-    applyActivePlaceLine(value);
-}
-pub fn visitingPlaceForTest() ?*const Place {
-    return visitingPlace();
-}
-pub fn resumeVisitForTest() void {
-    resumeVisit();
-}
 
 pub fn boot(model: *Model, fx: *Effects) void {
     // FIRST, before anything slow. On a cold launch macOS sends the Apple Event
@@ -6263,12 +3685,6 @@ pub fn forgetLevelCountForTest() void {
 /// One tick of the open level's upkeep, for a test.
 pub fn refreshOpenLevelForTest(model: *Model, now: i64) void {
     refreshOpenLevel(model, now);
-}
-
-/// Marks the fetch for generation `seq` as finished, the way its worker does
-/// when every relay has answered, for a test that has no worker.
-pub fn finishLevelFetchForTest(seq: u64) void {
-    navigation.g_thread_done_seq.store(seq, .release);
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -7479,7 +4895,7 @@ pub fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void
 }
 
 /// What a bookmark write did, in the reader's terms.
-fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
+pub fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
     switch (outcome) {
         .published => setToast(model, if (adding) "Bookmarked" else "Bookmark removed"),
         .nothing_to_do => {},
@@ -7499,7 +4915,7 @@ fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
 }
 
 /// What a mute write did, in the reader's terms.
-fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
+pub fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
     switch (outcome) {
         .published => setToast(model, if (muting) "Muted" else "Unmuted"),
         .nothing_to_do => {},
@@ -7519,14 +4935,6 @@ fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
     }
 }
 
-pub fn sayMuteWriteForTest(model: *Model, outcome: MuteWrite, muting: bool) void {
-    sayMuteWrite(model, outcome, muting);
-}
-
-pub fn sayBookmarkWriteForTest(model: *Model, outcome: BookmarkWrite, adding: bool) void {
-    sayBookmarkWrite(model, outcome, adding);
-}
-
 /// Puts `text` on the clipboard. A test build records it instead, because the
 /// effect queue behind `fx` does not exist there and the text is the thing worth
 /// checking: what Plaza hands another client.
@@ -7542,21 +4950,6 @@ var g_last_clipboard_len: usize = 0;
 pub fn lastClipboardForTest() []const u8 {
     return g_last_clipboard[0..g_last_clipboard_len];
 }
-
-/// Every sentence `noListToast` can say, for the test that checks each fits.
-pub fn noListToastsForTest() [9][]const u8 {
-    var out: [9][]const u8 = undefined;
-    var n: usize = 0;
-    inline for (.{ "follow list", "mute list", "bookmarks" }) |what| {
-        for ([_]OwnListsRead{ .reading, .incomplete, .none_found }) |read| {
-            out[n] = noListToastIn(what, read);
-            n += 1;
-        }
-    }
-    return out;
-}
-
-pub const place_looking_toast_for_test = place_looking_toast;
 
 pub fn setToast(model: *Model, text: []const u8) void {
     const n = @min(text.len, model.toast_buf.len);
@@ -7580,227 +4973,14 @@ pub const ProfileStage = enum { fetching, absent, unread, have, saving, sent, fa
 /// reader's profile actually uses.
 pub const ProfileNameKey = enum { display_name, display_name_legacy, name };
 
-pub fn noteOwnContactsAnsweredForTest(pk: [32]u8) void {
-    noteOwnContactsAnswered(pk);
-}
-
-// There was a `g_own_relays_answered` here, set by the first EOSE from any relay
-// and read as permission to publish a kind:10002. It is GONE rather than merely
-// unused: an inference that wrong, left sitting in the file under a reassuring
-// name, is one grep away from becoming a gate again. `canWriteRelayList` is the
-// rule now, and the reason is written there.
-
-/// This account's newest stored event of `kind`, its tags flattened to one
-/// string. For tests that need to see what a publish actually WROTE rather than
-/// whether it returned true: a splice that quietly drops half the list still
-/// publishes, so the return value proves nothing about what went out.
-/// This account's newest stored event of `kind`, its CONTENT. For the one
-/// property that tags cannot show: that an encrypted half nobody here reads was
-/// carried through a write rather than replaced with nothing.
-pub fn ownRecordContentForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
-    const own = ownRecordJson(gpa, kind) orelse return null;
-    defer freeOwnProfile(gpa, own);
-    return gpa.dupe(u8, own.json) catch null;
-}
-
-pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
-    const own = ownRecordJson(gpa, kind) orelse return null;
-    defer freeOwnProfile(gpa, own);
-    var out = std.ArrayList(u8).empty;
-    for (own.tags) |tag| {
-        for (tag) |field| {
-            out.appendSlice(gpa, field) catch return null;
-            out.append(gpa, ' ') catch return null;
-        }
-        out.append(gpa, '\n') catch return null;
-    }
-    return out.toOwnedSlice(gpa) catch null;
-}
-
-/// Publishes one event the way any press does, so a test can ask what actually
-/// went out rather than what a helper built.
-pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
-    const gpa = std.heap.page_allocator;
-    const owned = gpa.dupe(u8, content) catch return;
-    signAndPublish(fx, gpa, created, kind, tags, owned, false, .none, null);
-}
-
 pub fn activePubkeyForTest() ?[32]u8 {
     return activePubkey();
-}
-
-pub fn forgetOwnProfileAnswerForTest() void {
-    forgetOwnProfileAnswer();
-}
-
-/// Records an answer the way the worker's `defer` does.
-pub fn recordOwnProfileAnswerForTest(pk: [32]u8, answered: bool) void {
-    lockOwnProfile();
-    own_profile.g_own_profile_asked_for = pk;
-    own_profile.g_own_profile_answered.store(answered, .release);
-    unlockOwnProfile();
-}
-
-pub fn ownProfileAnsweredForTest() bool {
-    return ownProfileAnswered();
-}
-
-pub fn seedProfileFieldsForTest(model: *Model, json: []const u8, keep_typed: bool) void {
-    seedProfileFields(model, json, keep_typed);
-}
-
-/// The merge, exposed so a test can prove what survives it. This is the whole
-/// safety argument of the Edit profile sheet in one function.
-pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
-    return mergeProfileJson(gpa, existing, model);
-}
-
-/// Drives the name beat's whole write, not just its merge. The tags it forwards
-/// are invisible to `mergeNameJsonForTest`, which only sees the content.
-pub fn publishNameForTest(model: *Model, fx: *Effects) void {
-    publishName(model, fx);
-}
-
-pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
-    return mergeNameJson(gpa, existing, name);
-}
-
-pub fn askVerdictForTest(msg: nostr.message.RelayMessage) []const u8 {
-    return @tagName(askVerdict(msg));
-}
-
-/// The replay seam, exercised without disk or relays. For tests.
-pub fn replayPendingForTest(model: *Model) void {
-    replayPending(model);
-}
-
-/// Restores a helper identity from a session pubkey hex. For tests.
-pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
-    return restoreHelperIdentity(pubkey_hex);
-}
-
-/// Sets what the create ceremony has reported, which is the only thing that
-/// tells an appearing key apart from any other. For tests.
-pub fn setCeremonyForTest(state: enum { none, running, created }) void {
-    keyholder.g_ceremony = switch (state) {
-        .none => .none,
-        .running => .running,
-        .created => .created,
-    };
-    keyholder.g_ceremony_adopted = false;
-}
-
-/// Parks the daemon health flag at "unreachable", so a queued setup stays queued
-/// instead of reaching for an effects layer a unit test does not have. For tests.
-pub fn setHelperUnreachableForTest() void {
-    keyholder.g_helper_state.store(0, .release);
-    keyholder.g_helper_setup = .none;
-    keyholder.g_helper_pending_in_flight = .none;
-}
-
-pub fn ceremonyOwesNameForTest() bool {
-    return keyholder.g_ceremony_adopted;
-}
-
-pub fn identityMintedForTest() bool {
-    return own_lists.g_identity_minted_here;
-}
-
-/// Delivers the ceremony window's exit, which is how Plaza learns what it did.
-/// For tests.
-pub fn handleNotaryExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
-    handleNotaryExited(model, e);
-}
-
-/// Delivers a daemon /pubkey answer, which is how a key made or imported in the
-/// other process reaches Plaza. For tests.
-pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectResponse) void {
-    handleHelperPubkey(model, response);
-}
-
-/// Starts connecting to a bunker the way `connectRemoteSigner` does, without a
-/// socket or a thread: the connection state is set, nobody is signed in, and a
-/// `connect` request is waiting for its answer. Returns that request's id. For
-/// tests.
-pub fn beginBunkerConnectForTest(pubkey: [32]u8, id_out: *[24]u8) []const u8 {
-    remote_signer.g_remote_pubkey = pubkey;
-    keyholder.g_signer_kind = .remote;
-    remote_signer.g_remote_status.store(1, .release);
-    remote_signer.g_remote_sign_notice.store(false, .release);
-    remote_signer.g_remote_confirming.store(true, .release);
-    login.g_login_error.store(@intFromEnum(LoginError.none), .release);
-    _ = remote_signer.g_remote_generation.fetchAdd(1, .monotonic);
-    const id = "connect-for-test";
-    @memcpy(id_out[0..id.len], id);
-    _ = registerPending(id, .connect, null, false, .none, 0, no_half_id, .{});
-    return id_out[0..id.len];
 }
 
 /// Lends the app an io for the one place a test reaches for it (minting the
 /// ephemeral client key). For tests.
 pub fn setIoForTest(io: ?std.Io) void {
     g_io = io;
-}
-
-/// The id of the `connect` request a pasted link left waiting, if any. For
-/// tests.
-pub fn pendingConnectIdForTest(out: *[24]u8) ?[]const u8 {
-    pendingLock();
-    defer pendingUnlock();
-    for (&remote_signer.g_pending) |*slot| {
-        if (slot.active and slot.method == .connect) {
-            @memcpy(out[0..slot.id_len], slot.id());
-            return out[0..slot.id_len];
-        }
-    }
-    return null;
-}
-
-/// What the listener does with a `connect` answer from the signer. For tests.
-pub fn answerBunkerConnectForTest(id: []const u8) void {
-    _ = takeAnswered(id);
-}
-
-/// Whether the pairing secret `needle` is still anywhere in the buffer that
-/// held it, or a client key is still held. For tests.
-pub fn remoteSecretHeldForTest(needle: []const u8) bool {
-    if (remote_signer.g_remote_client_kp != null) return true;
-    return std.mem.indexOf(u8, &remote_signer.g_remote_secret_buf, needle) != null;
-}
-
-/// Which listener generation is current, so a test can see one was stopped.
-/// For tests.
-pub fn remoteGenerationForTest() u64 {
-    return remote_signer.g_remote_generation.load(.acquire);
-}
-
-pub fn connectWentQuietForTest() bool {
-    return connectWentQuiet();
-}
-
-pub fn driveBunkerConnectForTest(model: *Model) void {
-    driveBunkerConnect(model);
-}
-
-/// Puts every piece of bunker state back to a guest's. For tests.
-pub fn resetBunkerConnectForTest() void {
-    abandonRemoteSigner(.none);
-    remote_signer.g_remote_confirming.store(false, .release);
-}
-
-/// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
-/// 3 unreachable) plus a remote identity, so the presentation is testable
-/// without a live bunker. For tests.
-pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
-    keyholder.g_signer_kind = if (status == 0) .helper else .remote;
-    remote_signer.g_remote_status.store(status, .release);
-    remote_signer.g_remote_sign_notice.store(false, .release);
-    if (npub_len > 0) {
-        const stub = "npub1testsigner";
-        const n = @min(stub.len, keyholder.g_identity_npub_buf.len);
-        @memcpy(keyholder.g_identity_npub_buf[0..n], stub[0..n]);
-        keyholder.g_identity_npub_len = n;
-    } else keyholder.g_identity_npub_len = 0;
 }
 
 /// Switches to the feed and brings the store + ingest pool up if they are not
@@ -7846,40 +5026,6 @@ pub fn initialModel() Model {
 // echoes our own note back through the ingest subscriptions it collapses onto
 // the local copy.
 
-pub fn replyHeldForTest() bool {
-    return compose.g_reply_due_s != 0;
-}
-
-pub fn holdReplyForTest(now_s: i64) void {
-    compose.g_reply_due_s = now_s + (if (compose.g_post_delay_s == 0) @as(i64, 5) else compose.g_post_delay_s);
-}
-
-pub fn postDelayForTest() i64 {
-    return compose.g_post_delay_s;
-}
-
-/// Gives the open place one write relay of its own, the way a parsed document
-/// would. The routing tests are about WHEN the relay list is read, not about
-/// parsing it.
-pub fn setPlaceWriteRelayForTest(url: []const u8) void {
-    if (places.g_place == null) return;
-    const m = &places.g_place.?;
-    m.write_relay_lens[0] = @intCast(copyBounded(&m.write_relays[0], url));
-    m.write_relays_len = 1;
-}
-
-pub fn setPostDelayForTest(seconds: i64) void {
-    compose.g_post_delay_s = seconds;
-}
-
-pub fn postHeldForTest() bool {
-    return compose.g_post_due_s != 0;
-}
-
-pub fn holdPostForTest(now_s: i64) void {
-    compose.g_post_due_s = now_s + compose.g_post_delay_s;
-}
-
 // ------------------------------------------------------------ picture upload
 //
 // Putting a picture into a note, an avatar or a banner.
@@ -7907,159 +5053,9 @@ pub fn holdPostForTest(now_s: i64) void {
 // what the worker is reading. The UI holds one reference; each worker holds one
 // while it runs.
 
-pub fn appendPictureToDraftForTest(model: *Model, url: []const u8) bool {
-    return appendPictureToDraft(model, url);
-}
-
-/// Records a picture as if it had just been uploaded. For tests.
-pub fn rememberUploadedForTest(url: []const u8, mime: []const u8, sha_hex: []const u8, size: usize, width: u32, height: u32, hash: []const u8, alt: []const u8) void {
-    var entry: UploadedPicture = .{ .used = true, .mime = mime, .size = size, .width = width, .height = height };
-    @memcpy(entry.url_buf[0..url.len], url);
-    entry.url_len = @intCast(url.len);
-    @memcpy(entry.sha_buf[0..sha_hex.len], sha_hex);
-    @memcpy(entry.blur_buf[0..hash.len], hash);
-    entry.blur_len = @intCast(hash.len);
-    @memcpy(entry.alt_buf[0..alt.len], alt);
-    entry.alt_len = @intCast(alt.len);
-    uploads.g_uploaded[uploads.g_uploaded_next % uploads.g_uploaded.len] = entry;
-    uploads.g_uploaded_next +%= 1;
-}
-
-pub fn forgetUploadedForTest() void {
-    uploads.g_uploaded = [_]UploadedPicture{.{}} ** 8;
-    uploads.g_uploaded_next = 0;
-}
-
-// Test seams for the upload: the file dialog stood in for, the phases read, and
-// the stages that happen on a thread or in a signer driven by hand.
-
-pub fn setPickPathForTest(path: ?[]const u8) void {
-    uploads.g_pick_path_override = path;
-}
-
-pub fn uploadPickForTest(model: *Model, fx: *Effects, target: u8) void {
-    uploadPick(model, fx, std.enums.fromInt(UploadTarget, target) orelse return);
-}
-
-pub fn uploadGoForTest(model: *Model, fx: *Effects) void {
-    uploadGo(model, fx);
-}
-
-pub fn uploadRetryForTest(model: *Model, fx: *Effects) void {
-    uploadRetry(model, fx);
-}
-
-pub fn uploadCancelForTest(model: *Model) void {
-    uploadCancel(model);
-}
-
-pub fn driveUploadForTest(model: *Model) void {
-    driveUpload(model);
-}
-
-pub fn dropUploadForTest() void {
-    dropUpload();
-}
-
-/// The phase of the job on screen, or "none".
-pub fn uploadStateForTest() []const u8 {
-    const job = uploads.g_upload orelse return "none";
-    return @tagName(job.phase());
-}
-
-/// Why the job failed, or empty.
-pub fn uploadMessageForTest() []const u8 {
-    const job = uploads.g_upload orelse return "";
-    return job.message();
-}
-
-/// Moves the job's token back in time, as if it had been signed `seconds` ago.
-pub fn ageUploadTokenForTest(seconds: i64) void {
-    const job = uploads.g_upload orelse return;
-    job.signing_since_s -= seconds;
-}
-
-pub fn uploadSentBytesForTest() usize {
-    const job = uploads.g_upload orelse return 0;
-    return job.progress.sent.load(.acquire);
-}
-
-/// Makes `urls` this account's server list, as if a kind:10063 had been read.
-pub fn setBlossomServersForTest(urls: []const []const u8) void {
-    const gpa = std.heap.page_allocator;
-    const tags = gpa.alloc(nostr.event.Tag, urls.len) catch return;
-    for (urls, 0..) |url, i| tags[i] = gpa.dupe([]const u8, &.{ "server", url }) catch return;
-    setBlossomServers(tags, 1);
-}
-
-pub fn forgetBlossomForTest() void {
-    forgetBlossom();
-}
-
-pub fn loadBlossomFromStoreForTest() void {
-    loadBlossomFromStore();
-}
-
-pub fn ingestAndPublishForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
-    ingestAndPublish(gpa, ev, null, .none);
-}
-
-pub fn clearLastPublishedForTest() void {
-    keyholder.g_last_published = null;
-    keyholder.g_last_published_tags = &.{};
-}
-
-pub fn ownRecordCreatedAtForTest(kind: u16) i64 {
-    return ownRecordCreatedAt(kind);
-}
-
-/// A token as the bunker's listener thread would park it.
-pub fn parkUploadSignForTest(event_json: ?[]const u8) void {
-    parkUploadSign(event_json);
-}
-
-pub fn tokenNamesFileForTest(tags: []const nostr.event.Tag, sha256_hex: []const u8, now: i64) bool {
-    return tokenNamesFile(tags, sha256_hex, now);
-}
-
 /// The clock a token's expiry is checked against.
 pub fn nowSecondsForTest() i64 {
     return nowSeconds();
-}
-
-/// Says the probe found nothing on any relay, for the account that is signed in.
-pub fn markBlossomProbeCleanForTest(clean: bool) void {
-    lockBlossom();
-    media_servers.g_blossom_probe_for = activePubkey();
-    unlockBlossom();
-    media_servers.g_blossom_probe_state.store(if (clean) probe_clean else probe_unknown, .release);
-}
-
-// ------------------------------------------------------- the reader's servers
-
-pub fn blossomProbeWantedForTest() bool {
-    const pk = activePubkey() orelse return false;
-    lockBlossom();
-    defer unlockBlossom();
-    return blossomProbeWantedUnlocked(pk);
-}
-
-pub fn probeReplyAnswersForTest(tag: std.meta.Tag(nostr.message.RelayMessage)) bool {
-    return probeReplyAnswers(tag);
-}
-
-pub fn writeBlossomServersForTest(fx: *Effects, add: ?[]const u8, remove: ?[]const u8) BlossomWrite {
-    return writeBlossomServers(fx, add, remove);
-}
-
-pub fn blossomServersForTest(out: *[blossom.max_servers][]const u8) usize {
-    const s = uploadServers();
-    for (0..s.count) |i| out[i] = std.heap.page_allocator.dupe(u8, s.at(i)) catch "";
-    return s.count;
-}
-
-pub fn blossomOwnListForTest() bool {
-    return uploadServers().own;
 }
 
 pub const BlossomEdit = enum { none, invalid, busy, unread, full, failed };
@@ -8074,19 +5070,6 @@ pub const BlossomEdit = enum { none, invalid, busy, unread, full, failed };
 // and the reaction publishes in the background. Un-like is a NIP-09 kind:5
 // deletion e-tagging our own reaction, since NIP-25 has no un-react. A guest
 // press cannot sign, so it is remembered and completed after sign-in.
-
-pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {
-    return notifiedBy(content, out);
-}
-
-pub fn deletableTargetKindForTest(model: *Model, note_id: i64) ?u16 {
-    const t = deletableTarget(model, note_id) orelse return null;
-    return t.kind;
-}
-
-pub fn drivePendingIntentForTest(model: *Model, fx: *Effects) void {
-    drivePendingIntent(model, fx);
-}
 
 // -------------------------------------------------------------------- the outbox
 //
@@ -8107,123 +5090,6 @@ pub fn drivePendingIntentForTest(model: *Model, fx: *Effects) void {
 // it is a record of what has not been acknowledged yet, drained whenever a relay
 // comes back.
 
-pub fn outboxHasRoomForTest() bool {
-    return outboxHasRoom();
-}
-
-/// The queue's own seams, so a test drives the real state machine rather than a
-/// copy of it.
-pub fn resetOutboxForTest() void {
-    outboxLock();
-    defer outboxUnlock();
-    for (&outbox.g_outbox) |*e| e.* = .{};
-    relay_conn.g_outbox_woke_at.store(0, .monotonic);
-    relay_conn.g_outbox_woke_ever.store(false, .monotonic);
-}
-
-pub fn outboxStateForTest(id: [32]u8) ?OutboxState {
-    outboxLock();
-    defer outboxUnlock();
-    const e = outboxEntryFor(id) orelse return null;
-    return e.state();
-}
-
-pub fn outboxRoundsForTest(id: [32]u8) ?u8 {
-    outboxLock();
-    defer outboxUnlock();
-    const e = outboxEntryFor(id) orelse return null;
-    return e.rounds;
-}
-
-pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
-    return enqueueOutbox(id, author, now_s, .none);
-}
-
-pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
-    recordOutboxAck(id, relay_index, accepted);
-}
-
-pub fn countOutboxRoundForTest(id: [32]u8) void {
-    markOutboxSending(id, true);
-    markOutboxSending(id, false);
-}
-
-pub fn sweepOutboxForTest(now_s: i64) void {
-    sweepOutbox(now_s);
-}
-
-pub fn outboxRetryDelayForTest(rounds: u8) i64 {
-    return outboxRetryDelay(rounds);
-}
-
-pub const rounds_before_stuck_for_test = rounds_before_stuck;
-pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
-
-pub fn collectOutboxDueForTest(ids: *[outbox_cap][32]u8, now_s: i64) usize {
-    return collectOutboxDue(ids, now_s);
-}
-
-pub fn syncOutboxOwnerForTest() void {
-    syncOutboxOwner();
-}
-
-pub fn loadOutboxForTest(owner: [32]u8) void {
-    loadOutbox(owner);
-}
-
-pub fn saveOutboxForTest() void {
-    saveOutbox();
-}
-
-pub fn outboxOwnerForTest() ?[32]u8 {
-    return outbox.g_outbox_owner;
-}
-
-pub fn clearOutboxOwnerForTest() void {
-    outbox.g_outbox_owner = null;
-}
-
-pub fn outboxAuthorAtForTest(i: usize) ?[32]u8 {
-    outboxLock();
-    defer outboxUnlock();
-    if (!outbox.g_outbox[i].used) return null;
-    return outbox.g_outbox[i].author;
-}
-
-pub fn outboxUsedSlotsForTest() usize {
-    outboxLock();
-    defer outboxUnlock();
-    var n: usize = 0;
-    for (&outbox.g_outbox) |*e| {
-        if (e.used) n += 1;
-    }
-    return n;
-}
-
-pub const outbox_cap_for_test = outbox_cap;
-
-/// Whether `url` is already one of the reader's own relays.
-pub fn poolHasRelayForTest(url: []const u8) bool {
-    return poolHasRelay(url);
-}
-
-/// What the route a held note is carrying names, for the test: the relay list a
-/// publish walk would actually dial, taken from the value and not from whatever
-/// room happens to be open when it is read.
-pub fn heldRouteRelaysForTest(out: [][]const u8) usize {
-    var n: usize = 0;
-    while (n < compose.g_held_route.len and n < out.len) : (n += 1) out[n] = compose.g_held_route.url(n);
-    return n;
-}
-
-pub fn routeForOpenPlaceRelaysForTest(out: [][]const u8) usize {
-    const r = routeForOpenPlace();
-    outbox.g_route_probe = r;
-    var n: usize = 0;
-    while (n < outbox.g_route_probe.len and n < out.len) : (n += 1) out[n] = outbox.g_route_probe.url(n);
-    return n;
-}
-
 // ------------------------------------------------------------------------ threads
 //
 // A thread is the focused note plus the kind:1 replies that e-tag it. It is
@@ -8232,48 +5098,6 @@ pub fn routeForOpenPlaceRelaysForTest(out: [][]const u8) usize {
 // fires a one-shot fetch of the rest (with their engagement) into the store; the
 // replies are cached in the model so they are pressable (open as a sub-thread)
 // and get their pictures fetched, the same local-first path the feed uses.
-
-/// The level bookkeeping, for a test that walks a stack up and down. Both take
-/// the same paths the app does, so what they assert is what a reader gets.
-pub fn enterThreadForTest(model: *Model, root: Note) void {
-    enterThread(model, root);
-}
-
-pub fn closeThreadForTest(model: *Model) void {
-    closeThread(model);
-}
-
-/// The thread a kept reply is filed under, for a test of where a reply went.
-pub fn keptReplyDraftForTest(event_id: [32]u8) ?[]const u8 {
-    for (&drafts.g_reply_drafts) |*d| {
-        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) return d.text[0..d.len];
-    }
-    return null;
-}
-
-pub fn feedEndLatchesForTest(asked: usize, answered: usize, added: usize) bool {
-    return feedEndLatches(asked, answered, added);
-}
-pub fn setFeedEndForTest() void {
-    navigation.g_feed_end_reached.store(true, .monotonic);
-}
-
-pub fn resetFeedEndForTest() void {
-    resetFeedEnd();
-    navigation.g_older_busy.store(false, .monotonic);
-}
-
-pub fn openTopicForTest(model: *Model, topic: []const u8) void {
-    openTopic(model, topic);
-}
-
-pub fn openBookmarksForTest(model: *Model) void {
-    openBookmarks(model);
-}
-
-pub fn enterProfileForTest(model: *Model, pubkey: [32]u8) void {
-    enterProfile(model, pubkey);
-}
 
 // ------------------------------------------------------- finding a person
 //
@@ -8284,194 +5108,6 @@ pub fn enterProfileForTest(model: *Model, pubkey: [32]u8) void {
 // as they land and each marked with the relay that gave it.
 
 // --- test seams
-
-/// Back to a fresh start: no index, no rows, no relay state.
-pub fn searchResetForTest() void {
-    searchReset();
-    lockSearchIndex();
-    people_search.g_search_index.deinit(std.heap.page_allocator);
-    people_search.g_search_index_ready = false;
-    unlockSearchIndex();
-    people_search.g_search_asked = 0;
-    people_search.g_search_typed_ms = 0;
-    people_search.g_nip05_ask = null;
-}
-
-/// Builds the index now, on this thread, from the store.
-pub fn searchIndexRefreshForTest() void {
-    searchIndexRefresh();
-}
-
-pub fn searchIndexLenForTest() usize {
-    lockSearchIndex();
-    defer unlockSearchIndex();
-    return people_search.g_search_index.entries.len;
-}
-
-pub fn searchRowCountForTest() usize {
-    return people_search.g_search_len;
-}
-
-pub fn searchRowPubkeyForTest(i: usize) [32]u8 {
-    return people_search.g_search_rows[i].pubkey;
-}
-
-pub fn searchRowLocalForTest(i: usize) bool {
-    return people_search.g_search_rows[i].local;
-}
-
-/// Bit `n` set means search relay `n` returned this row.
-pub fn searchRowRelaysForTest(i: usize) u8 {
-    return people_search.g_search_rows[i].relays;
-}
-
-pub fn searchTickForTest(model: *const Model, now_ms: i64) void {
-    searchTick(model, now_ms);
-}
-
-/// Whether the term on screen has been put to the relays.
-pub fn searchAskedForTest() bool {
-    return people_search.g_search_term_len > 0 and people_search.g_search_asked == people_search.g_search_gen.load(.acquire);
-}
-
-pub fn searchGenForTest() u32 {
-    return people_search.g_search_gen.load(.acquire);
-}
-
-/// A relay thread's hand-off, without the thread.
-pub const search_inbox_cap_for_test = search_inbox_cap;
-
-pub fn searchArrivedForTest(gen: u32, relay: u8, pubkey: [32]u8) void {
-    searchArrived(gen, relay, pubkey);
-}
-
-/// What a relay thread does with one event.
-pub fn searchAcceptForTest(gen: u32, relay: u8, signer: nostr.keys.Signer, ev: nostr.event.Event) bool {
-    const job = SearchJob{ .gen = gen, .relay = relay, .url = "", .term = undefined, .term_len = 0 };
-    return searchAccept(std.heap.page_allocator, signer, job, ev);
-}
-
-pub fn searchSetStatusForTest(relay: usize, state: search.RelayState, count: u16) void {
-    people_search.g_search_status[relay].store((search.Status{ .gen = people_search.g_search_gen.load(.acquire), .state = state, .count = count }).pack(), .release);
-}
-
-pub fn searchRelayCountForTest() usize {
-    return searchRelays().len;
-}
-
-pub fn searchRelayUrlForTest(i: usize) []const u8 {
-    return searchRelays()[i];
-}
-
-pub fn nip05AskedForTest() bool {
-    return people_search.g_nip05_ask != null;
-}
-
-pub fn handleNip05FoundForTest(model: *Model, response: native_sdk.EffectResponse) void {
-    handleNip05Found(model, response);
-}
-
-/// The key the lookup now awaited went out under.
-pub fn nip05AskKeyForTest() u64 {
-    return people_search.g_nip05_ask_key;
-}
-pub const search_scan_page_for_test = search_scan_page;
-
-/// Drives the REAL entry path, so what the test asserts is what a reader gets.
-pub fn openEventForTest(model: *Model, id: [32]u8) void {
-    openEvent(model, id);
-}
-
-/// One tick of the store-side half of that fetch.
-pub fn refreshEventFetchForTest(model: *Model) void {
-    refreshEventFetch(model);
-}
-
-/// Whether the window is still watching. Closed is what both walking away and
-/// arriving must produce: an open window keeps reading the store every tick.
-pub fn eventFetchArmedForTest() bool {
-    return navigation.g_event_want != null;
-}
-
-pub fn forgetEventFetchForTest() void {
-    navigation.g_event_want = null;
-}
-
-pub fn goHomeForTest(model: *Model) void {
-    goHome(model);
-}
-
-/// The REQ a topic sends, as the relay receives it.
-pub fn topicReqForTest(gpa: std.mem.Allocator, topic: []const u8) ![]u8 {
-    const values = [_][]const u8{topic};
-    var tags: [1]nostr.filter.TagFilter = undefined;
-    const filters = [_]nostr.filter.Filter{topicFilter(&values, &tags)};
-    return nostr.message.encodeReq(gpa, "plaza-topic", &filters);
-}
-
-pub fn roundReachForTest(seen: []ProfileSeen) ?i64 {
-    return roundReach(seen);
-}
-
-pub fn writeRelaysOfForTest(ev: nostr.event.Event, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
-    return writeRelaysOf(ev, out, lens);
-}
-
-pub fn profileTargetsForTest(pubkey: [32]u8, out: *[profile_round_targets][96]u8, lens: *[profile_round_targets]u8) usize {
-    return profileTargets(pubkey, out, lens);
-}
-
-pub fn profileEndReachedForTest(pubkey: [32]u8) bool {
-    return profileEndReached(pubkey);
-}
-
-pub fn setProfileEndForTest(pubkey: [32]u8) void {
-    profile_notes.g_profile_end.store(profileEndKey(pubkey), .monotonic);
-}
-
-pub fn resetProfileEndForTest() void {
-    resetProfileEnd();
-    profile_notes.g_profile_older_busy.store(false, .monotonic);
-    profile_notes.g_profile_older_ask = null;
-}
-
-pub fn profileOlderAskForTest() ?ProfileOlderAsk {
-    return profile_notes.g_profile_older_ask;
-}
-
-/// Records that a round for `pubkey` reached back to `at`, the way a relay
-/// answer does, for a test that has no relay.
-pub fn noteProfileReachForTest(pubkey: [32]u8, at: i64) void {
-    noteProfileReach(pubkey, at);
-}
-
-pub fn profileReachForTest(pubkey: [32]u8) ?i64 {
-    return profileReach(pubkey);
-}
-
-pub fn profileRoundEndedForTest(asked: usize, answered: usize, added: usize, older: usize) bool {
-    return profileRoundEnded(.{ .asked = asked, .answered = answered, .added = added, .older = older });
-}
-
-/// Puts the page's first fetch back in flight, or lands it, for a test that has
-/// no socket to do either.
-pub fn setFirstProfileFetchOutForTest(model: *Model, out: bool) void {
-    const done = navigation.g_thread_done_seq.load(.acquire);
-    if (out) {
-        model.thread_seq = done + 1;
-    } else {
-        navigation.g_thread_done_seq.store(model.thread_seq, .release);
-    }
-}
-
-pub fn loadOlderProfileForTest(model: *Model) void {
-    loadOlderProfile(model);
-}
-
-pub fn loadAtProfileBottomForTest(model: *Model, bottom_in_view: bool) void {
-    profile_notes.g_profile_bottom_in_view = bottom_in_view;
-    loadAtProfileBottom(model);
-}
 
 /// Fetches a note's replies (and their engagement) into the store, on a detached
 /// thread. One dial per relay: opening a thread is a rare, human-paced action, so
@@ -8494,35 +5130,6 @@ pub fn loadAtProfileBottomForTest(model: *Model, bottom_in_view: bool) void {
 // result, and doing it properly means a `checked_at` per pubkey in the store
 // with a staleness rule, which is its own change.
 
-pub fn sweepRelayListsForTest() void {
-    sweepRelayLists();
-}
-pub fn collectUnroutedForTest(out: [][32]u8) usize {
-    return collectUnrouted(out);
-}
-pub fn indexerRelaysForTest() []const []const u8 {
-    return &indexer_relays;
-}
-pub fn indexerChunkForTest() usize {
-    return indexer_chunk;
-}
-pub fn resetIndexerAskedForTest() void {
-    routing.g_indexer_asked_len = 0;
-    routing.g_indexed.store(0, .monotonic);
-}
-pub fn markIndexerAskedForTest(pk: [32]u8) void {
-    if (routing.g_indexer_asked_len >= routing.g_indexer_asked.len) return;
-    routing.g_indexer_asked[routing.g_indexer_asked_len] = pk;
-    routing.g_indexer_asked_len += 1;
-}
-pub fn indexerAskedLenForTest() usize {
-    return routing.g_indexer_asked_len;
-}
-
-pub fn relayFetchAllowedForTest() bool {
-    return relayFetchAllowed();
-}
-
 // ------------------------------------------------------- remote signer (NIP-46)
 //
 // Signing can be routed to an external signer (Notary) over NIP-46 so the user's
@@ -8534,10 +5141,6 @@ pub fn relayFetchAllowedForTest() bool {
 // out on its own short-lived connection, so a blocked receive never stalls a
 // send. A signed note returns as a response `result`, stored and published to
 // the feed pool exactly like a locally signed one.
-
-pub fn remoteDecryptMethodNameForTest(payload: []const u8) []const u8 {
-    return @tagName(remoteDecryptMethod(payload));
-}
 
 // -------------------------------------------------------------------- app run
 
@@ -8831,49 +5434,6 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 // (Notary, over NIP-46) so the key never touches the client is the next
 // onboarding option, and swaps in at `signAndPublish`.
 
-/// The document one place writes, for the round-trip test.
-pub fn writePlaceDocumentForTest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), m: *const Place) !void {
-    return writePlaceDocument(gpa, out, m);
-}
-
-pub fn settingsWritesForTest() usize {
-    return prefs.g_settings_writes;
-}
-
-pub fn writeDraftForTest(io: std.Io, dir: *std.Io.Dir, text: []const u8, warn: ?[]const u8) void {
-    writeDraft(io, dir, text, warn);
-}
-
-pub fn draftWarningForModelForTest(model: *const Model) ?[]const u8 {
-    return draftWarningOf(model);
-}
-
-/// Restores a launch's composer from `dir`, the way startup does.
-pub fn loadDraftIntoForTest(io: std.Io, dir: *std.Io.Dir, model: *Model) void {
-    var draft_buf: [note_content_cap]u8 = undefined;
-    var warn_buf: [warning_input_capacity]u8 = undefined;
-    const stashed = readDraft(io, dir, &draft_buf, &warn_buf);
-    applyStashedDraft(model, stashed);
-}
-
-/// Logs out: deletes the session (and, for a local key, the key file itself),
-/// resets the identity globals, and returns to onboarding. The feed store and
-/// its ingest threads keep running (they serve the starter pack regardless of
-/// who is signed in); a subsequent sign-in reuses them. The user is never locked
-/// in, a local key can always be copied from Settings first, and a remote
-/// signer keeps the user's key throughout.
-/// Drives the whole sign-out, so a test can assert what does NOT survive it. The
-/// list of things it clears is the interesting part, and every one of them was
-/// added after something of the previous account's turned up under the next
-/// account's key.
-pub fn performLogoutForTest(model: *Model, fx: *Effects) void {
-    performLogout(model, fx);
-}
-
-pub fn loggedOutPubkeyForTest() ?[32]u8 {
-    return keyholder.g_logged_out_pk;
-}
-
 // ----------------------------------------------------------- background ingest
 //
 // Each relay's ingest loop runs on its own thread with its own `std.Io.Threaded`
@@ -8881,47 +5441,6 @@ pub fn loggedOutPubkeyForTest() ?[32]u8 {
 // across threads, the exact shape the Notary daemon uses per relay. It dials,
 // subscribes for recent kind:1, verifies each event, and writes it into the
 // shared store; the UI thread reads it back through `Model.refresh`.
-
-/// Opens, or replaces, the engagement subscription over the first `count`
-/// watched notes.
-///
-/// A REQ under an existing id IS a replacement, so widening the watched set
-/// costs one message and no CLOSE.
-/// Records a feed note's id so its engagement can be watched, deduped and
-/// bounded.
-///
-/// Shared by the pool threads and the routed ones, because they had drifted:
-/// the pool watched engagement and the routed relays did not, and after the
-/// outbox landed the routed relays are the ones carrying most of the feed. One
-/// function is what stops that happening again.
-///
-/// The cap keeps the `#e` filter a size relays actually accept.
-pub const engagementWatchCapForTest = engagement_watch_cap;
-
-pub fn rememberFeedIdForTest(
-    ids: *[engagement_watch_cap]i64,
-    hex: *[engagement_watch_cap][64]u8,
-    len: *usize,
-    ev: nostr.event.Event,
-) void {
-    rememberFeedId(ids, hex, len, ev);
-}
-
-pub fn publishFeedWatchForTest(notes: []const Note) void {
-    publishFeedWatch(notes);
-}
-
-pub fn mergeFeedWatchForTest(
-    ids: *[engagement_watch_cap]i64,
-    hex: *[engagement_watch_cap][64]u8,
-    len: usize,
-) usize {
-    return mergeFeedWatch(ids, hex, len);
-}
-
-pub fn feedWatchGenerationForTest() u32 {
-    return feedWatchGeneration();
-}
 
 // -- Every socket asks only about the people it can answer for ---------------
 //
@@ -8942,46 +5461,6 @@ pub fn feedWatchGenerationForTest() u32 {
 //
 // So the invariant, and there is a test for it by name: every followed author
 // appears in at least one relay's filters.
-
-pub fn poolAuthorsForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
-    return poolAuthors(index, out);
-}
-pub fn poolAuthorsOrAllForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
-    return poolAuthorsOrAll(index, out);
-}
-pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]u8) usize {
-    lockDiscovered();
-    defer unlockDiscovered();
-    if (index >= routing.g_discovered.len) return 0;
-    const d = &routing.g_discovered[index];
-    @memcpy(out[0..d.authors_len], d.authors[0..d.authors_len]);
-    return d.authors_len;
-}
-pub fn clearRoutesForTest() void {
-    lockDiscovered();
-    defer unlockDiscovered();
-    for (&routing.g_pool_routed) |*p| {
-        p.url_len = 0;
-        p.authors_len = 0;
-    }
-    routing.g_residual_len = 0;
-}
-
-pub fn forgetDiscoveredForTest() void {
-    forgetDiscovered();
-}
-
-pub const outboxSubIdForTest = outbox_sub_id;
-
-pub fn routeFollowUpForTest(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
-    return routeFollowUp(live_url, live_gen, slot_url, slot_gen);
-}
-
-pub fn residualCountForTest() usize {
-    lockDiscovered();
-    defer unlockDiscovered();
-    return routing.g_residual_len;
-}
 
 // -- Being asked who you are (NIP-42) ----------------------------------------
 //
@@ -9027,95 +5506,35 @@ pub fn residualCountForTest() usize {
 //     that stays refused is a finished subscription, counted as settled and
 //     not as data (Jumble relay-subscription.ts:107-110).
 
-pub fn answerHelperAuthForTest(a: std.mem.Allocator, unsigned_json: []const u8) void {
-    const secret = feed_state.g_test_secret orelse return;
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const kp = signer.keyPairFromSecretKey(secret) catch return;
-    var parsed = nostr.event.fromJson(a, unsigned_json) catch return;
-    defer parsed.deinit();
-    const ev = parsed.value;
-    const signed = nostr.event.create(a, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
-    const signed_json = nostr.event.toJson(a, signed) catch return;
-    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(a) catch return;
-    handleHelperAuthSigned(.{ .key = helper_auth_key, .outcome = .ok, .status = 200, .body = body });
-}
-
-pub fn resetRelayAuthForTest() void {
-    authLock();
-    relay_auth.g_auth_choices = @splat(.{});
-    relay_auth.g_auth_slots = @splat(.{});
-    authUnlock();
-    relay_auth.g_helper_auth_active = false;
-    relay_auth.g_helper_auth_index = 0;
-}
-
-pub fn authChoiceForTest(url: []const u8) AuthChoice {
-    return authChoiceFor(url);
-}
-pub fn authChoiceOfForTest(account: [32]u8, url: []const u8) AuthChoice {
-    return authChoiceOf(account, url);
-}
-pub fn setAuthChoiceForTest(account: [32]u8, url: []const u8, choice: AuthChoice) bool {
-    return setAuthChoice(account, url, choice);
-}
-pub fn authFileForTest(buf: []u8) ?[]const u8 {
-    return formatAuthChoicesFile(buf);
-}
-pub fn applyAuthFileForTest(raw: []const u8) void {
-    applyAuthChoicesFile(raw);
-}
-pub fn authPhaseNameForTest(index: usize) []const u8 {
-    return @tagName(authSlotPhase(index));
-}
-pub fn authRowNoteForTest(index: usize) ?[]const u8 {
-    return authRowNote(index);
-}
-pub fn authBadgeTextForTest(index: usize, url: []const u8) ?[]const u8 {
-    return authBadgeText(index, url);
-}
-pub fn driveRelayAuthForTest(fx: *Effects) void {
-    driveRelayAuth(fx);
-}
-pub fn authAnswerForTest(index: usize, allow: bool) void {
-    authAnswer(index, allow);
-}
-pub fn authCycleForTest(index: usize) void {
-    authCycle(index);
-}
-pub fn authSweepForTest(now_s: i64) void {
-    authSweep(now_s);
-}
-pub fn authHelperBusyForTest() bool {
-    return relay_auth.g_helper_auth_active;
-}
-/// The keyholder's answer to the request that was out has arrived and been
-/// dropped, as `handleHelperAuthSigned` does, leaving it free for the next.
-pub fn authHelperFreeForTest() void {
-    relay_auth.g_helper_auth_active = false;
-}
-/// The connection on `index` has ended.
-pub fn authSlotResetForTest(index: usize) void {
-    authSlotReset(index);
-}
-pub fn authDeliverSignedForTest(index: usize, ev: nostr.event.Event) void {
-    var verifier = nostr.keys.Signer.init();
-    defer verifier.deinit();
-    authDeliverSigned(std.heap.page_allocator, verifier, index, ev);
-}
-
-/// The reader thread's reaction, driven by a test with a stand-in relay.
-pub const AuthSessionForTest = AuthSession;
-pub const AuthReactionForTest = AuthReaction;
-pub fn authReactForTest(sess: *AuthSession, url: []const u8, msg: nostr.message.RelayMessage, now_ms: i64) AuthReaction {
-    return authReact(sess, url, msg, now_ms);
-}
-pub fn authPollForTest(sess: *AuthSession, url: []const u8, relay: anytype, now_ms: i64) []const u8 {
-    return @tagName(authPoll(sess, url, relay, now_ms, identityGeneration()));
-}
-pub const auth_gate_wait_ms_for_test = auth_gate_wait_ms;
-
 // re-exports: tuning.zig
+pub const ancestor_row_chrome_for_test = tuning.ancestor_row_chrome_for_test;
+pub const compose_capacity_for_test = tuning.compose_capacity_for_test;
+pub const compose_editor_width_for_test = tuning.compose_editor_width_for_test;
+pub const engagementWatchCapForTest = tuning.engagementWatchCapForTest;
+pub const feed_prefetch_rows_for_test = tuning.feed_prefetch_rows_for_test;
+pub const ghost_row_extent_for_test = tuning.ghost_row_extent_for_test;
+pub const gif_target_px_for_test = tuning.gif_target_px_for_test;
+pub const link_card_height_bare_for_test = tuning.link_card_height_bare_for_test;
+pub const link_card_height_for_test = tuning.link_card_height_for_test;
+pub const listening_row_extent_for_test = tuning.listening_row_extent_for_test;
+pub const loadOlderForTest = tuning.loadOlderForTest;
+pub const maxImageBytesForTest = tuning.maxImageBytesForTest;
+pub const maxImageDownloadBytesForTest = tuning.maxImageDownloadBytesForTest;
+pub const maxMediaImagesForTest = tuning.maxMediaImagesForTest;
+pub const media_target_px_for_test = tuning.media_target_px_for_test;
+pub const noteContentCapForTest = tuning.noteContentCapForTest;
+pub const note_content_cap_for_test = tuning.note_content_cap_for_test;
+pub const outside_row_extent_for_test = tuning.outside_row_extent_for_test;
+pub const picture_column_width_for_test = tuning.picture_column_width_for_test;
+pub const plaza_version_for_test = tuning.plaza_version_for_test;
+pub const quote_picture_width_for_test = tuning.quote_picture_width_for_test;
+pub const reply_editor_height_for_test = tuning.reply_editor_height_for_test;
+pub const settings_column_width_for_test = tuning.settings_column_width_for_test;
+pub const settings_content_width_for_test = tuning.settings_content_width_for_test;
+pub const show_more_extent_for_test = tuning.show_more_extent_for_test;
+pub const starterPackLenForTest = tuning.starterPackLenForTest;
+pub const thread_inset_for_test = tuning.thread_inset_for_test;
+pub const updateNewsForTest = tuning.updateNewsForTest;
 pub const RowRange = tuning.RowRange;
 pub const ancestor_body_lines = tuning.ancestor_body_lines;
 pub const ancestor_bottom_pad = tuning.ancestor_bottom_pad;
@@ -9274,6 +5693,7 @@ pub const thread_skeleton_extent = tuning.thread_skeleton_extent;
 pub const update_check_key = tuning.update_check_key;
 
 // re-exports: hiding.zig
+pub const engagementKindsForTest = hiding.engagementKindsForTest;
 pub const Hideable = hiding.Hideable;
 pub const HideableInfo = hiding.HideableInfo;
 pub const applyHiddenLine = hiding.applyHiddenLine;
@@ -9286,6 +5706,7 @@ pub const isTakenAway = hiding.isTakenAway;
 pub const setHidden = hiding.setHidden;
 
 // re-exports: prefs.zig
+pub const settingsWritesForTest = prefs.settingsWritesForTest;
 pub const clientTag = prefs.clientTag;
 pub const client_tag_name = prefs.client_tag_name;
 pub const isMediaProxyUrl = prefs.isMediaProxyUrl;
@@ -9304,6 +5725,7 @@ pub const setShowSensitive = prefs.setShowSensitive;
 pub const showSensitive = prefs.showSensitive;
 
 // re-exports: updates.zig
+pub const resetUpdateStateForTest = updates.resetUpdateStateForTest;
 pub const ReleaseNews = updates.ReleaseNews;
 pub const handleUpdateChecked = updates.handleUpdateChecked;
 pub const maybeCheckForUpdate = updates.maybeCheckForUpdate;
@@ -9315,6 +5737,10 @@ pub const updateCheckDue = updates.updateCheckDue;
 pub const updateCheckOn = updates.updateCheckOn;
 
 // re-exports: links.zig
+pub const captureArgvLinkForTest = links.captureArgvLinkForTest;
+pub const takePendingLinkForTest = links.takePendingLinkForTest;
+pub const takeWrittenLinkForTest = links.takeWrittenLinkForTest;
+pub const writePendingLinkForTest = links.writePendingLinkForTest;
 pub const captureArgvLink = links.captureArgvLink;
 pub const external_link_policy = links.external_link_policy;
 pub const handlePlazaLink = links.handlePlazaLink;
@@ -9342,6 +5768,50 @@ pub const nip05Resolve = login.nip05Resolve;
 pub const parseAddress = login.parseAddress;
 
 // re-exports: places.zig
+pub const activePlaceIndexForTest = places.activePlaceIndexForTest;
+pub const applyActivePlaceLineForTest = places.applyActivePlaceLineForTest;
+pub const armPlaceFetchForTest = places.armPlaceFetchForTest;
+pub const arrivalInheritsRoomForTest = places.arrivalInheritsRoomForTest;
+pub const bootPlaceIndexForTest = places.bootPlaceIndexForTest;
+pub const bouncePlaceForTest = places.bouncePlaceForTest;
+pub const clearActivePlaceForTest = places.clearActivePlaceForTest;
+pub const clearPlaceFeedForTest = places.clearPlaceFeedForTest;
+pub const flushPlaceIdsForTest = places.flushPlaceIdsForTest;
+pub const forgetPlacesForTest = places.forgetPlacesForTest;
+pub const goToOwnPlazaForTest = places.goToOwnPlazaForTest;
+pub const keptPlaceSeenLenForTest = places.keptPlaceSeenLenForTest;
+pub const markPlaceFetchAppliedForTest = places.markPlaceFetchAppliedForTest;
+pub const openKeptPlaceForTest = places.openKeptPlaceForTest;
+pub const placeFeedIndexForTest = places.placeFeedIndexForTest;
+pub const placeFetchArmedForTest = places.placeFetchArmedForTest;
+pub const place_kind_for_test = places.place_kind_for_test;
+pub const place_looking_toast_for_test = places.place_looking_toast_for_test;
+pub const quoteHintsForTest = places.quoteHintsForTest;
+pub const refreshPlaceFetchForTest = places.refreshPlaceFetchForTest;
+pub const refreshPlaceFetchNoticeForTest = places.refreshPlaceFetchNoticeForTest;
+pub const rememberPlaceIdsForTest = places.rememberPlaceIdsForTest;
+pub const resetPlacesForTest = places.resetPlacesForTest;
+pub const restoreOpenPlaceForTest = places.restoreOpenPlaceForTest;
+pub const resumeVisitForTest = places.resumeVisitForTest;
+pub const runStalePlaceFeedWorkerForTest = places.runStalePlaceFeedWorkerForTest;
+pub const samePlaceForTest = places.samePlaceForTest;
+pub const savePlacesForTest = places.savePlacesForTest;
+pub const seedFromKeptPlaceForTest = places.seedFromKeptPlaceForTest;
+pub const seedPlaceFeedForTest = places.seedPlaceFeedForTest;
+pub const setKeptPlaceSeenLenForTest = places.setKeptPlaceSeenLenForTest;
+pub const setPlaceHomeForTest = places.setPlaceHomeForTest;
+pub const setPlaceInfoForTest = places.setPlaceInfoForTest;
+pub const setPlaceLinkForTest = places.setPlaceLinkForTest;
+pub const setPlaceWriteRelayForTest = places.setPlaceWriteRelayForTest;
+pub const setRailForTest = places.setRailForTest;
+pub const startPlaceFeedForTest = places.startPlaceFeedForTest;
+pub const stepPlaceForTest = places.stepPlaceForTest;
+pub const togglePlacesRailForTest = places.togglePlacesRailForTest;
+pub const visitParsedPlaceForTest = places.visitParsedPlaceForTest;
+pub const visitPlaceForTest = places.visitPlaceForTest;
+pub const visitPlaceWithFeedForTest = places.visitPlaceWithFeedForTest;
+pub const visitingPlaceForTest = places.visitingPlaceForTest;
+pub const writePlaceDocumentForTest = places.writePlaceDocumentForTest;
 pub const Place = places.Place;
 pub const PlaceInfo = places.PlaceInfo;
 pub const PlaceLink = places.PlaceLink;
@@ -9402,6 +5872,20 @@ pub const visitingPlace = places.visitingPlace;
 pub const writePlaceDocument = places.writePlaceDocument;
 
 // re-exports: relay_table.zig
+pub const addRelayForTest = relay_table.addRelayForTest;
+pub const applyRelaysFileForTest = relay_table.applyRelaysFileForTest;
+pub const bootstrap_relay_count_for_test = relay_table.bootstrap_relay_count_for_test;
+pub const clearRelaysForTest = relay_table.clearRelaysForTest;
+pub const forgetRelayRemovalsForTest = relay_table.forgetRelayRemovalsForTest;
+pub const formatRelaysFileForTest = relay_table.formatRelaysFileForTest;
+pub const indexerChunkForTest = relay_table.indexerChunkForTest;
+pub const indexerRelaysForTest = relay_table.indexerRelaysForTest;
+pub const maxRelaysForTest = relay_table.maxRelaysForTest;
+pub const max_relays_for_test = relay_table.max_relays_for_test;
+pub const noteRelayRemovedForTest = relay_table.noteRelayRemovedForTest;
+pub const relayReadWriteForTest = relay_table.relayReadWriteForTest;
+pub const resetRelaysForTest = relay_table.resetRelaysForTest;
+pub const resetRelaysToBootstrapForTest = relay_table.resetRelaysToBootstrapForTest;
 pub const RelayDial = relay_table.RelayDial;
 pub const RelayEntry = relay_table.RelayEntry;
 pub const RelayUse = relay_table.RelayUse;
@@ -9433,6 +5917,23 @@ pub const unlockRelayTable = relay_table.unlockRelayTable;
 pub const writeRelayCount = relay_table.writeRelayCount;
 
 // re-exports: relay_list.zig
+pub const adoptRelayListForTest = relay_list.adoptRelayListForTest;
+pub const canWriteRelayListForTest = relay_list.canWriteRelayListForTest;
+pub const clearRelayListPublishForTest = relay_list.clearRelayListPublishForTest;
+pub const flushRelayListForTest = relay_list.flushRelayListForTest;
+pub const ingestRelayListForTest = relay_list.ingestRelayListForTest;
+pub const isReaderNoteForTest = relay_list.isReaderNoteForTest;
+pub const markRelaysMineForTest = relay_list.markRelaysMineForTest;
+pub const publishRelayListForTest = relay_list.publishRelayListForTest;
+pub const relayIsMineForTest = relay_list.relayIsMineForTest;
+pub const relayListDueForTest = relay_list.relayListDueForTest;
+pub const relayListEditedForTest = relay_list.relayListEditedForTest;
+pub const relayListIsOwnedForTest = relay_list.relayListIsOwnedForTest;
+pub const relayListPendingForTest = relay_list.relayListPendingForTest;
+pub const relayListStampForTest = relay_list.relayListStampForTest;
+pub const relayOwnerForTest = relay_list.relayOwnerForTest;
+pub const setRelayListStampForTest = relay_list.setRelayListStampForTest;
+pub const stageOwnRelayListForTest = relay_list.stageOwnRelayListForTest;
 pub const adoptRelayList = relay_list.adoptRelayList;
 pub const applyOwnRelayList = relay_list.applyOwnRelayList;
 pub const canWriteRelayList = relay_list.canWriteRelayList;
@@ -9449,6 +5950,44 @@ pub const relayWriteBlockedReason = relay_list.relayWriteBlockedReason;
 pub const setRelayListStamp = relay_list.setRelayListStamp;
 
 // re-exports: routing.zig
+pub const RelayRankForTest = routing.RelayRankForTest;
+pub const clearRelayRefusalForTest = routing.clearRelayRefusalForTest;
+pub const clearRoutesForTest = routing.clearRoutesForTest;
+pub const collectUnroutedForTest = routing.collectUnroutedForTest;
+pub const discoveredAuthorsCapForTest = routing.discoveredAuthorsCapForTest;
+pub const discoveredAuthorsForTest = routing.discoveredAuthorsForTest;
+pub const discoveredGenerationForTest = routing.discoveredGenerationForTest;
+pub const foldWriteRelaysForTest = routing.foldWriteRelaysForTest;
+pub const forgetDiscoveredForTest = routing.forgetDiscoveredForTest;
+pub const forgetRefusedRelaysForTest = routing.forgetRefusedRelaysForTest;
+pub const indexerAskedLenForTest = routing.indexerAskedLenForTest;
+pub const markIndexerAskedForTest = routing.markIndexerAskedForTest;
+pub const maxDiscoveredRelaysForTest = routing.maxDiscoveredRelaysForTest;
+pub const noteRelayRefusalAtForTest = routing.noteRelayRefusalAtForTest;
+pub const outboxRelaysPerAuthorForTest = routing.outboxRelaysPerAuthorForTest;
+pub const outboxSubIdForTest = routing.outboxSubIdForTest;
+pub const poolAuthorsForTest = routing.poolAuthorsForTest;
+pub const poolAuthorsOrAllForTest = routing.poolAuthorsOrAllForTest;
+pub const rankRelaySuggestionsForTest = routing.rankRelaySuggestionsForTest;
+pub const refusedRelayCountForTest = routing.refusedRelayCountForTest;
+pub const relayFetchAllowedForTest = routing.relayFetchAllowedForTest;
+pub const relayIsRefusedForTest = routing.relayIsRefusedForTest;
+pub const relayRankUrlForTest = routing.relayRankUrlForTest;
+pub const relayRankWritersForTest = routing.relayRankWritersForTest;
+pub const resetIndexerAskedForTest = routing.resetIndexerAskedForTest;
+pub const residualCountForTest = routing.residualCountForTest;
+pub const routeCoverageForTest = routing.routeCoverageForTest;
+pub const routeCoverageTargetForTest = routing.routeCoverageTargetForTest;
+pub const routeFollowUpForTest = routing.routeFollowUpForTest;
+pub const routeRecomputeDueForTest = routing.routeRecomputeDueForTest;
+pub const routeRecomputeMinMsForTest = routing.routeRecomputeMinMsForTest;
+pub const routeSettleMaxMsForTest = routing.routeSettleMaxMsForTest;
+pub const routeSettleMsForTest = routing.routeSettleMsForTest;
+pub const routedRefusalMsForTest = routing.routedRefusalMsForTest;
+pub const routedRefusalStrikesForTest = routing.routedRefusalStrikesForTest;
+pub const sameRouteForTest = routing.sameRouteForTest;
+pub const sweepRelayListsForTest = routing.sweepRelayListsForTest;
+pub const worthEvictingForTest = routing.worthEvictingForTest;
 pub const RelayRank = routing.RelayRank;
 pub const RouteCoverage = routing.RouteCoverage;
 pub const RouteFollowUp = routing.RouteFollowUp;
@@ -9505,6 +6044,28 @@ pub const worthEvicting = routing.worthEvicting;
 pub const writeTagUrls = routing.writeTagUrls;
 
 // re-exports: relay_conn.zig
+pub const askPoolForTest = relay_conn.askPoolForTest;
+pub const askableSlotsForTest = relay_conn.askableSlotsForTest;
+pub const bunkerWatchSlotForTest = relay_conn.bunkerWatchSlotForTest;
+pub const clearOneShotsForTest = relay_conn.clearOneShotsForTest;
+pub const clearRelayRttForTest = relay_conn.clearRelayRttForTest;
+pub const discoveredWatchBaseForTest = relay_conn.discoveredWatchBaseForTest;
+pub const expiredOneShotsForTest = relay_conn.expiredOneShotsForTest;
+pub const isFeedSubForTest = relay_conn.isFeedSubForTest;
+pub const isOneShotSubForTest = relay_conn.isOneShotSubForTest;
+pub const markOneShotCutForTest = relay_conn.markOneShotCutForTest;
+pub const oneShotBudgetMsForTest = relay_conn.oneShotBudgetMsForTest;
+pub const oneShotSlotsForTest = relay_conn.oneShotSlotsForTest;
+pub const oneShotSubPrefixForTest = relay_conn.oneShotSubPrefixForTest;
+pub const outboxWokeForTest = relay_conn.outboxWokeForTest;
+pub const recordRelayRttForTest = relay_conn.recordRelayRttForTest;
+pub const relayStatusConnectedForTest = relay_conn.relayStatusConnectedForTest;
+pub const relayStatusQuietForTest = relay_conn.relayStatusQuietForTest;
+pub const relayWatchSlotsForTest = relay_conn.relayWatchSlotsForTest;
+pub const resetOutboxWokeForTest = relay_conn.resetOutboxWokeForTest;
+pub const seatOneShotForTest = relay_conn.seatOneShotForTest;
+pub const setRelayQuietForTest = relay_conn.setRelayQuietForTest;
+pub const setRelayStatusForTest = relay_conn.setRelayStatusForTest;
 pub const Conn = relay_conn.Conn;
 pub const askPool = relay_conn.askPool;
 pub const askableSlots = relay_conn.askableSlots;
@@ -9539,6 +6100,12 @@ pub const unlockLiveRelay = relay_conn.unlockLiveRelay;
 pub const watchOneShot = relay_conn.watchOneShot;
 
 // re-exports: store_glue.zig
+pub const ownRecordCreatedAtForTest = store_glue.ownRecordCreatedAtForTest;
+pub const ownRecordReadsForTest = store_glue.ownRecordReadsForTest;
+pub const plazaIngestForTest = store_glue.plazaIngestForTest;
+pub const plazaIngestFromForTest = store_glue.plazaIngestFromForTest;
+pub const plazaIngestVerifiedForTest = store_glue.plazaIngestVerifiedForTest;
+pub const resetOwnRecordReadsForTest = store_glue.resetOwnRecordReadsForTest;
 pub const ownListBackups = store_glue.ownListBackups;
 pub const ownRecordCreatedAt = store_glue.ownRecordCreatedAt;
 pub const ownRecordExists = store_glue.ownRecordExists;
@@ -9546,6 +6113,18 @@ pub const plazaIngest = store_glue.plazaIngest;
 pub const plazaIngestFrom = store_glue.plazaIngestFrom;
 
 // re-exports: feed_state.zig
+pub const feedKeyForTest = feed_state.feedKeyForTest;
+pub const feedSinceForTest = feed_state.feedSinceForTest;
+pub const invalidateFeedForTest = feed_state.invalidateFeedForTest;
+pub const noteFeedArrivalForTest = feed_state.noteFeedArrivalForTest;
+pub const overflowFeedArrivalsForTest = feed_state.overflowFeedArrivalsForTest;
+pub const profileParsesForTest = feed_state.profileParsesForTest;
+pub const reconcileForTest = feed_state.reconcileForTest;
+pub const reserveFeedForTest = feed_state.reserveFeedForTest;
+pub const resetFeedChangeDetectionForTest = feed_state.resetFeedChangeDetectionForTest;
+pub const setFeedNewestForTest = feed_state.setFeedNewestForTest;
+pub const setIdentityForTest = feed_state.setIdentityForTest;
+pub const setStoreForTest = feed_state.setStoreForTest;
 pub const FeedWork = feed_state.FeedWork;
 pub const attachFeedStorage = feed_state.attachFeedStorage;
 pub const authorInSet = feed_state.authorInSet;
@@ -9571,6 +6150,9 @@ pub const seedFeedNewest = feed_state.seedFeedNewest;
 pub const takeFeedArrivals = feed_state.takeFeedArrivals;
 
 // re-exports: thread_model.zig
+pub const arrivalTableForTest = thread_model.arrivalTableForTest;
+pub const splitByFollowGraphForTest = thread_model.splitByFollowGraphForTest;
+pub const stampArrivalForTest = thread_model.stampArrivalForTest;
 pub const Ancestor = thread_model.Ancestor;
 pub const AncestorGap = thread_model.AncestorGap;
 pub const ArrivalTable = thread_model.ArrivalTable;
@@ -9596,6 +6178,11 @@ pub const threadQueryIds = thread_model.threadQueryIds;
 pub const thread_ancestor_max = thread_model.thread_ancestor_max;
 
 // re-exports: note_build.zig
+pub const commentEventForTest = note_build.commentEventForTest;
+pub const copyDisplayTextForTest = note_build.copyDisplayTextForTest;
+pub const findQuoteRefForTest = note_build.findQuoteRefForTest;
+pub const foldMathAlnumForTest = note_build.foldMathAlnumForTest;
+pub const invisibleForDisplayForTest = note_build.invisibleForDisplayForTest;
 pub const Imeta = note_build.Imeta;
 pub const KindRender = note_build.KindRender;
 pub const MediaKind = note_build.MediaKind;
@@ -9631,6 +6218,29 @@ pub const urlHost = note_build.urlHost;
 pub const utf8SafeLen = note_build.utf8SafeLen;
 
 // re-exports: profile_cache.zig
+pub const agePlaceLogoForTest = profile_cache.agePlaceLogoForTest;
+pub const avatarFallbackStateForTest = profile_cache.avatarFallbackStateForTest;
+pub const avatarPartialCountForTest = profile_cache.avatarPartialCountForTest;
+pub const buildRoutedFiltersForTest = profile_cache.buildRoutedFiltersForTest;
+pub const deliverAvatarResponseForTest = profile_cache.deliverAvatarResponseForTest;
+pub const fillProfileTextForTest = profile_cache.fillProfileTextForTest;
+pub const forgetWantedProfilesForTest = profile_cache.forgetWantedProfilesForTest;
+pub const imageClockForTest = profile_cache.imageClockForTest;
+pub const isProfileWantedForTest = profile_cache.isProfileWantedForTest;
+pub const markAvatarWantedForTest = profile_cache.markAvatarWantedForTest;
+pub const markPlaceLogoSeenForTest = profile_cache.markPlaceLogoSeenForTest;
+pub const profileHintCountForTest = profile_cache.profileHintCountForTest;
+pub const profileWantedForTest = profile_cache.profileWantedForTest;
+pub const refreshProfilesForTest = profile_cache.refreshProfilesForTest;
+pub const resetProfilesForTest = profile_cache.resetProfilesForTest;
+pub const resetWantedProfilesForTest = profile_cache.resetWantedProfilesForTest;
+pub const setProfileAvatarForTest = profile_cache.setProfileAvatarForTest;
+pub const setProfileNameForTest = profile_cache.setProfileNameForTest;
+pub const setProfileNip05ForTest = profile_cache.setProfileNip05ForTest;
+pub const setProfilePictureForTest = profile_cache.setProfilePictureForTest;
+pub const wantProfileForTest = profile_cache.wantProfileForTest;
+pub const wantProfilesAheadForTest = profile_cache.wantProfilesAheadForTest;
+pub const wantedProfileCountForTest = profile_cache.wantedProfileCountForTest;
 pub const Profile = profile_cache.Profile;
 pub const WantedProfile = profile_cache.WantedProfile;
 pub const buildRoutedFilters = profile_cache.buildRoutedFilters;
@@ -9654,6 +6264,7 @@ pub const wantProfilesAhead = profile_cache.wantProfilesAhead;
 pub const wanted_profiles_cap = profile_cache.wanted_profiles_cap;
 
 // re-exports: person_card.zig
+pub const verifiedNip05ForTest = person_card.verifiedNip05ForTest;
 pub const followsMe = person_card.followsMe;
 pub const nip05Display = person_card.nip05Display;
 pub const npubShortOf = person_card.npubShortOf;
@@ -9670,6 +6281,23 @@ pub const personWebsite = person_card.personWebsite;
 pub const verifiedNip05 = person_card.verifiedNip05;
 
 // re-exports: quote_cache.zig
+pub const addressDialsPerRoundForTest = quote_cache.addressDialsPerRoundForTest;
+pub const advanceQuoteRoundForTest = quote_cache.advanceQuoteRoundForTest;
+pub const dropQuoteForTest = quote_cache.dropQuoteForTest;
+pub const fillQuoteForTest = quote_cache.fillQuoteForTest;
+pub const quoteBackoffRoundsForTest = quote_cache.quoteBackoffRoundsForTest;
+pub const quoteForTest = quote_cache.quoteForTest;
+pub const quoteHintCountForTest = quote_cache.quoteHintCountForTest;
+pub const quoteTextForTest = quote_cache.quoteTextForTest;
+pub const rearmWantedQuotesForTest = quote_cache.rearmWantedQuotesForTest;
+pub const refreshQuotesForTest = quote_cache.refreshQuotesForTest;
+pub const requestWantedQuotesForTest = quote_cache.requestWantedQuotesForTest;
+pub const requeueMissingQuotesForTest = quote_cache.requeueMissingQuotesForTest;
+pub const resetQuotesForTest = quote_cache.resetQuotesForTest;
+pub const seedQuoteForTest = quote_cache.seedQuoteForTest;
+pub const wantQuoteForTest = quote_cache.wantQuoteForTest;
+pub const wantQuoteHintedForTest = quote_cache.wantQuoteHintedForTest;
+pub const warnQuoteForTest = quote_cache.warnQuoteForTest;
 pub const QuoteEntry = quote_cache.QuoteEntry;
 pub const QuoteState = quote_cache.QuoteState;
 pub const address_dials_per_round = quote_cache.address_dials_per_round;
@@ -9688,6 +6316,19 @@ pub const wantQuote = quote_cache.wantQuote;
 pub const wantQuoteHinted = quote_cache.wantQuoteHinted;
 
 // re-exports: addresses.zig
+pub const addressDialledForTest = addresses.addressDialledForTest;
+pub const addressFetchArmedForTest = addresses.addressFetchArmedForTest;
+pub const addressForTest = addresses.addressForTest;
+pub const addressKeyForTest = addresses.addressKeyForTest;
+pub const addressPoolBatchForTest = addresses.addressPoolBatchForTest;
+pub const addressPoolFiltersForTest = addresses.addressPoolFiltersForTest;
+pub const addressRegisteredForTest = addresses.addressRegisteredForTest;
+pub const forgetAddressFetchForTest = addresses.forgetAddressFetchForTest;
+pub const newestAddressIdForTest = addresses.newestAddressIdForTest;
+pub const openAddressedArticleForTest = addresses.openAddressedArticleForTest;
+pub const refreshAddressFetchForTest = addresses.refreshAddressFetchForTest;
+pub const resetAddressesForTest = addresses.resetAddressesForTest;
+pub const storedWriteRelaysForTest = addresses.storedWriteRelaysForTest;
 pub const Address = addresses.Address;
 pub const AddressQuery = addresses.AddressQuery;
 pub const AddressSlot = addresses.AddressSlot;
@@ -9705,6 +6346,11 @@ pub const registerAddress = addresses.registerAddress;
 pub const storedWriteRelays = addresses.storedWriteRelays;
 
 // re-exports: link_preview.zig
+pub const clearLinkPreviewsForTest = link_preview.clearLinkPreviewsForTest;
+pub const linkRequestedForTest = link_preview.linkRequestedForTest;
+pub const scanLinkFetchesForTest = link_preview.scanLinkFetchesForTest;
+pub const seedLinkForTest = link_preview.seedLinkForTest;
+pub const setLinkPreviewForTest = link_preview.setLinkPreviewForTest;
 pub const PageMeta = link_preview.PageMeta;
 pub const firstLinkUrl = link_preview.firstLinkUrl;
 pub const handleLinkFetched = link_preview.handleLinkFetched;
@@ -9719,6 +6365,14 @@ pub const urlDomain = link_preview.urlDomain;
 pub const wantLink = link_preview.wantLink;
 
 // re-exports: relay_hints.zig
+pub const hintsForTest = relay_hints.hintsForTest;
+pub const isHintableRelayForTest = relay_hints.isHintableRelayForTest;
+pub const noteAddressForTest = relay_hints.noteAddressForTest;
+pub const note_address_cap_for_test = relay_hints.note_address_cap_for_test;
+pub const profileAddressForTest = relay_hints.profileAddressForTest;
+pub const recordSeenOnForTest = relay_hints.recordSeenOnForTest;
+pub const resetSeenOnForTest = relay_hints.resetSeenOnForTest;
+pub const seenUrlCountForTest = relay_hints.seenUrlCountForTest;
 pub const HintList = relay_hints.HintList;
 pub const UrlList = relay_hints.UrlList;
 pub const hintOrEmpty = relay_hints.hintOrEmpty;
@@ -9735,6 +6389,15 @@ pub const seenOnLock = relay_hints.seenOnLock;
 pub const seenOnUnlock = relay_hints.seenOnUnlock;
 
 // re-exports: engagement.zig
+pub const countEngagementForTest = engagement.countEngagementForTest;
+pub const isLikedForTest = engagement.isLikedForTest;
+pub const likeReactionIdForTest = engagement.likeReactionIdForTest;
+pub const rememberLikeForTest = engagement.rememberLikeForTest;
+pub const repostedByMeForTest = engagement.repostedByMeForTest;
+pub const resetEngagementForTest = engagement.resetEngagementForTest;
+pub const resetLikesForTest = engagement.resetLikesForTest;
+pub const setZapMsatForTest = engagement.setZapMsatForTest;
+pub const zap_msat_ceiling_for_test = engagement.zap_msat_ceiling_for_test;
 pub const Counts = engagement.Counts;
 pub const Engagement = engagement.Engagement;
 pub const MyLike = engagement.MyLike;
@@ -9757,6 +6420,17 @@ pub const seen_engagement_cap = engagement.seen_engagement_cap;
 pub const zap_msat_ceiling = engagement.zap_msat_ceiling;
 
 // re-exports: inbox.zig
+pub const bakeBodyForTest = inbox.bakeBodyForTest;
+pub const collapseEventRefsForTest = inbox.collapseEventRefsForTest;
+pub const forgetInboxBodyStampForTest = inbox.forgetInboxBodyStampForTest;
+pub const inboxAddForTest = inbox.inboxAddForTest;
+pub const inboxLenForTest = inbox.inboxLenForTest;
+pub const inboxVerbForTest = inbox.inboxVerbForTest;
+pub const loadInboxForTest = inbox.loadInboxForTest;
+pub const resetInboxForTest = inbox.resetInboxForTest;
+pub const resolveInboxBodiesForTest = inbox.resolveInboxBodiesForTest;
+pub const saveInboxForTest = inbox.saveInboxForTest;
+pub const seedInboxUnreadForTest = inbox.seedInboxUnreadForTest;
 pub const InboxItem = inbox.InboxItem;
 pub const InboxVerb = inbox.InboxVerb;
 pub const bakeBody = inbox.bakeBody;
@@ -9785,6 +6459,11 @@ pub const unlockInbox = inbox.unlockInbox;
 pub const wantInboxProfiles = inbox.wantInboxProfiles;
 
 // re-exports: image_cache.zig
+pub const avatarUrlForTest = image_cache.avatarUrlForTest;
+pub const feedImageUrlForTest = image_cache.feedImageUrlForTest;
+pub const mediaUrlForTest = image_cache.mediaUrlForTest;
+pub const pictureWarmedForTest = image_cache.pictureWarmedForTest;
+pub const stbCanDecodeForTest = image_cache.stbCanDecodeForTest;
 pub const MediaFit = image_cache.MediaFit;
 pub const avatarUrl = image_cache.avatarUrl;
 pub const cacheName = image_cache.cacheName;
@@ -9803,6 +6482,16 @@ pub const stbi_load_gif_from_memory = image_cache.stbi_load_gif_from_memory;
 pub const storeCachedImage = image_cache.storeCachedImage;
 
 // re-exports: image_pool.zig
+pub const acquireImageIdForTest = image_pool.acquireImageIdForTest;
+pub const assignAvatarSlotsForTest = image_pool.assignAvatarSlotsForTest;
+pub const beginImagePassForTest = image_pool.beginImagePassForTest;
+pub const chooseImageIdForTest = image_pool.chooseImageIdForTest;
+pub const imageIdOwnerNameForTest = image_pool.imageIdOwnerNameForTest;
+pub const imageIdTakeableForTest = image_pool.imageIdTakeableForTest;
+pub const placeLogoUntouchableForTest = image_pool.placeLogoUntouchableForTest;
+pub const resetWarmForTest = image_pool.resetWarmForTest;
+pub const touchMediaClockForTest = image_pool.touchMediaClockForTest;
+pub const warmAheadForTest = image_pool.warmAheadForTest;
 pub const WarmEntry = image_pool.WarmEntry;
 pub const acquireImageId = image_pool.acquireImageId;
 pub const assignAvatarSlots = image_pool.assignAvatarSlots;
@@ -9819,6 +6508,29 @@ pub const warm_ring_len = image_pool.warm_ring_len;
 pub const warmedAlready = image_pool.warmedAlready;
 
 // re-exports: feed_media.zig
+pub const appendAvatarSliceForTest = feed_media.appendAvatarSliceForTest;
+pub const appendMediaSliceForTest = feed_media.appendMediaSliceForTest;
+pub const claimMediaSlotForTest = feed_media.claimMediaSlotForTest;
+pub const deliverMediaResponseForTest = feed_media.deliverMediaResponseForTest;
+pub const hostOfForTest = feed_media.hostOfForTest;
+pub const markMediaFailedForTest = feed_media.markMediaFailedForTest;
+pub const markMediaLoadedForTest = feed_media.markMediaLoadedForTest;
+pub const mediaAttemptsForTest = feed_media.mediaAttemptsForTest;
+pub const mediaFallbackStateForTest = feed_media.mediaFallbackStateForTest;
+pub const mediaIdleForTest = feed_media.mediaIdleForTest;
+pub const mediaKeyForTest = feed_media.mediaKeyForTest;
+pub const mediaPartialCountForTest = feed_media.mediaPartialCountForTest;
+pub const mediaPartialForTest = feed_media.mediaPartialForTest;
+pub const mediaSlotNoteIdsForTest = feed_media.mediaSlotNoteIdsForTest;
+pub const mediaSlotStateForTest = feed_media.mediaSlotStateForTest;
+pub const mediaSlotWantedForTest = feed_media.mediaSlotWantedForTest;
+pub const proxyRefusedCountForTest = feed_media.proxyRefusedCountForTest;
+pub const quoteMediaKeyForTest = feed_media.quoteMediaKeyForTest;
+pub const rangeHeaderForTest = feed_media.rangeHeaderForTest;
+pub const resetMediaForTest = feed_media.resetMediaForTest;
+pub const scanMediaFetchesForTest = feed_media.scanMediaFetchesForTest;
+pub const setMediaSlotHostForTest = feed_media.setMediaSlotHostForTest;
+pub const setVisibleRangeForTest = feed_media.setVisibleRangeForTest;
 pub const Download = feed_media.Download;
 pub const ImageFailure = feed_media.ImageFailure;
 pub const MediaSlot = feed_media.MediaSlot;
@@ -9848,6 +6560,21 @@ pub const retryFailedImages = feed_media.retryFailedImages;
 pub const scanMediaFetches = feed_media.scanMediaFetches;
 
 // re-exports: own_lists.zig
+pub const confirmStartFreshForTest = own_lists.confirmStartFreshForTest;
+pub const contactsConfirmedAbsentForTest = own_lists.contactsConfirmedAbsentForTest;
+pub const forgetOwnListMemoForTest = own_lists.forgetOwnListMemoForTest;
+pub const haveOwnContactListForTest = own_lists.haveOwnContactListForTest;
+pub const identityMintedForTest = own_lists.identityMintedForTest;
+pub const needsFreshConsentForTest = own_lists.needsFreshConsentForTest;
+pub const noHistoryKnownForTest = own_lists.noHistoryKnownForTest;
+pub const noListToastsForTest = own_lists.noListToastsForTest;
+pub const noteContactsAnsweredByForTest = own_lists.noteContactsAnsweredByForTest;
+pub const noteContactsAnsweredFromForTest = own_lists.noteContactsAnsweredFromForTest;
+pub const noteOwnOutboxForTest = own_lists.noteOwnOutboxForTest;
+pub const ownListsWaitedForTest = own_lists.ownListsWaitedForTest;
+pub const ownRelaysAllFinishedForTest = own_lists.ownRelaysAllFinishedForTest;
+pub const retryOwnListsReadForTest = own_lists.retryOwnListsReadForTest;
+pub const setIdentityMintedForTest = own_lists.setIdentityMintedForTest;
 pub const FreshAsk = own_lists.FreshAsk;
 pub const ListKind = own_lists.ListKind;
 pub const OwnListsRead = own_lists.OwnListsRead;
@@ -9877,6 +6604,23 @@ pub const startedFresh = own_lists.startedFresh;
 pub const takeFresh = own_lists.takeFresh;
 
 // re-exports: follows.zig
+pub const applyUndoForTest = follows.applyUndoForTest;
+pub const armUndoForTest = follows.armUndoForTest;
+pub const armUnlikeUndoForTest = follows.armUnlikeUndoForTest;
+pub const clearPendingFollowBaseForTest = follows.clearPendingFollowBaseForTest;
+pub const countPeopleForTest = follows.countPeopleForTest;
+pub const followSetForTest = follows.followSetForTest;
+pub const followsFromTagsForTest = follows.followsFromTagsForTest;
+pub const forgetFollowsForTest = follows.forgetFollowsForTest;
+pub const ingestContactListForTest = follows.ingestContactListForTest;
+pub const loadFollowsFromStoreForTest = follows.loadFollowsFromStoreForTest;
+pub const pendingFollowCountForTest = follows.pendingFollowCountForTest;
+pub const pendingUndoIsNoneForTest = follows.pendingUndoIsNoneForTest;
+pub const setFollowsForTest = follows.setFollowsForTest;
+pub const setHomeScopeForTest = follows.setHomeScopeForTest;
+pub const setPendingFollowBaseForTest = follows.setPendingFollowBaseForTest;
+pub const shrinkAllowedForTest = follows.shrinkAllowedForTest;
+pub const writeFollowForTest = follows.writeFollowForTest;
 pub const FollowWrite = follows.FollowWrite;
 pub const HomeScope = follows.HomeScope;
 pub const PendingUndo = follows.PendingUndo;
@@ -9923,6 +6667,13 @@ pub const shrinkAllowed = follows.shrinkAllowed;
 pub const writeFollow = follows.writeFollow;
 
 // re-exports: mutes.zig
+pub const forgetMutesForTest = mutes.forgetMutesForTest;
+pub const ingestMuteListForTest = mutes.ingestMuteListForTest;
+pub const loadMutesFromStoreForTest = mutes.loadMutesFromStoreForTest;
+pub const privateMutesForTest = mutes.privateMutesForTest;
+pub const sayMuteWriteForTest = mutes.sayMuteWriteForTest;
+pub const setMutesForTest = mutes.setMutesForTest;
+pub const writeMuteForTest = mutes.writeMuteForTest;
 pub const MuteWrite = mutes.MuteWrite;
 pub const forgetMutes = mutes.forgetMutes;
 pub const ingestMuteList = mutes.ingestMuteList;
@@ -9937,6 +6688,14 @@ pub const unlockMutes = mutes.unlockMutes;
 pub const writeMute = mutes.writeMute;
 
 // re-exports: bookmarks.zig
+pub const finishPrivateBookmarkForTest = bookmarks.finishPrivateBookmarkForTest;
+pub const forgetBookmarksForTest = bookmarks.forgetBookmarksForTest;
+pub const lastSealedForTest = bookmarks.lastSealedForTest;
+pub const loadBookmarksFromStoreForTest = bookmarks.loadBookmarksFromStoreForTest;
+pub const sayBookmarkWriteForTest = bookmarks.sayBookmarkWriteForTest;
+pub const sealPrivateBookmarkForTest = bookmarks.sealPrivateBookmarkForTest;
+pub const writeBookmarkForTest = bookmarks.writeBookmarkForTest;
+pub const writePrivateBookmarkForTest = bookmarks.writePrivateBookmarkForTest;
 pub const BookmarkWrite = bookmarks.BookmarkWrite;
 pub const bookmarkAt = bookmarks.bookmarkAt;
 pub const bookmarkCount = bookmarks.bookmarkCount;
@@ -9951,6 +6710,26 @@ pub const writeBookmark = bookmarks.writeBookmark;
 pub const writePrivateBookmark = bookmarks.writePrivateBookmark;
 
 // re-exports: private_lists.zig
+pub const answerPrivateHalfForTest = private_lists.answerPrivateHalfForTest;
+pub const askPrivateHalfForTest = private_lists.askPrivateHalfForTest;
+pub const claimPrivateHalfPendingForTest = private_lists.claimPrivateHalfPendingForTest;
+pub const deliverPrivateHalfKeyedForTest = private_lists.deliverPrivateHalfKeyedForTest;
+pub const endRemoteHalfAskForTest = private_lists.endRemoteHalfAskForTest;
+pub const failRemoteHalfForTest = private_lists.failRemoteHalfForTest;
+pub const forgetPrivateHalvesForTest = private_lists.forgetPrivateHalvesForTest;
+pub const markIdleHalvesAskedForTest = private_lists.markIdleHalvesAskedForTest;
+pub const openPrivateHalfForTest = private_lists.openPrivateHalfForTest;
+pub const parkRemoteHalfAnswerForCiphertextForTest = private_lists.parkRemoteHalfAnswerForCiphertextForTest;
+pub const parkRemoteHalfAnswerForTest = private_lists.parkRemoteHalfAnswerForTest;
+pub const privateHalfAskKeyForTest = private_lists.privateHalfAskKeyForTest;
+pub const privateHalfGateNameForTest = private_lists.privateHalfGateNameForTest;
+pub const privateHalfIsReadableForTest = private_lists.privateHalfIsReadableForTest;
+pub const privateHalfRetryAtForTest = private_lists.privateHalfRetryAtForTest;
+pub const privateHalfRetryDelayForTest = private_lists.privateHalfRetryDelayForTest;
+pub const privateHalfStateForTest = private_lists.privateHalfStateForTest;
+pub const rearmPrivateHalvesForTest = private_lists.rearmPrivateHalvesForTest;
+pub const slotIdForTest = private_lists.slotIdForTest;
+pub const timeoutRemoteHalfForTest = private_lists.timeoutRemoteHalfForTest;
 pub const HalfAskEnd = private_lists.HalfAskEnd;
 pub const beginHelperAsk = private_lists.beginHelperAsk;
 pub const endHalfAsk = private_lists.endHalfAsk;
@@ -9970,6 +6749,58 @@ pub const sameRecord = private_lists.sameRecord;
 pub const scanPrivateHalves = private_lists.scanPrivateHalves;
 
 // re-exports: keyholder.zig
+pub const answerHelperSignForTest = keyholder.answerHelperSignForTest;
+pub const ceremonyCanTakeKeyForTest = keyholder.ceremonyCanTakeKeyForTest;
+pub const ceremonyOwesNameForTest = keyholder.ceremonyOwesNameForTest;
+pub const clearIdentityForTest = keyholder.clearIdentityForTest;
+pub const clearLastPublishedForTest = keyholder.clearLastPublishedForTest;
+pub const clearLastPublishedTagsForTest = keyholder.clearLastPublishedTagsForTest;
+pub const clearLoggedOutLatchForTest = keyholder.clearLoggedOutLatchForTest;
+pub const deliverHelperPubkeyForTest = keyholder.deliverHelperPubkeyForTest;
+pub const deliverHelperSignedForTest = keyholder.deliverHelperSignedForTest;
+pub const exeDirForTest = keyholder.exeDirForTest;
+pub const expireHelperSignForTest = keyholder.expireHelperSignForTest;
+pub const forgetLastPublishedForTest = keyholder.forgetLastPublishedForTest;
+pub const handleHelperPubkeyForTest = keyholder.handleHelperPubkeyForTest;
+pub const handleHelperSignedForTest = keyholder.handleHelperSignedForTest;
+pub const handleNotaryExitedForTest = keyholder.handleNotaryExitedForTest;
+pub const helperPortForTest = keyholder.helperPortForTest;
+pub const helperReachableForTest = keyholder.helperReachableForTest;
+pub const helperSecretForTest = keyholder.helperSecretForTest;
+pub const helperSetupMayFireForTest = keyholder.helperSetupMayFireForTest;
+pub const helperSetupPendingForTest = keyholder.helperSetupPendingForTest;
+pub const helperSetupQueuedForTest = keyholder.helperSetupQueuedForTest;
+pub const helperSignNoticeForTest = keyholder.helperSignNoticeForTest;
+pub const helperSignPendingForTest = keyholder.helperSignPendingForTest;
+pub const helperSignRestorableForTest = keyholder.helperSignRestorableForTest;
+pub const helperSignTimeoutMillisForTest = keyholder.helperSignTimeoutMillisForTest;
+pub const helperSignTimeoutSecondsForTest = keyholder.helperSignTimeoutSecondsForTest;
+pub const helperStateForTest = keyholder.helperStateForTest;
+pub const helperTokenForTest = keyholder.helperTokenForTest;
+pub const holdHelperSignForTest = keyholder.holdHelperSignForTest;
+pub const lastPublishedForTest = keyholder.lastPublishedForTest;
+pub const lastPublishedTagsForTest = keyholder.lastPublishedTagsForTest;
+pub const loggedOutForTest = keyholder.loggedOutForTest;
+pub const loggedOutPubkeyForTest = keyholder.loggedOutPubkeyForTest;
+pub const mintHelperSecretForTest = keyholder.mintHelperSecretForTest;
+pub const releaseHelperSignForTest = keyholder.releaseHelperSignForTest;
+pub const requestHelperSignForTest = keyholder.requestHelperSignForTest;
+pub const resolveSiblingForTest = keyholder.resolveSiblingForTest;
+pub const restoreHelperForTest = keyholder.restoreHelperForTest;
+pub const scanHelperSignForTest = keyholder.scanHelperSignForTest;
+pub const setCeremonyForTest = keyholder.setCeremonyForTest;
+pub const setHelperPortForTest = keyholder.setHelperPortForTest;
+pub const setHelperReadyForTest = keyholder.setHelperReadyForTest;
+pub const setHelperUnreachableForTest = keyholder.setHelperUnreachableForTest;
+pub const setKeyholderMissingForTest = keyholder.setKeyholderMissingForTest;
+pub const setNotaryWindowFoundForTest = keyholder.setNotaryWindowFoundForTest;
+pub const setRemoteStateForTest = keyholder.setRemoteStateForTest;
+pub const setSignerKindForTest = keyholder.setSignerKindForTest;
+pub const setSignerKindHelperForTest = keyholder.setSignerKindHelperForTest;
+pub const setSignerKindLocalForTest = keyholder.setSignerKindLocalForTest;
+pub const signerKindNameForTest = keyholder.signerKindNameForTest;
+pub const signerReadyForTest = keyholder.signerReadyForTest;
+pub const silenceTestSignerForTest = keyholder.silenceTestSignerForTest;
 pub const HelperState = keyholder.HelperState;
 pub const adoptHelperIdentity = keyholder.adoptHelperIdentity;
 pub const beginCreate = keyholder.beginCreate;
@@ -10008,6 +6839,28 @@ pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
 
 // re-exports: remote_signer.zig
+pub const RemoteMethodForTest = remote_signer.RemoteMethodForTest;
+pub const answerBunkerConnectForTest = remote_signer.answerBunkerConnectForTest;
+pub const beginBunkerConnectForTest = remote_signer.beginBunkerConnectForTest;
+pub const bumpRemoteGenerationForTest = remote_signer.bumpRemoteGenerationForTest;
+pub const clearPendingForTest = remote_signer.clearPendingForTest;
+pub const connectWentQuietForTest = remote_signer.connectWentQuietForTest;
+pub const deliverNip46ResponseForTest = remote_signer.deliverNip46ResponseForTest;
+pub const driveBunkerConnectForTest = remote_signer.driveBunkerConnectForTest;
+pub const failPendingByContentForTest = remote_signer.failPendingByContentForTest;
+pub const failPendingForTest = remote_signer.failPendingForTest;
+pub const halfInboxHoldsForTest = remote_signer.halfInboxHoldsForTest;
+pub const pendingConnectIdForTest = remote_signer.pendingConnectIdForTest;
+pub const registerPendingForTest = remote_signer.registerPendingForTest;
+pub const registerRemoteHalfAskForTest = remote_signer.registerRemoteHalfAskForTest;
+pub const remoteDecryptMethodNameForTest = remote_signer.remoteDecryptMethodNameForTest;
+pub const remoteGenerationForTest = remote_signer.remoteGenerationForTest;
+pub const remoteSecretHeldForTest = remote_signer.remoteSecretHeldForTest;
+pub const remoteSignNoticeForTest = remote_signer.remoteSignNoticeForTest;
+pub const resetBunkerConnectForTest = remote_signer.resetBunkerConnectForTest;
+pub const scanPendingRemoteForTest = remote_signer.scanPendingRemoteForTest;
+pub const setRemotePubkeyForTest = remote_signer.setRemotePubkeyForTest;
+pub const takePendingContentForTest = remote_signer.takePendingContentForTest;
 pub const RemoteMethod = remote_signer.RemoteMethod;
 pub const abandonRemoteSigner = remote_signer.abandonRemoteSigner;
 pub const bunkerConnecting = remote_signer.bunkerConnecting;
@@ -10038,6 +6891,10 @@ pub const takeAnswered = remote_signer.takeAnswered;
 pub const takePending = remote_signer.takePending;
 
 // re-exports: drafts.zig
+pub const draftWarningForModelForTest = drafts.draftWarningForModelForTest;
+pub const keptReplyDraftForTest = drafts.keptReplyDraftForTest;
+pub const loadDraftIntoForTest = drafts.loadDraftIntoForTest;
+pub const writeDraftForTest = drafts.writeDraftForTest;
 pub const applyStashedDraft = drafts.applyStashedDraft;
 pub const draftWarningOf = drafts.draftWarningOf;
 pub const forgetReplyDrafts = drafts.forgetReplyDrafts;
@@ -10050,6 +6907,7 @@ pub const takeReplyDraft = drafts.takeReplyDraft;
 pub const writeDraft = drafts.writeDraft;
 
 // re-exports: session.zig
+pub const performLogoutForTest = session.performLogoutForTest;
 pub const legacyKeyOnDisk = session.legacyKeyOnDisk;
 pub const performLogout = session.performLogout;
 pub const persistSession = session.persistSession;
@@ -10057,6 +6915,19 @@ pub const plazaDir = session.plazaDir;
 pub const restoreSession = session.restoreSession;
 
 // re-exports: own_profile.zig
+pub const askVerdictForTest = own_profile.askVerdictForTest;
+pub const forgetOwnProfileAnswerForTest = own_profile.forgetOwnProfileAnswerForTest;
+pub const forgetOwnRecordAnswersForTest = own_profile.forgetOwnRecordAnswersForTest;
+pub const mergeNameJsonForTest = own_profile.mergeNameJsonForTest;
+pub const mergeProfileJsonForTest = own_profile.mergeProfileJsonForTest;
+pub const noteOwnContactsAnsweredForTest = own_profile.noteOwnContactsAnsweredForTest;
+pub const ownProfileAnsweredForTest = own_profile.ownProfileAnsweredForTest;
+pub const ownRecordContentForTest = own_profile.ownRecordContentForTest;
+pub const ownRecordTagsJoinedForTest = own_profile.ownRecordTagsJoinedForTest;
+pub const publishNameForTest = own_profile.publishNameForTest;
+pub const recordOwnProfileAnswerForTest = own_profile.recordOwnProfileAnswerForTest;
+pub const replayPendingForTest = own_profile.replayPendingForTest;
+pub const seedProfileFieldsForTest = own_profile.seedProfileFieldsForTest;
 pub const OwnProfile = own_profile.OwnProfile;
 pub const askVerdict = own_profile.askVerdict;
 pub const forgetOwnProfileAnswer = own_profile.forgetOwnProfileAnswer;
@@ -10084,6 +6955,22 @@ pub const trimmedField = own_profile.trimmedField;
 pub const unlockOwnProfile = own_profile.unlockOwnProfile;
 
 // re-exports: uploads.zig
+pub const ageUploadTokenForTest = uploads.ageUploadTokenForTest;
+pub const appendPictureToDraftForTest = uploads.appendPictureToDraftForTest;
+pub const driveUploadForTest = uploads.driveUploadForTest;
+pub const dropUploadForTest = uploads.dropUploadForTest;
+pub const forgetUploadedForTest = uploads.forgetUploadedForTest;
+pub const parkUploadSignForTest = uploads.parkUploadSignForTest;
+pub const rememberUploadedForTest = uploads.rememberUploadedForTest;
+pub const setPickPathForTest = uploads.setPickPathForTest;
+pub const tokenNamesFileForTest = uploads.tokenNamesFileForTest;
+pub const uploadCancelForTest = uploads.uploadCancelForTest;
+pub const uploadGoForTest = uploads.uploadGoForTest;
+pub const uploadMessageForTest = uploads.uploadMessageForTest;
+pub const uploadPickForTest = uploads.uploadPickForTest;
+pub const uploadRetryForTest = uploads.uploadRetryForTest;
+pub const uploadSentBytesForTest = uploads.uploadSentBytesForTest;
+pub const uploadStateForTest = uploads.uploadStateForTest;
 pub const UploadJob = uploads.UploadJob;
 pub const UploadTarget = uploads.UploadTarget;
 pub const UploadedPicture = uploads.UploadedPicture;
@@ -10104,6 +6991,15 @@ pub const uploadedImeta = uploads.uploadedImeta;
 pub const uploadedPictureFor = uploads.uploadedPictureFor;
 
 // re-exports: media_servers.zig
+pub const blossomOwnListForTest = media_servers.blossomOwnListForTest;
+pub const blossomProbeWantedForTest = media_servers.blossomProbeWantedForTest;
+pub const blossomServersForTest = media_servers.blossomServersForTest;
+pub const forgetBlossomForTest = media_servers.forgetBlossomForTest;
+pub const loadBlossomFromStoreForTest = media_servers.loadBlossomFromStoreForTest;
+pub const markBlossomProbeCleanForTest = media_servers.markBlossomProbeCleanForTest;
+pub const probeReplyAnswersForTest = media_servers.probeReplyAnswersForTest;
+pub const setBlossomServersForTest = media_servers.setBlossomServersForTest;
+pub const writeBlossomServersForTest = media_servers.writeBlossomServersForTest;
 pub const BlossomWrite = media_servers.BlossomWrite;
 pub const blossomAdd = media_servers.blossomAdd;
 pub const blossomProbeAsking = media_servers.blossomProbeAsking;
@@ -10132,6 +7028,24 @@ pub const profilePictureField = view_upload.profilePictureField;
 pub const uploadStrip = view_upload.uploadStrip;
 
 // re-exports: compose.zig
+pub const contentTagsForTest = compose.contentTagsForTest;
+pub const countOutboxRoundForTest = compose.countOutboxRoundForTest;
+pub const deletableTargetKindForTest = compose.deletableTargetKindForTest;
+pub const drivePendingIntentForTest = compose.drivePendingIntentForTest;
+pub const dupeTagsForTest = compose.dupeTagsForTest;
+pub const heldRouteRelaysForTest = compose.heldRouteRelaysForTest;
+pub const holdPostForTest = compose.holdPostForTest;
+pub const holdReplyForTest = compose.holdReplyForTest;
+pub const ingestAndPublishForTest = compose.ingestAndPublishForTest;
+pub const markOutboxRoundForTest = compose.markOutboxRoundForTest;
+pub const markRepostedByMeForTest = compose.markRepostedByMeForTest;
+pub const notifiedByForTest = compose.notifiedByForTest;
+pub const postDelayForTest = compose.postDelayForTest;
+pub const postHeldForTest = compose.postHeldForTest;
+pub const replyHeldForTest = compose.replyHeldForTest;
+pub const setPostDelayForTest = compose.setPostDelayForTest;
+pub const signAndPublishForTest = compose.signAndPublishForTest;
+pub const submitPostForTest = compose.submitPostForTest;
 pub const WarnCarry = compose.WarnCarry;
 pub const clearRepostedByMe = compose.clearRepostedByMe;
 pub const clientOf = compose.clientOf;
@@ -10172,6 +7086,28 @@ pub const withClientTag = compose.withClientTag;
 pub const withContentWarning = compose.withContentWarning;
 
 // re-exports: outbox.zig
+pub const clearOutboxOwnerForTest = outbox.clearOutboxOwnerForTest;
+pub const collectOutboxDueForTest = outbox.collectOutboxDueForTest;
+pub const enqueueOutboxForTest = outbox.enqueueOutboxForTest;
+pub const forgetOutboxAcksForTest = outbox.forgetOutboxAcksForTest;
+pub const loadOutboxForTest = outbox.loadOutboxForTest;
+pub const outboxAuthorAtForTest = outbox.outboxAuthorAtForTest;
+pub const outboxHasRoomForTest = outbox.outboxHasRoomForTest;
+pub const outboxOwnerForTest = outbox.outboxOwnerForTest;
+pub const outboxRetryDelayForTest = outbox.outboxRetryDelayForTest;
+pub const outboxRoundsForTest = outbox.outboxRoundsForTest;
+pub const outboxStateForTest = outbox.outboxStateForTest;
+pub const outboxUsedSlotsForTest = outbox.outboxUsedSlotsForTest;
+pub const outbox_cap_for_test = outbox.outbox_cap_for_test;
+pub const outbox_sent_linger_for_test = outbox.outbox_sent_linger_for_test;
+pub const poolHasRelayForTest = outbox.poolHasRelayForTest;
+pub const recordOutboxAckForTest = outbox.recordOutboxAckForTest;
+pub const resetOutboxForTest = outbox.resetOutboxForTest;
+pub const rounds_before_stuck_for_test = outbox.rounds_before_stuck_for_test;
+pub const routeForOpenPlaceRelaysForTest = outbox.routeForOpenPlaceRelaysForTest;
+pub const saveOutboxForTest = outbox.saveOutboxForTest;
+pub const sweepOutboxForTest = outbox.sweepOutboxForTest;
+pub const syncOutboxOwnerForTest = outbox.syncOutboxOwnerForTest;
 pub const OutboxCounts = outbox.OutboxCounts;
 pub const OutboxEntry = outbox.OutboxEntry;
 pub const OutboxState = outbox.OutboxState;
@@ -10201,6 +7137,26 @@ pub const sweepOutbox = outbox.sweepOutbox;
 pub const syncOutboxOwner = outbox.syncOutboxOwner;
 
 // re-exports: people_search.zig
+pub const handleNip05FoundForTest = people_search.handleNip05FoundForTest;
+pub const nip05AskKeyForTest = people_search.nip05AskKeyForTest;
+pub const nip05AskedForTest = people_search.nip05AskedForTest;
+pub const searchAcceptForTest = people_search.searchAcceptForTest;
+pub const searchArrivedForTest = people_search.searchArrivedForTest;
+pub const searchAskedForTest = people_search.searchAskedForTest;
+pub const searchGenForTest = people_search.searchGenForTest;
+pub const searchIndexLenForTest = people_search.searchIndexLenForTest;
+pub const searchIndexRefreshForTest = people_search.searchIndexRefreshForTest;
+pub const searchRelayCountForTest = people_search.searchRelayCountForTest;
+pub const searchRelayUrlForTest = people_search.searchRelayUrlForTest;
+pub const searchResetForTest = people_search.searchResetForTest;
+pub const searchRowCountForTest = people_search.searchRowCountForTest;
+pub const searchRowLocalForTest = people_search.searchRowLocalForTest;
+pub const searchRowPubkeyForTest = people_search.searchRowPubkeyForTest;
+pub const searchRowRelaysForTest = people_search.searchRowRelaysForTest;
+pub const searchSetStatusForTest = people_search.searchSetStatusForTest;
+pub const searchTickForTest = people_search.searchTickForTest;
+pub const search_inbox_cap_for_test = people_search.search_inbox_cap_for_test;
+pub const search_scan_page_for_test = people_search.search_scan_page_for_test;
 pub const SearchJob = people_search.SearchJob;
 pub const SearchRow = people_search.SearchRow;
 pub const awakeMs = people_search.awakeMs;
@@ -10225,6 +7181,18 @@ pub const submitAddress = people_search.submitAddress;
 pub const unlockSearchIndex = people_search.unlockSearchIndex;
 
 // re-exports: profile_notes.zig
+pub const loadAtProfileBottomForTest = profile_notes.loadAtProfileBottomForTest;
+pub const loadOlderProfileForTest = profile_notes.loadOlderProfileForTest;
+pub const noteProfileReachForTest = profile_notes.noteProfileReachForTest;
+pub const profileEndReachedForTest = profile_notes.profileEndReachedForTest;
+pub const profileOlderAskForTest = profile_notes.profileOlderAskForTest;
+pub const profileReachForTest = profile_notes.profileReachForTest;
+pub const profileRoundEndedForTest = profile_notes.profileRoundEndedForTest;
+pub const profileTargetsForTest = profile_notes.profileTargetsForTest;
+pub const resetProfileEndForTest = profile_notes.resetProfileEndForTest;
+pub const roundReachForTest = profile_notes.roundReachForTest;
+pub const setProfileEndForTest = profile_notes.setProfileEndForTest;
+pub const writeRelaysOfForTest = profile_notes.writeRelaysOfForTest;
 pub const ProfileOlderAsk = profile_notes.ProfileOlderAsk;
 pub const ProfileSeen = profile_notes.ProfileSeen;
 pub const armProfileReach = profile_notes.armProfileReach;
@@ -10245,6 +7213,23 @@ pub const roundReach = profile_notes.roundReach;
 pub const writeRelaysOf = profile_notes.writeRelaysOf;
 
 // re-exports: navigation.zig
+pub const closeThreadForTest = navigation.closeThreadForTest;
+pub const enterProfileForTest = navigation.enterProfileForTest;
+pub const enterThreadForTest = navigation.enterThreadForTest;
+pub const eventFetchArmedForTest = navigation.eventFetchArmedForTest;
+pub const feedEndLatchesForTest = navigation.feedEndLatchesForTest;
+pub const finishLevelFetchForTest = navigation.finishLevelFetchForTest;
+pub const forgetEventFetchForTest = navigation.forgetEventFetchForTest;
+pub const goHomeForTest = navigation.goHomeForTest;
+pub const markThreadFetchDoneForTest = navigation.markThreadFetchDoneForTest;
+pub const openBookmarksForTest = navigation.openBookmarksForTest;
+pub const openEventForTest = navigation.openEventForTest;
+pub const openTopicForTest = navigation.openTopicForTest;
+pub const refreshEventFetchForTest = navigation.refreshEventFetchForTest;
+pub const resetFeedEndForTest = navigation.resetFeedEndForTest;
+pub const setFeedEndForTest = navigation.setFeedEndForTest;
+pub const setFirstProfileFetchOutForTest = navigation.setFirstProfileFetchOutForTest;
+pub const topicReqForTest = navigation.topicReqForTest;
 pub const Standing = navigation.Standing;
 pub const buildOlderFilters = navigation.buildOlderFilters;
 pub const closeAddress = navigation.closeAddress;
@@ -10272,6 +7257,29 @@ pub const swapThreadRoot = navigation.swapThreadRoot;
 pub const topicFilter = navigation.topicFilter;
 
 // re-exports: relay_auth.zig
+pub const AuthReactionForTest = relay_auth.AuthReactionForTest;
+pub const AuthSessionForTest = relay_auth.AuthSessionForTest;
+pub const answerHelperAuthForTest = relay_auth.answerHelperAuthForTest;
+pub const applyAuthFileForTest = relay_auth.applyAuthFileForTest;
+pub const authAnswerForTest = relay_auth.authAnswerForTest;
+pub const authBadgeTextForTest = relay_auth.authBadgeTextForTest;
+pub const authChoiceForTest = relay_auth.authChoiceForTest;
+pub const authChoiceOfForTest = relay_auth.authChoiceOfForTest;
+pub const authCycleForTest = relay_auth.authCycleForTest;
+pub const authDeliverSignedForTest = relay_auth.authDeliverSignedForTest;
+pub const authFileForTest = relay_auth.authFileForTest;
+pub const authHelperBusyForTest = relay_auth.authHelperBusyForTest;
+pub const authHelperFreeForTest = relay_auth.authHelperFreeForTest;
+pub const authPhaseNameForTest = relay_auth.authPhaseNameForTest;
+pub const authPollForTest = relay_auth.authPollForTest;
+pub const authReactForTest = relay_auth.authReactForTest;
+pub const authRowNoteForTest = relay_auth.authRowNoteForTest;
+pub const authSlotResetForTest = relay_auth.authSlotResetForTest;
+pub const authSweepForTest = relay_auth.authSweepForTest;
+pub const auth_gate_wait_ms_for_test = relay_auth.auth_gate_wait_ms_for_test;
+pub const driveRelayAuthForTest = relay_auth.driveRelayAuthForTest;
+pub const resetRelayAuthForTest = relay_auth.resetRelayAuthForTest;
+pub const setAuthChoiceForTest = relay_auth.setAuthChoiceForTest;
 pub const AuthChoice = relay_auth.AuthChoice;
 pub const AuthReaction = relay_auth.AuthReaction;
 pub const AuthSession = relay_auth.AuthSession;
@@ -10303,6 +7311,10 @@ pub const loadAuthChoices = relay_auth.loadAuthChoices;
 pub const setAuthChoice = relay_auth.setAuthChoice;
 
 // re-exports: ingest.zig
+pub const feedWatchGenerationForTest = ingest.feedWatchGenerationForTest;
+pub const mergeFeedWatchForTest = ingest.mergeFeedWatchForTest;
+pub const publishFeedWatchForTest = ingest.publishFeedWatchForTest;
+pub const rememberFeedIdForTest = ingest.rememberFeedIdForTest;
 pub const discoveredRelayThread = ingest.discoveredRelayThread;
 pub const feedWatchGeneration = ingest.feedWatchGeneration;
 pub const ingestRelay = ingest.ingestRelay;
@@ -10328,6 +7340,16 @@ pub const quoteSkeleton = view_media.quoteSkeleton;
 pub const videoCard = view_media.videoCard;
 
 // re-exports: view_note.zig
+pub const askForMediaForTest = view_note.askForMediaForTest;
+pub const buildReplyContextForTest = view_note.buildReplyContextForTest;
+pub const firstLineOfForTest = view_note.firstLineOfForTest;
+pub const forgetAskedMediaForTest = view_note.forgetAskedMediaForTest;
+pub const forgetUncoveredForTest = view_note.forgetUncoveredForTest;
+pub const liveRelayCountForTest = view_note.liveRelayCountForTest;
+pub const oneLineForTest = view_note.oneLineForTest;
+pub const quotingPillLabelForTest = view_note.quotingPillLabelForTest;
+pub const toggleExpandedForTest = view_note.toggleExpandedForTest;
+pub const uncoverNoteForTest = view_note.uncoverNoteForTest;
 pub const QuotePictureBox = view_note.QuotePictureBox;
 pub const absoluteNoteTime = view_note.absoluteNoteTime;
 pub const anyVerbShown = view_note.anyVerbShown;
@@ -10380,6 +7402,16 @@ pub const vgap = view_note.vgap;
 pub const warningCovered = view_note.warningCovered;
 
 // re-exports: view_chrome.zig
+pub const avatarRadiusForTest = view_chrome.avatarRadiusForTest;
+pub const identityInkForTest = view_chrome.identityInkForTest;
+pub const npubShortForTest = view_chrome.npubShortForTest;
+pub const offlineBannerTextForTest = view_chrome.offlineBannerTextForTest;
+pub const pausedBannerTextForTest = view_chrome.pausedBannerTextForTest;
+pub const poolIsHealthyForTest = view_chrome.poolIsHealthyForTest;
+pub const poolIsHealthyOfForTest = view_chrome.poolIsHealthyOfForTest;
+pub const relayBadgeTextForTest = view_chrome.relayBadgeTextForTest;
+pub const roomVerbFillForTest = view_chrome.roomVerbFillForTest;
+pub const signerStatusLabelForTest = view_chrome.signerStatusLabelForTest;
 pub const accountHasName = view_chrome.accountHasName;
 pub const accountName = view_chrome.accountName;
 pub const avatarRadius = view_chrome.avatarRadius;
@@ -10410,6 +7442,17 @@ pub const statusChip = view_chrome.statusChip;
 pub const updateBanner = view_chrome.updateBanner;
 
 // re-exports: view_place.zig
+pub const deliverPlaceLogoBodyForTest = view_place.deliverPlaceLogoBodyForTest;
+pub const lowerScopeForTest = view_place.lowerScopeForTest;
+pub const placeHomeHeightForTest = view_place.placeHomeHeightForTest;
+pub const placeLogoShownForTest = view_place.placeLogoShownForTest;
+pub const placeLogoStateNameForTest = view_place.placeLogoStateNameForTest;
+pub const scanPlaceLogoForTest = view_place.scanPlaceLogoForTest;
+pub const setPlaceLogoAskedForTest = view_place.setPlaceLogoAskedForTest;
+pub const setPlaceLogoIdForTest = view_place.setPlaceLogoIdForTest;
+pub const setPlaceLogoLoadedForTest = view_place.setPlaceLogoLoadedForTest;
+pub const stripEmptyImagesForTest = view_place.stripEmptyImagesForTest;
+pub const visibleLenForTest = view_place.visibleLenForTest;
 pub const handlePlaceLogoFetched = view_place.handlePlaceLogoFetched;
 pub const lowerScope = view_place.lowerScope;
 pub const placeHeader = view_place.placeHeader;
@@ -10423,6 +7466,8 @@ pub const stripEmptyImages = view_place.stripEmptyImages;
 pub const visibleLen = view_place.visibleLen;
 
 // re-exports: view_rail.zig
+pub const avatarImageIdForTest = view_rail.avatarImageIdForTest;
+pub const placeTileColorsForTest = view_rail.placeTileColorsForTest;
 pub const avatarImageId = view_rail.avatarImageId;
 pub const backupNudge = view_rail.backupNudge;
 pub const guestBanner = view_rail.guestBanner;
@@ -10437,6 +7482,7 @@ pub const youAvatar = view_rail.youAvatar;
 pub const feedView = view_feed.feedView;
 
 // re-exports: view_profile.zig
+pub const profileFooterForTest = view_profile.profileFooterForTest;
 pub const ProfileRows = view_profile.ProfileRows;
 pub const bookmarks_level_key = view_profile.bookmarks_level_key;
 pub const handleBannerFetched = view_profile.handleBannerFetched;
@@ -10450,12 +7496,30 @@ pub const threadLevelKey = view_profile.threadLevelKey;
 pub const topicLevelKey = view_profile.topicLevelKey;
 
 // re-exports: view_article.zig
+pub const articleRowCountForTest = view_article.articleRowCountForTest;
+pub const articleRowForTest = view_article.articleRowForTest;
+pub const forgetArticleForTest = view_article.forgetArticleForTest;
 pub const articleFor = view_article.articleFor;
 pub const articlePanel = view_article.articlePanel;
 pub const articleRowAt = view_article.articleRowAt;
 pub const isArticleRoot = view_article.isArticleRoot;
 
 // re-exports: view_thread.zig
+pub const ancestorBodyLinesForTest = view_thread.ancestorBodyLinesForTest;
+pub const ancestorRowForTest = view_thread.ancestorRowForTest;
+pub const extentTableLenForTest = view_thread.extentTableLenForTest;
+pub const ghostRowForTest = view_thread.ghostRowForTest;
+pub const listeningFooterForTest = view_thread.listeningFooterForTest;
+pub const noteRowEstimateForTest = view_thread.noteRowEstimateForTest;
+pub const outsideGraphRowForTest = view_thread.outsideGraphRowForTest;
+pub const profileExtentTableForTest = view_thread.profileExtentTableForTest;
+pub const quoteBodyLinesForTest = view_thread.quoteBodyLinesForTest;
+pub const recordVisibleAuthorsForTest = view_thread.recordVisibleAuthorsForTest;
+pub const recordVisibleNotesForTest = view_thread.recordVisibleNotesForTest;
+pub const replyBlockForTest = view_thread.replyBlockForTest;
+pub const rowExtentFromTableForTest = view_thread.rowExtentFromTableForTest;
+pub const showMoreRepliesForTest = view_thread.showMoreRepliesForTest;
+pub const threadExtentTableForTest = view_thread.threadExtentTableForTest;
 pub const RowExtents = view_thread.RowExtents;
 pub const ThreadRows = view_thread.ThreadRows;
 pub const ancestorBodyLines = view_thread.ancestorBodyLines;
@@ -10482,6 +7546,8 @@ pub const threadRepliesFromStore = view_thread.threadRepliesFromStore;
 pub const visible_set_cap = view_thread.visible_set_cap;
 
 // re-exports: view_compose.zig
+pub const composeReachForTest = view_compose.composeReachForTest;
+pub const insertMentionForTest = view_compose.insertMentionForTest;
 pub const composeReach = view_compose.composeReach;
 pub const composeSheet = view_compose.composeSheet;
 pub const insertMention = view_compose.insertMention;
@@ -10489,6 +7555,8 @@ pub const mentionQuery = view_compose.mentionQuery;
 pub const replyNotifyRow = view_compose.replyNotifyRow;
 
 // re-exports: view_notifications.zig
+pub const notificationRowForTest = view_notifications.notificationRowForTest;
+pub const notifications_column_width_for_test = view_notifications.notifications_column_width_for_test;
 pub const inbox_page = view_notifications.inbox_page;
 pub const notificationRow = view_notifications.notificationRow;
 pub const notificationsSheet = view_notifications.notificationsSheet;
@@ -10513,6 +7581,8 @@ pub const profileSheet = view_sheets.profileSheet;
 pub const toastOverlay = view_sheets.toastOverlay;
 
 // re-exports: view_settings.zig
+pub const cycleRelayForTest = view_settings.cycleRelayForTest;
+pub const removeRelayForTest = view_settings.removeRelayForTest;
 pub const cycleRelay = view_settings.cycleRelay;
 pub const forgetChangedRelaySlotStates = view_settings.forgetChangedRelaySlotStates;
 pub const mayRemoveRelay = view_settings.mayRemoveRelay;

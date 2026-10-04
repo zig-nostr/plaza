@@ -12,6 +12,10 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const Model = main.Model;
+const forgetBookmarks = main.forgetBookmarks;
+const loadBookmarksFromStore = main.loadBookmarksFromStore;
+const sayMuteWrite = main.sayMuteWrite;
 const Effects = main.Effects;
 const OwnProfile = main.OwnProfile;
 const activePubkey = main.activePubkey;
@@ -328,4 +332,31 @@ pub fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) 
     defer gpa.free(tags);
     for (parsed.value, 0..) |tag, i| tags[i] = tag;
     return mutesFromTags(tags, out);
+}
+
+pub fn privateMutesForTest(content: []const u8, out: [][32]u8) usize {
+    return privateMutes(std.heap.page_allocator, content, out);
+}
+pub fn writeMuteForTest(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
+    return writeMute(fx, pubkey, muting);
+}
+pub fn forgetMutesForTest() void {
+    forgetMutes();
+    forgetBookmarks();
+}
+
+pub fn setMutesForTest(list: []const [32]u8, created_at: i64) bool {
+    return setMutes(list, created_at);
+}
+
+pub fn loadMutesFromStoreForTest() void {
+    loadMutesFromStore();
+    loadBookmarksFromStore();
+}
+
+pub fn ingestMuteListForTest(ev: nostr.event.Event) void {
+    ingestMuteList(ev);
+}
+pub fn sayMuteWriteForTest(model: *Model, outcome: MuteWrite, muting: bool) void {
+    sayMuteWrite(model, outcome, muting);
 }

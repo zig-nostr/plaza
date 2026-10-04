@@ -574,3 +574,12 @@ pub fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
         }),
     });
 }
+
+pub fn avatarImageIdForTest(pubkey: [32]u8) u64 {
+    const p = lookupProfile(pubkey) orelse return 0;
+    return p.image_id;
+}
+pub fn placeTileColorsForTest(m: *const Place) struct { bg: canvas.Color, ink: canvas.Color } {
+    const c = placeTileColors(m);
+    return .{ .bg = c.bg, .ink = c.ink };
+}

@@ -409,3 +409,53 @@ pub fn blossomRemove(model: *Model, fx: *Effects, index: u8) void {
         .failed => model.blossom_error = .failed,
     }
 }
+
+/// Makes `urls` this account's server list, as if a kind:10063 had been read.
+pub fn setBlossomServersForTest(urls: []const []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const tags = gpa.alloc(nostr.event.Tag, urls.len) catch return;
+    for (urls, 0..) |url, i| tags[i] = gpa.dupe([]const u8, &.{ "server", url }) catch return;
+    setBlossomServers(tags, 1);
+}
+
+pub fn forgetBlossomForTest() void {
+    forgetBlossom();
+}
+
+pub fn loadBlossomFromStoreForTest() void {
+    loadBlossomFromStore();
+}
+/// Says the probe found nothing on any relay, for the account that is signed in.
+pub fn markBlossomProbeCleanForTest(clean: bool) void {
+    lockBlossom();
+    g_blossom_probe_for = activePubkey();
+    unlockBlossom();
+    g_blossom_probe_state.store(if (clean) probe_clean else probe_unknown, .release);
+}
+
+// ------------------------------------------------------- the reader's servers
+
+pub fn blossomProbeWantedForTest() bool {
+    const pk = activePubkey() orelse return false;
+    lockBlossom();
+    defer unlockBlossom();
+    return blossomProbeWantedUnlocked(pk);
+}
+
+pub fn probeReplyAnswersForTest(tag: std.meta.Tag(nostr.message.RelayMessage)) bool {
+    return probeReplyAnswers(tag);
+}
+
+pub fn writeBlossomServersForTest(fx: *Effects, add: ?[]const u8, remove: ?[]const u8) BlossomWrite {
+    return writeBlossomServers(fx, add, remove);
+}
+
+pub fn blossomServersForTest(out: *[blossom.max_servers][]const u8) usize {
+    const s = uploadServers();
+    for (0..s.count) |i| out[i] = std.heap.page_allocator.dupe(u8, s.at(i)) catch "";
+    return s.count;
+}
+
+pub fn blossomOwnListForTest() bool {
+    return uploadServers().own;
+}

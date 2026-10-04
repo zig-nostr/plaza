@@ -480,3 +480,42 @@ fn metaAttr(tag: []const u8, name: []const u8) ?[]const u8 {
     }
     return null;
 }
+
+/// Files a preview as if a page had answered, for a test that renders the card.
+pub fn seedLinkForTest(url: []const u8, title: []const u8, desc: []const u8) void {
+    const slot = wantLink(url) orelse return;
+    storeLinkMeta(slot, .{ .title = title, .description = desc });
+    slot.state = .loaded;
+}
+pub fn setLinkPreviewForTest(url: []const u8, domain: []const u8, title: []const u8, description: []const u8) void {
+    for (&g_links) |*l| {
+        if (l.used) continue;
+        l.* = .{ .used = true, .state = .loaded };
+        const u = @min(url.len, l.url_buf.len);
+        @memcpy(l.url_buf[0..u], url[0..u]);
+        l.url_len = @intCast(u);
+        const d = @min(domain.len, l.domain_buf.len);
+        @memcpy(l.domain_buf[0..d], domain[0..d]);
+        l.domain_len = @intCast(d);
+        const t = @min(title.len, l.title_buf.len);
+        @memcpy(l.title_buf[0..t], title[0..t]);
+        l.title_len = @intCast(t);
+        const c = @min(description.len, l.desc_buf.len);
+        @memcpy(l.desc_buf[0..c], description[0..c]);
+        l.desc_len = @intCast(c);
+        return;
+    }
+}
+
+pub fn clearLinkPreviewsForTest() void {
+    for (&g_links) |*l| l.* = .{};
+}
+pub fn scanLinkFetchesForTest(fx: *Effects, model: *const Model) void {
+    scanLinkFetches(fx, model);
+}
+
+/// Whether the page behind `url` has been asked for (or is being).
+pub fn linkRequestedForTest(url: []const u8) bool {
+    const l = linkFor(url) orelse return false;
+    return l.state == .fetching or l.attempts > 0;
+}

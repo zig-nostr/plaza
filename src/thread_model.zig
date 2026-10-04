@@ -752,3 +752,15 @@ pub fn splitByFollowGraph(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u
     }
     return .{ .inside = inside[0..ni], .outside = outside[0..no] };
 }
+
+/// A fresh arrival table, for a test that drives the real stamping.
+pub fn arrivalTableForTest() ArrivalTable {
+    return .{};
+}
+
+pub fn stampArrivalForTest(table: *ArrivalTable, notes: []Note, settled: bool) void {
+    stampArrival(table, notes, settled);
+}
+pub fn splitByFollowGraphForTest(ui: *AppUi, blocks: []const ThreadBlock, author: [32]u8) GraphSplit {
+    return splitByFollowGraph(ui, blocks, author);
+}

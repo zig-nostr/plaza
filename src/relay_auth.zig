@@ -7,14 +7,15 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const keyholder = @import("keyholder.zig");
+const feed_state = @import("feed_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const identityGeneration = main.identityGeneration;
 const Effects = main.Effects;
 const activePubkey = main.activePubkey;
-const answerHelperAuthForTest = main.answerHelperAuthForTest;
 const helperFetch = main.helperFetch;
 const hexLower = main.hexLower;
 const isFeedSub = main.isFeedSub;
@@ -830,3 +831,91 @@ pub fn authRowNote(index: usize) ?[]const u8 {
         .idle, .done => null,
     };
 }
+
+pub fn answerHelperAuthForTest(a: std.mem.Allocator, unsigned_json: []const u8) void {
+    const secret = feed_state.g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    var parsed = nostr.event.fromJson(a, unsigned_json) catch return;
+    defer parsed.deinit();
+    const ev = parsed.value;
+    const signed = nostr.event.create(a, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
+    const signed_json = nostr.event.toJson(a, signed) catch return;
+    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(a) catch return;
+    handleHelperAuthSigned(.{ .key = helper_auth_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+pub fn resetRelayAuthForTest() void {
+    authLock();
+    g_auth_choices = @splat(.{});
+    g_auth_slots = @splat(.{});
+    authUnlock();
+    g_helper_auth_active = false;
+    g_helper_auth_index = 0;
+}
+
+pub fn authChoiceForTest(url: []const u8) AuthChoice {
+    return authChoiceFor(url);
+}
+pub fn authChoiceOfForTest(account: [32]u8, url: []const u8) AuthChoice {
+    return authChoiceOf(account, url);
+}
+pub fn setAuthChoiceForTest(account: [32]u8, url: []const u8, choice: AuthChoice) bool {
+    return setAuthChoice(account, url, choice);
+}
+pub fn authFileForTest(buf: []u8) ?[]const u8 {
+    return formatAuthChoicesFile(buf);
+}
+pub fn applyAuthFileForTest(raw: []const u8) void {
+    applyAuthChoicesFile(raw);
+}
+pub fn authPhaseNameForTest(index: usize) []const u8 {
+    return @tagName(authSlotPhase(index));
+}
+pub fn authRowNoteForTest(index: usize) ?[]const u8 {
+    return authRowNote(index);
+}
+pub fn authBadgeTextForTest(index: usize, url: []const u8) ?[]const u8 {
+    return authBadgeText(index, url);
+}
+pub fn driveRelayAuthForTest(fx: *Effects) void {
+    driveRelayAuth(fx);
+}
+pub fn authAnswerForTest(index: usize, allow: bool) void {
+    authAnswer(index, allow);
+}
+pub fn authCycleForTest(index: usize) void {
+    authCycle(index);
+}
+pub fn authSweepForTest(now_s: i64) void {
+    authSweep(now_s);
+}
+pub fn authHelperBusyForTest() bool {
+    return g_helper_auth_active;
+}
+/// The keyholder's answer to the request that was out has arrived and been
+/// dropped, as `handleHelperAuthSigned` does, leaving it free for the next.
+pub fn authHelperFreeForTest() void {
+    g_helper_auth_active = false;
+}
+/// The connection on `index` has ended.
+pub fn authSlotResetForTest(index: usize) void {
+    authSlotReset(index);
+}
+pub fn authDeliverSignedForTest(index: usize, ev: nostr.event.Event) void {
+    var verifier = nostr.keys.Signer.init();
+    defer verifier.deinit();
+    authDeliverSigned(std.heap.page_allocator, verifier, index, ev);
+}
+
+/// The reader thread's reaction, driven by a test with a stand-in relay.
+pub const AuthSessionForTest = AuthSession;
+pub const AuthReactionForTest = AuthReaction;
+pub fn authReactForTest(sess: *AuthSession, url: []const u8, msg: nostr.message.RelayMessage, now_ms: i64) AuthReaction {
+    return authReact(sess, url, msg, now_ms);
+}
+pub fn authPollForTest(sess: *AuthSession, url: []const u8, relay: anytype, now_ms: i64) []const u8 {
+    return @tagName(authPoll(sess, url, relay, now_ms, identityGeneration()));
+}
+pub const auth_gate_wait_ms_for_test = auth_gate_wait_ms;

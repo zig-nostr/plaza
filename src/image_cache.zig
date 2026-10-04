@@ -12,6 +12,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const warmedAlready = main.warmedAlready;
 const Effects = main.Effects;
 const avatar_target_px = main.avatar_target_px;
 const gif_target_px = main.gif_target_px;
@@ -316,4 +317,33 @@ pub fn decodeAndRegister(fx: *Effects, id: u64, bytes: []const u8, max_dim: u32)
     if (stbir_resize_uint8_linear(pixels, w, h, 0, out.ptr, @intCast(dst_w), @intCast(dst_h), 0, stbir_rgba) == null) return null;
     fx.registerImage(id, dst_w, dst_h, out) catch return null;
     return .{ .width = dst_w, .height = dst_h };
+}
+
+/// Whether the vendored decoder can read `bytes` at all. Test seam: what makes
+/// the platform fallback in `decodeAndRegister` load-bearing is precisely which
+/// formats stb was NOT built for.
+pub fn stbCanDecodeForTest(bytes: []const u8) bool {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse return false;
+    stbi_image_free(px);
+    return true;
+}
+
+pub fn avatarUrlForTest(buf: []u8, src: []const u8, direct: bool) []const u8 {
+    return avatarUrl(buf, src, direct);
+}
+
+pub fn feedImageUrlForTest(buf: []u8, src: []const u8) []const u8 {
+    return feedImageUrl(buf, src);
+}
+pub fn mediaUrlForTest(buf: []u8, src: []const u8, px: u32, fit: MediaFit) []const u8 {
+    return mediaUrl(buf, src, px, fit);
+}
+/// Whether warming has asked for this picture address, the way `warmPicture`
+/// builds it.
+pub fn pictureWarmedForTest(src: []const u8) bool {
+    var url_buf: [1024]u8 = undefined;
+    return warmedAlready(feedImageUrl(&url_buf, src));
 }

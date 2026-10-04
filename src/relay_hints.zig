@@ -339,3 +339,31 @@ pub fn profileAddress(out: *[note_address_cap]u8, pubkey: [32]u8) ?[]const u8 {
     @memcpy(out[0..addr.len], addr);
     return out[0..addr.len];
 }
+
+pub fn noteAddressForTest(out: *[note_address_cap]u8, note: *const Note, relays_wanted: usize) ?[]const u8 {
+    return noteAddress(out, note, relays_wanted);
+}
+pub fn profileAddressForTest(out: *[note_address_cap]u8, pubkey: [32]u8) ?[]const u8 {
+    return profileAddress(out, pubkey);
+}
+pub const note_address_cap_for_test = note_address_cap;
+pub fn recordSeenOnForTest(id: [32]u8, url: []const u8) void {
+    recordSeenOnId(id, url);
+}
+pub fn resetSeenOnForTest() void {
+    seenOnLock();
+    defer seenOnUnlock();
+    for (&g_seen_on) |*e| e.* = .{};
+    g_seen_url_n = 0;
+}
+pub fn hintsForTest(id: [32]u8, author: ?[32]u8) HintList {
+    var out: HintList = .{};
+    hintsFor(id, author, &out);
+    return out;
+}
+pub fn isHintableRelayForTest(url: []const u8) bool {
+    return isHintableRelay(url);
+}
+pub fn seenUrlCountForTest() usize {
+    return g_seen_url_n;
+}

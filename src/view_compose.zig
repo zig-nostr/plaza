@@ -511,3 +511,12 @@ pub fn composeReach(ui: *AppUi, written: usize, dropped: usize) []const u8 {
     if (live == 0) return "no relay is answering · it will wait in the outbox";
     return ui.fmt("posts to {d} {s}", .{ live, if (live == 1) "relay" else "relays" });
 }
+
+pub fn insertMentionForTest(model: *Model, pubkey: [32]u8) void {
+    insertMention(model, pubkey);
+}
+
+pub fn composeReachForTest(arena: std.mem.Allocator, written: usize, dropped: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return composeReach(&ui, written, dropped);
+}

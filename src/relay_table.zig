@@ -12,6 +12,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const forgetDiscovered = main.forgetDiscovered;
+const forgetRefusedRelaysForTest = main.forgetRefusedRelaysForTest;
 const forgetChangedRelaySlotStates = main.forgetChangedRelaySlotStates;
 const forgetOutboxAcks = main.forgetOutboxAcks;
 const hexLower = main.hexLower;
@@ -460,4 +462,81 @@ pub fn addRelay(url: []const u8, read: bool, write: bool) ?usize {
         return i;
     }
     return null;
+}
+
+pub fn noteRelayRemovedForTest(url: []const u8) void {
+    noteRelayRemoved(url);
+}
+
+pub fn forgetRelayRemovalsForTest() void {
+    forgetRelayRemovals();
+}
+/// How many relays the app is born with. Tests derive from this rather than
+/// naming a number, so changing the bootstrap list is one edit and not a hunt
+/// through the suite for every place that happened to say five.
+pub const bootstrap_relay_count_for_test = bootstrap_relays.len;
+
+/// The most relays a reader may have, which is what the ack mask can address.
+pub const max_relays_for_test = max_relays;
+
+/// Puts the pool back to the one the app was born with. For tests, which need a
+/// known pool: the real one is loaded from disk or from their kind:10002.
+pub fn resetRelaysForTest() void {
+    g_relays = [_]RelayEntry{.{}} ** max_relays;
+    g_relay_count.store(0, .release);
+    relay_list.g_relays_are_mine = false;
+    setRelayListStamp(0);
+    relay_list.g_relay_list_dirty = false;
+    forgetRelayRemovals();
+    relay_list.g_staged_ready.store(false, .release);
+    g_suggested_count.store(0, .release);
+    forgetDiscovered();
+    forgetRefusedRelaysForTest();
+    seedBootstrapRelays();
+}
+
+/// The file this pool would be saved as, and reading one back. The stamp line
+/// is what carries "how new is what we hold" across a restart.
+pub fn formatRelaysFileForTest(buf: []u8) ?[]const u8 {
+    return formatRelaysFile(buf);
+}
+
+pub fn applyRelaysFileForTest(raw: []const u8) void {
+    applyRelaysFile(raw);
+}
+
+/// An EMPTY pool, the way a launch starts before the file is read. Distinct from
+/// `resetRelaysForTest`, which seeds the bootstrap list: a test that means to
+/// reproduce a restart must not have four relays already sitting in the seats
+/// the file is about to fill.
+pub fn clearRelaysForTest() void {
+    g_relays = [_]RelayEntry{.{}} ** max_relays;
+    g_relay_count.store(0, .release);
+    relay_list.g_relays_are_mine = false;
+    relay_list.g_relay_owner = null;
+    setRelayListStamp(0);
+    relay_list.g_relay_list_dirty = false;
+    forgetRelayRemovals();
+    relay_list.g_staged_ready.store(false, .release);
+    g_suggested_count.store(0, .release);
+    forgetDiscovered();
+    forgetRefusedRelaysForTest();
+}
+pub fn addRelayForTest(url: []const u8, read: bool, write: bool) ?usize {
+    return addRelay(url, read, write);
+}
+
+pub fn resetRelaysToBootstrapForTest() void {
+    resetRelaysToBootstrap();
+}
+pub const maxRelaysForTest = max_relays;
+pub fn relayReadWriteForTest(i: usize) ?RelayUse {
+    const e = relayAt(i) orelse return null;
+    return .{ .read = e.read, .write = e.write };
+}
+pub fn indexerRelaysForTest() []const []const u8 {
+    return &indexer_relays;
+}
+pub fn indexerChunkForTest() usize {
+    return indexer_chunk;
 }

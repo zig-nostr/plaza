@@ -630,3 +630,95 @@ pub fn submitAddress(model: *Model, fx: *Effects) void {
         .term => searchAskRelays(),
     }
 }
+
+/// Back to a fresh start: no index, no rows, no relay state.
+pub fn searchResetForTest() void {
+    searchReset();
+    lockSearchIndex();
+    g_search_index.deinit(std.heap.page_allocator);
+    g_search_index_ready = false;
+    unlockSearchIndex();
+    g_search_asked = 0;
+    g_search_typed_ms = 0;
+    g_nip05_ask = null;
+}
+
+/// Builds the index now, on this thread, from the store.
+pub fn searchIndexRefreshForTest() void {
+    searchIndexRefresh();
+}
+
+pub fn searchIndexLenForTest() usize {
+    lockSearchIndex();
+    defer unlockSearchIndex();
+    return g_search_index.entries.len;
+}
+
+pub fn searchRowCountForTest() usize {
+    return g_search_len;
+}
+
+pub fn searchRowPubkeyForTest(i: usize) [32]u8 {
+    return g_search_rows[i].pubkey;
+}
+
+pub fn searchRowLocalForTest(i: usize) bool {
+    return g_search_rows[i].local;
+}
+
+/// Bit `n` set means search relay `n` returned this row.
+pub fn searchRowRelaysForTest(i: usize) u8 {
+    return g_search_rows[i].relays;
+}
+
+pub fn searchTickForTest(model: *const Model, now_ms: i64) void {
+    searchTick(model, now_ms);
+}
+
+/// Whether the term on screen has been put to the relays.
+pub fn searchAskedForTest() bool {
+    return g_search_term_len > 0 and g_search_asked == g_search_gen.load(.acquire);
+}
+
+pub fn searchGenForTest() u32 {
+    return g_search_gen.load(.acquire);
+}
+
+/// A relay thread's hand-off, without the thread.
+pub const search_inbox_cap_for_test = search_inbox_cap;
+
+pub fn searchArrivedForTest(gen: u32, relay: u8, pubkey: [32]u8) void {
+    searchArrived(gen, relay, pubkey);
+}
+
+/// What a relay thread does with one event.
+pub fn searchAcceptForTest(gen: u32, relay: u8, signer: nostr.keys.Signer, ev: nostr.event.Event) bool {
+    const job = SearchJob{ .gen = gen, .relay = relay, .url = "", .term = undefined, .term_len = 0 };
+    return searchAccept(std.heap.page_allocator, signer, job, ev);
+}
+
+pub fn searchSetStatusForTest(relay: usize, state: search.RelayState, count: u16) void {
+    g_search_status[relay].store((search.Status{ .gen = g_search_gen.load(.acquire), .state = state, .count = count }).pack(), .release);
+}
+
+pub fn searchRelayCountForTest() usize {
+    return searchRelays().len;
+}
+
+pub fn searchRelayUrlForTest(i: usize) []const u8 {
+    return searchRelays()[i];
+}
+
+pub fn nip05AskedForTest() bool {
+    return g_nip05_ask != null;
+}
+
+pub fn handleNip05FoundForTest(model: *Model, response: native_sdk.EffectResponse) void {
+    handleNip05Found(model, response);
+}
+
+/// The key the lookup now awaited went out under.
+pub fn nip05AskKeyForTest() u64 {
+    return g_nip05_ask_key;
+}
+pub const search_scan_page_for_test = search_scan_page;

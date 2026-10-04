@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const npubShortOf = main.npubShortOf;
 const AppUi = main.AppUi;
 const Conn = main.Conn;
 const Model = main.Model;
@@ -1137,4 +1138,48 @@ pub fn pillButton(ui: *AppUi, label: []const u8, press: Msg, filled: bool, on_su
             }),
         }),
     });
+}
+
+pub fn relayBadgeTextForTest(i: usize) []const u8 {
+    const e = relayAt(i) orelse return "(removed)";
+    return relayBadgeText(e);
+}
+pub fn poolIsHealthyOfForTest(live: usize, total: usize) bool {
+    return poolIsHealthyOf(live, total);
+}
+pub fn signerStatusLabelForTest() []const u8 {
+    return signerStatus().label;
+}
+/// The abbreviated npub exactly as the view renders it, so a test can count how
+/// many times a screen says it without hard-coding the truncation. For tests.
+pub fn npubShortForTest(arena: std.mem.Allocator, pubkey: [32]u8) []const u8 {
+    return npubShortOf(arena, pubkey);
+}
+pub fn pausedBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return pausedBannerText(&ui, queued);
+}
+
+pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize, none_set: bool) []const u8 {
+    var ui = AppUi.init(arena);
+    return offlineBannerText(&ui, queued, none_set);
+}
+
+/// Whether the pool counts as healthy: MOST of it answering, not all of it. The
+/// redesign's at-rest bar reads "4/5 relays" in green while its working bar reads
+/// "3/5" in amber, so the line sits at four fifths. A relay pool always has a
+/// straggler, and a bar that goes amber for one is a bar nobody reads.
+pub fn poolIsHealthyForTest(live: usize) bool {
+    return poolIsHealthy(live);
+}
+pub fn identityInkForTest() canvas.Color {
+    return identityInk();
+}
+
+pub fn roomVerbFillForTest() canvas.Color {
+    return roomVerbFill();
+}
+
+pub fn avatarRadiusForTest(size: f32) f32 {
+    return avatarRadius(size);
 }

@@ -542,3 +542,78 @@ pub const FreshAsk = struct {
         return self.server_buf[0..self.server_len];
     }
 };
+
+pub fn forgetOwnListMemoForTest() void {
+    forgetOwnListMemo();
+}
+
+pub fn ownRelaysAllFinishedForTest() bool {
+    return ownRelaysAllFinished();
+}
+
+pub fn noteOwnOutboxForTest(ev: nostr.event.Event) void {
+    noteOwnOutbox(ev);
+}
+
+pub fn noHistoryKnownForTest(kind: ListKind) bool {
+    return noHistoryKnown(kind);
+}
+
+pub fn needsFreshConsentForTest(kind: ListKind) bool {
+    return needsFreshConsent(kind);
+}
+
+pub fn confirmStartFreshForTest(kind: ListKind) bool {
+    return confirmStartFresh(kind);
+}
+
+pub fn retryOwnListsReadForTest() void {
+    retryOwnListsRead();
+}
+
+/// Pretends the wait has run for `seconds`, for a test that cannot sleep.
+pub fn ownListsWaitedForTest(seconds: i64) void {
+    const pk = activePubkey() orelse return;
+    g_own_lists_since = nowSeconds() - seconds;
+    g_own_lists_since_for = pk;
+}
+
+pub fn setIdentityMintedForTest(minted: bool) void {
+    g_identity_minted_here = minted;
+}
+
+/// The relay now in slot `index` answered. Slots with no relay are ignored, as
+/// the ingest thread for an empty seat never dials anything.
+pub fn noteContactsAnsweredByForTest(index: usize, pk: [32]u8) void {
+    const e = relayAt(index) orelse return;
+    noteContactsAnsweredBy(index, e.url(), pk);
+}
+
+/// A relay answered from seat `index` at `url`, whatever sits there now: what an
+/// answer that arrived just before the seat changed hands leaves behind.
+pub fn noteContactsAnsweredFromForTest(index: usize, url: []const u8, pk: [32]u8) void {
+    noteContactsAnsweredBy(index, url, pk);
+}
+
+pub fn contactsConfirmedAbsentForTest() bool {
+    return contactsConfirmedAbsent();
+}
+
+pub fn haveOwnContactListForTest() bool {
+    return haveOwnContactList();
+}
+/// Every sentence `noListToast` can say, for the test that checks each fits.
+pub fn noListToastsForTest() [9][]const u8 {
+    var out: [9][]const u8 = undefined;
+    var n: usize = 0;
+    inline for (.{ "follow list", "mute list", "bookmarks" }) |what| {
+        for ([_]OwnListsRead{ .reading, .incomplete, .none_found }) |read| {
+            out[n] = noListToastIn(what, read);
+            n += 1;
+        }
+    }
+    return out;
+}
+pub fn identityMintedForTest() bool {
+    return g_identity_minted_here;
+}

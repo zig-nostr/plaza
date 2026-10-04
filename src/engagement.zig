@@ -376,3 +376,48 @@ fn noteIdFromHex(hex: []const u8) ?i64 {
     _ = std.fmt.hexToBytes(&bytes, hex[0..16]) catch return null;
     return @intCast(std.mem.readInt(u64, &bytes, .big) & std.math.maxInt(i64));
 }
+
+/// Clears the like table. For tests, which share the process globals.
+pub fn rememberLikeForTest(note_id: i64, reaction_id: [32]u8) void {
+    rememberLike(note_id, reaction_id);
+}
+
+pub fn likeReactionIdForTest(note_id: i64) ?[32]u8 {
+    const e = likeEntry(note_id) orelse return null;
+    return e.reaction_id;
+}
+
+pub fn resetLikesForTest() void {
+    g_my_likes = [_]MyLike{.{}} ** my_likes_cap;
+}
+
+/// Whether this session has liked the note (for tests and the view).
+pub fn isLikedForTest(note_id: i64) bool {
+    return isLiked(note_id);
+}
+pub const zap_msat_ceiling_for_test = zap_msat_ceiling;
+
+/// Clears the engagement table and dedup set. For tests.
+/// Sets a note's zap total directly, for tests about what the RENDER does with
+/// a large number. Ingestion cannot produce one in a single step any more, and
+/// the two properties are worth testing apart: what is admitted, and what is
+/// survivable once admitted.
+pub fn setZapMsatForTest(id: i64, msat: u64) void {
+    engagementLock();
+    defer engagementUnlock();
+    if (ensureEngagement(id)) |row| row.counts.zap_msat = msat;
+}
+
+pub fn resetEngagementForTest() void {
+    g_engagement = [_]Engagement{.{}} ** engagement_cap;
+    g_seen = [_]u64{0} ** seen_engagement_cap;
+    g_seen_len = 0;
+}
+
+/// Folds an event into the counts, for tests (the ingest path without threads).
+pub fn countEngagementForTest(ev: nostr.event.Event, feed_ids: []const i64) void {
+    countEngagement(ev, feed_ids);
+}
+pub fn repostedByMeForTest(note_id: i64) bool {
+    return engagementFor(note_id).reposted_by_me;
+}

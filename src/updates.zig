@@ -189,3 +189,12 @@ pub fn newerRelease(body: []const u8, current: []const u8, version_out: []u8, ur
     @memcpy(url_out[0..url.string.len], url.string);
     return .{ .version_len = theirs.len, .url_len = url.string.len };
 }
+
+pub fn resetUpdateStateForTest() void {
+    g_update_check = true;
+    g_update_version_len = 0;
+    g_update_url_len = 0;
+    g_update_asking = false;
+    g_update_dismissed = false;
+    g_update_next_at_ms = 0;
+}

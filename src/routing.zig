@@ -1478,3 +1478,151 @@ pub fn followRouteChanges(io: std.Io) void {
         }
     }
 }
+
+pub fn routeCoverageForTest() RouteCoverage {
+    return g_route_coverage;
+}
+pub const routeCoverageTargetForTest = route_coverage_target;
+
+// -- Relays that will not have us ---------------------------------------------
+//
+// Coverage says which relays carry the people you follow. It does not say which
+// of them will talk to you, and those are not the same set. A paid relay refuses
+// the WEBSOCKET HANDSHAKE, before a single Nostr message is exchanged, so there
+// is no protocol answer to give it: no NIP-42 challenge arrives, and nothing to
+// authenticate with would help, because what it wants is a subscription.
+//
+// Found on my own account: `wss://nostr.wine` is the single best relay by
+// coverage, 50 of 257 follows write there, and it had a routed slot to itself
+// dialling and failing on a widening ladder forever. The coverage counter could
+// not see it. It reported those 50 people as reached.
+//
+// So a routed relay that will not have us gives up its slot and the greedy
+// spends it on the next relay down, which is a real one. This applies ONLY to
+// relays Plaza chose. A relay the reader added themselves keeps its seat and
+// keeps retrying however badly it behaves, because dropping somebody's own relay
+// quietly is the opposite of what they asked for.
+
+pub fn relayIsRefusedForTest(strikes: u6, at_ms: i64, now_ms: ?i64) bool {
+    return relayIsRefused(strikes, at_ms, now_ms);
+}
+pub const routedRefusalStrikesForTest = routed_refusal_strikes;
+pub const routedRefusalMsForTest = routed_refusal_ms;
+
+pub fn refusedRelayCountForTest() usize {
+    var urls: [routed_refusal_slots][96]u8 = undefined;
+    var lens: [routed_refusal_slots]u8 = @splat(0);
+    return refusedRelays(&urls, &lens);
+}
+pub fn noteRelayRefusalAtForTest(url: []const u8, now: i64) bool {
+    return noteRelayRefusalAt(url, now);
+}
+pub fn clearRelayRefusalForTest(url: []const u8) void {
+    clearRelayRefusal(url);
+}
+pub fn forgetRefusedRelaysForTest() void {
+    lockRefused();
+    defer unlockRefused();
+    for (&g_refused) |*e| {
+        e.url_len = 0;
+        e.strikes = 0;
+        e.at_ms = -1;
+    }
+}
+
+pub fn worthEvictingForTest(challenger_gain: usize, incumbent_gain: usize) bool {
+    return worthEvicting(challenger_gain, incumbent_gain);
+}
+
+pub fn sameRouteForTest(url_a: []const u8, authors_a: []const [32]u8, url_b: []const u8, authors_b: []const [32]u8) bool {
+    return sameRoute(url_a, authors_a, url_b, authors_b);
+}
+
+pub fn routeRecomputeDueForTest(pending_ms: ?i64, since_list_ms: ?i64, since_run_ms: ?i64) bool {
+    return routeRecomputeDue(pending_ms, since_list_ms, since_run_ms);
+}
+pub const routeSettleMsForTest = route_settle_ms;
+pub const routeRecomputeMinMsForTest = route_recompute_min_ms;
+pub const routeSettleMaxMsForTest = route_settle_max_ms;
+
+pub fn rankRelaySuggestionsForTest(store: *nostr.store.Store) void {
+    rankRelaySuggestions(store);
+}
+pub fn foldWriteRelaysForTest(table: []RelayRank, len_in: usize, urls: []const []const u8) usize {
+    return foldWriteRelays(table, len_in, urls);
+}
+pub const RelayRankForTest = RelayRank;
+pub fn relayRankWritersForTest(e: RelayRank) u16 {
+    return e.writers;
+}
+pub fn relayRankUrlForTest(e: *const RelayRank) []const u8 {
+    return e.urlSlice();
+}
+pub const outboxRelaysPerAuthorForTest = outbox_relays_per_author;
+pub const maxDiscoveredRelaysForTest = max_discovered_relays;
+pub const discoveredAuthorsCapForTest = discovered_authors_cap;
+pub fn discoveredGenerationForTest(index: usize) u32 {
+    if (index >= g_discovered_gen.len) return 0;
+    return g_discovered_gen[index].load(.acquire);
+}
+pub fn sweepRelayListsForTest() void {
+    sweepRelayLists();
+}
+pub fn collectUnroutedForTest(out: [][32]u8) usize {
+    return collectUnrouted(out);
+}
+pub fn resetIndexerAskedForTest() void {
+    g_indexer_asked_len = 0;
+    g_indexed.store(0, .monotonic);
+}
+pub fn markIndexerAskedForTest(pk: [32]u8) void {
+    if (g_indexer_asked_len >= g_indexer_asked.len) return;
+    g_indexer_asked[g_indexer_asked_len] = pk;
+    g_indexer_asked_len += 1;
+}
+pub fn indexerAskedLenForTest() usize {
+    return g_indexer_asked_len;
+}
+
+pub fn relayFetchAllowedForTest() bool {
+    return relayFetchAllowed();
+}
+pub fn poolAuthorsForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthors(index, out);
+}
+pub fn poolAuthorsOrAllForTest(index: usize, out: *[max_follows + 1][32]u8) usize {
+    return poolAuthorsOrAll(index, out);
+}
+pub fn discoveredAuthorsForTest(index: usize, out: *[discovered_authors_cap][32]u8) usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    if (index >= g_discovered.len) return 0;
+    const d = &g_discovered[index];
+    @memcpy(out[0..d.authors_len], d.authors[0..d.authors_len]);
+    return d.authors_len;
+}
+pub fn clearRoutesForTest() void {
+    lockDiscovered();
+    defer unlockDiscovered();
+    for (&g_pool_routed) |*p| {
+        p.url_len = 0;
+        p.authors_len = 0;
+    }
+    g_residual_len = 0;
+}
+
+pub fn forgetDiscoveredForTest() void {
+    forgetDiscovered();
+}
+
+pub const outboxSubIdForTest = outbox_sub_id;
+
+pub fn routeFollowUpForTest(live_url: []const u8, live_gen: u32, slot_url: []const u8, slot_gen: u32) RouteFollowUp {
+    return routeFollowUp(live_url, live_gen, slot_url, slot_gen);
+}
+
+pub fn residualCountForTest() usize {
+    lockDiscovered();
+    defer unlockDiscovered();
+    return g_residual_len;
+}

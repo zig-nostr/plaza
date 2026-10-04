@@ -464,3 +464,8 @@ pub fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         ui.el(.separator, .{ .style = .{ .background = p.divider_row } }, .{}),
     });
 }
+
+pub fn notificationRowForTest(ui: *AppUi, item: *const InboxItem) AppUi.Node {
+    return notificationRow(ui, item);
+}
+pub const notifications_column_width_for_test = notifications_column_width;

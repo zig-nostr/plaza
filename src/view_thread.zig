@@ -1807,3 +1807,78 @@ pub fn threadOccluder(ui: *AppUi, level_key: u64, panel: AppUi.Node) AppUi.Node 
     // out while staying invisibly small, so the thread sits flush like the feed.
     return ui.el(.card, .{ .grow = 1, .padding = 0.01, .global_key = .{ .int = level_key }, .style = .{ .background = p.surface_window, .border = p.surface_window, .radius = 0, .stroke_width = 0 } }, .{panel});
 }
+
+/// Pretends a build put exactly these notes on screen in the front level.
+pub fn recordVisibleNotesForTest(ids: []const i64) void {
+    const set = &g_level_visible[0];
+    set.reset();
+    g_visible_level = 0;
+    for (ids) |id| set.pushNote(id);
+}
+/// Pretends a build put exactly these authors on screen in the front level.
+pub fn recordVisibleAuthorsForTest(authors: []const [32]u8) void {
+    const set = &g_level_visible[0];
+    set.reset();
+    g_visible_level = 0;
+    for (authors) |pk| set.pushAuthor(pk);
+}
+
+/// The retained tables, for a test that drops the build arena and then reads
+/// them exactly as the SDK does.
+pub fn threadExtentTableForTest(level: usize) *const anyopaque {
+    return &g_thread_extents[@min(level, g_thread_extents.len - 1)];
+}
+
+pub fn profileExtentTableForTest(level: usize) *const anyopaque {
+    return &g_profile_extents[@min(level, g_profile_extents.len - 1)];
+}
+
+pub fn rowExtentFromTableForTest(context: ?*const anyopaque, index: u64) f32 {
+    return rowExtentFromTable(context, index);
+}
+
+pub fn extentTableLenForTest(context: ?*const anyopaque) usize {
+    const table: *const RowExtents = @ptrCast(@alignCast(context orelse return 0));
+    return table.len;
+}
+/// The ancestor row and one reply block, for a test that asserts what they PAINT
+/// (the rail between two discs is a grown separator, so it only exists when the
+/// row hands its avatar column a height, which is exactly what once went wrong).
+pub fn ancestorRowForTest(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
+    return ancestorRow(ui, ancestor, first);
+}
+
+pub fn replyBlockForTest(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first: bool, last: bool) AppUi.Node {
+    return replyBlock(ui, block, root_author, first, last);
+}
+
+/// The rows a level can hold whose height is a fixed constant, so a test can
+/// measure each one and hold its estimate to what it actually draws. Every
+/// constant here was hand-calibrated once and then drifted.
+pub fn ghostRowForTest(ui: *AppUi, capped: bool) AppUi.Node {
+    const ancestor: Ancestor = .{ .ghost = if (capped) .capped else .missing };
+    return ghostRow(ui, &ancestor, true);
+}
+
+pub fn listeningFooterForTest(ui: *AppUi) AppUi.Node {
+    return listeningFooter(ui);
+}
+
+pub fn outsideGraphRowForTest(ui: *AppUi, open: bool) AppUi.Node {
+    return outsideGraphRow(ui, 2, open);
+}
+
+pub fn showMoreRepliesForTest(ui: *AppUi) AppUi.Node {
+    return showMoreReplies(ui, 3);
+}
+
+pub fn ancestorBodyLinesForTest(note: *const Note) f32 {
+    return ancestorBodyLines(note);
+}
+pub fn quoteBodyLinesForTest(e: *const QuoteEntry) f32 {
+    return quoteBodyLines(e);
+}
+
+pub fn noteRowEstimateForTest(note: *const Note, chrome: f32) f32 {
+    return noteRowEstimate(note, chrome);
+}

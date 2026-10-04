@@ -10,6 +10,7 @@ const follows = @import("follows.zig");
 const own_lists = @import("own_lists.zig");
 const blossom = @import("blossom.zig");
 const remote_signer = @import("remote_signer.zig");
+const feed_state = @import("feed_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -22,7 +23,6 @@ const WarnCarry = main.WarnCarry;
 const abbreviateNpub = main.abbreviateNpub;
 const acceptUploadAuth = main.acceptUploadAuth;
 const activePubkey = main.activePubkey;
-const answerHelperSignForTest = main.answerHelperSignForTest;
 const applyUndo = main.applyUndo;
 const compose_capacity = main.compose_capacity;
 const draftWarningOf = main.draftWarningOf;
@@ -1179,4 +1179,287 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // The room this write was submitted FROM, not the one on screen now: the
     // keyholder can ask a person, and the reader can walk out while it waits.
     ingestAndPublish(gpa, out, null, g_helper_sign.route);
+}
+
+/// Delivers one /pubkey answer the way the runtime would.
+pub fn deliverHelperPubkeyForTest(model: *Model, body: []const u8) void {
+    handleHelperPubkey(model, .{ .key = helper_poll_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+pub fn helperSetupPendingForTest() bool {
+    return g_helper_setup != .none;
+}
+
+pub fn helperStateForTest() HelperState {
+    return helperState();
+}
+
+pub fn helperTokenForTest() []const u8 {
+    return helperToken();
+}
+
+/// Puts the daemon into the "answering and holding a key" state, so a test can
+/// ask what the OTHER conditions do.
+pub fn setHelperReadyForTest() void {
+    g_helper_state.store(2, .release);
+}
+
+pub fn helperReachableForTest() bool {
+    return helperReachable();
+}
+
+pub fn helperPortForTest() u16 {
+    return g_helper_port;
+}
+
+pub fn setHelperPortForTest(port: u16) void {
+    g_helper_port = port;
+}
+
+pub fn helperSecretForTest() []const u8 {
+    return g_helper_secret_buf[0..g_helper_secret_len];
+}
+
+pub fn mintHelperSecretForTest(io: std.Io) void {
+    var raw: [24]u8 = undefined;
+    io.randomSecure(&raw) catch return;
+    const written = std.fmt.bufPrint(&g_helper_secret_buf, "{x}\n", .{raw}) catch return;
+    g_helper_secret_len = written.len;
+}
+
+/// `false` restores the unprobed state rather than claiming a keyholder was
+/// found, because in a test nothing has looked for one.
+pub fn setKeyholderMissingForTest(missing: bool) void {
+    g_keyholder = if (missing) .missing else .unprobed;
+}
+
+pub fn resolveSiblingForTest(io: std.Io, out: []u8, dir: []const u8, name: []const u8) usize {
+    return resolveSibling(io, out, dir, name);
+}
+
+pub fn exeDirForTest(io: std.Io, buf: []u8) ?[]const u8 {
+    return exeDir(io, buf);
+}
+
+/// Adopts the Notary signer kind for the active test identity, so the status
+/// line can be asked what it says about a daemon that is not there.
+/// Says that this test drives the keyholder's answers itself.
+///
+/// A test that reaches for this one is asking about what happens WHILE a
+/// signature is out, or when the answer is a 401, or when none comes at all.
+/// The stand-in keyholder that answers every other test instantly would give
+/// it a success before it could look, so switching kind here silences it.
+pub fn setSignerKindHelperForTest() void {
+    g_signer_kind = .helper;
+    g_test_signer_silent = true;
+}
+
+/// Hands the keyholder back to the stand-in, for a test that took it.
+pub fn setSignerKindLocalForTest() void {
+    g_signer_kind = .helper;
+    g_test_signer_silent = false;
+}
+
+/// Which kind of signer this app is using, by name.
+pub fn signerKindNameForTest() []const u8 {
+    return @tagName(g_signer_kind);
+}
+pub fn ceremonyCanTakeKeyForTest() bool {
+    return ceremonyCanTakeKey();
+}
+pub fn setSignerKindForTest(kind: []const u8) void {
+    g_signer_kind = if (std.mem.eql(u8, kind, "remote")) .remote else .helper;
+}
+
+/// Pretends the ceremony window was (or was not) found beside Plaza.
+pub fn setNotaryWindowFoundForTest(found: bool) void {
+    g_notary_win_len = if (found) "/nonexistent/notary".len else 0;
+    if (found) @memcpy(g_notary_win_buf[0.."/nonexistent/notary".len], "/nonexistent/notary");
+}
+
+/// Whether a helper setup is sitting queued, waiting for the daemon to answer.
+pub fn helperSetupQueuedForTest() bool {
+    return g_helper_setup != .none;
+}
+
+pub fn helperSetupMayFireForTest(queued: bool, state: HelperState) bool {
+    return helperSetupMayFire(queued, state);
+}
+
+pub fn helperSignTimeoutSecondsForTest() i64 {
+    return helper_sign_timeout_s;
+}
+
+pub fn helperSignTimeoutMillisForTest() u32 {
+    return helper_sign_timeout_ms;
+}
+/// The tag set of the last event handed to a signer, for tests.
+pub fn lastPublishedTagsForTest() []const nostr.event.Tag {
+    return g_last_published_tags;
+}
+
+pub fn lastPublishedForTest() ?nostr.event.Event {
+    return g_last_published;
+}
+
+pub fn forgetLastPublishedForTest() void {
+    g_last_published = null;
+}
+
+pub fn clearLastPublishedTagsForTest() void {
+    g_last_published_tags = &.{};
+}
+
+pub fn helperSignRestorableForTest() bool {
+    return g_helper_sign.active and g_helper_sign.restorable;
+}
+
+pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
+    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none);
+}
+
+pub fn handleHelperSignedForTest(response: native_sdk.EffectResponse) void {
+    handleHelperSigned(response);
+}
+
+pub fn releaseHelperSignForTest() void {
+    releaseHelperSign();
+}
+
+/// Puts the pending sign past its deadline, for the case where no terminal ever
+/// arrives: a daemon that accepts the socket and then says nothing.
+pub fn expireHelperSignForTest() void {
+    g_helper_sign.deadline_s = 0;
+}
+
+pub fn scanHelperSignForTest(model: *Model) void {
+    scanHelperSign(model);
+}
+
+pub fn helperSignNoticeForTest() bool {
+    return g_helper_sign_notice.load(.acquire);
+}
+
+pub fn signerReadyForTest() bool {
+    return signerReady();
+}
+
+pub fn silenceTestSignerForTest(silent: bool) void {
+    g_test_signer_silent = silent;
+}
+
+pub fn holdHelperSignForTest() void {
+    g_signer_kind = .helper;
+    g_helper_sign.active = true;
+}
+
+pub fn helperSignPendingForTest() bool {
+    return g_helper_sign.active;
+}
+
+/// Ingests and publishes a signed event returned by the daemon. Trusted: it
+/// came from our own daemon over authenticated loopback. A kind:0 seeds the
+/// profile cache so the name shows at once.
+/// The keyholder a test has: signs what was asked for and answers exactly as
+/// the daemon would, so `handleHelperSigned` runs for real.
+///
+/// Only compiled into a test binary. It exists so that the four hundred tests
+/// that "are somebody" drive the path that ships rather than one that does not,
+/// which is worth more than the shortcut it replaces.
+pub fn answerHelperSignForTest(gpa: std.mem.Allocator, unsigned_json: []const u8) void {
+    const secret = feed_state.g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    var parsed = nostr.event.fromJson(gpa, unsigned_json) catch return;
+    defer parsed.deinit();
+    const ev = parsed.value;
+    const signed = nostr.event.create(gpa, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
+    const signed_json = nostr.event.toJson(gpa, signed) catch return;
+    defer gpa.free(signed_json);
+    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+/// Delivers one signed-event answer the way the runtime would, so a test can
+/// hand the app an event it did NOT ask for.
+pub fn deliverHelperSignedForTest(body: []const u8) void {
+    handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
+}
+/// Clears the active identity again. For tests.
+pub fn clearIdentityForTest() void {
+    follows.g_home_scope = .following;
+    g_identity_npub_len = 0;
+    g_signer_kind = .helper;
+    feed_state.g_test_secret = null;
+    g_helper_has_identity = false;
+}
+/// What pressing "Create your identity" does to the sign-out latch: drops it
+/// before any new key exists. The pubkey latch is what has to hold after this.
+pub fn loggedOutForTest() bool {
+    return g_logged_out;
+}
+
+pub fn clearLoggedOutLatchForTest() void {
+    g_logged_out = false;
+}
+/// Restores a helper identity from a session pubkey hex. For tests.
+pub fn restoreHelperForTest(pubkey_hex: []const u8) bool {
+    return restoreHelperIdentity(pubkey_hex);
+}
+
+/// Sets what the create ceremony has reported, which is the only thing that
+/// tells an appearing key apart from any other. For tests.
+pub fn setCeremonyForTest(state: enum { none, running, created }) void {
+    g_ceremony = switch (state) {
+        .none => .none,
+        .running => .running,
+        .created => .created,
+    };
+    g_ceremony_adopted = false;
+}
+
+/// Parks the daemon health flag at "unreachable", so a queued setup stays queued
+/// instead of reaching for an effects layer a unit test does not have. For tests.
+pub fn setHelperUnreachableForTest() void {
+    g_helper_state.store(0, .release);
+    g_helper_setup = .none;
+    g_helper_pending_in_flight = .none;
+}
+
+pub fn ceremonyOwesNameForTest() bool {
+    return g_ceremony_adopted;
+}
+/// Delivers the ceremony window's exit, which is how Plaza learns what it did.
+/// For tests.
+pub fn handleNotaryExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
+    handleNotaryExited(model, e);
+}
+
+/// Delivers a daemon /pubkey answer, which is how a key made or imported in the
+/// other process reaches Plaza. For tests.
+pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectResponse) void {
+    handleHelperPubkey(model, response);
+}
+/// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
+/// 3 unreachable) plus a remote identity, so the presentation is testable
+/// without a live bunker. For tests.
+pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
+    g_signer_kind = if (status == 0) .helper else .remote;
+    remote_signer.g_remote_status.store(status, .release);
+    remote_signer.g_remote_sign_notice.store(false, .release);
+    if (npub_len > 0) {
+        const stub = "npub1testsigner";
+        const n = @min(stub.len, g_identity_npub_buf.len);
+        @memcpy(g_identity_npub_buf[0..n], stub[0..n]);
+        g_identity_npub_len = n;
+    } else g_identity_npub_len = 0;
+}
+pub fn clearLastPublishedForTest() void {
+    g_last_published = null;
+    g_last_published_tags = &.{};
+}
+pub fn loggedOutPubkeyForTest() ?[32]u8 {
+    return g_logged_out_pk;
 }

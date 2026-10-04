@@ -12,6 +12,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const note_content_cap = main.note_content_cap;
+const warning_input_capacity = main.warning_input_capacity;
 const Model = main.Model;
 const compose_capacity = main.compose_capacity;
 const plazaDir = main.plazaDir;
@@ -203,4 +205,27 @@ pub fn readDraft(io: std.Io, dir: *std.Io.Dir, out: []u8, warn_out: []u8) Stashe
     if (n.len == 0) return .{};
     const w = dir.readFile(io, draft_warning_file, warn_out) catch return .{ .text = out[0..n.len] };
     return .{ .text = out[0..n.len], .warn = warn_out[0..w.len] };
+}
+
+/// The thread a kept reply is filed under, for a test of where a reply went.
+pub fn keptReplyDraftForTest(event_id: [32]u8) ?[]const u8 {
+    for (&g_reply_drafts) |*d| {
+        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) return d.text[0..d.len];
+    }
+    return null;
+}
+pub fn writeDraftForTest(io: std.Io, dir: *std.Io.Dir, text: []const u8, warn: ?[]const u8) void {
+    writeDraft(io, dir, text, warn);
+}
+
+pub fn draftWarningForModelForTest(model: *const Model) ?[]const u8 {
+    return draftWarningOf(model);
+}
+
+/// Restores a launch's composer from `dir`, the way startup does.
+pub fn loadDraftIntoForTest(io: std.Io, dir: *std.Io.Dir, model: *Model) void {
+    var draft_buf: [note_content_cap]u8 = undefined;
+    var warn_buf: [warning_input_capacity]u8 = undefined;
+    const stashed = readDraft(io, dir, &draft_buf, &warn_buf);
+    applyStashedDraft(model, stashed);
 }

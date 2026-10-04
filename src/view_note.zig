@@ -1626,3 +1626,48 @@ pub fn noteSpans(ui: *AppUi, note: *const Note, text: []const u8) []const canvas
     if (start < first or start + text.len > first + whole.len) return contentSpans(ui, text);
     return contentSpansIn(ui, text, note.mentions.all(), start - first);
 }
+
+pub fn liveRelayCountForTest() usize {
+    return liveRelayCount();
+}
+pub fn askForMediaForTest(note_id: i64) void {
+    askForMedia(note_id);
+}
+
+pub fn forgetAskedMediaForTest() void {
+    g_media_asked = [_]i64{0} ** asked_cap;
+}
+
+pub fn uncoverNoteForTest(note_id: i64) void {
+    uncoverNote(note_id);
+}
+
+pub fn forgetUncoveredForTest() void {
+    g_uncovered = [_]i64{0} ** uncovered_cap;
+}
+
+pub fn firstLineOfForTest(text: []const u8, max: usize) []const u8 {
+    return firstLineOf(text, max);
+}
+
+/// Renders just the reply line and returns its concatenated text, so a test can
+/// read what a reader would see without standing up a whole feed.
+pub fn buildReplyContextForTest(arena: std.mem.Allocator, note: *const Note) ![]const u8 {
+    var ui = AppUi.init(arena);
+    const node = replyContext(&ui, note);
+    const tree = try ui.finalize(node);
+    var out: std.ArrayList(u8) = .empty;
+    try collectText(tree.root, arena, &out);
+    return out.items;
+}
+
+pub fn oneLineForTest(ui: *AppUi, text: []const u8) []const u8 {
+    return oneLine(ui, text);
+}
+
+pub fn quotingPillLabelForTest(ui: *AppUi, id: [32]u8) []const u8 {
+    return quotingPillLabel(ui, id);
+}
+pub fn toggleExpandedForTest(note_id: i64) void {
+    toggleExpanded(note_id);
+}

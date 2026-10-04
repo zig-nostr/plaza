@@ -328,3 +328,7 @@ pub fn personAvatar(ui: *AppUi, pubkey: [32]u8, size: f32) AppUi.Node {
         .style = .{ .background = tint.bg, .border = tint.border, .foreground = tint.glyph, .stroke_width = 3 },
     }, ui.fmt("{c}{c}", .{ hexdigits[pubkey[0] >> 4], hexdigits[pubkey[0] & 0x0f] }));
 }
+
+pub fn verifiedNip05ForTest(pubkey: [32]u8) []const u8 {
+    return verifiedNip05(pubkey);
+}

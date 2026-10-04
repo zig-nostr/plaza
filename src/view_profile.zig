@@ -998,3 +998,7 @@ pub fn threadLevelKey(level: usize, root_id: i64) u64 {
     const lo = @as(u64, @intCast(root_id)) & ((@as(u64, 1) << 59) - 1);
     return hi | lo;
 }
+
+pub fn profileFooterForTest(model: *const Model, pubkey: [32]u8, shown: usize) u8 {
+    return @intFromEnum(profileFooter(model, pubkey, shown));
+}

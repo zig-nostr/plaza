@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const feed_state = @import("feed_state.zig");
+const quote_cache = @import("quote_cache.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1746,4 +1747,238 @@ pub fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
         g_places[g_places_len] = m;
         g_places_len += 1;
     }
+}
+
+/// So a test builds an address for the kind Plaza actually looks for, rather
+/// than repeating the number and agreeing with it by coincidence.
+pub const place_kind_for_test = place_kind;
+/// The relays a quote's fetch would dial, empty when it is not cached.
+pub fn quoteHintsForTest(id: [32]u8) RelayHints {
+    for (&quote_cache.g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints;
+    }
+    return .{};
+}
+pub fn placeFeedIndexForTest() u8 {
+    return g_place_feed;
+}
+
+pub fn setPlaceInfoForTest(state: PlaceInfo) void {
+    g_place_info = state;
+}
+
+pub fn togglePlacesRailForTest() void {
+    togglePlacesRail();
+}
+pub fn setRailForTest(open: bool) void {
+    g_rail_open = open;
+}
+
+pub fn forgetPlacesForTest() void {
+    forgetPlaces();
+}
+
+/// The predicate above, for the test: the arrival path it guards needs a store,
+/// a relay and a link, and the decision it makes does not.
+pub fn samePlaceForTest(pubkey: [32]u8, ident: []const u8) bool {
+    var w: @TypeOf(g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
+    return samePlace(w);
+}
+
+/// How many remembered notes a place ARRIVING from a link inherits from the
+/// room already open. The consequence, not the predicate: those ids are saved
+/// onto the arriving place's row, so a room that inherits the wrong ones shows
+/// another place's notes on every later visit, from the rail, forever.
+pub fn arrivalInheritsRoomForTest(pubkey: [32]u8, ident: []const u8) u16 {
+    var m = Place{};
+    m.author = pubkey;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    var w: @TypeOf(g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    w.ident_len = @intCast(copyBounded(&w.ident_buf, ident));
+    _ = adoptOpenRoom(w, &m);
+    return m.seen_len;
+}
+
+/// Drives the REAL entry path. It spawns a worker that dials and fails without
+/// a relay, which is harmless: the seeding this asserts happens before it.
+pub fn startPlaceFeedForTest(i: usize) void {
+    startPlaceFeed(&g_places[i]);
+}
+
+/// Arms the fetch a `plaza://` link arms, without the link or the sockets.
+pub fn armPlaceFetchForTest(pubkey: [32]u8, ident: []const u8) void {
+    var want: @TypeOf(g_place_want.?) = .{ .pubkey = pubkey, .ident_buf = @splat(0), .ident_len = 0 };
+    want.ident_len = @intCast(copyBounded(&want.ident_buf, ident));
+    g_place_want = want;
+}
+
+/// One tick of the store-side half of that fetch.
+pub fn refreshPlaceFetchForTest() void {
+    _ = placeFetchStep();
+}
+
+/// The same tick with the reader's side of it: the toast a fetch that ends
+/// without a place leaves.
+pub fn refreshPlaceFetchNoticeForTest(model: *Model) void {
+    refreshPlaceFetch(model);
+}
+
+/// The link has been followed and a copy shown, which is the state the fetch
+/// window is in while it watches for a newer one.
+pub fn markPlaceFetchAppliedForTest() void {
+    if (g_place_want) |*w| w.applied = true;
+}
+
+/// Whether the window is still watching. Closed is what walking away must
+/// produce: an open window re-applies its place over the room on screen.
+pub fn placeFetchArmedForTest() bool {
+    return g_place_want != null;
+}
+pub fn savePlacesForTest() void {
+    savePlaces();
+}
+
+pub fn setPlaceLinkForTest(state: PlaceLink) void {
+    setPlaceLink(state);
+}
+
+/// Runs a feed worker that belongs to a room already left, against a url that
+/// fails before any socket is opened.
+pub fn runStalePlaceFeedWorkerForTest() void {
+    var url_buf: [place_relay_cap]u8 = undefined;
+    const url = "http://not-a-relay";
+    @memcpy(url_buf[0..url.len], url);
+    const stale = g_place_gen.load(.monotonic) -% 1;
+    placeFeedWorker(url_buf, url.len, undefined, 0, stale, undefined, 0);
+}
+
+/// Arrives in a place that has a named feed, which is the ordinary case.
+pub fn visitPlaceWithFeedForTest(author: [32]u8, ident: []const u8, name: []const u8, feed: []const u8) void {
+    visitPlaceForTest(author, ident, name);
+    if (g_place) |*m| {
+        m.feeds[0].name_len = @intCast(copyBounded(&m.feeds[0].name_buf, feed));
+        m.feeds[0].relay_len = @intCast(copyBounded(&m.feeds[0].relay_buf, "wss://example.test"));
+        m.feeds_len = 1;
+    }
+}
+
+pub fn flushPlaceIdsForTest(now_s: i64) void {
+    flushPlaceIds(now_s);
+}
+pub fn setPlaceHomeForTest(text: []const u8) void {
+    if (g_place) |*m| m.home_len = @intCast(copyBounded(&m.home_buf, text));
+}
+pub fn setKeptPlaceSeenLenForTest(i: usize, n: u16) void {
+    g_places[i].seen_len = n;
+}
+
+pub fn seedPlaceFeedForTest(ids: []const [32]u8) void {
+    seedPlaceFeed(ids);
+}
+pub fn clearPlaceFeedForTest() void {
+    clearPlaceFeed();
+}
+pub fn rememberPlaceIdsForTest() void {
+    rememberPlaceIds();
+}
+pub fn keptPlaceSeenLenForTest(i: usize) u16 {
+    return g_places[i].seen_len;
+}
+pub fn seedFromKeptPlaceForTest(i: usize) void {
+    seedPlaceFeed(g_places[i].seen[0..g_places[i].seen_len]);
+}
+
+pub fn resetPlacesForTest() void {
+    // The feed ids too, or one test's room leaks into the next one's.
+    clearPlaceFeed();
+    g_rail_open = false;
+    g_place_info = .closed;
+    g_place_flushed_at = 0;
+    g_place_flushed_rev = 0;
+    g_place = null;
+    g_place_feed = 0;
+    g_place_kept = false;
+    g_visited = null;
+    g_place_last = 0;
+    g_places = @splat(.{});
+    g_places_len = 0;
+}
+
+/// Arrives in a place the way a link does: in it, kept only if it already was.
+pub fn visitPlaceForTest(author: [32]u8, ident: []const u8, name: []const u8) void {
+    var m = Place{};
+    m.author = author;
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, ident));
+    m.name_len = @intCast(copyBounded(&m.name_buf, name));
+    g_place = m;
+    g_place_feed = 0;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+}
+
+/// Arrives in a place parsed from a real Hallway document.
+///
+/// The other visit helpers build a `Place` by hand, which cannot exercise the
+/// fields the PARSER resolves (the colour, the avatar shape, a feed's kinds),
+/// so a test using them would assert against whatever the test itself set.
+pub fn visitParsedPlaceForTest(gpa: std.mem.Allocator, content: []const u8) bool {
+    var m = parsePlace(gpa, content) orelse return false;
+    m.author = @splat(0x7a);
+    m.ident_len = @intCast(copyBounded(&m.ident_buf, "parsed"));
+    g_place = m;
+    g_place_feed = 0;
+    g_place_kept = placeIndexOf(m.author, m.ident()) != null;
+    return true;
+}
+
+pub fn clearActivePlaceForTest() void {
+    g_place = null;
+    g_place_feed = 0;
+    g_place_kept = false;
+}
+pub fn openKeptPlaceForTest(i: usize) void {
+    openKeptPlace(i);
+}
+pub fn goToOwnPlazaForTest() void {
+    goToOwnPlaza();
+}
+pub fn bouncePlaceForTest() void {
+    bouncePlace();
+}
+pub fn stepPlaceForTest(delta: i8) void {
+    stepPlace(delta);
+}
+pub fn activePlaceIndexForTest() ?usize {
+    return activePlaceIndex();
+}
+
+pub fn restoreOpenPlaceForTest() void {
+    restoreOpenPlace();
+}
+
+pub fn bootPlaceIndexForTest() ?usize {
+    return bootPlaceIndex();
+}
+pub fn applyActivePlaceLineForTest(value: []const u8) void {
+    applyActivePlaceLine(value);
+}
+pub fn visitingPlaceForTest() ?*const Place {
+    return visitingPlace();
+}
+pub fn resumeVisitForTest() void {
+    resumeVisit();
+}
+pub const place_looking_toast_for_test = place_looking_toast;
+/// Gives the open place one write relay of its own, the way a parsed document
+/// would. The routing tests are about WHEN the relay list is read, not about
+/// parsing it.
+pub fn setPlaceWriteRelayForTest(url: []const u8) void {
+    if (g_place == null) return;
+    const m = &g_place.?;
+    m.write_relay_lens[0] = @intCast(copyBounded(&m.write_relays[0], url));
+    m.write_relays_len = 1;
+}
+/// The document one place writes, for the round-trip test.
+pub fn writePlaceDocumentForTest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), m: *const Place) !void {
+    return writePlaceDocument(gpa, out, m);
 }

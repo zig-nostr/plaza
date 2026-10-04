@@ -9,11 +9,13 @@ const main = @import("main.zig");
 const own_lists = @import("own_lists.zig");
 const private_lists = @import("private_lists.zig");
 const keyholder = @import("keyholder.zig");
+const feed_state = @import("feed_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const sayBookmarkWrite = main.sayBookmarkWrite;
 const Effects = main.Effects;
 const Model = main.Model;
 const OwnProfile = main.OwnProfile;
@@ -34,7 +36,6 @@ const privateHalfOpened = main.privateHalfOpened;
 const private_seal_key = main.private_seal_key;
 const requestRemoteEncrypt = main.requestRemoteEncrypt;
 const sameRecord = main.sameRecord;
-const sealPrivateBookmarkForTest = main.sealPrivateBookmarkForTest;
 const setToast = main.setToast;
 const signAndPublish = main.signAndPublish;
 const signerReady = main.signerReady;
@@ -528,4 +529,57 @@ fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, ev
     }
     out.append(gpa, ']') catch return null;
     return out.toOwnedSlice(gpa) catch null;
+}
+
+/// The keyholder a test has, for the seal path.
+pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8) void {
+    const secret = feed_state.g_test_secret orelse {
+        private_lists.g_private_seal = .{};
+        return;
+    };
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch {
+        private_lists.g_private_seal = .{};
+        return;
+    };
+    // A test binary has no runtime io, so it makes its own. The seal has to be
+    // real: the point of this path is that what gets published decrypts back.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = main.g_io orelse threaded.io();
+    const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
+        private_lists.g_private_seal = .{};
+        return;
+    };
+    defer gpa.free(sealed);
+    g_test_sealed_len = @intCast(@min(sealed.len, g_test_sealed.len));
+    @memcpy(g_test_sealed[0..g_test_sealed_len], sealed[0..g_test_sealed_len]);
+}
+
+pub fn lastSealedForTest() []const u8 {
+    return g_test_sealed[0..g_test_sealed_len];
+}
+
+pub fn finishPrivateBookmarkForTest(model: *Model, fx: *Effects) void {
+    finishPrivateBookmark(model, fx, g_test_sealed[0..g_test_sealed_len]);
+}
+
+pub fn writePrivateBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    return writePrivateBookmark(fx, event_id, adding);
+}
+
+pub fn writeBookmarkForTest(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
+    return writeBookmark(fx, event_id, adding);
+}
+
+pub fn loadBookmarksFromStoreForTest() void {
+    loadBookmarksFromStore();
+}
+
+pub fn forgetBookmarksForTest() void {
+    forgetBookmarks();
+}
+pub fn sayBookmarkWriteForTest(model: *Model, outcome: BookmarkWrite, adding: bool) void {
+    sayBookmarkWrite(model, outcome, adding);
 }

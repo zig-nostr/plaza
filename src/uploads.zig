@@ -611,3 +611,89 @@ pub fn uploadedImeta(gpa: std.mem.Allocator, url: []const u8) ?[]const []const u
     const entry = uploadedPictureFor(url) orelse return null;
     return blossom.imetaTag(gpa, url, entry.mime, &entry.sha_buf, entry.size, entry.width, entry.height, entry.blur_buf[0..entry.blur_len], entry.alt_buf[0..entry.alt_len]) catch null;
 }
+
+pub fn appendPictureToDraftForTest(model: *Model, url: []const u8) bool {
+    return appendPictureToDraft(model, url);
+}
+
+/// Records a picture as if it had just been uploaded. For tests.
+pub fn rememberUploadedForTest(url: []const u8, mime: []const u8, sha_hex: []const u8, size: usize, width: u32, height: u32, hash: []const u8, alt: []const u8) void {
+    var entry: UploadedPicture = .{ .used = true, .mime = mime, .size = size, .width = width, .height = height };
+    @memcpy(entry.url_buf[0..url.len], url);
+    entry.url_len = @intCast(url.len);
+    @memcpy(entry.sha_buf[0..sha_hex.len], sha_hex);
+    @memcpy(entry.blur_buf[0..hash.len], hash);
+    entry.blur_len = @intCast(hash.len);
+    @memcpy(entry.alt_buf[0..alt.len], alt);
+    entry.alt_len = @intCast(alt.len);
+    g_uploaded[g_uploaded_next % g_uploaded.len] = entry;
+    g_uploaded_next +%= 1;
+}
+
+pub fn forgetUploadedForTest() void {
+    g_uploaded = [_]UploadedPicture{.{}} ** 8;
+    g_uploaded_next = 0;
+}
+
+// Test seams for the upload: the file dialog stood in for, the phases read, and
+// the stages that happen on a thread or in a signer driven by hand.
+
+pub fn setPickPathForTest(path: ?[]const u8) void {
+    g_pick_path_override = path;
+}
+
+pub fn uploadPickForTest(model: *Model, fx: *Effects, target: u8) void {
+    uploadPick(model, fx, std.enums.fromInt(UploadTarget, target) orelse return);
+}
+
+pub fn uploadGoForTest(model: *Model, fx: *Effects) void {
+    uploadGo(model, fx);
+}
+
+pub fn uploadRetryForTest(model: *Model, fx: *Effects) void {
+    uploadRetry(model, fx);
+}
+
+pub fn uploadCancelForTest(model: *Model) void {
+    uploadCancel(model);
+}
+
+pub fn driveUploadForTest(model: *Model) void {
+    driveUpload(model);
+}
+
+pub fn dropUploadForTest() void {
+    dropUpload();
+}
+
+/// The phase of the job on screen, or "none".
+pub fn uploadStateForTest() []const u8 {
+    const job = g_upload orelse return "none";
+    return @tagName(job.phase());
+}
+
+/// Why the job failed, or empty.
+pub fn uploadMessageForTest() []const u8 {
+    const job = g_upload orelse return "";
+    return job.message();
+}
+
+/// Moves the job's token back in time, as if it had been signed `seconds` ago.
+pub fn ageUploadTokenForTest(seconds: i64) void {
+    const job = g_upload orelse return;
+    job.signing_since_s -= seconds;
+}
+
+pub fn uploadSentBytesForTest() usize {
+    const job = g_upload orelse return 0;
+    return job.progress.sent.load(.acquire);
+}
+
+/// A token as the bunker's listener thread would park it.
+pub fn parkUploadSignForTest(event_json: ?[]const u8) void {
+    parkUploadSign(event_json);
+}
+
+pub fn tokenNamesFileForTest(tags: []const nostr.event.Tag, sha256_hex: []const u8, now: i64) bool {
+    return tokenNamesFile(tags, sha256_hex, now);
+}

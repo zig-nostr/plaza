@@ -713,3 +713,60 @@ pub fn lowerScope(scope: []const u8) []const u8 {
     if (std.mem.eql(u8, scope, "Starter pack")) return "starter pack";
     return scope;
 }
+
+pub fn setPlaceLogoIdForTest(id: u64) void {
+    g_place_logo_id = id;
+}
+/// Whether the mark on screen belongs to the room on screen, for the test.
+pub fn placeLogoShownForTest() bool {
+    return g_place_logo_state == .loaded and g_place_logo_id != 0;
+}
+/// A mark loaded and on screen for a given place, the way a finished fetch
+/// leaves it, so a test can walk out of that room and see what stays behind.
+pub fn setPlaceLogoLoadedForTest(id: u64, pubkey: [32]u8, ident: []const u8) void {
+    g_place_logo_id = id;
+    g_place_logo_for = pubkey;
+    g_place_logo_for_ident_len = @intCast(copyBounded(&g_place_logo_for_ident_buf, ident));
+    g_place_logo_state = .loaded;
+}
+
+pub fn scanPlaceLogoForTest(fx: *Effects, model: *const Model) void {
+    scanPlaceLogo(fx, model);
+}
+
+/// A fetch in flight, started by a given place.
+pub fn setPlaceLogoAskedForTest(pubkey: [32]u8, ident: []const u8) void {
+    g_place_logo_asked_for = pubkey;
+    g_place_logo_asked_ident_len = @intCast(copyBounded(&g_place_logo_asked_ident_buf, ident));
+    g_place_logo_state = .fetching;
+}
+
+pub fn placeLogoStateNameForTest() []const u8 {
+    return @tagName(g_place_logo_state);
+}
+
+/// Hands the logo pipeline a fetched body, the way the effect loop does.
+pub fn deliverPlaceLogoBodyForTest(fx: *Effects, body: []const u8) void {
+    handlePlaceLogoFetched(fx, .{
+        .key = place_logo_fetch_key,
+        .outcome = .ok,
+        .status = 200,
+        .body = body,
+    });
+}
+
+pub fn visibleLenForTest(line: []const u8) usize {
+    return visibleLen(line);
+}
+
+pub fn placeHomeHeightForTest(text: []const u8) f32 {
+    return placeHomeHeight(text);
+}
+
+pub fn stripEmptyImagesForTest(arena: std.mem.Allocator, src: []const u8) []const u8 {
+    return stripEmptyImages(arena, src);
+}
+
+pub fn lowerScopeForTest(scope: []const u8) []const u8 {
+    return lowerScope(scope);
+}

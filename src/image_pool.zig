@@ -18,6 +18,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const wantProfilesAhead = main.wantProfilesAhead;
 const Effects = main.Effects;
 const InboxItem = main.InboxItem;
 const MediaSlot = main.MediaSlot;
@@ -557,4 +558,56 @@ fn finishAvatar(fx: *Effects, p: *Profile, bytes: []const u8) void {
         // Undecodable bytes are a fact about the picture, not about the network.
         p.avatar_state = .failed;
     }
+}
+
+/// Runs one avatar-id assignment pass, for tests.
+pub fn assignAvatarSlotsForTest(fx: *Effects, model: *const Model) void {
+    wantProfilesAhead(model);
+    beginImagePass();
+    assignAvatarSlots(fx, model);
+}
+pub fn warmAheadForTest(fx: *Effects, model: *const Model) void {
+    warmAhead(fx, model);
+}
+
+pub fn resetWarmForTest() void {
+    g_warm_ring = [_]WarmEntry{.{}} ** warm_ring_len;
+    g_warm_ring_next = 0;
+}
+/// Whether the pool could take this id back right now: held, and neither on
+/// screen this pass nor mid-fetch.
+pub fn imageIdTakeableForTest(id: u64) bool {
+    if (id < 1 or id > image_registry_slots) return false;
+    const owners = imageIdOwners();
+    return imageIdSeen(owners[@intCast(id)]) != null;
+}
+pub fn touchMediaClockForTest() u64 {
+    beginImagePass();
+    return profile_cache.g_image_clock;
+}
+
+pub fn acquireImageIdForTest(fx: *Effects) ?u64 {
+    return acquireImageId(fx);
+}
+
+/// What the pool thinks holds an id. The bug this guards against is a slot the
+/// app holds and the pool calls `free`.
+pub fn imageIdOwnerNameForTest(id: u64) []const u8 {
+    if (id < 1 or id > image_registry_slots) return "out-of-range";
+    const owners = imageIdOwners();
+    return @tagName(owners[@intCast(id)]);
+}
+
+pub fn placeLogoUntouchableForTest() bool {
+    return imageIdSeen(.place_logo) == null;
+}
+/// The id the pool would hand out next, without taking it. Lets a test ask what
+/// the rule decides without an effects channel to drop pixels through.
+pub fn chooseImageIdForTest() ?u64 {
+    const owners = imageIdOwners();
+    const pick = chooseImageId(&owners) orelse return null;
+    return pick.id;
+}
+pub fn beginImagePassForTest() void {
+    beginImagePass();
 }

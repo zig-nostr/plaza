@@ -1019,3 +1019,82 @@ pub fn inFollowGraph(pubkey: [32]u8) bool {
     }
     return inFollowedSet(pubkey);
 }
+
+pub fn followSetForTest() []const [32]u8 {
+    return followSet();
+}
+/// How many people are on the reader's OWN list, whichever feed is being read.
+/// The menu names both feeds at once, so it cannot ask `followTotal`: that one
+/// answers for the feed in front of you.
+pub fn setHomeScopeForTest(next: HomeScope) void {
+    setHomeScope(next);
+}
+pub fn pendingUndoIsNoneForTest() bool {
+    return g_pending_undo == .none;
+}
+
+/// Arms an undo directly, for the writes whose real path needs a live note, a
+/// live `Effects` or a relay behind it. Arming itself is not what these check:
+/// `signAndPublish` takes the record as an argument, so a write cannot reach
+/// the signer without one. What they check is that each record puts the right
+/// thing back.
+pub fn armUndoForTest(u: PendingUndo) void {
+    armUndo(u);
+}
+
+pub fn armUnlikeUndoForTest(note_id: i64, reaction_id: [32]u8) void {
+    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
+}
+
+pub fn applyUndoForTest(model: *Model) void {
+    applyUndo(model);
+}
+
+/// Puts the app in the state a bunker or a Notary key leaves it in: a contact
+/// list signed, handed to the signer, and not yet in the store. That gap cannot
+/// be driven from a test, because the async paths need a live `Effects`, so the
+/// state they produce is set up directly and the write is then driven for real.
+pub fn setPendingFollowBaseForTest(tags: []const nostr.event.Tag, content: []const u8, created_at: i64) void {
+    setPendingFollowBase(tags, content, created_at);
+}
+
+pub fn clearPendingFollowBaseForTest() void {
+    clearPendingFollowBase();
+}
+
+pub fn pendingFollowCountForTest() ?usize {
+    const tags = g_pending_follow_tags orelse return null;
+    return countPeople(tags);
+}
+
+pub fn countPeopleForTest(tags: []const nostr.event.Tag) usize {
+    return countPeople(tags);
+}
+
+pub fn shrinkAllowedForTest(before: usize, after: usize, following: bool) bool {
+    return shrinkAllowed(before, after, following);
+}
+
+pub fn writeFollowForTest(fx: *Effects, pubkey: [32]u8, following: bool) bool {
+    return writeFollow(fx, pubkey, following) == .published;
+}
+
+pub fn followsFromTagsForTest(tags: []const nostr.event.Tag, out: [][32]u8) usize {
+    return followsFromTags(tags, out);
+}
+
+pub fn setFollowsForTest(list: []const [32]u8, created_at: i64) bool {
+    return setFollows(list, created_at);
+}
+
+pub fn forgetFollowsForTest() void {
+    g_home_scope = .following;
+    forgetFollows();
+}
+pub fn loadFollowsFromStoreForTest() void {
+    loadFollowsFromStore();
+}
+
+pub fn ingestContactListForTest(ev: nostr.event.Event) void {
+    ingestContactList(ev);
+}

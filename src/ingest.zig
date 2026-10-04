@@ -843,3 +843,28 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         }
     }
 }
+
+pub fn rememberFeedIdForTest(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: *usize,
+    ev: nostr.event.Event,
+) void {
+    rememberFeedId(ids, hex, len, ev);
+}
+
+pub fn publishFeedWatchForTest(notes: []const Note) void {
+    publishFeedWatch(notes);
+}
+
+pub fn mergeFeedWatchForTest(
+    ids: *[engagement_watch_cap]i64,
+    hex: *[engagement_watch_cap][64]u8,
+    len: usize,
+) usize {
+    return mergeFeedWatch(ids, hex, len);
+}
+
+pub fn feedWatchGenerationForTest() u32 {
+    return feedWatchGeneration();
+}

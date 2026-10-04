@@ -496,3 +496,75 @@ pub fn askPool(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
 pub fn networkAllowed() bool {
     return !builtin.is_test;
 }
+
+pub const discoveredWatchBaseForTest = discovered_watch_base;
+pub const relayWatchSlotsForTest = relay_watch_slots;
+pub fn setRelayStatusForTest(i: usize, connected: bool) void {
+    setRelayStatus(i, if (connected) .connected else .offline);
+}
+
+pub fn relayStatusConnectedForTest(i: usize) bool {
+    return connHolds(@enumFromInt(g_relay_status[i].load(.monotonic)));
+}
+
+pub fn setRelayQuietForTest(i: usize) void {
+    setRelayStatus(i, .quiet);
+}
+pub fn outboxWokeForTest() bool {
+    return g_outbox_woke_ever.load(.monotonic);
+}
+pub fn resetOutboxWokeForTest() void {
+    g_outbox_woke_ever.store(false, .monotonic);
+    g_outbox_woke_at.store(0, .monotonic);
+}
+pub fn relayStatusQuietForTest(i: usize) bool {
+    return @as(Conn, @enumFromInt(g_relay_status[i].load(.monotonic))) == .quiet;
+}
+/// Seats a deadline in the one-shot table without a socket, so what the keeper
+/// decides about it can be driven directly.
+pub fn seatOneShotForTest(slot: usize, deadline_ms: i64) void {
+    g_oneshot_deadline[slot] = deadline_ms;
+}
+pub fn clearOneShotsForTest() void {
+    for (0..one_shot_slots) |i| {
+        g_oneshot[i] = null;
+        g_oneshot_deadline[i] = 0;
+    }
+}
+pub fn expiredOneShotsForTest(now_ms: i64, out: []usize) usize {
+    var buf: [one_shot_slots]usize = undefined;
+    const n = expiredOneShots(now_ms, &buf);
+    const take = @min(n, out.len);
+    @memcpy(out[0..take], buf[0..take]);
+    return take;
+}
+pub fn markOneShotCutForTest(slot: usize) void {
+    g_oneshot_deadline[slot] = one_shot_already_cut;
+}
+pub const oneShotSlotsForTest = one_shot_slots;
+pub const oneShotBudgetMsForTest = one_shot_budget_ms;
+pub const bunkerWatchSlotForTest = bunker_watch_slot;
+/// Records one round trip for relay `index`. Stored as milliseconds PLUS ONE, so
+/// a sub-millisecond answer (a warm or local relay, truncated to 0) is a reading
+/// rather than an empty slot.
+pub fn recordRelayRttForTest(index: usize, ms: u64) void {
+    recordRelayRtt(index, ms);
+}
+
+pub fn clearRelayRttForTest(index: usize) void {
+    clearRelayRtt(index);
+}
+pub fn isFeedSubForTest(sub_id: []const u8) bool {
+    return isFeedSub(sub_id);
+}
+
+pub fn askPoolForTest(sub_id: []const u8, filters: []const nostr.filter.Filter) usize {
+    return askPool(sub_id, filters);
+}
+pub fn askableSlotsForTest(out: []usize) usize {
+    return askableSlots(out);
+}
+pub fn isOneShotSubForTest(sub_id: []const u8) bool {
+    return isOneShotSub(sub_id);
+}
+pub const oneShotSubPrefixForTest = one_shot_sub_prefix;

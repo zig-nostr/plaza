@@ -690,3 +690,87 @@ pub fn replayPending(model: *Model) void {
         model.composing = true;
     }
 }
+
+pub fn forgetOwnRecordAnswersForTest() void {
+    forgetOwnRecordAnswers();
+}
+pub fn noteOwnContactsAnsweredForTest(pk: [32]u8) void {
+    noteOwnContactsAnswered(pk);
+}
+
+// There was a `g_own_relays_answered` here, set by the first EOSE from any relay
+// and read as permission to publish a kind:10002. It is GONE rather than merely
+// unused: an inference that wrong, left sitting in the file under a reassuring
+// name, is one grep away from becoming a gate again. `canWriteRelayList` is the
+// rule now, and the reason is written there.
+
+/// This account's newest stored event of `kind`, its tags flattened to one
+/// string. For tests that need to see what a publish actually WROTE rather than
+/// whether it returned true: a splice that quietly drops half the list still
+/// publishes, so the return value proves nothing about what went out.
+/// This account's newest stored event of `kind`, its CONTENT. For the one
+/// property that tags cannot show: that an encrypted half nobody here reads was
+/// carried through a write rather than replaced with nothing.
+pub fn ownRecordContentForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const own = ownRecordJson(gpa, kind) orelse return null;
+    defer freeOwnProfile(gpa, own);
+    return gpa.dupe(u8, own.json) catch null;
+}
+
+pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
+    const own = ownRecordJson(gpa, kind) orelse return null;
+    defer freeOwnProfile(gpa, own);
+    var out = std.ArrayList(u8).empty;
+    for (own.tags) |tag| {
+        for (tag) |field| {
+            out.appendSlice(gpa, field) catch return null;
+            out.append(gpa, ' ') catch return null;
+        }
+        out.append(gpa, '\n') catch return null;
+    }
+    return out.toOwnedSlice(gpa) catch null;
+}
+pub fn forgetOwnProfileAnswerForTest() void {
+    forgetOwnProfileAnswer();
+}
+
+/// Records an answer the way the worker's `defer` does.
+pub fn recordOwnProfileAnswerForTest(pk: [32]u8, answered: bool) void {
+    lockOwnProfile();
+    g_own_profile_asked_for = pk;
+    g_own_profile_answered.store(answered, .release);
+    unlockOwnProfile();
+}
+
+pub fn ownProfileAnsweredForTest() bool {
+    return ownProfileAnswered();
+}
+
+pub fn seedProfileFieldsForTest(model: *Model, json: []const u8, keep_typed: bool) void {
+    seedProfileFields(model, json, keep_typed);
+}
+
+/// The merge, exposed so a test can prove what survives it. This is the whole
+/// safety argument of the Edit profile sheet in one function.
+pub fn mergeProfileJsonForTest(gpa: std.mem.Allocator, existing: []const u8, model: *const Model) ?[]u8 {
+    return mergeProfileJson(gpa, existing, model);
+}
+
+/// Drives the name beat's whole write, not just its merge. The tags it forwards
+/// are invisible to `mergeNameJsonForTest`, which only sees the content.
+pub fn publishNameForTest(model: *Model, fx: *Effects) void {
+    publishName(model, fx);
+}
+
+pub fn mergeNameJsonForTest(gpa: std.mem.Allocator, existing: []const u8, name: []const u8) ?[]u8 {
+    return mergeNameJson(gpa, existing, name);
+}
+
+pub fn askVerdictForTest(msg: nostr.message.RelayMessage) []const u8 {
+    return @tagName(askVerdict(msg));
+}
+
+/// The replay seam, exercised without disk or relays. For tests.
+pub fn replayPendingForTest(model: *Model) void {
+    replayPending(model);
+}

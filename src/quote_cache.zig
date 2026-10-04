@@ -549,3 +549,108 @@ fn askQuoteAt(url_buf: [place_relay_cap]u8, url_len: usize, id: [32]u8) void {
 pub fn noteHasEventQuote(note: *const Note) bool {
     return note.quote.kind == .event;
 }
+
+/// Clears the quote cache. For tests, which share the process globals.
+pub fn resetQuotesForTest() void {
+    g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
+    g_quote_clock = 0;
+}
+
+pub const addressDialsPerRoundForTest = address_dials_per_round;
+/// Seeds a resolved quote, so a test can render the aside and price it without a
+/// relay. Returns the id it was filed under.
+pub fn seedQuoteForTest(id: [32]u8, pubkey: [32]u8, created_at: i64, text: []const u8) void {
+    wantQuote(id);
+    const e = quoteFor(id) orelse return;
+    e.pubkey = pubkey;
+    e.created_at = created_at;
+    // These fixtures were written before a quote entry carried a kind, and
+    // every one of them means "a note". Left at the 0 default they would each
+    // claim to hold an event of a kind nothing can draw.
+    e.kind = 1;
+    const keep = @min(text.len, e.text_buf.len);
+    @memcpy(e.text_buf[0..keep], text[0..keep]);
+    e.text_len = @intCast(keep);
+    e.state = .loaded;
+}
+
+/// Puts a resolved parent in the cache, as an answered fetch would.
+pub fn fillQuoteForTest(id: [32]u8, pubkey: [32]u8, text: []const u8) void {
+    wantQuote(id);
+    const q = quoteFor(id) orelse return;
+    q.state = .loaded;
+    q.pubkey = pubkey;
+    // These fixtures were written before a quote entry carried a kind, and
+    // every one of them means "a note". Left at the 0 default they would each
+    // claim to hold an event of a kind nothing can draw.
+    q.kind = 1;
+    const n = @min(text.len, q.text_buf.len);
+    @memcpy(q.text_buf[0..n], text[0..n]);
+    q.text_len = @intCast(n);
+}
+
+/// How many relay hints the cache entry for `id` is holding, or null when there
+/// is no entry. For asserting that a decoded address actually left its hints
+/// somewhere the fetch will find them.
+pub fn quoteHintCountForTest(id: [32]u8) ?u8 {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints.count;
+    }
+    return null;
+}
+
+pub fn wantQuoteForTest(id: [32]u8) void {
+    wantQuote(id);
+}
+
+/// Wants a quoted event the way an `nevent1` naming relays does.
+pub fn wantQuoteHintedForTest(id: [32]u8, hints: []const []const u8) void {
+    wantQuoteHinted(id, hints);
+}
+
+pub fn quoteTextForTest(id: [32]u8) ?[]const u8 {
+    const q = quoteFor(id) orelse return null;
+    if (q.state != .loaded) return null;
+    return q.text_buf[0..q.text_len];
+}
+pub fn refreshQuotesForTest(store: *nostr.store.Store) void {
+    refreshQuotes(store);
+}
+
+pub fn requeueMissingQuotesForTest() void {
+    requeueMissingQuotes();
+}
+
+pub fn requestWantedQuotesForTest() void {
+    requestWantedQuotes();
+}
+
+pub fn advanceQuoteRoundForTest(rounds: u64) void {
+    g_quote_round +%= rounds;
+}
+
+pub fn rearmWantedQuotesForTest() void {
+    rearmWantedQuotes();
+}
+
+pub fn quoteBackoffRoundsForTest(attempts: u8) u64 {
+    return quoteBackoffRounds(attempts);
+}
+
+/// Marks a cached quote as one its author asked to have covered.
+pub fn warnQuoteForTest(id: [32]u8, reason: []const u8) void {
+    const q = quoteFor(id) orelse return;
+    q.warned = true;
+    @memcpy(q.warning_buf[0..reason.len], reason);
+    q.warning_len = @intCast(reason.len);
+}
+
+pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
+    return quoteFor(id);
+}
+
+pub fn dropQuoteForTest(id: [32]u8) void {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) q.* = .{};
+    }
+}

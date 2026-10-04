@@ -354,3 +354,17 @@ pub fn performLogout(model: *Model, fx: *Effects) void {
     // uninterrupted (the pool and store keep running), not a welcome wall.
     model.stage = .ready;
 }
+
+/// Logs out: deletes the session (and, for a local key, the key file itself),
+/// resets the identity globals, and returns to onboarding. The feed store and
+/// its ingest threads keep running (they serve the starter pack regardless of
+/// who is signed in); a subsequent sign-in reuses them. The user is never locked
+/// in, a local key can always be copied from Settings first, and a remote
+/// signer keeps the user's key throughout.
+/// Drives the whole sign-out, so a test can assert what does NOT survive it. The
+/// list of things it clears is the interesting part, and every one of them was
+/// added after something of the previous account's turned up under the next
+/// account's key.
+pub fn performLogoutForTest(model: *Model, fx: *Effects) void {
+    performLogout(model, fx);
+}

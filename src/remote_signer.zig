@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const slotIdForTest = main.slotIdForTest;
 const Effects = main.Effects;
 const LoginError = main.LoginError;
 const Model = main.Model;
@@ -975,4 +976,147 @@ pub fn hexLower(out: *[64]u8, bytes: [32]u8) void {
         out[i * 2] = digits[b >> 4];
         out[i * 2 + 1] = digits[b & 0x0f];
     }
+}
+
+/// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
+/// Pretends this session connected to `pubkey`'s bunker.
+pub fn setRemotePubkeyForTest(pubkey: [32]u8) void {
+    g_remote_pubkey = pubkey;
+}
+
+/// Hands one NIP-46 response event to the listener's handler, as a relay would.
+/// The generation is the live one, so only the checks under test can reject it.
+pub fn deliverNip46ResponseForTest(
+    signer: nostr.keys.Signer,
+    client_kp: nostr.keys.KeyPair,
+    ev: nostr.event.Event,
+) void {
+    handleNip46Response(
+        std.heap.page_allocator,
+        signer,
+        client_kp,
+        ev,
+        g_remote_generation.load(.acquire),
+    );
+}
+
+// Test seams for the NIP-46 pending-request table (the correlation and teardown
+// logic), exercised without threads or a live bunker.
+pub const RemoteMethodForTest = RemoteMethod;
+pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
+    return registerPending(req_id, method, content, content != null, .none, 0, no_half_id, .{});
+}
+pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
+    const taken = takePending(req_id) orelse return null;
+    return .{ .method = taken.method, .content = taken.content };
+}
+pub fn failPendingForTest(req_id: []const u8) bool {
+    return failPending(req_id);
+}
+pub fn clearPendingForTest() void {
+    clearPending();
+}
+/// Marks the pending sign whose draft is `content` failed, as a refusal or a
+/// timeout would, so a test can pick WHICH of several signs comes back.
+pub fn failPendingByContentForTest(content: []const u8) bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active or slot.method != .sign_event) continue;
+        const c = slot.content orelse continue;
+        if (!std.mem.eql(u8, c, content)) continue;
+        slot.failed = true;
+        return true;
+    }
+    return false;
+}
+pub fn bumpRemoteGenerationForTest() void {
+    _ = newRemoteGeneration();
+}
+pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
+    scanPendingRemote(model, fx);
+}
+pub fn remoteSignNoticeForTest() bool {
+    return g_remote_sign_notice.load(.acquire);
+}
+/// Whether any parked bunker answer is still waiting for the tick, or still
+/// holds plaintext.
+pub fn halfInboxHoldsForTest() bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_half_inbox) |*box| {
+        if (box.used or box.plain_len != 0) return true;
+    }
+    return false;
+}
+
+/// A decrypt request registered for the half in `index`, with no outcome yet,
+/// as `requestRemoteDecrypt` does.
+pub fn registerRemoteHalfAskForTest(index: u8, method: RemoteMethod) bool {
+    return registerPending("halfask", method, null, false, .none, index, slotIdForTest(index), .{});
+}
+/// Starts connecting to a bunker the way `connectRemoteSigner` does, without a
+/// socket or a thread: the connection state is set, nobody is signed in, and a
+/// `connect` request is waiting for its answer. Returns that request's id. For
+/// tests.
+pub fn beginBunkerConnectForTest(pubkey: [32]u8, id_out: *[24]u8) []const u8 {
+    g_remote_pubkey = pubkey;
+    keyholder.g_signer_kind = .remote;
+    g_remote_status.store(1, .release);
+    g_remote_sign_notice.store(false, .release);
+    g_remote_confirming.store(true, .release);
+    login.g_login_error.store(@intFromEnum(LoginError.none), .release);
+    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    const id = "connect-for-test";
+    @memcpy(id_out[0..id.len], id);
+    _ = registerPending(id, .connect, null, false, .none, 0, no_half_id, .{});
+    return id_out[0..id.len];
+}
+/// The id of the `connect` request a pasted link left waiting, if any. For
+/// tests.
+pub fn pendingConnectIdForTest(out: *[24]u8) ?[]const u8 {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and slot.method == .connect) {
+            @memcpy(out[0..slot.id_len], slot.id());
+            return out[0..slot.id_len];
+        }
+    }
+    return null;
+}
+
+/// What the listener does with a `connect` answer from the signer. For tests.
+pub fn answerBunkerConnectForTest(id: []const u8) void {
+    _ = takeAnswered(id);
+}
+
+/// Whether the pairing secret `needle` is still anywhere in the buffer that
+/// held it, or a client key is still held. For tests.
+pub fn remoteSecretHeldForTest(needle: []const u8) bool {
+    if (g_remote_client_kp != null) return true;
+    return std.mem.indexOf(u8, &g_remote_secret_buf, needle) != null;
+}
+
+/// Which listener generation is current, so a test can see one was stopped.
+/// For tests.
+pub fn remoteGenerationForTest() u64 {
+    return g_remote_generation.load(.acquire);
+}
+
+pub fn connectWentQuietForTest() bool {
+    return connectWentQuiet();
+}
+
+pub fn driveBunkerConnectForTest(model: *Model) void {
+    driveBunkerConnect(model);
+}
+
+/// Puts every piece of bunker state back to a guest's. For tests.
+pub fn resetBunkerConnectForTest() void {
+    abandonRemoteSigner(.none);
+    g_remote_confirming.store(false, .release);
+}
+pub fn remoteDecryptMethodNameForTest(payload: []const u8) []const u8 {
+    return @tagName(remoteDecryptMethod(payload));
 }

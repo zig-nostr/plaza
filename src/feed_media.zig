@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const lookupProfile = main.lookupProfile;
 const Effects = main.Effects;
 const Model = main.Model;
 const Note = main.Note;
@@ -897,4 +898,162 @@ pub fn retryFailedImages() void {
             m.attempts = 0;
         }
     }
+}
+
+/// The address warming asks for, so a test can hold it against the one the row
+/// will look up. They are built in two places and must not drift.
+pub fn setVisibleRangeForTest(first: usize, last: usize) void {
+    g_visible_first = first;
+    g_visible_last = last;
+}
+
+// ---------------------------------------------------------------- feed media
+//
+// Feed images take the image ids the avatars do not, through a small LRU keyed
+// by note. Only the top of the feed loads for now: that is what the budget
+// holds and what is on screen at rest. Windowed visibility (load exactly what
+// is in view, evict what leaves) arrives with the virtual list.
+
+/// Clears the media cache. For tests, which share the process globals.
+/// Whether the slot for `note_id` was marked wanted by the most recent pass.
+/// This is the thing the claim pass reads to decide what it may evict, so it is
+/// the thing a test about "which pictures the level is spending its slots on"
+/// has to ask about.
+pub fn mediaSlotWantedForTest(note_id: i64) ?bool {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.last_used == profile_cache.g_image_clock;
+}
+
+pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
+    scanMediaFetches(fx, model);
+}
+/// How many picture slots are currently held, and by which notes.
+pub fn mediaSlotNoteIdsForTest(out: []i64) usize {
+    var n: usize = 0;
+    for (&g_media) |*m| {
+        if (!m.used or n == out.len) continue;
+        out[n] = m.note_id;
+        n += 1;
+    }
+    return n;
+}
+pub fn resetMediaForTest() void {
+    for (&g_media) |*m| m.down.release();
+    g_media = [_]MediaSlot{.{}} ** max_media_images;
+    profile_cache.g_image_clock = 0;
+}
+
+/// How many slots are holding a half-assembled picture. Zero at rest: a slice
+/// buffer belongs to one fetch and dies with it.
+pub fn mediaPartialCountForTest() usize {
+    var n: usize = 0;
+    for (&g_media) |*m| {
+        if (m.down.buf != null) n += 1;
+    }
+    return n;
+}
+
+pub fn mediaKeyForTest(note_id: i64, index: usize) i64 {
+    return mediaKey(note_id, index);
+}
+
+pub fn markMediaFailedForTest(slot: *MediaSlot) void {
+    slot.state = .failed;
+}
+
+pub fn mediaAttemptsForTest(note_id: i64) ?u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.attempts;
+}
+
+/// The host a slot's picture lives on, which `fireMediaAt` normally sets from
+/// the note. A test that drives the response handler directly never went
+/// through it.
+pub fn setMediaSlotHostForTest(note_id: i64, host: []const u8) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    const n = @min(host.len, m.host_buf.len);
+    @memcpy(m.host_buf[0..n], host[0..n]);
+    m.host_len = @intCast(n);
+}
+
+pub fn mediaIdleForTest(note_id: i64) bool {
+    const m = mediaSlotFor(note_id) orelse return false;
+    return m.state == .idle;
+}
+
+/// Whether this note's picture is now pinned to its own host rather than the
+/// proxy, and whether it will be asked for again.
+pub fn mediaFallbackStateForTest(note_id: i64) ?struct { idle: bool, direct: bool } {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return .{ .idle = m.state == .idle, .direct = m.direct };
+}
+/// Feeds one delivered slice to a profile's face, exactly as a 206 does.
+pub fn appendAvatarSliceForTest(pubkey: [32]u8, body: []const u8) ?SliceOutcome {
+    const p = lookupProfile(pubkey) orelse return null;
+    return p.down.append(body);
+}
+pub fn rangeHeaderForTest(buf: []u8, offset: usize) ?[]const u8 {
+    return rangeHeader(buf, offset);
+}
+
+/// Feeds one delivered slice to a note's slot, exactly as a 206 response does.
+pub fn appendMediaSliceForTest(note_id: i64, body: []const u8) ?SliceOutcome {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.down.append(body);
+}
+
+/// What a note's slot has assembled so far, or null if it is holding nothing.
+pub fn mediaPartialForTest(note_id: i64) ?[]const u8 {
+    const m = mediaSlotFor(note_id) orelse return null;
+    return m.down.bytes();
+}
+
+pub fn deliverMediaResponseForTest(
+    fx: *Effects,
+    note_id: i64,
+    outcome: native_sdk.EffectFetchOutcome,
+    status: u16,
+    body: []const u8,
+) void {
+    const m = mediaSlotFor(note_id) orelse return;
+    handleMediaFetched(fx, .{
+        .key = media_fetch_key_base + mediaSlotIndex(m),
+        .outcome = outcome,
+        .status = status,
+        .body = body,
+    });
+}
+
+pub fn claimMediaSlotForTest(fx: *Effects, note_id: i64) ?*MediaSlot {
+    return claimMediaSlot(fx, note_id);
+}
+pub fn proxyRefusedCountForTest() usize {
+    return g_proxy_refused_count;
+}
+
+pub fn hostOfForTest(url: []const u8) []const u8 {
+    return hostOf(url);
+}
+/// The media-slot key a quote's picture is filed under.
+pub fn quoteMediaKeyForTest(id: [32]u8) i64 {
+    return quoteMediaKey(id);
+}
+
+/// Where the slot filed under `key` is in its life, and the registry id it
+/// holds (0 for none), or null when no slot exists. Looks without claiming.
+pub fn mediaSlotStateForTest(key: i64) ?struct { state: []const u8, image_id: u64, url: []const u8 } {
+    const m = mediaSlotFor(key) orelse return null;
+    return .{ .state = @tagName(m.state), .image_id = m.image_id, .url = m.url() };
+}
+/// Leaves the slot under `key` the way a finished fetch would: a registry id
+/// taken from the pool, marked loaded at this size. The decode itself needs a
+/// platform codec a test does not have.
+pub fn markMediaLoadedForTest(fx: *Effects, key: i64, width: usize, height: usize) ?u64 {
+    const slot = claimMediaSlot(fx, key) orelse return null;
+    if (slot.image_id == 0) slot.image_id = acquireImageId(fx) orelse return null;
+    slot.state = .loaded;
+    slot.width = width;
+    slot.height = height;
+    rememberAspect(slot.note_id, width, height);
+    return slot.image_id;
 }

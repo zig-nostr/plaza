@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const relay_conn = @import("relay_conn.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -895,3 +896,109 @@ pub fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event, route: PlaceR
 /// with a busy subscription can have several in front of the OK; past this it is
 /// not answering about this note.
 const max_publish_messages = 8;
+
+pub fn forgetOutboxAcksForTest() void {
+    forgetOutboxAcks();
+}
+pub fn outboxHasRoomForTest() bool {
+    return outboxHasRoom();
+}
+
+/// The queue's own seams, so a test drives the real state machine rather than a
+/// copy of it.
+pub fn resetOutboxForTest() void {
+    outboxLock();
+    defer outboxUnlock();
+    for (&g_outbox) |*e| e.* = .{};
+    relay_conn.g_outbox_woke_at.store(0, .monotonic);
+    relay_conn.g_outbox_woke_ever.store(false, .monotonic);
+}
+
+pub fn outboxStateForTest(id: [32]u8) ?OutboxState {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.state();
+}
+
+pub fn outboxRoundsForTest(id: [32]u8) ?u8 {
+    outboxLock();
+    defer outboxUnlock();
+    const e = outboxEntryFor(id) orelse return null;
+    return e.rounds;
+}
+
+pub fn enqueueOutboxForTest(id: [32]u8, author: [32]u8, now_s: i64) bool {
+    return enqueueOutbox(id, author, now_s, .none);
+}
+
+pub fn recordOutboxAckForTest(id: [32]u8, relay_index: usize, accepted: bool) void {
+    recordOutboxAck(id, relay_index, accepted);
+}
+
+pub fn sweepOutboxForTest(now_s: i64) void {
+    sweepOutbox(now_s);
+}
+
+pub fn outboxRetryDelayForTest(rounds: u8) i64 {
+    return outboxRetryDelay(rounds);
+}
+
+pub const rounds_before_stuck_for_test = rounds_before_stuck;
+pub const outbox_sent_linger_for_test = outbox_sent_linger_s;
+
+pub fn collectOutboxDueForTest(ids: *[outbox_cap][32]u8, now_s: i64) usize {
+    return collectOutboxDue(ids, now_s);
+}
+
+pub fn syncOutboxOwnerForTest() void {
+    syncOutboxOwner();
+}
+
+pub fn loadOutboxForTest(owner: [32]u8) void {
+    loadOutbox(owner);
+}
+
+pub fn saveOutboxForTest() void {
+    saveOutbox();
+}
+
+pub fn outboxOwnerForTest() ?[32]u8 {
+    return g_outbox_owner;
+}
+
+pub fn clearOutboxOwnerForTest() void {
+    g_outbox_owner = null;
+}
+
+pub fn outboxAuthorAtForTest(i: usize) ?[32]u8 {
+    outboxLock();
+    defer outboxUnlock();
+    if (!g_outbox[i].used) return null;
+    return g_outbox[i].author;
+}
+
+pub fn outboxUsedSlotsForTest() usize {
+    outboxLock();
+    defer outboxUnlock();
+    var n: usize = 0;
+    for (&g_outbox) |*e| {
+        if (e.used) n += 1;
+    }
+    return n;
+}
+
+pub const outbox_cap_for_test = outbox_cap;
+
+/// Whether `url` is already one of the reader's own relays.
+pub fn poolHasRelayForTest(url: []const u8) bool {
+    return poolHasRelay(url);
+}
+
+pub fn routeForOpenPlaceRelaysForTest(out: [][]const u8) usize {
+    const r = routeForOpenPlace();
+    g_route_probe = r;
+    var n: usize = 0;
+    while (n < g_route_probe.len and n < out.len) : (n += 1) out[n] = g_route_probe.url(n);
+    return n;
+}

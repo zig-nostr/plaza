@@ -249,3 +249,21 @@ pub fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
     places.g_place_want = want;
     askPlace(fx, ptr.relays);
 }
+
+pub fn writePendingLinkForTest(io: std.Io, dir: *std.Io.Dir, link: []const u8, now_s: i64) void {
+    writePendingLinkIn(io, dir, link, now_s);
+}
+
+pub fn takeWrittenLinkForTest(io: std.Io, dir: *std.Io.Dir, buf: []u8, now_s: i64) ?[]const u8 {
+    return takeWrittenLinkIn(io, dir, buf, now_s);
+}
+
+pub fn captureArgvLinkForTest(link: []const u8) void {
+    if (link.len > g_argv_link_buf.len) return;
+    @memcpy(g_argv_link_buf[0..link.len], link);
+    g_argv_link_len = link.len;
+}
+
+pub fn takePendingLinkForTest(buf: []u8) ?[]const u8 {
+    return takePendingLink(buf);
+}

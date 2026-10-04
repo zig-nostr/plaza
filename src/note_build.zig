@@ -918,3 +918,38 @@ pub fn utf8SafeLen(s: []const u8, max: usize) usize {
     while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
     return n;
 }
+
+/// Builds a Note over `content` and runs the quote-reference scan, so a test can
+/// assert what `findQuoteRef` captured (id/off/len) without a live event.
+pub fn findQuoteRefForTest(content: []const u8) Note {
+    var note = Note{};
+    const n = @min(content.len, note.content_buf.len);
+    @memcpy(note.content_buf[0..n], content[0..n]);
+    note.content_len = @intCast(n);
+    findQuoteRef(&note);
+    return note;
+}
+/// A NIP-22 comment, for the inbox tests: same shape as the kind:1 builder
+/// there, with the kind that makes the other vocabulary apply.
+pub fn commentEventForTest(author: u8, tags: []const nostr.event.Tag) nostr.event.Event {
+    return .{
+        .id = [_]u8{author} ** 32,
+        .pubkey = [_]u8{author} ** 32,
+        .created_at = 100,
+        .kind = comment_kind,
+        .tags = tags,
+        .content = "a comment",
+        .sig = [_]u8{0} ** 64,
+    };
+}
+pub fn invisibleForDisplayForTest(cp: u21) bool {
+    return invisibleForDisplay(cp);
+}
+
+pub fn copyDisplayTextForTest(dst: []u8, src: []const u8) usize {
+    return copyDisplayText(dst, src);
+}
+
+pub fn foldMathAlnumForTest(cp: u21) ?u8 {
+    return foldMathAlnum(cp);
+}

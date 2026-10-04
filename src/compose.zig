@@ -1371,3 +1371,85 @@ pub fn markOutboxSending(id: [32]u8, sending: bool) void {
     if (!sending) e.rounds +|= 1;
     _ = outbox.g_outbox_rev.fetchAdd(1, .monotonic);
 }
+
+/// One failed publish round, the way `markOutboxSending(false)` records it.
+pub fn markOutboxRoundForTest(id: [32]u8) void {
+    markOutboxSending(id, true);
+    markOutboxSending(id, false);
+}
+/// Drives one helper sign the way `signAndPublish` does, without needing a live
+/// daemon behind it. The fetch itself goes nowhere in a test; what is under test
+/// is what happens to the note when it does not come back.
+/// Drives the whole post, from the composer down through the signer dispatch.
+/// The dispatch is the part that mattered: it forwarded `restorable` to the
+/// bunker and dropped it on the way to the built-in signer, so the flag arriving
+/// intact is not something a test of `requestHelperSign` alone can see.
+pub fn submitPostForTest(model: *Model, fx: *Effects) bool {
+    return submitPost(model, fx, null);
+}
+pub fn dupeTagsForTest(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
+    return dupeTags(gpa, tags);
+}
+
+pub fn contentTagsForTest(gpa: std.mem.Allocator, content: []const u8) []const nostr.event.Tag {
+    return contentTags(gpa, content, &.{}, &.{});
+}
+pub fn markRepostedByMeForTest(note_id: i64) void {
+    markRepostedByMe(note_id);
+}
+/// Publishes one event the way any press does, so a test can ask what actually
+/// went out rather than what a helper built.
+pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []const nostr.event.Tag, content: []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const owned = gpa.dupe(u8, content) catch return;
+    signAndPublish(fx, gpa, created, kind, tags, owned, false, .none, null);
+}
+pub fn replyHeldForTest() bool {
+    return g_reply_due_s != 0;
+}
+
+pub fn holdReplyForTest(now_s: i64) void {
+    g_reply_due_s = now_s + (if (g_post_delay_s == 0) @as(i64, 5) else g_post_delay_s);
+}
+
+pub fn postDelayForTest() i64 {
+    return g_post_delay_s;
+}
+pub fn setPostDelayForTest(seconds: i64) void {
+    g_post_delay_s = seconds;
+}
+
+pub fn postHeldForTest() bool {
+    return g_post_due_s != 0;
+}
+
+pub fn holdPostForTest(now_s: i64) void {
+    g_post_due_s = now_s + g_post_delay_s;
+}
+pub fn ingestAndPublishForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
+    ingestAndPublish(gpa, ev, null, .none);
+}
+pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {
+    return notifiedBy(content, out);
+}
+
+pub fn deletableTargetKindForTest(model: *Model, note_id: i64) ?u16 {
+    const t = deletableTarget(model, note_id) orelse return null;
+    return t.kind;
+}
+
+pub fn drivePendingIntentForTest(model: *Model, fx: *Effects) void {
+    drivePendingIntent(model, fx);
+}
+pub fn countOutboxRoundForTest(id: [32]u8) void {
+    markOutboxSending(id, true);
+    markOutboxSending(id, false);
+}
+/// What the route a held note is carrying names, for the test: the relay list a
+/// publish walk would actually dial, taken from the value and not from whatever
+/// room happens to be open when it is read.
+pub fn heldRouteRelaysForTest(out: [][]const u8) usize {
+    var n: usize = 0;
+    while (n < g_held_route.len and n < out.len) : (n += 1) out[n] = g_held_route.url(n);
+    return n;
+}

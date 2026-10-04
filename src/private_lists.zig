@@ -8,15 +8,16 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const keyholder = @import("keyholder.zig");
 const remote_signer = @import("remote_signer.zig");
+const feed_state = @import("feed_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const no_half_id = main.no_half_id;
 const Effects = main.Effects;
 const OwnProfile = main.OwnProfile;
 const activePubkey = main.activePubkey;
-const answerPrivateHalfForTest = main.answerPrivateHalfForTest;
 const helperFetch = main.helperFetch;
 const invalidateFeed = main.invalidateFeed;
 const isNip04Payload = main.isNip04Payload;
@@ -439,4 +440,146 @@ pub fn privateHalfGate(gpa: std.mem.Allocator, content: []const u8) HalfGate {
         },
         .open, .unreadable => return .unreadable,
     }
+}
+
+/// Claims a private-half slot the way a reader hitting an encrypted list does,
+/// and returns its index, WITHOUT the test keyholder answering it. That is what
+/// a bunker reader's state actually looks like: the half is claimed and waiting
+/// on a signer that answers over the relay rather than over HTTP.
+pub fn claimPrivateHalfPendingForTest(content: []const u8) ?u8 {
+    const id = privateHalfId(content);
+    for (&g_private_halves, 0..) |*h, i| {
+        if (h.used) continue;
+        if (content.len > g_private_ciphertext[i].buf.len) return null;
+        h.* = .{ .used = true, .state = .asking, .id = id };
+        @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
+        g_private_ciphertext[i].len = @intCast(content.len);
+        return @intCast(i);
+    }
+    return null;
+}
+
+/// What the listener thread does when the bunker answers a `nip44_decrypt`.
+pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
+    parkHalfAnswer(index, slotIdForTest(index), plain);
+}
+
+/// The same for an ask that was made about `ciphertext`, whoever holds the slot
+/// by the time the answer lands.
+pub fn parkRemoteHalfAnswerForCiphertextForTest(index: u8, ciphertext: []const u8, plain: []const u8) void {
+    parkHalfAnswer(index, privateHalfId(ciphertext), plain);
+}
+
+pub fn slotIdForTest(index: u8) [32]u8 {
+    if (index >= g_private_halves.len) return no_half_id;
+    return g_private_halves[index].id;
+}
+
+/// A decrypt the bunker refused or never answered, for the ask made about
+/// `ciphertext`.
+pub fn endRemoteHalfAskForTest(index: u8, ciphertext: []const u8, end: HalfAskEnd) bool {
+    return endHalfAsk(index, privateHalfId(ciphertext), end);
+}
+
+/// A `nip44_decrypt` the bunker refused: an explicit error.
+pub fn failRemoteHalfForTest(index: u8) bool {
+    return endHalfAsk(index, slotIdForTest(index), .failed);
+}
+
+/// A `nip44_decrypt` the bunker never answered before the deadline.
+pub fn timeoutRemoteHalfForTest(index: u8) bool {
+    return endHalfAsk(index, slotIdForTest(index), .timed_out);
+}
+/// What the tick does for every idle half when a bunker is the signer: the ask
+/// goes out and the half waits for it. The test has no relay to send to.
+pub fn markIdleHalvesAskedForTest() void {
+    for (&g_private_halves) |*h| {
+        if (h.used and h.state == .idle) h.state = .asking;
+    }
+}
+pub fn privateHalfRetryAtForTest(index: u8) i64 {
+    if (index >= g_private_halves.len) return -1;
+    return g_private_halves[index].retry_at_s;
+}
+
+pub fn privateHalfRetryDelayForTest() i64 {
+    return private_half_retry_s;
+}
+
+/// The sweep `scanPrivateHalves` runs each tick, with the clock stated.
+pub fn rearmPrivateHalvesForTest(now: i64) void {
+    rearmPrivateHalves(now, false);
+}
+
+pub fn privateHalfStateForTest(index: u8) []const u8 {
+    if (index >= g_private_halves.len or !g_private_halves[index].used) return "none";
+    return switch (g_private_halves[index].state) {
+        .idle => "idle",
+        .asking => "asking",
+        .open => "open",
+        .refused => "refused",
+        .unreadable => "unreadable",
+    };
+}
+
+pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
+    const id = privateHalfId(content);
+    for (&g_private_halves) |*h| {
+        if (!h.used or std.mem.eql(u8, &h.id, &id)) {
+            h.* = .{ .used = true, .state = .open, .id = id };
+            const n = @min(plain.len, h.plain_buf.len);
+            @memcpy(h.plain_buf[0..n], plain[0..n]);
+            h.plain_len = @intCast(n);
+            return;
+        }
+    }
+}
+
+/// The keyholder a test has, for the decrypt path. Only in a test binary.
+pub fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []const u8) void {
+    const secret = feed_state.g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    const key = beginHelperAsk(i);
+    const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, kp.public_key, content) catch {
+        // Notary would answer 422: it looked, and the ciphertext does not open.
+        handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 422, .body = "{\"error\":\"unreadable\"}" });
+        return;
+    };
+    defer gpa.free(plain);
+    const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
+    defer gpa.free(body);
+    handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 200, .body = body });
+}
+/// The same under a stated key, so an answer can be delivered after the ask it
+/// belongs to is long gone.
+pub fn deliverPrivateHalfKeyedForTest(key: u64, status: u16, body: []const u8) void {
+    handlePrivateHalf(.{ .key = key, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
+}
+
+/// The key the ask now in flight on slot `index` went out under.
+pub fn privateHalfAskKeyForTest(index: u8) u64 {
+    return privateHalfKey(index, g_private_halves[index].ask_seq);
+}
+
+/// Puts slot zero in the "asked, waiting" state for a given ciphertext.
+pub fn askPrivateHalfForTest(content: []const u8) void {
+    g_private_halves[0] = .{ .used = true, .state = .idle, .id = privateHalfId(content) };
+    _ = beginHelperAsk(0);
+    const n = @min(content.len, g_private_ciphertext[0].buf.len);
+    @memcpy(g_private_ciphertext[0].buf[0..n], content[0..n]);
+    g_private_ciphertext[0].len = @intCast(n);
+}
+
+pub fn privateHalfIsReadableForTest(content: []const u8) bool {
+    return privateHalfIsReadable(std.heap.page_allocator, content);
+}
+
+pub fn forgetPrivateHalvesForTest() void {
+    forgetPrivateHalves();
+}
+
+pub fn privateHalfGateNameForTest(content: []const u8) []const u8 {
+    return @tagName(privateHalfGate(std.heap.page_allocator, content));
 }

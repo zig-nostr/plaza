@@ -1055,3 +1055,87 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     // the UI can stop showing loading skeletons even if nothing came back.
     g_thread_done_seq.store(seq, .release);
 }
+
+/// Marks a thread's reply fetch as finished, the way its worker does.
+pub fn markThreadFetchDoneForTest(seq: u64) void {
+    g_thread_done_seq.store(seq, .release);
+}
+/// Marks the fetch for generation `seq` as finished, the way its worker does
+/// when every relay has answered, for a test that has no worker.
+pub fn finishLevelFetchForTest(seq: u64) void {
+    g_thread_done_seq.store(seq, .release);
+}
+/// The level bookkeeping, for a test that walks a stack up and down. Both take
+/// the same paths the app does, so what they assert is what a reader gets.
+pub fn enterThreadForTest(model: *Model, root: Note) void {
+    enterThread(model, root);
+}
+
+pub fn closeThreadForTest(model: *Model) void {
+    closeThread(model);
+}
+
+pub fn feedEndLatchesForTest(asked: usize, answered: usize, added: usize) bool {
+    return feedEndLatches(asked, answered, added);
+}
+pub fn setFeedEndForTest() void {
+    g_feed_end_reached.store(true, .monotonic);
+}
+
+pub fn resetFeedEndForTest() void {
+    resetFeedEnd();
+    g_older_busy.store(false, .monotonic);
+}
+
+pub fn openTopicForTest(model: *Model, topic: []const u8) void {
+    openTopic(model, topic);
+}
+
+pub fn openBookmarksForTest(model: *Model) void {
+    openBookmarks(model);
+}
+
+pub fn enterProfileForTest(model: *Model, pubkey: [32]u8) void {
+    enterProfile(model, pubkey);
+}
+/// Drives the REAL entry path, so what the test asserts is what a reader gets.
+pub fn openEventForTest(model: *Model, id: [32]u8) void {
+    openEvent(model, id);
+}
+
+/// One tick of the store-side half of that fetch.
+pub fn refreshEventFetchForTest(model: *Model) void {
+    refreshEventFetch(model);
+}
+
+/// Whether the window is still watching. Closed is what both walking away and
+/// arriving must produce: an open window keeps reading the store every tick.
+pub fn eventFetchArmedForTest() bool {
+    return g_event_want != null;
+}
+
+pub fn forgetEventFetchForTest() void {
+    g_event_want = null;
+}
+
+pub fn goHomeForTest(model: *Model) void {
+    goHome(model);
+}
+
+/// The REQ a topic sends, as the relay receives it.
+pub fn topicReqForTest(gpa: std.mem.Allocator, topic: []const u8) ![]u8 {
+    const values = [_][]const u8{topic};
+    var tags: [1]nostr.filter.TagFilter = undefined;
+    const filters = [_]nostr.filter.Filter{topicFilter(&values, &tags)};
+    return nostr.message.encodeReq(gpa, "plaza-topic", &filters);
+}
+/// Puts the page's first fetch back in flight, or lands it, for a test that has
+/// no socket to do either.
+pub fn setFirstProfileFetchOutForTest(model: *Model, out: bool) void {
+    const done = g_thread_done_seq.load(.acquire);
+    if (out) {
+        model.thread_seq = done + 1;
+    } else {
+        g_thread_done_seq.store(model.thread_seq, .release);
+    }
+}

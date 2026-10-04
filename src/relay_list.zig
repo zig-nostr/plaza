@@ -464,3 +464,74 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     saveRelays();
     return true;
 }
+
+pub fn relayListDueForTest(now_s: i64) bool {
+    return relayListDue(now_s);
+}
+
+pub fn relayListEditedForTest(now_s: i64) void {
+    g_relays_are_mine = true;
+    g_relay_list_dirty = true;
+    g_relay_list_touched = now_s;
+}
+
+pub fn clearRelayListPublishForTest() void {
+    clearRelayListPublish();
+}
+
+/// Drives the settle-and-publish the frame tick drives, so a test can assert
+/// that a refused publish leaves the edit pending rather than losing it.
+pub fn flushRelayListForTest(fx: *Effects, now_s: i64) void {
+    flushRelayList(fx, now_s);
+}
+
+pub fn relayListPendingForTest() bool {
+    return g_relay_list_dirty;
+}
+/// Whether publishing the pool would go out right now. The safety property is
+/// that it does NOT, until this account's own relay list has been read.
+pub fn publishRelayListForTest(fx: *Effects) bool {
+    return publishRelayListReporting(fx);
+}
+pub fn canWriteRelayListForTest() bool {
+    return canWriteRelayList();
+}
+pub fn relayListStampForTest() i64 {
+    return heldRelayListStamp();
+}
+
+pub fn setRelayListStampForTest(created_at: i64) void {
+    setRelayListStamp(created_at);
+}
+
+/// Applies a staged kind:10002 the way the frame loop does.
+pub fn adoptRelayListForTest() bool {
+    return adoptRelayList();
+}
+
+pub fn stageOwnRelayListForTest(ev: nostr.event.Event) void {
+    applyOwnRelayList(ev);
+}
+
+pub fn ingestRelayListForTest(ev: nostr.event.Event) void {
+    ingestRelayList(ev);
+}
+pub fn isReaderNoteForTest(kind: u16) bool {
+    return isReaderNote(kind);
+}
+pub fn markRelaysMineForTest() void {
+    g_relays_are_mine = true;
+    g_relay_owner = activePubkey();
+}
+
+pub fn relayListIsOwnedForTest() bool {
+    return relayListIsOwned();
+}
+
+pub fn relayOwnerForTest() ?[32]u8 {
+    return g_relay_owner;
+}
+
+pub fn relayIsMineForTest() bool {
+    return g_relays_are_mine;
+}

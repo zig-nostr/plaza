@@ -11,6 +11,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const adoptHelperIdentity = main.adoptHelperIdentity;
+const refreshProfiles = main.refreshProfiles;
 const Model = main.Model;
 const Note = main.Note;
 const feed_page = main.feed_page;
@@ -424,4 +426,74 @@ pub fn feedCardFrom(store: *nostr.store.Store, ev: nostr.event.Event, now_s: i64
 pub fn attachFeedStorage(model: *Model) void {
     _ = ensureFeedCapacity(feed_page);
     model.notes = g_feed_notes;
+}
+
+/// Points the app's store at a test's own, so the funnel can be driven for real.
+pub fn setStoreForTest(store: ?*nostr.store.Store) void {
+    main.g_store = store;
+    if (store) |st| seedFeedNewest(st);
+}
+/// Stamps the newest note the feed has seen, so a test can put `feedSince` in
+/// the state that matters. Without this it returns null for want of any note at
+/// all, and a test asserting "no since" passes whether or not the code asks for
+/// one.
+pub fn setFeedNewestForTest(created_at: i64) void {
+    g_feed_newest.store(created_at, .monotonic);
+}
+pub fn feedSinceForTest() ?i64 {
+    return feedSince();
+}
+pub fn setIdentityForTest(secret: [32]u8) void {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    g_test_secret = secret;
+    adoptHelperIdentity(kp.public_key);
+}
+/// Forces the next reconcile to do the full work rather than take the
+/// unchanged-store fast path, so a benchmark measures a rebuild.
+pub fn invalidateFeedForTest() void {
+    invalidateFeed();
+}
+pub fn reconcileForTest(model: *Model, store: *nostr.store.Store, now_s: i64) void {
+    invalidateFeed();
+    refreshProfiles(store);
+    model.rebuildNotes(store, now_s);
+}
+/// Empties the arrival buffer and asks for a full read next time, so a test
+/// starts from a known place rather than from whatever the last one left.
+pub fn resetFeedChangeDetectionForTest() void {
+    clearFeedArrivals();
+    invalidateFeed();
+    g_notes_limit = 0;
+    g_notes_feed_limit = 0;
+    main.g_last_count = std.math.maxInt(usize);
+}
+
+/// Announces an id as newly arrived without storing anything. For the case the
+/// app is not supposed to produce and the splice guards against anyway.
+pub fn noteFeedArrivalForTest(id: [32]u8) void {
+    noteFeedArrival(id);
+}
+
+/// Fills the arrival buffer past its capacity, the way a backfill does.
+pub fn overflowFeedArrivalsForTest() void {
+    for (0..feed_arrival_cap + 1) |i| {
+        var id = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, id[0..8], i, .big);
+        noteFeedArrival(id);
+    }
+}
+
+pub fn profileParsesForTest() usize {
+    return g_profile_parses;
+}
+pub fn reserveFeedForTest(model: *Model, n: usize) void {
+    _ = ensureFeedCapacity(n);
+    model.notes = g_feed_notes;
+}
+/// The key a quote of `id` is uncovered by, which is the key the same note
+/// carries in the feed.
+pub fn feedKeyForTest(id: [32]u8) i64 {
+    return feedKeyOf(id);
 }

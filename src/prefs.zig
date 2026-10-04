@@ -270,3 +270,7 @@ pub fn saveSettings() void {
         .flags = .{ .permissions = secret_file_permissions },
     }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
 }
+
+pub fn settingsWritesForTest() usize {
+    return g_settings_writes;
+}

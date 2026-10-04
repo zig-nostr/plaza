@@ -224,3 +224,7 @@ pub fn applyHiddenLine(value: []const u8) void {
         }
     }
 }
+
+pub fn engagementKindsForTest() []const u16 {
+    return engagementKinds();
+}

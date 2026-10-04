@@ -319,3 +319,24 @@ pub fn articlePanel(ui: *AppUi, model: *const Model, root: *const Note, level_ke
         ui.virtualList(options, window, .{rows}),
     });
 }
+
+/// Forgets the loaded article, for a test that opens several in turn.
+pub fn forgetArticleForTest() void {
+    if (g_article) |old| {
+        old.arena.deinit();
+        std.heap.page_allocator.destroy(old);
+    }
+    g_article = null;
+}
+
+/// How many rows the reader built for the article behind `event_id`, and how many
+/// the list was told about. The difference is the whole point of windowing.
+pub fn articleRowCountForTest(event_id: [32]u8) usize {
+    return if (articleFor(event_id)) |a| a.rowCount() else 0;
+}
+
+/// Row `index` of the article `root` names, built the way the reader builds it,
+/// so a test can read every row and not only the ones a viewport would mount.
+pub fn articleRowForTest(ui: *AppUi, root: *const Note, index: usize) AppUi.Node {
+    return articleRowAt(ui, root, articleFor(root.event_id), index);
+}

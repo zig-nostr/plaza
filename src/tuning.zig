@@ -11,6 +11,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const Model = main.Model;
+const handleUpdateChecked = main.handleUpdateChecked;
 const comment_kind = main.comment_kind;
 const feed_column_width = main.feed_column_width;
 const verb_slot_height = main.verb_slot_height;
@@ -612,3 +614,73 @@ pub const max_gif_total_bytes = 24 * 1024 * 1024;
 pub const max_playing_gifs = 2;
 pub const animation_interval_ms: u32 = 80;
 pub const animation_timer_key: u64 = 2;
+
+pub const plaza_version_for_test = plaza_version;
+pub const settings_column_width_for_test = settings_column_width;
+pub const settings_content_width_for_test = settings_content_width;
+/// The same number, for a test that has to know where a row's disc lands.
+pub const thread_inset_for_test: f32 = thread_inset;
+pub const picture_column_width_for_test: f32 = picture_column_width;
+pub const compose_editor_width_for_test = compose_editor_width;
+pub const reply_editor_height_for_test = reply_editor_height;
+pub const link_card_height_for_test: f32 = link_card_height;
+pub const link_card_height_bare_for_test: f32 = link_card_height_bare;
+/// Makes room for `n` notes and re-points `model` at the grown buffer. For tests
+/// that fill the feed by hand rather than through the store: the app grows on
+/// its way through `rebuildNotes`, and writing past the end without that is the
+/// out-of-bounds it should be.
+/// One more page, the way the reader's scroll asks for it. For tests, so they
+/// page down through the real path rather than setting the limit by hand.
+pub fn loadOlderForTest(model: *Model) void {
+    model.feed_limit += feed_page;
+}
+pub fn updateNewsForTest(body: []const u8) void {
+    handleUpdateChecked(.{ .key = update_check_key, .outcome = .ok, .status = 200, .body = body, .truncated = false, .dropped_before = 0 });
+}
+pub const feed_prefetch_rows_for_test = feed_prefetch_rows;
+pub const gif_target_px_for_test = gif_target_px;
+pub const media_target_px_for_test = media_target_px;
+pub fn maxMediaImagesForTest() usize {
+    return max_media_images;
+}
+
+pub const quote_picture_width_for_test = quote_picture_width;
+
+pub fn maxImageBytesForTest() usize {
+    return max_image_bytes;
+}
+
+pub fn maxImageDownloadBytesForTest() usize {
+    return max_image_download_bytes;
+}
+/// The same, recording where each mention's label landed into `mentions` when
+/// one is given. A note wants that table so the label can be pressed; a profile's
+/// "about" text is rendered the same way and has nowhere to put one.
+pub const note_content_cap_for_test = note_content_cap;
+pub fn noteContentCapForTest() usize {
+    return note_content_cap;
+}
+pub const compose_capacity_for_test = compose_capacity;
+pub fn starterPackLenForTest() usize {
+    return starter_pack.len;
+}
+pub const ghost_row_extent_for_test = ghost_row_extent;
+pub const listening_row_extent_for_test = listening_row_extent;
+pub const outside_row_extent_for_test = outside_row_extent;
+pub const show_more_extent_for_test = show_more_extent;
+pub const ancestor_row_chrome_for_test = ancestor_row_chrome;
+/// Opens, or replaces, the engagement subscription over the first `count`
+/// watched notes.
+///
+/// A REQ under an existing id IS a replacement, so widening the watched set
+/// costs one message and no CLOSE.
+/// Records a feed note's id so its engagement can be watched, deduped and
+/// bounded.
+///
+/// Shared by the pool threads and the routed ones, because they had drifted:
+/// the pool watched engagement and the routed relays did not, and after the
+/// outbox landed the routed relays are the ones carrying most of the feed. One
+/// function is what stops that happening again.
+///
+/// The cap keeps the `#e` filter a size relays actually accept.
+pub const engagementWatchCapForTest = engagement_watch_cap;

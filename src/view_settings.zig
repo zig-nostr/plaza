@@ -982,3 +982,11 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
         relaySuggestions(ui, model),
     });
 }
+
+pub fn cycleRelayForTest(i: usize) void {
+    cycleRelay(i);
+}
+
+pub fn removeRelayForTest(i: usize) void {
+    removeRelay(i);
+}
