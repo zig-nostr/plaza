@@ -180,6 +180,8 @@ mark. A yellow room should not make an error look like weather.
 Arriving opens the host's own text once, in a card you can close and find again
 under Info.
 
+An address or link for a place that no relay turns up says so once the wait is over, and one whose event turns out not to be a place document says that instead.
+
 The format is fiatjaf's Hallway universe object and the field names are his
 exactly, so a document written for one is read the same way by the other. The
 two do not yet share a publishing path: Hallway's deployer ships a site, and

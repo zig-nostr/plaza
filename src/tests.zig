@@ -25769,6 +25769,169 @@ const AddressFixture = struct {
     }
 };
 
+test "an address for a place nobody has says it is looking, then that it did not turn up" {
+    // Paste an naddr for a place no relay holds and Plaza said nothing at all:
+    // the field closed, the feed stayed the feed, and a missing note, one
+    // field over, toasts twice. Silence reads as a paste that did not take.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("nobody");
+    defer f.down();
+
+    const host = [_]u8{0x3c} ** 32;
+    f.paste(try nostr.nip19.encodeNaddr(arena, "ghost-town", host, main.place_kind_for_test, &.{}));
+    try testing.expect(main.placeFetchArmedForTest());
+    try testing.expectEqualStrings("Looking for that place", f.model.toast_text());
+
+    // The whole window, with nothing ever arriving. The paste took one look
+    // itself, so fourteen more ticks leave it still waiting.
+    for (0..14) |_| main.refreshPlaceFetchNoticeForTest(&f.model);
+    try testing.expect(main.placeFetchArmedForTest());
+    try testing.expectEqualStrings("Looking for that place", f.model.toast_text());
+
+    // One past it, and the reader is told. Without this the window closed with
+    // no word and the toast above simply timed out.
+    main.refreshPlaceFetchNoticeForTest(&f.model);
+    try testing.expect(!main.placeFetchArmedForTest());
+    try testing.expectEqualStrings("That place did not turn up.", f.model.toast_text());
+    try testing.expect(main.activePlace() == null);
+}
+
+test "a place that turns up retires the looking toast" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("lateplace");
+    defer f.down();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x40} ** 32);
+    f.paste(try nostr.nip19.encodeNaddr(arena, "late-room", kp.public_key, main.place_kind_for_test, &.{}));
+    try testing.expectEqualStrings("Looking for that place", f.model.toast_text());
+
+    // It lands a moment later, as a relay's answer does.
+    const tags = [_]nostr.event.Tag{&.{ "d", "late-room" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags,
+        \\{"appName":"Late Room","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev);
+    main.refreshPlaceFetchNoticeForTest(&f.model);
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqualStrings("", f.model.toast_text());
+}
+
+test "an address whose event is not a place says so instead of staying silent" {
+    // Kind 30078 is app-specific data, so a stranger's event under the same
+    // pubkey and `d` can hold anything. Parsing failed, the window closed, and
+    // that was the whole of the answer.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("notaplace");
+    defer f.down();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3d} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "d", "not-json" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags, "this is not a place", null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    f.paste(try nostr.nip19.encodeNaddr(arena, "not-json", kp.public_key, main.place_kind_for_test, &.{}));
+    try testing.expectEqualStrings("That address does not describe a place.", f.model.toast_text());
+    try testing.expect(!main.placeFetchArmedForTest());
+    try testing.expect(main.activePlace() == null);
+}
+
+test "an address for a place already held opens it without a looking toast" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("held");
+    defer f.down();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3e} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "d", "held-room" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags,
+        \\{"appName":"Held Room","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    f.paste(try nostr.nip19.encodeNaddr(arena, "held-room", kp.public_key, main.place_kind_for_test, &.{}));
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqualStrings("", f.model.toast_text());
+}
+
+test "an address for the room already open does not say it is looking" {
+    // The window only watches for a newer copy then, so "Looking for that
+    // place" over the room it names describes a search that is not happening.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("sameroom");
+    defer f.down();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x41} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "d", "same-room" }};
+    const ev = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags,
+        \\{"appName":"Same Room","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, ev);
+
+    const addr = try nostr.nip19.encodeNaddr(arena, "same-room", kp.public_key, main.place_kind_for_test, &.{});
+    f.paste(addr);
+    try testing.expect(main.activePlace() != null);
+    f.paste(addr);
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqualStrings("", f.model.toast_text());
+}
+
+test "a later copy of the open room that is not a place leaves the room alone" {
+    // The address was a place, and the reader is in it. A newer edition that
+    // does not parse is the host's mistake, not a wrong address, and the room
+    // on screen is still the place the address names.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("brokenedit");
+    defer f.down();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x42} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "d", "edited-room" }};
+    const good = try nostr.event.create(arena, signer, kp, 1000, 30078, &tags,
+        \\{"appName":"Edited Room","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    , null);
+    _ = try main.plazaIngestForTest(arena, good);
+    f.paste(try nostr.nip19.encodeNaddr(arena, "edited-room", kp.public_key, main.place_kind_for_test, &.{}));
+    try testing.expect(main.activePlace() != null);
+
+    const broken = try nostr.event.create(arena, signer, kp, 2000, 30078, &tags, "not a place any more", null);
+    _ = try main.plazaIngestForTest(arena, broken);
+    main.refreshPlaceFetchNoticeForTest(&f.model);
+    try testing.expect(main.activePlace() != null);
+    try testing.expectEqualStrings("", f.model.toast_text());
+}
+
 test "an address opened over Settings leaves Settings so the result is seen" {
     // Cmd+L works over Settings, and the destination is drawn UNDER it. Press
     // Open and the dialog closed, Settings stayed up, and nothing visible

@@ -33156,7 +33156,13 @@ pub fn armPlaceFetchForTest(pubkey: [32]u8, ident: []const u8) void {
 
 /// One tick of the store-side half of that fetch.
 pub fn refreshPlaceFetchForTest() void {
-    refreshPlaceFetch();
+    _ = placeFetchStep();
+}
+
+/// The same tick with the reader's side of it: the toast a fetch that ends
+/// without a place leaves.
+pub fn refreshPlaceFetchNoticeForTest(model: *Model) void {
+    refreshPlaceFetch(model);
 }
 
 /// The link has been followed and a copy shown, which is the state the fetch
@@ -33608,11 +33614,40 @@ fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, iden
     }
 }
 
+/// What one look for the place being waited on came to.
+const PlaceFetch = enum {
+    /// Nothing to say yet: still looking, or nothing is being waited on.
+    waiting,
+    /// A copy was found and the reader is in the room.
+    arrived,
+    /// The window ran out with nothing found.
+    missed,
+    /// Something was found under that address and it does not describe a place.
+    not_a_place,
+};
+
+const place_looking_toast = "Looking for that place";
+
+/// One tick of the place fetch, and what the reader is told when it ends
+/// without a place. Silence was the answer to both, so a pasted address that
+/// named nothing looked exactly like one that was still loading.
+fn refreshPlaceFetch(model: *Model) void {
+    switch (placeFetchStep()) {
+        .waiting => {},
+        // The room is on screen, so "looking" is out of date.
+        .arrived => if (std.mem.eql(u8, model.toast_text(), place_looking_toast)) {
+            model.toast_until = 0;
+        },
+        .missed => setToast(model, "That place did not turn up."),
+        .not_a_place => setToast(model, "That address does not describe a place."),
+    }
+}
+
 /// Looks for the place being waited on, once the store has grown. Called from
 /// the tick, which is where every other "did it arrive yet" check in this app
 /// lives.
-fn refreshPlaceFetch() void {
-    const want = g_place_want orelse return;
+fn placeFetchStep() PlaceFetch {
+    const want = g_place_want orelse return .waiting;
     // Shown once and the reader has since walked out. The window closes rather
     // than dragging them back into a room they left on the next tick.
     //
@@ -33625,24 +33660,27 @@ fn refreshPlaceFetch() void {
     // `adoptOpenRoom` was carrying.
     if (want.applied and !samePlace(want)) {
         g_place_want = null;
-        return;
+        return .waiting;
     }
-    const store = g_store orelse return;
+    const store = g_store orelse return .waiting;
     const gpa = std.heap.page_allocator;
 
     const authors = [_][32]u8{want.pubkey};
     const kinds = [_]u16{place_kind};
     const values = [_][]const u8{want.ident_buf[0..want.ident_len]};
     const tags = [_]nostr.filter.TagFilter{.{ .letter = 'd', .values = &values }};
-    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return;
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .tags = &tags, .limit = 1 }) catch return .waiting;
     defer result.deinit();
 
     if (result.events.len == 0) {
         // Give up eventually rather than spinning on a store read forever. A
         // place nobody can find is a fact worth showing, not a spinner.
         g_place_want.?.waited +|= 1;
-        if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
-        return;
+        if (g_place_want.?.waited > place_fetch_ticks) {
+            g_place_want = null;
+            return if (want.applied) .waiting else .missed;
+        }
+        return .waiting;
     }
     const ev = result.events[0];
     // Already showing this copy, or a newer one.
@@ -33664,13 +33702,16 @@ fn refreshPlaceFetch() void {
         if (g_place.?.applied_at >= ev.created_at) {
             g_place_want.?.waited +|= 1;
             if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
-            return;
+            return .waiting;
         }
     }
     var m = parsePlace(gpa, ev.content) orelse {
-        // It exists and is not a place. Stop asking.
+        // It exists and is not a place. Stop asking, and say so, unless a copy
+        // that WAS a place is already on screen: then this is a later edition
+        // that did not parse, the room stays as it is, and telling a reader
+        // standing in it that the address is not a place would be wrong.
         g_place_want = null;
-        return;
+        return if (want.applied) .waiting else .not_a_place;
     };
     m.author = want.pubkey;
     m.ident_len = want.ident_len;
@@ -33744,6 +33785,7 @@ fn refreshPlaceFetch() void {
     // still picked up, and the watching stops when the fetch would have.
     g_place_want.?.waited +|= 1;
     if (g_place_want.?.waited > place_fetch_ticks) g_place_want = null;
+    return .arrived;
 }
 
 /// How many ticks a place fetch may go unanswered. The tick is a second, and a
@@ -33989,7 +34031,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // so there is nothing to subscribe to.
                 var link_buf: [2048]u8 = undefined;
                 if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
-                refreshPlaceFetch();
+                refreshPlaceFetch(model);
                 // Beside it, and after it: a place arriving from a link moves
                 // the reader into a room, and that is a walk away from a note
                 // they asked for a moment earlier.
@@ -40486,6 +40528,15 @@ fn openAddress(model: *Model, fx: *Effects) void {
             want.ident_len = @intCast(copyBounded(&want.ident_buf, pl.identifier));
             g_place_want = want;
             askPlace(fx, hit.hints);
+            // A copy already in the store opens the room now. Otherwise say
+            // that the address was heard: the fetch ends with a toast of its
+            // own, and the seconds between are not silence.
+            // Not when the address is the room already on screen: there is
+            // nothing to look for, and the window only watches for a newer copy.
+            refreshPlaceFetch(model);
+            if (g_place_want) |w| {
+                if (!w.applied and !samePlace(w)) setToast(model, place_looking_toast);
+            }
         },
         .article => |art| {
             // Cannot fail: `parseAddress` only returns this for an address that
