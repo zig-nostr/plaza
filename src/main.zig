@@ -25177,11 +25177,13 @@ pub const PendingUndo = union(enum) {
     /// RESTARTS, not just for the session.
     relay_list: i64,
     repost: i64,
-    /// The typed text, owned here, so a refused reply is not destroyed.
-    reply: []const u8,
+    /// The typed text, owned here, so a refused reply is not destroyed, and the
+    /// thread it answers, so it goes back to that thread and no other.
+    reply: Reply,
     profile,
 
     const ListPress = struct { pubkey: [32]u8, added: bool, created_at: i64 };
+    pub const Reply = struct { text: []const u8, root: [32]u8 };
     const Unlike = struct { note_id: i64, reaction_id: [32]u8 };
 };
 
@@ -25196,7 +25198,7 @@ fn armUndo(u: PendingUndo) void {
 /// Drops the record without applying it: the signature came back.
 fn releaseUndo() void {
     switch (g_pending_undo) {
-        .reply => |text| std.heap.page_allocator.free(text),
+        .reply => |r| std.heap.page_allocator.free(r.text),
         else => {},
     }
     g_pending_undo = .none;
@@ -25312,11 +25314,18 @@ fn applyUndo(model: *Model) void {
             g_relay_list_dirty = true;
             setToast(model, "Your relays were not saved. Trying again.");
         },
-        .reply => |text| {
+        .reply => |r| {
             // Into the reply box it was taken from, and only if the reader has
-            // not started typing another one.
-            if (model.reply_empty()) model.reply_buffer.set(text);
-            std.heap.page_allocator.free(text);
+            // not started typing another one. The box belongs to whatever thread
+            // is open NOW, so when the reader has moved on the reply is kept for
+            // its own thread instead: put in the open box it would read as an
+            // answer to somebody else, one press from being sent there.
+            if (model.viewing_thread != 0 and std.mem.eql(u8, &model.thread_root.event_id, &r.root)) {
+                if (model.reply_empty()) model.reply_buffer.set(r.text);
+            } else {
+                keepReplyDraft(r.root, r.text, false);
+            }
+            std.heap.page_allocator.free(r.text);
             setToast(model, "Not signed. Your reply is back.");
         },
         .profile => {
@@ -34970,13 +34979,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.notifications_open = false;
             openEvent(model, id);
         },
-        .close_thread => {
-            // A held reply belongs to the thread being left. Leaving it armed
-            // would publish it into a conversation the reader had walked away
-            // from, seconds later.
-            g_reply_due_s = 0;
-            closeThread(model);
-        },
+        // A held reply belongs to the thread being left. Leaving it armed would
+        // publish it into a conversation the reader had walked away from,
+        // seconds later; `parkReplyDraft` stops it and keeps the text.
+        .close_thread => closeThread(model),
         .go_home => goHome(model),
         .reply_edit => |edit| _ = applyPlainEdit(compose_capacity, &model.reply_buffer, edit),
         .reply_submit => {
@@ -36614,7 +36620,7 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     // Its own copy, because `content` belongs to the write seam from here and a
     // reply is not `restorable`: the composer's restore path holds one draft and
     // hands it to the composer, which is the wrong box for this text.
-    const kept: PendingUndo = if (std.heap.page_allocator.dupe(u8, text)) |c| .{ .reply = c } else |_| .none;
+    const kept: PendingUndo = if (std.heap.page_allocator.dupe(u8, text)) |c| .{ .reply = .{ .text = c, .root = root.event_id } } else |_| .none;
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, content, false, kept, route);
     model.reply_buffer.clear();
 }
@@ -39986,41 +39992,67 @@ const reply_draft_slots = 8;
 const ReplyDraft = struct {
     used: bool = false,
     event_id: [32]u8 = @splat(0),
+    /// When it was kept, so the one dropped when the slots run out is the oldest.
+    kept: u64 = 0,
     len: usize = 0,
     text: [compose_capacity]u8 = undefined,
 };
 var g_reply_drafts: [reply_draft_slots]ReplyDraft = [_]ReplyDraft{.{}} ** reply_draft_slots;
-var g_reply_draft_next: usize = 0;
+var g_reply_draft_clock: u64 = 0;
 
 /// Keeps what is in the reply box under the thread it belongs to, then empties
 /// the box. The box only ever holds the open thread's reply, and every move to
 /// another level passes through here, so `thread_root` is whose it is. An empty
 /// box keeps nothing and leaves any other thread's draft alone.
+///
+/// A reply held under its Undo pause is the box's text too, so it stops here
+/// and is kept with the rest. Left armed it would fire into whatever thread is
+/// open when the pause ran out, with whatever draft that thread put back in the
+/// box, and nobody would have pressed Reply on it.
 fn parkReplyDraft(model: *Model) void {
     defer model.reply_buffer.clear();
+    const held = g_reply_due_s != 0;
+    g_reply_due_s = 0;
     const text = model.reply_buffer.text();
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+    keepReplyDraft(model.thread_root.event_id, text, true);
+    if (held) setToast(model, "Reply not sent. It is kept in its thread.");
+}
+
+/// Files `text` as the kept reply for the thread rooted at `event_id`. A thread
+/// that already has one keeps it unless `replace`, so a reply coming back from
+/// a refused signature never writes over one typed since.
+fn keepReplyDraft(event_id: [32]u8, text: []const u8, replace: bool) void {
     var slot: ?usize = null;
-    for (g_reply_drafts, 0..) |d, i| {
-        if (d.used and std.mem.eql(u8, &d.event_id, &model.thread_root.event_id)) slot = i;
+    for (&g_reply_drafts, 0..) |*d, i| {
+        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) slot = i;
     }
+    if (slot != null and !replace) return;
     if (slot == null) {
-        for (g_reply_drafts, 0..) |d, i| {
+        for (&g_reply_drafts, 0..) |*d, i| {
             if (!d.used) {
                 slot = i;
                 break;
             }
         }
     }
+    // Full: the one kept longest ago makes room. Not a rotating index, which
+    // would pick whichever slot it reached next, and that can be the draft kept
+    // a moment ago into a slot a return had just freed.
     const i = slot orelse blk: {
-        const evict = g_reply_draft_next % reply_draft_slots;
-        g_reply_draft_next += 1;
-        break :blk evict;
+        var oldest: usize = 0;
+        for (&g_reply_drafts, 0..) |*d, j| {
+            if (d.kept < g_reply_drafts[oldest].kept) oldest = j;
+        }
+        break :blk oldest;
     };
+    const n = @min(text.len, compose_capacity);
+    g_reply_draft_clock += 1;
     g_reply_drafts[i].used = true;
-    g_reply_drafts[i].event_id = model.thread_root.event_id;
-    g_reply_drafts[i].len = text.len;
-    @memcpy(g_reply_drafts[i].text[0..text.len], text);
+    g_reply_drafts[i].event_id = event_id;
+    g_reply_drafts[i].kept = g_reply_draft_clock;
+    g_reply_drafts[i].len = n;
+    @memcpy(g_reply_drafts[i].text[0..n], text[0..n]);
 }
 
 /// Puts back the reply the reader left in this thread, or leaves the box empty.
@@ -40034,13 +40066,24 @@ fn takeReplyDraft(model: *Model, event_id: [32]u8) void {
     }
 }
 
-/// Forgets every kept reply, for a session that is ending.
+/// Forgets every kept reply, for a session that is ending. The text is wiped as
+/// well as released: it is the leaving account's private thinking.
 fn forgetReplyDrafts() void {
-    for (&g_reply_drafts) |*d| d.used = false;
+    for (&g_reply_drafts) |*d| {
+        @memset(&d.text, 0);
+        d.used = false;
+        d.event_id = @splat(0);
+        d.kept = 0;
+        d.len = 0;
+    }
 }
 
-pub fn parkReplyDraftForTest(model: *Model) void {
-    parkReplyDraft(model);
+/// The thread a kept reply is filed under, for a test of where a reply went.
+pub fn keptReplyDraftForTest(event_id: [32]u8) ?[]const u8 {
+    for (&g_reply_drafts) |*d| {
+        if (d.used and std.mem.eql(u8, &d.event_id, &event_id)) return d.text[0..d.len];
+    }
+    return null;
 }
 
 /// Pushes whatever level is open, so Back returns to it. A no-op at the feed,

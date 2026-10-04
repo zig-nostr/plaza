@@ -1944,6 +1944,112 @@ test "a reply half written in a thread is still there when the reader comes back
     try testing.expect(model.reply_empty());
 }
 
+/// A thread root with nothing behind it but its id, for tests of the level
+/// bookkeeping that never read a reply.
+fn bareRoot(byte: u8) main.Note {
+    var note = main.Note{ .id = @as(i64, byte) + 1000, .created_at = 1_800_000_000 };
+    note.event_id = [_]u8{byte} ** 32;
+    return note;
+}
+
+test "a reply held under its pause stops when the reader leaves, and is kept" {
+    main.setIdentityForTest([_]u8{0x81} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+    const a = bareRoot(0xa1);
+    const b = bareRoot(0xb1);
+
+    // The second thread has a reply of its own kept from an earlier visit.
+    main.enterThreadForTest(&model, b);
+    model.reply_buffer.set("kept for b, not finished");
+    main.closeThreadForTest(&model);
+
+    // A reply pressed in the first thread is held, and the reader walks into the
+    // second before the pause runs out. Left armed, the pause would fire there,
+    // on the box the second thread just put its own unfinished reply back into.
+    main.enterThreadForTest(&model, a);
+    model.reply_buffer.set("held for a");
+    main.holdReplyForTest(1_800_000_000);
+    main.enterThreadForTest(&model, b);
+    try testing.expect(!main.replyHeldForTest());
+    try testing.expectEqualStrings("kept for b, not finished", model.reply_draft());
+    try testing.expectEqualStrings("Reply not sent. It is kept in its thread.", model.toast_text());
+
+    // And what was held is not lost: it is the first thread's kept reply.
+    main.closeThreadForTest(&model);
+    try testing.expectEqualStrings("held for a", model.reply_draft());
+}
+
+test "when the kept replies run out, the oldest one makes room" {
+    main.setIdentityForTest([_]u8{0x82} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+
+    // Eight threads, each left with a reply in it.
+    for (0..8) |i| {
+        const root = bareRoot(@intCast(0x10 + i));
+        main.enterThreadForTest(&model, root);
+        model.reply_buffer.set("a reply");
+        main.goHomeForTest(&model);
+    }
+    // The first is visited again and left with its reply, so it is now the
+    // NEWEST kept, in the slot its return freed.
+    main.enterThreadForTest(&model, bareRoot(0x10));
+    try testing.expectEqualStrings("a reply", model.reply_draft());
+    model.reply_buffer.set("a reply, rewritten");
+    main.goHomeForTest(&model);
+
+    // A ninth needs a slot. It takes the second thread's, the one kept longest
+    // ago, never the one kept a moment ago.
+    main.enterThreadForTest(&model, bareRoot(0x30));
+    model.reply_buffer.set("the ninth");
+    main.goHomeForTest(&model);
+    try testing.expect(main.keptReplyDraftForTest(bareRoot(0x11).event_id) == null);
+    try testing.expectEqualStrings("a reply, rewritten", main.keptReplyDraftForTest(bareRoot(0x10).event_id).?);
+    try testing.expectEqualStrings("the ninth", main.keptReplyDraftForTest(bareRoot(0x30).event_id).?);
+}
+
+test "a refused reply goes back to its own thread, never into the open one" {
+    main.setIdentityForTest([_]u8{0x83} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+    const a = bareRoot(0xa3);
+    const b = bareRoot(0xb3);
+
+    // The reply to the first thread went to the signer, and the reader is in the
+    // second when the refusal comes back. Their box is empty, and the answer to
+    // somebody else does not belong in it.
+    main.enterThreadForTest(&model, b);
+    const kept = try std.heap.page_allocator.dupe(u8, "an answer to a");
+    main.armUndoForTest(.{ .reply = .{ .text = kept, .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expect(model.reply_empty());
+    try testing.expectEqualStrings("an answer to a", main.keptReplyDraftForTest(a.event_id).?);
+
+    // It is there when the reader goes back to the first thread.
+    main.closeThreadForTest(&model);
+    main.enterThreadForTest(&model, a);
+    try testing.expectEqualStrings("an answer to a", model.reply_draft());
+
+    // And a refusal never writes over a reply typed since: the first thread's
+    // new reply is kept, and the late one is not filed on top of it.
+    model.reply_buffer.set("typed since");
+    main.closeThreadForTest(&model);
+    const late = try std.heap.page_allocator.dupe(u8, "the refused one");
+    main.armUndoForTest(.{ .reply = .{ .text = late, .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expectEqualStrings("typed since", main.keptReplyDraftForTest(a.event_id).?);
+}
+
 test "a fresh draft is empty and disables Post" {
     var model = main.initialModel();
     try testing.expect(model.draft_empty());
@@ -20200,11 +20306,15 @@ test "every other write nobody signed is put back too" {
         try testing.expect(!main.repostedByMeForTest(note_id));
     }
 
-    // A reply that was never signed gives the typed text back.
+    // A reply that was never signed gives the typed text back, into the thread
+    // it answers.
     {
         var model = main.initialModel();
+        model.thread_root = main.Note{ .id = 31, .created_at = 1_800_000_000 };
+        model.thread_root.event_id = [_]u8{0x31} ** 32;
+        model.viewing_thread = 31;
         const kept = try std.heap.page_allocator.dupe(u8, "the answer I actually typed");
-        main.armUndoForTest(.{ .reply = kept });
+        main.armUndoForTest(.{ .reply = .{ .text = kept, .root = model.thread_root.event_id } });
         main.applyUndoForTest(&model);
         try testing.expectEqualStrings("the answer I actually typed", model.reply_draft());
     }
