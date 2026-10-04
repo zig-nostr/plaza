@@ -1019,6 +1019,13 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
                 parked = true;
                 return parkFailedSign(pending, true);
             }
+            // And signed at all: an id that is the hash of what the event says,
+            // and a signature over it. The store refuses one that is not, and
+            // the undo released below would be gone with nothing sent.
+            if (!(nostr.event.verify(gpa, signer, parsed.value) catch false)) {
+                parked = true;
+                return parkFailedSign(pending, false);
+            }
             // A process-lifetime copy of the content: `parsed` is freed on
             // return, but the detached publisher reads it afterwards. Our
             // composer produces tagless kind:1 notes, so an empty tag set still

@@ -180,6 +180,58 @@ test "a bunker answer that cannot be published hands the press back and says why
     try testing.expectEqualStrings("That like was not signed.", model.toast_text());
 }
 
+test "a bunker answer under the reader's key that does not verify hands the press back" {
+    // Signed as the reader, so the key check passed, and the undo was released
+    // on that. The store then refused the event as invalid, and the like stayed
+    // filled and the note was gone, with nothing sent.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    const gpa = std.heap.page_allocator;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const client_kp = try signer.keyPairFromSecretKey([_]u8{0x26} ** 32);
+    const reader_secret = [_]u8{0x27} ** 32;
+    const reader_kp = try signer.keyPairFromSecretKey(reader_secret);
+    main.setIdentityForTest(reader_secret);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.setRemotePubkeyForTest(reader_kp.public_key);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    var fx: main.EffectsForTest = undefined;
+    var idbuf: [24]u8 = undefined;
+
+    // A like, answered with the reader's event and a broken signature.
+    const liked: i64 = 0x0b1e;
+    main.rememberLikeForTest(liked, [_]u8{0x28} ** 32);
+    main.signAndPublishWithUndoForTest(&fx, 1_800_000_001, 7, "+", .{ .like = liked });
+    const like_id = main.pendingSignIdForTest("+", &idbuf) orelse return error.NoPendingSign;
+    var forged = try nostr.event.create(gpa, signer, reader_kp, 1_800_000_001, 7, &.{}, "+", null);
+    forged.sig[0] ^= 0xff;
+    const forged_json = try nostr.event.toJson(gpa, forged);
+    defer gpa.free(forged_json);
+    try answerRemoteSign(signer, reader_kp, client_kp, like_id, forged_json);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(!main.isLikedForTest(liked));
+    try testing.expectEqualStrings("That like was not signed.", model.toast_text());
+
+    // A note, answered with an event whose id is not the hash of what it says.
+    model.draft_buffer.set("an id that does not match");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    const note_id = main.pendingSignIdForTest("an id that does not match", &idbuf) orelse return error.NoPendingSign;
+    var altered = try nostr.event.create(gpa, signer, reader_kp, 1_800_000_002, 1, &.{}, "an id that does not match", null);
+    altered.content = "something else";
+    const altered_json = try nostr.event.toJson(gpa, altered);
+    defer gpa.free(altered_json);
+    try answerRemoteSign(signer, reader_kp, client_kp, note_id, altered_json);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("an id that does not match", model.draft());
+}
+
 test "logout empties the NIP-46 pending table so a new session inherits nothing" {
     main.clearPendingForTest();
     defer main.clearPendingForTest();
