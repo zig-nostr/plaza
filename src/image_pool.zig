@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const inbox = @import("inbox.zig");
 const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
+const feed_media = @import("feed_media.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -156,7 +157,7 @@ pub fn imageIdOwners() [image_registry_slots + 1]IdOwner {
             owners[@intCast(p.image_id)] = .{ .avatar = p };
         }
     }
-    for (&main.g_media) |*m| {
+    for (&feed_media.g_media) |*m| {
         if (m.used and m.image_id >= 1 and m.image_id <= image_registry_slots) {
             owners[@intCast(m.image_id)] = .{ .media = m };
         }
