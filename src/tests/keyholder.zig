@@ -398,6 +398,69 @@ test "a note Notary signs goes to the place it was written in" {
     try testing.expect(main.lastPublishedRouteExclusiveForTest());
 }
 
+test "a refused note goes back under what was typed since, or to the clipboard" {
+    // A refused note went back only into an empty composer. A reader who had
+    // started the next note lost the refused one, with nothing said.
+    main.setIdentityForTest([_]u8{0x53} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+    var fx: main.EffectsForTest = undefined;
+
+    // Both fit: what was typed since stays first.
+    {
+        var model = main.initialModel();
+        main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "the refused note", true);
+        model.draft_buffer.set("typed since");
+        main.expireHelperSignForTest();
+        main.scanHelperSignForTest(&model);
+        try testing.expectEqualStrings("typed since\n\nthe refused note", model.draft());
+        try testing.expectEqualStrings("Not signed. It is back, under what you typed.", model.toast_text());
+    }
+
+    // They do not fit: the box is untouched, and the note is on the clipboard
+    // on the next tick, said only then.
+    {
+        var model = main.initialModel();
+        main.requestHelperSignForTest(&fx, 1_800_000_001, 1, "too long to join", true);
+        var long: [4090]u8 = undefined;
+        @memset(&long, 'y');
+        model.draft_buffer.set(&long);
+        main.expireHelperSignForTest();
+        main.scanHelperSignForTest(&model);
+        try testing.expectEqualSlices(u8, &long, model.draft());
+        try testing.expect(std.mem.indexOf(u8, model.toast_text(), "back") == null);
+        main.copyRefusedDraftForTest(&model, &fx);
+        try testing.expectEqualStrings("too long to join", main.lastClipboardForTest());
+        try testing.expectEqualStrings("Not signed. No room, so it is on the clipboard.", model.toast_text());
+    }
+}
+
+test "every note a bunker refuses in one sweep comes back, not only the first" {
+    // The sweep kept the first refused draft and freed the rest.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.setIdentityForTest([_]u8{0x54} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    model.draft_buffer.set("first note");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    model.draft_buffer.set("second note");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expect(main.failPendingByContentForTest("first note"));
+    try testing.expect(main.failPendingByContentForTest("second note"));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(std.mem.indexOf(u8, model.draft(), "first note") != null);
+    try testing.expect(std.mem.indexOf(u8, model.draft(), "second note") != null);
+}
+
 // ---- B3: guest-first launch ------------------------------------------------
 
 test "a guest feed shows the join strip; dismissing keeps the Guest chip" {

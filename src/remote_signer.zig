@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const giveDraftBack = main.giveDraftBack;
 const oneShotDeadline = main.oneShotDeadline;
 const withdrawLiveRelay = main.withdrawLiveRelay;
 const takeDownBunkerListener = main.takeDownBunkerListener;
@@ -109,7 +110,7 @@ pub var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 // is the right tool (std.Io.Mutex would drag a per-thread `io` through every
 // access, across threads that deliberately never share one).
 const remote_sign_timeout_s: i64 = 30;
-const max_pending_remote = 8;
+pub const max_pending_remote = 8;
 pub const no_half_id = [_]u8{0} ** 32;
 pub const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt, sign_auth, sign_upload_auth };
 const PendingRemote = struct {
@@ -1023,8 +1024,10 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     const now = nowSeconds();
     const gpa = std.heap.page_allocator;
     const generation = g_remote_generation.load(.acquire);
-    var restore: ?[]const u8 = null;
-    var restore_warn: WarnCarry = .{};
+    // Every refused note, given back after the lock is released.
+    var restores: [max_pending_remote][]const u8 = undefined;
+    var restore_warns: [max_pending_remote]WarnCarry = undefined;
+    var restores_len: usize = 0;
     var sign_failed = false;
     var signed_by_another_key = false;
     // Each failed sign's own record, put back after the lock is released.
@@ -1071,13 +1074,14 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         }
         switch (method) {
             .sign_event => {
-                // The composer holds one draft: keep the first restorable one,
-                // free the rest. A reaction's content is not restorable, so it
-                // is freed and its failure stays silent.
+                // Every restorable one is given back, not only the first. A
+                // reaction's content is not restorable, so it is freed and its
+                // failure stays silent.
                 if (content) |c| {
-                    if (slot_restorable and restore == null) {
-                        restore = c;
-                        restore_warn = slot_warn;
+                    if (slot_restorable) {
+                        restores[restores_len] = c;
+                        restore_warns[restores_len] = slot_warn;
+                        restores_len += 1;
                     } else gpa.free(c);
                 }
                 if (slot_restorable) sign_failed = true;
@@ -1179,10 +1183,11 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         invalidateFeed();
     }
 
-    if (restore) |c| {
-        if (model.draft_empty()) {
-            setPlain(compose_capacity, &model.draft_buffer, c);
-            restore_warn.restoreInto(model);
+    for (restores[0..restores_len], restore_warns[0..restores_len]) |c, w| {
+        switch (giveDraftBack(model, c, w)) {
+            .restored => {},
+            .below => setToast(model, "Not signed. It is back, under what you typed."),
+            .clipboard => {},
         }
         gpa.free(c);
     }
