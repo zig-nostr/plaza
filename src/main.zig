@@ -3366,72 +3366,6 @@ pub fn setPlain(comptime capacity: usize, buffer: *canvas.TextBuffer(capacity), 
     buffer.set(plainLineBreaks(text, &scratch).text);
 }
 
-/// Where a note the signer refused went.
-const DraftBack = enum {
-    /// Into an empty composer, as it was.
-    restored,
-    /// Under what the reader has typed since, after a blank line.
-    below,
-    /// Neither fit, so it waits to be copied to the clipboard on the next tick.
-    clipboard,
-};
-
-/// A refused note that did not fit the composer, waiting for the tick to copy
-/// it. Several can be refused in one sweep, so they queue up behind each other,
-/// and it holds as many as can be out at once, so none is ever dropped here.
-var g_refused_draft: [(compose_capacity + 2) * (max_pending_remote + 1)]u8 = undefined;
-
-var g_refused_draft_len: usize = 0;
-
-/// Gives a note the signer refused back to the reader, and never at the cost
-/// of what they have typed since.
-///
-/// It used to go back only into an empty composer and was freed otherwise, so a
-/// reader who had started the next note lost the one that was refused. Now what
-/// was typed since stays first and the refused note goes under it, after a
-/// blank line. When the two do not fit together the box is left exactly as it
-/// is and the refused note goes to the clipboard instead, and the toast says so
-/// only once it is there.
-pub fn giveDraftBack(model: *Model, text: []const u8, warn: WarnCarry) DraftBack {
-    if (model.draft_empty()) {
-        setPlain(compose_capacity, &model.draft_buffer, text);
-        warn.restoreInto(model);
-        return .restored;
-    }
-    const typed = model.draft();
-    if (typed.len + 2 + text.len <= compose_capacity) {
-        var joined: [compose_capacity]u8 = undefined;
-        @memcpy(joined[0..typed.len], typed);
-        @memcpy(joined[typed.len..][0..2], "\n\n");
-        @memcpy(joined[typed.len + 2 ..][0..text.len], text);
-        setPlain(compose_capacity, &model.draft_buffer, joined[0 .. typed.len + 2 + text.len]);
-        // The refused note was covered by a warning. Joined to a draft without
-        // one it would go out uncovered, so the warning comes with it; a warning
-        // the reader set themselves is theirs and stays.
-        if (!model.warn_on) warn.restoreInto(model);
-        return .below;
-    }
-    const sep: usize = if (g_refused_draft_len > 0) 2 else 0;
-    const n = @min(text.len, compose_capacity);
-    if (sep > 0) @memcpy(g_refused_draft[g_refused_draft_len..][0..2], "\n\n");
-    @memcpy(g_refused_draft[g_refused_draft_len + sep ..][0..n], text[0..n]);
-    g_refused_draft_len += sep + n;
-    return .clipboard;
-}
-
-/// The tick's half: copies a refused note that fit nowhere, and only then says
-/// where it is.
-fn copyRefusedDraft(model: *Model, fx: *Effects) void {
-    if (g_refused_draft_len == 0) return;
-    writeClipboardText(fx, refused_draft_clip_key, g_refused_draft[0..g_refused_draft_len]);
-    g_refused_draft_len = 0;
-    setToast(model, "Not signed. No room, so it is on the clipboard.");
-}
-
-pub fn copyRefusedDraftForTest(model: *Model, fx: *Effects) void {
-    copyRefusedDraft(model, fx);
-}
-
 /// Keeps the open level current, once a tick: what a backfill has since put in
 /// the store, the loading line, and the relative times.
 ///
@@ -6558,6 +6492,9 @@ pub const takeAnswered = remote_signer.takeAnswered;
 pub const takePending = remote_signer.takePending;
 
 // re-exports: drafts.zig
+pub const copyRefusedDraft = drafts.copyRefusedDraft;
+pub const copyRefusedDraftForTest = drafts.copyRefusedDraftForTest;
+pub const giveDraftBack = drafts.giveDraftBack;
 pub const refusedReplyClipForTest = drafts.refusedReplyClipForTest;
 pub const flushRefusedReplyClip = drafts.flushRefusedReplyClip;
 pub const putBackRefusedReply = drafts.putBackRefusedReply;
