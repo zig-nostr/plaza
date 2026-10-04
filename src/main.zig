@@ -6550,6 +6550,7 @@ pub const writeBlossomServers = media_servers.writeBlossomServers;
 pub const blossomStatusText = view_upload.blossomStatusText;
 pub const mediaServersCard = view_upload.mediaServersCard;
 pub const profilePictureField = view_upload.profilePictureField;
+pub const uploadButtonsForTest = view_upload.uploadButtonsForTest;
 pub const uploadStrip = view_upload.uploadStrip;
 
 // re-exports: compose.zig

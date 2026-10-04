@@ -453,3 +453,34 @@ test "the avatar and the banner take the address into their own fields, and only
     const reopened = try buildTree(a.allocator(), &model);
     try testing.expect(!findAnyTextContaining(reopened.root, "not published until you press Save"));
 }
+
+test "an upload's Cancel sits on the card's edge when it is the only button" {
+    // The row used to hold a zero-width spacer where Upload goes, and a row
+    // charges its gap for every child, so while a picture was on its way Cancel
+    // stood 8pt in from where it stands beside Upload.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = main.Model{};
+
+    const Build = struct {
+        fn alone(ui: *main.AppUi) main.AppUi.Node {
+            return main.uploadButtonsForTest(ui, false);
+        }
+        fn paired(ui: *main.AppUi) main.AppUi.Node {
+            return main.uploadButtonsForTest(ui, true);
+        }
+    };
+    const alone = try painted.Painted.renderPiece(arena, &model, Build.alone, 400, 100);
+    const paired = try painted.Painted.renderPiece(arena, &model, Build.paired, 400, 100);
+    const first_alone = firstButtonX(alone) orelse return error.NoButton;
+    const first_paired = firstButtonX(paired) orelse return error.NoButton;
+    try testing.expectApproxEqAbs(first_paired, first_alone, 0.01);
+}
+
+fn firstButtonX(p: painted.Painted) ?f32 {
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind == .button) return node.widget.frame.x;
+    }
+    return null;
+}

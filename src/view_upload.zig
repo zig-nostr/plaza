@@ -178,14 +178,20 @@ fn uploadBar(ui: *AppUi, percent: usize) AppUi.Node {
 }
 
 fn uploadButtons(ui: *AppUi, primary: ?Msg, primary_label: []const u8, cancel_label: []const u8) AppUi.Node {
-    return ui.row(.{ .gap = 8, .cross = .center }, .{
-        if (primary) |msg|
-            ui.button(.{ .size = .sm, .variant = .primary, .on_press = msg }, primary_label)
-        else
-            ui.spacer(0),
-        ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.upload_cancel }, cancel_label),
+    const cancel = ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.upload_cancel }, cancel_label);
+    // Two rows rather than a spacer standing in for the missing button: a row
+    // charges its gap for every child, so a zero-width spacer still pushed
+    // Cancel 8pt in from the card's edge while the upload was under way.
+    if (primary) |msg| return ui.row(.{ .gap = 8, .cross = .center }, .{
+        ui.button(.{ .size = .sm, .variant = .primary, .on_press = msg }, primary_label),
+        cancel,
         ui.spacer(1),
     });
+    return ui.row(.{ .gap = 0, .cross = .center }, .{ cancel, ui.spacer(1) });
+}
+
+pub fn uploadButtonsForTest(ui: *AppUi, with_primary: bool) AppUi.Node {
+    return uploadButtons(ui, if (with_primary) Msg.upload_go else null, "Upload", "Cancel");
 }
 
 /// The label row of a profile field that can take a picture: the name, and on
