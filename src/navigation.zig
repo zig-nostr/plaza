@@ -328,7 +328,7 @@ fn fetchOlderWorker(until: i64) void {
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have
         // let go of this pointer before the connection is freed.
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe("plaza-older", filters[0..flen]) catch continue;
         asked += 1;
@@ -895,7 +895,7 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have let
         // go of this pointer before the connection is freed.
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe("plaza-topic", &filters) catch continue;
         var seen: usize = 0;
@@ -1023,7 +1023,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have
         // let go of this pointer before the connection is freed.
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
 
         // Phase 1: the replies themselves (kind:1 e-tagging the root). Collect

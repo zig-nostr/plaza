@@ -5597,6 +5597,7 @@ pub const worthEvicting = routing.worthEvicting;
 pub const writeTagUrls = routing.writeTagUrls;
 
 // re-exports: relay_conn.zig
+pub const oneShotDeadline = relay_conn.oneShotDeadline;
 pub const withdrawBunkerListenerForTest = relay_conn.withdrawBunkerListenerForTest;
 pub const bunkerListenerForTest = relay_conn.bunkerListenerForTest;
 pub const offerBunkerListenerForTest = relay_conn.offerBunkerListenerForTest;

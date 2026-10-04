@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const oneShotDeadline = main.oneShotDeadline;
 const withdrawLiveRelay = main.withdrawLiveRelay;
 const takeDownBunkerListener = main.takeDownBunkerListener;
 const parkHalfAnswer = main.parkHalfAnswer;
@@ -803,8 +804,9 @@ fn sendNip46(gpa: std.mem.Allocator, req_json: []const u8, client_kp: nostr.keys
     const watched = watchOneShot(io, relay, one_shot_budget_ms);
     defer releaseOneShot(watched);
     try relay.publish(sealed.event);
-    // Read the relay's OK so the frame flushes before we close; best-effort.
-    var msg = (relay.receive() catch return) orelse return;
+    // Read the relay's OK so the frame flushes before we close; best-effort,
+    // and bounded on its own for when the keeper had no slot to watch it with.
+    var msg = (relay.receiveTimeout(oneShotDeadline(io)) catch return) orelse return;
     msg.deinit();
 }
 

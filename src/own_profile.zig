@@ -628,7 +628,7 @@ fn ownProfileWorker(pk: [32]u8) void {
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have
         // let go of this pointer before the connection is freed.
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe("plaza-me", &filters) catch continue;
         var seen: usize = 0;

@@ -231,7 +231,7 @@ pub fn profileRound(pubkey: [32]u8, until: ?i64) ProfileRound {
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have
         // let go of this pointer before the connection is freed.
         defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe(if (until != null) "plaza-person-older" else "plaza-person", filters) catch continue;
         round.asked += 1;

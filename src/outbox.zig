@@ -12,6 +12,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const oneShotDeadline = main.oneShotDeadline;
 const activePlace = main.activePlace;
 const activePubkey = main.activePubkey;
 const copyBounded = main.copyBounded;
@@ -772,8 +773,9 @@ fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event
         defer releaseOneShot(watched);
         relay.publish(ev) catch continue;
         // One read, to give the frame somewhere to flush to. The verdict is not
-        // recorded, so there is nothing to wait around for.
-        var msg = (relay.receive() catch continue) orelse continue;
+        // recorded, so there is nothing to wait around for. Bounded on its own,
+        // for when the keeper had no slot to watch it with.
+        var msg = (relay.receiveTimeout(oneShotDeadline(io)) catch continue) orelse continue;
         msg.deinit();
     }
 }
@@ -882,9 +884,12 @@ pub fn publishEvent(gpa: std.mem.Allocator, ev: nostr.event.Event, route: PlaceR
         // is the whole content of the outbox. A relay may say other things
         // first (a NOTICE, an EVENT for an open subscription), so this reads
         // until it sees a verdict for THIS id or runs out of patience.
+        // One deadline for the whole exchange, so the reads end on time even
+        // when the keeper had no slot to watch this socket with.
+        const until = oneShotDeadline(io);
         var seen: usize = 0;
         while (seen < max_publish_messages) : (seen += 1) {
-            var msg = (relay.receive() catch break) orelse break;
+            var msg = (relay.receiveTimeout(until) catch break) orelse break;
             defer msg.deinit();
             switch (msg.value) {
                 .ok => |ok| {

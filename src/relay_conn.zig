@@ -229,6 +229,15 @@ pub const one_shot_slots = 16;
 /// Eight seconds sits among what the reference clients allow one request:
 /// welshman 3s, Amethyst 8s, NDK and Jumble 10s.
 pub const one_shot_budget_ms: i64 = 8_000;
+
+/// The same budget, as a deadline from now that `receiveTimeout` honours on its
+/// own. For a socket that has to be read even when the keeper's table is full
+/// (a publish, whose relay is not skipped just because nobody is watching), so
+/// its reads end on time without the keeper.
+pub fn oneShotDeadline(io: std.Io) std.Io.Timeout {
+    const budget: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(one_shot_budget_ms), .clock = .awake } };
+    return if (budget.toTimestamp(io)) |at| .{ .deadline = at } else budget;
+}
 /// Written into a cut slot's deadline so the keeper does not cut the same
 /// socket again on every tick until its owner notices. The owner clears it.
 pub const one_shot_already_cut: i64 = std.math.maxInt(i64);

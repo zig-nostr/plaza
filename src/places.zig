@@ -1401,7 +1401,7 @@ fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, iden
 
     var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch return;
     defer relay.deinit();
-    const watched = watchOneShot(io, relay, one_shot_budget_ms);
+    const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse return;
     defer releaseOneShot(watched);
 
     const authors = [_][32]u8{pubkey};

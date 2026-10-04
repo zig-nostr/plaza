@@ -1233,7 +1233,7 @@ fn sweepRelayListsWorker() void {
         // The clock starts once the socket is up, which is what NDK gets wrong:
         // its budget races its own TCP handshake on a cold start and everything
         // that misses is written off as "this person has no relay list".
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
 
         var start: usize = 0;
