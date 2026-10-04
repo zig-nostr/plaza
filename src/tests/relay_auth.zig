@@ -10,6 +10,7 @@ const long_form = @import("../article.zig");
 const theme = @import("../theme.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const AppUi = main.AppUi;
@@ -1022,4 +1023,29 @@ test "a re-issued feed that a relay refuses for want of AUTH is asked again once
     try testing.expect(ok.resend.feed);
     try testing.expect(!ok.resend.inbox);
     try testing.expect(!ok.resend.engagement);
+}
+
+test "the AUTH notice's verbs are targets with room for their focus ring" {
+    // Converted to pressable rows, Allow and Don't allow hugged their words: 18pt
+    // tall, with the focus ring drawn 2pt off the letters.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const idx = try authFixture();
+    defer authCleanup();
+    var sess = main.AuthSessionForTest{ .index = idx };
+    challengeAndRefuse(&sess, auth_test_url, "chal-ring", 1);
+    try testing.expectEqual(@as(?usize, idx), main.authAsking());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const p = try painted.Painted.render(arena, &model);
+    const allow = p.frameOf("Let auth.example.com know who you are") orelse return error.NoAllow;
+    const deny = p.frameOf("Do not identify yourself to auth.example.com") orelse return error.NoDeny;
+    for ([_]geometry.RectF{ allow, deny }) |f| {
+        try testing.expect(f.height >= main.body_line_height + 2 * main.auth_verb_inset - 0.5);
+    }
+    // Side by side on one line, not touching.
+    try testing.expectApproxEqAbs(allow.y, deny.y, 0.5);
+    try testing.expect(deny.x >= allow.x + allow.width);
 }

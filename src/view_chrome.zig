@@ -625,6 +625,12 @@ pub fn updateBanner(ui: *AppUi) AppUi.Node {
     });
 }
 
+/// How far each of the AUTH notice's two verbs reaches past its word. The verbs
+/// are the whole decision, and drawn hugging their text they were 18pt tall with
+/// a focus ring sitting on the letters. The space comes out of the gaps around
+/// them, so every word stays where it was and the panel keeps its height.
+pub const auth_verb_inset: f32 = 4;
+
 /// The line asking whether a relay may know who the reader is.
 ///
 /// Shown only for a relay that has refused something for want of AUTH, once per
@@ -656,7 +662,9 @@ pub fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                 ui.row(.{ .cross = .center, .gap = 0 }, .{
                     hgap(ui, 11),
                     ui.column(.{ .gap = 0 }, .{
-                        vgap(ui, 8),
+                        // 4 here and 4 inside each verb make the 8 the panel
+                        // always had above and below its line.
+                        vgap(ui, 8 - auth_verb_inset),
                         ui.row(.{ .cross = .center, .gap = 0 }, .{
                             ui.paragraph(
                                 .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body } },
@@ -670,10 +678,11 @@ pub fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                                     .scale = meta_scale,
                                 }},
                             ),
-                            hgap(ui, 8),
+                            hgap(ui, 8 - auth_verb_inset),
                             pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
+                                .padding = auth_verb_inset,
                                 .on_press = Msg{ .auth_allow = @intCast(index) },
                                 .style = .{ .quiet_hover = true },
                                 .semantics = .{ .role = .button, .label = ui.fmt("Let {s} know who you are", .{name}), .focusable = true },
@@ -683,10 +692,11 @@ pub fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                                     &.{.{ .text = "Allow", .weight = .medium, .underline = true, .scale = meta_scale }},
                                 ),
                             }),
-                            hgap(ui, 12),
+                            hgap(ui, 12 - 2 * auth_verb_inset),
                             pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
+                                .padding = auth_verb_inset,
                                 .on_press = Msg{ .auth_deny = @intCast(index) },
                                 .style = .{ .quiet_hover = true },
                                 .semantics = .{ .role = .button, .label = ui.fmt("Do not identify yourself to {s}", .{name}), .focusable = true },
@@ -697,9 +707,9 @@ pub fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                                 ),
                             }),
                         }),
-                        vgap(ui, 8),
+                        vgap(ui, 8 - auth_verb_inset),
                     }),
-                    hgap(ui, 11),
+                    hgap(ui, 11 - auth_verb_inset),
                 }),
             }),
             hgap(ui, chrome_inset),
