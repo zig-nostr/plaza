@@ -150,6 +150,10 @@ pub var g_upload: ?*UploadJob = null;
 /// picture is not published yet.
 pub var g_profile_upload_unsaved: bool = false;
 
+pub fn setProfileUploadUnsavedForTest(on: bool) void {
+    g_profile_upload_unsaved = on;
+}
+
 /// Stands in for the file dialog: tests, and the harness that drives the real
 /// app without a person to click through a native panel. Null in a build nobody
 /// has set it in, which is every shipped one.

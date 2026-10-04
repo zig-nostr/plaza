@@ -3812,10 +3812,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_banner_edit => |edit| model.profile_banner_buffer.apply(edit),
         .profile_lud16_edit => |edit| model.profile_lud16_buffer.apply(edit),
         .profile_nip05_edit => |edit| model.profile_nip05_buffer.apply(edit),
-        .profile_save => {
-            uploads.g_profile_upload_unsaved = false;
-            saveProfile(model, fx);
-        },
+        .profile_save => saveProfile(model, fx),
         .retry_own_lists => {
             retryOwnListsRead();
             setToast(model, "Asking your relays again.");
@@ -6502,6 +6499,7 @@ pub const trimmedField = own_profile.trimmedField;
 pub const unlockOwnProfile = own_profile.unlockOwnProfile;
 
 // re-exports: uploads.zig
+pub const setProfileUploadUnsavedForTest = uploads.setProfileUploadUnsavedForTest;
 pub const ageUploadTokenForTest = uploads.ageUploadTokenForTest;
 pub const appendPictureToDraftForTest = uploads.appendPictureToDraftForTest;
 pub const driveUploadForTest = uploads.driveUploadForTest;

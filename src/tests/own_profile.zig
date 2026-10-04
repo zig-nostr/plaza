@@ -425,6 +425,47 @@ test "a first profile is published only after a second, informed press" {
     try testing.expect(std.mem.indexOf(u8, other.profile_status(), "not every relay that may keep one answered") != null);
 }
 
+test "the unsaved picture notice stays until Save really sends" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("unsavedpic");
+    defer fs.close();
+    _ = signInNothingFound(0x7a);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    defer main.setProfileUploadUnsavedForTest(false);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    model.profile_picture_buffer.set("https://media.example/new.png");
+    var fx: main.EffectsForTest = undefined;
+    main.setProfileUploadUnsavedForTest(true);
+    const notice = "not published until you press Save";
+
+    // Still reading: Save does nothing, and the notice stays.
+    model.profile_stage = .fetching;
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(findAnyTextContaining((try buildTree(arena, &model)).root, notice));
+
+    // The first press on a first profile only asks. Nothing went out.
+    model.profile_stage = .absent;
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+    try testing.expect(main.ownRecordContentForTest(testing.allocator, 0) == null);
+    try testing.expect(findAnyTextContaining((try buildTree(arena, &model)).root, notice));
+
+    // The answer sends it, and only then does the notice go.
+    main.update(&model, .profile_save, &fx);
+    const content = main.ownRecordContentForTest(testing.allocator, 0) orelse return error.NothingWritten;
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "new.png") != null);
+    try testing.expect(!findAnyTextContaining((try buildTree(arena, &model)).root, notice));
+}
+
 test "a profile that lands between the two presses is shown, not merged over" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

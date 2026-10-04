@@ -391,6 +391,9 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
     // "Saved here and sent to your relays" is otherwise the last word on an
     // edit that reached nobody.
     signAndPublish(fx, gpa, created, 0, tags, merged, false, .profile, null);
+    // Only here, where the edit has actually gone to be signed. Every return
+    // above leaves the sheet as it was, and the picture in it is still not out.
+    uploads.g_profile_upload_unsaved = false;
     // NOT "published": nothing here can know that yet. `signAndPublish` returns
     // no verdict, the remote and helper paths have not even signed, and a kind:0
     // that reaches no relay is not retried. What IS true is that the edit is
