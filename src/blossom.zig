@@ -588,15 +588,19 @@ fn stripWebp(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
 }
 
 /// Comment extensions and every application extension but the two that make a
-/// GIF loop (`NETSCAPE2.0`, `ANIMEXTS1.0`) are dropped; everything else, the
-/// pictures, their palettes, timing and transparency, is kept byte for byte, and
-/// whatever follows the trailer is not sent. An application extension is where
-/// an editor writes XMP (`XMP DataXMP`), which can carry a location.
+/// GIF loop (`NETSCAPE2.0`, `ANIMEXTS1.0`) and its colour profile
+/// (`ICCRGBG1012`) are dropped; everything else, the pictures, their palettes,
+/// timing and transparency, is kept byte for byte, and whatever follows the
+/// trailer is not sent. An application extension is where an editor writes XMP
+/// (`XMP DataXMP`), which can carry a location.
 ///
-/// Walked by the GIF89a block structure. A file that runs out before its
-/// trailer, or holds a block that is none of the three the format has, is
-/// refused rather than half stripped: what follows the point it stopped making
-/// sense is unknown, and sending it is the thing this is here to prevent.
+/// Walked by the GIF89a block structure. Where a block should start, the end of
+/// the data or a byte that starts no block is taken as the end of the picture,
+/// the way decoders read it: what was accepted is kept and a trailer is written
+/// after it, and nothing past that point is sent. Plenty of encoders leave the
+/// trailer off, or a stray byte before it. A block cut off partway is refused
+/// rather than half stripped, since how much of it was meant to be there is
+/// unknown.
 fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
     if (b.len < 13) return null;
     if (!std.mem.eql(u8, b[0..6], "GIF87a") and !std.mem.eql(u8, b[0..6], "GIF89a")) return null;
@@ -607,13 +611,14 @@ fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
     var keep: Ranges = .{};
     defer keep.list.deinit(gpa);
     try keep.add(gpa, 0, pos);
-    while (true) {
-        if (pos >= b.len) return null;
+    var trailer = false;
+    while (pos < b.len) {
         const start = pos;
         switch (b[pos]) {
             // Trailer: the end of the file as far as any decoder reads it.
             0x3b => {
                 try keep.add(gpa, start, pos + 1);
+                trailer = true;
                 break;
             },
             // Image descriptor: nine bytes, a local colour table if it has
@@ -635,15 +640,23 @@ fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
                 pos = gifSubBlocksEnd(b, body) orelse return null;
                 const drop = switch (label) {
                     0xfe => true,
-                    0xff => !gifLoopExtension(b[body..pos]),
+                    0xff => !gifKeptApplication(b[body..pos]),
                     else => false,
                 };
                 if (!drop) try keep.add(gpa, start, pos);
             },
-            else => return null,
+            // A byte that starts no block: the end of the picture.
+            else => break,
         }
     }
-    return .{ .bytes = try assemble(gpa, b, keep.list.items), .orientation = 0 };
+    const bytes = try assemble(gpa, b, keep.list.items);
+    if (trailer) return .{ .bytes = bytes, .orientation = 0 };
+    const ended = gpa.realloc(bytes, bytes.len + 1) catch |err| {
+        gpa.free(bytes);
+        return err;
+    };
+    ended[ended.len - 1] = 0x3b;
+    return .{ .bytes = ended, .orientation = 0 };
 }
 
 /// Where a run of GIF sub-blocks starting at `pos` ends, past its zero
@@ -659,12 +672,14 @@ fn gifSubBlocksEnd(b: []const u8, start: usize) ?usize {
     }
 }
 
-/// Whether an application extension's sub-blocks are one of the two that set
-/// how many times an animation plays.
-fn gifLoopExtension(blocks: []const u8) bool {
+/// Whether an application extension's sub-blocks are one that is kept: the two
+/// that set how many times an animation plays, and the ICC colour profile,
+/// without which the colours are read in the wrong space.
+fn gifKeptApplication(blocks: []const u8) bool {
     if (blocks.len < 12 or blocks[0] != 11) return false;
     const id = blocks[1..12];
-    return std.mem.eql(u8, id, "NETSCAPE2.0") or std.mem.eql(u8, id, "ANIMEXTS1.0");
+    return std.mem.eql(u8, id, "NETSCAPE2.0") or std.mem.eql(u8, id, "ANIMEXTS1.0") or
+        std.mem.eql(u8, id, "ICCRGBG1012");
 }
 
 /// The EXIF orientation a JPEG carries, read without copying anything.
@@ -1594,18 +1609,58 @@ test "an animated gif keeps the block that makes it loop" {
     try std.testing.expect(!untouched.stripped);
 }
 
-test "a gif that ends early or holds a block it cannot have is refused, not half stripped" {
+test "a gif cut off inside a block is refused, not half stripped" {
     const gpa = std.testing.allocator;
     const whole = try testGif(gpa, gif_xmp);
     defer gpa.free(whole);
-    // Cut before its trailer, and cut inside the xmp block.
-    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, whole[0 .. whole.len - 1])));
+    // Cut inside the xmp block, inside the picture's data, and just after an
+    // extension's introducer.
     try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, whole[0..30])));
-    // A byte where a block should start that starts none.
-    var odd = try gpa.dupe(u8, whole);
-    defer gpa.free(odd);
-    odd[19] = 0x99;
-    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, odd)));
+    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, whole[0 .. whole.len - 3])));
+    const introducer = try std.mem.concat(gpa, u8, &.{ whole[0 .. whole.len - 1], "\x21" });
+    try std.testing.expectError(error.Damaged, prepare(gpa, introducer));
+}
+
+test "a gif with no trailer, or a stray byte before it, ends where its blocks end" {
+    const gpa = std.testing.allocator;
+    const clean = try testGif(gpa, "");
+    defer gpa.free(clean);
+    const with_xmp = try testGif(gpa, gif_xmp);
+    defer gpa.free(with_xmp);
+    const body = clean[0 .. clean.len - 1];
+    const cases = [_][]const u8{
+        // No trailer at all, which plenty of encoders leave off.
+        body,
+        with_xmp[0 .. with_xmp.len - 1],
+        // A stray zero between the picture and the trailer, and whatever
+        // follows it, which is not sent. Any byte that starts no block reads
+        // the same way.
+        "\x00",
+        "\x00\x3b",
+        "\x00where I am\x3b",
+        "\x99",
+    };
+    for (cases, 0..) |case, i| {
+        const file = if (i < 2) try gpa.dupe(u8, case) else try std.mem.concat(gpa, u8, &.{ body, case });
+        var prepared = try prepare(gpa, file);
+        defer prepared.deinit(gpa);
+        // The picture, closed with a trailer, and nothing else.
+        try std.testing.expectEqualSlices(u8, clean, prepared.bytes);
+        try std.testing.expect(prepared.stripped);
+        try std.testing.expectEqual(@as(u32, 1), prepared.width);
+        try std.testing.expect(prepared.blurhash_len > 0);
+    }
+}
+
+test "a gif keeps its colour profile" {
+    const gpa = std.testing.allocator;
+    const gif_icc = "\x21\xff\x0bICCRGBG1012\x04icc!\x00";
+    const kept = try testGif(gpa, gif_icc);
+    defer gpa.free(kept);
+    var prepared = try prepare(gpa, try testGif(gpa, gif_icc ++ gif_xmp));
+    defer prepared.deinit(gpa);
+    try std.testing.expect(prepared.stripped);
+    try std.testing.expectEqualSlices(u8, kept, prepared.bytes);
 }
 
 test "what is not a picture is refused by its bytes, and a damaged one is not sent" {
