@@ -84,6 +84,7 @@ Two scripts are not part of CI:
 
 ## Related
 
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the one-process shape, how data flows from relays to the store to the view and back out, the signer, the threads and locks, and how it is tested.
 - [`nostr`](https://github.com/zig-nostr/nostr): the protocol library. It has an agent skill: `npx skills add zig-nostr/nostr`.
 - [Notary](https://github.com/zig-nostr/notary): the signer Plaza bundles. A signer fix reaches Plaza users only when `.github/notary-ref` moves and Plaza releases.
 - [deed](https://github.com/zig-nostr/deed): a nostr command line, handy for checking what Plaza wrote to a relay.

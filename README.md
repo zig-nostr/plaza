@@ -281,6 +281,8 @@ scripts/frame-budget.sh
 
 ## Develop
 
+How the app is put together, and where to start reading, is in [ARCHITECTURE.md](ARCHITECTURE.md). Contributor conventions and the file layout are in [AGENTS.md](AGENTS.md).
+
 ```sh
 native dev     # build and run with hot reload
 native test    # run the test suite
