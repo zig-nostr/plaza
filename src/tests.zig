@@ -1738,6 +1738,143 @@ test "opening a thread shows it, and a guest reply routes to the join" {
     try testing.expectEqual(@as(i64, 0), model.viewing_thread);
 }
 
+/// The words on the Back control of whichever level is open, or null if there is
+/// none on screen.
+fn backText(root: canvas.Widget) ?[]const u8 {
+    const back = findByLabel(root, "Back") orelse return null;
+    var last: ?[]const u8 = null;
+    for (back.children) |child| {
+        if (child.text.len > 0) last = child.text;
+    }
+    return last;
+}
+
+test "Back names where it actually goes, from every place a level opens" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.setIdentityForTest([_]u8{0x7d} ** 32);
+    defer {
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x7e} ** 32);
+    const ev = try signedNote(arena, signer, kp, 1_800_000_000, "a note someone replied to");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/back.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    _ = try store.ingest(arena, ev, .{});
+    main.setStoreForTest(&store);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(ev, 1_800_000_100);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+    var fx: main.EffectsForTest = undefined;
+    const feed = model.scope_name();
+
+    // From the feed, Back goes to the feed.
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    try testing.expectEqualStrings(feed, backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+
+    // From a row in Notifications, a thread's Back goes to Notifications. It
+    // used to name the feed and then land on the sheet.
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_event = ev.id }, &fx);
+    try testing.expectEqual(id, model.viewing_thread);
+    try testing.expectEqualStrings("Notifications", backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(model.notifications_open);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+
+    // And so does a person's page opened from there.
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_person = ev.pubkey }, &fx);
+    try testing.expect(model.viewing_profile != null);
+    try testing.expectEqualStrings("Notifications", backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(model.notifications_open);
+
+    // Once the reader goes deeper, Back names the level it returns to, not the
+    // sheet. A thread opened from the feed, then its author's page: Back from
+    // the page lands on the thread.
+    main.update(&model, .close_notifications, &fx);
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    main.update(&model, Msg{ .open_person = ev.pubkey }, &fx);
+    try testing.expectEqualStrings(model.thread_stack[0].note.author(), backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expectEqualStrings(feed, backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+
+    // A topic names itself the way its own header does, and the bookmark list
+    // by its title.
+    var topic_level = main.Screen{ .topic_len = 3 };
+    @memcpy(topic_level.topic_buf[0..3], "zig");
+    try testing.expectEqualStrings("#zig", topic_level.backLabel(arena));
+    try testing.expectEqualStrings("Bookmarks", (main.Screen{ .bookmarks = true }).backLabel(arena));
+
+    // A visit to Notifications that never got back to the sheet (the reader went
+    // Home instead) must not turn the next ordinary thread into a way back to it.
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_person = ev.pubkey }, &fx);
+    main.goHomeForTest(&model);
+    main.update(&model, Msg{ .open_thread = id }, &fx);
+    try testing.expectEqualStrings(feed, backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(!model.notifications_open);
+}
+
+test "an article opened from Notifications names Notifications on its Back" {
+    // The article reader draws its own header, and it worked its Back label out
+    // by itself: the level underneath, else the feed's name. Opened from a row in
+    // Notifications, Back returns to the sheet, so the label has to come from the
+    // one place that knows that.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6b} ** 32);
+    main.setIdentityForTest([_]u8{0x6c} ** 32);
+    defer main.clearIdentityForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "article-back");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "from-the-sheet" },
+        &[_][]const u8{ "title", "An article somebody mentioned me in" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, "Some words.");
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_event = ev.id }, &fx);
+    try testing.expectEqual(@as(u16, 30023), model.thread_root.kind);
+    try testing.expectEqualStrings("Notifications", backText((try buildTree(arena, &model)).root) orelse return error.NoBack);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(model.notifications_open);
+}
+
 test "a fresh draft is empty and disables Post" {
     var model = main.initialModel();
     try testing.expect(model.draft_empty());

@@ -22139,17 +22139,22 @@ fn backControl(ui: *AppUi, label: []const u8, press: Msg) AppUi.Node {
     });
 }
 
+/// What Back says it goes to, read from the same state `closeThread` acts on so
+/// the two cannot disagree: the level stacked underneath, else Notifications when
+/// that is the way back, else the feed.
+fn backLabel(model: *const Model, arena: std.mem.Allocator) []const u8 {
+    if (model.thread_stack_len > 0) return model.thread_stack[model.thread_stack_len - 1].backLabel(arena);
+    if (model.notifications_return) return "Notifications";
+    return model.scope_name();
+}
+
 /// The thread header: a Back affordance (to the parent thread, or the feed), the
 /// "Thread" label, and the reply count (known from the crowd count up front, so
 /// it reads right before the replies are fetched).
 fn threadHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    // Back names WHERE it goes, never a bare "Thread" beside the "Thread" title:
-    // the feed ("Following") at the root, else the parent post's author.
-    const back_label = if (model.thread_stack_len > 0)
-        model.thread_stack[model.thread_stack_len - 1].backLabel()
-    else
-        model.scope_name();
+    // Back names WHERE it goes, never a bare "Thread" beside the "Thread" title.
+    const back_label = backLabel(model, ui.arena);
     const count = model.threadReplyCount();
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
@@ -22311,10 +22316,8 @@ fn articleFootHeight(av: ?*const ArticleView) f32 {
 
 fn articleHeader(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
-    const back_label = if (model.thread_stack_len > 0)
-        model.thread_stack[model.thread_stack_len - 1].backLabel()
-    else
-        model.scope_name();
+    // The same answer the thread header gives, from the state Back acts on.
+    const back_label = backLabel(model, ui.arena);
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
             backControl(ui, back_label, .close_thread),
@@ -22768,9 +22771,9 @@ pub const Screen = struct {
 
     /// What Back says it goes to: a person's name, or the author of the note
     /// underneath. Back names WHERE it lands, never what it leaves.
-    pub fn backLabel(self: *const Screen) []const u8 {
+    pub fn backLabel(self: *const Screen, arena: std.mem.Allocator) []const u8 {
         if (self.bookmarks) return "Bookmarks";
-        if (self.topic()) |t| return t;
+        if (self.topic()) |t| return std.fmt.allocPrint(arena, "#{s}", .{t}) catch t;
         if (self.profile) |pk| {
             if (lookupProfile(pk)) |prof| {
                 if (prof.name_len > 0) return prof.name();
@@ -26727,10 +26730,7 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
 /// because only a person's page had this band.
 fn levelBand(ui: *AppUi, model: *const Model, title: []const u8) AppUi.Node {
     const p = theme.palette;
-    const back_label = if (model.thread_stack_len > 0)
-        model.thread_stack[model.thread_stack_len - 1].backLabel()
-    else
-        model.scope_name();
+    const back_label = backLabel(model, ui.arena);
     return ui.column(.{}, .{
         ui.row(.{ .cross = .center, .gap = 10, .padding = 12 }, .{
             backControl(ui, back_label, Msg.close_thread),
@@ -39892,6 +39892,9 @@ const max_publish_messages = 8;
 /// a thread is already open, the current root is pushed so Back returns to it.
 fn openThread(model: *Model, note_id: i64) void {
     const target = model.noteById(note_id) orelse return;
+    // A note pressed on the feed itself has no sheet to go back to, whatever an
+    // earlier visit to Notifications left behind.
+    if (!model.levelOpen()) model.notifications_return = false;
     enterThread(model, target.*);
 }
 
@@ -41196,6 +41199,7 @@ pub fn forgetEventFetchForTest() void {
 /// gets dropped.
 fn goHome(model: *Model) void {
     model.thread_stack_len = 0;
+    model.notifications_return = false;
     model.viewing_profile = null;
     model.viewing_thread = 0;
     // Every kind of level, not the two that were written first. A topic and the
@@ -44087,6 +44091,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     model.name_buffer.clear();
     model.viewing_thread = 0;
     model.thread_stack_len = 0;
+    model.notifications_return = false;
     model.viewing_profile = null;
     model.topic_len = 0;
     model.viewing_bookmarks = false;
