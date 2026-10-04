@@ -714,6 +714,55 @@ test "a note that arrives after you have walked away does not drag you back" {
     try testing.expectEqual(@as(i64, 0), model.viewing_thread);
     try testing.expect(model.viewing_profile != null);
 }
+
+test "a note asked for from Notifications does not pull the reader off a hashtag page or Bookmarks" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x3f} ** 32);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/walkedlevel.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetQuotesForTest();
+    main.forgetEventFetchForTest();
+    defer main.forgetEventFetchForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // A notification row for a note nobody has fetched, and then a hashtag.
+    const first = try signedNote(arena, signer, kp, 1_800_000_000, "asked for from the sheet");
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_event = first.id }, &fx);
+    try testing.expect(main.eventFetchArmedForTest());
+    main.update(&model, Msg{ .open_url = "t\x00zig" }, &fx);
+    main.refreshEventFetchForTest(&model);
+    try testing.expect(!main.eventFetchArmedForTest());
+    _ = try main.plazaIngestVerifiedForTest(arena, first, signer);
+    main.refreshEventFetchForTest(&model);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expectEqualStrings("zig", model.viewingTopic() orelse return error.TopicLost);
+    main.goHomeForTest(&model);
+
+    // The same with the bookmark list.
+    const second = try signedNote(arena, signer, kp, 1_800_000_001, "asked for, then Bookmarks");
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_event = second.id }, &fx);
+    main.update(&model, .open_bookmarks, &fx);
+    main.refreshEventFetchForTest(&model);
+    _ = try main.plazaIngestVerifiedForTest(arena, second, signer);
+    main.refreshEventFetchForTest(&model);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+    try testing.expect(model.viewing_bookmarks);
+}
 test "a half written reply survives a trip to a hashtag page or an article, and an article's newer copy" {
     // The reply box is parked under its thread whenever the level changes. The
     // hashtag page and the article reader are levels too, and an article swaps

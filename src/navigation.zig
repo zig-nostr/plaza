@@ -610,6 +610,17 @@ pub const Standing = struct {
     /// The open thread, zero at the feed.
     thread: i64 = 0,
     profile: ?[32]u8 = null,
+    /// The other two kinds of level. Left out, a note fetch started at the
+    /// feed or from Notifications opened its thread over a hashtag page or the
+    /// bookmark list the reader had gone to meanwhile.
+    bookmarks: bool = false,
+    topic_buf: [max_topic_bytes]u8 = @splat(0),
+    topic_len: u8 = 0,
+    /// How deep the back stack is. The feed is never pushed, so this alone
+    /// cannot tell the feed from the first level over it, which is why the
+    /// level kinds above are compared too; it catches the same level reached
+    /// again by a different route.
+    depth: usize = 0,
     /// The open room: host plus `d`, the pair that is a place's identity, and
     /// null in the reader's own plaza. A title is not an identity, and two
     /// communities may share one.
@@ -617,6 +628,8 @@ pub const Standing = struct {
 
     pub fn eql(a: Standing, b: Standing) bool {
         if (a.stage != b.stage or a.thread != b.thread) return false;
+        if (a.bookmarks != b.bookmarks or a.depth != b.depth) return false;
+        if (!std.mem.eql(u8, a.topic_buf[0..a.topic_len], b.topic_buf[0..b.topic_len])) return false;
         if ((a.profile == null) != (b.profile == null)) return false;
         if (a.profile) |ap| {
             if (!std.mem.eql(u8, &ap, &b.profile.?)) return false;
@@ -636,7 +649,13 @@ pub fn standingNow(model: *const Model) Standing {
         .stage = model.stage,
         .thread = model.viewing_thread,
         .profile = model.viewing_profile,
+        .bookmarks = model.viewing_bookmarks,
+        .depth = model.currentLevel(),
     };
+    if (model.viewingTopic()) |topic| {
+        @memcpy(s.topic_buf[0..topic.len], topic);
+        s.topic_len = @intCast(topic.len);
+    }
     if (places.g_place) |*p| {
         var here: @TypeOf(s.place.?) = .{ .pubkey = p.author, .ident_buf = @splat(0), .ident_len = 0 };
         here.ident_len = @intCast(copyBounded(&here.ident_buf, p.ident()));
