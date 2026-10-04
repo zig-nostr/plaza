@@ -676,8 +676,8 @@ test "a second list write inside one bunker round trip waits for the first" {
     var idbuf: [24]u8 = undefined;
     const mute_sign = main.pendingSignIdForKindForTest(10000, &idbuf) orelse return error.NoPendingSign;
     try testing.expect(main.takeAnsweredForTest(mute_sign));
+    defer main.signLandedForTest();
     try testing.expectEqual(main.MuteWrite.signer_busy, main.writeMuteForTest(&fx, [_]u8{0xe2} ** 32, true));
-    main.signLandedForTest();
 }
 
 test "a public bookmark waits for a private one being sealed, and the other way round" {

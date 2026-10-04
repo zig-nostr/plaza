@@ -340,9 +340,12 @@ var g_signs_landing = std.atomic.Value(u32).init(0);
 /// private half is sealed by the signer, and a pending copy of it would be a
 /// ciphertext nothing here has opened).
 pub fn listWriteInFlight(kind: u16) bool {
-    if (g_signs_landing.load(.acquire) != 0) return true;
     pendingLock();
     defer pendingUnlock();
+    // Read under the lock `takeAnswered` moves a sign from the table to this
+    // count under. Read before it, the listener could take the slot in between,
+    // and this saw the count still at zero and then no slot.
+    if (g_signs_landing.load(.acquire) != 0) return true;
     for (&g_pending) |*slot| {
         if (slot.active and slot.method == .sign_event and slot.kind == kind) return true;
     }
