@@ -764,6 +764,8 @@ const HelperSign = struct {
     /// What this press changed, put back if the signature never comes. Owned
     /// by the slot.
     undo: PendingUndo = .none,
+    /// The kind of the event out for signing.
+    kind: u16 = 0,
 };
 pub var g_helper_sign: HelperSign = .{};
 
@@ -920,6 +922,7 @@ pub fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kin
     // the note gone and the app saying "Posted".
     rememberHelperSign(gpa, content_owned, restorable, route, WarnCarry.fromTags(tags), undo);
     g_helper_sign.upload_auth = kind == blossom.auth_kind;
+    g_helper_sign.kind = kind;
     const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
         failHelperSign();
         return;

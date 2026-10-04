@@ -3481,6 +3481,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         // that had never been read and the merge deleted them.
                         if (!model.profile_seeded) seedProfileFields(model, own.json, true);
                         model.profile_stage = .have;
+                    } else if (profileSignPending()) {
+                        // A profile is with the signer. Wait for it to be
+                        // signed and stored, or to fail, before concluding.
                     } else if (ownProfileAnswered()) {
                         model.profile_stage = .absent;
                     } else if (now - model.profile_asked_at > own_profile_wait_s) {
@@ -6501,6 +6504,7 @@ pub const plazaDir = session.plazaDir;
 pub const restoreSession = session.restoreSession;
 
 // re-exports: own_profile.zig
+pub const profileSignPending = own_profile.profileSignPending;
 pub const askVerdictForTest = own_profile.askVerdictForTest;
 pub const forgetOwnProfileAnswerForTest = own_profile.forgetOwnProfileAnswerForTest;
 pub const forgetOwnRecordAnswersForTest = own_profile.forgetOwnRecordAnswersForTest;

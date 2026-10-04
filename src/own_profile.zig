@@ -10,11 +10,14 @@ const own_lists = @import("own_lists.zig");
 const session = @import("session.zig");
 const store_glue = @import("store_glue.zig");
 const uploads = @import("uploads.zig");
+const keyholder = @import("keyholder.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const takeFresh = main.takeFresh;
+const listWriteInFlight = main.listWriteInFlight;
 const SelfRead = main.SelfRead;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -182,6 +185,13 @@ pub fn freeOwnProfile(gpa: std.mem.Allocator, own: OwnProfile) void {
     gpa.free(own.tags);
 }
 
+/// Whether a kind:0 of this reader's is with a signer, Notary or a bunker. Until
+/// it is signed and stored, no profile in the store is not "no profile".
+pub fn profileSignPending() bool {
+    if (keyholder.g_helper_sign.active and keyholder.g_helper_sign.kind == 0) return true;
+    return listWriteInFlight(0);
+}
+
 /// Opens the sheet, seeded from the reader's own kind:0 if the app has it.
 pub fn openProfileEdit(model: *Model) void {
     // A guest has no key, so there is nothing to read and nothing that could
@@ -215,7 +225,10 @@ pub fn openProfileEdit(model: *Model) void {
     // Nothing here yet. Ask before concluding anything.
     model.profile_seeded = false;
     model.profile_asked_at = nowSeconds();
-    model.profile_stage = if (ownProfileAnswered()) .absent else .fetching;
+    // Never `.absent` while a profile is with the signer: the reader's first one,
+    // saved a moment ago, is not in the store until it is signed, and the sheet
+    // would offer to start fresh over it.
+    model.profile_stage = if (ownProfileAnswered() and !profileSignPending()) .absent else .fetching;
     if (model.profile_stage == .fetching) startOwnProfileFetch();
 }
 
@@ -364,6 +377,14 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
         return;
     }
     defer if (existing) |e| freeOwnProfile(gpa, e);
+    // A first profile for a key not made here spends the reader's yes, as every
+    // list's first write does. One yes starts one profile: left standing, a later
+    // read that came back empty (the first one still at the signer) published a
+    // second first profile without asking.
+    if (existing == null and !own_lists.g_identity_minted_here and !takeFresh(.profile)) {
+        model.profile_confirm_new = false;
+        return;
+    }
 
     const merged = mergeProfileJson(gpa, if (existing) |e| e.json else "{}", model) orelse {
         model.profile_stage = .failed;

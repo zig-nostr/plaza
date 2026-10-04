@@ -430,6 +430,58 @@ test "mute and bookmark ask the same question about their own list" {
     try testing.expect(main.needsFreshConsentForTest(.bookmarks));
     try testing.expect(main.needsFreshConsentForTest(.follows));
 }
+
+test "a first profile's yes is spent by its save, and a reopened sheet waits for the signer" {
+    // The yes to "start a new profile" was never spent, and the sheet concluded
+    // there was no profile from the store alone, while the first one was still
+    // with the bunker. Reopened in that window it offered a fresh start again,
+    // and a second Save published a second first profile without asking.
+    var fs: FreshStore = undefined;
+    try fs.open("firstprofile2");
+    defer fs.close();
+    const me = signInNothingFound(0x6e);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    defer main.forgetOwnProfileAnswerForTest();
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    // The bunker holds the reader's key.
+    main.setRemotePubkeyForTest(me);
+    main.recordOwnProfileAnswerForTest(me, true);
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(model.profile_stage == .absent);
+    model.profile_name_buffer.set("Fresh");
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_stage == .sent);
+    try testing.expect(!main.noHistoryKnownForTest(.profile));
+
+    // Reopened while the bunker still has it: not "no profile".
+    model.editing_profile = false;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(model.profile_stage == .fetching);
+
+    // The bunker refuses. Now there is none, and the next Save asks again.
+    var idbuf: [24]u8 = undefined;
+    const id = main.pendingSignIdForKindForTest(0, &idbuf) orelse return error.NoPendingSign;
+    try testing.expect(main.failPendingForTest(id));
+    main.scanPendingRemoteForTest(&model, &fx);
+    model.editing_profile = false;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(model.profile_stage == .absent);
+    model.profile_name_buffer.set("Fresh again");
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+    var none: [24]u8 = undefined;
+    try testing.expect(main.pendingSignIdForKindForTest(0, &none) == null);
+}
 test "every status the Edit profile sheet can show fits the two lines it has room for" {
     // The sheet is a fixed card in a 760 high window and the status sits above the
     // buttons. Three lines pushed Save and Try again past the card and off the
