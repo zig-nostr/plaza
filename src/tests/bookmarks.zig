@@ -108,6 +108,7 @@ test "an empty bookmark list says whether anything is saved" {
 }
 
 test "a bookmark splices onto the list and never publishes over an unreadable half" {
+    defer main.resetOutboxForTest();
     main.forgetBookmarksForTest();
     defer {
         main.forgetBookmarksForTest();
@@ -194,6 +195,7 @@ test "a private bookmark is sealed, written and read back" {
     // The whole round trip: the press builds the new private tag array, the
     // keyholder seals it, the splice publishes it as the content with the
     // public half untouched, and reading the list back finds it.
+    defer main.resetOutboxForTest();
     main.forgetBookmarksForTest();
     defer {
         main.forgetBookmarksForTest();

@@ -4013,6 +4013,7 @@ test "a note that no relay took is still owed" {
     // The whole point of the queue: a note written on a train and lost on
     // landing is the worst thing a client can do.
     main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
     // The queue answers to whoever is signed in, so a test about counts has to
     // BE somebody. See "a queued note belongs to the account that wrote it".
     main.setIdentityForTest([_]u8{0x41} ** 32);
@@ -4761,6 +4762,7 @@ test "an edit gives a note that gave up its rounds back" {
     // acked and refused are both zero. Skipping those was skipping exactly the
     // notes that adding a relay is meant to rescue.
     main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
     main.setIdentityForTest([_]u8{0x43} ** 32);
     defer main.clearIdentityForTest();
     const me = main.activePubkeyForTest() orelse return error.NoIdentity;
@@ -5499,6 +5501,7 @@ test "a removed relay is not put back by the splice that protects the rest" {
     // The splice carries forward every relay the pool has no seat for, and a
     // relay the reader just removed looks exactly like one of those. Without a
     // ledger of removals the splice would undo every removal press.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6208,6 +6211,7 @@ test "pressing Follow when every relay finished empty asks first, and writes onl
     // The account the hunt found: no kind:3 anywhere. Follow used to stay grey for
     // the whole session. Now it is live, and the press puts the one question only
     // the reader can answer. A no leaves the relays exactly as they were.
+    defer main.resetOutboxForTest();
     var fs: FreshStore = undefined;
     try fs.open("askfollow");
     defer fs.close();
@@ -6300,6 +6304,7 @@ test "the yes is only taken while every relay still has finished without the lis
 test "a list that is held is never asked about" {
     // Asking is for a list that is not there. One in the store is spliced onto, as
     // it always was, with no question.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6333,6 +6338,7 @@ test "a list that is held is never asked about" {
 }
 
 test "mute and bookmark ask the same question about their own list" {
+    defer main.resetOutboxForTest();
     var fs: FreshStore = undefined;
     try fs.open("askothers");
     defer fs.close();
@@ -6382,6 +6388,7 @@ test "a first profile is published only after a second, informed press" {
     // Save was dead for good on an account with no kind:0 on the relays. It is
     // live once every relay has finished, the first press shows what a wrong
     // guess costs and writes nothing, and the second is the reader's answer.
+    defer main.resetOutboxForTest();
     var fs: FreshStore = undefined;
     try fs.open("firstprofile");
     defer fs.close();
@@ -6595,6 +6602,7 @@ test "a yes is never spent on an account other than the one it was asked about" 
 }
 
 test "a list that arrives while the question is open is spliced onto, and arms nothing" {
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -8402,6 +8410,7 @@ test "a queued note belongs to the account that wrote it, and to nobody else" {
     // writing, which is the one thing this queue exists to prevent. So the note
     // survives and stops being walkable instead.
     main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
 
     main.setIdentityForTest([_]u8{0x0A} ** 32);
     const a = main.activePubkeyForTest() orelse return error.NoIdentity;
@@ -8469,6 +8478,7 @@ test "another account's notes do not sit in the slots this account needs" {
     // parked in its own record, not deleted, and the array holds only whoever is
     // signed in.
     main.resetOutboxForTest();
+    defer main.resetOutboxForTest();
     main.clearOutboxOwnerForTest();
 
     var tmp = std.testing.tmpDir(.{});
@@ -11363,6 +11373,7 @@ test "a follow that could not be written says why instead of nothing" {
     // for it looks perfectly live: the button is enabled, the menu row is not
     // greyed, and the press did nothing at all. That window is a second or two
     // for a local key and as long as an approval prompt takes for a Notary one.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -11458,6 +11469,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
     // So this sweeps from the floor the MANIFEST declares, passed in by
     // build.zig, rather than from a number repeated here. Widen the column and
     // this fails until the floor moves with it.
+    defer main.resetOutboxForTest();
     const floor = @import("window_floor").manifest_min_width;
 
     const States = enum { feed, feed_with_link, thread, profile, settings, notifications, composing, joining, places_rail, place_visiting, place_about, place_leaving, menu_scope, menu_relays, menu_account, menu_outbox };
@@ -14246,6 +14258,7 @@ fn muteFixture(
 }
 
 test "muting splices onto the list rather than replacing it" {
+    defer main.resetOutboxForTest();
     main.forgetMutesForTest();
     defer {
         main.forgetMutesForTest();
@@ -14300,6 +14313,7 @@ test "muting splices onto the list rather than replacing it" {
 }
 
 test "unmuting removes exactly one name" {
+    defer main.resetOutboxForTest();
     main.forgetMutesForTest();
     defer {
         main.forgetMutesForTest();
@@ -14439,6 +14453,7 @@ test "muting yourself is not a thing" {
 }
 
 test "a private half this app CAN read survives a public mute" {
+    defer main.resetOutboxForTest();
     main.forgetMutesForTest();
     defer {
         main.forgetMutesForTest();
@@ -14503,6 +14518,7 @@ test "a bunker reader's private mutes are opened by the bunker and carried throu
     // The case this started from: signed in through a bunker, the private half
     // of the mute list has to be opened by a NIP-46 round trip, and a write
     // before the answer must refuse rather than publish an empty content.
+    defer main.resetOutboxForTest();
     main.forgetMutesForTest();
     defer {
         main.setSignerKindForTest("helper");
@@ -14646,6 +14662,7 @@ test "a bunker that never opens the private half leaves the mute list untouched"
 }
 
 test "the profile offers Mute, and says why when it cannot" {
+    defer main.resetOutboxForTest();
     main.forgetMutesForTest();
     defer {
         main.forgetMutesForTest();
@@ -22012,6 +22029,7 @@ test "copying your profile address names the relays you publish to" {
 }
 
 test "a like, a repost and a reply name where the note lives" {
+    defer main.resetOutboxForTest();
     freshHints();
     defer freshHints();
     main.resetEngagementForTest();
@@ -23589,6 +23607,7 @@ fn blossomFixture(
 }
 
 test "the server list is spliced, not rebuilt, and is never written over a list that was not read" {
+    defer main.resetOutboxForTest();
     main.forgetBlossomForTest();
     defer {
         main.forgetBlossomForTest();
@@ -23696,6 +23715,7 @@ test "a first media server list waits for the relays the reader writes to, and f
     // only an absence once every relay the reader's own kind:10002 names for
     // writing has finished without one, and even then a press asks before a
     // list of one goes out over anything Plaza has not looked at.
+    defer main.resetOutboxForTest();
     var fs: FreshStore = undefined;
     try fs.open("firstservers");
     defer fs.close();

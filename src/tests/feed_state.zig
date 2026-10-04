@@ -433,6 +433,7 @@ test "the name beat forwards the tags it read, the same as the sheet's save" {
     // seam `&.{}`. Its own doc comment says one path exists so the destructive
     // shape cannot come back, and this is the half of the shape that was still
     // there. Driving the whole write, because the merge helper never sees a tag.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -607,6 +608,7 @@ test "a relay list is spliced onto the one the reader published" {
     // eight. A reader with thirteen relays had five deleted from their NIP-65
     // list by one badge press, along with every tag type this app does not
     // model. The event is now what they published, plus what they changed here.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -723,6 +725,7 @@ test "following writes the newest known list plus the change, and nothing else m
     // the petnames and relay hints on other people's p tags, tag types this app
     // does not model, and the content blob, which on older clients is a relay
     // map and on none of them is ours to discard.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -794,6 +797,7 @@ test "following writes the newest known list plus the change, and nothing else m
 }
 
 test "unfollowing removes exactly one name" {
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -926,6 +930,7 @@ test "a full follow list rebuilds the feed fast enough to do it every second" {
     }
 }
 test "one yes starts one list, and a later empty read is refused rather than a second start" {
+    defer main.resetOutboxForTest();
     var fs: FreshStore = undefined;
     try fs.open("oneyes");
     defer fs.close();
@@ -954,6 +959,7 @@ test "the follow splice matches on the p tag, not on any tag carrying that value
     // so it silently deletes an unrelated tag that happens to carry the same
     // value, and drops short tags like the ["-"] protected marker entirely.
     // Not copying that.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

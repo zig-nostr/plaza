@@ -447,6 +447,7 @@ test "following someone from the starter pack on a new key actually publishes" {
     // scanned the same set with no ownership test, decided there was nothing to
     // do, and returned a status `sayFollowWrite` deliberately renders as
     // silence. A press that changes nothing and says nothing.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -595,6 +596,7 @@ test "one relay's silence never authorizes replacing a contact list" {
     // relay, which simply does not carry it, finishes first. If that unlocked
     // the write, pressing Follow would publish nine hard-coded accounts over
     // the real list, on every relay, and 1991 follows would be gone.
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -805,6 +807,7 @@ test "a second follow before the signer answers does not undo the first" {
     // that window both read the SAME pre-press list, so the second published a
     // list without the first in it, at a newer stamp, and the first follow was
     // undone on every relay while both said "Following".
+    defer main.resetOutboxForTest();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
