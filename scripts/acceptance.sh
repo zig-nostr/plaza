@@ -16,9 +16,10 @@
 # amount of local testing can see it. So the follows journey publishes to a real
 # relay and reads the result back with an independent tool.
 #
-# NOT part of CI, on purpose. It publishes signed events to public relays and it
-# needs a key, neither of which belongs in a pull request check. Run it by hand
-# before tagging a release.
+# CI runs the `guest` and `bundle` journeys, which publish nothing.
+# The `follows` journey is NOT part of CI, on purpose: it publishes signed
+# events to a public relay and it needs a key, neither of which belongs in a
+# pull request check. Run the whole script by hand before tagging a release.
 #
 # What it needs:
 #

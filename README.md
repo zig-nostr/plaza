@@ -299,9 +299,7 @@ edited and read back off a relay with an independent tool.
 scripts/acceptance.sh
 ```
 
-It is not part of CI. It publishes signed events to public relays, so it needs a
-throwaway account rather than a checkout, and it says so and skips rather than
-guessing. The details are in the script.
+CI runs two of its journeys on every change, in the `acceptance` job: the cold start (`scripts/acceptance.sh guest`) and the packaged bundle (`scripts/acceptance.sh bundle`). The contact-list journey and the frame journey run by hand. The contact-list journey publishes signed events to a public relay, so it needs a throwaway account rather than a checkout, and it says so and skips rather than guessing. The details are in the script.
 
 Plaza is a [Native SDK](https://github.com/vercel-labs/native) app: plain Zig
 for the logic and the feed (`src/*.zig`), declarative `.native` markup for

@@ -58,10 +58,10 @@ zig build test -Doptimize=ReleaseFast   # the mode that ships; CI runs both
 
 Run the tests in ReleaseFast as well as Debug before calling a change done. The app ships ReleaseFast, and optimized builds have caught bugs a Debug build did not.
 
-Two scripts are not part of CI:
+Two scripts drive a real build:
 
-- `scripts/frame-budget.sh` measures frame cost while the feed scrolls and fails when a stage passes its budget. Run it on any change to the feed or its rendering.
-- `scripts/acceptance.sh` drives a real build against public relays and publishes signed events. It needs a throwaway account. Do not run it without the maintainer's go-ahead.
+- `scripts/frame-budget.sh` measures frame cost while the feed scrolls and fails when a stage passes its budget. It is not part of CI. Run it on any change to the feed or its rendering.
+- `scripts/acceptance.sh` runs journeys a reader takes. CI's `acceptance` job runs two of them on macOS: `guest`, a cold start that fills a feed from public relays, and `bundle`, the packaged app launched the way a person launches it. The `follows` journey publishes signed events to a public relay and needs a throwaway account, so it runs by hand only, and never without the maintainer's go-ahead.
 
 ## Conventions
 

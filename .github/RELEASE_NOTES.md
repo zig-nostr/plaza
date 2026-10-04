@@ -44,7 +44,7 @@
 
 **Two quick changes with a bunker no longer erase each other.** Muting, bookmarking or adding a media server twice inside one round trip to a bunker published the second list without the first. The second press now waits, with the busy message, until the first is stored.
 
-**A refused reply or note is never lost.** What you typed since stays first and the refused text goes under it. If both do not fit, the refused text is copied to the clipboard and the message says so. A refused note keeps its content warning, and a like is taken back only when its own signature fails, not another press's. A signer answer that cannot be used, such as one signed by a different key, says so and hands the press back.
+**A refused reply or note is never lost, and never joined to what you are typing.** It goes back into its box when the box is empty and nothing is waiting there to be posted. Otherwise it waits beside the box, under a line that says how many were not signed, with Copy, which copies them all a blank line apart, and Dismiss. Nothing touches the clipboard until you press Copy, and if the copy does not go through they stay where they are. A refused reply to a thread you have left is kept for that thread. A refused note keeps its own content warning, and a like is taken back only when its own signature fails, not another press's. A signer answer that cannot be used, such as one signed by a different key or one that does not verify, says so and hands the press back, and a press made while a bunker has every request still out says the signer is busy and changes nothing.
 
 **Notes written in a place reach the place.** A note Notary signed in a place that writes only to its own relays went to your public relays instead. A place whose relay closes its feed now says so, where before it looked empty.
 
@@ -56,11 +56,11 @@
 
 **Pictures and avatars are never fetched from your local network, and the media proxy is not bypassed.** An address on a loopback or LAN host is never requested for a note's picture, an avatar, a banner, an article cover or a place's logo. With the proxy on, pictures go through it, a place's logo included, and turning off "Ask the host when the proxy refuses" stops direct fetches at once. A relay named by somebody else's relay list, a reply's recipients or a place is dialled only when it is public.
 
-**GIF uploads are stripped.** Comments and XMP, which can carry a location, are removed from a GIF before it is sent, as for other pictures. A damaged GIF is refused rather than half stripped.
+**GIF uploads are stripped.** Comments and XMP, which can carry a location, are removed from a GIF before it is sent, as for other pictures, and its colour profile and looping are kept. A GIF that ends without its closing marker is closed where its pictures end and sent, as other apps read it. One with a block cut off partway, or with no picture left in it, is refused rather than half stripped.
 
 **Covered notes and articles fetch nothing until shown.** A covered note no longer fetches the picture of the note it quotes, and the article reader keeps an article's content warning.
 
-**A key pasted into search is never sent.** Any run of sixty or more hex digits is refused wherever it sits in the field. A search relay that ignores its limit cannot flood the list, each relay gets one search thread at most, and a term you already replaced is not sent.
+**A key pasted into search is never sent.** Any run of sixty or more hex digits is refused wherever it sits in the field. A search relay that ignores its limit cannot flood the list, a relay that never finishes connecting holds at most two search threads and gets the next term once one ends, and a term you already replaced is not sent.
 
 **Relay hints never carry another account's relays.** After a sign-out or a switch, the relays one account read through are not named in the next account's likes, quotes and copied addresses, and routed relays stop asking about the old follows. A bunker pairing that ends releases its connection and its key.
 
