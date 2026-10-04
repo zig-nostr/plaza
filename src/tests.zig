@@ -29455,7 +29455,7 @@ test "a NIP-05 address typed into the field opens the person its domain names" {
     try testing.expect(main.nip05AskedForTest());
     try testing.expect(model.address_open);
 
-    main.handleNip05FoundForTest(&model, .{ .key = main.nip05_lookup_key_for_test, .status = 200, .body = body });
+    main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 200, .body = body });
     try testing.expect(!model.address_open);
     try testing.expect(model.viewing_profile != null);
     try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 32), &model.viewing_profile.?);
@@ -29466,7 +29466,6 @@ test "a NIP-05 lookup that fails says why and leaves the field to be fixed" {
     main.searchResetForTest();
     defer main.searchResetForTest();
     var fx: main.EffectsForTest = undefined;
-    const ok_key = main.nip05_lookup_key_for_test;
 
     // The domain does not list the name.
     {
@@ -29474,7 +29473,7 @@ test "a NIP-05 lookup that fails says why and leaves the field to be fixed" {
         model.stage = .ready;
         typeIntoSearch(&model, "bob@example.com");
         main.update(&model, Msg.address_submit, &fx);
-        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 200, .body = "{\"names\":{}}" });
+        main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 200, .body = "{\"names\":{}}" });
         try testing.expect(model.address_open);
         try testing.expectEqual(main.AddressError.not_found, model.address_error);
         try testing.expectEqualStrings("bob@example.com", model.address_draft());
@@ -29485,7 +29484,7 @@ test "a NIP-05 lookup that fails says why and leaves the field to be fixed" {
         model.stage = .ready;
         typeIntoSearch(&model, "bob@example.com");
         main.update(&model, Msg.address_submit, &fx);
-        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 503, .body = "" });
+        main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 503, .body = "" });
         try testing.expect(model.address_open);
         try testing.expectEqual(main.AddressError.lookup_failed, model.address_error);
         try testing.expect(model.viewing_profile == null);
@@ -29499,10 +29498,45 @@ test "a NIP-05 lookup that fails says why and leaves the field to be fixed" {
         main.update(&model, Msg.address_submit, &fx);
         main.update(&model, Msg{ .address_edit = .{ .insert_text = "x" } }, &fx);
         const hex = "ef" ** 32;
-        main.handleNip05FoundForTest(&model, .{ .key = ok_key, .status = 200, .body = "{\"names\":{\"bob\":\"" ++ hex ++ "\"}}" });
+        main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 200, .body = "{\"names\":{\"bob\":\"" ++ hex ++ "\"}}" });
         try testing.expect(model.address_open);
         try testing.expect(model.viewing_profile == null);
     }
+}
+
+test "an answer to an earlier NIP-05 lookup never names the person for the next one" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    const evil = "ee" ** 32;
+    const good = "11" ** 32;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    typeIntoSearch(&model, "bob@one.example");
+    main.update(&model, Msg.address_submit, &fx);
+    const first = main.nip05AskKeyForTest();
+
+    // The reader moves to the same name at another domain and asks again
+    // before the first domain has answered.
+    model.address_buffer.clear();
+    main.update(&model, Msg{ .address_edit = .{ .insert_text = "bob@two.example" } }, &fx);
+    try testing.expectEqualStrings("A NIP-05 address. Enter asks its domain who that is.", model.address_status());
+    main.update(&model, Msg.address_submit, &fx);
+    const second = main.nip05AskKeyForTest();
+    try testing.expect(first != second);
+    try testing.expectEqualStrings("Asking the domain who that is.", model.address_status());
+
+    // The first domain answers last-asked's name with its own person: dropped,
+    // and the second lookup is still the one awaited.
+    main.handleNip05FoundForTest(&model, .{ .key = first, .status = 200, .body = "{\"names\":{\"bob\":\"" ++ evil ++ "\"}}" });
+    try testing.expect(model.address_open);
+    try testing.expect(model.viewing_profile == null);
+    try testing.expect(main.nip05AskedForTest());
+
+    main.handleNip05FoundForTest(&model, .{ .key = second, .status = 200, .body = "{\"names\":{\"bob\":\"" ++ good ++ "\"}}" });
+    try testing.expect(!model.address_open);
+    try testing.expectEqualSlices(u8, &([_]u8{0x11} ** 32), &model.viewing_profile.?);
 }
 
 test "pressing a result opens that person and puts the field away" {

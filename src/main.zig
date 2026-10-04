@@ -3643,9 +3643,12 @@ const avatar_fetch_key_base: u64 = 1000;
 const media_fetch_key_base: u64 = 2000;
 // NIP-05 well-known verification fetches, keyed `<base> + profile slot`.
 const nip05_fetch_key_base: u64 = 3000;
-// The one NIP-05 lookup the search field can have in flight: the reader's own
-// question, not a profile's verification, so it sits clear of the slot range.
-const nip05_lookup_key: u64 = 3900;
+// NIP-05 lookups typed into the search field, keyed `<base> + (sequence % count)`
+// so each one has a key of its own and an answer can be told from the answer to
+// the lookup before it. Far above every range here: verification alone runs from
+// its base to its base plus `profile_cap`.
+const nip05_lookup_key_base: u64 = 0x0500_0000;
+const nip05_lookup_keys: u64 = 64;
 const link_fetch_key_base: u64 = 4000;
 // Warming: the same bytes, fetched for a row that is NOT on screen yet, and
 // written to the disk cache without claiming a registry id. See `warmAhead`.
@@ -12220,7 +12223,7 @@ pub const Model = struct {
                 .blank => "",
                 .address => "An address. Enter opens it.",
                 .key => "That looks like a key or a signer link. It is not searched for, and it stays on this device.",
-                .nip05 => if (g_nip05_ask != null) "Asking the domain who that is." else "A NIP-05 address. Enter asks its domain who that is.",
+                .nip05 => if (nip05Pending(self.address_buffer.text())) "Asking the domain who that is." else "A NIP-05 address. Enter asks its domain who that is.",
                 .term => "Enter asks the search relays now.",
             },
             .unreadable => "That is not an address Plaza can read.",
@@ -38467,6 +38470,21 @@ fn searchRelayStatus(i: usize) search.Status {
 
 /// The address being looked up, and whether the answer is awaited.
 var g_nip05_ask: ?Nip05Address = null;
+/// The key that lookup went out under. An answer under any other key is to an
+/// earlier lookup, possibly for another domain, and is not this one's answer.
+var g_nip05_ask_key: u64 = 0;
+var g_nip05_seq: u64 = 0;
+
+fn sameNip05(a: *const Nip05Address, b: *const Nip05Address) bool {
+    return std.mem.eql(u8, a.name(), b.name()) and std.mem.eql(u8, a.domain(), b.domain());
+}
+
+/// Whether the address in the field is the one whose answer is awaited.
+fn nip05Pending(text: []const u8) bool {
+    const ask = g_nip05_ask orelse return false;
+    const current = nip05Address(text) orelse return false;
+    return sameNip05(&ask, &current);
+}
 
 /// Sends the lookup for `name@domain`. The domain is a stranger's, from the
 /// reader's own address, which is why this waits for an explicit press instead
@@ -38478,11 +38496,13 @@ fn lookupNip05(model: *Model, fx: *Effects) void {
         model.address_error = .unreadable;
         return;
     };
+    g_nip05_seq +%= 1;
+    g_nip05_ask_key = nip05_lookup_key_base + g_nip05_seq % nip05_lookup_keys;
     g_nip05_ask = addr;
     model.address_error = .none;
     if (!networkAllowed()) return;
     fx.fetch(.{
-        .key = nip05_lookup_key,
+        .key = g_nip05_ask_key,
         .url = url,
         .on_response = Effects.responseMsg(.nip05_found),
     });
@@ -38491,14 +38511,17 @@ fn lookupNip05(model: *Model, fx: *Effects) void {
 /// The well-known document came back. Goes to the person it names, if the
 /// reader is still looking at the address they asked about.
 fn handleNip05Found(model: *Model, response: native_sdk.EffectResponse) void {
-    if (response.key != nip05_lookup_key) return;
+    // An answer to an earlier lookup. It may be from another domain, and the
+    // field may hold that same name at a new one: read as this lookup's answer,
+    // the old domain would get to say who the new address is.
+    if (response.key != g_nip05_ask_key) return;
     const ask = g_nip05_ask orelse return;
     g_nip05_ask = null;
     // The reader typed on, or left. The answer is to a question nobody is
     // asking any more.
     const current = nip05Address(model.address_buffer.text()) orelse return;
     if (!model.address_open) return;
-    if (!std.mem.eql(u8, current.name(), ask.name()) or !std.mem.eql(u8, current.domain(), ask.domain())) return;
+    if (!sameNip05(&current, &ask)) return;
 
     if (response.outcome != .ok or response.status != 200 or response.truncated or response.body.len == 0) {
         model.address_error = .lookup_failed;
@@ -38622,7 +38645,10 @@ pub fn handleNip05FoundForTest(model: *Model, response: native_sdk.EffectRespons
     handleNip05Found(model, response);
 }
 
-pub const nip05_lookup_key_for_test = nip05_lookup_key;
+/// The key the lookup now awaited went out under.
+pub fn nip05AskKeyForTest() u64 {
+    return g_nip05_ask_key;
+}
 pub const search_scan_page_for_test = search_scan_page;
 
 fn openEvent(model: *Model, id: [32]u8) void {
