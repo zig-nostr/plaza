@@ -29300,6 +29300,44 @@ test "people the relays name are folded in, marked with who named them, and coun
     try testing.expectEqual(@as(usize, 0), main.searchRowCountForTest());
 }
 
+test "every relay's answer reaches the list when they all answer at once" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "nobody held");
+    const gen = main.searchGenForTest();
+
+    // Three relays each send a full answer before the next tick drains them.
+    // The first lists the same people the third ends with.
+    const per_relay = search.relay_limit;
+    for (0..main.searchRelayCountForTest()) |relay| {
+        for (0..per_relay) |i| {
+            var pk = [_]u8{0} ** 32;
+            pk[0] = @intCast(relay);
+            pk[1] = @intCast(i);
+            if (relay == 2 and i + 1 == per_relay) pk = [_]u8{0} ** 32;
+            main.searchArrivedForTest(gen, @intCast(relay), pk);
+        }
+    }
+    try testing.expect(main.search_inbox_cap_for_test >= main.searchRelayCountForTest() * per_relay);
+    main.searchTickForTest(&model, 0);
+
+    // The list is full, and the first person in it carries the mark of the last
+    // relay to name them, which arrived after everything else.
+    try testing.expectEqual(@as(usize, main.search_rows_max), main.searchRowCountForTest());
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &main.searchRowPubkeyForTest(0));
+    try testing.expectEqual(@as(u8, 0b101), main.searchRowRelaysForTest(0));
+
+    // And one relay sending a person twice has named one person.
+    var seen: search.Seen = .{};
+    try testing.expect(seen.add([_]u8{1} ** 32));
+    try testing.expect(!seen.add([_]u8{1} ** 32));
+    try testing.expect(seen.add([_]u8{2} ** 32));
+}
+
 test "a relay that found no one is named, not left out" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -38039,7 +38039,11 @@ var g_search_status: [search.relays_max]std.atomic.Value(u64) = @splat(std.atomi
 /// A person a relay returned, on its way from the thread that read it to the one
 /// that draws it.
 const SearchArrival = struct { gen: u32, relay: u8, pubkey: [32]u8 };
-const search_inbox_cap = 64;
+/// Room for every relay's full answer between two ticks. The tick drains once a
+/// second and three relays can each send `relay_limit` people well inside that,
+/// so a smaller inbox dropped the later relays' answers: their people never
+/// appeared, and people already listed lost the mark naming them.
+const search_inbox_cap = search.relays_max * search.relay_limit;
 var g_search_inbox: [search_inbox_cap]SearchArrival = undefined;
 var g_search_inbox_len: usize = 0;
 var g_search_inbox_lock = std.atomic.Value(bool).init(false);
@@ -38366,6 +38370,8 @@ fn searchRelayWorker(job: SearchJob) void {
 
     var state: search.RelayState = .unreachable_;
     var found: u16 = 0;
+    // Who this relay has named, so two versions of one profile count once.
+    var seen: search.Seen = .{};
     defer searchPublish(job, state, found);
 
     var relay = nostr.relay.dial(gpa, io, job.url) catch return;
@@ -38389,7 +38395,7 @@ fn searchRelayWorker(job: SearchJob) void {
         defer msg.deinit();
         const reply: search.Reply = switch (msg.value) {
             .event => |e| blk: {
-                if (searchAccept(gpa, signer, job, e.event)) found +|= 1;
+                if (searchAccept(gpa, signer, job, e.event) and seen.add(e.event.pubkey)) found +|= 1;
                 break :blk .event;
             },
             .eose => .eose,
@@ -38584,6 +38590,8 @@ pub fn searchGenForTest() u32 {
 }
 
 /// A relay thread's hand-off, without the thread.
+pub const search_inbox_cap_for_test = search_inbox_cap;
+
 pub fn searchArrivedForTest(gen: u32, relay: u8, pubkey: [32]u8) void {
     searchArrived(gen, relay, pubkey);
 }

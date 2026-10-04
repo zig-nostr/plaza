@@ -337,6 +337,26 @@ pub fn settle(reply: Reply, found: u16) ?RelayState {
     };
 }
 
+/// The people one relay has returned for one term. A relay may send two
+/// versions of the same profile, and the count it is shown with is of people.
+pub const Seen = struct {
+    keys: [relay_limit][32]u8 = undefined,
+    len: usize = 0,
+
+    /// True the first time `pubkey` is added. A relay that sends more people
+    /// than it was asked for has the extra counted without the check.
+    pub fn add(self: *Seen, pubkey: [32]u8) bool {
+        for (self.keys[0..self.len]) |k| {
+            if (std.mem.eql(u8, &k, &pubkey)) return false;
+        }
+        if (self.len < self.keys.len) {
+            self.keys[self.len] = pubkey;
+            self.len += 1;
+        }
+        return true;
+    }
+};
+
 /// A relay's state and result count in one word, so a worker can publish both
 /// with a single store and the reader can never see one half of an update. The
 /// term generation rides along so a late answer for an old term is ignored.
