@@ -835,11 +835,24 @@ pub fn closeThread(model: *Model) void {
 // The open-thread generation, so a reply fetch can report completion for the
 // thread it was launched for and not a later one. `g_thread_seq` is bumped on
 // each open; the worker copies its seq and, when it has asked every relay,
-// stores it into `g_thread_done_seq`. The UI thread clears the loading skeletons
+// raises `g_thread_done_seq` to it. The UI thread clears the loading skeletons
 // only when the CURRENT thread's fetch is the one that finished (so a genuinely
 // empty thread stops loading, but a stale late worker never clears a new thread).
 var g_thread_seq = std.atomic.Value(u64).init(0);
 pub var g_thread_done_seq = std.atomic.Value(u64).init(0);
+
+/// Records that the fetch for generation `seq` has asked every relay. Only ever
+/// forward: a slow worker for a level the reader has already left finishes
+/// after the newer level's, and a plain store put the mark back behind the open
+/// level, which then read as still fetching for the rest of the visit.
+fn finishLevelFetch(seq: u64) void {
+    _ = g_thread_done_seq.fetchMax(seq, .acq_rel);
+}
+
+/// The way a worker reports, for a test that plays a late one.
+pub fn finishLevelFetchLateForTest(seq: u64) void {
+    finishLevelFetch(seq);
+}
 
 const topic_kinds = [_]u16{1};
 
@@ -861,13 +874,13 @@ pub fn topicFilter(values: *const [1][]const u8, tags: *[1]nostr.filter.TagFilte
 /// are the honest set, rather than a search relay nobody chose.
 fn fetchTopicNotes(topic: []const u8, seq: u64) void {
     if (!relayFetchAllowed() or topic.len == 0 or topic.len > max_topic_bytes) {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     }
     var owned: [max_topic_bytes]u8 = undefined;
     @memcpy(owned[0..topic.len], topic);
     const thread = std.Thread.spawn(.{}, fetchTopicWorker, .{ owned, @as(u8, @intCast(topic.len)), seq }) catch {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     };
     thread.detach();
@@ -880,7 +893,7 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
     const io = threaded.io();
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
-    defer g_thread_done_seq.store(seq, .release);
+    defer finishLevelFetch(seq);
 
     const topic = topic_buf[0..topic_len];
     const values = [_][]const u8{topic};
@@ -931,18 +944,18 @@ fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
     // the relays may hold more than they did, and the relay set may be another.
     resetProfileEnd();
     if (!relayFetchAllowed()) {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     }
     const thread = std.Thread.spawn(.{}, fetchProfileWorker, .{ pubkey, seq }) catch {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     };
     thread.detach();
 }
 
 fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
-    defer g_thread_done_seq.store(seq, .release);
+    defer finishLevelFetch(seq);
     _ = profileRound(pubkey, null);
 }
 /// How many frames one relay gets to answer a profile's backfill before this
@@ -961,11 +974,11 @@ pub fn engagementFilter(tags: []const nostr.filter.TagFilter) nostr.filter.Filte
 }
 fn fetchThreadReplies(root_id: [32]u8, seq: u64) void {
     if (!relayFetchAllowed()) {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     }
     const thread = std.Thread.spawn(.{}, fetchRepliesWorker, .{ root_id, seq }) catch {
-        g_thread_done_seq.store(seq, .release);
+        finishLevelFetch(seq);
         return;
     };
     thread.detach();
@@ -1103,7 +1116,7 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
     }
     // Every relay has been asked: the reply set is as complete as it will get, so
     // the UI can stop showing loading skeletons even if nothing came back.
-    g_thread_done_seq.store(seq, .release);
+    finishLevelFetch(seq);
 }
 
 /// Marks a thread's reply fetch as finished, the way its worker does.

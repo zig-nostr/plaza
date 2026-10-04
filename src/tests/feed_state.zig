@@ -2685,6 +2685,9 @@ test "a thread nobody has replied to stops loading once the fetch is done or has
     model.thread_root = main.noteFrom(root, opened);
     model.thread_seq = 7_000_001;
     model.thread_open_at = opened;
+    // A made-up generation far ahead of the real counter, and a finished mark
+    // only ever moves forward, so put it back for whatever runs next.
+    defer main.finishLevelFetchForTest(0);
     model.thread_loading = true;
 
     // The first tick sees the store move (it has never looked) and reads it. The

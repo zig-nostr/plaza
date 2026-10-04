@@ -3394,8 +3394,11 @@ fn refreshOpenLevel(model: *Model, now: i64) void {
     // quietly.
     for (model.thread_notes[0..model.thread_notes_len]) |*note| note.setTime(now);
     if (model.viewing_profile != null) {
+        // The same give-up a thread has: a relay that never sends its EOSE is
+        // no reason to keep a person with no notes behind a spinner for good.
         model.thread_loading = model.thread_notes_len == 0 and
-            navigation.g_thread_done_seq.load(.acquire) < model.thread_seq;
+            navigation.g_thread_done_seq.load(.acquire) < model.thread_seq and
+            now - model.thread_open_at <= thread_loading_grace_s;
     } else if (model.viewing_thread != 0) {
         // Every tick, not only when the store moved: a thread nobody answered
         // leaves the store unchanged, and that is exactly when the skeletons
@@ -6833,6 +6836,7 @@ pub const roundReach = profile_notes.roundReach;
 pub const writeRelaysOf = profile_notes.writeRelaysOf;
 
 // re-exports: navigation.zig
+pub const finishLevelFetchLateForTest = navigation.finishLevelFetchLateForTest;
 pub const forgetStaleReturn = navigation.forgetStaleReturn;
 pub const closeThreadForTest = navigation.closeThreadForTest;
 pub const enterProfileForTest = navigation.enterProfileForTest;

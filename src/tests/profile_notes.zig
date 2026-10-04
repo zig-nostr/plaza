@@ -356,6 +356,69 @@ test "history is not declared over by a round that was only second to the first 
     try testing.expect(!main.profileRoundEndedForTest(0, 0, 0, 0));
 }
 
+test "a slow fetch for a page already left does not stall the page now open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/late-worker.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    const who = [_]u8{0x6d} ** 32;
+    try seedAuthorNotes(&store, arena, who, 1, 1_800_000_000, false);
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // The reader opens one page, then another before the first page's fetch
+    // has come back. The second page's fetch lands, and only then the first's.
+    main.enterProfileForTest(&model, [_]u8{0x6e} ** 32);
+    const left_seq = model.thread_seq;
+    main.enterProfileForTest(&model, who);
+    try testing.expect(model.thread_seq > left_seq);
+    main.finishLevelFetchLateForTest(model.thread_seq);
+    main.finishLevelFetchLateForTest(left_seq);
+
+    // The open page's own fetch is still the one on record, so reaching its
+    // end asks for older notes.
+    main.loadOlderProfileForTest(&model);
+    try testing.expect(main.profileOlderAskForTest() != null);
+}
+
+test "a person with no notes stops loading when a relay never answers" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quiet-person.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, [_]u8{0x6f} ** 32);
+    // Its fetch never comes back: a relay that holds its EOSE.
+    main.setFirstProfileFetchOutForTest(&model, true);
+    const opened = model.thread_open_at;
+
+    main.tickOpenLevelForTest(&model, opened + 1);
+    try testing.expect(model.thread_loading);
+    // Given up on, like a thread: the page says they have written nothing
+    // rather than spinning for the rest of the visit.
+    main.tickOpenLevelForTest(&model, opened + 60);
+    try testing.expect(!model.thread_loading);
+}
+
 test "a short page does not page while its own first fetch is still out" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
