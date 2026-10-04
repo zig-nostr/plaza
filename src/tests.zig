@@ -1875,6 +1875,75 @@ test "an article opened from Notifications names Notifications on its Back" {
     try testing.expect(model.notifications_open);
 }
 
+test "a reply half written in a thread is still there when the reader comes back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.setIdentityForTest([_]u8{0x7f} ** 32);
+    defer main.clearIdentityForTest();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x80} ** 32);
+    const first = try signedNote(arena, signer, kp, 1_800_000_000, "the first note");
+    const second = try signedNote(arena, signer, kp, 1_800_000_100, "the second note");
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(first, 1_800_000_200);
+    model.notes[1] = main.noteFrom(second, 1_800_000_200);
+    model.notes_len = 2;
+    const a = model.notes[0].id;
+    const b = model.notes[1].id;
+    var fx: main.EffectsForTest = undefined;
+
+    // Back to the feed and in again: the sentence is where the reader left it.
+    main.update(&model, Msg{ .open_thread = a }, &fx);
+    model.reply_buffer.set("I was about to say");
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(model.reply_empty());
+    main.update(&model, Msg{ .open_thread = a }, &fx);
+    try testing.expectEqualStrings("I was about to say", model.reply_draft());
+
+    // It belongs to that thread. Another one opens with an empty box, and its own
+    // draft is kept apart.
+    main.update(&model, Msg{ .open_thread = b }, &fx);
+    try testing.expect(model.reply_empty());
+    model.reply_buffer.set("and over here");
+    // Back from the second thread lands on the first, and its box is full again.
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expectEqual(a, model.viewing_thread);
+    try testing.expectEqualStrings("I was about to say", model.reply_draft());
+    main.update(&model, Msg.close_thread, &fx);
+    main.update(&model, Msg{ .open_thread = b }, &fx);
+    try testing.expectEqualStrings("and over here", model.reply_draft());
+
+    // A person's page in between, and Home, keep it as well.
+    main.update(&model, Msg{ .open_person = first.pubkey }, &fx);
+    try testing.expect(model.reply_empty());
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expectEqualStrings("and over here", model.reply_draft());
+    main.goHomeForTest(&model);
+    main.update(&model, Msg{ .open_thread = b }, &fx);
+    try testing.expectEqualStrings("and over here", model.reply_draft());
+
+    // Emptying the box on purpose is also a draft: nothing comes back.
+    model.reply_buffer.clear();
+    main.update(&model, Msg.close_thread, &fx);
+    main.update(&model, Msg{ .open_thread = b }, &fx);
+    try testing.expect(model.reply_empty());
+
+    // Signing out takes every kept reply with it, as it does the open one.
+    model.reply_buffer.set("private thinking");
+    main.update(&model, Msg.close_thread, &fx);
+    main.performLogoutForTest(&model, &fx);
+    main.setIdentityForTest([_]u8{0x7f} ** 32);
+    model.notes[1] = main.noteFrom(second, 1_800_000_200);
+    model.notes_len = 2;
+    main.update(&model, Msg{ .open_thread = b }, &fx);
+    try testing.expect(model.reply_empty());
+}
+
 test "a fresh draft is empty and disables Post" {
     var model = main.initialModel();
     try testing.expect(model.draft_empty());
@@ -32317,4 +32386,65 @@ test "a connect answered by the signer is never read as one that never went out"
     }
     thread.join();
     try testing.expectEqual(@as(u32, 0), misread);
+}
+
+test "a half written reply survives a trip to a hashtag page or an article, and an article's newer copy" {
+    // The reply box is parked under its thread whenever the level changes. The
+    // hashtag page and the article reader are levels too, and an article swaps
+    // its root in place when a newer copy lands, which is not a level change:
+    // the reply being typed under it must stay where it is.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "parked");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+    main.forgetAddressFetchForTest();
+    defer main.forgetAddressFetchForTest();
+
+    const note = try signedNote(arena, signer, kp, 1_800_000_000, "a note with a #zig tag");
+    _ = try main.plazaIngestVerifiedForTest(arena, note, signer);
+    const tags = [_]nostr.event.Tag{&[_][]const u8{ "d", "kept-reply" }};
+    const first = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, "The first copy.");
+    const second = try signedKind(arena, signer, kp, 1_800_005_000, 30023, &tags, "The copy that was edited since.");
+    _ = try main.plazaIngestVerifiedForTest(arena, first, signer);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterThreadForTest(&model, main.noteFrom(note, 1_800_000_100));
+    model.reply_buffer.set("half a thought");
+
+    // Out to the hashtag page and Back.
+    main.openTopicForTest(&model, "zig");
+    try testing.expectEqualStrings("", model.reply_draft());
+    main.closeThreadForTest(&model);
+    try testing.expectEqualStrings("half a thought", model.reply_draft());
+
+    // Out to an article and Back.
+    main.openEventForTest(&model, first.id);
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &first.id));
+    try testing.expectEqualStrings("", model.reply_draft());
+    main.closeThreadForTest(&model);
+    try testing.expectEqualStrings("half a thought", model.reply_draft());
+
+    // A reply typed under the article stays put when a newer copy swaps in.
+    main.closeThreadForTest(&model);
+    main.openAddressedArticleForTest(&model, 30023, kp.public_key, "kept-reply");
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &first.id));
+    model.reply_buffer.set("about the article");
+    _ = try main.plazaIngestVerifiedForTest(arena, second, signer);
+    _ = try buildTree(arena, &model);
+    main.refreshAddressFetchForTest(&model);
+    try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &second.id));
+    try testing.expectEqualStrings("about the article", model.reply_draft());
 }

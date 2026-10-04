@@ -39902,8 +39902,11 @@ fn openThread(model: *Model, note_id: i64) void {
 /// the back-stack, snapshots the new root, and fires its reply fetch. Shared by
 /// open-a-feed-note, open-a-reply, and open-a-quoted-note.
 fn enterThread(model: *Model, root: Note) void {
+    parkReplyDraft(model);
     pushCurrentScreen(model);
-    model.reply_buffer.clear();
+    // Here and not in `setThreadRoot`: a newer copy of the article being read
+    // swaps the root in place, and the reply being typed under it stays put.
+    takeReplyDraft(model, root.event_id);
     setThreadRoot(model, root);
 }
 
@@ -39954,6 +39957,74 @@ fn swapThreadRoot(model: *Model, root: Note) void {
 
 pub fn closeThreadForTest(model: *Model) void {
     closeThread(model);
+}
+
+// Unsent replies, kept for the threads the reader stepped out of. The reply box
+// holds one reply, and it belongs to the open thread, so every move to another
+// level used to empty it: a sentence half written was gone after a Back, where
+// a half written note survives a restart. A draft lives here from the moment its
+// thread is left until the reader returns to it, which takes it back out, so a
+// slot only ever holds a thread that is not open. Session only, a few at a
+// time, and the oldest is dropped when they run out.
+const reply_draft_slots = 8;
+const ReplyDraft = struct {
+    used: bool = false,
+    event_id: [32]u8 = @splat(0),
+    len: usize = 0,
+    text: [compose_capacity]u8 = undefined,
+};
+var g_reply_drafts: [reply_draft_slots]ReplyDraft = [_]ReplyDraft{.{}} ** reply_draft_slots;
+var g_reply_draft_next: usize = 0;
+
+/// Keeps what is in the reply box under the thread it belongs to, then empties
+/// the box. The box only ever holds the open thread's reply, and every move to
+/// another level passes through here, so `thread_root` is whose it is. An empty
+/// box keeps nothing and leaves any other thread's draft alone.
+fn parkReplyDraft(model: *Model) void {
+    defer model.reply_buffer.clear();
+    const text = model.reply_buffer.text();
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+    var slot: ?usize = null;
+    for (g_reply_drafts, 0..) |d, i| {
+        if (d.used and std.mem.eql(u8, &d.event_id, &model.thread_root.event_id)) slot = i;
+    }
+    if (slot == null) {
+        for (g_reply_drafts, 0..) |d, i| {
+            if (!d.used) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    const i = slot orelse blk: {
+        const evict = g_reply_draft_next % reply_draft_slots;
+        g_reply_draft_next += 1;
+        break :blk evict;
+    };
+    g_reply_drafts[i].used = true;
+    g_reply_drafts[i].event_id = model.thread_root.event_id;
+    g_reply_drafts[i].len = text.len;
+    @memcpy(g_reply_drafts[i].text[0..text.len], text);
+}
+
+/// Puts back the reply the reader left in this thread, or leaves the box empty.
+fn takeReplyDraft(model: *Model, event_id: [32]u8) void {
+    model.reply_buffer.clear();
+    for (&g_reply_drafts) |*d| {
+        if (!d.used or !std.mem.eql(u8, &d.event_id, &event_id)) continue;
+        model.reply_buffer.set(d.text[0..d.len]);
+        d.used = false;
+        return;
+    }
+}
+
+/// Forgets every kept reply, for a session that is ending.
+fn forgetReplyDrafts() void {
+    for (&g_reply_drafts) |*d| d.used = false;
+}
+
+pub fn parkReplyDraftForTest(model: *Model) void {
+    parkReplyDraft(model);
 }
 
 /// Pushes whatever level is open, so Back returns to it. A no-op at the feed,
@@ -40184,7 +40255,7 @@ fn openTopic(model: *Model, topic_in: []const u8) void {
     model.viewing_profile = null;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
-    model.reply_buffer.clear();
+    parkReplyDraft(model);
     @memcpy(model.topic_buf[0..topic.len], topic);
     model.topic_len = @intCast(topic.len);
     const now = nowSeconds();
@@ -40212,7 +40283,7 @@ fn openBookmarks(model: *Model) void {
     model.viewing_thread = 0;
     model.topic_len = 0;
     model.thread_notes_len = 0;
-    model.reply_buffer.clear();
+    parkReplyDraft(model);
     model.viewing_bookmarks = true;
     model.thread_seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
     model.thread_open_at = nowSeconds();
@@ -40239,7 +40310,7 @@ fn enterProfile(model: *Model, pubkey: [32]u8) void {
     model.viewing_profile = pubkey;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
-    model.reply_buffer.clear();
+    parkReplyDraft(model);
     wantProfile(pubkey);
     model.profile_tab = .notes;
     model.profile_limit = profile_page;
@@ -41209,7 +41280,7 @@ fn goHome(model: *Model) void {
     model.viewing_bookmarks = false;
     model.thread_loading = false;
     model.thread_notes_len = 0;
-    model.reply_buffer.clear();
+    parkReplyDraft(model);
     model.menu = .none;
     model.notifications_open = false;
     model.stage = .ready;
@@ -41232,7 +41303,7 @@ fn closeThread(model: *Model) void {
     // walk back land where the reader left it.
     model.thread_page[model.currentLevel()] = 1;
     model.thread_outside_open[model.currentLevel()] = false;
-    model.reply_buffer.clear();
+    parkReplyDraft(model);
     model.thread_notes_len = 0;
     if (model.thread_stack_len > 0) {
         model.thread_stack_len -= 1;
@@ -41277,6 +41348,7 @@ fn closeThread(model: *Model) void {
             model.viewing_profile = null;
             model.viewing_thread = prev.note.id;
             model.thread_root = prev.note;
+            takeReplyDraft(model, prev.note.event_id);
             model.refreshThreadNotes(now);
             model.thread_loading = model.thread_notes_len == 0;
             fetchThreadReplies(prev.note.event_id, seq);
@@ -44088,6 +44160,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // logout, so a freshly minted key could be given a permanent kind:0 carrying
     // the previous person's typed name.
     model.reply_buffer.clear();
+    forgetReplyDrafts();
     model.name_buffer.clear();
     model.viewing_thread = 0;
     model.thread_stack_len = 0;
