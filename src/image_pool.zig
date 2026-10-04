@@ -11,6 +11,7 @@ const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
 const feed_media = @import("feed_media.zig");
 const view_place = @import("view_place.zig");
+const view_profile = @import("view_profile.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -147,8 +148,8 @@ const IdOwner = union(enum) {
 /// thousands of entries and this runs whenever a face or a picture appears.
 pub fn imageIdOwners() [image_registry_slots + 1]IdOwner {
     var owners = [_]IdOwner{.free} ** (image_registry_slots + 1);
-    if (main.g_banner_image_id >= 1 and main.g_banner_image_id <= image_registry_slots) {
-        owners[@intCast(main.g_banner_image_id)] = .banner;
+    if (view_profile.g_banner_image_id >= 1 and view_profile.g_banner_image_id <= image_registry_slots) {
+        owners[@intCast(view_profile.g_banner_image_id)] = .banner;
     }
     if (view_place.g_place_logo_id >= 1 and view_place.g_place_logo_id <= image_registry_slots) {
         owners[@intCast(view_place.g_place_logo_id)] = .place_logo;
@@ -178,7 +179,7 @@ pub fn imageIdSeen(owner: IdOwner) ?u64 {
         .free => null,
         .avatar => |p| if (p.avatar_clock == profile_cache.g_image_clock or p.avatar_state == .fetching) null else p.avatar_clock,
         .media => |m| if (m.last_used == profile_cache.g_image_clock or m.state == .fetching) null else m.last_used,
-        .banner => if (main.g_banner_seen == profile_cache.g_image_clock) null else main.g_banner_seen,
+        .banner => if (view_profile.g_banner_seen == profile_cache.g_image_clock) null else view_profile.g_banner_seen,
         .place_logo => if (view_place.g_place_logo_seen == profile_cache.g_image_clock or view_place.g_place_logo_state == .fetching) null else view_place.g_place_logo_seen,
     };
 }
@@ -200,8 +201,8 @@ fn releaseImageId(fx: *Effects, owner: IdOwner, id: u64) void {
             m.state = .idle;
         },
         .banner => {
-            main.g_banner_image_id = 0;
-            main.g_banner_state = .idle;
+            view_profile.g_banner_image_id = 0;
+            view_profile.g_banner_state = .idle;
         },
         .place_logo => {
             view_place.g_place_logo_id = 0;
