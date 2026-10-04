@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const relay_list = @import("relay_list.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -216,8 +217,8 @@ pub fn applyRelaysFile(raw: []const u8) void {
     // same file, so "a file exists" says nothing about whose relays are in it,
     // and reading it as the signed-in account's would let five default relays be
     // published over a real NIP-65 list.
-    main.g_relay_owner = owner;
-    main.g_relays_are_mine = owner != null;
+    relay_list.g_relay_owner = owner;
+    relay_list.g_relays_are_mine = owner != null;
     setRelayListStamp(stamp);
 }
 
@@ -238,15 +239,15 @@ pub fn formatRelaysFile(buf: []u8) ?[]const u8 {
     var w = std.Io.Writer.fixed(buf);
     // Whose list this is, first. Without it a file written while signed out (the
     // bootstrap pool) reads back as the next account's own list.
-    if (main.g_relay_owner) |owner| {
+    if (relay_list.g_relay_owner) |owner| {
         var hex: [64]u8 = undefined;
         hexLower(&hex, owner);
         w.print("owner {s}\n", .{hex[0..]}) catch return null;
     }
     // And WHEN it was signed, so a launch can tell this account's own newer list
     // from an older one a slow relay is still replaying.
-    if (main.g_relay_list_stamp != 0) {
-        w.print("stamp {d}\n", .{main.g_relay_list_stamp}) catch return null;
+    if (relay_list.g_relay_list_stamp != 0) {
+        w.print("stamp {d}\n", .{relay_list.g_relay_list_stamp}) catch return null;
     }
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
@@ -376,18 +377,18 @@ pub fn resetRelaysToBootstrap() void {
     snapshotRelayUrls(&before, &lens);
     lockRelayTable();
     g_relays = [_]RelayEntry{.{}} ** max_relays;
-    main.g_staged_created_at = 0;
+    relay_list.g_staged_created_at = 0;
     unlockRelayTable();
     g_relay_count.store(0, .release);
-    main.g_relays_are_mine = false;
-    main.g_relay_owner = null;
+    relay_list.g_relays_are_mine = false;
+    relay_list.g_relay_owner = null;
     // The stamp goes with the owner. Left behind, the bootstrap pool the next
     // account inherits would claim to be as new as the list the previous one
     // published, and refuse theirs.
     setRelayListStamp(0);
-    main.g_staged_ready.store(false, .release);
+    relay_list.g_staged_ready.store(false, .release);
     g_suggested_count.store(0, .release);
-    main.g_relay_list_dirty = false;
+    relay_list.g_relay_list_dirty = false;
     forgetRelayRemovals();
     // Seeded FIRST, so the comparison below is against the pool that is actually
     // in place rather than the momentary empty table.
