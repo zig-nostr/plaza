@@ -67,6 +67,7 @@ const quote_picture_min_aspect = main.quote_picture_min_aspect;
 const quote_picture_width = main.quote_picture_width;
 const quote_pill_height = main.quote_pill_height;
 const quote_pill_label_width = main.quote_pill_label_width;
+const rearmQuoteAddress = main.rearmQuoteAddress;
 const recalledAspect = main.recalledAspect;
 const relayAt = main.relayAt;
 const relaySlots = main.relaySlots;
@@ -747,6 +748,7 @@ pub fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, 
             kids[n] = textParaAt(ui, noteSpans(ui, note, head), scale, ink);
             n += 1;
         }
+        rearmQuoteAddress(&q);
         kids[n] = quoteRule(ui, q.id);
         n += 1;
         const tail = std.mem.trim(u8, full[card_end..cut], " \t\r\n");

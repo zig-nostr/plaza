@@ -356,7 +356,20 @@ const QuoteRef = struct {
     id: [32]u8 = [_]u8{0} ** 32,
     off: u16 = 0,
     len: u16 = 0,
+    /// The coordinate, when the quote is an `naddr`. `id` is then only a hash
+    /// of it, filed in `g_addresses`, and that table evicts: a note kept in the
+    /// feed after its slot went had a card that asked for an id nobody holds
+    /// and a press that opened nothing. Carried here so a miss can file it again
+    /// (`rearmQuoteAddress`).
+    addr: ?Address = null,
 };
+
+/// Files a quote's address again if its slot was evicted, so the stand-in key a
+/// note holds always resolves while the note is drawn.
+pub fn rearmQuoteAddress(ref: *const QuoteRef) void {
+    const addr = ref.addr orelse return;
+    if (addressFor(ref.id) == null) _ = registerAddress(addr, &.{});
+}
 
 /// How many mentions in one note can be pressed. Past this they still render as
 /// `@name`, they just do not open anything, which is the mild end of a note

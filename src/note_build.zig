@@ -308,6 +308,7 @@ pub fn findQuoteRef(note: *Note) void {
     const text = note.content();
     var scratch: [16 * 1024]u8 = undefined;
     var i: usize = 0;
+    var found_addr: ?Address = null;
     while (i < text.len) : (i += 1) {
         // The token starts at a `nostr:` prefix, or a bare `nevent1`/`note1`, but
         // only at a word boundary, so one embedded in a URL (`…/nostr:nevent…`)
@@ -341,11 +342,12 @@ pub fn findQuoteRef(note: *Note) void {
             // Only the kinds with a screen. Any other address stays the text it
             // was, as it always has.
             const addr = Address.make(ptr.kind, ptr.pubkey, ptr.identifier) orelse break :blk null;
+            found_addr = addr;
             break :blk registerAddress(addr, ptr.relays);
         } else (nostr.nip19.decodeNote(arena, token) catch null);
 
         if (id) |event_id| {
-            note.quote = .{ .kind = .event, .id = event_id, .off = @intCast(i), .len = @intCast((body_start - i) + j) };
+            note.quote = .{ .kind = .event, .id = event_id, .off = @intCast(i), .len = @intCast((body_start - i) + j), .addr = found_addr };
             return;
         }
     }

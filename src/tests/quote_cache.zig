@@ -20,6 +20,7 @@ const harness = @import("../tests.zig");
 
 // ---- from tests.zig
 const articleStore = harness.articleStore;
+const buildTree = harness.buildTree;
 const findAnyText = harness.findAnyText;
 const frameOfText = harness.frameOfText;
 const signedKind = harness.signedKind;
@@ -707,6 +708,64 @@ test "a card for an naddr fills from the store and opens the article" {
     model.stage = .ready;
     main.openEventForTest(&model, note.quote.id);
     try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &ev.id));
+}
+
+test "an naddr card keeps its address after the table lets it go" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    var store = try articleStore(&tmp, &pbuf, "cardevicted");
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.forgetArticleForTest();
+    defer main.forgetArticleForTest();
+    main.forgetAddressFetchForTest();
+    defer main.forgetAddressFetchForTest();
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+    main.resetAddressesForTest();
+    defer main.resetAddressesForTest();
+
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "d", "kept" },
+        &[_][]const u8{ "title", "Still reachable" },
+    };
+    const ev = try signedKind(arena, signer, kp, 1_800_000_000, 30023, &tags, "The article body.");
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+
+    const naddr = try nostr.nip19.encodeNaddr(arena, "kept", kp.public_key, 30023, &.{});
+    const text = try std.fmt.allocPrint(arena, "read this nostr:{s}", .{naddr});
+    const note_ev = try signedNote(arena, signer, kp, 1_800_000_100, text);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteFrom(note_ev, 1_800_000_200);
+    model.notes_len = 1;
+    const key = model.notes[0].quote.id;
+    try testing.expect(main.addressRegisteredForTest(key));
+
+    // The note stays in the feed; the address table and the quote cache both
+    // move on without it, as they do under a long scroll.
+    main.resetAddressesForTest();
+    main.resetQuotesForTest();
+    try testing.expect(!main.addressRegisteredForTest(key));
+
+    // Drawn again, the card files its address again, so it fills and opens.
+    _ = try buildTree(arena, &model);
+    try testing.expect(main.addressRegisteredForTest(key));
+    main.refreshQuotesForTest(&store);
+    try testing.expectEqualStrings("Still reachable", main.quoteTextForTest(key) orelse "");
+    var opened = main.initialModel();
+    opened.stage = .ready;
+    main.openEventForTest(&opened, key);
+    try testing.expect(std.mem.eql(u8, &opened.thread_root.event_id, &ev.id));
 }
 
 test "a card for an naddr nobody has settles as missing, and loads if it lands later" {
