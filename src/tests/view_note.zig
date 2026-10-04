@@ -10,6 +10,7 @@ const long_form = @import("../article.zig");
 const theme = @import("../theme.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const AppUi = main.AppUi;
@@ -284,4 +285,42 @@ test "a pressed hashtag opens the tag that was pressed, however many were drawn 
     main.beginViewBuildForTest();
     const fresh = main.contentSpans(&ui, "#fresh")[0].link;
     try testing.expectEqualStrings("fresh", main.topicLinkValueForTest(fresh) orelse return error.NoTopic);
+}
+
+test "a long display name stays on one line above the handle" {
+    // A name wider than the identity block wrapped onto a second line, and the
+    // block is exactly the disc's height with the handle pinned to its foot, so
+    // the handle drew over the name's second line and the body under it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    const model = main.Model{};
+
+    const pk = [_]u8{0x6e} ** 32;
+    main.setProfileNameForTest(pk, "Maximiliana Featherstonehaugh-Worthington, Keeper of Unreasonable");
+    const Build = struct {
+        var note: main.Note = .{};
+        fn block(ui: *main.AppUi) main.AppUi.Node {
+            return main.identityBlockForTest(ui, &note);
+        }
+    };
+    Build.note = .{};
+    Build.note.pubkey = pk;
+
+    const p = try painted.Painted.renderPiece(arena, &model, Build.block, main.window_width, 200);
+    var name_frame: ?geometry.RectF = null;
+    for (p.layout.nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.text, "Maximiliana")) name_frame = node.widget.frame;
+    }
+    const frame = name_frame orelse return error.NoName;
+    // One line of the name, which is under 1.5 body lines tall.
+    try testing.expect(frame.height < main.body_line_height * 1.5);
+    // And it says it was cut.
+    var tree_text: ?[]const u8 = null;
+    for (p.layout.nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.text, "Maximiliana")) tree_text = node.widget.text;
+    }
+    try testing.expect(std.mem.endsWith(u8, tree_text.?, "\u{2026}"));
 }

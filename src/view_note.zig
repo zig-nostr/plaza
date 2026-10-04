@@ -274,13 +274,50 @@ pub fn identityBlock(ui: *AppUi, note: *const Note) AppUi.Node {
     // takes any back, so a name wider than the row keeps its full width and
     // takes the handle, the time and the card's right edge with it. Sixty-four
     // characters of display name reached 354px past the window.
+    //
+    // ONE line. The block is as tall as the disc and holds the name over the
+    // handle, so a name that wrapped onto a second line drew the handle over
+    // its own second line and the body under it. A paragraph built from spans
+    // does not elide at its width, so the name is cut by width units first.
     return ui.column(.{ .height = avatar_size, .width = identity_text_width, .main = .space_between }, .{
         ui.paragraph(
-            .{ .width = identity_text_width, .style = .{ .foreground = p.text_primary } },
-            &.{.{ .text = note.author(), .weight = .medium, .scale = name_scale }},
+            .{ .width = identity_text_width, .wrap = false, .style = .{ .foreground = p.text_primary } },
+            &.{.{ .text = elideUnits(ui, note.author(), identity_name_units), .weight = .medium, .scale = name_scale }},
         ),
         handleLine(ui, note),
     });
+}
+
+pub fn identityBlockForTest(ui: *AppUi, note: *const Note) AppUi.Node {
+    return identityBlock(ui, note);
+}
+
+/// How much of a display name the identity line shows, in width units (a
+/// narrow character is one, a wide one two; see `elideUnits`). Measured against
+/// `identity_text_width` at the name's size: 48 narrow characters of an
+/// ordinary name fill about 340 of its 386 points, and a name set in capitals
+/// that runs past the block still stops short of the time at the row's end.
+const identity_name_units = 48;
+
+/// `text` cut to `units` width units with an ellipsis where it was cut. A
+/// character from U+2E80 up (CJK, emoji) counts two, because it draws about
+/// twice as wide as a Latin letter and a cap on codepoints alone would let a
+/// line of them run twice as far.
+fn elideUnits(ui: *AppUi, text: []const u8, units: usize) []const u8 {
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch break;
+        const w: usize = if (cp >= 0x2E80) 2 else 1;
+        if (used + w > units) {
+            return ui.fmt("{s}\u{2026}", .{std.mem.trimEnd(u8, text[0..i], " ,")});
+        }
+        used += w;
+        i += len;
+    }
+    return text[0..i];
 }
 
 /// The identity block's second line: the verified check, then the handle. The
