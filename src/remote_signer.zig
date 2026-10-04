@@ -144,6 +144,9 @@ const PendingRemote = struct {
     // sign_event only: the answer was an event signed by a key other than the
     // reader's. Failed like any other, and said so in those words.
     wrong_key: bool = false,
+    // sign_event only: the kind of the event out for signing, so a second write
+    // to the same list can see that the first has not landed.
+    kind: u16 = 0,
 
     pub fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -241,12 +244,12 @@ pub fn pendingUnlock() void {
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
 pub fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry) bool {
-    return registerPendingWith(req_id, method, content, restorable, route, half_index, half_id, warn, .none);
+    return registerPendingWith(req_id, method, content, restorable, route, half_index, half_id, warn, .none, 0);
 }
 
 /// `registerPending` for a sign that carries an undo. The slot takes ownership
 /// of `undo` only when this returns true.
-fn registerPendingWith(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry, undo: PendingUndo) bool {
+fn registerPendingWith(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry, undo: PendingUndo, kind: u16) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -265,6 +268,7 @@ fn registerPendingWith(req_id: []const u8, method: RemoteMethod, content: ?[]con
             .route = route,
             .warn = if (restorable) warn else .{},
             .undo = undo,
+            .kind = kind,
         };
         @memcpy(slot.id_buf[0..req_id.len], req_id);
         return true;
@@ -302,8 +306,62 @@ pub fn takeAnswered(req_id: []const u8) ?PendingRemote {
             const taken = slot.*;
             slot.* = .{};
             g_remote_status.store(2, .release);
+            // Out of the table but not in the store yet. Counted under the same
+            // lock, so a list write never sees neither.
+            if (taken.method == .sign_event) _ = g_signs_landing.fetchAdd(1, .acq_rel);
             return taken;
         }
+    }
+    return null;
+}
+
+/// Signatures the listener has taken out of the table and not yet stored or
+/// parked. Brief, and counted so that window is not a gap.
+var g_signs_landing = std.atomic.Value(u32).init(0);
+
+/// Whether a write to the list of `kind` is out with the bunker, or has come
+/// back and is still on its way into the store.
+///
+/// A bunker signs several things at once, so `signerReady` is always true for
+/// one. Every list write splices onto the record in the store, and the store
+/// does not hold a write until its signature comes back. Two presses inside
+/// that round trip both spliced onto the same record, and the second, newer,
+/// published a list without the first. The follow list keeps a copy of what it
+/// signed as the next base; these lists refuse the second press instead, which
+/// keeps one rule for them however their content is held (the bookmark list's
+/// private half is sealed by the signer, and a pending copy of it would be a
+/// ciphertext nothing here has opened).
+pub fn listWriteInFlight(kind: u16) bool {
+    if (g_signs_landing.load(.acquire) != 0) return true;
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and slot.method == .sign_event and slot.kind == kind) return true;
+    }
+    return false;
+}
+
+/// What the listener does when it takes a signature out of the table, and
+/// leaves undone until `signLandedForTest`.
+pub fn takeAnsweredForTest(req_id: []const u8) bool {
+    const taken = takeAnswered(req_id) orelse return false;
+    if (taken.content) |c| std.heap.page_allocator.free(c);
+    releaseUndo(taken.undo);
+    return true;
+}
+
+pub fn signLandedForTest() void {
+    _ = g_signs_landing.fetchSub(1, .acq_rel);
+}
+
+/// The request id of the pending sign for an event of `kind`.
+pub fn pendingSignIdForKindForTest(kind: u16, out: *[24]u8) ?[]const u8 {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active or slot.method != .sign_event or slot.kind != kind) continue;
+        @memcpy(out[0..slot.id_len], slot.id());
+        return out[0..slot.id_len];
     }
     return null;
 }
@@ -624,7 +682,7 @@ pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPendingWith(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags), undo)) {
+    if (!registerPendingWith(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags), undo, kind)) {
         gpa.free(content_owned);
         return;
     }
@@ -842,6 +900,10 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
     // or one already handled: drop it (no double publish, no stray "connected").
     // Taking it also marks the connection up (see `takeAnswered`).
     const pending = takeAnswered(resp.value.id) orelse return;
+    // Stored, published or parked by the time this returns.
+    defer if (pending.method == .sign_event) {
+        _ = g_signs_landing.fetchSub(1, .acq_rel);
+    };
     // Unless the answer was unusable and the request went back in the table.
     var parked = false;
     defer if (!parked) {

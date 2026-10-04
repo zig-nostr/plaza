@@ -6395,6 +6395,10 @@ pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
 
 // re-exports: remote_signer.zig
+pub const signLandedForTest = remote_signer.signLandedForTest;
+pub const takeAnsweredForTest = remote_signer.takeAnsweredForTest;
+pub const pendingSignIdForKindForTest = remote_signer.pendingSignIdForKindForTest;
+pub const listWriteInFlight = remote_signer.listWriteInFlight;
 pub const plausibleSealForTest = remote_signer.plausibleSealForTest;
 pub const nip44CiphertextLenForTest = remote_signer.nip44CiphertextLenForTest;
 pub const max_private_cipher_len = remote_signer.max_private_cipher_len;

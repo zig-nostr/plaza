@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const listWriteInFlight = main.listWriteInFlight;
 const parkSealAnswer = main.parkSealAnswer;
 const max_private_cipher_len = main.max_private_cipher_len;
 const plausibleSeal = main.plausibleSeal;
@@ -231,6 +232,12 @@ pub const BookmarkWrite = enum {
 ///      bookmark the reader has.
 pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     if (!signerReady()) return .signer_busy;
+    if (listWriteInFlight(bookmark_list_kind)) return .signer_busy;
+    // A private bookmark being sealed is a write to this same list. Its finish
+    // checks the stored record is the one it was built on, and a public write
+    // still out is in no store, so that check could not see it: whichever
+    // landed second would publish a list without the other.
+    if (private_lists.g_private_seal.active) return .signer_busy;
     _ = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
 
@@ -319,6 +326,9 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
 pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     if (!signerReady()) return .signer_busy;
     if (private_lists.g_private_seal.active) return .signer_busy;
+    // And the other way round: a public write still out would be missing from
+    // the record this seal is built on.
+    if (listWriteInFlight(bookmark_list_kind)) return .signer_busy;
     const me = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
 

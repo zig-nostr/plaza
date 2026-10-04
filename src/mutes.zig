@@ -12,6 +12,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const listWriteInFlight = main.listWriteInFlight;
 const Model = main.Model;
 const forgetBookmarks = main.forgetBookmarks;
 const loadBookmarksFromStore = main.loadBookmarksFromStore;
@@ -196,6 +197,7 @@ pub const MuteWrite = enum {
 /// the one case where having no list is a fact rather than a failed read.
 pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     if (!signerReady()) return .signer_busy;
+    if (listWriteInFlight(mute_list_kind)) return .signer_busy;
     const me = activePubkey() orelse return .failed;
     // Muting yourself would hide your own notes from your own feed.
     if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;

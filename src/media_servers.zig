@@ -13,6 +13,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const listWriteInFlight = main.listWriteInFlight;
 const Effects = main.Effects;
 const FreshAsk = main.FreshAsk;
 const Model = main.Model;
@@ -287,6 +288,7 @@ pub const BlossomWrite = enum {
 /// has not been read.
 pub fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]const u8) BlossomWrite {
     if (!signerReady()) return .signer_busy;
+    if (listWriteInFlight(blossom_list_kind)) return .signer_busy;
     _ = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
     // Compared and written in one spelling, whatever the caller was handed.

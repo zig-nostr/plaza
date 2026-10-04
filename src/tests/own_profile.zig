@@ -641,6 +641,66 @@ test "a private half past 4096 bytes is read, and the list can still be written"
     try testing.expect(main.isBookmarked(last));
 }
 
+test "a second list write inside one bunker round trip waits for the first" {
+    // A bunker has several signatures out at once, and the store does not hold
+    // a list write until its signature comes back. Two mute presses inside that
+    // round trip both spliced onto the same stored list, and the second, newer,
+    // published a list without the first. The same for bookmarks and media
+    // servers.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.forgetPrivateSealForTest();
+    defer main.forgetPrivateSealForTest();
+    defer main.forgetMutesForTest();
+    defer main.forgetBookmarksForTest();
+    main.setIdentityForTest([_]u8{0x86} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var fx: main.EffectsForTest = undefined;
+
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, [_]u8{0xe1} ** 32, true));
+    try testing.expectEqual(main.MuteWrite.signer_busy, main.writeMuteForTest(&fx, [_]u8{0xe2} ** 32, true));
+
+    try testing.expectEqual(main.BookmarkWrite.published, main.writeBookmarkForTest(&fx, [_]u8{0xe3} ** 32, true));
+    try testing.expectEqual(main.BookmarkWrite.signer_busy, main.writeBookmarkForTest(&fx, [_]u8{0xe4} ** 32, true));
+    // A private bookmark is a write to the same list.
+    try testing.expectEqual(main.BookmarkWrite.signer_busy, main.writePrivateBookmarkForTest(&fx, [_]u8{0xe5} ** 32, true));
+
+    try testing.expectEqual(main.BlossomWrite.published, main.writeBlossomServersForTest(&fx, "https://one.example", null));
+    try testing.expectEqual(main.BlossomWrite.signer_busy, main.writeBlossomServersForTest(&fx, "https://two.example", null));
+
+    // Taken out of the table by the listener and not stored yet is still out.
+    var idbuf: [24]u8 = undefined;
+    const mute_sign = main.pendingSignIdForKindForTest(10000, &idbuf) orelse return error.NoPendingSign;
+    try testing.expect(main.takeAnsweredForTest(mute_sign));
+    try testing.expectEqual(main.MuteWrite.signer_busy, main.writeMuteForTest(&fx, [_]u8{0xe2} ** 32, true));
+    main.signLandedForTest();
+}
+
+test "a public bookmark waits for a private one being sealed, and the other way round" {
+    // A seal finishes only over the record it was built on. A public bookmark
+    // still with the signer is in no store, so that check passed with neither
+    // stored, and whichever landed second published the list without the other.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.forgetPrivateSealForTest();
+    defer main.forgetPrivateSealForTest();
+    defer main.forgetBookmarksForTest();
+    main.setIdentityForTest([_]u8{0x87} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var fx: main.EffectsForTest = undefined;
+
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xe6} ** 32, true));
+    try testing.expectEqual(main.BookmarkWrite.signer_busy, main.writeBookmarkForTest(&fx, [_]u8{0xe7} ** 32, true));
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes
