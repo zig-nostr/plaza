@@ -58,6 +58,7 @@ Two scripts are not part of CI:
 - `zig fmt` is the formatter; CI fails on unformatted code.
 - [Conventional Commits](https://www.conventionalcommits.org/). One concern per pull request, with its tests, and every pull request links its issue.
 - Never commit to `main`; everything lands through a reviewed pull request.
+- A row that answers a press is built with `pressRow` in `src/main.zig`, never with a bare `row`, `column` or `data_row` and an `on_press`. The toolkit gives Tab a stop, a focus ring and Return/Space activation to its own controls and to `list_item` only, so a layout kind with a press can be clicked and nothing else. A test walks every screen and fails on one.
 - A release is a version bump in `app.zon` plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds it.
 
 ## Nostr rules that matter here

@@ -9152,7 +9152,7 @@ test "the notifications page draws its rows in the reading column" {
     const tree = try painted.Painted.renderAt(arena, model, main.window_width, main.window_height);
     var widest: f32 = 0;
     for (tree.layout.nodes) |n| {
-        if (n.widget.kind != .data_row) continue;
+        if (n.widget.kind != .data_row and n.widget.kind != .list_item) continue;
         widest = @max(widest, n.widget.frame.width);
     }
     try testing.expect(widest > 0);
@@ -10382,6 +10382,331 @@ test "your own page is written for you, not about you" {
     try testing.expect(findAnyTextContainingText(theirs.root, "they have written") != null);
     try testing.expect(findAnyText(theirs.root, "Their follow list has not arrived yet") != null);
     try testing.expect(findAnyTextContainingText(theirs.root, "you have written") == null);
+}
+
+/// Whether anything at or under `widget` is a focus stop.
+fn holdsFocusStop(widget: canvas.Widget) bool {
+    if (canvas.widgetIsFocusable(widget)) return true;
+    for (widget.children) |child| {
+        if (holdsFocusStop(child)) return true;
+    }
+    return false;
+}
+
+/// A sheet's backdrop, which closes the sheet when it is clicked. It is a
+/// panel, dialog or card that does not call itself a button, and it holds the
+/// sheet's own controls, which the keyboard does reach (and Escape closes it
+/// besides). It is the pointer's shortcut and has no reason to be a stop of its
+/// own. A row that merely CONTAINS focusable controls is not one: a note row
+/// holds a like and a reply and still has to be reachable itself.
+fn isBackdrop(widget: canvas.Widget) bool {
+    switch (widget.kind) {
+        .panel, .dialog, .card => {},
+        else => return false,
+    }
+    if (widget.semantics.role != .none) return false;
+    for (widget.children) |child| {
+        if (holdsFocusStop(child)) return true;
+    }
+    return false;
+}
+
+/// Whether a focusable descendant of `widget` is bound to the very press it is.
+/// A note row opens its thread when clicked, and so does the Reply verb inside
+/// it; the row is the pointer's larger target for something the keyboard
+/// already reaches, and a second stop beside it would read the note twice.
+fn hasKeyboardTwin(tree: AppUi.Tree, widget: canvas.Widget, msg: Msg) bool {
+    for (widget.children) |child| {
+        if (canvas.widgetIsFocusable(child)) {
+            if (tree.msgFor(child.id, .press)) |m| {
+                if (std.meta.eql(m, msg)) return true;
+            }
+        }
+        if (hasKeyboardTwin(tree, child, msg)) return true;
+    }
+    return false;
+}
+
+/// Walks one screen and fails on any press the keyboard cannot use. There are
+/// three ways to be out of reach, and the first two shipped: a row bound to a
+/// press with no focus stop (Tab walks past it); a row with a focus stop that is
+/// a layout kind (the toolkit answers Return and Space, and draws a focus ring,
+/// only for its own controls and `list_item`, so a `row` given `focusable` takes
+/// focus, paints nothing and does nothing on either key); and a focus stop that
+/// answers neither key.
+fn expectKeyboardReach(tree: AppUi.Tree, widget: canvas.Widget, screen: []const u8) !void {
+    if (tree.msgFor(widget.id, .press)) |msg| out: {
+        if (widget.state.disabled or widget.semantics.hidden) break :out;
+        // The card inside a sheet swallows presses so the backdrop does not
+        // close it from under you. It is not a control.
+        if (msg == .absorb_press) break :out;
+        if (!canvas.widgetIsFocusable(widget)) {
+            if (isBackdrop(widget) or hasKeyboardTwin(tree, widget, msg)) break :out;
+            std.debug.print(
+                "\n{s}: a {s} \"{s}\" answers a press and the keyboard cannot reach it (build it with pressRow)\n",
+                .{ screen, @tagName(widget.kind), widget.semantics.label },
+            );
+            return error.PressNotReachableByKeyboard;
+        }
+        // An inline link is the toolkit's own text hit-area. It is a focus stop
+        // that draws no ring (upstream), and `keyActivation` is what makes Return
+        // open it. Everything else must be a kind the toolkit rings and answers.
+        const inline_link = widget.kind == .text and widget.semantics.role == .link;
+        for ([_][]const u8{ "enter", "space" }) |name| {
+            const key = canvas.WidgetKeyboardEvent{ .phase = .key_down, .key = name, .focused_id = widget.id };
+            const answered = if (inline_link)
+                main.keyActivation(tree, key) != null
+            else
+                canvas.widgetKeyboardControlIntent(widget, key) != null;
+            if (!answered) {
+                std.debug.print(
+                    "\n{s}: a {s} \"{s}\" takes focus and {s} does nothing on it, and it draws no focus ring (build it with pressRow)\n",
+                    .{ screen, @tagName(widget.kind), widget.semantics.label, name },
+                );
+                return error.FocusedPressDoesNothing;
+            }
+        }
+    }
+    for (widget.children) |child| try expectKeyboardReach(tree, child, screen);
+}
+
+test "every press on every screen can be reached and fired from the keyboard" {
+    // The overflow sweep above visits sixteen screens as a guest. This visits the
+    // ones a signed-in reader sees as well, because most of them are built by
+    // different code: the composer, the notifications page, the profile editor,
+    // the sheets that only open for somebody with a key. A guard that only ever
+    // looked at the guest feed would pass with half the app unreachable.
+    const States = enum { feed, feed_no_reply_verb, thread, thread_nested, thread_no_reply_verb, own_profile, other_profile, bookmarks, settings, settings_editing, notifications, notifications_empty, composing, naming, address, joining, bunker, deleting, menu_scope, menu_relays, menu_account, relay_auth };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/keys.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = [_]u8{0x2f} ** 32;
+    inline for (@typeInfo(States).@"enum".fields) |f| {
+        const st: States = @enumFromInt(f.value);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Signed in, except where the screen is the guest's.
+        if (st == .joining or st == .bunker) main.clearIdentityForTest() else main.setIdentityForTest(me);
+        defer main.clearIdentityForTest();
+        // A reader can take the Reply verb away, and it is the keyboard's usual
+        // way into a thread, so those screens are walked without it as well.
+        main.setHidden(.replies, st == .feed_no_reply_verb or st == .thread_no_reply_verb);
+        defer main.setHidden(.replies, false);
+        defer main.resetInboxForTest();
+        main.resetPlacesForTest();
+        main.resetProfilesForTest();
+        main.clearRelaysForTest();
+        _ = main.addRelayForTest("wss://relay.example.org", true, true);
+        main.seedInboxUnreadForTest(if (st == .notifications_empty) 0 else 3);
+        // A relay that refused something until the reader identifies to it,
+        // whose question sits above the feed with an Allow and a Don't allow.
+        main.resetRelayAuthForTest();
+        defer main.resetRelayAuthForTest();
+        var auth_index: ?usize = null;
+        if (st == .relay_auth) {
+            auth_index = main.addRelayForTest(auth_test_url, true, true) orelse return error.NoSeat;
+            var sess = main.AuthSessionForTest{ .index = auth_index.? };
+            challengeAndRefuse(&sess, auth_test_url, "chal-keys", 0);
+        }
+
+        const model = try arena.create(main.Model);
+        model.* = main.initialModel();
+        model.stage = .ready;
+        model.notes[0] = main.noteWithLinkForTest("https://example.com/a");
+        model.notes_len = 1;
+        switch (st) {
+            .feed, .feed_no_reply_verb, .notifications_empty => {},
+            .thread => {
+                model.viewing_thread = model.notes[0].id;
+                model.thread_root = model.notes[0];
+                model.thread_notes[0] = model.notes[0];
+                model.thread_notes_len = 1;
+            },
+            // A reply with a reply of its own, which draws as a nested row
+            // with no verbs under it.
+            .thread_nested, .thread_no_reply_verb => {
+                model.viewing_thread = model.notes[0].id;
+                model.thread_root = model.notes[0];
+                model.thread_root.event_id = [_]u8{0xAA} ** 32;
+                model.thread_notes[0] = threadNote(0xB1, 200, 0xAA);
+                model.thread_notes[0].id = 61;
+                model.thread_notes[1] = threadNote(0xC1, 300, 0xB1);
+                model.thread_notes[1].id = 62;
+                model.thread_notes_len = 2;
+                main.arrangeThread(model.thread_notes[0..2], model.thread_root.event_id);
+            },
+            .own_profile => model.viewing_profile = me,
+            .other_profile => model.viewing_profile = model.notes[0].pubkey,
+            .bookmarks => model.viewing_bookmarks = true,
+            .settings => model.stage = .settings,
+            .settings_editing => {
+                model.stage = .settings;
+                model.editing_profile = true;
+            },
+            .notifications => model.notifications_open = true,
+            .composing => model.composing = true,
+            .naming => model.naming = true,
+            .address => model.address_open = true,
+            .joining => model.joining = true,
+            .bunker => {
+                model.joining = true;
+                model.bunker_mode = true;
+            },
+            .deleting => model.deleting_note = model.notes[0].id,
+            .menu_scope => model.menu = .scope,
+            .menu_relays => model.menu = .relays,
+            .menu_account => model.menu = .account,
+            .relay_auth => {},
+        }
+        if (st == .notifications_empty) model.notifications_open = true;
+
+        const tree = try buildTree(arena, model);
+        // A screen the setup never reached has nothing to press and passes
+        // the walk below, which reads exactly like coverage.
+        if (countPresses(tree, tree.root) < 8) {
+            std.debug.print("\nthe {s} screen drew {d} presses: it was never reached\n", .{ f.name, countPresses(tree, tree.root) });
+            return error.ScreenNeverReached;
+        }
+        // And the nested reply is on it, or the thread screens walk only the
+        // rows that were already reachable.
+        if ((st == .thread_nested or st == .thread_no_reply_verb) and countPressesOf(tree, tree.root, Msg{ .open_thread = 62 }) == 0) {
+            std.debug.print("\nthe {s} screen drew no nested reply\n", .{f.name});
+            return error.ScreenNeverReached;
+        }
+        if (auth_index) |i| {
+            if (countPressesOf(tree, tree.root, Msg{ .auth_allow = @intCast(i) }) == 0 or
+                countPressesOf(tree, tree.root, Msg{ .auth_deny = @intCast(i) }) == 0)
+            {
+                std.debug.print("\nthe {s} screen drew no AUTH question\n", .{f.name});
+                return error.ScreenNeverReached;
+            }
+        }
+        expectKeyboardReach(tree, tree.root, f.name) catch |err| {
+            std.debug.print("\nthe {s} screen has a press the keyboard cannot use\n", .{f.name});
+            return err;
+        };
+    }
+}
+
+test "return and space press a focused inline link" {
+    // The toolkit puts a Tab stop on every link inside a paragraph and answers
+    // neither key on it, so a reader could tab onto a link in a note and nothing
+    // would happen. `keyActivation` is what presses it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.noteWithLinkForTest("");
+    const body = "see https://example.com/a/page for the details";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes_len = 1;
+    const tree = try buildTree(arena, &model);
+
+    const link = findLinkWidget(tree.root) orelse return error.NoLinkInTheNote;
+    const press = tree.msgFor(link.id, .press) orelse return error.LinkHasNoPress;
+    for ([_][]const u8{ "enter", "space" }) |name| {
+        const key = canvas.WidgetKeyboardEvent{ .phase = .key_down, .key = name, .focused_id = link.id };
+        const got = main.keyActivation(tree, key) orelse return error.KeyDidNotPressTheLink;
+        try testing.expect(std.meta.eql(got, press));
+    }
+    // Only the activation keys, only on key down, and not with a chord.
+    const tab = canvas.WidgetKeyboardEvent{ .phase = .key_down, .key = "tab", .focused_id = link.id };
+    try testing.expect(main.keyActivation(tree, tab) == null);
+    const up = canvas.WidgetKeyboardEvent{ .phase = .key_up, .key = "enter", .focused_id = link.id };
+    try testing.expect(main.keyActivation(tree, up) == null);
+    const chord = canvas.WidgetKeyboardEvent{ .phase = .key_down, .key = "enter", .focused_id = link.id, .modifiers = .{ .super = true } };
+    try testing.expect(main.keyActivation(tree, chord) == null);
+    // And nothing at all when nothing has the keyboard.
+    const nowhere = canvas.WidgetKeyboardEvent{ .phase = .key_down, .key = "enter" };
+    try testing.expect(main.keyActivation(tree, nowhere) == null);
+}
+
+test "a notification's keyboard stop goes where it says" {
+    // The age under a notification is the keyboard's way to what the row opens,
+    // and it is labelled "Open note". A mention that answers nothing has no
+    // target, so the row opens the person instead, and a stop there would be a
+    // third way to the same profile under a label that says otherwise.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xB9} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.forgetFollowsForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    model.notifications_everyone = true;
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    const target = [_]u8{0x7E} ** 32;
+    var target_hex: [64]u8 = undefined;
+    for (target, 0..) |b, i| _ = std.fmt.bufPrint(target_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    // A mention with no note under it: the row opens the person.
+    const mention = [_]nostr.event.Tag{&.{ "p", &me_hex }};
+    _ = main.inboxAddForTest(inboxEvent(1, 0xCA, &mention, 1_800_000_000), 1_800_000_000);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContainingText(tree.root, "mentioned you in a note") != null);
+        try testing.expectEqual(@as(usize, 0), countLabelled(tree.root, "Open note"));
+    }
+
+    // A reply to a note of the reader's: the stop is there and opens that note.
+    const reply = [_]nostr.event.Tag{ &.{ "e", &target_hex, "", "reply" }, &.{ "p", &me_hex } };
+    _ = main.inboxAddForTest(inboxEvent(1, 0xCB, &reply, 1_800_000_100), 1_800_000_100);
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expectEqual(@as(usize, 1), countLabelled(tree.root, "Open note"));
+        try testing.expect(countPressesOf(tree, tree.root, Msg{ .open_event = target }) > 0);
+    }
+}
+
+fn countLabelled(widget: canvas.Widget, label: []const u8) usize {
+    var n: usize = if (canvas.widgetIsFocusable(widget) and std.mem.eql(u8, widget.semantics.label, label)) 1 else 0;
+    for (widget.children) |child| n += countLabelled(child, label);
+    return n;
+}
+
+fn countPressesOf(tree: AppUi.Tree, widget: canvas.Widget, msg: Msg) usize {
+    var n: usize = 0;
+    if (tree.msgFor(widget.id, .press)) |m| {
+        if (std.meta.eql(m, msg)) n += 1;
+    }
+    for (widget.children) |child| n += countPressesOf(tree, child, msg);
+    return n;
+}
+
+fn countPresses(tree: AppUi.Tree, widget: canvas.Widget) usize {
+    var n: usize = if (tree.msgFor(widget.id, .press) != null) 1 else 0;
+    for (widget.children) |child| n += countPresses(tree, child);
+    return n;
+}
+
+fn findLinkWidget(widget: canvas.Widget) ?canvas.Widget {
+    if (widget.kind == .text and widget.semantics.role == .link) return widget;
+    for (widget.children) |child| {
+        if (findLinkWidget(child)) |found| return found;
+    }
+    return null;
 }
 
 test "every way into the app is wired, by name" {
@@ -15288,6 +15613,7 @@ test "no view paints past the right edge at the narrowest the window can be" {
         // note alone accounts for eighteen nodes, which was enough to look like
         // an opened menu.
         if (st == .feed_with_link) base_nodes = p.layout.nodes.len;
+        try expectKeyboardReach(p.tree, p.tree.root, f.name);
         {
             const tk = theme.tokens(main.Model)(model);
             canvas.expectA11yAuditSweepClean(arena_state.allocator(), p.tree.root, .{

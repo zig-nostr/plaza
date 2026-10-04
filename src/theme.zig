@@ -441,6 +441,12 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.accent = p.accent;
             t.colors.accent_text = p.on_accent;
             t.colors.focus_ring = p.border_focus;
+            // The toolkit floors every `list_item` at this height. Every
+            // pressable Plaza builds is one (see `pressRow` in main.zig), and the
+            // pills, links and verbs among them are shorter than that, so the
+            // floor made each of them taller than its content. Rows that were
+            // sized by the floor state `list_row_height`.
+            t.metrics.row_extent = 0;
             t.colors.disabled = p.surface_inset;
 
             // The default scrim is a 10% wash that leans on a backdrop blur for

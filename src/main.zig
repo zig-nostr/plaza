@@ -3826,6 +3826,16 @@ const ancestor_identity_gap: f32 = 4;
 const ancestor_body_lines: usize = 2;
 /// A notification's preview, for the same reason and by the same rule.
 const notification_body_lines: usize = 2;
+
+/// How tall a `list_item` is when its content does not say. The toolkit used to
+/// floor every list row at this, and Plaza's theme no longer lets it (see
+/// `metrics.row_extent` in theme.zig), so a row that was sized by the floor
+/// states it.
+const list_row_height: f32 = 28;
+
+/// The age under a notification, which is also the row's keyboard stop. One line
+/// of the mono meta type.
+const notification_age_height: f32 = 18.1;
 /// A quote is an aside, so it shows four lines of the note it quotes and stops
 /// (11f). Its height is then known where the row around it is priced.
 const quote_body_lines: usize = 4;
@@ -18835,7 +18845,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 // `.list_item` given a background draws none, so the first
                 // version of this button was white text on the card's own
                 // dark surface: present, pressable, and unreadable.
-                ui.row(.{
+                pressRow(ui, .{
                     .grow = 1,
                     .gap = 0,
                     .on_press = Msg.name_save,
@@ -18857,6 +18867,7 @@ fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 hgap(ui, 12),
                 ui.el(.list_item, .{
                     .padding = 0.01,
+                    .height = list_row_height,
                     .on_press = Msg.name_skip,
                     .style = .{ .quiet_hover = true },
                     .semantics = .{ .role = .button, .label = "Skip", .focusable = true },
@@ -19095,6 +19106,7 @@ fn notificationsHeader(ui: *AppUi) AppUi.Node {
             // the bell in a rail the page was covering.
             ui.el(.list_item, .{
                 .padding = 0.01,
+                .height = list_row_height,
                 .cross = .center,
                 .on_press = Msg.close_notifications,
                 .style = .{ .radius = 6, .quiet_hover = true },
@@ -19211,6 +19223,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     };
     const body = item.body();
     const emoji = item.reactionGlyph();
+    const open: Msg = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author };
 
     // Name, verb and amount are SPANS of one paragraph, not three paragraphs.
     // The row is priced in widget nodes against a per-view ceiling that refuses
@@ -19237,6 +19250,7 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     var kids_len: usize = 0;
     kids[kids_len] = ui.el(.list_item, .{
         .padding = 0.01,
+        .height = list_row_height,
         .on_press = Msg{ .open_person = item.author },
         .style = .{ .radius = 4, .quiet_hover = true },
         .semantics = .{ .role = .button, .label = "Open profile", .focusable = true },
@@ -19267,10 +19281,29 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         );
         kids_len += 1;
     }
-    kids[kids_len] = ui.paragraph(
-        .{ .style = .{ .foreground = p.text_faint_alt } },
-        &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
-    );
+    // What the row itself opens, as a stop the keyboard can reach. The row's
+    // paragraphs wrap, and the toolkit measures a wrapping paragraph correctly
+    // only inside a `row` or `data_row`, so the row stays one and cannot take
+    // the focus ring itself. The age sits under the text and is one line, which
+    // a list row measures correctly.
+    //
+    // Only when the row opens a note. A mention that answers nothing has no
+    // target, so the row opens the person, and the name above is already that
+    // stop: a third one to the same profile, called "Open note", would say the
+    // wrong thing about where it goes.
+    const opens_note = item.hasTarget();
+    kids[kids_len] = pressRow(ui, .{
+        .padding = 0.01,
+        .height = notification_age_height,
+        .on_press = if (opens_note) open else null,
+        .style = .{ .radius = 4, .quiet_hover = true },
+        .semantics = if (opens_note) .{ .role = .button, .label = "Open note", .focusable = true } else .{},
+    }, .{
+        ui.paragraph(
+            .{ .style = .{ .foreground = p.text_faint_alt } },
+            &.{.{ .text = inboxAge(ui, item.created_at), .monospace = true, .scale = mono_meta_scale }},
+        ),
+    });
     kids_len += 1;
 
     return ui.column(.{ .gap = 0 }, .{
@@ -19286,9 +19319,9 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
             // always an older note of the reader's own, or a stranger's note the
             // feed would never carry. So the obvious route made the common press
             // a silent no-op. This one asks the store by name.
-            .on_press = if (item.hasTarget()) Msg{ .open_event = item.target_id } else Msg{ .open_person = item.author },
+            .on_press = open,
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = if (verb_text.len > 0) verb_text else "replied to you", .focusable = true },
+            .semantics = .{ .role = .button, .label = if (verb_text.len > 0) verb_text else "replied to you" },
         }, .{
             // The unread dot holds its width either way, so a row does not shift
             // sideways the moment it is read.
@@ -19515,7 +19548,7 @@ fn joinCard(ui: *AppUi, comptime glyph: []const u8, comptime app: bool, title: [
     // `.list_item` carrying a background draws nothing at all (the same rule
     // `modalCard` is built around), so the first version of this card had the
     // recommended rung rendering as invisible white-on-black text.
-    return ui.row(.{
+    return pressRow(ui, .{
         .gap = 0,
         .on_press = press,
         .semantics = .{ .role = if (live) .button else .text, .label = title, .focusable = live },
@@ -19706,6 +19739,7 @@ fn joinLadderCard(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.row(.{ .cross = .center, .gap = 0 }, .{
             ui.el(.list_item, .{
                 .padding = 0.01,
+                .height = list_row_height,
                 .on_press = Msg.close_join,
                 .style = .{ .quiet_hover = true },
                 .autofocus = true,
@@ -20036,6 +20070,7 @@ fn mentionPicker(ui: *AppUi, model: *const Model) AppUi.Node {
         const hexdigits = "0123456789abcdef";
         row.* = ui.el(.list_item, .{
             .padding = 0.01,
+            .height = list_row_height,
             .cross = .center,
             .on_press = Msg{ .insert_mention = c.pubkey },
             .style = .{ .radius = 6, .background = if (i == 0) p.surface_menu_selected else null },
@@ -20158,28 +20193,32 @@ fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.No
             // Switched off stays on screen, dimmed, rather than disappearing:
             // a chip that vanished when pressed would leave nothing to press
             // to bring the person back.
-            kid.* = ui.el(.panel, .{
-                .padding = 0.01,
+            // The press and its focus ring live on the outer row, the chip's
+            // fill and border on the panel inside it: a list row draws a fill
+            // and a ring and no border.
+            kid.* = pressRow(ui, .{
                 .on_press = Msg{ .toggle_mention_off = pubkey },
-                .style = .{
-                    .background = if (off) p.surface_rail_tile else p.surface_input,
-                    .border = p.border_chip,
-                    .radius = 999,
-                    .stroke_width = 1,
-                },
-                .semantics = .{
-                    .role = .button,
-                    .label = if (off) "Not notifying, press to switch back on" else "Notifying, press to switch off",
-                },
+                .style = .{ .radius = 999, .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = if (off) "Not notifying, press to switch back on" else "Notifying, press to switch off", .focusable = true },
             }, .{
-                ui.row(.{ .cross = .center, .gap = 0 }, .{
-                    hgap(ui, 10),
-                    ui.paragraph(
-                        .{ .style = .{ .foreground = if (off) p.text_muted else p.text_secondary } },
-                        &.{.{ .text = clipToChars(personName(ui, pubkey), 14, 42), .scale = stat_scale }},
-                    ),
-                    hgap(ui, 10),
-                    vgap(ui, 24),
+                ui.el(.panel, .{
+                    .padding = 0.01,
+                    .style = .{
+                        .background = if (off) p.surface_rail_tile else p.surface_input,
+                        .border = p.border_chip,
+                        .radius = 999,
+                        .stroke_width = 1,
+                    },
+                }, .{
+                    ui.row(.{ .cross = .center, .gap = 0 }, .{
+                        hgap(ui, 10),
+                        ui.paragraph(
+                            .{ .style = .{ .foreground = if (off) p.text_muted else p.text_secondary } },
+                            &.{.{ .text = clipToChars(personName(ui, pubkey), 14, 42), .scale = stat_scale }},
+                        ),
+                        hgap(ui, 10),
+                        vgap(ui, 24),
+                    }),
                 }),
             });
         }
@@ -21127,7 +21166,7 @@ fn threadEmptyNote(ui: *AppUi) AppUi.Node {
 /// laid out at nothing` measures rather than inspects.
 fn backControl(ui: *AppUi, label: []const u8, press: Msg) AppUi.Node {
     const p = theme.palette;
-    return ui.row(.{
+    return pressRow(ui, .{
         .cross = .center,
         .gap = 3,
         .padding = 4,
@@ -24636,7 +24675,10 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 ui.row(.{ .gap = 6, .cross = .start }, .{
                     identityBlock(ui, note),
                     ui.spacer(1),
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, meta_scale)),
+                    if (isTakenAway(.replies))
+                        threadTime(ui, note, true, .{}, .{ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, meta_scale))})
+                    else
+                        ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, meta_scale)),
                 }),
                 vgap(ui, 5),
                 noteBody(ui, note, true),
@@ -24697,14 +24739,15 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
         // would draw nothing.
         // A `list_item`, which is the kind the renderer washes on hover, given an
         // explicit width so it constrains the body instead of sizing to it.
-        ui.el(.data_row, .{
+        pressRow(ui, .{
             .width = thread_column_width,
             .padding = 0.01,
             // By EVENT id: an ancestor is neither in the feed nor in the open
             // thread's replies, so the render key `open_thread` resolves through
             // would find nothing and the press would quietly do nothing.
             .on_press = Msg{ .open_event = note.event_id },
-            .semantics = .{ .role = .button, .label = "Focus this note" },
+            .style = .{ .radius = 0 },
+            .semantics = .{ .role = .button, .label = "Focus this note", .focusable = true },
         }, .{
             hgap(ui, thread_inset),
             ui.column(.{ .cross = .center, .gap = 0 }, .{
@@ -24940,7 +24983,9 @@ fn nestedReply(ui: *AppUi, note: *const Note, root_author: [32]u8) AppUi.Node {
                         ui.spacer(0),
                     nestedHandle(ui, note),
                     ui.spacer(1),
-                    ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, nested_meta_scale)),
+                    // A nested reply draws no verbs, so its time is the only way
+                    // the keyboard has into it (see `threadTime`).
+                    threadTime(ui, note, true, .{}, .{ui.paragraph(.{ .style = .{ .foreground = p.text_faint_alt } }, timeSpans(ui, note, nested_meta_scale))}),
                 }),
                 vgap(ui, 3),
                 noteBodyAt(ui, note, true, nested_body_scale, p.text_nested),
@@ -24986,14 +25031,15 @@ fn outsideGraphRow(ui: *AppUi, count: usize, open: bool) AppUi.Node {
     // because a `list_item` carries a 28px intrinsic row floor, and this line is
     // a single 18px text line: without it the quiet line grows ten pixels looser
     // than the shot.
-    return ui.el(
-        .data_row,
+    return pressRow(
+        ui,
         .{
             .width = thread_column_width,
             .height = outside_row_extent,
             .padding = 0.01,
             .cross = .center,
             .on_press = .toggle_outside_replies,
+            .style = .{ .radius = 0 },
             // The row is a disclosure, so it says which way it is pointing: the
             // glyph, the verb in the label, and the accessible expanded state.
             .expanded = open,
@@ -25029,12 +25075,13 @@ fn showMoreReplies(ui: *AppUi, hidden: usize) AppUi.Node {
         vgap(ui, 12),
         // Height stated for the same reason as the held line: a `list_item` (the
         // kind that washes) carries a 28px intrinsic floor.
-        ui.el(.data_row, .{
+        pressRow(ui, .{
             .width = thread_column_width,
             .height = show_more_extent - 12 - 10,
             .padding = 0.01,
             .cross = .center,
             .on_press = .show_more_replies,
+            .style = .{ .radius = 0 },
             .semantics = .{ .role = .button, .label = "Show more replies", .focusable = true },
         }, .{
             hgap(ui, 52),
@@ -25055,12 +25102,13 @@ fn branchMore(ui: *AppUi, child: *const Note, deeper: usize) AppUi.Node {
     const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 6),
-        ui.el(.data_row, .{
+        pressRow(ui, .{
             .grow = 1,
             .height = branch_more_extent - 6,
             .padding = 0.01,
             .cross = .center,
             .on_press = Msg{ .open_thread = child.id },
+            .style = .{ .radius = 0 },
             .semantics = .{ .role = .button, .label = "More in this branch", .focusable = true },
         }, .{
             // Indented to the nested rail, so the line reads as part of the branch
@@ -25115,7 +25163,7 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
             hgap(ui, 10),
             // The verb sits beside the field, quiet until there is something to
             // send: an empty reply has nothing to confirm.
-            ui.row(.{
+            pressRow(ui, .{
                 .cross = .center,
                 .gap = 0,
                 // Pressable while it counts even though the field is now empty of
@@ -26593,7 +26641,7 @@ fn railDest(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label:
     const p = theme.palette;
     const tint = if (selected) p.text_primary else p.text_muted;
     const glyph = ui.appIcon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon);
-    return ui.row(.{
+    return pressRow(ui, .{
         .on_press = press,
         .style = .{ .quiet_hover = true },
         .semantics = .{ .role = .button, .label = label, .focusable = true },
@@ -26728,16 +26776,18 @@ fn placeRow(ui: *AppUi, m: *const Place, press: ?Msg, selected: bool) AppUi.Node
     else
         "\u{2022}";
     const tile = placeTileColors(m);
-    return ui.el(.data_row, .{
+    return pressRow(ui, .{
         .width = places_rail_width,
         .height = place_row_height,
         .cross = .center,
         .padding = 0,
         .on_press = press,
+        // Square, as the `data_row` this was drew it: a list row rounds its wash
+        // unless told otherwise.
         .style = if (selected)
-            .{ .background = p.surface_menu_selected }
+            .{ .background = p.surface_menu_selected, .radius = 0 }
         else
-            .{ .quiet_hover = true },
+            .{ .quiet_hover = true, .radius = 0 },
         .semantics = .{
             .role = if (press == null) .none else .button,
             .label = if (press == null) name else ui.fmt("Open {s}", .{name}),
@@ -26811,7 +26861,7 @@ fn tilePlate(ui: *AppUi, style: canvas.WidgetStyle, label: []const u8, glyph: Ap
 fn railBell(ui: *AppUi) AppUi.Node {
     const p = theme.palette;
     const unread = inboxUnread();
-    return ui.el(.data_row, .{
+    return pressRow(ui, .{
         .width = 36,
         .height = 36,
         .main = .center,
@@ -26880,7 +26930,7 @@ fn railTile(ui: *AppUi, comptime icon: []const u8, size: f32, press: Msg, label:
     const p = theme.palette;
     const tint = if (bright) roomVerbInk() else p.text_muted;
     const glyph = ui.icon(.{ .width = size, .height = size, .style = .{ .foreground = tint } }, icon);
-    return ui.row(.{
+    return pressRow(ui, .{
         .on_press = press,
         .style = .{ .quiet_hover = true },
         .semantics = .{ .role = .button, .label = label, .focusable = true },
@@ -26912,7 +26962,7 @@ fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
     // branch and the payload cannot disagree: with no identity there is no
     // `.open_person` carrying thirty-two bytes that belong to nobody.
     const press: Msg = if (activePubkey()) |me| Msg{ .open_person = me } else .open_join;
-    return ui.el(.data_row, .{
+    return pressRow(ui, .{
         .on_press = press,
         // The tile's own box, stated. Left unsized, this row measured ZERO wide
         // (a `data_row` hugs its content and the seat inside it is centred, not
@@ -26925,7 +26975,7 @@ fn railYou(ui: *AppUi, guest: bool) AppUi.Node {
         .cross = .center,
         .padding = 0,
         .style = .{ .quiet_hover = true },
-        .semantics = .{ .label = "You" },
+        .semantics = .{ .role = .button, .label = "You", .focusable = true },
     }, .{
         // The same 36x36 centring box every other rail tile uses. Without it the
         // 28px seat sat at the row's natural position while the 36px glyph tiles
@@ -27033,11 +27083,11 @@ fn guestBanner(ui: *AppUi, model: *const Model) AppUi.Node {
                 // U+2715 codepoint is outside Geist's coverage, rendered tofu).
                 // Padded well past the 12px glyph: the target is the press, not the
                 // drawing.
-                ui.row(.{
+                pressRow(ui, .{
                     .padding = 6,
                     .on_press = .dismiss_guest_strip,
                     .style = .{ .quiet_hover = true },
-                    .semantics = .{ .role = .button, .label = "Dismiss" },
+                    .semantics = .{ .role = .button, .label = "Dismiss", .focusable = true },
                 }, .{
                     ui.icon(.{ .width = 12, .height = 12, .style = .{ .foreground = p.text_faint_alt } }, "x"),
                 }),
@@ -27570,7 +27620,7 @@ fn placeHeader(ui: *AppUi, model: *const Model, m: *const Place) AppUi.Node {
                 ui.spacer(0)
             else if (m.feeds_len > 1)
                 ui.stack(.{}, .{
-                    ui.row(.{
+                    pressRow(ui, .{
                         .cross = .center,
                         .gap = 5,
                         .on_press = Msg{ .toggle_menu = .place_feed },
@@ -27638,7 +27688,7 @@ fn scopeHeader(ui: *AppUi, model: *const Model) AppUi.Node {
             // The name AND its chevron are the trigger, so the menu opens under
             // the word it names rather than off a 11px glyph.
             ui.stack(.{}, .{
-                ui.row(.{
+                pressRow(ui, .{
                     .cross = .center,
                     .gap = 7,
                     .on_press = Msg{ .toggle_menu = .scope },
@@ -27957,7 +28007,7 @@ fn menuRow(ui: *AppUi, label: []const u8, glyph: ?[]const u8, hint: ?[]const u8,
     // (the rows measured 330x32 and painted nothing at all). So a menu row has
     // no hover state until that is understood; the design specifies a SELECTED
     // row surface, which is a different state and is drawn.
-    return ui.row(.{
+    return pressRow(ui, .{
         .cross = .center,
         .gap = 0,
         .on_press = press,
@@ -28287,7 +28337,7 @@ fn updateBanner(ui: *AppUi) AppUi.Node {
                             hgap(ui, 8),
                             // The verb, and it says where it goes rather than
                             // "Update": nothing here updates anything.
-                            ui.row(.{
+                            pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
                                 .on_press = Msg.open_update,
@@ -28300,7 +28350,7 @@ fn updateBanner(ui: *AppUi) AppUi.Node {
                                 ),
                             }),
                             hgap(ui, 12),
-                            ui.row(.{
+                            pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
                                 .on_press = Msg.dismiss_update,
@@ -28369,7 +28419,7 @@ fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                                 }},
                             ),
                             hgap(ui, 8),
-                            ui.row(.{
+                            pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
                                 .on_press = Msg{ .auth_allow = @intCast(index) },
@@ -28382,7 +28432,7 @@ fn relayAuthBanner(ui: *AppUi) AppUi.Node {
                                 ),
                             }),
                             hgap(ui, 12),
-                            ui.row(.{
+                            pressRow(ui, .{
                                 .cross = .center,
                                 .gap = 0,
                                 .on_press = Msg{ .auth_deny = @intCast(index) },
@@ -28695,7 +28745,7 @@ fn statusChip(ui: *AppUi, chip: StatusChip) AppUi.Node {
         })
     else
         ui.row(.{ .cross = .center, .gap = 0 }, .{ hgap(ui, 8), body, hgap(ui, 8) });
-    return ui.row(.{
+    return pressRow(ui, .{
         .cross = .center,
         .on_press = chip.press,
         .style = .{ .quiet_hover = true },
@@ -28785,7 +28835,7 @@ fn pillButton(ui: *AppUi, label: []const u8, press: Msg, filled: bool, on_surfac
     // The fill and the outline live on a `.panel`: a row paints no background at
     // all (the renderer draws nothing for the layout kinds), which is why the
     // filled pill was reading as dark-on-dark text with no button under it.
-    return ui.row(.{
+    return pressRow(ui, .{
         .on_press = press,
         .style = .{ .quiet_hover = true },
         .semantics = .{ .role = .button, .label = label, .focusable = true },
@@ -28882,6 +28932,45 @@ const identity_text_width: f32 = picture_column_width - 6 - time_column_width;
 const profile_name_max: usize = 28;
 const profile_band_name_max: usize = 32;
 const profile_handle_max: usize = 34;
+
+/// A row that answers a press, built so the keyboard can use it.
+///
+/// A `row`, a `column` or a `data_row` with an `on_press` answers a click and
+/// nothing else. The toolkit gives Tab a stop, a focus ring and a Return or
+/// Space activation to its own controls and to `list_item`, and the layout kinds
+/// get none of the three: Tab can land on one, nothing is drawn, and the key
+/// does nothing. So every hand-built pressable is a `list_item`, which is the
+/// toolkit's row-with-children, and this is the one place that says so. A row
+/// with no press stays a plain row, because a statement is not a stop.
+///
+/// `list_item` insets its children by default, which a row never did, so the
+/// padding is zeroed unless the caller states one. Its height floor is the
+/// toolkit's row height; a caller whose row is shorter gives it a `height`.
+fn pressRow(ui: *AppUi, options: AppUi.ElementOptions, children: anytype) AppUi.Node {
+    if (options.on_press == null) return ui.row(options, children);
+    var o = options;
+    if (o.padding == null) o.padding = 0.01;
+    return ui.el(.list_item, o, children);
+}
+
+/// A note's time, made the keyboard's way into the note's thread when nothing
+/// else in the row is.
+///
+/// A row whose body wraps stays a `data_row` (see `pressRow`), so the row is the
+/// pointer's target and cannot be a stop of its own. The Reply verb under the
+/// note opens the same thread and is the stop. Where there is no Reply verb (a
+/// nested reply never draws one, and a reader can take the verb away) the time
+/// is, so no thread can be opened by the pointer alone. With `stop` false this
+/// is the plain row it always was.
+fn threadTime(ui: *AppUi, note: *const Note, stop: bool, options: AppUi.ElementOptions, children: anytype) AppUi.Node {
+    var o = options;
+    if (stop) {
+        o.on_press = Msg{ .open_thread = note.id };
+        o.style = .{ .radius = 4, .quiet_hover = true };
+        o.semantics = .{ .role = .button, .label = "Open thread", .focusable = true };
+    }
+    return pressRow(ui, o, children);
+}
 
 /// Fixed empty space along ONE axis. `ui.spacer(n)` takes a GROW factor, not a
 /// size, so it cannot express an inset; these are the sized counterparts, used
@@ -29047,13 +29136,12 @@ fn engagementRowAt(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
     const c = engagementFor(note.id);
     return ui.row(.{ .gap = 0, .cross = .center }, .{
         // Reply opens the note's thread, where the pinned composer answers it.
-        // A plain pressable row, never a `.list_item`: that kind carries a 28px
-        // intrinsic height floor and its padding walks the cluster off the rail
-        // the disc, name and body share.
+        // It is also the keyboard's way into that thread, because the note row
+        // around it is a pointer target only (see `threadTime`).
         if (isTakenAway(.replies)) ui.spacer(0) else verbSlot(ui, verbWithCount(ui, ui.appIcon(glyph, "reply"), if (counts and !countHidden(.replies, .reply_counts)) c.replies else 0, p.text_metric, .{
             .on_press = Msg{ .open_thread = note.id },
             .style = .{ .quiet_hover = true },
-            .semantics = .{ .role = .button, .label = "Reply" },
+            .semantics = .{ .role = .button, .label = "Reply", .focusable = true },
         })),
         if (isTakenAway(.reposts)) ui.spacer(0) else verbSlot(ui, repostAction(ui, note, c, counts)),
         if (isTakenAway(.reactions)) ui.spacer(0) else verbSlot(ui, likeAction(ui, note, counts)),
@@ -29092,7 +29180,7 @@ fn verbWithCount(ui: *AppUi, glyph: AppUi.Node, count: u64, color: canvas.Color,
     var opts = options;
     opts.gap = 6;
     opts.cross = .center;
-    return ui.row(opts, .{kids[0..n]});
+    return pressRow(ui, opts, .{kids[0..n]});
 }
 
 /// A count beside an action icon, or nothing at zero (so the icon stands alone
@@ -29401,7 +29489,7 @@ fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink:
     if (long) {
         // A deeper hit target than the row's open-thread press, so tapping it
         // toggles the fold rather than opening the thread.
-        kids[n] = ui.el(.data_row, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more" } }, .{
+        kids[n] = pressRow(ui, .{ .on_press = Msg{ .toggle_expand = note.id }, .padding = 2, .style = .{ .quiet_hover = true }, .semantics = .{ .role = .button, .label = if (expanded) "Show less" else "Show more", .focusable = true } }, .{
             ui.text(.{ .size = .sm, .style = .{ .foreground = p.text_secondary } }, if (expanded) "Show less" else "Show more"),
         });
         n += 1;
@@ -29926,12 +30014,12 @@ fn quoteAside(ui: *AppUi, id: ?[32]u8, body: AppUi.Node) AppUi.Node {
             // does not: the width-aware measurer has no case for that kind, so a
             // wrapping quote body would measure one line tall and draw over the
             // verbs under it.
-            ui.row(.{
+            pressRow(ui, .{
                 .grow = 1,
                 // By EVENT id, read straight from the store: a quoted note is in
                 // neither the feed nor the open thread's replies.
                 .on_press = Msg{ .open_event = event_id },
-                .semantics = .{ .role = .button, .label = "Quoted note" },
+                .semantics = .{ .role = .button, .label = "Quoted note", .focusable = true },
             }, .{inner})
         else
             inner,
@@ -30290,7 +30378,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                             // same metrics it paints with, so a name that does
                             // not fit ends in an ellipsis instead of moving the
                             // furniture.
-                            ui.row(.{ .gap = 0, .width = time_column_width }, .{
+                            threadTime(ui, note, isTakenAway(.replies), .{ .gap = 0, .width = time_column_width }, .{
                                 ui.spacer(1),
                                 ui.paragraph(
                                     .{
@@ -30638,7 +30726,7 @@ fn quoteSkeleton(ui: *AppUi) AppUi.Node {
 fn pictureFailedBox(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
     const p = theme.palette;
     const host = urlHost(note.imageUrl());
-    return ui.el(.data_row, .{
+    return pressRow(ui, .{
         .width = pictureWidth(note),
         .height = height,
         .padding = 0,
@@ -30670,7 +30758,7 @@ fn pictureFailedBox(ui: *AppUi, note: *const Note, height: f32) AppUi.Node {
 /// over the corners. A `data_row` lays children out horizontally, so the chips
 /// ride a stack: there is no way to place a child at a point.
 fn pictureBox(ui: *AppUi, note: *const Note, height: f32, content: AppUi.Node) AppUi.Node {
-    return ui.el(.data_row, .{
+    return pressRow(ui, .{
         .width = pictureWidth(note),
         .height = height,
         .padding = 0,
@@ -31231,6 +31319,35 @@ fn onCommand(name: []const u8) ?Msg {
 
 pub fn onCommandForTest(name: []const u8) ?Msg {
     return onCommand(name);
+}
+
+/// The running app, so the key handler can read the tree the window is showing.
+/// Set once in `main`, read only from the thread that delivers keys.
+var g_app: ?*PlazaApp = null;
+
+/// What Return or Space does to a focused widget the toolkit has no answer for.
+///
+/// The toolkit answers those two keys for its own controls and for `list_item`
+/// (see `pressRow`), and for nothing else. The one thing it focuses and then
+/// ignores is an inline link in a paragraph: Tab lands on a link in a note, and
+/// Return does nothing. This is the one place that says what the key means
+/// there, and it is what a click means: the widget's own press.
+///
+/// Disabled widgets are skipped, and so are the editable kinds, where Space and
+/// Return are typing.
+pub fn keyActivation(tree: AppUi.Tree, keyboard: canvas.WidgetKeyboardEvent) ?Msg {
+    if (keyboard.phase != .key_down or keyboard.modifiers.hasNavigationModifier()) return null;
+    if (!canvas.isWidgetActivationKey(keyboard.key)) return null;
+    const id = keyboard.focused_id orelse return null;
+    const widget = tree.findWidget(id) orelse return null;
+    if (widget.state.disabled or canvas.isWidgetTextEntry(widget)) return null;
+    return tree.msgFor(id, .press);
+}
+
+fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
+    const app = g_app orelse return null;
+    const tree = app.tree orelse return null;
+    return keyActivation(tree, keyboard);
 }
 const Effects = PlazaApp.Effects;
 /// The effects type, exported so tests can exercise the fx-free slot paths.
@@ -38928,6 +39045,7 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .view = appView,
         .on_command = onCommand,
+        .on_key = onKey,
         // On macOS: none. The typography tokens sit on the BUILT-IN ids (the
         // toolkit's default sans IS Geist), which is the only routing that
         // gives span weights real medium and bold faces, and `registerFontFaces`
@@ -38941,6 +39059,7 @@ pub fn main(init: std.process.Init) !void {
         .tokens_fn = theme.tokens(Model),
     });
     defer app_state.destroy();
+    g_app = app_state;
     app_state.model = initialModel();
     // Guest-first: the app opens INTO the feed, never a welcome wall. A
     // restored session is signed straight back in; a newcomer browses as a
