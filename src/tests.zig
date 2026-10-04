@@ -24209,3 +24209,753 @@ test "hiding replies stops asking relays for comments too" {
         try testing.expect(k != 1);
     }
 }
+
+// ---- NIP-36 content warnings --------------------------------------------------
+
+fn warnedEvent(id_byte: u8, content: []const u8, tags: []const nostr.event.Tag) nostr.event.Event {
+    return .{
+        .id = [_]u8{id_byte} ** 32,
+        .pubkey = [_]u8{0x61} ** 32,
+        .created_at = 1_800_000_000,
+        .kind = 1,
+        .tags = tags,
+        .content = content,
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+test "the content-warning tag is read with a reason, without one, and when malformed" {
+    // The TAG is the warning, not the sentence in it. A bare tag, an empty reason
+    // and a reason with a control character in it all ask for the note to be
+    // covered, and only the first of those has no words to show.
+    const none = [_]nostr.event.Tag{&.{ "t", "nostr" }};
+    try testing.expect(main.contentWarningIn(&none) == null);
+
+    const with_reason = [_]nostr.event.Tag{&.{ "content-warning", "  spoilers  " }};
+    try testing.expectEqualStrings("spoilers", main.contentWarningIn(&with_reason).?);
+
+    const bare = [_]nostr.event.Tag{&.{"content-warning"}};
+    try testing.expectEqualStrings("", main.contentWarningIn(&bare).?);
+
+    const empty = [_]nostr.event.Tag{&.{ "content-warning", "" }};
+    try testing.expectEqualStrings("", main.contentWarningIn(&empty).?);
+
+    const control = [_]nostr.event.Tag{&.{ "content-warning", "bad\x00reason" }};
+    try testing.expectEqualStrings("", main.contentWarningIn(&control).?);
+
+    // Clipped on a character boundary: 60 three-byte characters cannot be cut
+    // through the middle of one.
+    const long = [_]nostr.event.Tag{&.{ "content-warning", "日本語" ** 20 }};
+    const clipped = main.contentWarningIn(&long).?;
+    try testing.expect(clipped.len < ("日本語" ** 20).len);
+    try testing.expect(std.unicode.utf8ValidateSlice(clipped));
+}
+
+test "a note carries its author's content warning and the reason they gave" {
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    const warned = main.noteFrom(warnedEvent(0xC0, "the butler did it", &tags), 1_800_000_100);
+    try testing.expect(warned.warned);
+    try testing.expectEqualStrings("spoilers", warned.warning());
+
+    const plain = main.noteFrom(warnedEvent(0xC1, "good morning", &.{}), 1_800_000_100);
+    try testing.expect(!plain.warned);
+    try testing.expectEqual(@as(usize, 0), plain.warning().len);
+}
+
+test "a covered note shows who wrote it and why, and nothing it says or points at" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    // Previews off so a press that uncovers a picture asks for nothing: a test
+    // cannot construct a usable effect table.
+    const previews_were = main.mediaPreviews();
+    main.setMediaPreviews(false);
+    defer main.setMediaPreviews(previews_were);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const first_tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    const second_tags = [_]nostr.event.Tag{&.{"content-warning"}};
+    model.notes[0] = main.noteFrom(warnedEvent(0xC2, "FIRSTSECRET https://example.com/a.jpg", &first_tags), 1_800_000_100);
+    model.notes[1] = main.noteFrom(warnedEvent(0xC3, "SECONDSECRET", &second_tags), 1_800_000_100);
+    model.notes[2] = main.noteFrom(warnedEvent(0xC4, "PLAINWORDS", &.{}), 1_800_000_100);
+    model.notes_len = 3;
+
+    const before = try buildTree(arena, &model);
+    // The words are not in the tree at all, so they cannot be read, copied from
+    // the accessibility tree or drawn by a later change that forgets to check.
+    try testing.expect(!findAnyTextContaining(before.root, "FIRSTSECRET"));
+    try testing.expect(!findAnyTextContaining(before.root, "SECONDSECRET"));
+    try testing.expect(findAnyTextContaining(before.root, "PLAINWORDS"));
+    // The reason, when there is one, and the plain notice when there is not.
+    try testing.expect(findAnyTextContaining(before.root, "Content warning: spoilers"));
+    try testing.expect(findAnyText(before.root, "Content warning") != null);
+    try testing.expectEqual(@as(usize, 2), countByLabel(before.root, "Show this note"));
+    // And no picture: not drawn, and not offered as one to load either.
+    try testing.expectEqual(@as(usize, 0), countByLabel(before.root, "Attached image, press to enlarge"));
+    try testing.expectEqual(@as(usize, 0), countByLabel(before.root, "Load this image"));
+
+    // Pressing uncovers THAT note and no other.
+    const msg = pressMsgByLabel(before, "Show this note") orelse return error.NothingToPress;
+    switch (msg) {
+        .uncover_note => |key| try testing.expectEqual(model.notes[0].id, key),
+        else => return error.WrongPress,
+    }
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, msg, &fx);
+
+    const after = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContaining(after.root, "FIRSTSECRET"));
+    try testing.expect(!findAnyTextContaining(after.root, "SECONDSECRET"));
+    try testing.expectEqual(@as(usize, 1), countByLabel(after.root, "Show this note"));
+    // The picture is now offered, which means it was not before.
+    try testing.expectEqual(@as(usize, 1), countByLabel(after.root, "Load this image"));
+}
+
+test "the setting for readers who would rather see everything is off, and does what it says" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    // The default, before anything has touched it.
+    try testing.expect(!main.showSensitive());
+    defer main.setShowSensitive(false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    model.notes[0] = main.noteFrom(warnedEvent(0xC5, "OPENLYSHOWN", &tags), 1_800_000_100);
+    model.notes_len = 1;
+
+    try testing.expect(main.noteCovered(&model.notes[0]));
+    main.setShowSensitive(true);
+    try testing.expect(!main.noteCovered(&model.notes[0]));
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContaining(tree.root, "OPENLYSHOWN"));
+    try testing.expectEqual(@as(usize, 0), countByLabel(tree.root, "Show this note"));
+}
+
+test "uncovering a note does not persist and does not leak to another" {
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    const a = main.noteFrom(warnedEvent(0xC6, "a", &tags), 1_800_000_100);
+    const b = main.noteFrom(warnedEvent(0xC7, "b", &tags), 1_800_000_100);
+    try testing.expect(main.noteCovered(&a));
+    try testing.expect(main.noteCovered(&b));
+    main.uncoverNoteForTest(a.id);
+    try testing.expect(!main.noteCovered(&a));
+    try testing.expect(main.noteCovered(&b));
+    // Session only: a new launch starts with the set empty.
+    main.forgetUncoveredForTest();
+    try testing.expect(main.noteCovered(&a));
+}
+
+/// How many fetches a fake effect table has recorded.
+fn recordedFetches(fx: *main.EffectsForTest) usize {
+    return fx.pendingFetchCount();
+}
+
+test "a covered note's pictures are not fetched, and are once it is uncovered" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.resetWarmForTest();
+    defer main.resetWarmForTest();
+    main.clearLinkPreviewsForTest();
+    defer main.clearLinkPreviewsForTest();
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    // Previews ON, which is the case that matters: the note is covered and
+    // nothing else is stopping the request. The proxy is off so the address a
+    // fetch would go to is the note's own.
+    const previews_were = main.mediaPreviews();
+    main.setMediaPreviews(true);
+    defer main.setMediaPreviews(previews_were);
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaProxyOn(false);
+    defer main.setMediaProxyOn(proxy_was);
+
+    // A real effect table in its fake mode: requests are recorded, never sent.
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const picture = "https://example.com/private.jpg";
+    const page = "https://example.org/article";
+    var model = main.initialModel();
+    model.stage = .ready;
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "nudity" }};
+    model.notes[0] = main.noteFrom(warnedEvent(0xC8, picture ++ " " ++ page, &tags), 1_800_000_100);
+    model.notes_len = 1;
+    try testing.expect(model.notes[0].hasImage());
+    try testing.expect(model.notes[0].hasLink());
+    _ = try painted.Painted.render(arena, &model);
+
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    main.scanLinkFetchesForTest(&fx, &model);
+    // No slot was ever claimed for it, so nothing was requested.
+    try testing.expect(main.mediaSlotWantedForTest(model.notes[0].id) == null);
+    try testing.expect(!main.linkRequestedForTest(page));
+    try testing.expectEqual(@as(usize, 0), recordedFetches(&fx));
+
+    // The positive control: the same note, uncovered, is asked for. Without it
+    // the assertions above would pass for a note that could never be fetched.
+    main.uncoverNoteForTest(model.notes[0].id);
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    main.scanLinkFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotWantedForTest(model.notes[0].id) != null);
+    try testing.expect(main.linkRequestedForTest(page));
+    try testing.expect(recordedFetches(&fx) >= 2);
+}
+
+test "warming ahead skips a covered note and fetches the same note once uncovered" {
+    main.resetWarmForTest();
+    defer main.resetWarmForTest();
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    const previews_were = main.mediaPreviews();
+    main.setMediaPreviews(true);
+    defer main.setMediaPreviews(previews_were);
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaProxyOn(false);
+    defer main.setMediaProxyOn(proxy_was);
+    defer main.setVisibleRangeForTest(0, 0);
+
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Twenty plain rows, with the note under test just below the screen, inside
+    // the band that is warmed.
+    var model = main.initialModel();
+    model.stage = .ready;
+    for (0..20) |i| {
+        model.notes[i] = main.noteFrom(warnedEvent(@intCast(0x40 + i), "plain", &.{}), 1_800_000_100);
+        model.notes[i].id = @intCast(500 + i);
+    }
+    model.notes_len = 20;
+    main.setVisibleRangeForTest(0, 2);
+    const at = model.visibleRange().last + 1;
+    try testing.expect(at <= model.prefetchRange().last);
+    const picture = "https://example.com/below.jpg";
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "graphic" }};
+    model.notes[at] = main.noteFrom(warnedEvent(0xE0, picture, &tags), 1_800_000_100);
+    model.notes[at].id = 900;
+    try testing.expect(model.notes[at].hasImage());
+
+    main.warmAheadForTest(&fx, &model);
+    try testing.expect(!main.pictureWarmedForTest(picture));
+    try testing.expectEqual(@as(usize, 0), recordedFetches(&fx));
+
+    main.uncoverNoteForTest(model.notes[at].id);
+    main.warmAheadForTest(&fx, &model);
+    try testing.expect(main.pictureWarmedForTest(picture));
+    try testing.expectEqual(@as(usize, 1), recordedFetches(&fx));
+}
+
+test "a covered row is priced as the chip it draws" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    const previews_were = main.mediaPreviews();
+    main.setMediaPreviews(true);
+    defer main.setMediaPreviews(previews_were);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    const long = "a long note that would run to several lines if it were drawn, " ** 6 ++ " https://example.com/tall.jpg";
+    model.notes[0] = main.noteFrom(warnedEvent(0xC9, long, &tags), 1_800_000_100);
+    model.notes_len = 1;
+
+    const covered_price = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    const p = try painted.Painted.render(arena, &model);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    // The same standing slack every estimate here carries: characters against a
+    // column width where the engine measures glyphs.
+    if (@abs(rows[0].height - covered_price) > 1.5 * main.body_line_height) {
+        std.debug.print("\ncovered row draws {d}, priced {d}\n", .{ rows[0].height, covered_price });
+        return error.CoveredRowMispriced;
+    }
+
+    // And it is a real saving over the note it covers.
+    main.setShowSensitive(true);
+    defer main.setShowSensitive(false);
+    const open_price = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    try testing.expect(open_price > covered_price + 3 * main.body_line_height);
+}
+
+test "a thread covers the note it is about and the replies under it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    const root_tags = [_]nostr.event.Tag{&.{ "content-warning", "graphic" }};
+    model.thread_root = main.noteFrom(warnedEvent(0xCA, "ROOTSECRET https://example.com/root.jpg", &root_tags), 1_800_000_100);
+    model.viewing_thread = model.thread_root.id;
+
+    var reply_ev = warnedEvent(0xCB, "REPLYSECRET", &.{&.{ "content-warning", "also graphic" }});
+    reply_ev.created_at = 1_800_000_200;
+    model.thread_notes[0] = main.noteFrom(reply_ev, 1_800_000_300);
+    model.thread_notes[0].reply_parent = model.thread_root.event_id;
+    model.thread_notes[0].has_reply_parent = true;
+    model.thread_notes[0].depth = 1;
+    model.thread_notes_len = 1;
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(!findAnyTextContaining(tree.root, "ROOTSECRET"));
+    try testing.expect(!findAnyTextContaining(tree.root, "REPLYSECRET"));
+    try testing.expect(findAnyTextContaining(tree.root, "Content warning: graphic"));
+    try testing.expect(findAnyTextContaining(tree.root, "Content warning: also graphic"));
+    try testing.expectEqual(@as(usize, 0), countByLabel(tree.root, "Attached image, press to enlarge"));
+}
+
+test "an ancestor above a thread is covered too" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    const Build = struct {
+        var ancestor: main.Ancestor = undefined;
+        fn row(ui: *main.AppUi) main.AppUi.Node {
+            return main.ancestorRowForTest(ui, &ancestor, true);
+        }
+    };
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    Build.ancestor = .{ .note = main.noteFrom(warnedEvent(0xCC, "ANCESTORSECRET", &tags), 1_800_000_100) };
+
+    var ui = main.AppUi.init(arena);
+    const tree = try ui.finalize(Build.row(&ui));
+    try testing.expect(!findAnyTextContaining(tree.root, "ANCESTORSECRET"));
+    try testing.expect(findAnyTextContaining(tree.root, "Content warning: spoilers"));
+}
+
+test "a quote card, a reply line and a quoting pill do not repeat a covered note" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    const quoted_id = [_]u8{0x5f} ** 32;
+    main.seedQuoteForTest(quoted_id, [_]u8{0x7a} ** 32, 100, "QUOTEDSECRET");
+    main.warnQuoteForTest(quoted_id, "spoilers");
+
+    // The card inside a feed row.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA2, 100, 0);
+    model.notes[0].id = 8;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContaining(tree.root, "Look at this."));
+    try testing.expect(!findAnyTextContaining(tree.root, "QUOTEDSECRET"));
+    try testing.expect(findAnyTextContaining(tree.root, "Content warning: spoilers"));
+
+    // The line above a reply.
+    var reply = main.Note{};
+    reply.id = 9;
+    reply.reply_parent = quoted_id;
+    reply.has_reply_parent = true;
+    const line = try main.buildReplyContextForTest(arena, &reply);
+    try testing.expect(std.mem.indexOf(u8, line, "QUOTEDSECRET") == null);
+    try testing.expect(std.mem.indexOf(u8, line, "reply to") != null);
+
+    // The pill that walks into a quote of a quote.
+    var ui = main.AppUi.init(arena);
+    const label = main.quotingPillLabelForTest(&ui, quoted_id);
+    try testing.expect(std.mem.indexOf(u8, label, "QUOTEDSECRET") == null);
+
+    // Uncovering the note anywhere uncovers it here: it is one note.
+    main.uncoverNoteForTest(main.feedKeyForTest(quoted_id));
+    const open_line = try main.buildReplyContextForTest(arena, &reply);
+    try testing.expect(std.mem.indexOf(u8, open_line, "QUOTEDSECRET") != null);
+}
+
+test "a notification covers the words of a covered note and uncovers on a press" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    const tags = [_]nostr.event.Tag{&.{ "content-warning", "spoilers" }};
+    const ev = warnedEvent(0xCD, "NOTIFYSECRET", &tags);
+    var item = main.InboxItem{ .used = true, .author = ev.pubkey, .verb = .reply, .created_at = ev.created_at };
+    main.bakeBodyForTest(&item, ev);
+    try testing.expect(item.warned);
+
+    var ui = main.AppUi.init(arena);
+    const tree = try ui.finalize(main.notificationRowForTest(&ui, &item));
+    try testing.expect(!findAnyTextContaining(tree.root, "NOTIFYSECRET"));
+    try testing.expect(findAnyTextContaining(tree.root, "Content warning: spoilers"));
+    const msg = pressMsgByLabel(tree, "Show this note") orelse return error.NothingToPress;
+    switch (msg) {
+        .uncover_note => |key| try testing.expectEqual(main.noteIdOf(ev), key),
+        else => return error.WrongPress,
+    }
+
+    main.uncoverNoteForTest(main.noteIdOf(ev));
+    var ui2 = main.AppUi.init(arena);
+    const open = try ui2.finalize(main.notificationRowForTest(&ui2, &item));
+    try testing.expect(findAnyTextContaining(open.root, "NOTIFYSECRET"));
+}
+
+test "the composer can set a content warning, with or without a reason" {
+    main.setIdentityForTest([_]u8{0x34} ** 32);
+    defer main.clearIdentityForTest();
+    var fx: main.EffectsForTest = undefined;
+
+    // With a reason.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.composing = true;
+        main.clearLastPublishedTagsForTest();
+        model.draft_buffer.set("a note I want covered");
+        model.warn_on = true;
+        model.warn_buffer.set("  nudity  ");
+        try testing.expect(main.submitPostForTest(&model, &fx));
+        const tag = tagNamed(main.lastPublishedTagsForTest(), "content-warning") orelse return error.NoWarningTag;
+        try testing.expectEqual(@as(usize, 2), tag.len);
+        try testing.expectEqualStrings("nudity", tag[1]);
+        // One warning per note: the next one starts clean.
+        try testing.expect(!model.warn_on);
+        try testing.expectEqual(@as(usize, 0), model.warn_draft().len);
+    }
+    // On with no reason: still a tag, because the tag is what covers it.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.composing = true;
+        main.clearLastPublishedTagsForTest();
+        model.draft_buffer.set("covered, no reason given");
+        model.warn_on = true;
+        try testing.expect(main.submitPostForTest(&model, &fx));
+        const tag = tagNamed(main.lastPublishedTagsForTest(), "content-warning") orelse return error.NoWarningTag;
+        try testing.expectEqualStrings("", tag[1]);
+    }
+    // Off: no tag at all, even with text left in the reason field.
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.composing = true;
+        main.clearLastPublishedTagsForTest();
+        model.draft_buffer.set("an ordinary note");
+        model.warn_buffer.set("stale reason");
+        try testing.expect(main.submitPostForTest(&model, &fx));
+        try testing.expect(tagNamed(main.lastPublishedTagsForTest(), "content-warning") == null);
+    }
+}
+
+test "a draft handed back after a failed sign keeps its content warning" {
+    // A note whose warning did not come back with it is one press from going out
+    // uncovered.
+    main.setIdentityForTest([_]u8{0x4e} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    model.draft_buffer.set("the sentence I actually wanted to publish");
+    model.warn_on = true;
+    model.warn_buffer.set("spoilers");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expect(model.draft_empty());
+    try testing.expect(!model.warn_on);
+
+    main.handleHelperSignedForTest(.{ .key = 0, .outcome = .ok, .status = 409, .body = "" });
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("the sentence I actually wanted to publish", model.draft());
+    try testing.expect(model.warn_on);
+    try testing.expectEqualStrings("spoilers", model.warn_draft());
+}
+
+test "settings offers the switch and says what it does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setShowSensitive(false);
+    defer main.setShowSensitive(false);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.stage = .settings;
+    const tree = try buildTree(arena, &model);
+    const switch_label = "Show sensitive notes without a warning";
+    try testing.expect(findByLabel(tree.root, switch_label) != null);
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .sensitive_toggle, &fx);
+    try testing.expect(main.showSensitive());
+    main.update(&model, .sensitive_toggle, &fx);
+    try testing.expect(!main.showSensitive());
+}
+
+test "a draft handed back by a timed-out sign has the warning it was signed with" {
+    // Several signs can be out at once with a remote signer. The warning rides
+    // with each one, so the draft that comes back gets its own, not whichever
+    // post was submitted last.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.setIdentityForTest([_]u8{0x4d} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var fx: main.EffectsForTest = undefined;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    // First post, warned. Second post, not.
+    model.draft_buffer.set("first, behind a warning");
+    model.warn_on = true;
+    model.warn_buffer.set("spoilers");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    model.draft_buffer.set("second, nothing to warn about");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+
+    // The first one times out. The second is still with the signer.
+    try testing.expect(main.failPendingByContentForTest("first, behind a warning"));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("first, behind a warning", model.draft());
+    try testing.expect(model.warn_on);
+    try testing.expectEqualStrings("spoilers", model.warn_draft());
+
+    // Now the second one, into a clean composer: it must not inherit the first
+    // one's warning, which the single global it used to share would have given it.
+    model.draft_buffer.clear();
+    model.warn_on = false;
+    model.warn_buffer.clear();
+    try testing.expect(main.failPendingByContentForTest("second, nothing to warn about"));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("second, nothing to warn about", model.draft());
+    try testing.expect(!model.warn_on);
+    try testing.expectEqual(@as(usize, 0), model.warn_draft().len);
+}
+
+test "a draft saved to disk keeps its content warning, and loses it with the draft" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var model = main.initialModel();
+    model.draft_buffer.set("half a thought");
+    model.warn_on = true;
+    model.warn_buffer.set("politics");
+    main.writeDraftForTest(io, &tmp.dir, model.draft(), main.draftWarningForModelForTest(&model));
+
+    // A fresh launch: the composer and the warning come back together.
+    var next = main.initialModel();
+    main.loadDraftIntoForTest(io, &tmp.dir, &next);
+    try testing.expectEqualStrings("half a thought", next.draft());
+    try testing.expect(next.warn_on);
+    try testing.expectEqualStrings("politics", next.warn_draft());
+
+    // A warning with no reason is still a warning.
+    model.warn_buffer.clear();
+    main.writeDraftForTest(io, &tmp.dir, model.draft(), main.draftWarningForModelForTest(&model));
+    var bare = main.initialModel();
+    main.loadDraftIntoForTest(io, &tmp.dir, &bare);
+    try testing.expect(bare.warn_on);
+    try testing.expectEqual(@as(usize, 0), bare.warn_draft().len);
+
+    // The warning switched off removes the file, so it cannot come back over a
+    // draft that no longer wants it.
+    model.warn_on = false;
+    main.writeDraftForTest(io, &tmp.dir, model.draft(), main.draftWarningForModelForTest(&model));
+    var plain = main.initialModel();
+    main.loadDraftIntoForTest(io, &tmp.dir, &plain);
+    try testing.expectEqualStrings("half a thought", plain.draft());
+    try testing.expect(!plain.warn_on);
+
+    // And deleting the draft deletes the warning with it.
+    model.warn_on = true;
+    model.warn_buffer.set("politics");
+    main.writeDraftForTest(io, &tmp.dir, model.draft(), main.draftWarningForModelForTest(&model));
+    main.writeDraftForTest(io, &tmp.dir, "", null);
+    var gone = main.initialModel();
+    main.loadDraftIntoForTest(io, &tmp.dir, &gone);
+    try testing.expect(gone.draft_empty());
+    try testing.expect(!gone.warn_on);
+    main.writeDraftForTest(io, &tmp.dir, "a new draft", null);
+    var fresh = main.initialModel();
+    main.loadDraftIntoForTest(io, &tmp.dir, &fresh);
+    try testing.expect(!fresh.warn_on);
+}
+
+test "a content warning is never published without its tag when the tag cannot be built" {
+    const base = [_]nostr.event.Tag{&.{ "t", "nostr" }};
+    // Every allocation point the tag needs, failing in turn: the answer is
+    // "refuse", never the original tags.
+    var fail_at: usize = 0;
+    while (fail_at < 3) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        try testing.expect(main.withContentWarning(failing.allocator(), &base, "spoilers") == null);
+    }
+    // No warning asked for: the tags come back untouched, and that is not a failure.
+    var never = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const same = main.withContentWarning(never.allocator(), &base, null) orelse return error.Refused;
+    try testing.expectEqual(@as(usize, 1), same.len);
+    // And when it can be built, it is appended.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const built = main.withContentWarning(arena_state.allocator(), &base, "spoilers") orelse return error.Refused;
+    try testing.expectEqual(@as(usize, 2), built.len);
+    try testing.expectEqualStrings("content-warning", built[1][0]);
+    try testing.expectEqualStrings("spoilers", built[1][1]);
+}
+
+test "a line break in the warning reason does not reach the tag" {
+    main.setIdentityForTest([_]u8{0x35} ** 32);
+    defer main.clearIdentityForTest();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    main.clearLastPublishedTagsForTest();
+    model.draft_buffer.set("a note");
+    model.warn_on = true;
+    model.warn_buffer.set("first line\nsecond line\r\n\tthird");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    const tag = tagNamed(main.lastPublishedTagsForTest(), "content-warning") orelse return error.NoWarningTag;
+    for (tag[1]) |c| try testing.expect(c >= 0x20 and c != 0x7f);
+    try testing.expect(std.mem.startsWith(u8, tag[1], "first line"));
+    try testing.expect(std.mem.indexOf(u8, tag[1], "second line") != null);
+    try testing.expect(std.mem.endsWith(u8, tag[1], "third"));
+    // And a reader's side of it: the reason is shown, not dropped as malformed.
+    const read = main.contentWarningIn(&.{tag}).?;
+    try testing.expect(read.len > 0);
+}
+
+/// The width of a notice's label in units: one for a narrow character, two for a
+/// wide one. The engine's test measure is not a glyph measure (it sizes CJK
+/// narrower than a screen does), so the claim "this fits" is made on what the
+/// label says, with a deliberately generous width per unit.
+fn labelUnits(text: []const u8) usize {
+    var units: usize = 0;
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (it.nextCodepoint()) |cp| units += if (cp >= 0x2E80) @as(usize, 2) else 1;
+    return units;
+}
+
+/// A covered note's chip, in a column of `column`: the label cut to a short
+/// line, and that line plus the "Show" and the paddings inside the column even at
+/// seven pixels a unit, wider than the mono register ever draws a unit.
+fn expectChipFits(p: painted.Painted, chip: native_sdk.geometry.RectF, column: native_sdk.geometry.RectF) !void {
+    var label: ?[]const u8 = null;
+    for (p.layout.nodes) |n| {
+        if (std.mem.startsWith(u8, n.widget.text, "Content warning")) label = n.widget.text;
+    }
+    const text = label orelse return error.NoLabel;
+    try testing.expect(std.mem.indexOf(u8, text, "\u{2026}") != null);
+    const worst = @as(f32, @floatFromInt(labelUnits(text))) * 7.0 + 4 * 7.0 + 60.0;
+    if (chip.x < column.x - 0.5 or chip.x + chip.width > column.x + column.width + 0.5 or worst > chip.width) {
+        std.debug.print("\nchip {d}..{d} column {d}..{d}, label needs about {d}\n", .{ chip.x, chip.x + chip.width, column.x, column.x + column.width, worst });
+        return error.ChipOutsideColumn;
+    }
+    const show = frameOfText(p, "Show") orelse return error.NoShow;
+    try testing.expect(show.x + show.width <= chip.x + chip.width + 0.5);
+}
+
+test "a long reason stays inside the column it is drawn in" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+
+    // 48 wide characters, then 48 narrow ones: the two ways a reason runs long.
+    const cjk = "警告内容警告内容警告内容警告内容警告内容警告内容警告内容警告内容警告内容警告内容警告内容警告内容";
+    const latin = "a reason that goes on and on and on and on and on";
+    const reasons = [_][]const u8{ cjk, latin };
+
+    for (reasons) |reason| {
+        // A nested reply, at the deepest indent a thread draws, in the narrowest
+        // window the app allows.
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.thread_root = main.noteFrom(warnedEvent(0xD0, "the root", &.{}), 1_800_000_100);
+        model.viewing_thread = model.thread_root.id;
+        const tags = [_]nostr.event.Tag{&.{ "content-warning", reason }};
+        var reply = warnedEvent(0xD1, "REPLYSECRET", &tags);
+        reply.created_at = 1_800_000_200;
+        model.thread_notes[0] = main.noteFrom(reply, 1_800_000_300);
+        model.thread_notes[0].reply_parent = model.thread_root.event_id;
+        model.thread_notes[0].has_reply_parent = true;
+        model.thread_notes[0].depth = 6;
+        model.thread_notes_len = 1;
+
+        const p = try painted.Painted.renderAt(arena, &model, main.window_min_width, main.window_height);
+        const chips = p.framesOf("Show this note");
+        try testing.expectEqual(@as(usize, 1), chips.len);
+        const rows = p.framesOf("Open thread");
+        try testing.expect(rows.len >= 1);
+        // Inside the reply's own row, which is the column it is drawn in.
+        try expectChipFits(p, chips[0], rows[rows.len - 1]);
+
+        // A quote card in a feed row.
+        const quoted_id = [_]u8{0x5e} ** 32;
+        main.seedQuoteForTest(quoted_id, [_]u8{0x7b} ** 32, 100, "QUOTEDSECRET");
+        main.warnQuoteForTest(quoted_id, reason[0..@min(reason.len, 96)]);
+        var feed = main.initialModel();
+        feed.stage = .ready;
+        feed.notes[0] = threadNote(0xA3, 100, 0);
+        feed.notes[0].id = 11;
+        const body = "Look at this.";
+        @memcpy(feed.notes[0].content_buf[0..body.len], body);
+        feed.notes[0].content_len = @intCast(body.len);
+        feed.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+        feed.notes_len = 1;
+        const q = try painted.Painted.renderAt(arena, &feed, main.window_min_width, main.window_height);
+        const qchips = q.framesOf("Show this note");
+        try testing.expectEqual(@as(usize, 1), qchips.len);
+        const cards = q.framesOf("Quoted note");
+        try testing.expectEqual(@as(usize, 1), cards.len);
+        try expectChipFits(q, qchips[0], cards[0]);
+        main.resetQuotesForTest();
+    }
+}

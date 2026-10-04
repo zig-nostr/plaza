@@ -3885,6 +3885,10 @@ pub const reply_editor_height_for_test = reply_editor_height;
 const picture_stripe_cap: usize = 24;
 /// The off-state chip's own height.
 const picture_ask_height: f32 = 24;
+/// The chip that stands in for a note while its author's content warning is up.
+/// One line, a little taller than the picture-ask chip because it stands in for
+/// the whole body rather than annotating a picture under it.
+const cover_notice_height: f32 = 28;
 /// A link card, with and without a description. Its TEXT column sets the height,
 /// not its 30px tile: the domain, title and description each take a full body
 /// line box whatever register they are set in (a span scaled down keeps the line
@@ -5678,6 +5682,9 @@ const HelperSign = struct {
     failed: bool = false,
     deadline_s: i64 = 0,
     content: ?[]u8 = null,
+    /// The content warning this note was signed with, so the note that comes back
+    /// is handed back with ITS warning and not whichever one was set last.
+    warn: WarnCarry = .{},
 };
 var g_helper_sign: HelperSign = .{};
 
@@ -5715,7 +5722,7 @@ pub fn helperSignTimeoutMillisForTest() u32 {
 /// Remembers a note handed to the daemon, so a failure has something to give
 /// back. Called BEFORE the request is built, because building it can fail too
 /// and those paths used to lose the note just as quietly.
-fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool, route: PlaceRoute) void {
+fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool, route: PlaceRoute, warn: WarnCarry) void {
     releaseHelperSign();
     g_helper_sign = .{
         .active = true,
@@ -5724,6 +5731,7 @@ fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: b
         .failed = false,
         .deadline_s = nowSeconds() + helper_sign_timeout_s,
         .content = if (restorable) gpa.dupe(u8, content) catch null else null,
+        .warn = if (restorable) warn else .{},
     };
 }
 
@@ -5747,6 +5755,7 @@ fn scanHelperSign(model: *Model) void {
     if (!g_helper_sign.failed and nowSeconds() < g_helper_sign.deadline_s) return;
     const restorable = g_helper_sign.restorable;
     const content = g_helper_sign.content;
+    const warn = g_helper_sign.warn;
     g_helper_sign = .{};
     const gpa = std.heap.page_allocator;
     if (content) |c| {
@@ -5754,7 +5763,8 @@ fn scanHelperSign(model: *Model) void {
         // keeps what they are typing; the restored one would overwrite it.
         if (restorable and model.draft_empty()) {
             setPlain(compose_capacity, &model.draft_buffer, c);
-            saveDraft(model.draft());
+            warn.restoreInto(model);
+            saveDraft(model.draft(), draftWarningOf(model));
             // Said out loud, because the notice this used to rely on cannot be
             // read: its string lives in `Model.identity()`, which is listed in
             // `view_unbound` and rendered by nothing. So a reader saw "Posted",
@@ -5950,7 +5960,7 @@ fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u
     const pk = activePubkey() orelse return;
     // Recorded first. Every `catch return` below is a path that used to end with
     // the note gone and the app saying "Posted".
-    rememberHelperSign(gpa, content_owned, restorable, route);
+    rememberHelperSign(gpa, content_owned, restorable, route, WarnCarry.fromTags(tags));
     const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
         failHelperSign();
         return;
@@ -6273,6 +6283,10 @@ const PendingRemote = struct {
     // back on a human timescale, by which time the reader may be standing in a
     // different room entirely.
     route: PlaceRoute = .none,
+    // sign_event only: the content warning the draft was signed with, kept with
+    // THIS request so the draft that comes back gets its own warning when several
+    // signs are out at once.
+    warn: WarnCarry = .{},
 
     fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -6318,7 +6332,7 @@ fn pendingUnlock() void {
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8) bool {
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, warn: WarnCarry) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -6334,6 +6348,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
             .content = content,
             .restorable = restorable,
             .route = route,
+            .warn = if (restorable) warn else .{},
         };
         @memcpy(slot.id_buf[0..req_id.len], req_id);
         return true;
@@ -6377,7 +6392,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null, .none, 0);
+    return registerPending(req_id, method, content, content != null, .none, 0, .{});
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -6388,6 +6403,20 @@ pub fn failPendingForTest(req_id: []const u8) bool {
 }
 pub fn clearPendingForTest() void {
     clearPending();
+}
+/// Marks the pending sign whose draft is `content` failed, as a refusal or a
+/// timeout would, so a test can pick WHICH of several signs comes back.
+pub fn failPendingByContentForTest(content: []const u8) bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active or slot.method != .sign_event) continue;
+        const c = slot.content orelse continue;
+        if (!std.mem.eql(u8, c, content)) continue;
+        slot.failed = true;
+        return true;
+    }
+    return false;
 }
 pub fn bumpRemoteGenerationForTest() void {
     _ = g_remote_generation.fetchAdd(1, .monotonic);
@@ -6547,6 +6576,22 @@ pub fn mediaPreviews() bool {
 
 pub fn setMediaPreviews(on: bool) void {
     g_media_previews = on;
+}
+
+/// Whether notes their authors marked sensitive (NIP-36) are drawn like any
+/// other. OFF by default: the author asked for the note to be covered and the
+/// reader has not said they would rather not be asked. Jumble keeps the same
+/// switch (`NSFW_DISPLAY_POLICY.SHOW`, `src/constants.ts:329`) and Amethyst's
+/// `WarningType` has a Show entry (`SecurityFiltersScreen.kt:116`); both default
+/// to covering.
+var g_show_sensitive: bool = false;
+
+pub fn showSensitive() bool {
+    return g_show_sensitive;
+}
+
+pub fn setShowSensitive(on: bool) void {
+    g_show_sensitive = on;
 }
 /// Whether notes published from here say so, with NIP-89's `client` tag.
 ///
@@ -7175,6 +7220,13 @@ const QuoteEntry = struct {
     /// the card opens the quoted note, where the picture draws with a real slot.
     image_host_buf: [48]u8 = [_]u8{0} ** 48,
     image_host_len: u8 = 0,
+    /// The quoted note's author asked for it to be covered (NIP-36), and why.
+    /// The words stay in `text_buf` so uncovering is instant, and nothing reads
+    /// them while `quoteCovered` is true: a quote card, a reply context line and
+    /// a quoting pill are three more places a note's words are drawn.
+    warned: bool = false,
+    warning_buf: [warning_reason_bytes]u8 = [_]u8{0} ** warning_reason_bytes,
+    warning_len: u8 = 0,
     /// What the quoted note itself quotes, if anything. Depth stops here (11g):
     /// one hop is a pill saying where it goes, never a third nested body. The
     /// reference is decoded from the event's own content at fill time, because
@@ -7500,6 +7552,9 @@ fn scanLinkFetches(fx: *Effects, model: *const Model) void {
 
 fn fireLink(fx: *Effects, note: *const Note, fired: *usize) void {
     if (!note.hasLink()) return;
+    // A covered note links nowhere until it is uncovered: the page behind the
+    // link would learn it was read, and its title is a second way to see the note.
+    if (noteCovered(note)) return;
     if (!shouldPreviewLink(note.link_is_video, note.linkUrl())) return;
     const slot = wantLink(note.linkUrl()) orelse return;
     // Stamped first, so the eviction guard above counts this entry as wanted in
@@ -7749,6 +7804,19 @@ fn quoteFor(id: [32]u8) ?*QuoteEntry {
     return null;
 }
 
+/// Whether a cached quote is covered right now. Keyed by the quoted event's own
+/// id, which is the id a feed row of that same note carries, so uncovering a note
+/// anywhere uncovers it everywhere it is drawn: it is one note.
+fn quoteCovered(q: *const QuoteEntry) bool {
+    return warningCovered(q.warned, feedKeyOf(q.id));
+}
+
+/// The words a quote may show, none while it is covered.
+fn quoteShownText(q: *const QuoteEntry) []const u8 {
+    if (quoteCovered(q)) return "";
+    return q.text_buf[0..q.text_len];
+}
+
 /// Fills any unresolved quote from the store (it grew, so the fetch may have
 /// landed): copies the quoted author and a truncated body, and asks for the
 /// author's name. Gives up (marks missing) once every relay has been tried.
@@ -7774,6 +7842,13 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         q.pubkey = se.event.pubkey;
         q.kind = se.event.kind;
         q.created_at = se.event.created_at;
+        q.warned = false;
+        q.warning_len = 0;
+        if (contentWarningOf(se.event)) |reason| {
+            q.warned = true;
+            @memcpy(q.warning_buf[0..reason.len], reason);
+            q.warning_len = @intCast(reason.len);
+        }
         var tmp: [note_content_cap]u8 = undefined;
         const omit = firstImageUrl(se.event.content) orelse "";
         const host = urlHost(omit);
@@ -8394,6 +8469,13 @@ pub const InboxItem = struct {
     /// between "somebody reacted" and seeing what they actually sent.
     glyph_buf: [16]u8 = [_]u8{0} ** 16,
     glyph_len: u8 = 0,
+    /// The note whose words `body_buf` holds asked to be covered (NIP-36). The
+    /// row draws the cover chip in the body's place, and `body_key` is the id
+    /// pressing it uncovers, the same one the note carries in the feed.
+    warned: bool = false,
+    warning_buf: [warning_reason_bytes]u8 = [_]u8{0} ** warning_reason_bytes,
+    warning_len: u8 = 0,
+    body_key: i64 = 0,
 
     pub fn hasTarget(self: InboxItem) bool {
         return !std.mem.allEqual(u8, &self.target_id, 0);
@@ -8723,7 +8805,7 @@ fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
 fn bakeInboxText(item: *InboxItem, ev: nostr.event.Event, verb: InboxVerb, target: [32]u8) void {
     switch (verb) {
         // Their words, already in hand.
-        .reply, .mention => item.body_len = fillClipped(&item.body_buf, ev.content),
+        .reply, .mention => bakeBody(item, ev),
         .like => {
             // The reaction as sent. NIP-25 allows `+`, `-`, an empty string and
             // a `:shortcode:`; `+` and empty both mean a like, and the row draws
@@ -8750,7 +8832,28 @@ fn bakeTargetBody(item: *InboxItem, target: [32]u8) void {
     const store = g_store orelse return;
     var se = (store.getEvent(std.heap.page_allocator, target) catch return) orelse return;
     defer se.deinit();
-    item.body_len = fillClipped(&item.body_buf, se.event.content);
+    bakeBody(item, se.event);
+}
+
+/// Copies an event's words into the row, and its content warning with them.
+fn bakeBody(item: *InboxItem, ev: nostr.event.Event) void {
+    item.body_len = fillClipped(&item.body_buf, ev.content);
+    item.body_key = feedKeyOf(ev.id);
+    item.warned = false;
+    item.warning_len = 0;
+    if (contentWarningOf(ev)) |reason| {
+        item.warned = true;
+        @memcpy(item.warning_buf[0..reason.len], reason);
+        item.warning_len = @intCast(reason.len);
+    }
+}
+
+pub fn bakeBodyForTest(item: *InboxItem, ev: nostr.event.Event) void {
+    bakeBody(item, ev);
+}
+
+pub fn notificationRowForTest(ui: *AppUi, item: *const InboxItem) AppUi.Node {
+    return notificationRow(ui, item);
 }
 
 /// The rows the notifications window last put on screen. Written by the view,
@@ -10258,6 +10361,16 @@ pub const Note = struct {
     /// name can never be longer than the row that draws it.
     client_buf: [client_name_bytes]u8 = [_]u8{0} ** client_name_bytes,
     client_len: u8 = 0,
+    /// The author asked for this note to be covered, with NIP-36's
+    /// `content-warning` tag. A fact about the note, decided once here from its
+    /// tags: whether it is covered RIGHT NOW is a question about the reader (the
+    /// switch in Settings, and whether they have pressed this one), and is
+    /// answered by `noteCovered`.
+    warned: bool = false,
+    /// The reason the author gave, clipped. Empty for a bare tag, which still
+    /// covers the note: the warning is the tag, not the sentence.
+    warning_buf: [warning_reason_bytes]u8 = [_]u8{0} ** warning_reason_bytes,
+    warning_len: u8 = 0,
     // Thread placement, stamped by `arrangeThread`: how deep this reply sits
     // under the root (1 = a direct reply). Meaningless outside an arranged
     // thread.
@@ -10428,6 +10541,11 @@ pub const Note = struct {
     pub fn client(self: *const Note) []const u8 {
         return self.client_buf[0..self.client_len];
     }
+    /// The reason the author gave for covering this note, empty when they gave
+    /// none or the note carries no warning.
+    pub fn warning(self: *const Note) []const u8 {
+        return self.warning_buf[0..self.warning_len];
+    }
     pub fn content(self: *const Note) []const u8 {
         return self.content_buf[0..self.content_len];
     }
@@ -10496,6 +10614,10 @@ pub const Model = struct {
     // text through `draft()`, never the buffer itself, and every edit event is
     // mirrored here in `update`.
     draft_buffer: canvas.TextBuffer(compose_capacity) = .{},
+    /// Whether the note being written carries a content warning, and why. The
+    /// reason may stay empty: the tag is the warning.
+    warn_on: bool = false,
+    warn_buffer: canvas.TextBuffer(warning_input_capacity) = .{},
     /// Bytes of the last paste that did not fit, so the composer can say so.
     /// Zero once something that fits is typed or pasted over it.
     draft_dropped: usize = 0,
@@ -10726,7 +10848,8 @@ pub const Model = struct {
         "profile_website",        "profile_website_buffer", "profile_website_long",      "profile_status",       "profile_tab",
         "profile_untouched",      "proxy_draft",            "proxy_explainer",           "proxy_on",             "proxy_status",
         "relay_buffer",           "relay_count",            "relay_draft",               "relay_error",          "relay_full",
-        "relay_status",           "relays_paused",          "scope_name",                "signer_line",          "signer_sub",
+        "relay_status",           "relays_paused",          "scope_name",                "sensitive_explainer",  "sensitive_on",
+        "signer_line",            "signer_sub",             "warn_buffer",               "warn_draft",           "warn_on",
         "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",            "update_check_explainer",
         "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
     };
@@ -10938,6 +11061,20 @@ pub const Model = struct {
     pub fn previews_on(self: *const Model) bool {
         _ = self;
         return g_media_previews;
+    }
+    /// Whether covered notes are drawn without their cover.
+    pub fn sensitive_on(_: *const Model) bool {
+        return g_show_sensitive;
+    }
+    pub fn sensitive_explainer(_: *const Model) []const u8 {
+        return if (g_show_sensitive)
+            "On. Notes their authors marked sensitive are drawn like any other, pictures included, and nothing asks first."
+        else
+            "Off. A note its author marked sensitive stays covered, and nothing it points at is fetched, until you press it.";
+    }
+    /// What is typed in the content warning's reason field.
+    pub fn warn_draft(self: *const Model) []const u8 {
+        return self.warn_buffer.text();
     }
     pub fn profile_name(self: *const Model) []const u8 {
         return self.profile_name_buffer.text();
@@ -12625,7 +12762,7 @@ fn warmAhead(fx: *Effects, model: *const Model) void {
                 if (warmAvatar(fx, p)) faces += 1;
             }
         }
-        if (pictures < picture_per_tick and note.hasImage()) {
+        if (pictures < picture_per_tick and showsImage(note)) {
             if (warmPicture(fx, note)) pictures += 1;
         }
     }
@@ -13584,6 +13721,32 @@ pub fn scanMediaFetchesForTest(fx: *Effects, model: *const Model) void {
     scanMediaFetches(fx, model);
 }
 
+pub fn warmAheadForTest(fx: *Effects, model: *const Model) void {
+    warmAhead(fx, model);
+}
+
+/// Whether warming has asked for this picture address, the way `warmPicture`
+/// builds it.
+pub fn pictureWarmedForTest(src: []const u8) bool {
+    var url_buf: [1024]u8 = undefined;
+    return warmedAlready(feedImageUrl(&url_buf, src));
+}
+
+pub fn resetWarmForTest() void {
+    g_warm_ring = [_]WarmEntry{.{}} ** warm_ring_len;
+    g_warm_ring_next = 0;
+}
+
+pub fn scanLinkFetchesForTest(fx: *Effects, model: *const Model) void {
+    scanLinkFetches(fx, model);
+}
+
+/// Whether the page behind `url` has been asked for (or is being).
+pub fn linkRequestedForTest(url: []const u8) bool {
+    const l = linkFor(url) orelse return false;
+    return l.state == .fetching or l.attempts > 0;
+}
+
 /// Pretends a build put exactly these notes on screen in the front level.
 pub fn recordVisibleNotesForTest(ids: []const i64) void {
     const set = &g_level_visible[0];
@@ -14051,6 +14214,10 @@ fn fireMedia(fx: *Effects, note: *const Note, fired: *usize, per_tick: usize) vo
 fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per_tick: usize) void {
     const link = note.imageAt(index).url();
     if (link.len == 0) return;
+    // A covered note's pictures are not asked for. Fetching them and then hiding
+    // them would defeat the cover: the host would learn the reader's address
+    // either way, and a metered connection pays for bytes nobody sees.
+    if (noteCovered(note)) return;
     // With previews off, nothing leaves the machine until the reader asks for
     // this note's pictures. That is the point of the setting: not bandwidth, but
     // that reading a feed should not tell every host in it that you did.
@@ -14522,6 +14689,15 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         const n = @min(name.len, note.client_buf.len);
         @memcpy(note.client_buf[0..n], name[0..n]);
         note.client_len = @intCast(n);
+    }
+
+    // The author's own request to have this covered. Read here, with the tags in
+    // hand, for the same reason the client name is: the tags are gone by the time
+    // anything draws.
+    if (contentWarningOf(ev)) |reason| {
+        note.warned = true;
+        @memcpy(note.warning_buf[0..reason.len], reason);
+        note.warning_len = @intCast(reason.len);
     }
 
     // Image links become pictures, so lift them out of the text and omit them
@@ -16093,6 +16269,14 @@ pub const Msg = union(enum) {
     proxy_save,
     /// Flips whether the app reaches out for what notes point at.
     previews_toggle,
+    /// Settings: draw notes their authors marked sensitive without covering them.
+    sensitive_toggle,
+    /// Uncover one note whose author asked for it to be covered (by id).
+    uncover_note: i64,
+    /// The composer's "add a content warning" switch.
+    warn_toggle,
+    /// A text edit in the composer's content warning reason.
+    warn_edit: canvas.TextInputEvent,
     proxy_toggle,
     post_delay_cycle,
     direct_fallback_toggle,
@@ -16265,6 +16449,10 @@ pub const Msg = union(enum) {
         "place_resume",
         "place_step",
         "previews_toggle",
+        "sensitive_toggle",
+        "uncover_note",
+        "warn_toggle",
+        "warn_edit",
         "private_seal",
         "profile_about_edit",
         "profile_name_edit",
@@ -16670,6 +16858,26 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
             &.{.{ .text = model.previews_explainer(), .scale = mono_hint_scale }},
+        ),
+        cardDivider(ui),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.sensitive_on(),
+            .text = "Show sensitive notes without a warning",
+            .on_toggle = Msg.sensitive_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Show sensitive notes without a warning", .focusable = true },
+        }, .{}),
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = model.sensitive_explainer(), .scale = mono_hint_scale }},
         ),
         cardDivider(ui),
         ui.el(.checkbox, .{
@@ -17474,7 +17682,9 @@ fn notificationExtentEstimate(context: ?*const anyopaque, index: u64) f32 {
     const item = &ctx.items[i];
     // 12 padding top and bottom, the name line, the time line, and the body.
     var extent: f32 = 12 * 2 + body_line_height + body_line_height + 6;
-    if (item.body_len > 0) {
+    if (warningCovered(item.warned, item.body_key)) {
+        extent += cover_notice_height;
+    } else if (item.body_len > 0) {
         const per_line: f32 = 58;
         const lines = @max(1.0, @ceil(@as(f32, @floatFromInt(item.body_len)) / per_line));
         extent += lines * body_line_height;
@@ -17669,7 +17879,12 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         ui.paragraph(.{ .style = .{ .foreground = p.text_body_soft } }, head[0..head_len]),
     });
     kids_len += 1;
-    if (body.len > 0) {
+    if (warningCovered(item.warned, item.body_key)) {
+        // The note's words are covered, so the row says so in their place, and
+        // the chip uncovers them without leaving the list.
+        kids[kids_len] = coverNotice(ui, item.warning_buf[0..item.warning_len], item.body_key);
+        kids_len += 1;
+    } else if (body.len > 0) {
         // Theirs for a reply, yours for everything else, and dimmer when it is
         // yours: you wrote it, so the new fact is who did what to it.
         const own = item.verb != .reply and item.verb != .mention;
@@ -18239,6 +18454,7 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                         }),
                     }),
                     composeNotifyRow(ui, model),
+                    composeWarningRow(ui, model),
                     vgap(ui, 10),
                     // What pressing Post will do, in the terms that matter: how
                     // far the note goes, and how much room is left when that
@@ -18261,6 +18477,49 @@ fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.spacer(1),
             }),
         }),
+    });
+}
+
+/// The composer's content warning: a switch, and once it is on a line for the
+/// reason. The reason is optional because the tag is the warning; a note with an
+/// empty one is still covered for everyone who reads it.
+///
+/// Under the card and above the reach line, where the other things that change
+/// who sees what (the people it notifies) already sit.
+fn composeWarningRow(ui: *AppUi, model: *const Model) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 12),
+        ui.el(.checkbox, .{
+            .size = .sm,
+            .checked = model.warn_on,
+            .text = "Add a content warning",
+            .on_toggle = Msg.warn_toggle,
+            .style = .{
+                .accent = p.surface_control_solid,
+                .accent_foreground = p.on_accent,
+                .border = p.border_radio,
+                .radius = 4,
+                .stroke_width = 1.5,
+            },
+            .semantics = .{ .label = "Add a content warning", .focusable = true },
+        }, .{}),
+        if (model.warn_on) vgap(ui, 8) else ui.spacer(0),
+        if (model.warn_on) ui.inputGroup(
+            .{ .semantics = .{ .label = "Content warning reason" } },
+            ui.el(.textarea, .{
+                .text = model.warn_draft(),
+                .placeholder = "Reason (optional)",
+                .on_input = AppUi.inputMsg(.warn_edit),
+                .height = 40,
+            }, .{}),
+            null,
+        ) else ui.spacer(0),
+        if (model.warn_on) vgap(ui, 6) else ui.spacer(0),
+        if (model.warn_on) ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_faint } },
+            &.{.{ .text = "Readers see the reason and a button to show the note. Its pictures are not fetched until they do.", .scale = mono_hint_scale }},
+        ) else ui.spacer(0),
     });
 }
 
@@ -18745,6 +19004,14 @@ fn noteRowEstimateBody(note: *const Note, chrome: f32) f32 {
 fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     const line_height: f32 = body_line_height;
     const chars_per_line: f32 = 70;
+    // A covered note is its chrome and one chip: no body lines, no fold, no
+    // picture, no link card and no quote, whatever it carries underneath.
+    if (noteCovered(note)) {
+        var covered = chrome + cover_notice_height;
+        if (note.has_reply_parent) covered += line_height + 4;
+        if (note.has_reposter) covered += line_height + 4;
+        return covered;
+    }
     // A collapsed long note shows only the fold, plus a line for "Show more".
     const collapsed = noteIsLong(note) and !isExpanded(note.id);
     const shown_chars: f32 = @floatFromInt(if (collapsed) collapsedLen(note.content(), note_collapse_chars) else note.content_len);
@@ -18807,10 +19074,16 @@ fn quoteAsideExtent(id: [32]u8) f32 {
         .missing => quote_quiet_chrome + body_line_height,
         // The depth-1 pill, when the quoted note quotes something itself: it is
         // a row of its own under the body, and the row around it is priced.
-        .loaded => quote_aside_chrome + quoteBodyLines(e) * body_line_height +
-            (if (e.has_quote_of) quote_pill_height + 4 else 0) +
-            (if (kindRender(e.kind) == .unsupported) quote_pill_height + 4 else 0) +
-            (if (e.image_host_len > 0) quote_pill_height + 4 else 0),
+        .loaded => blk: {
+            // A covered quote swaps its body for the cover chip and drops the
+            // picture chip; the pills under it are unchanged.
+            const covered = quoteCovered(e);
+            break :blk quote_aside_chrome +
+                (if (covered) cover_notice_height else quoteBodyLines(e) * body_line_height) +
+                (if (e.has_quote_of) quote_pill_height + 4 else 0) +
+                (if (kindRender(e.kind) == .unsupported) quote_pill_height + 4 else 0) +
+                (if (e.image_host_len > 0 and !covered) quote_pill_height + 4 else 0);
+        },
     };
 }
 
@@ -19192,6 +19465,9 @@ fn blockExtent(block: *const ThreadBlock) f32 {
 /// How many lines an ancestor's clamped body wraps to: one or two, the clamp's
 /// whole point.
 fn ancestorBodyLines(note: *const Note) f32 {
+    // The cover chip is a line and a half of this register tall, which two lines
+    // price without ever under-reserving it.
+    if (noteCovered(note)) return @floatFromInt(ancestor_body_lines);
     // No body, no line. An image-only reply is a common shape, and its content
     // is empty because the URL is lifted out of the text: pricing it at a line
     // the row never draws is space the level reports and does not fill.
@@ -19612,9 +19888,9 @@ fn threadRoot(ui: *AppUi, note: *const Note, leads: bool) AppUi.Node {
             hgap(ui, thread_inset),
             ui.column(.{ .grow = 1, .gap = 0 }, .{
                 focalBody(ui, note),
-                if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
+                if (showsImage(note)) vgap(ui, 8) else ui.spacer(0),
+                if (showsImage(note)) noteGallery(ui, note) else ui.spacer(0),
+                if (showsLink(note)) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                 vgap(ui, 9),
                 focalMeta(ui, note),
             }),
@@ -20989,7 +21265,7 @@ pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
 pub fn failRemoteHalfForTest(index: u8) bool {
     var idbuf: [24]u8 = undefined;
     const req_id = std.fmt.bufPrint(&idbuf, "half{d}", .{index}) catch return false;
-    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index)) return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index, .{})) return false;
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
@@ -22401,9 +22677,9 @@ fn replyBlock(ui: *AppUi, block: *const ThreadBlock, root_author: [32]u8, first:
                 }),
                 vgap(ui, 5),
                 noteBody(ui, note, true),
-                if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
+                if (showsImage(note)) vgap(ui, 8) else ui.spacer(0),
+                if (showsImage(note)) noteGallery(ui, note) else ui.spacer(0),
+                if (showsLink(note)) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                 vgap(ui, 8),
                 engagementRow(ui, note),
             }),
@@ -22486,7 +22762,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
                 // chrome, and dropping it would make the estimate wrong by 4px
                 // for exactly the rows nothing measures.
                 vgap(ui, ancestor_identity_gap),
-                if (note.content_len == 0) ui.spacer(0) else ancestorBody(ui, note),
+                if (note.content_len == 0 and !noteCovered(note)) ui.spacer(0) else ancestorBody(ui, note),
                 vgap(ui, ancestor_bottom_pad),
             }),
             hgap(ui, thread_inset),
@@ -22498,6 +22774,7 @@ fn ancestorRow(ui: *AppUi, ancestor: *const Ancestor, first: bool) AppUi.Node {
 /// cut is made in the SPANS: building them from the whole text first keeps a
 /// mention reading as `@name` rather than as half of a bech32 token.
 fn ancestorBody(ui: *AppUi, note: *const Note) AppUi.Node {
+    if (noteCovered(note)) return coverNotice(ui, note.warning(), note.id);
     const spans = clampSpansToLines(ui, noteSpans(ui, note, note.content()), ancestor_body_lines);
     return textParaAt(ui, spans, nested_body_scale, theme.palette.text_secondary_alt);
 }
@@ -26850,6 +27127,71 @@ pub fn forgetAskedMediaForTest() void {
     g_media_asked = [_]i64{0} ** asked_cap;
 }
 
+/// The covered notes the reader has uncovered, by note id.
+///
+/// Session-only and per note, deliberately: a warning is about one note, so
+/// pressing it must not carry to the next launch or to any other note. A ring
+/// like the two above, oldest dropped when it fills, which re-covers a note the
+/// reader uncovered long ago and has since scrolled far away from.
+const uncovered_cap = 64;
+var g_uncovered = [_]i64{0} ** uncovered_cap;
+
+pub fn isUncovered(note_id: i64) bool {
+    for (g_uncovered) |u| {
+        if (u == note_id) return true;
+    }
+    return false;
+}
+
+fn uncoverNote(note_id: i64) void {
+    if (note_id == 0 or isUncovered(note_id)) return;
+    for (&g_uncovered) |*u| {
+        if (u.* == 0) {
+            u.* = note_id;
+            return;
+        }
+    }
+    std.mem.copyForwards(i64, g_uncovered[0 .. uncovered_cap - 1], g_uncovered[1..]);
+    g_uncovered[uncovered_cap - 1] = note_id;
+}
+
+/// The key a quote of `id` is uncovered by, which is the key the same note
+/// carries in the feed.
+pub fn feedKeyForTest(id: [32]u8) i64 {
+    return feedKeyOf(id);
+}
+
+pub fn uncoverNoteForTest(note_id: i64) void {
+    uncoverNote(note_id);
+}
+
+pub fn forgetUncoveredForTest() void {
+    g_uncovered = [_]i64{0} ** uncovered_cap;
+}
+
+/// Whether something the author marked sensitive is covered right now: the
+/// author asked, the reader has not turned the warnings off, and has not pressed
+/// this one. The ONE answer every surface asks, so the text, the pictures, the
+/// link card, the fetches and the row's height cannot disagree about it.
+fn warningCovered(warned: bool, key: i64) bool {
+    return warned and !g_show_sensitive and !isUncovered(key);
+}
+
+/// Whether `note` is covered. Its pictures and link are covered with it, and
+/// nothing is fetched for them while it is.
+pub fn noteCovered(note: *const Note) bool {
+    return warningCovered(note.warned, note.id);
+}
+
+/// A covered note draws no picture and no link card, whatever it carries.
+fn showsImage(note: *const Note) bool {
+    return note.hasImage() and !noteCovered(note);
+}
+
+fn showsLink(note: *const Note) bool {
+    return note.hasLink() and !noteCovered(note);
+}
+
 var g_expanded = [_]i64{0} ** expanded_cap;
 
 fn isExpanded(note_id: i64) bool {
@@ -26957,6 +27299,9 @@ fn noteBody(ui: *AppUi, note: *const Note, collapsible: bool) AppUi.Node {
 /// a thread is about.
 fn noteBodyAt(ui: *AppUi, note: *const Note, collapsible: bool, scale: f32, ink: canvas.Color) AppUi.Node {
     const p = theme.palette;
+    // The author's warning replaces the whole body: the words, the quote card
+    // and the fold with it. One chip, in the space the body would have taken.
+    if (noteCovered(note)) return coverNotice(ui, note.warning(), note.id);
     // A kind nothing here can draw says which kind, where the body would be.
     // `noteFrom` leaves the body empty for these, and an empty paragraph is
     // what made such a card read as a note that had failed to load rather than
@@ -27033,7 +27378,7 @@ fn replyContext(ui: *AppUi, note: *const Note) AppUi.Node {
 
     const name = quoteAuthorName(ui, q.pubkey);
     const label = std.fmt.allocPrint(ui.arena, "reply to {s}", .{name}) catch "reply to a note";
-    return replyContextLine(ui, label, q.text_buf[0..q.text_len]);
+    return replyContextLine(ui, label, quoteShownText(q));
 }
 
 /// One muted line: who was answered, then the opening of what they said.
@@ -27191,13 +27536,13 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         }),
         // Four lines of the quoted note, and no more: a quote is an aside, and
         // its height has to be known where the outer row is priced.
-        if (q.text_len > 0) quoteBody(ui, note) else ui.spacer(0),
+        if (quoteCovered(q)) coverNotice(ui, q.warning_buf[0..q.warning_len], feedKeyOf(id)) else if (q.text_len > 0) quoteBody(ui, note) else ui.spacer(0),
         // What the card cannot draw, said rather than left blank. The chip for
         // an unsupported kind sits beside the one for a picture because they
         // answer the same question: a card with a name, a time and nothing
         // under it reads as a rendering fault, and this says which it is.
         if (kindRender(q.kind) == .unsupported) unsupportedKindChip(ui, q.kind) else ui.spacer(0),
-        if (q.image_host_len > 0) quoteMediaChip(ui, q.image_host_buf[0..q.image_host_len]) else ui.spacer(0),
+        if (q.image_host_len > 0 and !quoteCovered(q)) quoteMediaChip(ui, q.image_host_buf[0..q.image_host_len]) else ui.spacer(0),
         // A quote of a quote stops here. One more body would be a third voice in
         // a row, so the second hop is a pill that says where it goes.
         if (q.has_quote_of) quotingPill(ui, q.quote_of) else ui.spacer(0),
@@ -27378,7 +27723,10 @@ fn quotingPillLabel(ui: *AppUi, id: [32]u8) []const u8 {
             // a kind whose content is empty by design drew "Quoting @somebody"
             // with a blank after it, which reads as a note that failed to load.
             .unsupported => ui.fmt("Quoting a kind {d} event", .{e.kind}),
-            else => ui.fmt("Quoting {s} · {s}", .{ quotePillHandle(ui, e.pubkey), oneLine(ui, e.text_buf[0..e.text_len]) }),
+            else => ui.fmt("Quoting {s} · {s}", .{
+                quotePillHandle(ui, e.pubkey),
+                if (quoteCovered(e)) "content warning" else oneLine(ui, e.text_buf[0..e.text_len]),
+            }),
         },
         .missing => "Quotes a note no relay has",
         else => "Quoting a note",
@@ -27540,6 +27888,14 @@ pub fn rearmWantedQuotesForTest() void {
 
 pub fn quoteBackoffRoundsForTest(attempts: u8) u64 {
     return quoteBackoffRounds(attempts);
+}
+
+/// Marks a cached quote as one its author asked to have covered.
+pub fn warnQuoteForTest(id: [32]u8, reason: []const u8) void {
+    const q = quoteFor(id) orelse return;
+    q.warned = true;
+    @memcpy(q.warning_buf[0..reason.len], reason);
+    q.warning_len = @intCast(reason.len);
 }
 
 pub fn quoteForTest(id: [32]u8) ?*QuoteEntry {
@@ -27791,9 +28147,9 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         // The picture. The space is reserved at the picture's own
                         // shape whether or not it has loaded, so the feed never
                         // shifts as images arrive.
-                        if (note.hasImage()) vgap(ui, 8) else ui.spacer(0),
-                        if (note.hasImage()) noteGallery(ui, note) else ui.spacer(0),
-                        if (note.hasLink()) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
+                        if (showsImage(note)) vgap(ui, 8) else ui.spacer(0),
+                        if (showsImage(note)) noteGallery(ui, note) else ui.spacer(0),
+                        if (showsLink(note)) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
                         if (anyVerbShown()) vgap(ui, 10) else ui.spacer(0),
                         engagementRow(ui, note),
                     }),
@@ -28197,6 +28553,83 @@ fn pictureAskChip(ui: *AppUi, note: *const Note) AppUi.Node {
         }),
         ui.spacer(1),
     });
+}
+
+/// What a note is while its author's content warning is up: one quiet chip
+/// where the words and the pictures would be, saying so, giving the reason when
+/// there is one, and uncovering THIS note when pressed.
+///
+/// The same chip the ask-for-a-picture line wears (inset ground, hairline,
+/// mono-register text), because it is the same kind of thing: a control that
+/// stands in for content the reader has not yet agreed to see. It hugs its text
+/// rather than spanning the column, which also means it needs no width from the
+/// caller and reads the same in a feed row, a reply and a quote card.
+///
+/// The warning triangle is the one warm mark in it. Nothing else here is
+/// coloured, so a covered note reads as covered from across the window without
+/// the reason having to be legible.
+///
+/// The notice is one line so a covered row's height stays known and the feed
+/// keeps its rhythm. It also never wraps, so the reason shown is cut hard (see
+/// `coverReasonShown`) to keep the chip inside the narrowest column it can be
+/// drawn in: a nested reply, an ancestor row, a quote card.
+fn coverNotice(ui: *AppUi, reason: []const u8, key: i64) AppUi.Node {
+    const p = theme.palette;
+    const shown = coverReasonShown(ui, reason);
+    const label = if (shown.len > 0)
+        ui.fmt("Content warning: {s}", .{shown})
+    else
+        "Content warning";
+    return ui.row(.{ .gap = 0 }, .{
+        ui.el(.list_item, .{
+            .padding = 0.01,
+            .height = cover_notice_height,
+            .cross = .center,
+            .on_press = Msg{ .uncover_note = key },
+            .style = .{ .background = p.surface_inset, .border = p.border_chip, .radius = 6, .stroke_width = 1, .quiet_hover = true },
+            .semantics = .{ .role = .button, .label = "Show this note", .focusable = true },
+        }, .{
+            hgap(ui, 9),
+            ui.icon(.{ .width = 13, .height = 13, .style = .{ .foreground = p.status_warning } }, "alert"),
+            hgap(ui, 8),
+            ui.paragraph(
+                .{ .wrap = false, .style = .{ .foreground = p.text_muted } },
+                &.{.{ .text = label, .monospace = true, .scale = mono_meta_scale }},
+            ),
+            hgap(ui, 10),
+            ui.paragraph(
+                .{ .wrap = false, .style = .{ .foreground = p.text_secondary } },
+                &.{.{ .text = "Show", .weight = .medium, .monospace = true, .scale = mono_meta_scale }},
+            ),
+            hgap(ui, 9),
+        }),
+        ui.spacer(1),
+    });
+}
+
+/// How much of a reason the chip shows, in width units: a narrow character is
+/// one and a wide one (CJK, emoji) is two, because the chip hugs its text and
+/// never wraps, so the cap is on how wide the line gets and not on how many
+/// codepoints it holds.
+const cover_reason_units = 24;
+
+/// `reason` cut to `cover_reason_units`, with an ellipsis where it was cut. The
+/// full reason is still in the note; the chip is a label, not the place to read it.
+pub fn coverReasonShown(ui: *AppUi, reason: []const u8) []const u8 {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < reason.len) {
+        const len = std.unicode.utf8ByteSequenceLength(reason[i]) catch break;
+        if (i + len > reason.len) break;
+        const cp = std.unicode.utf8Decode(reason[i .. i + len]) catch break;
+        const w: usize = if (cp >= 0x2E80) 2 else 1;
+        if (units + w > cover_reason_units) {
+            return ui.fmt("{s}\u{2026}", .{std.mem.trimEnd(u8, reason[0..i], " ")});
+        }
+        units += w;
+        i += len;
+    }
+    return reason[0..i];
 }
 
 /// A decoded blurhash: the low-frequency colour of a picture, which is all a
@@ -29872,8 +30305,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // What was written but not sent when the app last closed, back in the
     // composer where it was left.
     var draft_buf: [note_content_cap]u8 = undefined;
-    const stashed = loadDraft(&draft_buf);
-    if (stashed.len > 0) setPlain(compose_capacity, &model.draft_buffer, stashed);
+    var warn_buf: [warning_input_capacity]u8 = undefined;
+    const stashed = loadDraft(&draft_buf, &warn_buf);
+    applyStashedDraft(model, stashed);
     // What was owed when the app last closed. Read before the first frame, so a
     // note written offline yesterday is visible as owed rather than lost, and
     // offered again as soon as a relay answers. Whose queue that is comes from
@@ -30119,7 +30553,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // At most one write a second, and only when something changed.
                 if (g_draft_dirty) {
                     g_draft_dirty = false;
-                    saveDraft(model.draft());
+                    saveDraft(model.draft(), draftWarningOf(model));
                 }
                 const counts = outboxCounts();
                 model.outbox_pending = counts.trying;
@@ -30469,7 +30903,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.draft_dropped = 0;
             // Closing the sheet stashes what is in it. The words survived a
             // closed sheet already; this is what carries them past a quit.
-            saveDraft(model.draft());
+            saveDraft(model.draft(), draftWarningOf(model));
         },
         .open_join => model.joining = true,
         // Enter: keep this place. That is all it does, and it is private.
@@ -30895,6 +31329,32 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 warmAhead(fx, model);
                 scanLinkFetches(fx, model);
             }
+        },
+        .sensitive_toggle => {
+            setShowSensitive(!showSensitive());
+            saveSettings();
+            // Turning the warnings off uncovers every pending picture at once,
+            // so fill the feed in without waiting for the next tick.
+            if (showSensitive()) {
+                scanMediaFetches(fx, model);
+                scanLinkFetches(fx, model);
+            }
+        },
+        .uncover_note => |key| {
+            uncoverNote(key);
+            // The pictures and the link card were held back, not just hidden:
+            // ask for them now rather than on the next tick.
+            scanMediaFetches(fx, model);
+            scanLinkFetches(fx, model);
+        },
+        .warn_toggle => {
+            model.warn_on = !model.warn_on;
+            if (!model.warn_on) model.warn_buffer.clear();
+            g_draft_dirty = true;
+        },
+        .warn_edit => |edit| {
+            model.warn_buffer.apply(edit);
+            g_draft_dirty = true;
         },
         .media_fetched => |response| handleMediaFetched(fx, response),
         .nip05_verified => |response| handleNip05Fetched(response),
@@ -31968,7 +32428,7 @@ fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     // The slot is emptied the moment its contents go to a signer. Leaving it
     // would restore an already-published note into the next launch's composer,
     // one keystroke from being posted twice.
-    saveDraft("");
+    saveDraft("", null);
     // Posting closes the sheet; the note is already local and will appear on the
     // next tick.
     model.composing = false;
@@ -32086,7 +32546,21 @@ fn submitPost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     const owned = gpa.dupe(u8, canonical) catch return false;
     // Read off `owned`, not off the draft buffer: that is cleared two lines
     // below, and the tags hold slices of whatever they were built from.
-    const tags = contentTags(gpa, owned, &.{}, model.mentionsOff());
+    const base_tags = contentTags(gpa, owned, &.{}, model.mentionsOff());
+    // The reader's content warning, when they set one. It travels in the tag set,
+    // and the signer's pending slot reads it back out of those same tags, so a
+    // sign that never comes back hands the words to the composer together with
+    // the warning they were signed under. Control characters become spaces: the
+    // reason field is a textarea, and a newline in a tag a reader draws on one
+    // line would show them a bare warning.
+    var reason_buf: [warning_input_capacity]u8 = undefined;
+    const warning: ?[]const u8 = if (model.warn_on) singleLine(&reason_buf, model.warn_buffer.text()) else null;
+    // Refused, not published without: a note the author asked to have covered
+    // must not go out uncovered because an allocation failed.
+    const tags = withContentWarning(gpa, base_tags, warning) orelse {
+        gpa.free(owned);
+        return false;
+    };
     // A composer draft: kind:1 carrying whatever its own text implies,
     // restorable to the composer if a remote signer never answers.
     // `.none` on purpose: this is the one write that IS `restorable`, so the
@@ -32094,7 +32568,72 @@ fn submitPost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     signAndPublish(fx, gpa, nowSeconds(), 1, tags, owned, true, .none, route);
     model.draft_buffer.clear();
     model.draft_dropped = 0;
+    model.warn_on = false;
+    model.warn_buffer.clear();
     return true;
+}
+
+/// `text` trimmed, with each control character (a newline from the textarea, a
+/// tab) turned into a space, written into `out`. Interior only: the ends are
+/// trimmed first.
+fn singleLine(out: []u8, text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const n = @min(trimmed.len, out.len);
+    for (trimmed[0..n], 0..) |c, i| out[i] = if (c < 0x20 or c == 0x7f) ' ' else c;
+    return std.mem.trim(u8, out[0..n], " ");
+}
+
+/// The content warning a composer post was signed with, kept in the pending sign
+/// that carries the post (the bunker's slot or the built-in signer's), so the
+/// post that comes back is restored with its own warning. One global for this
+/// held whichever post was submitted last: with several signs out, a timed-out
+/// one came back with another post's warning, or none.
+const WarnCarry = struct {
+    on: bool = false,
+    len: u8 = 0,
+    buf: [warning_input_capacity]u8 = [_]u8{0} ** warning_input_capacity,
+
+    /// Reads the warning off the tag set the post is being signed with.
+    fn fromTags(tags: []const nostr.event.Tag) WarnCarry {
+        for (tags) |tag| {
+            if (tag.len < 1 or !std.mem.eql(u8, tag[0], "content-warning")) continue;
+            var out = WarnCarry{ .on = true };
+            const reason = if (tag.len > 1) tag[1] else "";
+            const n = @min(reason.len, out.buf.len);
+            @memcpy(out.buf[0..n], reason[0..n]);
+            out.len = @intCast(n);
+            return out;
+        }
+        return .{};
+    }
+
+    /// Puts the warning back in the composer beside the draft it belonged to.
+    fn restoreInto(self: WarnCarry, model: *Model) void {
+        if (!self.on) return;
+        model.warn_on = true;
+        model.warn_buffer.set(self.buf[0..self.len]);
+    }
+};
+
+/// Appends NIP-36's `content-warning` tag when the reader set one. The reason is
+/// copied: the tags outlive the composer's buffer, like the content they sit with.
+/// An empty reason is still a tag, because the tag is what covers the note.
+/// Returns null when the tag could not be built: the caller refuses the post.
+pub fn withContentWarning(gpa: std.mem.Allocator, tags: []const nostr.event.Tag, reason: ?[]const u8) ?[]const nostr.event.Tag {
+    const text = reason orelse return tags;
+    const owned = gpa.dupe(u8, text) catch return null;
+    const tag = gpa.dupe([]const u8, &.{ "content-warning", owned }) catch {
+        gpa.free(owned);
+        return null;
+    };
+    const out = gpa.alloc(nostr.event.Tag, tags.len + 1) catch {
+        gpa.free(tag);
+        gpa.free(owned);
+        return null;
+    };
+    @memcpy(out[0..tags.len], tags);
+    out[tags.len] = tag;
+    return out;
 }
 
 /// Signs `content_owned` as an event of `kind` with `tags`, stamped `created`,
@@ -32219,6 +32758,43 @@ pub fn clientOf(ev: nostr.event.Event) ?[]const u8 {
         // about the note; refusing it outright threw away the whole fact, and
         // did so unevenly by script.
         return clipToChars(name, client_name_chars, client_name_bytes);
+    }
+    return null;
+}
+
+/// How long a content warning's reason may be, in bytes and in characters. One
+/// line in a chip, so it is clipped the way a client name is: both caps, because
+/// a byte cap alone is a different width in every script.
+const warning_reason_bytes = 96;
+const warning_reason_chars = 48;
+///
+/// The room the reason gets while it is being typed. What a reader sees is clipped
+/// to the caps above, so the field does not need to run far past them.
+const warning_input_capacity = 120;
+
+/// What an event's NIP-36 `content-warning` tag says, or null when it has none.
+///
+/// The TAG is the warning, not the sentence in it. `["content-warning"]` and
+/// `["content-warning", ""]` are both a request to cover the note and answer an
+/// empty reason, and so does a reason holding a control character, which is
+/// dropped rather than drawn: refusing to cover a note because its explanation
+/// was malformed would invert the author's request. Jumble and Amethyst read the
+/// tag the same way (`isNsfwEvent` in `src/lib/event.ts:49`, `TagArray.isSensitive`
+/// in `nip36SensitiveContent/TagArrayExt.kt:28`), and Amethyst's
+/// `ContentWarningTag.parse` blank-checks the reason (`ContentWarningTag.kt:39`).
+pub fn contentWarningOf(ev: nostr.event.Event) ?[]const u8 {
+    return contentWarningIn(ev.tags);
+}
+
+pub fn contentWarningIn(tags: []const nostr.event.Tag) ?[]const u8 {
+    for (tags) |tag| {
+        if (tag.len < 1 or !std.mem.eql(u8, tag[0], "content-warning")) continue;
+        if (tag.len < 2) return "";
+        const reason = std.mem.trim(u8, tag[1], " \t\r\n");
+        for (reason) |c| {
+            if (c < 0x20 or c == 0x7f) return "";
+        }
+        return clipToChars(reason, warning_reason_chars, warning_reason_bytes);
     }
     return null;
 }
@@ -35394,6 +35970,9 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
     return true;
 }
 
+/// Request ids a unit test hands out, which has no io to draw them from.
+var g_test_request_seq: u32 = 0;
+
 /// A request id nobody watching the relay can guess.
 ///
 /// These were `req-0`, `req-1`, and so on, from a counter that starts at zero
@@ -35406,7 +35985,12 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
 /// Sixteen hex characters from the system CSPRNG, the same source the ephemeral
 /// client key comes from.
 fn newRequestId(out: *[24]u8) ?[]const u8 {
-    const io = g_io orelse return null;
+    const io = g_io orelse {
+        // No io in a unit test, so ids come from a counter there. Never in the app.
+        if (!builtin.is_test) return null;
+        g_test_request_seq +%= 1;
+        return std.fmt.bufPrint(out, "test{x}", .{g_test_request_seq}) catch null;
+    };
     var raw: [8]u8 = undefined;
     io.randomSecure(&raw) catch return null;
     return std.fmt.bufPrint(out, "{x}", .{raw}) catch null;
@@ -35418,7 +36002,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false, .none, 0)) return;
+    if (!registerPending(req_id, .connect, null, false, .none, 0, .{})) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -35458,7 +36042,7 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0)) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0, WarnCarry.fromTags(tags))) {
         gpa.free(content_owned);
         return;
     }
@@ -35484,7 +36068,7 @@ fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: [
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return false;
-    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, @intCast(half_index))) return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, @intCast(half_index), .{})) return false;
     const params = [_][]const u8{ &hexbuf, ciphertext };
     sendRequest(gpa, .{ .id = req_id, .method = "nip44_decrypt", .params = &params });
     return true;
@@ -35497,7 +36081,7 @@ fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return false;
-    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0)) return false;
+    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0, .{})) return false;
     const params = [_][]const u8{ &hexbuf, plaintext };
     sendRequest(gpa, .{ .id = req_id, .method = "nip44_encrypt", .params = &params });
     return true;
@@ -35718,6 +36302,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     const gpa = std.heap.page_allocator;
     const generation = g_remote_generation.load(.acquire);
     var restore: ?[]const u8 = null;
+    var restore_warn: WarnCarry = .{};
     var sign_failed = false;
     var any_sign_failed = false;
     var connect_failed = false;
@@ -35733,6 +36318,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         const content = slot.content;
         const slot_half = slot.half_index;
         const slot_restorable = slot.restorable;
+        const slot_warn = slot.warn;
         slot.* = .{};
         if (stale) {
             if (content) |c| gpa.free(c);
@@ -35744,7 +36330,10 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 // free the rest. A reaction's content is not restorable, so it
                 // is freed and its failure stays silent.
                 if (content) |c| {
-                    if (slot_restorable and restore == null) restore = c else gpa.free(c);
+                    if (slot_restorable and restore == null) {
+                        restore = c;
+                        restore_warn = slot_warn;
+                    } else gpa.free(c);
                 }
                 if (slot_restorable) sign_failed = true;
                 // Any failed signature, restorable or not, may have been a
@@ -35818,7 +36407,10 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     }
 
     if (restore) |c| {
-        if (model.draft_empty()) setPlain(compose_capacity, &model.draft_buffer, c);
+        if (model.draft_empty()) {
+            setPlain(compose_capacity, &model.draft_buffer, c);
+            restore_warn.restoreInto(model);
+        }
         gpa.free(c);
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
@@ -36301,6 +36893,7 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
 fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     setMediaProxy(default_media_proxy);
     g_media_previews = true;
+    g_show_sensitive = false;
     g_client_tag = false;
     g_update_check = true;
     g_media_proxy_on = true;
@@ -36319,6 +36912,7 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         // An empty value is meaningful: the user chose to load originals.
         if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "show_sensitive")) g_show_sensitive = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "update_check")) g_update_check = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
@@ -36621,7 +37215,7 @@ fn saveSettings() void {
     var place_buf: [160]u8 = undefined;
     const place = activePlaceLine(&place_buf);
     var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\nupdate_check={s}\n", .{
+    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\nupdate_check={s}\nshow_sensitive={s}\n", .{
         mediaProxy(),
         if (g_media_previews) "on" else "off",
         if (g_client_tag) "on" else "off",
@@ -36633,6 +37227,7 @@ fn saveSettings() void {
         g_post_delay_s,
         @tagName(g_home_scope),
         if (g_update_check) "on" else "off",
+        if (g_show_sensitive) "on" else "off",
     }) catch return;
     dir.writeFile(io, .{
         .sub_path = "settings",
@@ -36644,9 +37239,24 @@ fn saveSettings() void {
 /// Where an unsent draft waits between launches. One slot, because the composer
 /// is one sheet: a list of drafts is a different feature and the plan says so.
 const draft_file = "draft";
+const draft_warning_file = "draft_warning";
 /// Set by an edit, cleared by the tick that writes it: a keystroke must not
 /// carry a file write, and a file write must not wait for the sheet to close.
 var g_draft_dirty = false;
+
+/// The content warning that goes with the draft, when one is switched on.
+fn applyStashedDraft(model: *Model, stashed: StashedDraft) void {
+    if (stashed.text.len == 0) return;
+    setPlain(compose_capacity, &model.draft_buffer, stashed.text);
+    if (stashed.warn) |reason| {
+        model.warn_on = true;
+        model.warn_buffer.set(reason);
+    }
+}
+
+fn draftWarningOf(model: *const Model) ?[]const u8 {
+    return if (model.warn_on) model.warn_buffer.text() else null;
+}
 
 /// Keeps what was written but not sent. The composer already survives being
 /// closed within a session; this is what makes it survive the app quitting,
@@ -36656,15 +37266,25 @@ var g_draft_dirty = false;
 /// Written with the same restrictive permissions as the rest of ~/.plaza,
 /// because an unsent note is as private as a sent one and rather more likely
 /// to be unfinished thinking.
-fn saveDraft(text: []const u8) void {
+///
+/// The warning rides along as a sibling file whose existence is the switch and
+/// whose content is the reason, written and deleted in the same breath as the
+/// draft: a note that was going to be covered must not come back from a quit
+/// one press from going out uncovered.
+fn saveDraft(text: []const u8, warn: ?[]const u8) void {
     const io = g_io orelse return;
     const environ = g_environ orelse return;
     var dir = plazaDir(io, environ) catch return;
     defer dir.close(io);
+    writeDraft(io, &dir, text, warn);
+}
+
+fn writeDraft(io: std.Io, dir: *std.Io.Dir, text: []const u8, warn: ?[]const u8) void {
     if (text.len == 0) {
         // Nothing to keep: the slot is removed rather than left holding a stale
         // draft that would reappear over the next empty composer.
         dir.deleteFile(io, draft_file) catch {};
+        dir.deleteFile(io, draft_warning_file) catch {};
         return;
     }
     dir.writeFile(io, .{
@@ -36672,16 +37292,54 @@ fn saveDraft(text: []const u8) void {
         .data = text,
         .flags = .{ .permissions = secret_file_permissions },
     }) catch {};
+    if (warn) |reason| {
+        dir.writeFile(io, .{
+            .sub_path = draft_warning_file,
+            .data = reason,
+            .flags = .{ .permissions = secret_file_permissions },
+        }) catch {};
+    } else {
+        dir.deleteFile(io, draft_warning_file) catch {};
+    }
 }
 
-/// Reads the stashed draft back, or an empty slice when there is none.
-fn loadDraft(out: []u8) []const u8 {
-    const io = g_io orelse return "";
-    const environ = g_environ orelse return "";
-    var dir = plazaDir(io, environ) catch return "";
+const StashedDraft = struct {
+    text: []const u8 = "",
+    /// The reason, when the draft was saved with a warning switched on (an empty
+    /// reason is still a warning).
+    warn: ?[]const u8 = null,
+};
+
+/// Reads the stashed draft back, or an empty one when there is none.
+fn loadDraft(out: []u8, warn_out: []u8) StashedDraft {
+    const io = g_io orelse return .{};
+    const environ = g_environ orelse return .{};
+    var dir = plazaDir(io, environ) catch return .{};
     defer dir.close(io);
-    const n = dir.readFile(io, draft_file, out) catch return "";
-    return out[0..n.len];
+    return readDraft(io, &dir, out, warn_out);
+}
+
+fn readDraft(io: std.Io, dir: *std.Io.Dir, out: []u8, warn_out: []u8) StashedDraft {
+    const n = dir.readFile(io, draft_file, out) catch return .{};
+    if (n.len == 0) return .{};
+    const w = dir.readFile(io, draft_warning_file, warn_out) catch return .{ .text = out[0..n.len] };
+    return .{ .text = out[0..n.len], .warn = warn_out[0..w.len] };
+}
+
+pub fn writeDraftForTest(io: std.Io, dir: *std.Io.Dir, text: []const u8, warn: ?[]const u8) void {
+    writeDraft(io, dir, text, warn);
+}
+
+pub fn draftWarningForModelForTest(model: *const Model) ?[]const u8 {
+    return draftWarningOf(model);
+}
+
+/// Restores a launch's composer from `dir`, the way startup does.
+pub fn loadDraftIntoForTest(io: std.Io, dir: *std.Io.Dir, model: *Model) void {
+    var draft_buf: [note_content_cap]u8 = undefined;
+    var warn_buf: [warning_input_capacity]u8 = undefined;
+    const stashed = readDraft(io, dir, &draft_buf, &warn_buf);
+    applyStashedDraft(model, stashed);
 }
 
 /// Logs out: deletes the session (and, for a local key, the key file itself),
@@ -36790,6 +37448,8 @@ fn performLogout(model: *Model, fx: *Effects) void {
     model.login_buffer.clear();
     model.draft_buffer.clear();
     model.draft_dropped = 0;
+    model.warn_on = false;
+    model.warn_buffer.clear();
     // Every other thing the previous reader typed, for the same reason the draft
     // is cleared: it is their private thinking, and it is one press from being
     // published under the NEXT account's key.
@@ -36807,7 +37467,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // And off the disk. An unfinished note is the previous account's private
     // thinking; leaving it would hand it to whoever signs in next, in their
     // composer, one keystroke from being published under THEIR key.
-    saveDraft("");
+    saveDraft("", null);
     // The OUTBOX is deliberately left alone, and that is not an oversight.
     //
     // A queued note is one the reader wrote and the app has not managed to
