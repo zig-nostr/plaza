@@ -772,7 +772,7 @@ pub fn forgetFollows() void {
 /// so the feed is theirs from the first frame rather than after a round trip.
 pub fn loadFollowsFromStore() void {
     const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, contact_list_kind) orelse return;
+    const own = (ownRecordJson(gpa, contact_list_kind) catch return) orelse return;
     defer freeOwnProfile(gpa, own);
     var list: [max_follows_tracked][32]u8 = undefined;
     const n = followsFromTags(own.tags, &list);
@@ -857,8 +857,8 @@ pub fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;
     const gpa = std.heap.page_allocator;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, contact_list_kind)) |own| previous = own;
+    // A failed read is not "no list": it would be built from nothing.
+    const previous: ?OwnProfile = ownWriteBase(gpa, contact_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     // A list this app signed moments ago and has not seen come back is newer

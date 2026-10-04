@@ -3500,7 +3500,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // A profile that arrives after it is shown rather than left
                     // for a Save to merge blank fields into.
                     const gpa = std.heap.page_allocator;
-                    if (ownWriteBase(gpa, 0)) |own| {
+                    // A failed read seeds nothing and is asked again next tick.
+                    if (ownWriteBase(gpa, 0) catch null) |own| {
                         defer freeOwnProfile(gpa, own);
                         seedProfileFields(model, own.json, true);
                         model.profile_stage = .have;
@@ -3508,7 +3509,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     }
                 } else if (model.editing_profile and model.profile_stage == .fetching) {
                     const gpa = std.heap.page_allocator;
-                    if (ownWriteBase(gpa, 0)) |own| {
+                    if (ownWriteBase(gpa, 0) catch null) |own| {
                         defer freeOwnProfile(gpa, own);
                         // A profile arriving a few seconds late must not replace
                         // the sentence the reader is in the middle of typing,
@@ -6653,6 +6654,7 @@ pub const ownProfileAnswered = own_profile.ownProfileAnswered;
 pub const ownProfileJson = own_profile.ownProfileJson;
 pub const ownRecordJson = own_profile.ownRecordJson;
 pub const ownWriteBase = own_profile.ownWriteBase;
+pub const setReadAllocatorForTest = own_profile.setReadAllocatorForTest;
 pub const own_profile_wait_s = own_profile.own_profile_wait_s;
 pub const publishName = own_profile.publishName;
 pub const replayPending = own_profile.replayPending;

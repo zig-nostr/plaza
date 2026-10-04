@@ -210,8 +210,8 @@ pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     if (std.mem.eql(u8, &me, &pubkey)) return .nothing_to_do;
     const gpa = std.heap.page_allocator;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, mute_list_kind)) |own| previous = own;
+    // A failed read is not "no list": it would be built from nothing.
+    const previous: ?OwnProfile = ownWriteBase(gpa, mute_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
@@ -303,7 +303,7 @@ pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
 /// account is hidden from the first frame rather than after a round trip.
 pub fn loadMutesFromStore() void {
     const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, mute_list_kind) orelse return;
+    const own = (ownRecordJson(gpa, mute_list_kind) catch return) orelse return;
     defer freeOwnProfile(gpa, own);
     var list: [max_mutes][32]u8 = undefined;
     var n = mutesFromTags(own.tags, &list);

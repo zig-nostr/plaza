@@ -871,3 +871,288 @@ test "every toast the app can show fits the toast whole" {
     try testing.expect(main.place_looking_toast_for_test.len <= cap);
     try testing.expectEqual(@as(usize, 0), too_long);
 }
+
+// A read of the reader's own record that could not finish is not "no record".
+// Every write that splices onto one used to take the two for the same answer and
+// build the write from nothing, which replaces the real record with it. These
+// fail the read at each allocation in turn, with a stored record present, and
+// ask each write path to refuse and publish nothing until the read works.
+
+const ReadOutcome = enum { refused, went_through, other };
+
+fn byEnum(result: anytype) ReadOutcome {
+    if (result == .failed) return .refused;
+    if (result == .published) return .went_through;
+    return .other;
+}
+
+fn refusedWhileReadFails(comptime attempt: fn () ReadOutcome) !void {
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var refused: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = fail_index });
+        main.setReadAllocatorForTest(failing.allocator());
+        const outcome = attempt();
+        main.setReadAllocatorForTest(null);
+        switch (outcome) {
+            .refused => {
+                refused += 1;
+                try testing.expect(main.lastPublishedForTest() == null);
+            },
+            .went_through => break,
+            .other => return error.UnexpectedOutcome,
+        }
+    }
+    // The first allocation is the query and a later one is the copy of the tags,
+    // so more than one read was refused before one worked.
+    try testing.expect(refused >= 2);
+    try testing.expect(fail_index < 64);
+    try testing.expect(main.lastPublishedForTest() != null);
+}
+
+const read_fail_secret = [_]u8{0x6b} ** 32;
+
+fn storeOwnRecord(arena: std.mem.Allocator, kind: u16, tags: []const nostr.event.Tag, content: []const u8) !void {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(read_fail_secret);
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, kind, tags, content, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+}
+
+const ReadFailFixture = struct {
+    arena_state: std.heap.ArenaAllocator,
+    store: FreshStore = undefined,
+
+    fn open(self: *ReadFailFixture, name: []const u8) !void {
+        self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        main.resetOutboxForTest();
+        main.setIdentityForTest(read_fail_secret);
+        main.setIdentityMintedForTest(false);
+        try self.store.open(name);
+    }
+
+    fn close(self: *ReadFailFixture) void {
+        self.store.close();
+        main.clearIdentityForTest();
+        main.resetOutboxForTest();
+        self.arena_state.deinit();
+    }
+};
+
+fn mutePress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    return byEnum(main.writeMute(&fx, [_]u8{0x83} ** 32, true));
+}
+test "a failed read of the mute list refuses the write instead of building one from nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-mute");
+    defer f.close();
+    main.forgetMutesForTest();
+    defer main.forgetMutesForTest();
+    const tags = [_]nostr.event.Tag{ &.{ "p", "82" ** 32 }, &.{ "t", "politics" } };
+    try storeOwnRecord(f.arena_state.allocator(), 10000, &tags, "");
+    try refusedWhileReadFails(mutePress);
+}
+
+fn followPress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    return byEnum(main.writeFollow(&fx, [_]u8{0x84} ** 32, true));
+}
+test "a failed read of the contact list refuses the write instead of building one from nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-follow");
+    defer f.close();
+    main.forgetFollowsForTest();
+    defer main.forgetFollowsForTest();
+    const tags = [_]nostr.event.Tag{ &.{ "p", "85" ** 32 }, &.{ "p", "86" ** 32 } };
+    try storeOwnRecord(f.arena_state.allocator(), 3, &tags, "");
+    try refusedWhileReadFails(followPress);
+}
+
+fn bookmarkPress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    return byEnum(main.writeBookmarkForTest(&fx, [_]u8{0x87} ** 32, true));
+}
+test "a failed read of the bookmark list refuses the write instead of building one from nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-bookmark");
+    defer f.close();
+    main.forgetBookmarksForTest();
+    defer main.forgetBookmarksForTest();
+    const tags = [_]nostr.event.Tag{&.{ "e", "89" ** 32 }};
+    try storeOwnRecord(f.arena_state.allocator(), 10003, &tags, "");
+    try refusedWhileReadFails(bookmarkPress);
+}
+
+test "a failed read of the bookmark list stops a private bookmark before the seal and after it" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-seal");
+    defer f.close();
+    main.forgetBookmarksForTest();
+    main.forgetPrivateHalvesForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.forgetPrivateHalvesForTest();
+    }
+    const tags = [_]nostr.event.Tag{&.{ "e", "8a" ** 32 }};
+    try storeOwnRecord(f.arena_state.allocator(), 10003, &tags, "");
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    // The press reads the list to seal onto it. Refused there, no seal starts.
+    var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = 0 });
+    main.setReadAllocatorForTest(failing.allocator());
+    try testing.expectEqual(main.BookmarkWrite.failed, main.writePrivateBookmarkForTest(&fx, [_]u8{0x8b} ** 32, true));
+    main.setReadAllocatorForTest(null);
+    try testing.expect(!main.privateSealActiveForTest());
+
+    // The seal comes back, and the splice reads the list again.
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0x8b} ** 32, true));
+    var failing_again = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = 0 });
+    main.setReadAllocatorForTest(failing_again.allocator());
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    main.setReadAllocatorForTest(null);
+    try testing.expectEqualStrings("That did not save, and nothing was published.", model.toast_text());
+    try testing.expect(main.lastPublishedForTest() == null);
+    try testing.expect(!main.isBookmarked([_]u8{0x8b} ** 32));
+
+    // The same press goes through once the read works.
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0x8b} ** 32, true));
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expect(main.isBookmarked([_]u8{0x8b} ** 32));
+}
+
+fn blossomPress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    return byEnum(main.writeBlossomServersForTest(&fx, "https://three.example", null));
+}
+test "a failed read of the media server list refuses the write instead of building one from nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-blossom");
+    defer f.close();
+    main.forgetBlossomForTest();
+    defer main.forgetBlossomForTest();
+    const tags = [_]nostr.event.Tag{ &.{ "server", "https://one.example" }, &.{ "server", "https://two.example" } };
+    try storeOwnRecord(f.arena_state.allocator(), 10063, &tags, "");
+    main.loadBlossomFromStoreForTest();
+    try refusedWhileReadFails(blossomPress);
+}
+
+fn relayListPress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    return if (main.publishRelayListForTest(&fx)) .went_through else .refused;
+}
+test "a failed read of the relay list keeps the edit pending instead of building one from nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-relays");
+    defer f.close();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+    const tags = [_]nostr.event.Tag{ &.{ "r", "wss://staying.example.com" }, &.{ "r", "wss://also.example.com" } };
+    try storeOwnRecord(f.arena_state.allocator(), 10002, &tags, "");
+    _ = main.addRelayForTest("wss://staying.example.com", true, true);
+    main.markRelaysMineForTest();
+    // A key minted here may write from nothing, which is the case a failed read
+    // used to be mistaken for.
+    main.setIdentityMintedForTest(true);
+    try refusedWhileReadFails(relayListPress);
+}
+
+fn namePress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.name_buffer.set("Bob");
+    return if (main.publishNameWithForTest(&model, &fx, std.heap.page_allocator)) .went_through else .refused;
+}
+test "a failed read of the profile refuses the name instead of merging it onto nothing" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-name");
+    defer f.close();
+    const tags = [_]nostr.event.Tag{&.{ "i", "github:someone", "a-proof-url" }};
+    try storeOwnRecord(f.arena_state.allocator(), 0, &tags, "{\"about\":\"kept\"}");
+    try refusedWhileReadFails(namePress);
+}
+
+fn saveSheetPress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.editing_profile = true;
+    model.profile_stage = .have;
+    model.profile_name_buffer.set("Bob");
+    main.saveProfile(&model, &fx);
+    return switch (model.profile_stage) {
+        .unread => .refused,
+        .sent, .saving => .went_through,
+        else => .other,
+    };
+}
+test "a failed read of the profile stops the sheet's save and says it could not read it" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-save");
+    defer f.close();
+    const tags = [_]nostr.event.Tag{&.{ "i", "github:someone", "a-proof-url" }};
+    try storeOwnRecord(f.arena_state.allocator(), 0, &tags, "{\"about\":\"kept\"}");
+    try refusedWhileReadFails(saveSheetPress);
+}
+
+test "opening the profile sheet over a failed read does not offer to start a profile" {
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-open");
+    defer f.close();
+    try storeOwnRecord(f.arena_state.allocator(), 0, &.{}, "{\"name\":\"Kept\"}");
+    var model = main.initialModel();
+    var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = 0 });
+    main.setReadAllocatorForTest(failing.allocator());
+    main.openProfileEdit(&model);
+    main.setReadAllocatorForTest(null);
+    try testing.expect(model.profile_stage == .unread);
+    try testing.expect(!model.profile_can_save());
+
+    main.openProfileEdit(&model);
+    try testing.expect(model.profile_stage == .have);
+    try testing.expectEqualStrings("Kept", model.profile_name());
+}
+
+fn lateProfileSavePress() ReadOutcome {
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    model.profile_name_buffer.set("Bob");
+    main.saveProfile(&model, &fx);
+    return switch (model.profile_stage) {
+        .unread => .refused,
+        .have => .went_through,
+        else => .other,
+    };
+}
+test "a profile that lands after the sheet said none is not merged blind when the read fails" {
+    // The sheet was told there was no profile, one arrived in the store, and the
+    // next Save looks again. A failed look there is not "still none".
+    var f: ReadFailFixture = .{ .arena_state = undefined };
+    try f.open("readfail-late");
+    defer f.close();
+    _ = harness.signInNothingFound(0x6b);
+    try storeOwnRecord(f.arena_state.allocator(), 0, &.{}, "{\"name\":\"Kept\"}");
+    var fail_index: usize = 0;
+    var refused: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = fail_index });
+        main.setReadAllocatorForTest(failing.allocator());
+        const outcome = lateProfileSavePress();
+        main.setReadAllocatorForTest(null);
+        switch (outcome) {
+            .refused => refused += 1,
+            .went_through => break,
+            .other => return error.UnexpectedOutcome,
+        }
+    }
+    try testing.expect(refused >= 2);
+    try testing.expect(fail_index < 64);
+}

@@ -126,7 +126,7 @@ pub fn forgetBlossom() void {
 
 pub fn loadBlossomFromStore() void {
     const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, blossom_list_kind) orelse return;
+    const own = (ownRecordJson(gpa, blossom_list_kind) catch return) orelse return;
     defer freeOwnProfile(gpa, own);
     setBlossomServers(own.tags, own.created_at);
 }
@@ -305,8 +305,8 @@ pub fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]co
     const add: ?[]const u8 = if (add_raw) |raw| (blossom.normalizeServer(&add_buf, raw) orelse return .failed) else null;
     const remove: ?[]const u8 = if (remove_raw) |raw| (blossom.normalizeServer(&remove_buf, raw) orelse return .failed) else null;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, blossom_list_kind)) |own| previous = own;
+    // A failed read is not "no list": it would be built from nothing.
+    const previous: ?OwnProfile = ownWriteBase(gpa, blossom_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     // With nothing stored to splice onto, only proof that there is nothing to
     // lose licenses a write. A list held in memory is not that proof: it is a

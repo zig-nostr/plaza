@@ -152,15 +152,39 @@ pub const OwnProfile = struct {
 /// else, so rebuilding from it would publish a profile with the rest deleted.
 ///
 /// The returned slice is owned by the caller's allocator.
-pub fn ownProfileJson(gpa: std.mem.Allocator) ?OwnProfile {
+pub fn ownProfileJson(gpa: std.mem.Allocator) OwnReadError!?OwnProfile {
     return ownRecordJson(gpa, 0);
+}
+
+/// A read of the reader's own record that did not complete: the query failed or
+/// a copy ran out of memory. Not the same answer as "there is no record", and
+/// every write that splices onto one has to tell them apart: taking this for
+/// "none" builds the write from nothing and replaces the real record with it.
+pub const OwnReadError = error{ReadFailed};
+
+/// Set by a test to make the reads below allocate from an allocator it can fail.
+/// Only consulted in a test build.
+pub var g_test_read_allocator: ?std.mem.Allocator = null;
+
+/// Makes the reads of the reader's own records allocate from `alloc`, or from
+/// the caller's again when null.
+pub fn setReadAllocatorForTest(alloc: ?std.mem.Allocator) void {
+    g_test_read_allocator = alloc;
+}
+
+fn readAllocator(gpa: std.mem.Allocator) std.mem.Allocator {
+    return if (builtin.is_test) (g_test_read_allocator orelse gpa) else gpa;
 }
 
 /// The reader's own newest event of `kind`, content and tags. The RAW record is
 /// the source of truth for every write this app makes over one of its own
 /// lists: the caches model a few fields and drop the rest, so rebuilding from
 /// one would publish a record with everything else deleted.
-pub fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
+///
+/// Null means there is no record (or no store or account to have one). A read
+/// that could not finish is `error.ReadFailed`, which is not that.
+pub fn ownRecordJson(gpa_arg: std.mem.Allocator, kind: u16) OwnReadError!?OwnProfile {
+    const gpa = readAllocator(gpa_arg);
     // Counted so a test can assert the SHAPE of the fix rather than its timing:
     // the property is that building a feed does not read this account's whole
     // contact list once per card, and a stopwatch on a CI runner is a poor way
@@ -170,14 +194,17 @@ pub fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     const pk = activePubkey() orelse return null;
     const kinds = [_]u16{kind};
     const authors = [_][32]u8{pk};
-    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return null;
+    var result = store.query(gpa, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }) catch return error.ReadFailed;
     defer result.deinit();
     if (result.events.len == 0) return null;
     // Copied out before `result.deinit()`: the query owns its events through an
     // arena, and the write seam holds what it is given past this frame.
-    const copy = gpa.dupe(u8, result.events[0].content) catch return null;
+    const copy = gpa.dupe(u8, result.events[0].content) catch return error.ReadFailed;
     // Whole or not at all. A partial base is what turns a splice into a delete.
-    const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
+    const tags = dupeTags(gpa, result.events[0].tags) orelse {
+        gpa.free(copy);
+        return error.ReadFailed;
+    };
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
 /// The record a write of `kind` builds on: the reader's own newest one, or the
@@ -185,18 +212,23 @@ pub fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
 ///
 /// Built on the stored one instead, the write would publish a record without
 /// the change already out on the relays. UI thread only, like the hold.
-pub fn ownWriteBase(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
-    const stored = ownRecordJson(gpa, kind);
+///
+/// `error.ReadFailed` when either copy could not be made. A caller that took
+/// that for "no record" would build the write from nothing, so every one of them
+/// refuses on it.
+pub fn ownWriteBase(gpa_arg: std.mem.Allocator, kind: u16) OwnReadError!?OwnProfile {
+    const gpa = readAllocator(gpa_arg);
+    const stored = try ownRecordJson(gpa, kind);
     const held = heldOwnRecord(kind) orelse return stored;
     if (stored) |own| {
         if (own.created_at >= held.created_at) return own;
         freeOwnProfile(gpa, own);
     }
     // Whole or not at all, as for the stored one.
-    const content = gpa.dupe(u8, held.content) catch return null;
+    const content = gpa.dupe(u8, held.content) catch return error.ReadFailed;
     const tags = dupeTags(gpa, held.tags) orelse {
         gpa.free(content);
-        return null;
+        return error.ReadFailed;
     };
     return .{ .json = content, .tags = tags, .created_at = held.created_at, .id = held.id };
 }
@@ -244,7 +276,15 @@ pub fn openProfileEdit(model: *Model) void {
     // published and not stored yet is newer than the store's, and the sheet
     // seeded from the store showed the old name, which a bio-only save then
     // published back.
-    if (ownWriteBase(gpa, 0)) |own| {
+    // A read that failed is not "nothing here yet": the sheet would go on to
+    // ask the relays, conclude there is none, and offer to start a profile over
+    // the one that is stored.
+    const base = ownWriteBase(gpa, 0) catch {
+        model.profile_seeded = false;
+        model.profile_stage = .unread;
+        return;
+    };
+    if (base) |own| {
         // The whole record, not just its content: freeing only `json` left every
         // tag it carried behind on each open of the sheet.
         defer freeOwnProfile(gpa, own);
@@ -372,7 +412,12 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
         // never shown, so merging the sheet into it would remove every one the
         // reader did not happen to type. Show it first; the next Save merges.
         const gpa = std.heap.page_allocator;
-        if (ownWriteBase(gpa, 0)) |own| {
+        const late = ownWriteBase(gpa, 0) catch {
+            model.profile_stage = .unread;
+            model.profile_confirm_new = false;
+            return;
+        };
+        if (late) |own| {
             defer freeOwnProfile(gpa, own);
             seedProfileFields(model, own.json, true);
             model.profile_stage = .have;
@@ -402,9 +447,13 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
 
     var prev_created_at: i64 = 0;
     var prev_tags: []const nostr.event.Tag = &.{};
-    var existing: ?OwnProfile = null;
-    if (ownWriteBase(gpa, 0)) |own| {
-        existing = own;
+    // Refused on a failed read, never merged onto nothing: that publishes a
+    // profile of one field over the real one.
+    const existing: ?OwnProfile = ownWriteBase(gpa, 0) catch {
+        model.profile_stage = .unread;
+        return;
+    };
+    if (existing) |own| {
         prev_created_at = own.created_at;
         prev_tags = own.tags;
     } else if (model.profile_stage != .absent) {
@@ -745,9 +794,10 @@ fn publishNameWith(model: *Model, fx: *Effects, build: std.mem.Allocator) bool {
 
     var prev_created_at: i64 = 0;
     var prev_tags: []const nostr.event.Tag = &.{};
-    var existing: ?OwnProfile = null;
-    if (ownWriteBase(gpa, 0)) |own| {
-        existing = own;
+    // A read that failed is not "no profile": the name would be merged onto
+    // `{}` and published over the real one.
+    const existing: ?OwnProfile = ownWriteBase(gpa, 0) catch return nameNotSet(model);
+    if (existing) |own| {
         prev_created_at = own.created_at;
         prev_tags = own.tags;
     }
@@ -829,13 +879,13 @@ pub fn noteOwnContactsAnsweredForTest(pk: [32]u8) void {
 /// property that tags cannot show: that an encrypted half nobody here reads was
 /// carried through a write rather than replaced with nothing.
 pub fn ownRecordContentForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
-    const own = ownRecordJson(gpa, kind) orelse return null;
+    const own = (ownRecordJson(gpa, kind) catch return null) orelse return null;
     defer freeOwnProfile(gpa, own);
     return gpa.dupe(u8, own.json) catch null;
 }
 
 pub fn ownRecordTagsJoinedForTest(gpa: std.mem.Allocator, kind: u16) ?[]u8 {
-    const own = ownRecordJson(gpa, kind) orelse return null;
+    const own = (ownRecordJson(gpa, kind) catch return null) orelse return null;
     defer freeOwnProfile(gpa, own);
     var out = std.ArrayList(u8).empty;
     for (own.tags) |tag| {

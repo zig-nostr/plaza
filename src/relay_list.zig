@@ -341,7 +341,7 @@ pub fn canWriteRelayList() bool {
 /// Whether this account's own kind:10002 is in the local store.
 fn haveOwnRelayList() bool {
     const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, relay_list_kind) orelse return false;
+    const own = (ownRecordJson(gpa, relay_list_kind) catch return false) orelse return false;
     freeOwnProfile(gpa, own);
     return true;
 }
@@ -387,8 +387,9 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     // is then replaced by the eight relays this process happens to hold, which
     // is the exact deletion the splice below exists to prevent. `writeFollow`
     // documents this hazard and decides its gate from the one read it uses.
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, relay_list_kind)) |own| previous = own;
+    // A failed read keeps the edit pending, like any other refusal here, and is
+    // not taken for "no list".
+    const previous: ?OwnProfile = ownWriteBase(gpa, relay_list_kind) catch return false;
     // Somebody else's list may not be overwritten sight unseen. Minting the
     // identity here is the one case where there is legitimately nothing to read.
     if (previous == null and !own_lists.g_identity_minted_here) return false;

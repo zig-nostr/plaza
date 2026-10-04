@@ -177,7 +177,7 @@ fn privateBookmarks(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) 
 
 pub fn loadBookmarksFromStore() void {
     const gpa = std.heap.page_allocator;
-    const own = ownRecordJson(gpa, bookmark_list_kind) orelse return;
+    const own = (ownRecordJson(gpa, bookmark_list_kind) catch return) orelse return;
     defer freeOwnProfile(gpa, own);
     var list: [max_bookmarks][32]u8 = undefined;
     var n = bookmarksFromTags(own.tags, &list);
@@ -253,8 +253,8 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
     forgetPrivateAnnounce();
     const gpa = std.heap.page_allocator;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
+    // A failed read is not "no list": it would be built from nothing.
+    const previous: ?OwnProfile = ownWriteBase(gpa, bookmark_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
@@ -346,8 +346,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     forgetPrivateAnnounce();
     const gpa = std.heap.page_allocator;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
+    const previous: ?OwnProfile = ownWriteBase(gpa, bookmark_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
     if (previous == null and !noHistoryKnown(.bookmarks)) return .no_list_yet;
@@ -472,8 +471,10 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     }
     const gpa = std.heap.page_allocator;
 
-    var previous: ?OwnProfile = null;
-    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
+    const previous: ?OwnProfile = ownWriteBase(gpa, bookmark_list_kind) catch {
+        setToast(model, "That did not save, and nothing was published.");
+        return;
+    };
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
