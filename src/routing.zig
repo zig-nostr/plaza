@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const relay_table = @import("relay_table.zig");
 const relay_conn = @import("relay_conn.zig");
+const engagement = @import("engagement.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1077,7 +1078,7 @@ pub fn forgetRelaySeen(relay_index: usize) void {
     const bit = @as(u64, 1) << @intCast(relay_index);
     engagementLock();
     defer engagementUnlock();
-    for (&main.g_engagement) |*e| e.relays_seen &= ~bit;
+    for (&engagement.g_engagement) |*e| e.relays_seen &= ~bit;
 }
 
 pub fn markRelaySeen(note_id: i64, relay_index: usize) void {
@@ -1089,7 +1090,7 @@ pub fn markRelaySeen(note_id: i64, relay_index: usize) void {
     // 512-row budget on every note the pool delivers, crowding out the counts the
     // rows exist for; the engagement subscription creates the rows for the notes
     // on screen, which are the only ones whose spread can be read.
-    for (&main.g_engagement) |*e| {
+    for (&engagement.g_engagement) |*e| {
         if (e.used and e.note_id == note_id) {
             e.relays_seen |= bit;
             return;
@@ -1103,7 +1104,7 @@ pub fn markRelaySeen(note_id: i64, relay_index: usize) void {
 pub fn relaysSeenFor(note_id: i64) usize {
     engagementLock();
     defer engagementUnlock();
-    for (&main.g_engagement) |*e| {
+    for (&engagement.g_engagement) |*e| {
         if (e.used and e.note_id == note_id) return @popCount(e.relays_seen);
     }
     return 0;
