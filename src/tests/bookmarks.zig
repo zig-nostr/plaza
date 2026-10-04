@@ -356,3 +356,142 @@ test "a private bookmark that was never signed is not announced by a later publi
     main.sayPrivateBookmarkPublished(&model);
     try testing.expectEqual(@as(usize, 0), model.toast_len);
 }
+
+/// Private mutes sealed to the bookmark fixture's key, stored and read: the
+/// reader whose cache the private bookmark tests below have to share.
+fn privateMutesFixture(arena: std.mem.Allocator, signer: nostr.keys.Signer, kp: nostr.keys.KeyPair, who: [32]u8, created_at: i64) ![]const u8 {
+    const hex = std.fmt.bytesToHex(who, .lower);
+    const plain = try std.fmt.allocPrint(arena, "[[\"p\",\"{s}\"]]", .{&hex});
+    const ck = try nostr.nip44.conversationKey(signer, kp.secret_key, kp.public_key);
+    const sealed = try nostr.nip44.encryptWithConversationKey(arena, ck, plain, [_]u8{@truncate(who[0])} ** 32);
+    const ev = try nostr.event.create(arena, signer, kp, created_at, 10000, &.{}, sealed, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    main.loadMutesFromStoreForTest();
+    return sealed;
+}
+
+test "private bookmarks written one after another stay writable, and the private mutes stay readable" {
+    // Every private bookmark write mints a new ciphertext, and each one read
+    // back took a slot of the private-half cache for good: an opened slot was
+    // never given up. With private mutes holding one slot, the fourth write's
+    // half found none, and from then on every bookmark said "Cannot open
+    // private bookmarks" until a restart. A mute list changed in another
+    // client hit the same wall.
+    defer main.resetOutboxForTest();
+    main.forgetBookmarksForTest();
+    main.forgetMutesForTest();
+    main.forgetPrivateHalvesForTest();
+    defer {
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.forgetLastPublishedForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmfive.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    const kp = try bookmarkFixture(arena, &signer, &store, &.{}, "");
+
+    const muted = [_]u8{0xc3} ** 32;
+    const mute_half = try privateMutesFixture(arena, signer, kp, muted, 1_800_000_000);
+    try testing.expect(main.isMuted(muted));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest(mute_half));
+
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    var ids: [5][32]u8 = undefined;
+    for (&ids, 0..) |*id, n| {
+        id.* = [_]u8{@intCast(0xd0 + n)} ** 32;
+        try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, id.*, true));
+        main.finishPrivateBookmarkForTest(&model, &fx);
+        try testing.expect(main.isBookmarked(id.*));
+        // The mute half is never what makes room.
+        try testing.expectEqualStrings("open", main.privateHalfStateOfForTest(mute_half));
+        try testing.expect(main.isMuted(muted));
+    }
+
+    // What went out last holds all five, and is what the store holds now.
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqual(@as(u16, 10003), out.kind);
+    const opened = try nostr.nip44.decrypt(arena, signer, kp.secret_key, kp.public_key, out.content);
+    for (ids) |id| {
+        const hex = std.fmt.bytesToHex(id, .lower);
+        try testing.expect(std.mem.indexOf(u8, opened, &hex) != null);
+    }
+    main.loadBookmarksFromStoreForTest();
+    for (ids) |id| try testing.expect(main.isBookmarked(id));
+
+    // The mute list changes in another client, and reads, and can be written.
+    const now_muted = [_]u8{0xc4} ** 32;
+    const new_mute_half = try privateMutesFixture(arena, signer, kp, now_muted, 1_900_000_000);
+    try testing.expect(main.isMuted(now_muted));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest(new_mute_half));
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, [_]u8{0xc5} ** 32, true));
+}
+
+test "a sealed private half is open the moment it is published, with nothing asked" {
+    // The reader holds the plaintext it asked to have sealed. Asking the signer
+    // to open the ciphertext that came back was a second round trip, on a bunker
+    // a second prompt, for a list it had just written.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateSealForTest();
+    main.forgetPrivateHalvesForTest();
+    defer {
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.clearPendingForTest();
+        main.setSignerKindLocalForTest();
+        main.forgetLastPublishedForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmseed.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    const kp = try bookmarkFixture(arena, &signer, &store, &.{}, "");
+
+    // A bunker seals it. Nothing in a test answers a bunker's decrypt inline,
+    // so a half that reads open below was opened by nothing but the seal.
+    var fx: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    main.setRemotePubkeyForTest(kp.public_key);
+    const note = [_]u8{0xe1} ** 32;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, note, true));
+    var threaded = std.Io.Threaded.init(arena, .{});
+    defer threaded.deinit();
+    const sealed = try nostr.nip44.encrypt(arena, threaded.io(), signer, kp.secret_key, kp.public_key, main.lastSealPlaintextForTest());
+    main.parkSealAnswerForTest(sealed);
+    main.setSignerKindLocalForTest();
+    var model = main.initialModel();
+    const asks = main.halfAskSeqForTest();
+    main.scanPendingRemoteForTest(&model, &fx);
+    const published = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqualStrings(sealed, published.content);
+
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest(sealed));
+    try testing.expect(main.privateHalfIsReadableForTest(sealed));
+    try testing.expectEqual(asks, main.halfAskSeqForTest());
+    // And the next write builds on it at once, rather than waiting on a prompt.
+    main.setSignerKindForTest("remote");
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xe2} ** 32, true));
+}

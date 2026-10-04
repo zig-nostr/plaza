@@ -34,6 +34,7 @@ const ownRecordJson = main.ownRecordJson;
 const ownWriteBase = main.ownWriteBase;
 const privateHalfGate = main.privateHalfGate;
 const privateHalfOpened = main.privateHalfOpened;
+const freePrivatePlain = main.freePrivatePlain;
 const shrinkAllowed = main.shrinkAllowed;
 const signAndPublish = main.signAndPublish;
 const signerReady = main.signerReady;
@@ -233,7 +234,7 @@ pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     // the ciphertext the reader already has. So content that is present and not
     // yet opened means no write at all, and the reader is told which of waiting,
     // declined or unreadable it is.
-    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+    if (base_content.len > 0) switch (privateHalfGate(gpa, .mutes, base_content)) {
         .readable => {},
         .waiting => return .private_half_waiting,
         .declined => return .private_half_declined,
@@ -341,11 +342,13 @@ pub fn ingestMuteList(ev: nostr.event.Event) void {
 /// is allowed to look like an empty half is how Jumble publishes away every
 /// private mute the reader had.
 pub fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
-    if (content.len == 0 or out.len == 0) return 0;
     // From the cache Notary fills, not from a secret key here. A miss queues
     // the ask and reads as "cannot read", which is the fail-safe every caller
-    // already handles.
-    const plain = privateHalfOpened(content) orelse return 0;
+    // already handles. Asked even for an empty content or a full list, because
+    // the read is also what tells the cache which half this list has now.
+    const plain = privateHalfOpened(gpa, .mutes, content) orelse return 0;
+    defer freePrivatePlain(gpa, plain);
+    if (out.len == 0) return 0;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
     defer parsed.deinit();
     var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;

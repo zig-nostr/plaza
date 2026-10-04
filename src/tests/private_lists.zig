@@ -446,3 +446,113 @@ test "a keyholder that refuses to open a private half leaves it unreadable" {
     main.deliverPrivateHalfForTest(200, "{\"items\":[]}");
     try testing.expect(!main.privateHalfIsReadableForTest(ciphertext));
 }
+
+test "a slot given up for a new half is never the half a list holds now, nor one an ask is out for" {
+    // The cache has four slots and no end of ciphertexts: every private
+    // bookmark write mints one. Giving up a slot is how it keeps working, and
+    // giving up the wrong one is a list that suddenly reads as unreadable, or
+    // an answer that lands on a slot about something else.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+
+    const plain = "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]";
+    // The mute list's half, read first so it is the one used longest ago.
+    main.openPrivateHalfForTest("mute-half", plain);
+    try testing.expect(main.readPrivateHalfForTest(.mutes, "mute-half"));
+    main.openPrivateHalfForTest("bookmark-half", plain);
+    try testing.expect(main.readPrivateHalfForTest(.bookmarks, "bookmark-half"));
+    // A bunker is still being asked about a third.
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    const asking = main.claimPrivateHalfPendingForTest("asked-half") orelse return error.NoSlot;
+
+    // Halves no list holds, more of them than there are slots.
+    var name_buf: [16]u8 = undefined;
+    for (0..12) |n| {
+        const name = try std.fmt.bufPrint(&name_buf, "stale-{d}", .{n});
+        main.openPrivateHalfForTest(name, plain);
+        // Each one got a slot: the one before it, the only slot free to go.
+        try testing.expectEqualStrings("open", main.privateHalfStateOfForTest(name));
+        try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("mute-half"));
+        try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("bookmark-half"));
+        try testing.expectEqualStrings("asking", main.privateHalfStateForTest(asking));
+        if (n > 0) {
+            const before = try std.fmt.bufPrint(&name_buf, "stale-{d}", .{n - 1});
+            try testing.expectEqualStrings("none", main.privateHalfStateOfForTest(before));
+        }
+    }
+
+    // A list read with a new half lets the old one go, and the new one stays.
+    main.openPrivateHalfForTest("bookmark-half-2", plain);
+    try testing.expect(main.readPrivateHalfForTest(.bookmarks, "bookmark-half-2"));
+    main.openPrivateHalfForTest("stale-next", plain);
+    try testing.expectEqualStrings("none", main.privateHalfStateOfForTest("bookmark-half"));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("bookmark-half-2"));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("mute-half"));
+
+    // Every slot held and waited on: a new half finds none and reads as not
+    // open, which every write already refuses on, rather than taking a list's.
+    main.forgetPrivateHalvesForTest();
+    main.openPrivateHalfForTest("mute-half", plain);
+    try testing.expect(main.readPrivateHalfForTest(.mutes, "mute-half"));
+    main.openPrivateHalfForTest("bookmark-half", plain);
+    try testing.expect(main.readPrivateHalfForTest(.bookmarks, "bookmark-half"));
+    _ = main.claimPrivateHalfPendingForTest("asked-1") orelse return error.NoSlot;
+    _ = main.claimPrivateHalfPendingForTest("asked-2") orelse return error.NoSlot;
+    main.openPrivateHalfForTest("no-room", plain);
+    try testing.expectEqualStrings("none", main.privateHalfStateOfForTest("no-room"));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("mute-half"));
+    try testing.expectEqualStrings("open", main.privateHalfStateOfForTest("bookmark-half"));
+}
+
+test "a list read on a relay's thread never sees another half's plaintext" {
+    // `ingestMuteList` runs on whichever thread the relay's event arrived on,
+    // and reads the private half there, while the UI thread asks, answers and
+    // gives slots up. A read handed a slice into a slot that was being filled
+    // for another ciphertext came back with that one's plaintext, or half of it.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+
+    const Reader = struct {
+        fn plainFor(buf: []u8, n: usize) []const u8 {
+            // Each half's plaintext names it, so a read can tell whose it got.
+            @memset(buf, @intCast('a' + n % 20));
+            return buf;
+        }
+        fn run(stop: *std.atomic.Value(bool), bad: *std.atomic.Value(u32)) void {
+            const gpa = std.heap.page_allocator;
+            var name_buf: [16]u8 = undefined;
+            var round: usize = 0;
+            while (!stop.load(.acquire)) : (round += 1) {
+                const n = round % 6;
+                const name = std.fmt.bufPrint(&name_buf, "half-{d}", .{n}) catch unreachable;
+                const plain = main.privateHalfOpened(gpa, .mutes, name) orelse continue;
+                defer main.freePrivatePlain(gpa, plain);
+                const want: u8 = @intCast('a' + n % 20);
+                for (plain) |c| {
+                    if (c != want) {
+                        _ = bad.fetchAdd(1, .monotonic);
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var bad = std.atomic.Value(u32).init(0);
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{ &stop, &bad });
+    var plain_buf: [4096]u8 = undefined;
+    var name_buf: [16]u8 = undefined;
+    for (0..20_000) |round| {
+        const n = (round * 7) % 6;
+        const name = try std.fmt.bufPrint(&name_buf, "half-{d}", .{n});
+        main.openPrivateHalfForTest(name, Reader.plainFor(&plain_buf, n));
+    }
+    stop.store(true, .release);
+    thread.join();
+    try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+}

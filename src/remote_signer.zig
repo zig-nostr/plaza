@@ -38,7 +38,9 @@ const compose_capacity = main.compose_capacity;
 const dupeTags = main.dupeTags;
 const enterFeed = main.enterFeed;
 const finishPrivateBookmark = main.finishPrivateBookmark;
-const halfAwaiting = main.halfAwaiting;
+const rearmHalfAsk = main.rearmHalfAsk;
+const refuseHalfAsk = main.refuseHalfAsk;
+const applyHalfAnswer = main.applyHalfAnswer;
 const ingestAndPublish = main.ingestAndPublish;
 const invalidateFeed = main.invalidateFeed;
 const loadBookmarksFromStore = main.loadBookmarksFromStore;
@@ -163,12 +165,11 @@ const PendingRemote = struct {
 };
 /// A decrypt answer on its way from the listener thread to the UI tick.
 ///
-/// The bunker's replies land on the listener thread, and `g_private_halves` is
-/// read by the view every frame and written by `scanPrivateHalves` on the UI
-/// thread. Rather than add a second writer to that state from another thread,
-/// the listener parks the plaintext here under the pending lock it already
-/// takes, and `scanPendingRemote` applies it where every other private-half
-/// write happens.
+/// The bunker's replies land on the listener thread, and the private-half cache
+/// is asked and answered on the UI thread. Rather than add a second place that
+/// answers from another thread, the listener parks the plaintext here under the
+/// pending lock it already takes, and `scanPendingRemote` applies it where every
+/// other answer is applied.
 const HalfInbox = struct {
     used: bool = false,
     index: u8 = 0,
@@ -1127,7 +1128,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 // asks. Only the half that ask was about: the slot may belong to
                 // another list by now.
                 if (method == .nip44_decrypt or method == .nip04_decrypt) {
-                    if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
+                    rearmHalfAsk(slot_half, slot_half_id);
                 }
                 // A seal that died with its session is over. Left active, every
                 // private bookmark after it read as "your signer is busy".
@@ -1174,10 +1175,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 // is asked again once `private_half_retry_s` has passed.
                 .nip44_decrypt, .nip04_decrypt => {
                     if (content) |c| gpa.free(c);
-                    if (halfAwaiting(slot_half, slot_half_id)) |h| {
-                        h.state = .refused;
-                        h.retry_at_s = if (slot_explicit) 0 else now + private_half_retry_s;
-                    }
+                    refuseHalfAsk(slot_half, slot_half_id, if (slot_explicit) 0 else now + private_half_retry_s);
                 },
                 // A seal the bunker refused or never answered. The list is left
                 // exactly as it was, which is the only safe outcome: the reader
@@ -1194,26 +1192,14 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
             }
         }
     }
-    // Answers that came back while the listener held them. Applied here so
-    // every write to `g_private_halves` happens on this thread.
+    // Answers that came back while the listener held them, applied on this
+    // thread like every other answer.
     var opened = false;
     for (&g_half_inbox) |*box| {
         if (!box.used) continue;
         // Only into the half that was asked: a slot freed by a sign-out and
         // taken by another list is not this answer's home.
-        if (halfAwaiting(box.index, box.half_id)) |h| {
-            if (box.ok and box.plain_len > 0 and box.plain_len <= h.plain_buf.len) {
-                @memcpy(h.plain_buf[0..box.plain_len], box.plain_buf[0..box.plain_len]);
-                h.plain_len = box.plain_len;
-                h.state = .open;
-                opened = true;
-            } else if (box.too_large or box.plain_len > h.plain_buf.len) {
-                // Asking again gets the same answer.
-                h.state = .unreadable;
-            } else {
-                h.state = .refused;
-            }
-        }
+        if (applyHalfAnswer(box.index, box.half_id, box.ok, box.too_large, box.plain_buf[0..box.plain_len])) opened = true;
         std.crypto.secureZero(u8, &box.plain_buf);
         box.* = .{};
     }
@@ -1235,7 +1221,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     if (stale_seal) forgetPrivateSeal();
     if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
     if (seal_failed) {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         setToast(model, "Your signer did not seal that. Nothing was sent.");
     }
     if (opened) {

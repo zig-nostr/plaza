@@ -42,6 +42,7 @@ const ownRecordJson = main.ownRecordJson;
 const ownWriteBase = main.ownWriteBase;
 const privateHalfGate = main.privateHalfGate;
 const privateHalfOpened = main.privateHalfOpened;
+const freePrivatePlain = main.freePrivatePlain;
 const private_seal_key = main.private_seal_key;
 const requestRemoteEncrypt = main.requestRemoteEncrypt;
 const sameRecord = main.sameRecord;
@@ -161,8 +162,11 @@ fn bookmarksFromTags(tags: []const nostr.event.Tag, out: [][32]u8) usize {
 /// list uses. A miss reads as none AND as unreadable, which the write path
 /// tells apart with `privateHalfIsReadable`.
 fn privateBookmarks(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
-    if (content.len == 0 or out.len == 0) return 0;
-    const plain = privateHalfOpened(content) orelse return 0;
+    // Asked even for an empty content or a full list, because the read is also
+    // what tells the cache which half this list has now.
+    const plain = privateHalfOpened(gpa, .bookmarks, content) orelse return 0;
+    defer freePrivatePlain(gpa, plain);
+    if (out.len == 0) return 0;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return 0;
     defer parsed.deinit();
     var tags = gpa.alloc(nostr.event.Tag, parsed.value.len) catch return 0;
@@ -260,7 +264,7 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
 
     if (!have_base and !own_lists.g_identity_minted_here and !takeFresh(.bookmarks)) return .no_list_yet;
 
-    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+    if (base_content.len > 0) switch (privateHalfGate(gpa, .bookmarks, base_content)) {
         .readable => {},
         .waiting => return .private_half_waiting,
         .declined => return .private_half_declined,
@@ -347,7 +351,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
     if (previous == null and !noHistoryKnown(.bookmarks)) return .no_list_yet;
-    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+    if (base_content.len > 0) switch (privateHalfGate(gpa, .bookmarks, base_content)) {
         .readable => {},
         .waiting => return .private_half_waiting,
         .declined => return .private_half_declined,
@@ -372,11 +376,13 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     private_lists.g_seal_ask_seq +%= 1;
     if (private_lists.g_seal_ask_seq == 0) private_lists.g_seal_ask_seq = 1;
     private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null, .account = me, .ask_seq = private_lists.g_seal_ask_seq, .plain_len = plaintext.len };
+    // Kept so the half this publishes is open from the moment it is.
+    private_lists.holdSealPlaintext(private_lists.g_seal_ask_seq, base_content, plaintext);
 
     if (keyholder.g_signer_kind == .remote) {
         private_lists.g_private_seal.awaiting_remote = true;
         if (!requestRemoteEncrypt(gpa, plaintext)) {
-            private_lists.g_private_seal = .{};
+            private_lists.clearPrivateSeal();
             return .failed;
         }
         return .published;
@@ -384,13 +390,13 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
 
     var peer_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return .failed;
     };
     // To yourself: NIP-51's private half is encrypted to your own key, so both
     // sides of the conversation key are this account's.
     const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{plaintext} }).toJson(gpa) catch {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return .failed;
     };
     defer gpa.free(body);
@@ -409,19 +415,19 @@ pub fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.Effec
     // Only the ask this seal is waiting on.
     if (response.key != privateSealKey(private_lists.g_private_seal.ask_seq)) return;
     if (response.outcome != .ok or response.status != 200) {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     };
     defer parsed.deinit();
     if (parsed.value.items.len == 0) {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
@@ -437,6 +443,9 @@ pub fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.Effec
 pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) void {
     const seal = private_lists.g_private_seal;
     private_lists.g_private_seal = .{};
+    // The plaintext is wiped however this ends; it is seeded below first if the
+    // splice goes out.
+    defer private_lists.dropSealPlaintext();
     if (!seal.active) return;
     // Sealed for the account that pressed, and published only as that account.
     const me = activePubkey() orelse return;
@@ -534,6 +543,10 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     g_private_announce_adding = seal.adding;
     g_private_announce_account = me;
     g_private_announce_at.store(created, .release);
+    // The half going out is open already: the plaintext it was sealed from is
+    // here, so the reader never asks the signer to open what it just wrote, and
+    // the half it replaces is free to give up its slot.
+    private_lists.seedSealedHalf(.bookmarks, seal.ask_seq, ciphertext);
     signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
 }
 
@@ -607,11 +620,14 @@ fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, ev
     defer tags.deinit(gpa);
     var found = false;
 
+    // The parsed tags can point into the plaintext, so it outlives them.
+    var plain: ?[]u8 = null;
+    defer if (plain) |p| freePrivatePlain(gpa, p);
     var parsed: ?std.json.Parsed([]const []const []const u8) = null;
     defer if (parsed) |p| p.deinit();
     if (base_content.len > 0) {
-        const plain = privateHalfOpened(base_content) orelse return null;
-        parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return null;
+        plain = privateHalfOpened(gpa, .bookmarks, base_content) orelse return null;
+        parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain.?, .{}) catch return null;
         for (parsed.?.value) |tag| {
             if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e") and hexEqlIgnoreCase(tag[1], &hex)) {
                 found = true;
@@ -635,13 +651,13 @@ fn privateBookmarkPlaintext(gpa: std.mem.Allocator, base_content: []const u8, ev
 /// The keyholder a test has, for the seal path.
 pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8) void {
     const secret = feed_state.g_test_secret orelse {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return;
     };
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     const kp = signer.keyPairFromSecretKey(secret) catch {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return;
     };
     // A test binary has no runtime io, so it makes its own. The seal has to be
@@ -650,12 +666,12 @@ pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8)
     defer threaded.deinit();
     const io = main.g_io orelse threaded.io();
     const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return;
     };
     defer gpa.free(sealed);
     if (sealed.len > g_test_sealed.len) {
-        private_lists.g_private_seal = .{};
+        private_lists.clearPrivateSeal();
         return;
     }
     g_test_sealed_len = sealed.len;
