@@ -31,6 +31,7 @@ const nowMillis = main.nowMillis;
 const nowSeconds = main.nowSeconds;
 const ownRecordCreatedAt = main.ownRecordCreatedAt;
 const ownRecordJson = main.ownRecordJson;
+const ownWriteBase = main.ownWriteBase;
 const poolHoldsRelay = main.poolHoldsRelay;
 const relayAt = main.relayAt;
 const relaySlots = main.relaySlots;
@@ -381,7 +382,7 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     // is the exact deletion the splice below exists to prevent. `writeFollow`
     // documents this hazard and decides its gate from the one read it uses.
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, relay_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, relay_list_kind)) |own| previous = own;
     // Somebody else's list may not be overwritten sight unseen. Minting the
     // identity here is the one case where there is legitimately nothing to read.
     if (previous == null and !own_lists.g_identity_minted_here) return false;

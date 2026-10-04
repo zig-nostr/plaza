@@ -859,7 +859,15 @@ test "a private bookmark list with control characters in it seals back whole" {
     try testing.expectEqualStrings(&new_hex, back[entries.len][1]);
 }
 
-test "a list published but not stored holds the next write until it is read back" {
+fn publishedNames(ev: nostr.event.Event, pubkey: [32]u8) bool {
+    const hex = std.fmt.bytesToHex(pubkey, .lower);
+    for (ev.tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], &hex)) return true;
+    }
+    return false;
+}
+
+test "a write after a list published but not stored builds on what went out" {
     // Notary's writes are published even when the store refuses them, so the
     // store can be a write behind the relays. The next mute spliced onto the
     // stored list and published it without the mute that was already out.
@@ -880,7 +888,6 @@ test "a list published but not stored holds the next write until it is read back
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     var fx: main.EffectsForTest = undefined;
-    var model = main.initialModel();
     const first = [_]u8{0xf1} ** 32;
     const second = [_]u8{0xf2} ** 32;
 
@@ -889,29 +896,31 @@ test "a list published but not stored holds the next write until it is read back
     try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, first, true));
     main.failIngestForTest(false);
     const out = main.lastPublishedForTest() orelse return error.NothingPublished;
-    try testing.expect(main.ownWriteUnstoredForTest(10000));
+    try testing.expect(publishedNames(out, first));
+    try testing.expect(main.heldOwnRecordForTest(10000));
 
-    // The second is held back, and says why.
+    // The second goes out at once, on top of the first, and newer than it.
     main.forgetLastPublishedForTest();
-    const held = main.writeMuteForTest(&fx, second, true);
-    try testing.expectEqual(main.MuteWrite.not_read_back, held);
-    try testing.expect(main.lastPublishedForTest() == null);
-    main.sayMuteWriteForTest(&model, held, true);
-    try testing.expectEqualStrings("Last change not read back yet. Try again soon.", model.toast_text());
-
-    // The first comes back from a relay. Now the second splices onto it.
-    _ = try main.plazaIngestVerifiedForTest(arena, out, signer);
-    try testing.expect(!main.ownWriteUnstoredForTest(10000));
     try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, second, true));
+    const next = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(publishedNames(next, first));
+    try testing.expect(publishedNames(next, second));
+    try testing.expect(next.created_at > out.created_at);
+    // It was stored, and it is at least as new as what was held.
+    try testing.expect(!main.heldOwnRecordForTest(10000));
     const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingStored;
     defer testing.allocator.free(tags);
     try testing.expect(std.mem.indexOf(u8, tags, "f1" ** 32) != null);
     try testing.expect(std.mem.indexOf(u8, tags, "f2" ** 32) != null);
+
+    // The first coming back from a relay late changes nothing.
+    _ = try main.plazaIngestVerifiedForTest(arena, out, signer);
+    try testing.expect(!main.heldOwnRecordForTest(10000));
 }
 
-test "a list published but not stored is stored by the tick, or let go and said" {
-    // Nothing tried the store again, so a refusal that no relay ever answered
-    // kept every write of that kind refused for the session.
+test "a list published but not stored is offered to the store until it is in, and never let go before" {
+    // Letting the hold go after a few tries made the next write splice onto the
+    // older stored list, and take the reader's last change back on every relay.
     var fs: FreshStore = undefined;
     try fs.open("unstored-retry");
     defer fs.close();
@@ -924,37 +933,37 @@ test "a list published but not stored is stored by the tick, or let go and said"
     main.forgetLastPublishedForTest();
     defer main.forgetLastPublishedForTest();
     var fx: main.EffectsForTest = undefined;
-    var model = main.initialModel();
     const first = [_]u8{0xf3} ** 32;
     const second = [_]u8{0xf4} ** 32;
-    const third = [_]u8{0xf5} ** 32;
     var now: i64 = 1_800_000_000;
 
-    // Refused once, and stored by the next try.
+    // Refused, and refused again by every offer for a day.
     main.failIngestForTest(true);
     try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, first, true));
-    main.failIngestForTest(false);
-    try testing.expect(main.ownWriteUnstoredForTest(10000));
-    main.retryUnstoredOwnWrites(&model, now);
-    try testing.expect(!main.ownWriteUnstoredForTest(10000));
+    var offers: usize = 0;
+    while (offers < 24 * 60) : (offers += 1) {
+        now += 60;
+        main.retryUnstoredOwnWrites(now);
+    }
+    try testing.expect(main.heldOwnRecordForTest(10000));
+
+    // A write in the meantime still builds on it, and is refused by the store
+    // in turn, so it is the one held now.
+    main.forgetLastPublishedForTest();
     try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, second, true));
+    const next = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(publishedNames(next, first));
+    try testing.expect(publishedNames(next, second));
+
+    // The store takes it on the next offer, and the hold goes.
+    main.failIngestForTest(false);
+    now += main.unstored_retry_max_s_for_test;
+    main.retryUnstoredOwnWrites(now);
+    try testing.expect(!main.heldOwnRecordForTest(10000));
     const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingStored;
     defer testing.allocator.free(tags);
     try testing.expect(std.mem.indexOf(u8, tags, "f3" ** 32) != null);
     try testing.expect(std.mem.indexOf(u8, tags, "f4" ** 32) != null);
-
-    // Refused every time: held while it is tried, then let go, and said.
-    main.failIngestForTest(true);
-    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, third, true));
-    var tries: usize = 0;
-    while (main.ownWriteUnstoredForTest(10000)) : (tries += 1) {
-        if (tries > 100) return error.HeldForever;
-        try testing.expect(model.toast_len == 0 or !std.mem.eql(u8, model.toast_text(), main.unstored_lost_toast));
-        now += 1;
-        main.retryUnstoredOwnWrites(&model, now);
-    }
-    try testing.expect(tries > 1);
-    try testing.expectEqualStrings(main.unstored_lost_toast, model.toast_text());
 }
 
 test "a seal that comes back the wrong length is not published" {

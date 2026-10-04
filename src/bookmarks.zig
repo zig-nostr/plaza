@@ -39,6 +39,7 @@ const noListToast = main.noListToast;
 const nowSeconds = main.nowSeconds;
 const ownRecordCreatedAt = main.ownRecordCreatedAt;
 const ownRecordJson = main.ownRecordJson;
+const ownWriteBase = main.ownWriteBase;
 const privateHalfGate = main.privateHalfGate;
 const privateHalfOpened = main.privateHalfOpened;
 const private_seal_key = main.private_seal_key;
@@ -248,7 +249,7 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
@@ -340,7 +341,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
     if (previous == null and !noHistoryKnown(.bookmarks)) return .no_list_yet;
@@ -461,7 +462,7 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, bookmark_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, bookmark_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;

@@ -19,6 +19,7 @@ const geometry = native_sdk.geometry;
 const unstored_toast = main.unstored_toast;
 const setToast = main.setToast;
 const ownWriteUnstored = main.ownWriteUnstored;
+const heldOwnRecord = main.heldOwnRecord;
 const takeFresh = main.takeFresh;
 const listWriteInFlight = main.listWriteInFlight;
 const SelfRead = main.SelfRead;
@@ -178,6 +179,27 @@ pub fn ownRecordJson(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
     const tags = dupeTags(gpa, result.events[0].tags) orelse return null;
     return .{ .json = copy, .tags = tags, .created_at = result.events[0].created_at, .id = result.events[0].id };
 }
+/// The record a write of `kind` builds on: the reader's own newest one, or the
+/// one that went out and the store has not taken yet when that is newer.
+///
+/// Built on the stored one instead, the write would publish a record without
+/// the change already out on the relays. UI thread only, like the hold.
+pub fn ownWriteBase(gpa: std.mem.Allocator, kind: u16) ?OwnProfile {
+    const stored = ownRecordJson(gpa, kind);
+    const held = heldOwnRecord(kind) orelse return stored;
+    if (stored) |own| {
+        if (own.created_at >= held.created_at) return own;
+        freeOwnProfile(gpa, own);
+    }
+    // Whole or not at all, as for the stored one.
+    const content = gpa.dupe(u8, held.content) catch return null;
+    const tags = dupeTags(gpa, held.tags) orelse {
+        gpa.free(content);
+        return null;
+    };
+    return .{ .json = content, .tags = tags, .created_at = held.created_at, .id = held.id };
+}
+
 /// Frees what `ownProfileJson` handed back.
 pub fn freeOwnProfile(gpa: std.mem.Allocator, own: OwnProfile) void {
     gpa.free(own.json);
@@ -376,7 +398,7 @@ pub fn saveProfile(model: *Model, fx: *Effects) void {
     var prev_created_at: i64 = 0;
     var prev_tags: []const nostr.event.Tag = &.{};
     var existing: ?OwnProfile = null;
-    if (ownProfileJson(gpa)) |own| {
+    if (ownWriteBase(gpa, 0)) |own| {
         existing = own;
         prev_created_at = own.created_at;
         prev_tags = own.tags;
@@ -703,7 +725,7 @@ pub fn publishName(model: *Model, fx: *Effects) void {
     var prev_created_at: i64 = 0;
     var prev_tags: []const nostr.event.Tag = &.{};
     var existing: ?OwnProfile = null;
-    if (ownProfileJson(gpa)) |own| {
+    if (ownWriteBase(gpa, 0)) |own| {
         existing = own;
         prev_created_at = own.created_at;
         prev_tags = own.tags;

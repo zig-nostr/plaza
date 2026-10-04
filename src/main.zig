@@ -3595,7 +3595,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 sayPrivateBookmarkPublished(model);
                 // A record of the reader's own that went out and did not reach
                 // the store, offered to it again.
-                retryUnstoredOwnWrites(model, now);
+                retryUnstoredOwnWrites(now);
                 // A relay that asked who the reader is, and was told yes: get
                 // the answer signed. The reader thread sends it.
                 driveRelayAuth(fx);
@@ -6235,8 +6235,9 @@ pub const takeFresh = own_lists.takeFresh;
 
 // re-exports: follows.zig
 pub const retryUnstoredOwnWrites = follows.retryUnstoredOwnWrites;
-pub const unstored_lost_toast = follows.unstored_lost_toast;
-pub const ownWriteUnstoredForTest = follows.ownWriteUnstoredForTest;
+pub const heldOwnRecord = follows.heldOwnRecord;
+pub const heldOwnRecordForTest = follows.heldOwnRecordForTest;
+pub const unstored_retry_max_s_for_test = follows.unstored_retry_max_s_for_test;
 pub const noteOwnRecordStored = follows.noteOwnRecordStored;
 pub const failIngestForTest = follows.failIngestForTest;
 pub const unstored_toast = follows.unstored_toast;
@@ -6629,6 +6630,7 @@ pub const ownContactsAnswered = own_profile.ownContactsAnswered;
 pub const ownProfileAnswered = own_profile.ownProfileAnswered;
 pub const ownProfileJson = own_profile.ownProfileJson;
 pub const ownRecordJson = own_profile.ownRecordJson;
+pub const ownWriteBase = own_profile.ownWriteBase;
 pub const own_profile_wait_s = own_profile.own_profile_wait_s;
 pub const publishName = own_profile.publishName;
 pub const replayPending = own_profile.replayPending;

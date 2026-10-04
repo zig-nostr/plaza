@@ -40,7 +40,7 @@
 
 **Private bookmarks are never cut or lost.** A private bookmark list past about 4 KB (around thirty-six bookmarks) read as unreadable, and adding to it through a bunker published it cut short, which no app could open. Large lists are now read and sealed whole, a seal that comes back damaged publishes nothing and says so, and entries with line breaks or other control characters in them are kept as they were.
 
-**A list is never replaced because one relay's copy could not be read.** A relay that sent your list when Plaza could not keep it no longer counts as having none, so the question about starting a new list is not asked over a list that exists. A change to your mutes, bookmarks, media servers or profile waits ("Last change not read back yet. Try again soon.") while the one before it is not yet read back, and a first profile is asked about again rather than published twice.
+**A list is never replaced because one relay's copy could not be read.** A relay that sent your list when Plaza could not keep it no longer counts as having none, so the question about starting a new list is not asked over a list that exists. When the last change to your mutes, bookmarks, follows, media servers, relays or profile went out but was not kept on this machine, the next change builds on the one that went out rather than the older one kept here, and Plaza keeps offering it to the store until it is in. A first profile is asked about again rather than published twice.
 
 **Two quick changes with a bunker no longer erase each other.** Muting, bookmarking or adding a media server twice inside one round trip to a bunker published the second list without the first. The second press now waits, with the busy message, until the first is stored.
 

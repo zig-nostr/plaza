@@ -31,6 +31,7 @@ const mute_list_kind = main.mute_list_kind;
 const nowSeconds = main.nowSeconds;
 const ownRecordCreatedAt = main.ownRecordCreatedAt;
 const ownRecordJson = main.ownRecordJson;
+const ownWriteBase = main.ownWriteBase;
 const privateHalfGate = main.privateHalfGate;
 const privateHalfOpened = main.privateHalfOpened;
 const shrinkAllowed = main.shrinkAllowed;
@@ -209,7 +210,7 @@ pub fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, mute_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, mute_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
 
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};

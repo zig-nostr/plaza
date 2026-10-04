@@ -27,6 +27,7 @@ const nowSeconds = main.nowSeconds;
 const one_shot_budget_ms = main.one_shot_budget_ms;
 const ownRecordCreatedAt = main.ownRecordCreatedAt;
 const ownRecordJson = main.ownRecordJson;
+const ownWriteBase = main.ownWriteBase;
 const ownRelaysAllFinished = main.ownRelaysAllFinished;
 const plazaIngest = main.plazaIngest;
 const relayFetchAllowed = main.relayFetchAllowed;
@@ -305,7 +306,7 @@ pub fn writeBlossomServers(fx: *Effects, add_raw: ?[]const u8, remove_raw: ?[]co
     const remove: ?[]const u8 = if (remove_raw) |raw| (blossom.normalizeServer(&remove_buf, raw) orelse return .failed) else null;
 
     var previous: ?OwnProfile = null;
-    if (ownRecordJson(gpa, blossom_list_kind)) |own| previous = own;
+    if (ownWriteBase(gpa, blossom_list_kind)) |own| previous = own;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     // With nothing stored to splice onto, only proof that there is nothing to
     // lose licenses a write. A list held in memory is not that proof: it is a
