@@ -540,6 +540,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // What the current feed subscription failed to keep of the reader's own
     // records. Starts over with every re-issue, as the question does.
     var self_read: SelfRead = .{};
+    // How many messages this connection had skipped as unreadable when the
+    // current question was asked. Any skipped after it may have been the
+    // reader's own list (see `SelfRead.sawUnreadableSince`).
+    var unreadable_at_ask = relay.unreadable();
     if (reads) try relay.subscribe(feed_sub, filters);
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
@@ -622,6 +626,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             relay.unsubscribe(feed_sub) catch {};
             feed_sub = std.fmt.bufPrint(&feed_sub_buf, feed_sub_base ++ "-{d}", .{subscribed_gen}) catch feed_sub_base;
             self_read = .{};
+            unreadable_at_ask = relay.unreadable();
             relay.subscribe(feed_sub, next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
@@ -663,6 +668,11 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             else => |e| return e,
         }) orelse break;
         defer msg.deinit();
+        // Before anything reads this message, an EOSE least of all: a message
+        // skipped on the way to it may have carried the reader's own list, and
+        // then this relay has not said it has none. The connection used to
+        // fail on such a message and redial, so its EOSE was never counted.
+        self_read.sawUnreadableSince(unreadable_at_ask, relay.unreadable());
 
         // Time to re-probe? The probe rides the next message rather than a
         // timer; a relay too quiet to carry one is also a relay whose latency

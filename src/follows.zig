@@ -181,6 +181,15 @@ pub const SelfRead = struct {
         self.unread = true;
     }
 
+    /// The same, read off the connection's count of messages it skipped
+    /// because they could not be parsed (`Relay.unreadable`): `at_ask` is the
+    /// count when the question was asked, `now` the count since. A relay
+    /// connection no longer fails on such a message, it skips it and counts
+    /// it, so the count moving is the only sign one arrived.
+    pub fn sawUnreadableSince(self: *SelfRead, at_ask: u64, now: u64) void {
+        if (now != at_ask) self.sawUnreadable();
+    }
+
     /// Whether this relay's end of stored events answers the question.
     pub fn eoseAnswers(self: SelfRead) bool {
         return !self.unread;

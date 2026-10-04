@@ -631,15 +631,14 @@ fn ownProfileWorker(pk: [32]u8) void {
         const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
         relay.subscribe("plaza-me", &filters) catch continue;
+        // A message that arrived and could not be parsed is skipped by the
+        // connection and counted, and it may have been the profile. Checked
+        // when this relay's part ends, whichever way it ends.
+        const unreadable_at_ask = relay.unreadable();
+        defer self_read.sawUnreadableSince(unreadable_at_ask, relay.unreadable());
         var seen: usize = 0;
         while (seen < 32) : (seen += 1) {
-            var msg = (relay.receive() catch |err| {
-                // A message that arrived and could not be parsed. This
-                // connection cannot read past it, and it may have been the
-                // profile.
-                if (err == error.InvalidMessage) self_read.sawUnreadable();
-                break;
-            }) orelse break;
+            var msg = (relay.receive() catch break) orelse break;
             defer msg.deinit();
             // Only an EOSE is an answer: "that is all I have". A CLOSED ends
             // this relay's part of the question and says nothing about the

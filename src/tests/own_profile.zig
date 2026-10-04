@@ -751,6 +751,15 @@ test "a relay that sent the reader's list and Plaza could not keep it has not sa
         read.sawUnreadable();
         try testing.expect(!read.eoseAnswers());
     }
+    // Which the connection reports by counting it: only a count that moved
+    // since the question was asked says one arrived.
+    {
+        var read: main.SelfReadForTest = .{};
+        read.sawUnreadableSince(3, 3);
+        try testing.expect(read.eoseAnswers());
+        read.sawUnreadableSince(3, 4);
+        try testing.expect(!read.eoseAnswers());
+    }
 }
 
 test "a private bookmark list with control characters in it seals back whole" {
