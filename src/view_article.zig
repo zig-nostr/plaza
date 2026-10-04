@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const article = @import("article.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -272,7 +273,7 @@ const KindOfRow = enum(u64) { article = 40 };
 pub fn articlePanel(ui: *AppUi, model: *const Model, root: *const Note, level_key: u64, level: usize, occluded: bool) AppUi.Node {
     const av = if (occluded) null else articleFor(root.event_id);
     const total: usize = if (av) |a| a.rowCount() else 1;
-    const table = &main.g_thread_extents[@min(level, main.g_thread_extents.len - 1)];
+    const table = &view_thread.g_thread_extents[@min(level, view_thread.g_thread_extents.len - 1)];
     table.reset();
     if (!occluded) {
         table.push(articleHeadHeight(root, av));
@@ -296,9 +297,9 @@ pub fn articlePanel(ui: *AppUi, model: *const Model, root: *const Note, level_ke
     };
     const window = ui.virtualWindow(options);
     if (!occluded) {
-        const set = &main.g_level_visible[@min(level, main.g_level_visible.len - 1)];
+        const set = &view_thread.g_level_visible[@min(level, view_thread.g_level_visible.len - 1)];
         set.reset();
-        main.g_visible_level = @min(level, main.g_level_visible.len - 1);
+        view_thread.g_visible_level = @min(level, view_thread.g_level_visible.len - 1);
         // Only while the head is on screen: the face and the cover are both in
         // it, and a reader deep in the body has no use for either.
         if (window.first_visible_index == 0) {

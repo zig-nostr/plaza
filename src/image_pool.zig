@@ -12,6 +12,7 @@ const profile_cache = @import("profile_cache.zig");
 const feed_media = @import("feed_media.zig");
 const view_place = @import("view_place.zig");
 const view_profile = @import("view_profile.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -102,7 +103,7 @@ pub fn assignAvatarSlots(fx: *Effects, model: *const Model) void {
         // and kept it: the claim pass never evicts anything marked wanted this
         // pass, and marking all of them made every id unreclaimable. Everyone
         // below kept initials for as long as the level was open.
-        const set = &main.g_level_visible[@min(main.g_visible_level, main.g_level_visible.len - 1)];
+        const set = &view_thread.g_level_visible[@min(view_thread.g_visible_level, view_thread.g_level_visible.len - 1)];
         for (set.authors[0..set.author_count]) |pk| push(&onscreen, &n, pk);
     } else {
         const w = model.visibleRange();

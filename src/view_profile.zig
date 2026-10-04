@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
 const profile_notes = @import("profile_notes.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -757,7 +758,7 @@ pub fn profilePanel(
             else => .none,
         },
     };
-    const table = &main.g_profile_extents[@min(level, main.g_profile_extents.len - 1)];
+    const table = &view_thread.g_profile_extents[@min(level, view_thread.g_profile_extents.len - 1)];
     table.reset();
     if (!occluded) {
         var row: usize = 0;

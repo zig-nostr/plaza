@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const prefs = @import("prefs.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -711,7 +712,7 @@ pub fn wantProfilesAhead(model: *const Model) void {
     // which catches likers and zappers who are in no other set.
     if (model.notifications_open) return;
     if (model.levelOpen()) {
-        const set = &main.g_level_visible[@min(main.g_visible_level, main.g_level_visible.len - 1)];
+        const set = &view_thread.g_level_visible[@min(view_thread.g_visible_level, view_thread.g_level_visible.len - 1)];
         for (set.authors[0..set.author_count]) |pk| wantProfile(pk);
         return;
     }

@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const main = @import("main.zig");
 const quote_cache = @import("quote_cache.zig");
 const article = @import("article.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -522,7 +523,7 @@ pub var g_address_want: ?struct {
 /// screen in the last frame drawn: `articlePanel` marks the root visible only
 /// while row 0 is in the window.
 fn articleHeadOnScreen(model: *const Model) bool {
-    const set = &main.g_level_visible[@min(model.thread_stack_len, main.g_level_visible.len - 1)];
+    const set = &view_thread.g_level_visible[@min(model.thread_stack_len, view_thread.g_level_visible.len - 1)];
     for (set.notes[0..set.note_count]) |id| {
         if (id == model.thread_root.id) return true;
     }

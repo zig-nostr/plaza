@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const prefs = @import("prefs.zig");
 const profile_cache = @import("profile_cache.zig");
 const quote_cache = @import("quote_cache.zig");
+const view_thread = @import("view_thread.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -361,7 +362,7 @@ pub fn scanMediaFetches(fx: *Effects, model: *const Model) void {
         // Mark, then fetch, as the feed does: marking first means the claim pass
         // can only evict what has scrolled away, never a picture needed later in
         // this same pass.
-        const set = &main.g_level_visible[@min(main.g_visible_level, main.g_level_visible.len - 1)];
+        const set = &view_thread.g_level_visible[@min(view_thread.g_visible_level, view_thread.g_level_visible.len - 1)];
         // Each id resolved once: `noteById` walks the whole feed before the
         // level's own rows, and both loops below need the note.
         var shown: [visible_set_cap]?*const Note = undefined;
