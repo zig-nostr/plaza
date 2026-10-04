@@ -11,6 +11,7 @@ const own_lists = @import("own_lists.zig");
 const prefs = @import("prefs.zig");
 const session = @import("session.zig");
 const blossom = @import("blossom.zig");
+const outbox = @import("outbox.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1326,7 +1327,7 @@ pub fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?
     // promises that anything written is kept.
     if (isReaderNote(ev.kind)) {
         if (!enqueueOutbox(ev.id, ev.pubkey, nowSeconds(), route)) {
-            main.g_outbox_overflow.store(true, .monotonic);
+            outbox.g_outbox_overflow.store(true, .monotonic);
             return;
         }
     } else if (verify == null) {
@@ -1368,5 +1369,5 @@ pub fn markOutboxSending(id: [32]u8, sending: bool) void {
     const e = outboxEntryFor(id) orelse return;
     e.sending = sending;
     if (!sending) e.rounds +|= 1;
-    _ = main.g_outbox_rev.fetchAdd(1, .monotonic);
+    _ = outbox.g_outbox_rev.fetchAdd(1, .monotonic);
 }

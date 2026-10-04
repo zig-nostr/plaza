@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const outbox = @import("outbox.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -320,12 +321,12 @@ fn wakeOutboxBackoff() void {
     outboxLock();
     defer outboxUnlock();
     var changed = false;
-    for (&main.g_outbox) |*e| {
+    for (&outbox.g_outbox) |*e| {
         if (!e.used or e.acked != 0 or e.rounds == 0) continue;
         e.rounds = 0;
         changed = true;
     }
-    if (changed) _ = main.g_outbox_rev.fetchAdd(1, .monotonic);
+    if (changed) _ = outbox.g_outbox_rev.fetchAdd(1, .monotonic);
 }
 
 /// Whether the reader has paused the pool. Read by every relay thread between
