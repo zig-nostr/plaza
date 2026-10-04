@@ -336,19 +336,62 @@ test "a search relay has one thread out at a time, and is asked again once it is
     defer main.searchResetForTest();
 
     // The first term takes relay 0.
-    try testing.expect(main.claimSearchSlotForTest(0, 5));
+    const at: i64 = 1_000;
+    try testing.expect(main.claimSearchSlotForTest(0, 5, at));
     // The reader types on while that thread is still dialling: no second thread
     // for the same relay, however many terms settle meanwhile. The others are
     // their own.
-    try testing.expect(!main.claimSearchSlotForTest(0, 6));
-    try testing.expect(!main.claimSearchSlotForTest(0, 7));
-    try testing.expect(main.claimSearchSlotForTest(1, 7));
+    try testing.expect(!main.claimSearchSlotForTest(0, 6, at));
+    try testing.expect(!main.claimSearchSlotForTest(0, 7, at));
+    try testing.expect(main.claimSearchSlotForTest(1, 7, at));
     // Once it has gone, the term on screen is put to it, once.
-    main.releaseSearchSlotForTest(0);
-    try testing.expect(main.claimSearchSlotForTest(0, 7));
-    main.releaseSearchSlotForTest(0);
-    try testing.expect(!main.claimSearchSlotForTest(0, 7));
-    main.releaseSearchSlotForTest(1);
+    main.releaseSearchSlotForTest(0, 5);
+    try testing.expect(main.claimSearchSlotForTest(0, 7, at));
+    main.releaseSearchSlotForTest(0, 7);
+    try testing.expect(!main.claimSearchSlotForTest(0, 7, at));
+    main.releaseSearchSlotForTest(1, 7);
+}
+
+test "a search relay whose handshake never ends is taken over by a later term" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    const budget = main.one_shot_budget_ms;
+
+    // A term takes relay 0, and its dial never comes back.
+    const at: i64 = 50_000;
+    try testing.expect(main.claimSearchSlotForTest(0, 5, at));
+    // Within the budget a newer term still waits for it.
+    try testing.expect(!main.claimSearchSlotForTest(0, 6, at + budget));
+    // Past it, the newer term takes the relay over instead of never reaching it.
+    try testing.expect(main.claimSearchSlotForTest(0, 6, at + budget + 1));
+
+    // The stuck thread finally ends and lets go of its claim. That is not the
+    // claim that holds the relay now, so the relay stays held: no third thread
+    // goes in beside the one that is out.
+    main.releaseSearchSlotForTest(0, 5);
+    try testing.expect(!main.claimSearchSlotForTest(0, 7, at + budget + 2));
+    // The claim that does hold it lets go, and the next term is put to it.
+    main.releaseSearchSlotForTest(0, 6);
+    try testing.expect(main.claimSearchSlotForTest(0, 7, at + budget + 2));
+    main.releaseSearchSlotForTest(0, 7);
+}
+
+test "a short term sent with Enter is put again to a relay that was busy" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // One letter does not go to the relays on its own, however long it waits.
+    typeIntoSearch(&model, "q");
+    try testing.expect(!main.searchTickAsksForTest(&model, 100_000));
+
+    // Enter sends it. A relay busy at that moment is asked on a later tick,
+    // which only happens if the tick keeps putting this term to the relays.
+    main.update(&model, Msg.address_submit, &fx);
+    try testing.expect(main.searchAskedForTest());
+    try testing.expect(main.searchTickAsksForTest(&model, 100_000));
 }
 
 test "a search term replaced while the socket opened is never sent" {

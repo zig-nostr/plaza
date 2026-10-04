@@ -6811,6 +6811,7 @@ pub const searchRowPubkeyForTest = people_search.searchRowPubkeyForTest;
 pub const searchRowRelaysForTest = people_search.searchRowRelaysForTest;
 pub const searchSendCurrentForTest = people_search.searchSendCurrentForTest;
 pub const searchSetStatusForTest = people_search.searchSetStatusForTest;
+pub const searchTickAsksForTest = people_search.searchTickAsksForTest;
 pub const searchTickForTest = people_search.searchTickForTest;
 pub const search_inbox_cap_for_test = people_search.search_inbox_cap_for_test;
 pub const search_scan_page_for_test = people_search.search_scan_page_for_test;

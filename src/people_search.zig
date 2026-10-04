@@ -103,24 +103,45 @@ pub var g_search_status: [search.relays_max]std.atomic.Value(u64) = @splat(std.a
 /// The generation each search relay has been put, so a relay that was busy when
 /// the term settled is asked once it is free.
 var g_search_slot_asked: [search.relays_max]u32 = @splat(0);
-/// Whether a thread is out for each search relay. The dial has no deadline of
-/// its own, so a relay that never completes the handshake parks its thread
-/// before the read budget starts; a fresh thread per settled term on top of
-/// that grew without bound while the reader typed.
-var g_search_live: [search.relays_max]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+/// Which generation's thread is out for each search relay, plus one, or 0 when
+/// none is. The dial has no deadline of its own, so a relay that never
+/// completes the handshake parks its thread before the read budget starts; a
+/// fresh thread per settled term on top of that grew without bound while the
+/// reader typed.
+var g_search_claim: [search.relays_max]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+/// When each claim was taken, on the awake clock. Every claim is made on the UI
+/// thread, and only a claim reads it, so it needs no lock.
+var g_search_claimed_ms: [search.relays_max]i64 = @splat(0);
 
-/// Takes search relay `i` for generation `gen`: false when it has already been
-/// put this term, or when its previous thread is still out, in which case a
-/// later tick asks again.
-fn claimSearchSlot(i: usize, gen: u32) bool {
+fn searchClaimToken(gen: u32) u64 {
+    return @as(u64, gen) + 1;
+}
+
+/// Takes search relay `i` for generation `gen` at `now_ms`: false when it has
+/// already been put this term, or when its previous thread is still out, in
+/// which case a later tick asks again.
+///
+/// A thread out longer than `one_shot_budget_ms` for an earlier term is taken
+/// over. Its dial has no deadline, so a handshake that never finishes held the
+/// relay for the rest of the session, and no later term reached it.
+fn claimSearchSlot(i: usize, gen: u32, now_ms: i64) bool {
     if (g_search_slot_asked[i] == gen) return false;
-    if (g_search_live[i].swap(true, .acq_rel)) return false;
+    const held = g_search_claim[i].load(.acquire);
+    if (held != 0) {
+        if (held >= searchClaimToken(gen)) return false;
+        if (now_ms - g_search_claimed_ms[i] <= one_shot_budget_ms) return false;
+    }
+    if (g_search_claim[i].cmpxchgStrong(held, searchClaimToken(gen), .acq_rel, .acquire) != null) return false;
+    g_search_claimed_ms[i] = now_ms;
     g_search_slot_asked[i] = gen;
     return true;
 }
 
-fn releaseSearchSlot(i: usize) void {
-    g_search_live[i].store(false, .release);
+/// Lets go of relay `i`, but only the claim generation `gen` made. A thread
+/// whose claim was taken over ends late, and freeing the slot then would let a
+/// second thread in beside the one that holds it now.
+fn releaseSearchSlot(i: usize, gen: u32) void {
+    _ = g_search_claim[i].cmpxchgStrong(searchClaimToken(gen), 0, .acq_rel, .monotonic);
 }
 
 /// A person a relay returned, on its way from the thread that read it to the one
@@ -405,7 +426,7 @@ pub const SearchJob = struct {
 /// Puts the term on screen to the search relays, once per term and relay. Runs
 /// every tick while the term stands: a relay whose previous thread was still
 /// out is asked here once that thread has gone.
-fn searchAskRelays() void {
+fn searchAskRelays(now_ms: i64) void {
     const gen = g_search_gen.load(.acquire);
     if (g_search_term_len == 0) return;
     g_search_asked = gen;
@@ -419,12 +440,12 @@ fn searchAskRelays() void {
             g_search_status[i].store((search.Status{ .gen = gen, .state = .paused, .count = 0 }).pack(), .release);
             continue;
         }
-        if (!claimSearchSlot(i, gen)) continue;
+        if (!claimSearchSlot(i, gen, now_ms)) continue;
         g_search_status[i].store((search.Status{ .gen = gen, .state = .asking, .count = 0 }).pack(), .release);
         var job = SearchJob{ .gen = gen, .relay = @intCast(i), .url = url, .term = undefined, .term_len = @intCast(g_search_term_len) };
         @memcpy(job.term[0..g_search_term_len], g_search_term[0..g_search_term_len]);
         const thread = std.Thread.spawn(.{}, searchRelayWorker, .{job}) catch {
-            releaseSearchSlot(i);
+            releaseSearchSlot(i, gen);
             g_search_status[i].store((search.Status{ .gen = gen, .state = .unreachable_, .count = 0 }).pack(), .release);
             continue;
         };
@@ -485,7 +506,7 @@ pub fn searchArrived(gen: u32, relay: u8, pubkey: [32]u8) void {
 
 /// Asks one search relay for profiles matching the term, on its own thread.
 fn searchRelayWorker(job: SearchJob) void {
-    defer releaseSearchSlot(job.relay);
+    defer releaseSearchSlot(job.relay, job.gen);
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -586,9 +607,20 @@ fn searchDrain() void {
 pub fn searchTick(model: *const Model, now_ms: i64) void {
     if (!model.address_open) return;
     // A NIP-05 address is asked of its domain, so only a name is put to relays.
-    const is_name = classifySearch(model.address_buffer.text()) == .term;
-    if (is_name and g_search_term_len >= search_auto_min and now_ms - g_search_typed_ms >= search_settle_ms) searchAskRelays();
+    if (searchTickAsks(model, now_ms)) searchAskRelays(now_ms);
     searchDrain();
+}
+
+/// Whether this tick puts the term to the relays: a name long enough to go on
+/// its own once typing has settled, or a term already sent, however short. Enter
+/// sends a term below `search_auto_min`, and a relay busy at that moment is
+/// asked on a later tick like any other, not left out of that term.
+fn searchTickAsks(model: *const Model, now_ms: i64) bool {
+    // A NIP-05 address is asked of its domain, so only a name is put to relays.
+    if (classifySearch(model.address_buffer.text()) != .term) return false;
+    if (g_search_term_len == 0) return false;
+    if (g_search_asked == g_search_gen.load(.acquire)) return true;
+    return g_search_term_len >= search_auto_min and now_ms - g_search_typed_ms >= search_settle_ms;
 }
 
 /// How one relay stands for the term on screen. A status left over from an
@@ -689,7 +721,7 @@ pub fn submitAddress(model: *Model, fx: *Effects) void {
         .nip05 => lookupNip05(model, fx),
         // Straight to the relays: pressing Enter is asking now, not after the
         // pause that typing waits for.
-        .term => searchAskRelays(),
+        .term => searchAskRelays(awakeMs()),
     }
 }
 
@@ -704,17 +736,23 @@ pub fn searchResetForTest() void {
     unlockSearchIndex();
     g_search_asked = 0;
     g_search_slot_asked = @splat(0);
-    for (&g_search_live) |*live| live.store(false, .release);
+    for (&g_search_claim) |*claim| claim.store(0, .release);
+    g_search_claimed_ms = @splat(0);
     g_search_typed_ms = 0;
     g_nip05_ask = null;
 }
 
-pub fn claimSearchSlotForTest(i: usize, gen: u32) bool {
-    return claimSearchSlot(i, gen);
+pub fn claimSearchSlotForTest(i: usize, gen: u32, now_ms: i64) bool {
+    return claimSearchSlot(i, gen, now_ms);
 }
 
-pub fn releaseSearchSlotForTest(i: usize) void {
-    releaseSearchSlot(i);
+pub fn releaseSearchSlotForTest(i: usize, gen: u32) void {
+    releaseSearchSlot(i, gen);
+}
+
+/// Whether a tick at `now_ms` would put the term on screen to the relays.
+pub fn searchTickAsksForTest(model: *const Model, now_ms: i64) bool {
+    return searchTickAsks(model, now_ms);
 }
 
 /// Whether a request built for generation `gen` would go out now, through
