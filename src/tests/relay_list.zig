@@ -343,3 +343,48 @@ test "an edit that could not be published is still pending" {
     main.flushRelayListForTest(&fx, 1_004);
     try testing.expect(!main.relayListPendingForTest());
 }
+
+test "a relay list after one the store refused is stamped past it" {
+    // The stamp was only past the stored list. Built on a list that went out
+    // and was not stored, it took that list's stamp, and the two tied on every
+    // relay.
+    defer main.resetOutboxForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x6e} ** 32);
+    var fs: harness.FreshStore = undefined;
+    try fs.open("relaystamp");
+    defer fs.close();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+    main.forgetRelayRemovalsForTest();
+    main.setIdentityForTest([_]u8{0x6e} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(false);
+    defer main.failIngestForTest(false);
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+
+    const tags = [_]nostr.event.Tag{&.{ "r", "wss://one.example.com" }};
+    const stored = try nostr.event.create(arena, signer, kp, 1_900_000_000, 10002, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, stored, signer);
+    _ = main.addRelayForTest("wss://one.example.com", true, true);
+    main.markRelaysMineForTest();
+    var fx: main.EffectsForTest = undefined;
+
+    main.failIngestForTest(true);
+    try testing.expect(main.publishRelayListForTest(&fx));
+    main.failIngestForTest(false);
+    const first = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(main.heldOwnRecordForTest(10002));
+
+    _ = main.addRelayForTest("wss://two.example.com", true, true);
+    main.forgetLastPublishedForTest();
+    try testing.expect(main.publishRelayListForTest(&fx));
+    const second = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(second.created_at > first.created_at);
+}

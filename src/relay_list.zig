@@ -449,10 +449,13 @@ pub fn publishRelayListReporting(fx: *Effects) bool {
     if (relay_tags == 0) return false;
     const owned = tags.toOwnedSlice(gpa) catch return false;
     handed_off = true;
-    // Past whatever is already stored. A replaceable event whose stamp does not
-    // beat the stored one is dropped by this store and by every relay, so an
+    // Past whatever is already stored, and past the list this one builds on,
+    // which is newer than the store's while one that went out is not stored
+    // yet. A replaceable event whose stamp does not beat the one it replaces is
+    // dropped by this store and by every relay (or loses the tie to it), so an
     // edit could vanish everywhere while the app showed it applied.
-    const created = @max(nowSeconds(), ownRecordCreatedAt(relay_list_kind) + 1);
+    const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
+    const created = @max(@max(nowSeconds(), ownRecordCreatedAt(relay_list_kind) + 1), base_created_at + 1);
     // NIP-65 puts everything in the tags and says nothing about the content, so
     // this app has nothing to write there. That is not the same as having
     // something to erase: whatever a previous client put there comes forward,
