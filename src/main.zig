@@ -38208,7 +38208,12 @@ fn hydrateProfiles(pubkeys: []const [32]u8) void {
 fn searchIndexEnsure() void {
     if (comptime builtin.is_test) return;
     if (g_store == null) return;
-    if (g_search_index_ready and nowSeconds() - g_search_index_built_s < search_index_ttl_s) return;
+    // Under the lock: the worker writes both of these from its own thread.
+    const now = nowSeconds();
+    lockSearchIndex();
+    const fresh = g_search_index_ready and now - g_search_index_built_s < search_index_ttl_s;
+    unlockSearchIndex();
+    if (fresh) return;
     if (g_search_index_building.swap(true, .acq_rel)) return;
     const thread = std.Thread.spawn(.{}, searchIndexWorker, .{}) catch {
         g_search_index_building.store(false, .release);
@@ -38298,11 +38303,12 @@ fn searchIndexRefresh() void {
     }
 
     var fresh_index = builder.finish() catch return;
+    const built_s = nowSeconds();
     lockSearchIndex();
     std.mem.swap(search.Index, &g_search_index, &fresh_index);
     g_search_index_ready = true;
+    g_search_index_built_s = built_s;
     unlockSearchIndex();
-    g_search_index_built_s = nowSeconds();
     fresh_index.deinit(gpa);
 }
 
