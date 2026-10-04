@@ -34975,8 +34975,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // anything that could close the sheet. Closing on arrival therefore
             // left it up in exactly the cases where the reader has least idea why
             // nothing moved.
-            model.notifications_return = model.notifications_open;
-            model.notifications_open = false;
+            leaveNotifications(model);
             openEvent(model, id);
         },
         // A held reply belongs to the thread being left. Leaving it armed would
@@ -35086,11 +35085,23 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// where it was and no reason at all. The most ordinary one is pressing Follow
 /// in the first seconds after opening the app, before this account's own list
 /// has come back from the relays.
+/// Closes the notifications sheet on the way into a level, and remembers whether
+/// the sheet is where that level's Back should land.
+///
+/// Only from the feed. Once a level is open, Back returns to it before anything
+/// else, and the flag already says how the reader reached the bottom of the
+/// stack: a thread opened from the sheet, then its author, then Back, is that
+/// thread again, and Back from there is the sheet. Rewriting the flag on the
+/// way to the author used to turn that last Back into the feed.
+fn leaveNotifications(model: *Model) void {
+    if (!model.levelOpen()) model.notifications_return = model.notifications_open;
+    model.notifications_open = false;
+}
+
 /// Open somebody's profile, remembering whether the notifications sheet was what
 /// we came from so closing it returns there rather than to the feed.
 fn openPerson(model: *Model, pubkey: [32]u8) void {
-    model.notifications_return = model.notifications_open;
-    model.notifications_open = false;
+    leaveNotifications(model);
     enterProfile(model, pubkey);
 }
 
@@ -40307,8 +40318,7 @@ fn openTopic(model: *Model, topic_in: []const u8) void {
     if (model.viewingTopic()) |current| {
         if (std.mem.eql(u8, current, topic)) return;
     }
-    model.notifications_return = model.notifications_open;
-    model.notifications_open = false;
+    leaveNotifications(model);
     pushCurrentScreen(model);
     model.viewing_bookmarks = false;
     model.viewing_profile = null;
@@ -40335,8 +40345,7 @@ pub fn openTopicForTest(model: *Model, topic: []const u8) void {
 /// The answer to "a bookmark I cannot find again is a button, not a feature".
 fn openBookmarks(model: *Model) void {
     if (model.viewing_bookmarks) return;
-    model.notifications_return = model.notifications_open;
-    model.notifications_open = false;
+    leaveNotifications(model);
     pushCurrentScreen(model);
     model.viewing_profile = null;
     model.viewing_thread = 0;

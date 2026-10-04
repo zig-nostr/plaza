@@ -1822,6 +1822,19 @@ test "Back names where it actually goes, from every place a level opens" {
     try testing.expectEqualStrings("#zig", topic_level.backLabel(arena));
     try testing.expectEqualStrings("Bookmarks", (main.Screen{ .bookmarks = true }).backLabel(arena));
 
+    // Deeper from the sheet: a thread opened from a row, then its author, then
+    // Back. That is the thread again, and its Back is still the sheet, because
+    // the walk into the author's page did not start from the feed.
+    model.notifications_open = true;
+    main.update(&model, Msg{ .open_event = ev.id }, &fx);
+    main.update(&model, Msg{ .open_person = ev.pubkey }, &fx);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expectEqual(id, model.viewing_thread);
+    try testing.expectEqualStrings("Notifications", backText((try buildTree(arena, &model)).root).?);
+    main.update(&model, Msg.close_thread, &fx);
+    try testing.expect(model.notifications_open);
+    main.update(&model, .close_notifications, &fx);
+
     // A visit to Notifications that never got back to the sheet (the reader went
     // Home instead) must not turn the next ordinary thread into a way back to it.
     model.notifications_open = true;
