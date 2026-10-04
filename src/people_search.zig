@@ -456,11 +456,19 @@ fn searchPublish(job: SearchJob, state: search.RelayState, count: u16) void {
 }
 
 /// Keeps one person a relay returned: verified, stored, and queued for the list.
-/// False when the event is not a profile or does not verify.
-pub fn searchAccept(gpa: std.mem.Allocator, signer: nostr.keys.Signer, job: SearchJob, ev: nostr.event.Event) bool {
+/// False when the event is not a profile, does not verify, names somebody this
+/// relay already named, or comes after the `relay_limit` people it was asked
+/// for. `seen` is this relay's own list for this term.
+///
+/// A relay that ignores `limit` is otherwise a firehose into the shared inbox,
+/// which has room for every relay's full answer and no more: one relay sending
+/// hundreds crowded the others' people out of it.
+pub fn searchAccept(gpa: std.mem.Allocator, signer: nostr.keys.Signer, job: SearchJob, ev: nostr.event.Event, seen: *search.Seen) bool {
     if (ev.kind != 0) return false;
+    if (seen.len >= search.relay_limit) return false;
     const result = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return false;
     if (result == .invalid) return false;
+    if (!seen.add(ev.pubkey)) return false;
     searchArrived(job.gen, job.relay, ev.pubkey);
     return true;
 }
@@ -523,7 +531,7 @@ fn searchRelayWorker(job: SearchJob) void {
         frames += 1;
         const reply: search.Reply = switch (msg.value) {
             .event => |e| blk: {
-                if (searchAccept(gpa, signer, job, e.event) and seen.add(e.event.pubkey)) found +|= 1;
+                if (searchAccept(gpa, signer, job, e.event, &seen)) found +|= 1;
                 break :blk .event;
             },
             .eose => .eose,
@@ -766,8 +774,22 @@ pub fn searchArrivedForTest(gen: u32, relay: u8, pubkey: [32]u8) void {
 
 /// What a relay thread does with one event.
 pub fn searchAcceptForTest(gen: u32, relay: u8, signer: nostr.keys.Signer, ev: nostr.event.Event) bool {
+    var seen: search.Seen = .{};
+    return searchAcceptSeenForTest(gen, relay, signer, ev, &seen);
+}
+
+/// The same, with the relay's list of who it has named carried between events.
+pub fn searchAcceptSeenForTest(gen: u32, relay: u8, signer: nostr.keys.Signer, ev: nostr.event.Event, seen: *SearchSeenForTest) bool {
     const job = SearchJob{ .gen = gen, .relay = relay, .url = "", .term = undefined, .term_len = 0 };
-    return searchAccept(std.heap.page_allocator, signer, job, ev);
+    return searchAccept(std.heap.page_allocator, signer, job, ev, seen);
+}
+pub const SearchSeenForTest = search.Seen;
+pub const searchRelayLimitForTest = search.relay_limit;
+
+pub fn searchInboxLenForTest() usize {
+    lockSearchInbox();
+    defer unlockSearchInbox();
+    return g_search_inbox_len;
 }
 
 pub fn searchSetStatusForTest(relay: usize, state: search.RelayState, count: u16) void {

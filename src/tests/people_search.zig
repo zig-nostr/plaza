@@ -293,6 +293,44 @@ test "a key, a signer link or a web link typed into search never leaves the mach
     try testing.expect(!main.searchAskedForTest());
 }
 
+test "a search relay that ignores its limit cannot flood the list" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/flood.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    const gen = main.searchGenForTest();
+    var seen: main.SearchSeenForTest = .{};
+
+    // The same person three times is one arrival, not three.
+    const twice = try profileEvent(arena, signer, 0x40, 1_800_000_000, "{\"name\":\"again\"}");
+    try testing.expect(main.searchAcceptSeenForTest(gen, 0, signer, twice, &seen));
+    try testing.expect(!main.searchAcceptSeenForTest(gen, 0, signer, twice, &seen));
+    try testing.expect(!main.searchAcceptSeenForTest(gen, 0, signer, twice, &seen));
+    try testing.expectEqual(@as(usize, 1), main.searchInboxLenForTest());
+
+    // Forty more people from a relay asked for thirty: the first thirty in all
+    // are queued and the rest are left at the door.
+    var accepted: usize = 1;
+    for (0..40) |i| {
+        const ev = try profileEvent(arena, signer, @intCast(0x41 + i), 1_800_000_000, "{\"name\":\"more\"}");
+        if (main.searchAcceptSeenForTest(gen, 0, signer, ev, &seen)) accepted += 1;
+    }
+    try testing.expectEqual(@as(usize, main.searchRelayLimitForTest), accepted);
+    try testing.expectEqual(@as(usize, main.searchRelayLimitForTest), main.searchInboxLenForTest());
+}
+
 test "a search relay has one thread out at a time, and is asked again once it is free" {
     main.searchResetForTest();
     defer main.searchResetForTest();
