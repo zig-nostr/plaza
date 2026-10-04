@@ -6385,6 +6385,7 @@ pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
 
 // re-exports: remote_signer.zig
+pub const pendingSignIdForTest = remote_signer.pendingSignIdForTest;
 pub const RemoteMethodForTest = remote_signer.RemoteMethodForTest;
 pub const answerBunkerConnectForTest = remote_signer.answerBunkerConnectForTest;
 pub const beginBunkerConnectForTest = remote_signer.beginBunkerConnectForTest;

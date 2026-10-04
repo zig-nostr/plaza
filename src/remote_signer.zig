@@ -138,6 +138,9 @@ const PendingRemote = struct {
     // sign_event only: what this press changed, put back if this request fails
     // and released when it is signed. Owned by the slot, like `content`.
     undo: PendingUndo = .none,
+    // sign_event only: the answer was an event signed by a key other than the
+    // reader's. Failed like any other, and said so in those words.
+    wrong_key: bool = false,
 
     pub fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -251,6 +254,29 @@ pub fn takeAnswered(req_id: []const u8) ?PendingRemote {
         }
     }
     return null;
+}
+
+/// Puts a sign the listener already took back in the table, failed, so the tick
+/// hands its draft back and applies its undo exactly as for a refusal. Taking
+/// the slot is how an answer is correlated, so an answer that turns out to be
+/// unusable has already consumed it, and dropping it there freed the draft with
+/// nothing said and nothing put back. Takes ownership of `taken`'s content and
+/// undo either way.
+fn parkFailedSign(taken: PendingRemote, wrong_key: bool) void {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active) continue;
+        slot.* = taken;
+        slot.active = true;
+        slot.failed = true;
+        slot.wrong_key = wrong_key;
+        return;
+    }
+    // The table filled up in between. Nowhere to park it: free what it owns
+    // rather than leak it.
+    if (taken.content) |c| std.heap.page_allocator.free(c);
+    releaseUndo(taken.undo);
 }
 
 /// Marks the pending request matching `req_id` failed, leaving it in the table
@@ -746,7 +772,11 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
     // or one already handled: drop it (no double publish, no stray "connected").
     // Taking it also marks the connection up (see `takeAnswered`).
     const pending = takeAnswered(resp.value.id) orelse return;
-    defer if (pending.content) |c| gpa.free(c);
+    // Unless the answer was unusable and the request went back in the table.
+    var parked = false;
+    defer if (!parked) {
+        if (pending.content) |c| gpa.free(c);
+    };
 
     g_remote_sign_notice.store(false, .release);
 
@@ -808,19 +838,30 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
             parkUploadSign(json);
         },
         .sign_event => {
-            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return releaseUndo(pending.undo);
+            // Every way this answer can turn out unusable is a failed sign:
+            // parked, so the tick gives the draft back and undoes the press.
+            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch {
+                parked = true;
+                return parkFailedSign(pending, false);
+            };
             defer parsed.deinit();
             // Signed as the account we asked it to sign as. The verify further
             // down the write path checks that an event's signature matches its
             // OWN pubkey, which a stranger's event also satisfies, so this is
             // the check that says the note is this reader's.
-            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return releaseUndo(pending.undo);
+            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) {
+                parked = true;
+                return parkFailedSign(pending, true);
+            }
             // A process-lifetime copy of the content: `parsed` is freed on
             // return, but the detached publisher reads it afterwards. Our
             // composer produces tagless kind:1 notes, so an empty tag set still
             // matches the signed id, and the write seam verifies that before
             // trusting it into the feed.
-            const owned = gpa.dupe(u8, parsed.value.content) catch return releaseUndo(pending.undo);
+            const owned = gpa.dupe(u8, parsed.value.content) catch {
+                parked = true;
+                return parkFailedSign(pending, false);
+            };
             var out = parsed.value;
             out.content = owned;
             // Preserve the signed tags (a reaction carries e/p/k); forcing them
@@ -828,7 +869,11 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
             // it. Deep-copied because `parsed` is freed on return.
             // Whole, or not published: the id is computed over these tags, so
             // a partial copy is an event the verify below would drop anyway.
-            out.tags = dupeTags(gpa, parsed.value.tags) orelse return releaseUndo(pending.undo);
+            out.tags = dupeTags(gpa, parsed.value.tags) orelse {
+                gpa.free(owned);
+                parked = true;
+                return parkFailedSign(pending, false);
+            };
             // Signed, so there is nothing to take back. Same reasoning as the
             // built-in signer's: released on the signature, not on the ingest.
             // This request's own record, never another one still out.
@@ -851,6 +896,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var restore: ?[]const u8 = null;
     var restore_warn: WarnCarry = .{};
     var sign_failed = false;
+    var signed_by_another_key = false;
     // Each failed sign's own record, put back after the lock is released.
     var undos: [max_pending_remote]PendingUndo = undefined;
     var undos_len: usize = 0;
@@ -872,6 +918,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         const slot_restorable = slot.restorable;
         const slot_warn = slot.warn;
         const slot_undo = slot.undo;
+        const slot_wrong_key = slot.wrong_key;
         slot.* = .{};
         if (stale) {
             if (content) |c| gpa.free(c);
@@ -904,6 +951,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 // follow press whose list already moved: this one's own.
                 undos[undos_len] = slot_undo;
                 undos_len += 1;
+                if (slot_wrong_key) signed_by_another_key = true;
             },
             .connect => {
                 if (content) |c| gpa.free(c);
@@ -1000,6 +1048,9 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
     for (undos[0..undos_len]) |u| applyUndo(model, u);
+    // Last, so it is the toast left standing: the one failure the reader cannot
+    // fix by asking again, because the signer is holding somebody else's key.
+    if (signed_by_another_key) setToast(model, "Your signer signed with a different key.");
     if (upload_sign_failed) uploadSignFailed();
     if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }
@@ -1064,6 +1115,21 @@ pub fn failPendingByContentForTest(content: []const u8) bool {
         return true;
     }
     return false;
+}
+
+/// The request id of the pending sign whose draft is `content`, copied into
+/// `out`, so a test can answer it the way the bunker would.
+pub fn pendingSignIdForTest(content: []const u8, out: *[24]u8) ?[]const u8 {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active or slot.method != .sign_event) continue;
+        const c = slot.content orelse continue;
+        if (!std.mem.eql(u8, c, content)) continue;
+        @memcpy(out[0..slot.id_len], slot.id());
+        return out[0..slot.id_len];
+    }
+    return null;
 }
 pub fn bumpRemoteGenerationForTest() void {
     _ = newRemoteGeneration();

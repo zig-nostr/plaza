@@ -115,6 +115,71 @@ test "only the signer we connected to can answer a signing request" {
     }
 }
 
+/// Seals a bunker's answer to request `id` with `result`, the way the bunker
+/// would, and hands it to the listener's handler.
+fn answerRemoteSign(signer: nostr.keys.Signer, bunker_kp: nostr.keys.KeyPair, client_kp: nostr.keys.KeyPair, id: []const u8, result: []const u8) !void {
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const body = try std.json.Stringify.valueAlloc(gpa, .{ .id = id, .result = result, .@"error" = "" }, .{});
+    defer gpa.free(body);
+    var sealed = try nostr.nip46.seal(gpa, threaded.io(), signer, bunker_kp, client_kp.public_key, body, 1_700_000_000);
+    defer sealed.deinit();
+    main.deliverNip46ResponseForTest(signer, client_kp, sealed.event);
+}
+
+test "a bunker answer that cannot be published hands the press back and says why" {
+    // The listener takes a request out of the table to match the answer to it.
+    // An answer that then turned out unusable (not an event, or an event signed
+    // by some other key) was dropped right there, after the take: the draft was
+    // freed, the press stayed moved, and nothing was said.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    const gpa = std.heap.page_allocator;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const client_kp = try signer.keyPairFromSecretKey([_]u8{0x16} ** 32);
+    const reader_secret = [_]u8{0x17} ** 32;
+    const reader_kp = try signer.keyPairFromSecretKey(reader_secret);
+    const stranger_kp = try signer.keyPairFromSecretKey([_]u8{0x18} ** 32);
+    main.setIdentityForTest(reader_secret);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    // The bunker holds the reader's key, so its answers come from that key.
+    main.setRemotePubkeyForTest(reader_kp.public_key);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    var fx: main.EffectsForTest = undefined;
+    var idbuf: [24]u8 = undefined;
+
+    // A note, answered with an event signed by somebody else's key.
+    model.draft_buffer.set("signed by the wrong key");
+    try testing.expect(main.submitPostForTest(&model, &fx));
+    try testing.expect(model.draft_empty());
+    const note_id = main.pendingSignIdForTest("signed by the wrong key", &idbuf) orelse return error.NoPendingSign;
+    const foreign = try nostr.event.create(gpa, signer, stranger_kp, 1_800_000_000, 1, &.{}, "signed by the wrong key", null);
+    const foreign_json = try nostr.event.toJson(gpa, foreign);
+    defer gpa.free(foreign_json);
+    try answerRemoteSign(signer, reader_kp, client_kp, note_id, foreign_json);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("signed by the wrong key", model.draft());
+    try testing.expectEqualStrings("Your signer signed with a different key.", model.toast_text());
+
+    // A like, answered with something that is not an event at all.
+    const liked: i64 = 0x0b0e;
+    main.rememberLikeForTest(liked, [_]u8{0x19} ** 32);
+    main.signAndPublishWithUndoForTest(&fx, 1_800_000_001, 7, "+", .{ .like = liked });
+    const like_id = main.pendingSignIdForTest("+", &idbuf) orelse return error.NoPendingSign;
+    try answerRemoteSign(signer, reader_kp, client_kp, like_id, "this is not an event");
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(!main.isLikedForTest(liked));
+    try testing.expectEqualStrings("That like was not signed.", model.toast_text());
+}
+
 test "logout empties the NIP-46 pending table so a new session inherits nothing" {
     main.clearPendingForTest();
     defer main.clearPendingForTest();
