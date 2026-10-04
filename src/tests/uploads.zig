@@ -441,15 +441,19 @@ test "the avatar and the banner take the address into their own fields, and only
     try awaitUpload("ready");
     main.update(&model, .close_profile_edit, &fx);
     try testing.expectEqualStrings("none", main.uploadStateForTest());
-    // And so does the sheet closing because Settings was opened over it.
+    // Settings' own shortcut, pressed inside Settings, is not a way out of the
+    // sheet: the picture on its way stays, and so does the sheet.
     model.editing_profile = true;
     main.update(&model, .{ .upload_pick = 1 }, &fx);
     try awaitUpload("ready");
     main.update(&model, .open_settings, &fx);
-    try testing.expect(!model.editing_profile);
+    try testing.expect(model.editing_profile);
+    try testing.expectEqualStrings("ready", main.uploadStateForTest());
+    main.update(&model, .close_profile_edit, &fx);
     try testing.expectEqualStrings("none", main.uploadStateForTest());
     // And reopening starts clean.
-    model.editing_profile = true;
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(model.editing_profile);
     const reopened = try buildTree(a.allocator(), &model);
     try testing.expect(!findAnyTextContaining(reopened.root, "not published until you press Save"));
 }

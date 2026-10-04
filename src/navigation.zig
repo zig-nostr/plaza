@@ -87,6 +87,10 @@ pub fn openPerson(model: *Model, pubkey: [32]u8) void {
 /// invitation to erase the setting it was supposed to show. The backup nudge did
 /// exactly that to the media proxy.
 pub fn enterSettings(model: *Model) void {
+    // Already here. Cmd+, reaches past every sheet, and running the rest again
+    // closes the Edit profile sheet over what was typed in it, drops a picture
+    // on its way into it, and puts back a media proxy half edited.
+    if (model.stage == .settings) return;
     model.menu = .none;
     // One sheet at a time: Settings is a sheet now, and the notifications sheet
     // is checked FIRST in the view, so leaving it open would open Settings into

@@ -64,6 +64,34 @@ test "a guest is not offered a profile to edit" {
     try testing.expect(!model.editing_profile);
     try testing.expect(model.joining);
 }
+
+test "the Edit profile sheet keeps what was typed through Cmd+, and Cmd+L" {
+    main.setIdentityForTest([_]u8{0x87} ** 32);
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.update(&model, .open_settings, &fx);
+    main.update(&model, Msg{ .proxy_edit = .{ .insert_text = "https://px.example" } }, &fx);
+    main.update(&model, .open_profile_edit, &fx);
+    try testing.expect(model.editing_profile);
+    main.update(&model, Msg{ .profile_name_edit = .{ .insert_text = "Ada" } }, &fx);
+
+    // Settings again, by its shortcut, from inside Settings. Nothing restarts.
+    main.update(&model, .open_settings, &fx);
+    try testing.expect(model.editing_profile);
+    try testing.expectEqualStrings("Ada", model.profile_name());
+    try testing.expect(std.mem.indexOf(u8, model.proxy_draft(), "px.example") != null);
+
+    // The address field waits for the sheet: opening it would hide the sheet,
+    // and a hit would leave Settings with the sheet still up and unseen.
+    main.update(&model, .open_address, &fx);
+    try testing.expect(!model.address_open);
+    try testing.expect(model.stage == .settings);
+    try testing.expect(model.editing_profile);
+    try testing.expectEqualStrings("Ada", model.profile_name());
+}
 test "the rail and guest banner carry the right entry points by identity" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

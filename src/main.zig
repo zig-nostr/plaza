@@ -4106,6 +4106,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             login.g_login_error.store(@intFromEnum(LoginError.none), .release);
         },
         .open_address => {
+            // Not over the Edit profile sheet. The field would replace the
+            // sheet on screen, and opening anything it found leaves Settings
+            // with the sheet still up but no longer drawn, its edits stranded
+            // where only the next Settings visit (which starts it over) goes.
+            // The sheet is modal, so the shortcut waits for it like every
+            // other press does.
+            if (model.stage == .settings and model.editing_profile) return;
             // Cmd+L with the field already up leaves it as it is: what is typed
             // in it and what that found. Starting over would empty the list
             // under a term that is still there, and never ask the relays for it.
