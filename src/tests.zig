@@ -25961,6 +25961,49 @@ test "an address opened over Settings leaves Settings so the result is seen" {
     try testing.expect(f.model.address_open);
 }
 
+test "a place with no feed says so instead of connecting forever" {
+    // A place document with no `hardcodedFeeds` has nothing to dial, so no
+    // socket ever opens and no result ever comes back. The empty state read
+    // "Connecting to this place…" for as long as the room stayed open.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+
+    try testing.expect(main.visitParsedPlaceForTest(arena,
+        \\{"appName":"No Feeds Place","homeMarkdown":"Nothing to read here."}
+    ));
+    main.update(&model, .place_enter, &fx);
+    main.startPlaceFeedForTest(0);
+    try testing.expectEqual(main.PlaceLink.no_feed, main.placeLink());
+    try testing.expectEqualStrings("This place has no feed to read.", model.empty_text());
+
+    // A feed that names a relay is a wait, not an absence.
+    main.resetPlacesForTest();
+    try testing.expect(main.visitParsedPlaceForTest(arena,
+        \\{"appName":"Has Feed","hardcodedFeeds":[{"name":"Feed","relays":["wss://a.example"]}]}
+    ));
+    main.update(&model, .place_enter, &fx);
+    main.startPlaceFeedForTest(0);
+    try testing.expect(main.placeLink() != .no_feed);
+    try testing.expectEqualStrings("Connecting to this place…", model.empty_text());
+}
+
+test "a feed worker for a room already left does not paint the next one as connecting" {
+    // Click from a room with a feed into one with none, and the first room's
+    // worker could wake after the second had said it has no feed, write
+    // "connecting" over it, and leave it there for good.
+    main.resetPlacesForTest();
+    defer main.resetPlacesForTest();
+    main.setPlaceLinkForTest(.no_feed);
+    main.runStalePlaceFeedWorkerForTest();
+    try testing.expectEqual(main.PlaceLink.no_feed, main.placeLink());
+}
+
 test "a note that arrives after you have walked away does not drag you back" {
     // The window has to close when the reader goes somewhere else, or a note
     // fetched fifteen seconds ago yanks them out of whatever they picked up

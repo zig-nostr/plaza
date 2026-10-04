@@ -13007,6 +13007,7 @@ pub const Model = struct {
                 .idle, .connecting => if (p) |m| (if (m.loadingLine().len > 0) m.loadingLine() else "Connecting to this place…") else "Connecting to this place…",
                 .unreachable_relay => if (p) |m| (if (m.lostLine().len > 0) m.lostLine() else "Can't reach this place. Retrying…") else "Can't reach this place. Retrying…",
                 .connected => if (p) |m| (if (m.emptyLine().len > 0) m.emptyLine() else "Nothing here yet.") else "Nothing here yet.",
+                .no_feed => "This place has no feed to read.",
             };
         }
         if (self.relay_count > 0 and self.offline_relays >= self.relay_count) return "Can't reach any relay. Retrying…";
@@ -32809,7 +32810,11 @@ fn placeIdsSnapshot(out: [][32]u8) usize {
 /// there looked exactly like a connected one while the bar cheerfully reported
 /// 5/5 relays. That is the reader being told the wrong thing about the only
 /// connection they are actually waiting on.
-pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay };
+///
+/// `no_feed` is a place with nothing to dial: no feed at all, or a feed that
+/// names no relay and a place that names none either. It is not a wait, and
+/// reading it as one left "Connecting to this place" up for good.
+pub const PlaceLink = enum(u8) { idle, connecting, connected, unreachable_relay, no_feed };
 var g_place_link = std.atomic.Value(u8).init(@intFromEnum(PlaceLink.idle));
 
 pub fn placeLink() PlaceLink {
@@ -32858,7 +32863,10 @@ fn startPlaceFeed(m: *const Place) void {
     // the room fills from the relay a moment later, which is what it does on a
     // first visit anyway.
     if (m.seen_len > 0 and m.seen_feed == g_place_feed) seedPlaceFeed(m.seen[0..m.seen_len]);
-    const feed = currentPlaceFeed(m) orelse return;
+    const feed = currentPlaceFeed(m) orelse {
+        setPlaceLink(.no_feed);
+        return;
+    };
     const gen = g_place_gen.load(.monotonic);
     var url_buf: [place_relay_cap]u8 = undefined;
     // A feed about people names no relay of its own, so it asks the PLACE's,
@@ -32871,12 +32879,21 @@ fn startPlaceFeed(m: *const Place) void {
         m.readRelay(0)
     else
         "";
-    if (url.len == 0) return;
+    if (url.len == 0) {
+        setPlaceLink(.no_feed);
+        return;
+    }
     const len = copyBounded(&url_buf, url);
     // Here and not at the top of this function: everything above is local, and
     // the tests that drive `.place_feed` are about the seeding and the feed
     // list, which must keep running. This is the line that opens a socket.
     if (!relayFetchAllowed()) return;
+    // Here, on the thread that just bumped the generation, and not first thing
+    // in the worker. The worker's write was unguarded, so a reader who clicked
+    // through a room with a feed into one with none had the first room's
+    // thread wake up late and paint "connecting" over the second room's
+    // `no_feed`, where nothing would ever clear it.
+    setPlaceLink(.connecting);
     // BY VALUE, like the url: the worker outlives this frame's borrow of the
     // place, and the reader may have walked out of it by the time the socket
     // opens.
@@ -32896,7 +32913,6 @@ fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [pla
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
-    setPlaceLink(.connecting);
     var relay = nostr.relay.dial(gpa, io, url_buf[0..url_len]) catch {
         // Only if this thread still owns the place. A dial that fails after the
         // reader has already walked out must not paint the next room's header.
@@ -33182,6 +33198,16 @@ pub fn savePlacesForTest() void {
 
 pub fn setPlaceLinkForTest(state: PlaceLink) void {
     setPlaceLink(state);
+}
+
+/// Runs a feed worker that belongs to a room already left, against a url that
+/// fails before any socket is opened.
+pub fn runStalePlaceFeedWorkerForTest() void {
+    var url_buf: [place_relay_cap]u8 = undefined;
+    const url = "http://not-a-relay";
+    @memcpy(url_buf[0..url.len], url);
+    const stale = g_place_gen.load(.monotonic) -% 1;
+    placeFeedWorker(url_buf, url.len, undefined, 0, stale, undefined, 0);
 }
 
 /// Arrives in a place that has a named feed, which is the ordinary case.
