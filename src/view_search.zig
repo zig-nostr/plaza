@@ -19,6 +19,7 @@ const SearchInput = main.SearchInput;
 const SearchRow = main.SearchRow;
 const avatarTint = main.avatarTint;
 const elide = main.elide;
+const hgap = main.hgap;
 const identityInk = main.identityInk;
 const lookupProfile = main.lookupProfile;
 const menu_scale = main.menu_scale;
@@ -37,6 +38,9 @@ const search_rows_max = main.search_rows_max;
 pub const search_sheet_width: f32 = 520;
 /// How tall the results are before they scroll.
 const search_results_height: f32 = 280;
+/// Room around the result rows for a focus ring: the ring's offset outside the
+/// row plus its stroke (2 and 2 in the theme's tokens).
+pub const search_ring_room: f32 = 4;
 /// The empty field's box, and what one relay's line costs under the list.
 const search_empty_height: f32 = 140;
 const search_relay_line_height: f32 = 19;
@@ -71,7 +75,7 @@ pub fn searchBody(ui: *AppUi, kind: SearchInput) AppUi.Node {
         n += 1;
         for (rows) |*r| {
             if (!r.local) continue;
-            nodes[n] = searchRow(ui, r);
+            nodes[n] = searchRowInset(ui, r);
             n += 1;
         }
     }
@@ -80,7 +84,7 @@ pub fn searchBody(ui: *AppUi, kind: SearchInput) AppUi.Node {
         n += 1;
         for (rows) |*r| {
             if (r.local) continue;
-            nodes[n] = searchRow(ui, r);
+            nodes[n] = searchRowInset(ui, r);
             n += 1;
         }
     }
@@ -124,6 +128,14 @@ fn searchNothingYet(kind: SearchInput) []const u8 {
     if (asking) return "No one on this device matches. Asking the search relays.";
     if (answered) return "No one on this device matches, and the search relays found no one.";
     return "No one on this device matches. The search relays are asked once you stop typing.";
+}
+
+/// A result row, held in from the list's sides by the focus ring's reach. A row
+/// is a stop as wide as the list and its ring is drawn outside it, so a row
+/// flush with the list had the two sides of its ring clipped away by the
+/// scroll. Only the rows move: the section labels keep the field's left edge.
+fn searchRowInset(ui: *AppUi, row: *const SearchRow) AppUi.Node {
+    return ui.row(.{ .gap = 0 }, .{ hgap(ui, search_ring_room), searchRow(ui, row), hgap(ui, search_ring_room) });
 }
 
 fn searchSectionLabel(ui: *AppUi, text: []const u8) AppUi.Node {
@@ -251,6 +263,8 @@ fn searchRow(ui: *AppUi, row: *const SearchRow) AppUi.Node {
     return ui.el(.list_item, .{
         .padding = 6,
         .gap = 10,
+        // Across the row it sits in (see `searchRowInset`), not down it.
+        .grow = 1,
         .cross = .center,
         .on_press = Msg{ .search_pick = pk },
         .style = .{ .radius = 8, .quiet_hover = true },

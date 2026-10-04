@@ -10,6 +10,7 @@ const long_form = @import("../article.zig");
 const theme = @import("../theme.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const AppUi = main.AppUi;
@@ -705,5 +706,48 @@ test "a person found by name or by NIP-05 over Settings leaves Settings" {
         main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 200, .body = "{\"names\":{\"alice\":\"" ++ hex ++ "\"}}" });
         try testing.expectEqual(main.Stage.ready, model.stage);
         try testing.expectEqualSlices(u8, &([_]u8{0x4f} ** 32), &(model.viewing_profile orelse return error.NoProfile));
+    }
+}
+
+/// The search sheet with one row from a relay: Rowan Reader, whose profile has a
+/// kind:0 username and no NIP-05 address.
+fn renderOneSearchRow(arena: std.mem.Allocator) !painted.Painted {
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "row");
+    const pk = [_]u8{0x4e} ** 32;
+    main.fillProfileTextForTest(pk, "Rowan Reader", "rowan", "");
+    main.searchArrivedForTest(main.searchGenForTest(), 0, pk);
+    main.searchTickForTest(&model, 0);
+    try testing.expectEqual(@as(usize, 1), main.searchRowCountForTest());
+    return painted.Painted.render(arena, &model);
+}
+
+test "a search result leaves room for its focus ring" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    const p = try renderOneSearchRow(arena_state.allocator());
+
+    const row = p.frameOf("Rowan Reader") orelse return error.NoRow;
+    // The list the row scrolls in: the scroll view that contains it.
+    var list: ?geometry.RectF = null;
+    for (p.layout.nodes) |node| {
+        if (node.widget.kind != .scroll_view) continue;
+        const f = node.widget.frame;
+        if (f.x <= row.x and row.x + row.width <= f.x + f.width and f.y <= row.y and row.y <= f.y + f.height) list = f;
+    }
+    const f = list orelse return error.NoList;
+    // The ring is drawn 2pt outside the row with a 2pt stroke, so the row must
+    // stand at least that far inside the region that clips it.
+    try testing.expect(row.x - f.x >= main.search_ring_room - 0.01);
+    try testing.expect((f.x + f.width) - (row.x + row.width) >= main.search_ring_room - 0.01);
+    // Only the rows are held in: the section label keeps the list's own edge.
+    for (p.layout.nodes) |node| {
+        if (!std.mem.startsWith(u8, node.widget.text, "FROM SEARCH RELAYS")) continue;
+        try testing.expectApproxEqAbs(f.x, node.widget.frame.x, 0.01);
     }
 }

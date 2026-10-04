@@ -7092,6 +7092,7 @@ pub const notifications_column_width = view_notifications.notifications_column_w
 
 // re-exports: view_search.zig
 pub const searchBody = view_search.searchBody;
+pub const search_ring_room = view_search.search_ring_room;
 pub const search_sheet_width = view_search.search_sheet_width;
 
 // re-exports: view_sheets.zig
