@@ -37,8 +37,6 @@ const invalidateFeed = main.invalidateFeed;
 const nowSeconds = main.nowSeconds;
 const parseMetadataInto = main.parseMetadataInto;
 const pendingHasRoom = main.pendingHasRoom;
-const pendingLock = main.pendingLock;
-const pendingUnlock = main.pendingUnlock;
 const persistSession = main.persistSession;
 const plazaDir = main.plazaDir;
 const releaseUndo = main.releaseUndo;
@@ -894,12 +892,7 @@ pub fn signerReady() bool {
 /// both the bunker's pending table and the built-in signer's slot.
 pub fn signInFlight() bool {
     if (g_helper_sign.active and g_helper_sign.restorable) return true;
-    pendingLock();
-    defer pendingUnlock();
-    for (&remote_signer.g_pending) |slot| {
-        if (slot.active and slot.restorable) return true;
-    }
-    return false;
+    return remote_signer.restorableSignPending();
 }
 
 /// Puts the built-in signer in the state it is in while a signature is out, so

@@ -6542,6 +6542,7 @@ pub const failPendingForTest = remote_signer.failPendingForTest;
 pub const halfInboxHoldsForTest = remote_signer.halfInboxHoldsForTest;
 pub const pendingConnectIdForTest = remote_signer.pendingConnectIdForTest;
 pub const registerPendingForTest = remote_signer.registerPendingForTest;
+pub const parkFailedSignForTest = remote_signer.parkFailedSignForTest;
 pub const registerRemoteHalfAskForTest = remote_signer.registerRemoteHalfAskForTest;
 pub const remoteDecryptMethodNameForTest = remote_signer.remoteDecryptMethodNameForTest;
 pub const remoteGenerationForTest = remote_signer.remoteGenerationForTest;

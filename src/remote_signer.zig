@@ -366,8 +366,27 @@ pub fn listWriteInFlight(kind: u16) bool {
     // count under. Read before it, the listener could take the slot in between,
     // and this saw the count still at zero and then no slot.
     if (g_signs_landing.load(.acquire) != 0) return true;
-    for (&g_pending) |*slot| {
-        if (slot.active and slot.method == .sign_event and slot.kind == kind) return true;
+    // The overflow is written under this same lock. A sign parked there is
+    // as much "not landed yet" as one in the table, and left out it let the
+    // next press through until the tick retired it.
+    for ([_][]PendingRemote{ &g_pending, &g_pending_overflow }) |table| {
+        for (table) |*slot| {
+            if (slot.active and slot.method == .sign_event and slot.kind == kind) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a sign carrying a composer draft is waiting in the table or beside
+/// it, for `signInFlight`. Takes the pending lock itself, so callers must not
+/// hold it.
+pub fn restorableSignPending() bool {
+    pendingLock();
+    defer pendingUnlock();
+    for ([_][]PendingRemote{ &g_pending, &g_pending_overflow }) |table| {
+        for (table) |*slot| {
+            if (slot.active and slot.restorable) return true;
+        }
     }
     return false;
 }
@@ -1283,6 +1302,16 @@ pub fn deliverNip46ResponseForTest(
 // Test seams for the NIP-46 pending-request table (the correlation and teardown
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
+/// Parks a failed sign the way the listener does when its answer was unusable.
+/// With the table full it lands in the overflow.
+pub fn parkFailedSignForTest(kind: u16, restorable: bool) void {
+    parkFailedSign(.{
+        .method = .sign_event,
+        .generation = g_remote_generation.load(.acquire),
+        .restorable = restorable,
+        .kind = kind,
+    }, false);
+}
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
     return registerPending(req_id, method, content, content != null, .none, 0, no_half_id, .{});
 }

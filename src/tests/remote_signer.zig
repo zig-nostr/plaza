@@ -683,3 +683,29 @@ test "a bunker sign parked while the table is full still gives its text back and
     try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .note));
     try testing.expectEqualStrings("the refused note", main.refusedTextForTest(0).?);
 }
+
+test "a failed sign parked beside a full table still counts as in flight" {
+    // The listener parks a failed sign beside the table when a press has taken
+    // its slot. The in-flight checks only looked at the table, so a press of
+    // the same kind went through until the tick retired the parked one.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    var ids: [main.max_pending_remote][8]u8 = undefined;
+    for (&ids, 0..) |*buf, i| {
+        try testing.expect(main.registerPendingForTest(try std.fmt.bufPrint(buf, "full{d}", .{i}), .nip44_decrypt, null));
+    }
+    try testing.expect(!main.listWriteInFlight(10000));
+    try testing.expect(!main.signInFlight());
+
+    main.parkFailedSignForTest(10000, false);
+    try testing.expect(main.listWriteInFlight(10000));
+    try testing.expect(!main.listWriteInFlight(10003));
+    try testing.expect(!main.signInFlight());
+
+    main.parkFailedSignForTest(1, true);
+    try testing.expect(main.signInFlight());
+
+    main.clearPendingForTest();
+    try testing.expect(!main.listWriteInFlight(10000));
+    try testing.expect(!main.signInFlight());
+}
