@@ -547,3 +547,58 @@ test "a reply is routed to the read relays of the people it names" {
         try testing.expect(main.poolHasRelayForTest(first.url));
     }
 }
+
+test "a reply goes only to the public relays a recipient reads" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/inboxes.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.clearRelaysForTest();
+    defer main.clearRelaysForTest();
+    _ = main.addRelayForTest("wss://reader.example.com", true, true);
+
+    // What a stranger's list says they read. The reader's signed reply is what
+    // gets sent there, so a cleartext, loopback, LAN or `.local` relay is not a
+    // place it goes, and neither is a string that is not a relay at all.
+    const them = [_]u8{0x6a} ** 32;
+    const list = nostr.event.Event{
+        .id = [_]u8{0x6a} ** 32,
+        .pubkey = them,
+        .created_at = 1_800_000_000,
+        .kind = 10002,
+        .tags = &.{
+            &.{ "r", "ws://cleartext.example.com", "read" },
+            &.{ "r", "wss://127.0.0.1:7777", "read" },
+            &.{ "r", "wss://192.168.0.9", "read" },
+            &.{ "r", "wss://nas.local", "read" },
+            &.{ "r", "wss://inbox.example.com", "read" },
+        },
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    _ = try store.ingest(arena, list, .{});
+
+    const hex = std.fmt.bytesToHex(them, .lower);
+    const reply = nostr.event.Event{
+        .id = [_]u8{0x6b} ** 32,
+        .pubkey = [_]u8{0x6c} ** 32,
+        .created_at = 1_800_000_001,
+        .kind = 1,
+        .tags = &.{&.{ "p", &hex }},
+        .content = "hi",
+        .sig = [_]u8{0} ** 64,
+    };
+    var urls: [main.maxExtraInboxRelaysForTest][96]u8 = undefined;
+    var url_len: [main.maxExtraInboxRelaysForTest]usize = undefined;
+    const n = main.recipientInboxUrlsForTest(arena, reply, &urls, &url_len);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("wss://inbox.example.com", urls[0][0..url_len[0]]);
+}

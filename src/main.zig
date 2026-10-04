@@ -5320,6 +5320,8 @@ pub const parseAddress = login.parseAddress;
 
 // re-exports: places.zig
 pub const placeFeedStepForTest = places.placeFeedStepForTest;
+pub const placeHintDialsForTest = places.placeHintDialsForTest;
+pub const placeHintsToAskForTest = places.placeHintsToAskForTest;
 pub const placeRefusalLine = places.placeRefusalLine;
 pub const drainPendingLinkForTest = places.drainPendingLinkForTest;
 pub const forgetPlaceFetchForTest = places.forgetPlaceFetchForTest;
@@ -6707,6 +6709,7 @@ pub const collectOutboxDueForTest = outbox.collectOutboxDueForTest;
 pub const enqueueOutboxForTest = outbox.enqueueOutboxForTest;
 pub const forgetOutboxAcksForTest = outbox.forgetOutboxAcksForTest;
 pub const loadOutboxForTest = outbox.loadOutboxForTest;
+pub const maxExtraInboxRelaysForTest = outbox.maxExtraInboxRelaysForTest;
 pub const outboxAuthorAtForTest = outbox.outboxAuthorAtForTest;
 pub const outboxHasRoomForTest = outbox.outboxHasRoomForTest;
 pub const outboxOwnerForTest = outbox.outboxOwnerForTest;
@@ -6717,6 +6720,7 @@ pub const outboxUsedSlotsForTest = outbox.outboxUsedSlotsForTest;
 pub const outbox_cap_for_test = outbox.outbox_cap_for_test;
 pub const outbox_sent_linger_for_test = outbox.outbox_sent_linger_for_test;
 pub const poolHasRelayForTest = outbox.poolHasRelayForTest;
+pub const recipientInboxUrlsForTest = outbox.recipientInboxUrlsForTest;
 pub const recordOutboxAckForTest = outbox.recordOutboxAckForTest;
 pub const resetOutboxForTest = outbox.resetOutboxForTest;
 pub const rounds_before_stuck_for_test = outbox.rounds_before_stuck_for_test;

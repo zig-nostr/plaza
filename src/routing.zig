@@ -23,6 +23,7 @@ const followSet = main.followSet;
 const followSnapshot = main.followSnapshot;
 const indexer_chunk = main.indexer_chunk;
 const indexer_relays = main.indexer_relays;
+const isPublicRelayUrl = main.isPublicRelayUrl;
 const isRelayUrl = main.isRelayUrl;
 const lockLiveRelay = main.lockLiveRelay;
 const lockRelayTable = main.lockRelayTable;
@@ -116,6 +117,11 @@ pub fn selectWriteRelays(urls: []const []const u8, out: *[outbox_relays_per_auth
         const url = std.mem.trim(u8, raw, " \t\r\n");
         if (url.len == 0 or url.len > 96) continue;
         if (!isRelayUrl(url)) continue;
+        // Somebody else's list, and what it names gets dialled with nobody
+        // pressing anything: the feed routes to it, a profile page pages from
+        // it, an article is looked for on it. A loopback, LAN or `.local` relay
+        // there would have every reader's machine knocking on its own network.
+        if (!isPublicRelayUrl(url)) continue;
         // A relay list naming the same relay twice is one person's opinion
         // twice, and it would quietly promote whatever a duplicate-happy list
         // mentions most.

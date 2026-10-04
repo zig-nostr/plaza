@@ -16,6 +16,8 @@ const oneShotDeadline = main.oneShotDeadline;
 const activePlace = main.activePlace;
 const activePubkey = main.activePubkey;
 const copyBounded = main.copyBounded;
+const isPublicRelayUrl = main.isPublicRelayUrl;
+const isRelayUrl = main.isRelayUrl;
 const max_relays = main.max_relays;
 const nowSeconds = main.nowSeconds;
 const one_shot_budget_ms = main.one_shot_budget_ms;
@@ -691,6 +693,7 @@ const inbox_relays_per_recipient = 3;
 /// A ceiling on the whole extra set, so a note naming a dozen people does not
 /// turn one Post into thirty dials.
 const max_extra_inbox_relays = 8;
+pub const maxExtraInboxRelaysForTest = max_extra_inbox_relays;
 
 /// Publishes `ev` to the relays the people it names actually READ from.
 ///
@@ -707,7 +710,35 @@ const max_extra_inbox_relays = 8;
 /// and a stranger's inbox relay refusing an unknown pubkey is normal rather
 /// than a delivery failure worth alarming them about.
 fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event.Event) void {
-    const store = main.g_store orelse return;
+    var urls: [max_extra_inbox_relays][96]u8 = undefined;
+    var url_len: [max_extra_inbox_relays]usize = undefined;
+    const urls_n = recipientInboxUrls(gpa, ev, &urls, &url_len);
+
+    for (0..urls_n) |i| {
+        const url = urls[i][0..url_len[i]];
+        var relay = nostr.relay.dial(gpa, io, url) catch continue;
+        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
+        // let go of this pointer before the connection is freed.
+        defer relay.deinit();
+        const watched = watchOneShot(io, relay, one_shot_budget_ms);
+        defer releaseOneShot(watched);
+        relay.publish(ev) catch continue;
+        // One read, to give the frame somewhere to flush to. The verdict is not
+        // recorded, so there is nothing to wait around for. Bounded on its own,
+        // for when the keeper had no slot to watch it with.
+        var msg = (relay.receiveTimeout(oneShotDeadline(io)) catch continue) orelse continue;
+        msg.deinit();
+    }
+}
+
+pub fn recipientInboxUrlsForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, urls: *[max_extra_inbox_relays][96]u8, url_len: *[max_extra_inbox_relays]usize) usize {
+    return recipientInboxUrls(gpa, ev, urls, url_len);
+}
+
+/// The relays `publishToRecipientInboxes` sends `ev` to: the read relays of the
+/// people it names, from the relay lists the store holds, without the pool's.
+fn recipientInboxUrls(gpa: std.mem.Allocator, ev: nostr.event.Event, urls: *[max_extra_inbox_relays][96]u8, url_len: *[max_extra_inbox_relays]usize) usize {
+    const store = main.g_store orelse return 0;
 
     // Who the note names. The author is skipped: a reply to yourself does not
     // need routing, and the pool already carries it.
@@ -727,14 +758,12 @@ fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event
         recipients[n] = pk;
         n += 1;
     }
-    if (n == 0) return;
+    if (n == 0) return 0;
 
     const kinds = [_]u16{relay_list_kind};
-    var result = store.query(gpa, .{ .authors = recipients[0..n], .kinds = &kinds, .limit = @intCast(n) }) catch return;
+    var result = store.query(gpa, .{ .authors = recipients[0..n], .kinds = &kinds, .limit = @intCast(n) }) catch return 0;
     defer result.deinit();
 
-    var urls: [max_extra_inbox_relays][96]u8 = undefined;
-    var url_len: [max_extra_inbox_relays]usize = undefined;
     var urls_n: usize = 0;
 
     for (result.events) |list_ev| {
@@ -748,6 +777,12 @@ fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event
             if (!entry.read) continue;
             const trimmed = std.mem.trim(u8, entry.url, " \t\r\n");
             if (trimmed.len == 0 or trimmed.len > 96) continue;
+            // A stranger's list, and what is sent there is the reader's own
+            // signed note. Only a well-formed `wss://` relay on the public
+            // internet: not `ws://` in the clear, and not a loopback, LAN or
+            // `.local` host that would have the reader's machine knocking on
+            // its own network.
+            if (!isRelayUrl(trimmed) or !isPublicRelayUrl(trimmed)) continue;
             // Already covered by the pool walk, so dialling it again would only
             // publish the same note twice to the same host.
             if (poolHasRelay(trimmed)) continue;
@@ -762,22 +797,7 @@ fn publishToRecipientInboxes(gpa: std.mem.Allocator, io: std.Io, ev: nostr.event
             taken += 1;
         }
     }
-
-    for (0..urls_n) |i| {
-        const url = urls[i][0..url_len[i]];
-        var relay = nostr.relay.dial(gpa, io, url) catch continue;
-        // Declared AFTER deinit so it runs BEFORE it: the keeper must have
-        // let go of this pointer before the connection is freed.
-        defer relay.deinit();
-        const watched = watchOneShot(io, relay, one_shot_budget_ms);
-        defer releaseOneShot(watched);
-        relay.publish(ev) catch continue;
-        // One read, to give the frame somewhere to flush to. The verdict is not
-        // recorded, so there is nothing to wait around for. Bounded on its own,
-        // for when the keeper had no slot to watch it with.
-        var msg = (relay.receiveTimeout(oneShotDeadline(io)) catch continue) orelse continue;
-        msg.deinit();
-    }
+    return urls_n;
 }
 pub fn poolHasRelay(url: []const u8) bool {
     for (0..relaySlots()) |i| {

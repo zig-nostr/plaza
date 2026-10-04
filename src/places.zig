@@ -383,9 +383,12 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
         if (m.feeds_len == m.feeds.len) break;
         // The first relay of this feed that is safe to dial. A feed whose relays
         // are all refused is skipped, and the rest of the place still applies.
+        // Public as well as well formed: a room opens its feed the moment the
+        // reader walks in, so a place naming a loopback or LAN relay would have
+        // every visitor's machine knocking on its own network.
         var chosen: []const u8 = "";
         for (f.relays) |r| {
-            if (isSafeRelayUrl(r)) {
+            if (isPublicRelayUrl(r)) {
                 chosen = r;
                 break;
             }
@@ -423,17 +426,17 @@ pub fn parsePlace(gpa: std.mem.Allocator, content: []const u8) ?Place {
     }
 
     // The community's own relays, checked like every other address a stranger
-    // fills in: `isSafeRelayUrl` is what stops a place pointing the reader's
-    // socket at something that is not a relay.
+    // fills in: `isPublicRelayUrl` is what stops a place pointing the reader's
+    // socket at something that is not a relay, or at their own network.
     for (w.readRepliesFrom) |r| {
         if (m.read_relays_len == place_relays_cap) break;
-        if (!isSafeRelayUrl(r)) continue;
+        if (!isPublicRelayUrl(r)) continue;
         m.read_relay_lens[m.read_relays_len] = @intCast(copyBounded(&m.read_relays[m.read_relays_len], r));
         m.read_relays_len += 1;
     }
     for (w.publishTargets) |r| {
         if (m.write_relays_len == place_relays_cap) break;
-        if (!isSafeRelayUrl(r)) continue;
+        if (!isPublicRelayUrl(r)) continue;
         m.write_relay_lens[m.write_relays_len] = @intCast(copyBounded(&m.write_relays[m.write_relays_len], r));
         m.write_relays_len += 1;
     }
@@ -1378,18 +1381,38 @@ pub fn askPlace(fx: *Effects, hints: []const []const u8) void {
 
     // And the hinted relays, which the pool does not hold. One throwaway socket
     // each, bounded, the same shape every other one-shot in this app uses.
-    var n: usize = 0;
-    for (hints) |h| {
-        if (n >= 3) break;
-        if (!isSafeRelayUrl(h)) continue;
+    var chosen: [place_hint_dials][]const u8 = undefined;
+    for (chosen[0..placeHintsToAsk(hints, &chosen)]) |h| {
         var url_buf: [place_relay_cap]u8 = undefined;
         const len = copyBounded(&url_buf, h);
         if (!relayFetchAllowed()) break;
         const t = std.Thread.spawn(.{}, askPlaceAt, .{ url_buf, len, want.pubkey, want.ident_buf, want.ident_len }) catch continue;
         t.detach();
-        n += 1;
     }
 }
+
+/// The most hinted relays one place link dials.
+const place_hint_dials = 3;
+
+/// Which of a place link's hints get a socket: the first few on the public
+/// internet. The link came from a stranger, so the same gate as every other
+/// hint, or a link in a note could point the reader's machine at its own
+/// loopback or LAN.
+fn placeHintsToAsk(hints: []const []const u8, out: *[place_hint_dials][]const u8) usize {
+    var n: usize = 0;
+    for (hints) |h| {
+        if (n == out.len) break;
+        if (!isPublicRelayUrl(h)) continue;
+        out[n] = h;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn placeHintsToAskForTest(hints: []const []const u8, out: *[place_hint_dials][]const u8) usize {
+    return placeHintsToAsk(hints, out);
+}
+pub const placeHintDialsForTest = place_hint_dials;
 
 fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, ident_buf: [64]u8, ident_len: u8) void {
     const gpa = std.heap.page_allocator;

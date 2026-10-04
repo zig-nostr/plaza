@@ -389,3 +389,48 @@ test "a short page does not page while its own first fetch is still out" {
     main.loadOlderProfileForTest(&model);
     try testing.expect(main.profileOlderAskForTest() != null);
 }
+
+test "a person's page never dials a relay on the reader's own network" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/private-targets.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.clearRelaysForTest();
+    defer main.clearRelaysForTest();
+    _ = main.addRelayForTest("wss://reader.example.com", true, true);
+
+    // A stranger's kind:10002, and opening their page pages from it with no
+    // press: every one of these would have been a socket to the reader's own
+    // loopback, LAN, or a name only their resolver knows.
+    const who = [_]u8{0x69} ** 32;
+    const list = nostr.event.Event{
+        .id = [_]u8{0x69} ** 32,
+        .pubkey = who,
+        .created_at = 1_800_000_000,
+        .kind = 10002,
+        .tags = &.{
+            &.{ "r", "wss://127.0.0.1:7777" },
+            &.{ "r", "wss://192.168.1.20" },
+            &.{ "r", "wss://printer.local" },
+            &.{ "r", "wss://their.example.com" },
+        },
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    _ = try store.ingest(arena, list, .{});
+
+    var out: [12][96]u8 = undefined;
+    var lens: [12]u8 = undefined;
+    const n = main.profileTargetsForTest(who, &out, &lens);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("wss://their.example.com", out[0][0..lens[0]]);
+    try testing.expectEqualStrings("wss://reader.example.com", out[1][0..lens[1]]);
+}

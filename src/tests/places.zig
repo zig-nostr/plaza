@@ -2601,3 +2601,29 @@ test "a feed worker for a room already left does not paint the next one as conne
     main.runStalePlaceFeedWorkerForTest();
     try testing.expectEqual(main.PlaceLink.no_feed, main.placeLink());
 }
+
+test "a place cannot send its visitors to their own network" {
+    // A room opens its feed as the reader walks in, and a post in it goes to
+    // the place's relays: every one of these is a stranger's choice of where
+    // the reader's machine connects.
+    const doc =
+        \\{"appName": "Inward",
+        \\ "readRepliesFrom": ["wss://127.0.0.1:7777", "wss://ok.example"],
+        \\ "publishTargets": ["wss://192.168.1.5", "wss://ok.example"],
+        \\ "hardcodedFeeds": [{"name": "x", "relays": ["wss://relay.local", "wss://feed.example"]}]}
+    ;
+    const place = main.parsePlace(testing.allocator, doc) orelse return error.PlaceRefused;
+    try testing.expectEqual(@as(u8, 1), place.read_relays_len);
+    try testing.expectEqualStrings("wss://ok.example", place.readRelay(0));
+    try testing.expectEqual(@as(u8, 1), place.write_relays_len);
+    try testing.expectEqualStrings("wss://ok.example", place.writeRelay(0));
+    try testing.expectEqual(@as(u8, 1), place.feeds_len);
+    try testing.expectEqualStrings("wss://feed.example", place.feeds[0].relay());
+
+    // And a place link's own hints, the same gate.
+    const hints = [_][]const u8{ "wss://localhost:4848", "wss://10.0.0.7", "wss://hint.example" };
+    var chosen: [main.placeHintDialsForTest][]const u8 = undefined;
+    const n = main.placeHintsToAskForTest(&hints, &chosen);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("wss://hint.example", chosen[0]);
+}

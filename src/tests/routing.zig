@@ -932,3 +932,18 @@ test "a follow with no relay list anywhere is asked once, not on every rebuild" 
     main.markIndexerAskedForTest(nobody.public_key);
     try testing.expectEqual(@as(usize, 0), main.collectUnroutedForTest(&out));
 }
+
+test "the feed does not route to a follow's relay on the reader's own network" {
+    // The same selection the outbox routes the feed with, which dials every
+    // relay it ranks: a follow listing their LAN relay ranks nothing.
+    var table: [8]main.RelayRankForTest = undefined;
+    const urls = [_][]const u8{
+        "wss://127.0.0.1",
+        "wss://10.0.0.7:4848",
+        "wss://relay.home.arpa",
+        "wss://public.example.com",
+    };
+    const len = main.foldWriteRelaysForTest(&table, 0, &urls);
+    try testing.expectEqual(@as(usize, 1), len);
+    try testing.expectEqualStrings("wss://public.example.com", main.relayRankUrlForTest(&table[0]));
+}
