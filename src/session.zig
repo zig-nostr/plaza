@@ -17,6 +17,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const forgetSeenOn = main.forgetSeenOn;
 const wipeRemoteSecrets = main.wipeRemoteSecrets;
 const forgetPrivateSeal = main.forgetPrivateSeal;
 const Effects = main.Effects;
@@ -296,6 +297,9 @@ pub fn performLogout(model: *Model, fx: *Effects) void {
     forgetMutes();
     forgetBookmarks();
     forgetPrivateHalves();
+    // And which relays carried which note: they are the relays this reader
+    // read, and the next account's hints would name them.
+    forgetSeenOn();
     dropUpload();
     forgetBlossom();
     resetInbox();

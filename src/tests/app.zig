@@ -2939,6 +2939,39 @@ test "every relay-fed note ingest remembers which relay it came from" {
     try testing.expectEqual(@as(usize, 11), from);
 }
 
+test "the relays one account read through are never the next account's hints" {
+    // Which relay delivered a note is learned reading as the account that is
+    // signed in, and a hint is published: in a like's or a quote's `e` tag and
+    // in a copied note address. The table was never cleared between accounts,
+    // so the next account named the previous one's own relay in public.
+    freshHints();
+    defer freshHints();
+    defer main.clearIdentityForTest();
+    defer main.clearLoggedOutLatchForTest();
+    defer main.setIdentityMintedForTest(false);
+    const note_id = [_]u8{0x5c} ** 32;
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    // A sign-out.
+    main.setIdentityForTest([_]u8{0x8a} ** 32);
+    main.recordSeenOnForTest(note_id, "wss://relay.alice.dev");
+    try testing.expectEqual(@as(usize, 1), main.hintsForTest(note_id, null).count);
+    main.performLogoutForTest(&model, &fx);
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(note_id, null).count);
+
+    // Another account adopted.
+    main.clearLoggedOutLatchForTest();
+    main.recordSeenOnForTest(note_id, "wss://relay.alice.dev");
+    main.setCeremonyForTest(.created);
+    const body = "{\"pubkey\":\"" ++ "5d" ** 32 ++ "\",\"state\":\"ready\"}";
+    model.stage = .onboarding;
+    main.handleHelperPubkeyForTest(&model, .{ .key = 0, .outcome = .ok, .status = 200, .body = body });
+    try testing.expect(main.activePubkeyForTest() != null);
+    try testing.expectEqual(@as(usize, 0), main.hintsForTest(note_id, null).count);
+}
+
 test "the three ways to hand out a note address all carry the hint" {
     freshHints();
     defer freshHints();

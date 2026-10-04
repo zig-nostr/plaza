@@ -4738,6 +4738,9 @@ pub fn enterFeed(model: *Model) void {
     forgetFollows();
     forgetMutes();
     forgetBookmarks();
+    // Which relays carried which note was learned reading as whoever was here
+    // before, and it is published in hints.
+    forgetSeenOn();
     // A picture on its way belongs to whoever asked for it.
     dropUpload();
     forgetBlossom();
@@ -5910,6 +5913,7 @@ pub const urlDomain = link_preview.urlDomain;
 pub const wantLink = link_preview.wantLink;
 
 // re-exports: relay_hints.zig
+pub const forgetSeenOn = relay_hints.forgetSeenOn;
 pub const hintsForTest = relay_hints.hintsForTest;
 pub const isHintableRelayForTest = relay_hints.isHintableRelayForTest;
 pub const noteAddressForTest = relay_hints.noteAddressForTest;

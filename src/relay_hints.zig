@@ -386,6 +386,15 @@ pub fn recordSeenOnForTest(id: [32]u8, url: []const u8) void {
     recordSeenOnId(id, url);
 }
 pub fn resetSeenOnForTest() void {
+    forgetSeenOn();
+}
+
+/// Forgets which relays delivered which note. On every change of account: the
+/// relays a note arrived on are the relays the previous reader read, and a hint
+/// is published. Left in place, the next account's like, quote or copied note
+/// address named the previous account's own relay, which is a permanent public
+/// link between the two.
+pub fn forgetSeenOn() void {
     seenOnLock();
     defer seenOnUnlock();
     for (&g_seen_on) |*e| e.* = .{};
