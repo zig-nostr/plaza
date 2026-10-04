@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const follows = @import("follows.zig");
 const own_lists = @import("own_lists.zig");
 const blossom = @import("blossom.zig");
+const remote_signer = @import("remote_signer.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -883,7 +884,7 @@ pub fn signInFlight() bool {
     if (g_helper_sign.active and g_helper_sign.restorable) return true;
     pendingLock();
     defer pendingUnlock();
-    for (&main.g_pending) |slot| {
+    for (&remote_signer.g_pending) |slot| {
         if (slot.active and slot.restorable) return true;
     }
     return false;

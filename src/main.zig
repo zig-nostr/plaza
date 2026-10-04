@@ -64,6 +64,7 @@ const mutes = @import("mutes.zig");
 const bookmarks = @import("bookmarks.zig");
 const private_lists = @import("private_lists.zig");
 const keyholder = @import("keyholder.zig");
+const remote_signer = @import("remote_signer.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -705,26 +706,6 @@ var g_last_level_count: usize = std.math.maxInt(usize);
 // carried across the thread boundary and the events read back by id, which is a
 // direct read each rather than a walk of the follow list.
 
-// Remote-signer (NIP-46) connection state, set at connect time and read by the
-// background threads. The ephemeral client keypair is Plaza's transport identity
-// with the bunker (never the user's key); the user's identity is the bunker's
-// own pubkey. Each worker thread makes its own secp256k1 signer, only these
-// bytes are shared.
-var g_remote_client_kp: ?nostr.keys.KeyPair = null;
-var g_remote_pubkey: [32]u8 = undefined;
-var g_remote_relay_buf: [256]u8 = undefined;
-var g_remote_relay_len: usize = 0;
-var g_remote_secret_buf: [128]u8 = undefined;
-var g_remote_secret_len: usize = 0;
-// 0 idle, 1 connecting, 2 connected, 3 failed. Drives the onboarding status line.
-var g_remote_status = std.atomic.Value(u8).init(0);
-// Set from the moment a pasted bunker link starts connecting until its first
-// answer arrives. While it is set the connection exists but nobody is signed in
-// by it: a link that points at a relay nobody is listening on, or a signer that
-// is not running, must not turn into an account that looks fine and then cannot
-// sign. See `driveBunkerConnect`.
-var g_remote_confirming = std.atomic.Value(bool).init(false);
-
 /// Delivers one /pubkey answer the way the runtime would.
 pub fn deliverHelperPubkeyForTest(model: *Model, body: []const u8) void {
     handleHelperPubkey(model, .{ .key = helper_poll_key, .outcome = .ok, .status = 200, .body = body });
@@ -829,7 +810,7 @@ pub fn ceremonyCanTakeKeyForTest() bool {
 /// Pretends the key is held by Notary, by a remote signer, or by Plaza itself.
 /// Pretends this session connected to `pubkey`'s bunker.
 pub fn setRemotePubkeyForTest(pubkey: [32]u8) void {
-    g_remote_pubkey = pubkey;
+    remote_signer.g_remote_pubkey = pubkey;
 }
 
 /// Hands one NIP-46 response event to the listener's handler, as a relay would.
@@ -844,7 +825,7 @@ pub fn deliverNip46ResponseForTest(
         signer,
         client_kp,
         ev,
-        g_remote_generation.load(.acquire),
+        remote_signer.g_remote_generation.load(.acquire),
     );
 }
 
@@ -1019,193 +1000,6 @@ pub fn deliverHelperSignedForTest(body: []const u8) void {
     handleHelperSigned(.{ .key = helper_sign_key, .outcome = .ok, .status = 200, .body = body });
 }
 
-// The listener runs for one connection generation. A logout or a reconnect
-// bumps this; the detached listener and the in-flight workers see the change
-// and stop, so an old bunker's listener never processes into a new session (or
-// a dead one). Correlating this into every pending request is the teardown fix.
-var g_remote_generation = std.atomic.Value(u64).init(0);
-
-/// A connect or a reconnect starts a new generation, and with it a new chance
-/// for a signer that said no. A half the previous session's bunker declined or
-/// never answered is put back to idle, so the next tick asks the signer that is
-/// connected now. Logout bumps the generation directly: it forgets the halves
-/// outright and has nothing to re-ask.
-fn newRemoteGeneration() u64 {
-    rearmPrivateHalves(0, true);
-    return g_remote_generation.fetchAdd(1, .monotonic) + 1;
-}
-// A remote sign that never came back, surfaced once in the composer identity
-// line so a restored draft is explained rather than silently reappearing.
-// Set by the timeout scan, cleared on the next edit or a later success.
-var g_remote_sign_notice = std.atomic.Value(bool).init(false);
-
-// Pending NIP-46 requests, keyed by id, so a response is correlated to the
-// request that asked for it (not guessed from whether `result` parses as an
-// event), and a request that never returns times out instead of losing the
-// draft. A tiny spinlock guards the table: every critical section is a handful
-// of field writes or an 8-slot scan and never touches IO, so a lock this cheap
-// is the right tool (std.Io.Mutex would drag a per-thread `io` through every
-// access, across threads that deliberately never share one).
-const remote_sign_timeout_s: i64 = 30;
-const max_pending_remote = 8;
-const no_half_id = [_]u8{0} ** 32;
-const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt, sign_auth, sign_upload_auth };
-const PendingRemote = struct {
-    active: bool = false,
-    id_buf: [24]u8 = undefined,
-    id_len: usize = 0,
-    method: RemoteMethod = .connect,
-    /// A decrypt only: which `g_private_halves` slot this answers. The
-    /// response arrives with nothing but a request id on it, so the slot has to
-    /// be remembered here or the plaintext has no home.
-    half_index: u8 = 0,
-    /// A decrypt only: `privateHalfId` of the ciphertext that was asked. The slot
-    /// index alone says where an answer would go, not whose it is: a sign-out
-    /// frees the slots while this ask is still out, and the next account can be
-    /// holding that slot by the time the answer lands.
-    half_id: [32]u8 = [_]u8{0} ** 32,
-    deadline_s: i64 = 0,
-    generation: u64 = 0,
-    // The listener flags a failed response here; the UI tick, which owns the
-    // composer, is what actually restores the draft (see `scanPendingRemote`).
-    failed: bool = false,
-    // sign_event only: the draft text, restored to the composer on failure or
-    // timeout. Owned by the slot; freed when the request resolves or is swept.
-    content: ?[]const u8 = null,
-    // Whether `content` is a composer draft worth restoring on failure. A
-    // reaction (kind:7 "+") is not, so its failure is silent, not a stray "+".
-    restorable: bool = false,
-    // Where the write was submitted from. A bunker asks a person, so this comes
-    // back on a human timescale, by which time the reader may be standing in a
-    // different room entirely.
-    route: PlaceRoute = .none,
-    // sign_event only: the content warning the draft was signed with, kept with
-    // THIS request so the draft that comes back gets its own warning when several
-    // signs are out at once.
-    warn: WarnCarry = .{},
-
-    pub fn id(self: *const PendingRemote) []const u8 {
-        return self.id_buf[0..self.id_len];
-    }
-};
-/// A decrypt answer on its way from the listener thread to the UI tick.
-///
-/// The bunker's replies land on the listener thread, and `g_private_halves` is
-/// read by the view every frame and written by `scanPrivateHalves` on the UI
-/// thread. Rather than add a second writer to that state from another thread,
-/// the listener parks the plaintext here under the pending lock it already
-/// takes, and `scanPendingRemote` applies it where every other private-half
-/// write happens.
-const HalfInbox = struct {
-    used: bool = false,
-    index: u8 = 0,
-    /// The ciphertext the ask was about, carried from `PendingRemote.half_id`.
-    half_id: [32]u8 = [_]u8{0} ** 32,
-    ok: bool = false,
-    plain_buf: [4096]u8 = undefined,
-    plain_len: u16 = 0,
-};
-pub var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;
-
-/// The same crossing for a seal, of which only one is ever in flight.
-const SealInbox = struct {
-    used: bool = false,
-    ok: bool = false,
-    buf: [4096]u8 = undefined,
-    len: u16 = 0,
-};
-var g_seal_inbox: SealInbox = .{};
-
-var g_pending_lock = std.atomic.Value(bool).init(false);
-pub var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
-
-pub fn pendingLock() void {
-    while (g_pending_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-}
-pub fn pendingUnlock() void {
-    g_pending_lock.store(false, .release);
-}
-
-/// Records a request as awaiting its response, taking ownership of `content`
-/// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
-/// Returns false when the table is full or the id does not fit, in which case
-/// the caller still owns `content`.
-pub fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry) bool {
-    if (req_id.len > 24) return false;
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (slot.active) continue;
-        slot.* = .{
-            .active = true,
-            .method = method,
-            .half_index = half_index,
-            .half_id = half_id,
-            .id_len = req_id.len,
-            .deadline_s = nowSeconds() + remote_sign_timeout_s,
-            .generation = g_remote_generation.load(.acquire),
-            .content = content,
-            .restorable = restorable,
-            .route = route,
-            .warn = if (restorable) warn else .{},
-        };
-        @memcpy(slot.id_buf[0..req_id.len], req_id);
-        return true;
-    }
-    return false;
-}
-
-/// Takes the pending request matching `req_id` out of the table, or null when
-/// none matches (an unknown id, or one already resolved: dropping it keeps a
-/// duplicated response from publishing twice). The caller owns the returned
-/// slot's `content`.
-fn takePending(req_id: []const u8) ?PendingRemote {
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
-            const taken = slot.*;
-            slot.* = .{};
-            return taken;
-        }
-    }
-    return null;
-}
-
-/// `takePending` for an answer from the signer, which also marks the connection
-/// up. Both happen under the table's lock: the tick decides a pasted link's
-/// `connect` never went out when it finds no slot and the status still at
-/// "connecting", and with the two done apart an answer that arrived between them
-/// read as exactly that, and a signer that said yes was reported as silent.
-fn takeAnswered(req_id: []const u8) ?PendingRemote {
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
-            const taken = slot.*;
-            slot.* = .{};
-            g_remote_status.store(2, .release);
-            return taken;
-        }
-    }
-    return null;
-}
-
-/// Marks the pending request matching `req_id` failed, leaving it in the table
-/// for the UI tick to restore the draft and free the content. Returns whether a
-/// slot matched.
-fn failPending(req_id: []const u8) bool {
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) {
-            slot.failed = true;
-            return true;
-        }
-    }
-    return false;
-}
-
 // Test seams for the NIP-46 pending-request table (the correlation and teardown
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
@@ -1227,7 +1021,7 @@ pub fn clearPendingForTest() void {
 pub fn failPendingByContentForTest(content: []const u8) bool {
     pendingLock();
     defer pendingUnlock();
-    for (&g_pending) |*slot| {
+    for (&remote_signer.g_pending) |*slot| {
         if (!slot.active or slot.method != .sign_event) continue;
         const c = slot.content orelse continue;
         if (!std.mem.eql(u8, c, content)) continue;
@@ -1243,20 +1037,7 @@ pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
     scanPendingRemote(model, fx);
 }
 pub fn remoteSignNoticeForTest() bool {
-    return g_remote_sign_notice.load(.acquire);
-}
-
-/// Empties the pending table, freeing every held draft. For logout, so a new
-/// session never inherits the old one's in-flight requests.
-fn clearPending() void {
-    const gpa = std.heap.page_allocator;
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (!slot.active) continue;
-        if (slot.content) |c| gpa.free(c);
-        slot.* = .{};
-    }
+    return remote_signer.g_remote_sign_notice.load(.acquire);
 }
 
 /// Why a pasted address did not open anything.
@@ -1780,7 +1561,7 @@ pub fn nowSeconds() i64 {
 /// show alongside the follows you read.
 pub fn activePubkey() ?[32]u8 {
     return switch (keyholder.g_signer_kind) {
-        .remote => if (g_remote_confirming.load(.acquire)) null else g_remote_pubkey,
+        .remote => if (remote_signer.g_remote_confirming.load(.acquire)) null else remote_signer.g_remote_pubkey,
         .helper => if (keyholder.g_helper_has_identity) keyholder.g_helper_identity_pk else null,
     };
 }
@@ -2772,7 +2553,7 @@ pub const Model = struct {
         _ = self;
         // A remote sign that never came back: the draft has been restored to the
         // composer, so say why rather than let it silently reappear.
-        if (keyholder.g_signer_kind == .remote and g_remote_sign_notice.load(.acquire))
+        if (keyholder.g_signer_kind == .remote and remote_signer.g_remote_sign_notice.load(.acquire))
             return "Your signer didn't respond. Draft restored, try again.";
         // The built-in signer, which is a separate process on loopback and can
         // refuse, be busy, or not be running at all.
@@ -2789,7 +2570,7 @@ pub const Model = struct {
         if (keyholder.g_signer_kind == .remote) {
             // The connection's honest state, not just its happy path: reaching,
             // signing as (which key), or unreachable.
-            return switch (g_remote_status.load(.acquire)) {
+            return switch (remote_signer.g_remote_status.load(.acquire)) {
                 1 => std.fmt.allocPrint(arena, "Reaching your signer · {s}", .{who}) catch who,
                 2 => std.fmt.allocPrint(arena, "Signing via your signer · {s}", .{who}) catch who,
                 3 => "Your signer is unreachable. Posts will not sign.",
@@ -2845,7 +2626,7 @@ pub const Model = struct {
             .signer_silent => return "Couldn't connect to your signer. Check that it is running and that the link is current, then try again.",
             .none => {},
         }
-        return switch (g_remote_status.load(.acquire)) {
+        return switch (remote_signer.g_remote_status.load(.acquire)) {
             1 => "Connecting to your signer…",
             3 => "Couldn't read that bunker link.",
             else => "",
@@ -9478,7 +9259,7 @@ pub fn timeoutRemoteHalfForTest(index: u8) bool {
 pub fn halfInboxHoldsForTest() bool {
     pendingLock();
     defer pendingUnlock();
-    for (&g_half_inbox) |*box| {
+    for (&remote_signer.g_half_inbox) |*box| {
         if (box.used or box.plain_len != 0) return true;
     }
     return false;
@@ -13815,7 +13596,7 @@ const SignerStatus = struct { label: []const u8, glyph: []const u8, color: canva
 pub fn signerIsHealthy() bool {
     return switch (keyholder.g_signer_kind) {
         .helper => helperState() == .ready,
-        .remote => !g_remote_sign_notice.load(.acquire),
+        .remote => !remote_signer.g_remote_sign_notice.load(.acquire),
     };
 }
 
@@ -13843,7 +13624,7 @@ fn signerStatus() SignerStatus {
         },
         // A remote bunker: reachable is the whole question, and the remote path
         // already tracks a failed round trip.
-        .remote => if (g_remote_sign_notice.load(.acquire))
+        .remote => if (remote_signer.g_remote_sign_notice.load(.acquire))
             .{ .label = "Signer unreachable", .glyph = "notary", .color = p.status_warning }
         else
             .{ .label = "Signer connected", .glyph = "notary", .color = p.status_success },
@@ -17279,7 +17060,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // machine sleeps or the app is killed is the sheet OPEN.
             g_draft_dirty = true;
             // The user is composing again: retire a stale "signer didn't respond".
-            g_remote_sign_notice.store(false, .release);
+            remote_signer.g_remote_sign_notice.store(false, .release);
             keyholder.g_helper_sign_notice.store(false, .release);
         },
         .post => {
@@ -19167,13 +18948,13 @@ pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectRespo
 /// `connect` request is waiting for its answer. Returns that request's id. For
 /// tests.
 pub fn beginBunkerConnectForTest(pubkey: [32]u8, id_out: *[24]u8) []const u8 {
-    g_remote_pubkey = pubkey;
+    remote_signer.g_remote_pubkey = pubkey;
     keyholder.g_signer_kind = .remote;
-    g_remote_status.store(1, .release);
-    g_remote_sign_notice.store(false, .release);
-    g_remote_confirming.store(true, .release);
+    remote_signer.g_remote_status.store(1, .release);
+    remote_signer.g_remote_sign_notice.store(false, .release);
+    remote_signer.g_remote_confirming.store(true, .release);
     login.g_login_error.store(@intFromEnum(LoginError.none), .release);
-    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    _ = remote_signer.g_remote_generation.fetchAdd(1, .monotonic);
     const id = "connect-for-test";
     @memcpy(id_out[0..id.len], id);
     _ = registerPending(id, .connect, null, false, .none, 0, no_half_id, .{});
@@ -19191,7 +18972,7 @@ pub fn setIoForTest(io: ?std.Io) void {
 pub fn pendingConnectIdForTest(out: *[24]u8) ?[]const u8 {
     pendingLock();
     defer pendingUnlock();
-    for (&g_pending) |*slot| {
+    for (&remote_signer.g_pending) |*slot| {
         if (slot.active and slot.method == .connect) {
             @memcpy(out[0..slot.id_len], slot.id());
             return out[0..slot.id_len];
@@ -19208,14 +18989,14 @@ pub fn answerBunkerConnectForTest(id: []const u8) void {
 /// Whether the pairing secret `needle` is still anywhere in the buffer that
 /// held it, or a client key is still held. For tests.
 pub fn remoteSecretHeldForTest(needle: []const u8) bool {
-    if (g_remote_client_kp != null) return true;
-    return std.mem.indexOf(u8, &g_remote_secret_buf, needle) != null;
+    if (remote_signer.g_remote_client_kp != null) return true;
+    return std.mem.indexOf(u8, &remote_signer.g_remote_secret_buf, needle) != null;
 }
 
 /// Which listener generation is current, so a test can see one was stopped.
 /// For tests.
 pub fn remoteGenerationForTest() u64 {
-    return g_remote_generation.load(.acquire);
+    return remote_signer.g_remote_generation.load(.acquire);
 }
 
 pub fn connectWentQuietForTest() bool {
@@ -19229,7 +19010,7 @@ pub fn driveBunkerConnectForTest(model: *Model) void {
 /// Puts every piece of bunker state back to a guest's. For tests.
 pub fn resetBunkerConnectForTest() void {
     abandonRemoteSigner(.none);
-    g_remote_confirming.store(false, .release);
+    remote_signer.g_remote_confirming.store(false, .release);
 }
 
 /// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
@@ -19237,8 +19018,8 @@ pub fn resetBunkerConnectForTest() void {
 /// without a live bunker. For tests.
 pub fn setRemoteStateForTest(status: u8, npub_len: usize) void {
     keyholder.g_signer_kind = if (status == 0) .helper else .remote;
-    g_remote_status.store(status, .release);
-    g_remote_sign_notice.store(false, .release);
+    remote_signer.g_remote_status.store(status, .release);
+    remote_signer.g_remote_sign_notice.store(false, .release);
     if (npub_len > 0) {
         const stub = "npub1testsigner";
         const n = @min(stub.len, keyholder.g_identity_npub_buf.len);
@@ -20098,7 +19879,7 @@ fn uploadTokenOutstanding() bool {
     pendingLock();
     defer pendingUnlock();
     if (g_upload_sign_inbox.used) return true;
-    for (&g_pending) |*slot| {
+    for (&remote_signer.g_pending) |*slot| {
         if (slot.active and slot.method == .sign_upload_auth) return true;
     }
     return false;
@@ -20202,7 +19983,7 @@ var g_upload_sign_inbox: UploadSignInbox = .{};
 
 /// Listener thread. `event_json` is the signed token, or null when the answer
 /// was unusable.
-fn parkUploadSign(event_json: ?[]const u8) void {
+pub fn parkUploadSign(event_json: ?[]const u8) void {
     pendingLock();
     defer pendingUnlock();
     g_upload_sign_inbox.used = true;
@@ -25500,719 +25281,8 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
 // send. A signed note returns as a response `result`, stored and published to
 // the feed pool exactly like a locally signed one.
 
-/// Pairs with an external signer from a `bunker://` URL: parses it, mints an
-/// ephemeral client key, starts the response listener, and sends the connect
-/// request. Returns false (and marks the status failed) on a bad URL. Returning
-/// true means the request is out, not that anyone is signed in: that happens
-/// when the signer answers it (see `driveBunkerConnect`).
-fn connectRemoteSigner(url_raw: []const u8) bool {
-    const url = std.mem.trim(u8, url_raw, " \t\r\n");
-    const io = g_io orelse return false;
-    const gpa = std.heap.page_allocator;
-
-    var parsed = nostr.nip46.parseBunkerUri(gpa, url) catch {
-        g_remote_status.store(3, .release);
-        return false;
-    };
-    defer parsed.deinit();
-    const bunker = parsed.value;
-    if (bunker.relays.len == 0 or bunker.relays[0].len > g_remote_relay_buf.len) {
-        g_remote_status.store(3, .release);
-        return false;
-    }
-    const relay_url = bunker.relays[0];
-
-    // Mint the ephemeral transport key (never the user's key).
-    var signer = nostr.keys.Signer.init();
-    const client_kp = signer.generateKeyPair(io) catch {
-        signer.deinit();
-        g_remote_status.store(3, .release);
-        return false;
-    };
-    signer.deinit();
-
-    // Stash the connection details for the worker threads.
-    g_remote_pubkey = bunker.remote_signer_pubkey;
-    @memcpy(g_remote_relay_buf[0..relay_url.len], relay_url);
-    g_remote_relay_len = relay_url.len;
-    if (bunker.secret) |s| {
-        const n = @min(s.len, g_remote_secret_buf.len);
-        @memcpy(g_remote_secret_buf[0..n], s[0..n]);
-        g_remote_secret_len = n;
-    } else g_remote_secret_len = 0;
-    g_remote_client_kp = client_kp;
-
-    // The user's identity is the bunker's pubkey.
-    const npub = abbreviateNpub(&keyholder.g_identity_npub_buf, g_remote_pubkey);
-    keyholder.g_identity_npub_len = npub.len;
-    keyholder.g_signer_kind = .remote;
-    g_remote_status.store(1, .release);
-    g_remote_sign_notice.store(false, .release);
-    // Nobody is signed in by this until the signer answers (see
-    // `driveBunkerConnect`).
-    g_remote_confirming.store(true, .release);
-
-    // A fresh generation: any prior listener (a reconnect to a second bunker)
-    // stops processing, and every request registered from here carries it.
-    const generation = newRemoteGeneration();
-
-    // The listener is a network thread, so a test build does not start one
-    // (see `networkAllowed`).
-    if (networkAllowed()) {
-        const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch {
-            abandonRemoteSigner(.signer_silent);
-            return false;
-        };
-        thread.detach();
-    }
-
-    sendConnect(gpa);
-    return true;
-}
-
-/// Request ids a unit test hands out, which has no io to draw them from.
-var g_test_request_seq: u32 = 0;
-
-/// Whether this generation's `connect` is neither waiting for its answer nor
-/// answered: it never went out, so there is nothing left to wait for.
-fn connectWentQuiet() bool {
-    const generation = g_remote_generation.load(.acquire);
-    pendingLock();
-    defer pendingUnlock();
-    for (&g_pending) |*slot| {
-        if (slot.active and slot.method == .connect and slot.generation == generation and !slot.failed) return false;
-    }
-    // Read under the same lock the listener takes an answer under (see
-    // `takeAnswered`), so a slot that is gone because it was ANSWERED is never
-    // mistaken for one that never went out.
-    return g_remote_status.load(.acquire) == 1;
-}
-
-/// Takes down a bunker connection that is not going to be anybody's sign-in:
-/// the listener stops, every request in flight is dropped, and the pairing
-/// secret and the client key are wiped rather than left in memory. Who is
-/// signed in is not touched here (see `abandonRemoteSigner`).
-fn dropRemoteConnection() void {
-    // Bumped first, so the detached listener stops processing before the state
-    // it reads is taken away.
-    _ = g_remote_generation.fetchAdd(1, .monotonic);
-    clearPending();
-    g_remote_confirming.store(false, .release);
-    g_remote_sign_notice.store(false, .release);
-    std.crypto.secureZero(u8, &g_remote_secret_buf);
-    g_remote_secret_len = 0;
-    if (g_remote_client_kp) |*kp| std.crypto.secureZero(u8, &kp.secret_key);
-    g_remote_client_kp = null;
-    g_remote_relay_len = 0;
-    g_remote_status.store(0, .release);
-}
-
-/// Takes back a bunker connection that never became a sign-in: the connection
-/// is dropped, and the reader is a guest again with the reason on the sheet
-/// they are still looking at.
-fn abandonRemoteSigner(why: LoginError) void {
-    dropRemoteConnection();
-    keyholder.g_identity_npub_len = 0;
-    keyholder.g_signer_kind = .helper;
-    login.g_login_error.store(@intFromEnum(why), .release);
-}
-
-/// Whether a pasted bunker link is still waiting on its signer.
-pub fn bunkerConnecting() bool {
-    return g_remote_confirming.load(.acquire);
-}
-
-/// The tick's half of connecting a pasted bunker link: signs the reader in once
-/// the signer has answered, and gives the sheet an error when it has not.
-///
-/// The link used to sign the reader in the moment it parsed. A link to a relay
-/// that was down then produced an account, a green dot, and a repost that sat
-/// on "Reposted" for thirty seconds before failing, with the reason only in a
-/// log. The answer to `connect` is the proof that the signer exists, is
-/// reachable and took this client, so it is what the sign-in waits for.
-fn driveBunkerConnect(model: *Model) void {
-    if (!g_remote_confirming.load(.acquire)) return;
-    // Something else took the seat (a keyholder key adopted while waiting).
-    // The pairing is not theirs, so it goes: left up, its listener would hold
-    // the bunker relay for the rest of the run with the link's secret in
-    // memory, and a late answer would mark a signer nobody uses "connected".
-    if (keyholder.g_signer_kind != .remote) {
-        dropRemoteConnection();
-        return;
-    }
-    switch (g_remote_status.load(.acquire)) {
-        2 => {
-            g_remote_confirming.store(false, .release);
-            login.g_login_error.store(@intFromEnum(LoginError.none), .release);
-            persistSession();
-            model.joining = false;
-            model.bunker_mode = false;
-            model.login_buffer.clear();
-            enterFeed(model);
-            replayPending(model);
-        },
-        // The request failed or ran out its thirty seconds.
-        3 => abandonRemoteSigner(.signer_silent),
-        // Connecting. If nothing is in flight any more there is nothing to wait
-        // for: the request never went out.
-        else => if (connectWentQuiet()) abandonRemoteSigner(.signer_silent),
-    }
-}
-
-/// A request id nobody watching the relay can guess.
-///
-/// These were `req-0`, `req-1`, and so on, from a counter that starts at zero
-/// on every launch. Our client pubkey is not a secret: it is the `p` tag on
-/// every request we publish. Anyone reading the bunker's relay could therefore
-/// address an answer to us and guess which request was in flight. They still
-/// cannot read the request, and after the sender check above they cannot be
-/// heard at all, but a request id should not be a countdown either.
-///
-/// Sixteen hex characters from the system CSPRNG, the same source the ephemeral
-/// client key comes from.
-fn newRequestId(out: *[24]u8) ?[]const u8 {
-    const io = g_io orelse {
-        // No io in a unit test, so ids come from a counter there. Never in the app.
-        if (!builtin.is_test) return null;
-        g_test_request_seq +%= 1;
-        return std.fmt.bufPrint(out, "test{x}", .{g_test_request_seq}) catch null;
-    };
-    var raw: [8]u8 = undefined;
-    io.randomSecure(&raw) catch return null;
-    return std.fmt.bufPrint(out, "{x}", .{raw}) catch null;
-}
-
-/// Sends the NIP-46 `connect` request (remote pubkey + optional secret).
-fn sendConnect(gpa: std.mem.Allocator) void {
-    var hexbuf: [64]u8 = undefined;
-    hexLower(&hexbuf, g_remote_pubkey);
-    var idbuf: [24]u8 = undefined;
-    const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false, .none, 0, no_half_id, .{})) return;
-    const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
-    sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
-}
-
-/// Remote path: build the unsigned event of `kind` (with `tags`, stamped
-/// `created_at`) and send a `sign_event` request. The signed event returns to
-/// the listener, which stores and publishes it. `restorable` is true only for a
-/// composer draft, so a failed reaction never lands "+"-text in the composer.
-fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
-    requestRemoteSignAs(.sign_event, gpa, created_at, kind, tags, content_owned, restorable, route);
-}
-
-/// The same request, tracked as `method`: an upload token is signed the same way
-/// and answered to a different place.
-fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
-    // `content_owned` is handed to the pending slot (so a timeout can restore
-    // it to the composer); it is freed here only on an early return.
-    // A canonical unsigned event (the bunker fills in the signature). The id is
-    // computed against the user's pubkey so the bunker's result matches it.
-    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, kind, tags, content_owned) catch {
-        gpa.free(content_owned);
-        return;
-    };
-    const unsigned = nostr.event.Event{
-        .id = id,
-        .pubkey = g_remote_pubkey,
-        .created_at = created_at,
-        .kind = kind,
-        .tags = tags,
-        .content = content_owned,
-        .sig = [_]u8{0} ** 64,
-    };
-    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch {
-        gpa.free(content_owned);
-        return;
-    };
-    defer gpa.free(unsigned_json);
-
-    var idbuf: [24]u8 = undefined;
-    const req_id = newRequestId(&idbuf) orelse {
-        gpa.free(content_owned);
-        return;
-    };
-    // Track before sending: the response can arrive on the listener thread the
-    // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags))) {
-        gpa.free(content_owned);
-        return;
-    }
-    const params = [_][]const u8{unsigned_json};
-    sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
-}
-
-/// Which NIP-46 method opens this private half.
-///
-/// NIP-51 lets the private half be NIP-04 or NIP-44, and the two are told apart
-/// by shape: a NIP-04 payload is `base64?iv=base64` and a NIP-44 one is bare
-/// base64, which can never contain a `?`. Jumble and Amethyst both choose on
-/// that marker. A legacy list sent to `nip44_decrypt` comes back as an error,
-/// which reads as a refusal and leaves the reader with a list they can never
-/// write.
-pub fn isNip04Payload(payload: []const u8) bool {
-    return std.mem.indexOf(u8, payload, "?iv=") != null;
-}
-
-fn remoteDecryptMethod(payload: []const u8) RemoteMethod {
-    return if (isNip04Payload(payload)) .nip04_decrypt else .nip44_decrypt;
-}
-
 pub fn remoteDecryptMethodNameForTest(payload: []const u8) []const u8 {
     return @tagName(remoteDecryptMethod(payload));
-}
-
-/// Remote path for a private half: ask the bunker to open it.
-///
-/// Without this a reader signed in through an external signer could never read
-/// their own encrypted list. `scanPrivateHalves` only knew how to ask the LOCAL
-/// keyholder over HTTP, so on a bunker the ask went to a daemon that either is
-/// not running or does not hold the key, came back not-ok, and the half was
-/// marked refused forever. `writeMute` then refused every mute write, because
-/// a private half that is present and unreadable is exactly the case it will
-/// not publish over. So the safety guard was firing correctly on a question
-/// that was never actually asked of the right signer.
-///
-/// The peer is the reader's own pubkey: NIP-51 encrypts a private half to
-/// yourself, so both sides of the conversation key are this account's.
-pub fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: []const u8) bool {
-    var hexbuf: [64]u8 = undefined;
-    hexLower(&hexbuf, g_remote_pubkey);
-    var idbuf: [24]u8 = undefined;
-    const req_id = newRequestId(&idbuf) orelse return false;
-    const method = remoteDecryptMethod(ciphertext);
-    if (!registerPending(req_id, method, null, false, .none, @intCast(half_index), privateHalfId(ciphertext), .{})) return false;
-    const params = [_][]const u8{ &hexbuf, ciphertext };
-    sendRequest(gpa, .{ .id = req_id, .method = @tagName(method), .params = &params });
-    return true;
-}
-
-/// Remote path for a seal: ask the bunker to encrypt a private half to this
-/// reader's own key. The answer completes the bookmark write.
-pub fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
-    var hexbuf: [64]u8 = undefined;
-    hexLower(&hexbuf, g_remote_pubkey);
-    var idbuf: [24]u8 = undefined;
-    const req_id = newRequestId(&idbuf) orelse return false;
-    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0, no_half_id, .{})) return false;
-    const params = [_][]const u8{ &hexbuf, plaintext };
-    sendRequest(gpa, .{ .id = req_id, .method = "nip44_encrypt", .params = &params });
-    return true;
-}
-
-/// Serializes `request` and spawns a one-shot thread to seal and publish it.
-fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
-    // `networkAllowed` and not `relayFetchAllowed`: the two say different
-    // things. This one asks only "may I touch the network", which is the whole
-    // of the concern here. Signing does not read the store and must not start
-    // depending on one existing.
-    if (!networkAllowed()) return;
-    const req_json = request.toJson(gpa) catch return;
-    var id_buf: [24]u8 = undefined;
-    const id_len = @min(request.id.len, id_buf.len);
-    @memcpy(id_buf[0..id_len], request.id[0..id_len]);
-    const thread = std.Thread.spawn(.{}, nip46Send, .{ gpa, req_json, id_buf, id_len }) catch {
-        gpa.free(req_json);
-        return;
-    };
-    thread.detach();
-}
-
-/// Seals `req_json` to the remote signer and publishes it on a throwaway
-/// connection to the bunker relay. Owns `req_json`. Its own io and signer.
-fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8, req_id: [24]u8, req_id_len: usize) void {
-    defer gpa.free(req_json);
-    const client_kp = g_remote_client_kp orelse return;
-    sendNip46(gpa, req_json, client_kp) catch {
-        // A request that could not even be put on the wire has no answer
-        // coming, so its slot is flagged failed now rather than left to run out
-        // its thirty seconds. The tick retires it the same way it retires a
-        // refusal.
-        _ = failPending(req_id[0..req_id_len]);
-    };
-}
-
-fn sendNip46(gpa: std.mem.Allocator, req_json: []const u8, client_kp: nostr.keys.KeyPair) !void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-
-    const created_at = std.Io.Timestamp.now(io, .real).toSeconds();
-    var sealed = try nostr.nip46.seal(gpa, io, signer, client_kp, g_remote_pubkey, req_json, created_at);
-    defer sealed.deinit();
-
-    var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
-    defer relay.deinit();
-    // The read below waits for the relay's OK. Without a deadline a bunker
-    // relay that accepts the publish and says nothing holds this thread, and
-    // this is the signing path: one wedged request would be one thread gone for
-    // the life of the process, every time the reader signed anything.
-    const watched = watchOneShot(io, relay, one_shot_budget_ms);
-    defer releaseOneShot(watched);
-    try relay.publish(sealed.event);
-    // Read the relay's OK so the frame flushes before we close; best-effort.
-    var msg = (relay.receive() catch return) orelse return;
-    msg.deinit();
-}
-
-/// The response listener: holds the bunker relay and processes responses,
-/// reconnecting until its `generation` is superseded (a logout or a reconnect
-/// bumps `g_remote_generation`). Its own io backend and signer, never the UI
-/// thread's.
-fn nip46ReceiveLoop(gpa: std.mem.Allocator, generation: u64) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const client_kp = g_remote_client_kp orelse return;
-
-    while (generation == g_remote_generation.load(.acquire)) {
-        nip46ReceiveOnce(gpa, io, signer, client_kp, generation) catch |err| {
-            std.debug.print("plaza: [signer] {s}\n", .{@errorName(err)});
-        };
-        if (generation != g_remote_generation.load(.acquire)) break;
-        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
-    }
-}
-
-/// Dials the bunker relay, subscribes for responses addressed to our client key
-/// (`#p` = the ephemeral pubkey, which only our bunker knows), and handles each
-/// until the connection drops or this listener's `generation` is superseded.
-fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, generation: u64) !void {
-    var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
-    // Withdrawn before the connection is freed: declared after `deinit`, so it
-    // runs before it.
-    defer relay.deinit();
-    offerLiveRelay(bunker_watch_slot, relay);
-    defer offerLiveRelay(bunker_watch_slot, null);
-
-    var client_hex: [64]u8 = undefined;
-    hexLower(&client_hex, client_kp.public_key);
-    const pvals = [_][]const u8{&client_hex};
-    const tag_filters = [_]nostr.filter.TagFilter{.{ .letter = 'p', .values = &pvals }};
-    const kinds = [_]u16{nostr.nip46.kind};
-    // FROM THE SIGNER, addressed to us. The `p` tag alone is not a restriction:
-    // our client pubkey is on every request we publish, so anyone reading the
-    // relay can address an event to it. Naming the author is what makes this
-    // subscription about a conversation with one party.
-    //
-    // `limit = 0` asks for nothing stored. Kind 24133 is ephemeral and a relay
-    // should not be keeping it, but one that does would otherwise replay a
-    // previous session's answers into this one.
-    const authors = [_][32]u8{g_remote_pubkey};
-    const filters = [_]nostr.filter.Filter{.{
-        .authors = &authors,
-        .kinds = &kinds,
-        .tags = &tag_filters,
-        .limit = 0,
-    }};
-    try relay.subscribe("plaza-nip46", &filters);
-
-    while (generation == g_remote_generation.load(.acquire)) {
-        var msg = (try relay.receive()) orelse break;
-        defer msg.deinit();
-        switch (msg.value) {
-            .event => |e| handleNip46Response(gpa, signer, client_kp, e.event, generation),
-            else => {},
-        }
-    }
-}
-
-/// Decrypts, parses, and correlates a NIP-46 response to the request that asked
-/// for it. An error response flags its request so the UI restores the draft; a
-/// `sign_event` result is verified, stored, and published to the feed pool (the
-/// remote equivalent of the local post path); a `connect` ack marks connected.
-/// An unknown or already-handled id is dropped, so a duplicate never publishes
-/// twice and a stale session's response never lands.
-fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client_kp: nostr.keys.KeyPair, ev: nostr.event.Event, generation: u64) void {
-    if (generation != g_remote_generation.load(.acquire)) return;
-    // Only the signer this session connected to.
-    //
-    // A relay filter is a request, not a guarantee, and this one has to hold on
-    // its own because of how NIP-44 works: the conversation key is derived from
-    // the SENDER's key, so an event from anybody decrypts successfully as long
-    // as they encrypted it to our client key. That key is public. Without this
-    // line, a stranger who guesses the id of a request in flight can answer it,
-    // and the answer is either an event we then publish from the reader's
-    // machine to the reader's relays, or a failure that discards their note.
-    if (!std.mem.eql(u8, &ev.pubkey, &g_remote_pubkey)) return;
-    const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
-    defer gpa.free(plaintext);
-    var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
-    defer resp.deinit();
-
-    if (resp.value.err.len != 0) {
-        std.debug.print("plaza: [signer] {s}\n", .{resp.value.err});
-        // Leave the slot in the table, flagged: the UI tick owns the composer,
-        // so it restores the draft (sign) or fails the status (connect).
-        _ = failPending(resp.value.id);
-        return;
-    }
-
-    // Correlate to the request that asked. A missing slot means an unknown id
-    // or one already handled: drop it (no double publish, no stray "connected").
-    // Taking it also marks the connection up (see `takeAnswered`).
-    const pending = takeAnswered(resp.value.id) orelse return;
-    defer if (pending.content) |c| gpa.free(c);
-
-    g_remote_sign_notice.store(false, .release);
-
-    switch (pending.method) {
-        // The connect ack is a plain "ack" string; the status above is the point.
-        .connect => {},
-        // The plaintext of a private half. Parked for the UI tick rather than
-        // written straight into `g_private_halves`, which the view reads every
-        // frame and `scanPrivateHalves` writes on the other thread.
-        .nip44_encrypt => {
-            pendingLock();
-            defer pendingUnlock();
-            const n = @min(resp.value.result.len, g_seal_inbox.buf.len);
-            @memcpy(g_seal_inbox.buf[0..n], resp.value.result[0..n]);
-            g_seal_inbox.len = @intCast(n);
-            g_seal_inbox.used = true;
-            g_seal_inbox.ok = n > 0;
-        },
-        .nip44_decrypt, .nip04_decrypt => {
-            pendingLock();
-            defer pendingUnlock();
-            for (&g_half_inbox) |*box| {
-                if (box.used) continue;
-                const n = @min(resp.value.result.len, box.plain_buf.len);
-                box.* = .{ .used = true, .index = pending.half_index, .half_id = pending.half_id, .ok = true, .plain_len = @intCast(n) };
-                @memcpy(box.plain_buf[0..n], resp.value.result[0..n]);
-                break;
-            }
-        },
-        // A relay's NIP-42 challenge, signed. Never published and never stored:
-        // it goes to the one relay that asked, by way of the slot that is
-        // waiting for it, and `authDeliverSigned` checks it before it can.
-        .sign_auth => {
-            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch {
-                authFailSigning(pending.half_index);
-                return;
-            };
-            defer parsed.deinit();
-            authDeliverSigned(gpa, signer, pending.half_index, parsed.value);
-        },
-        // An upload token: checked here, parked for the tick, never stored.
-        .sign_upload_auth => {
-            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch {
-                parkUploadSign(null);
-                return;
-            };
-            defer parsed.deinit();
-            const sound = std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey) and
-                (nostr.event.verify(gpa, signer, parsed.value) catch false);
-            if (!sound) {
-                parkUploadSign(null);
-                return;
-            }
-            const json = nostr.event.toJson(gpa, parsed.value) catch {
-                parkUploadSign(null);
-                return;
-            };
-            defer gpa.free(json);
-            parkUploadSign(json);
-        },
-        .sign_event => {
-            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
-            defer parsed.deinit();
-            // Signed as the account we asked it to sign as. The verify further
-            // down the write path checks that an event's signature matches its
-            // OWN pubkey, which a stranger's event also satisfies, so this is
-            // the check that says the note is this reader's.
-            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return;
-            // A process-lifetime copy of the content: `parsed` is freed on
-            // return, but the detached publisher reads it afterwards. Our
-            // composer produces tagless kind:1 notes, so an empty tag set still
-            // matches the signed id, and the write seam verifies that before
-            // trusting it into the feed.
-            const owned = gpa.dupe(u8, parsed.value.content) catch return;
-            var out = parsed.value;
-            out.content = owned;
-            // Preserve the signed tags (a reaction carries e/p/k); forcing them
-            // empty would make the id not match, and the verify below would drop
-            // it. Deep-copied because `parsed` is freed on return.
-            // Whole, or not published: the id is computed over these tags, so
-            // a partial copy is an event the verify below would drop anyway.
-            out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
-            // Signed, so there is nothing to take back. Same reasoning as the
-            // built-in signer's: released on the signature, not on the ingest.
-            releaseUndo();
-            ingestAndPublish(gpa, out, signer, pending.route);
-        },
-    }
-}
-
-/// UI-thread sweep of the pending table (called each tick): a request that
-/// failed or ran past its deadline is retired here, where the composer can be
-/// touched. A timed-out or refused `sign_event` restores its draft (only into
-/// an empty composer, so a newer draft is never clobbered) and shows a notice;
-/// a `connect` that never returned fails the connection status. A slot from a
-/// superseded generation (logout/reconnect) is dropped silently.
-fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
-    const now = nowSeconds();
-    const gpa = std.heap.page_allocator;
-    const generation = g_remote_generation.load(.acquire);
-    var restore: ?[]const u8 = null;
-    var restore_warn: WarnCarry = .{};
-    var sign_failed = false;
-    var any_sign_failed = false;
-    var connect_failed = false;
-    var seal_failed = false;
-    var upload_sign_failed = false;
-
-    pendingLock();
-    for (&g_pending) |*slot| {
-        if (!slot.active) continue;
-        const stale = slot.generation != generation;
-        const due = slot.failed or now >= slot.deadline_s;
-        if (!stale and !due) continue;
-        const method = slot.method;
-        const content = slot.content;
-        const slot_half = slot.half_index;
-        const slot_half_id = slot.half_id;
-        const slot_explicit = slot.failed;
-        const slot_restorable = slot.restorable;
-        const slot_warn = slot.warn;
-        slot.* = .{};
-        if (stale) {
-            if (content) |c| gpa.free(c);
-            // An ask that died with its session leaves the half "asking"
-            // forever, and nothing would ask again: the reader's list would
-            // stay read-only until a restart. Back to idle, so the next tick
-            // asks. Only the half that ask was about: the slot may belong to
-            // another list by now.
-            if (method == .nip44_decrypt or method == .nip04_decrypt) {
-                if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
-            }
-            continue;
-        }
-        switch (method) {
-            .sign_event => {
-                // The composer holds one draft: keep the first restorable one,
-                // free the rest. A reaction's content is not restorable, so it
-                // is freed and its failure stays silent.
-                if (content) |c| {
-                    if (slot_restorable and restore == null) {
-                        restore = c;
-                        restore_warn = slot_warn;
-                    } else gpa.free(c);
-                }
-                if (slot_restorable) sign_failed = true;
-                // Any failed signature, restorable or not, may have been a
-                // follow press whose list already moved.
-                any_sign_failed = true;
-            },
-            .connect => {
-                if (content) |c| gpa.free(c);
-                connect_failed = true;
-            },
-            // A token the bunker refused or never answered. The upload card says
-            // so; there is no draft to give back.
-            .sign_upload_auth => {
-                if (content) |c| gpa.free(c);
-                upload_sign_failed = true;
-            },
-            // Refused or never answered. NOT "the half is empty": that
-            // distinction is the whole reason this cache exists, and collapsing
-            // the two is what publishes an empty content over somebody's
-            // private list.
-            //
-            // An error from the bunker is a "no" and waits for a press. A
-            // deadline that passed is a silence: the prompt may be sitting
-            // unseen on a phone, or the answer lost on the way, so the half
-            // is asked again once `private_half_retry_s` has passed.
-            .nip44_decrypt, .nip04_decrypt => {
-                if (content) |c| gpa.free(c);
-                if (halfAwaiting(slot_half, slot_half_id)) |h| {
-                    h.state = .refused;
-                    h.retry_at_s = if (slot_explicit) 0 else now + private_half_retry_s;
-                }
-            },
-            // A seal the bunker refused or never answered. The list is left
-            // exactly as it was, which is the only safe outcome: the reader
-            // still has every private bookmark they had.
-            .nip44_encrypt => {
-                if (content) |c| gpa.free(c);
-                seal_failed = true;
-            },
-            // The relay's challenge goes unanswered and the row says so.
-            .sign_auth => {
-                if (content) |c| gpa.free(c);
-                authFailSigning(slot_half);
-            },
-        }
-    }
-    // Answers that came back while the listener held them. Applied here so
-    // every write to `g_private_halves` happens on this thread.
-    var opened = false;
-    for (&g_half_inbox) |*box| {
-        if (!box.used) continue;
-        // Only into the half that was asked: a slot freed by a sign-out and
-        // taken by another list is not this answer's home.
-        if (halfAwaiting(box.index, box.half_id)) |h| {
-            if (box.ok and box.plain_len > 0) {
-                const n = @min(box.plain_len, h.plain_buf.len);
-                @memcpy(h.plain_buf[0..n], box.plain_buf[0..n]);
-                h.plain_len = @intCast(n);
-                h.state = .open;
-                opened = true;
-            } else {
-                h.state = .refused;
-            }
-        }
-        std.crypto.secureZero(u8, &box.plain_buf);
-        box.* = .{};
-    }
-    // The bunker's ciphertext, if one arrived. Applied here so the splice and
-    // the publish happen on this thread, like every other write.
-    var sealed: ?[]const u8 = null;
-    var sealed_buf: [4096]u8 = undefined;
-    if (g_seal_inbox.used) {
-        if (g_seal_inbox.ok and g_seal_inbox.len > 0) {
-            @memcpy(sealed_buf[0..g_seal_inbox.len], g_seal_inbox.buf[0..g_seal_inbox.len]);
-            sealed = sealed_buf[0..g_seal_inbox.len];
-        } else seal_failed = true;
-        g_seal_inbox = .{};
-    }
-    pendingUnlock();
-    if (sealed) |ciphertext| finishPrivateBookmark(model, fx_for_seal, ciphertext);
-    if (seal_failed) {
-        private_lists.g_private_seal = .{};
-        setToast(model, "Your signer did not seal that. Nothing was sent.");
-    }
-    if (opened) {
-        // The set was read with this half closed, so it is short by whatever
-        // was in it. Read it again now that it can be.
-        loadMutesFromStore();
-        loadBookmarksFromStore();
-        invalidateFeed();
-    }
-
-    if (restore) |c| {
-        if (model.draft_empty()) {
-            setPlain(compose_capacity, &model.draft_buffer, c);
-            restore_warn.restoreInto(model);
-        }
-        gpa.free(c);
-    }
-    if (sign_failed) g_remote_sign_notice.store(true, .release);
-    if (any_sign_failed) applyUndo(model);
-    if (upload_sign_failed) uploadSignFailed();
-    if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
-}
-
-/// Lowercase-hex-encodes a 32-byte key into `out`.
-pub fn hexLower(out: *[64]u8, bytes: [32]u8) void {
-    const digits = "0123456789abcdef";
-    for (bytes, 0..) |b, i| {
-        out[i * 2] = digits[b >> 4];
-        out[i * 2 + 1] = digits[b & 0x0f];
-    }
 }
 
 // -------------------------------------------------------------------- app run
@@ -26568,16 +25638,16 @@ pub fn persistSession() void {
             break :blk std.fmt.bufPrint(&buf, "kind=helper\npubkey={s}\nminted={d}\n", .{ &pk_hex, @intFromBool(own_lists.g_identity_minted_here) }) catch return;
         },
         .remote => blk: {
-            const kp = g_remote_client_kp orelse return;
+            const kp = remote_signer.g_remote_client_kp orelse return;
             var pk_hex: [64]u8 = undefined;
-            hexLower(&pk_hex, g_remote_pubkey);
+            hexLower(&pk_hex, remote_signer.g_remote_pubkey);
             var cs_hex: [64]u8 = undefined;
             hexLower(&cs_hex, kp.secret_key);
             break :blk std.fmt.bufPrint(&buf, "kind=remote\nremote_pubkey={s}\nrelay={s}\nclient_secret={s}\nsecret={s}\n", .{
                 &pk_hex,
-                g_remote_relay_buf[0..g_remote_relay_len],
+                remote_signer.g_remote_relay_buf[0..remote_signer.g_remote_relay_len],
                 &cs_hex,
-                g_remote_secret_buf[0..g_remote_secret_len],
+                remote_signer.g_remote_secret_buf[0..remote_signer.g_remote_secret_len],
             }) catch return;
         },
     };
@@ -26644,8 +25714,8 @@ fn restoreSession(io: std.Io, environ: *const std.process.Environ.Map) bool {
 /// transport key, starts the response listener, and re-sends `connect`.
 fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []const u8, client_secret_hex: []const u8, secret: []const u8) bool {
     if (pubkey_hex.len != 64 or client_secret_hex.len != 64) return false;
-    if (relay.len == 0 or relay.len > g_remote_relay_buf.len) return false;
-    if (secret.len > g_remote_secret_buf.len) return false;
+    if (relay.len == 0 or relay.len > remote_signer.g_remote_relay_buf.len) return false;
+    if (secret.len > remote_signer.g_remote_secret_buf.len) return false;
 
     var pubkey: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&pubkey, pubkey_hex) catch return false;
@@ -26659,18 +25729,18 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
     };
     signer.deinit();
 
-    g_remote_pubkey = pubkey;
-    @memcpy(g_remote_relay_buf[0..relay.len], relay);
-    g_remote_relay_len = relay.len;
-    @memcpy(g_remote_secret_buf[0..secret.len], secret);
-    g_remote_secret_len = secret.len;
-    g_remote_client_kp = client_kp;
+    remote_signer.g_remote_pubkey = pubkey;
+    @memcpy(remote_signer.g_remote_relay_buf[0..relay.len], relay);
+    remote_signer.g_remote_relay_len = relay.len;
+    @memcpy(remote_signer.g_remote_secret_buf[0..secret.len], secret);
+    remote_signer.g_remote_secret_len = secret.len;
+    remote_signer.g_remote_client_kp = client_kp;
 
     const npub = abbreviateNpub(&keyholder.g_identity_npub_buf, pubkey);
     keyholder.g_identity_npub_len = npub.len;
     keyholder.g_signer_kind = .remote;
-    g_remote_status.store(1, .release);
-    g_remote_sign_notice.store(false, .release);
+    remote_signer.g_remote_status.store(1, .release);
+    remote_signer.g_remote_sign_notice.store(false, .release);
 
     // A fresh generation for this reconnected session (see `connectRemoteSigner`).
     const generation = newRemoteGeneration();
@@ -26842,9 +25912,9 @@ fn performLogout(model: *Model, fx: *Effects) void {
     // Tear down the NIP-46 session: bumping the generation stops the detached
     // listener from processing into the next session, and the pending table is
     // emptied so no in-flight request survives the logout.
-    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    _ = remote_signer.g_remote_generation.fetchAdd(1, .monotonic);
     clearPending();
-    g_remote_sign_notice.store(false, .release);
+    remote_signer.g_remote_sign_notice.store(false, .release);
     // And the built-in signer's slot, for the same reason: it holds the leaving
     // account's writing, and the confirmation said what that costs.
     releaseHelperSign();
@@ -26853,10 +25923,10 @@ fn performLogout(model: *Model, fx: *Effects) void {
     keyholder.g_identity_npub_len = 0;
     keyholder.g_helper_has_identity = false;
     keyholder.g_signer_kind = .helper;
-    g_remote_client_kp = null;
-    g_remote_relay_len = 0;
-    g_remote_secret_len = 0;
-    g_remote_status.store(0, .release);
+    remote_signer.g_remote_client_kp = null;
+    remote_signer.g_remote_relay_len = 0;
+    remote_signer.g_remote_secret_len = 0;
+    remote_signer.g_remote_status.store(0, .release);
     login.g_login_error.store(@intFromEnum(LoginError.none), .release);
     invalidateFeed();
 
@@ -27854,7 +26924,7 @@ fn authBeginSigning(index: usize, url: []const u8, out: *[auth_challenge_cap]u8)
 
 /// A signature that did not come: the signer refused, timed out, or answered
 /// with something unusable. Only moves a slot that is actually waiting on one.
-fn authFailSigning(index: usize) void {
+pub fn authFailSigning(index: usize) void {
     if (index >= max_relays) return;
     authLock();
     defer authUnlock();
@@ -27876,7 +26946,7 @@ fn authSweep(now_s: i64) void {
 /// signed in, naming this relay by the address it was dialed at and echoing the
 /// challenge it is currently holding. A signer is a separate program, and what
 /// it returns is data.
-fn authDeliverSigned(gpa: std.mem.Allocator, signer: nostr.keys.Signer, index: usize, ev: nostr.event.Event) void {
+pub fn authDeliverSigned(gpa: std.mem.Allocator, signer: nostr.keys.Signer, index: usize, ev: nostr.event.Event) void {
     if (index >= max_relays) return;
     var url_buf: [96]u8 = undefined;
     const entry = relaySnapshot(index, &url_buf) orelse {
@@ -29662,6 +28732,36 @@ pub const signInFlight = keyholder.signInFlight;
 pub const signerReady = keyholder.signerReady;
 pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
+
+// re-exports: remote_signer.zig
+pub const RemoteMethod = remote_signer.RemoteMethod;
+pub const abandonRemoteSigner = remote_signer.abandonRemoteSigner;
+pub const bunkerConnecting = remote_signer.bunkerConnecting;
+pub const clearPending = remote_signer.clearPending;
+pub const connectRemoteSigner = remote_signer.connectRemoteSigner;
+pub const connectWentQuiet = remote_signer.connectWentQuiet;
+pub const driveBunkerConnect = remote_signer.driveBunkerConnect;
+pub const failPending = remote_signer.failPending;
+pub const handleNip46Response = remote_signer.handleNip46Response;
+pub const hexLower = remote_signer.hexLower;
+pub const isNip04Payload = remote_signer.isNip04Payload;
+pub const newRemoteGeneration = remote_signer.newRemoteGeneration;
+pub const newRequestId = remote_signer.newRequestId;
+pub const nip46ReceiveLoop = remote_signer.nip46ReceiveLoop;
+pub const no_half_id = remote_signer.no_half_id;
+pub const pendingLock = remote_signer.pendingLock;
+pub const pendingUnlock = remote_signer.pendingUnlock;
+pub const registerPending = remote_signer.registerPending;
+pub const remoteDecryptMethod = remote_signer.remoteDecryptMethod;
+pub const requestRemoteDecrypt = remote_signer.requestRemoteDecrypt;
+pub const requestRemoteEncrypt = remote_signer.requestRemoteEncrypt;
+pub const requestRemoteSign = remote_signer.requestRemoteSign;
+pub const requestRemoteSignAs = remote_signer.requestRemoteSignAs;
+pub const scanPendingRemote = remote_signer.scanPendingRemote;
+pub const sendConnect = remote_signer.sendConnect;
+pub const sendRequest = remote_signer.sendRequest;
+pub const takeAnswered = remote_signer.takeAnswered;
+pub const takePending = remote_signer.takePending;
 
 test {
     _ = @import("tests.zig");

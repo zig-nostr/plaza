@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const keyholder = @import("keyholder.zig");
+const remote_signer = @import("remote_signer.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -229,7 +230,7 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
 pub fn parkHalfAnswer(index: u8, id: [32]u8, plain: []const u8) void {
     pendingLock();
     defer pendingUnlock();
-    for (&main.g_half_inbox) |*box| {
+    for (&remote_signer.g_half_inbox) |*box| {
         if (box.used) continue;
         const n = @min(plain.len, box.plain_buf.len);
         box.* = .{ .used = true, .index = index, .half_id = id, .ok = true, .plain_len = @intCast(n) };
@@ -250,7 +251,7 @@ pub fn endHalfAsk(index: u8, id: [32]u8, end: HalfAskEnd) bool {
     if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index, id, .{})) return false;
     pendingLock();
     defer pendingUnlock();
-    for (&main.g_pending) |*slot| {
+    for (&remote_signer.g_pending) |*slot| {
         if (!slot.active or !std.mem.eql(u8, slot.id(), req_id)) continue;
         switch (end) {
             .failed => slot.failed = true,
@@ -372,7 +373,7 @@ pub fn forgetPrivateHalves() void {
     // sweep to whatever list holds that slot by then.
     pendingLock();
     defer pendingUnlock();
-    for (&main.g_half_inbox) |*box| {
+    for (&remote_signer.g_half_inbox) |*box| {
         std.crypto.secureZero(u8, &box.plain_buf);
         box.* = .{};
     }
