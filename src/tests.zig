@@ -30930,3 +30930,561 @@ test "a quoted note in a notification preview is a label, not sixty characters o
     const n = main.collapseEventRefsForTest(&out, src);
     try testing.expectEqualStrings("look at this [Note] and [Note] too, note1 is not one", out[0..n]);
 }
+
+/// Puts `count` kind:1 notes by `author` into the store, newest first by
+/// construction: note `i` is dated `newest - i`. With `reply`, each one answers
+/// somebody, which is what makes the Notes tab count them as replies.
+fn seedAuthorNotes(store: *nostr.store.Store, arena: std.mem.Allocator, author: [32]u8, count: usize, newest: i64, reply: bool) !void {
+    for (0..count) |i| {
+        var id = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, id[0..4], @intCast(i + 1), .big);
+        id[31] = author[0];
+        var parent_hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&parent_hex, "{s}", .{"ab" ** 32}) catch unreachable;
+        const tags: []const nostr.event.Tag = if (reply) &.{&.{ "e", &parent_hex, "", "reply" }} else &.{};
+        const ev = nostr.event.Event{
+            .id = id,
+            .pubkey = author,
+            .created_at = newest - @as(i64, @intCast(i)),
+            .kind = 1,
+            .tags = tags,
+            .content = "a note",
+            .sig = [_]u8{0} ** 64,
+        };
+        _ = try store.ingest(arena, ev, .{});
+    }
+}
+
+test "a person's page pages down through the store, then asks the relays for older notes" {
+    // A profile read one page from the store and one from the relays and stopped.
+    // The list had no end to reach, so the notes under the first hundred (sixty
+    // or so on the Notes tab, once the replies are taken out) were out of reach.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/paging.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    const who = [_]u8{0x61} ** 32;
+    const newest: i64 = 1_800_000_000;
+    try seedAuthorNotes(&store, arena, who, 250, newest, false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    // The first page is what it always was.
+    try testing.expectEqual(@as(usize, 100), model.thread_notes_len);
+
+    // Reaching the end reads the next page from disk. No relay is involved.
+    main.loadOlderProfileForTest(&model);
+    try testing.expectEqual(@as(usize, 200), model.thread_notes_len);
+    try testing.expect(main.profileOlderAskForTest() == null);
+
+    // The store has fifty more, then it has no more.
+    main.loadOlderProfileForTest(&model);
+    try testing.expectEqual(@as(usize, 250), model.thread_notes_len);
+    try testing.expect(main.profileOlderAskForTest() == null);
+
+    // Newest first, no repeats, and every row is theirs.
+    for (model.thread_notes[0..250], 0..) |note, i| {
+        try testing.expectEqual(newest - @as(i64, @intCast(i)), note.created_at);
+        try testing.expectEqualSlices(u8, &who, &note.pubkey);
+    }
+
+    // Now the relays are asked, from as far back as they have brought this
+    // person's notes: here the first page, their newest hundred.
+    main.noteProfileReachForTest(who, newest - 99);
+    main.loadOlderProfileForTest(&model);
+    const ask = main.profileOlderAskForTest() orelse return error.NoOlderAsk;
+    try testing.expectEqualSlices(u8, &who, &ask.pubkey);
+    try testing.expectEqual(newest - 99, ask.until);
+}
+
+test "older notes are asked from where the relays reached, not from an old note the store happened to hold" {
+    // The store holds what any surface fetched. Beside the run the relays paged
+    // through, it can hold one old note of theirs from a thread or a quote, and
+    // paging from the oldest note in hand jumped straight past everything in
+    // between. On the next visit that note was still the oldest in hand, so the
+    // gap was skipped every time.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/gap.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    const who = [_]u8{0x6b} ** 32;
+    const newest: i64 = 1_800_000_000;
+    try seedAuthorNotes(&store, arena, who, 40, newest, false);
+    // A year older, and nothing in between.
+    var old = nostr.event.Event{
+        .id = [_]u8{0x6b} ** 32,
+        .pubkey = who,
+        .created_at = newest - 365 * 24 * 3600,
+        .kind = 1,
+        .tags = &.{},
+        .content = "an old note somebody quoted",
+        .sig = [_]u8{0} ** 64,
+    };
+    old.id[0] = 0xEE;
+    _ = try store.ingest(arena, old, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 41), model.thread_notes_len);
+
+    // No round has brought a note yet, so there is no run to continue: the page
+    // asks for their newest, from the moment it opened.
+    main.loadOlderProfileForTest(&model);
+    const first = main.profileOlderAskForTest() orelse return error.NoOlderAsk;
+    try testing.expectEqual(model.thread_open_at, first.until);
+
+    // The relays brought the forty. The next page starts under them, not under
+    // the note from a year ago.
+    main.noteProfileReachForTest(who, newest - 39);
+    main.loadOlderProfileForTest(&model);
+    const next = main.profileOlderAskForTest() orelse return error.NoOlderAsk;
+    try testing.expectEqual(newest - 39, next.until);
+
+    // A round for somebody else says nothing about this person.
+    main.noteProfileReachForTest([_]u8{0x6c} ** 32, newest - 5000);
+    try testing.expectEqual(@as(?i64, newest - 39), main.profileReachForTest(who));
+    // A later round can only take it further back.
+    main.noteProfileReachForTest(who, newest - 10);
+    try testing.expectEqual(@as(?i64, newest - 39), main.profileReachForTest(who));
+
+    // Back from a thread keeps how far the relays got; a fresh visit does not.
+    main.enterThreadForTest(&model, model.thread_notes[0]);
+    main.closeThreadForTest(&model);
+    try testing.expectEqual(@as(?i64, newest - 39), main.profileReachForTest(who));
+    main.enterProfileForTest(&model, [_]u8{0x6c} ** 32);
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(?i64, null), main.profileReachForTest(who));
+}
+
+test "a round reaches as far as every relay asked has answered for" {
+    // Each relay sends its newest page under the cursor. Under the oldest note
+    // of the shortest page, another relay may hold notes nobody sent yet, so the
+    // cut is the hundredth newest distinct note across all of them.
+    var seen: [200]main.ProfileSeen = undefined;
+    // Relay one: a full page, one note a second from 1000 down to 901.
+    for (0..100) |i| seen[i] = .{ .at = 1000 - @as(i64, @intCast(i)), .key = @intCast(i + 1) };
+    // Relay two: the same newest fifty, then fifty far older ones.
+    for (0..50) |i| seen[100 + i] = seen[i];
+    for (0..50) |i| seen[150 + i] = .{ .at = 500 - @as(i64, @intCast(i)), .key = @intCast(1000 + i) };
+    // Under 901 only relay two has answered: relay one stopped at its hundredth
+    // and may hold everything between 901 and 451. So the cut is 901, and a note
+    // both relays sent counts once (twice, and the cut would stop at 951).
+    const cut = main.roundReachForTest(&seen) orelse return error.NoReach;
+    try testing.expectEqual(@as(i64, 901), cut);
+
+    // Fewer than a page in all: every relay sent what it had, so the oldest.
+    var few = [_]main.ProfileSeen{ .{ .at = 30, .key = 3 }, .{ .at = 10, .key = 1 }, .{ .at = 20, .key = 2 } };
+    try testing.expectEqual(@as(?i64, 10), main.roundReachForTest(&few));
+    var none: [0]main.ProfileSeen = .{};
+    try testing.expectEqual(@as(?i64, null), main.roundReachForTest(&none));
+}
+
+test "back from a note keeps a person's page as deep as it was paged" {
+    // Back rebuilt the page from its first hundred, so a reader three pages down
+    // came back to a list cut short under them.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/depth.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    const who = [_]u8{0x6d} ** 32;
+    try seedAuthorNotes(&store, arena, who, 250, 1_800_000_000, false);
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    main.loadOlderProfileForTest(&model);
+    main.loadOlderProfileForTest(&model);
+    try testing.expectEqual(@as(usize, 250), model.thread_notes_len);
+
+    main.enterThreadForTest(&model, model.thread_notes[220]);
+    main.closeThreadForTest(&model);
+    try testing.expect(model.viewing_profile != null);
+    try testing.expectEqual(@as(usize, 250), model.thread_notes_len);
+}
+
+test "a person's page keeps the notes it already parsed when the store moves" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/reuse.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    const who = [_]u8{0x6e} ** 32;
+    const newest: i64 = 1_800_000_000;
+    try seedAuthorNotes(&store, arena, who, 150, newest, false);
+    // One note that names somebody, the only kind a name landing changes.
+    const named = [_]u8{0x6f} ** 32;
+    var mention = nostr.event.Event{
+        .id = [_]u8{0x6e} ** 32,
+        .pubkey = who,
+        .created_at = newest - 10,
+        .kind = 1,
+        .tags = &.{},
+        .content = try std.fmt.allocPrint(arena, "hi nostr:{s}", .{try nostr.nip19.encodeNpub(arena, named)}),
+        .sig = [_]u8{0} ** 64,
+    };
+    mention.id[0] = 0xAA;
+    _ = try store.ingest(arena, mention, .{});
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 100), model.thread_notes_len);
+
+    // The store moved for somebody else's sake: nothing on the page is parsed.
+    var before = main.profileParsesForTest();
+    main.refreshProfileNotesForTest(&model);
+    try testing.expectEqual(before, main.profileParsesForTest());
+
+    // The next page from the store parses that page and nothing above it.
+    before = main.profileParsesForTest();
+    main.loadOlderProfileForTest(&model);
+    try testing.expectEqual(@as(usize, 151), model.thread_notes_len);
+    try testing.expectEqual(before + 51, main.profileParsesForTest());
+
+    // A newer note lands on top: it is the one parse, and everything under it
+    // moved down a row intact.
+    var fresh = nostr.event.Event{
+        .id = [_]u8{0x6e} ** 32,
+        .pubkey = who,
+        .created_at = newest + 1,
+        .kind = 1,
+        .tags = &.{},
+        .content = "just now",
+        .sig = [_]u8{0} ** 64,
+    };
+    fresh.id[0] = 0xBB;
+    _ = try store.ingest(arena, fresh, .{});
+    before = main.profileParsesForTest();
+    main.refreshProfileNotesForTest(&model);
+    try testing.expectEqual(before + 1, main.profileParsesForTest());
+    try testing.expectEqual(@as(usize, 152), model.thread_notes_len);
+    var query = try store.query(arena, .{ .authors = &.{who}, .kinds = &.{1}, .limit = 152 });
+    defer query.deinit();
+    for (query.events, model.thread_notes[0..152]) |ev, note| {
+        try testing.expectEqualSlices(u8, &ev.id, &note.event_id);
+        try testing.expectEqual(ev.created_at, note.created_at);
+    }
+    try testing.expectEqualStrings("just now", model.thread_notes[0].content());
+
+    // A name landing re-reads the one note that names somebody, and only it.
+    before = main.profileParsesForTest();
+    main.setProfileNameForTest(named, "Grace");
+    main.refreshProfileNotesForTest(&model);
+    try testing.expectEqual(before + 1, main.profileParsesForTest());
+    var found = false;
+    for (model.thread_notes[0..model.thread_notes_len]) |note| {
+        if (std.mem.eql(u8, &note.event_id, &mention.id)) {
+            try testing.expectEqualStrings("hi @Grace", note.content());
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "a person's history ends when the relays say it does, and the page says so" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/ending.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    const who = [_]u8{0x62} ** 32;
+    const other = [_]u8{0x63} ** 32;
+    try seedAuthorNotes(&store, arena, who, 2, 1_800_000_000, false);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 2), model.thread_notes_len);
+
+    // Not at the end until a relay has said so: nothing says it yet, and a list
+    // that claims an end it has not found would hide the rest of the history.
+    try testing.expectEqual(@as(u8, 0), main.profileFooterForTest(&model, who, 2));
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(!findAnyTextContaining(tree.root, "That is everything"));
+    }
+
+    main.setProfileEndForTest(who);
+    try testing.expect(main.profileEndReachedForTest(who));
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "That is everything the relays have from them."));
+    }
+
+    // And it is THEIR end, not the page's: it says nothing about anybody else.
+    try testing.expect(!main.profileEndReachedForTest(other));
+
+    // At the end the reader's scroll asks nobody anything.
+    main.resetProfileEndForTest();
+    main.setProfileEndForTest(who);
+    main.loadOlderProfileForTest(&model);
+    try testing.expect(main.profileOlderAskForTest() == null);
+
+    // Opening the page again is asking again.
+    main.enterProfileForTest(&model, other);
+    main.enterProfileForTest(&model, who);
+    try testing.expect(!main.profileEndReachedForTest(who));
+}
+
+test "a list whose bottom is in view asks for more, even when it is too short to scroll" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/fill.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    // Someone who only ever answers other people: every one of their notes is a
+    // reply, so the Notes tab is empty however much history there is, and an
+    // empty list has no end to scroll to.
+    const who = [_]u8{0x64} ** 32;
+    try seedAuthorNotes(&store, arena, who, 150, 1_800_000_000, true);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    try testing.expectEqual(@as(usize, 100), model.thread_notes_len);
+    var buf: [200]usize = undefined;
+    try testing.expectEqual(@as(usize, 0), model.profileNotesFor(&buf, who).len);
+
+    // Bottom out of view: nothing to do.
+    main.loadAtProfileBottomForTest(&model, false);
+    try testing.expectEqual(@as(usize, 100), model.thread_notes_len);
+
+    // In view: from the store first.
+    main.loadAtProfileBottomForTest(&model, true);
+    try testing.expectEqual(@as(usize, 150), model.thread_notes_len);
+    try testing.expect(main.profileOlderAskForTest() == null);
+
+    // Then from the relays, once the store has nothing more, from as far back as
+    // they have brought this person's notes.
+    main.noteProfileReachForTest(who, 1_800_000_000 - 99);
+    main.loadAtProfileBottomForTest(&model, true);
+    const ask = main.profileOlderAskForTest() orelse return error.NoOlderAsk;
+    try testing.expectEqual(@as(i64, 1_800_000_000 - 99), ask.until);
+
+    // And not again from the same place. A round that left the list as it was
+    // would otherwise be asked for once a second for as long as the page is open.
+    main.resetProfileEndForTest();
+    main.loadAtProfileBottomForTest(&model, true);
+    try testing.expect(main.profileOlderAskForTest() == null);
+}
+
+test "a short tab fills itself a few pages and then leaves the rest to the reader" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bounded.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    // A thousand replies and no notes: the Notes tab stays empty however far
+    // back it goes, which is what the bound is for.
+    const who = [_]u8{0x6a} ** 32;
+    try seedAuthorNotes(&store, arena, who, 1000, 1_800_000_000, true);
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+
+    for (0..20) |_| main.loadAtProfileBottomForTest(&model, true);
+    // 100 to open, plus a page for each automatic ask.
+    try testing.expectEqual(@as(usize, 100 + 5 * 100), model.thread_notes_len);
+
+    // The reader scrolling to the end still gets another.
+    main.loadOlderProfileForTest(&model);
+    try testing.expectEqual(@as(usize, 100 + 6 * 100), model.thread_notes_len);
+}
+
+test "a person's newest page asks for their comments as well as their notes" {
+    // The next page starts where this one reached, so a kind the first page
+    // leaves out is never asked for in their newest stretch at all.
+    const who = [_]u8{0x65} ** 32;
+    const authors = [_][32]u8{who};
+    const f = main.buildProfileNewestFilter(&authors);
+    try testing.expectEqualSlices(u16, &.{ 1, main.comment_kind }, f.kinds.?);
+    try testing.expectEqual(@as(?u32, 100), f.limit);
+    try testing.expectEqual(@as(?i64, null), f.until);
+}
+
+test "the filter for older notes asks for exactly the notes before the oldest one held" {
+    const who = [_]u8{0x66} ** 32;
+    const authors = [_][32]u8{who};
+    const f = main.buildProfileOlderFilter(&authors, 1_700_000_123);
+    try testing.expectEqual(@as(?i64, 1_700_000_123), f.until);
+    try testing.expectEqual(@as(?u32, 100), f.limit);
+    try testing.expectEqual(@as(?i64, null), f.since);
+    try testing.expectEqualSlices(u8, &who, &f.authors.?[0]);
+    // Comments too: the page shows them, so paging has to be able to reach them.
+    try testing.expectEqualSlices(u16, &.{ 1, main.comment_kind }, f.kinds.?);
+}
+
+test "older notes are asked of the relays the person publishes to, then the reader's own" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/targets.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.clearRelaysForTest();
+    defer main.clearRelaysForTest();
+    _ = main.addRelayForTest("wss://reader.example.com", true, true);
+    _ = main.addRelayForTest("wss://writeonly.example.com", false, true);
+
+    const who = [_]u8{0x67} ** 32;
+    const list = nostr.event.Event{
+        .id = [_]u8{0x67} ** 32,
+        .pubkey = who,
+        .created_at = 1_800_000_000,
+        .kind = 10002,
+        .tags = &.{
+            &.{ "r", "wss://their.example.com" },
+            &.{ "r", "wss://readonly.example.com", "read" },
+            &.{ "r", "wss://reader.example.com", "write" },
+            &.{ "r", "wss://their.example.com" },
+        },
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    _ = try store.ingest(arena, list, .{});
+
+    var out: [12][96]u8 = undefined;
+    var lens: [12]u8 = undefined;
+    const n = main.profileTargetsForTest(who, &out, &lens);
+    // Their write relays in the order they listed them (a repeat and a read-only
+    // relay left out), then the reader's read relays they did not already name:
+    // the reader's own relay is named by both and asked once.
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("wss://their.example.com", out[0][0..lens[0]]);
+    try testing.expectEqualStrings("wss://reader.example.com", out[1][0..lens[1]]);
+
+    // Somebody whose list has not arrived is asked of the reader's relays alone.
+    const stranger = [_]u8{0x68} ** 32;
+    const m = main.profileTargetsForTest(stranger, &out, &lens);
+    try testing.expectEqual(@as(usize, 1), m);
+    try testing.expectEqualStrings("wss://reader.example.com", out[0][0..lens[0]]);
+}
+
+test "history is not declared over by a round that was only second to the first fetch" {
+    // Opening a page races two fetches for the same notes. Whichever lands
+    // second finds every one of them already stored, and "nothing was new to the
+    // store" read as "nothing older exists". On a person with two hundred notes
+    // that put "That is everything" under the first hundred.
+    try testing.expect(!main.profileRoundEndedForTest(1, 1, 0, 99));
+    // A relay that answered and had nothing older is the only thing that ends it.
+    try testing.expect(main.profileRoundEndedForTest(1, 1, 0, 0));
+    // One that never answered says nothing at all.
+    try testing.expect(!main.profileRoundEndedForTest(1, 0, 0, 0));
+    try testing.expect(!main.profileRoundEndedForTest(0, 0, 0, 0));
+}
+
+test "a short page does not page while its own first fetch is still out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/racing.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.resetProfileEndForTest();
+    defer main.resetProfileEndForTest();
+
+    // One note held, the way it is when the first fetch has not come back: the
+    // list is short, so it is "at its end" the moment it opens.
+    const who = [_]u8{0x69} ** 32;
+    try seedAuthorNotes(&store, arena, who, 1, 1_800_000_000, false);
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.enterProfileForTest(&model, who);
+    main.setFirstProfileFetchOutForTest(&model, true);
+
+    main.loadOlderProfileForTest(&model);
+    try testing.expect(main.profileOlderAskForTest() == null);
+
+    // Once the first fetch has landed, reaching the end asks.
+    main.setFirstProfileFetchOutForTest(&model, false);
+    main.loadOlderProfileForTest(&model);
+    try testing.expect(main.profileOlderAskForTest() != null);
+}

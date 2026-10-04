@@ -2675,6 +2675,29 @@ const feed_request_limit = 300;
 // built (the visible thread) is the one that breaks). The feed plus six
 // ancestors plus the current level is exactly eight.
 const thread_reply_cap = 100;
+/// How many of a person's notes one step of their page reads from the store, and
+/// how many more each time the reader reaches the end of the list.
+///
+/// A page and the thread cap are the same number on purpose: the first read has
+/// always been this many, and a person's page opens exactly as it did.
+const profile_page = thread_reply_cap;
+/// What a relay is asked for per page of older notes. One page, so that every
+/// row it returns fits the engagement query that follows it (`engagement_watch_cap`).
+/// Jumble asks for 200 (NoteList/index.tsx:49); it has no such query to fit.
+const profile_relay_page = 100;
+/// The most notes one person's page holds. The buffer grows on demand, and a
+/// ceiling is what keeps a very prolific account from growing it without limit.
+/// The page says so when it is reached, rather than pretending to be the end.
+const profile_notes_max = 1500;
+/// A tab with fewer rows than this keeps asking for older notes by itself.
+/// "Notes" and "Replies" split ONE stream, so a person who mostly answers has a
+/// short Notes tab that never scrolls, and a list that cannot scroll never
+/// reaches its end to ask.
+const profile_fill_rows = 30;
+/// How many pages one visit fetches by itself to fill a short tab. Past it the
+/// reader scrolls to ask, so an account with no replies at all cannot walk its
+/// whole history for a tab that will stay empty.
+const profile_autofill_max = 5;
 pub const thread_depth_max = 6;
 // How long a thread shows loading skeletons before giving up if the reply fetch
 // never signals completion (a relay that never sends EOSE), so a reply-less note
@@ -12248,8 +12271,20 @@ pub const Model = struct {
     // The open thread's replies, cached from the store so they are pressable
     // (open as a sub-thread), get their pictures fetched, and hold across
     // rebuilds. Rebuilt each tick, oldest first.
-    thread_notes: [thread_reply_cap]Note = [_]Note{.{}} ** thread_reply_cap,
+    //
+    // A SLICE, because a person's page outgrows a thread's cap: it pages down
+    // the way the feed does. It starts on a thread's worth of storage and
+    // `growLevelNotes` moves it onto a bigger buffer when a profile asks for one.
+    thread_notes: []Note = &g_level_boot,
     thread_notes_len: usize = 0,
+    /// How many of the open person's notes the store is asked for. Grows a page
+    /// at a time as the reader reaches the end of their list.
+    profile_limit: usize = profile_page,
+    /// Pages the open person's page has fetched by itself to fill a short tab.
+    profile_autofill: u8 = 0,
+    /// The cursor the last network ask for older notes started from, so the
+    /// page does not keep asking from a place that gave it nothing to show.
+    profile_asked_until: i64 = 0,
     // The back-stack of thread roots: opening a reply as a sub-thread pushes the
     // current root, so Back returns to it, and only the last Back returns to the
     // feed.
@@ -12355,7 +12390,7 @@ pub const Model = struct {
         "warn_on",                "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",
         "update_check_explainer", "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
         "blossom_buffer",         "blossom_draft",          "blossom_error",          "blossom_status",            "upload_alt",
-        "upload_alt_buffer",
+        "upload_alt_buffer",      "profile_limit",          "profile_autofill",       "profile_asked_until",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12980,7 +13015,7 @@ pub const Model = struct {
         var n: usize = 0;
         var i: usize = 0;
         const total = bookmarkCount();
-        while (i < total and n < self.thread_notes.len) : (i += 1) {
+        while (i < total and n < thread_reply_cap) : (i += 1) {
             const id = bookmarkAt(i) orelse continue;
             var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
             defer se.deinit();
@@ -13007,7 +13042,7 @@ pub const Model = struct {
         defer result.deinit();
         var n: usize = 0;
         for (result.events) |ev| {
-            if (n >= self.thread_notes.len) break;
+            if (n >= thread_reply_cap) break;
             // A tag is written under by strangers, and a muted one is hidden
             // here the way the feed and a thread hide them. Jumble's note list
             // does the same for its hashtag page
@@ -13043,19 +13078,81 @@ pub const Model = struct {
         // read.
         const kinds = [_]u16{ 1, comment_kind };
         const authors = [_][32]u8{pk};
+        const want = @min(self.profile_limit, profile_notes_max);
+        self.growLevelNotes(want);
         var result = store.query(std.heap.page_allocator, .{
             .authors = &authors,
             .kinds = &kinds,
-            .limit = thread_reply_cap,
+            .limit = @intCast(@min(want, self.thread_notes.len)),
         }) catch return;
         defer result.deinit();
-        var n: usize = 0;
-        for (result.events) |ev| {
-            if (n >= self.thread_notes.len) break;
-            self.thread_notes[n] = noteFrom(ev, now_s);
-            n += 1;
+
+        // A note already on the page is carried over rather than parsed again.
+        // This runs on the tick whenever the store moved, which is most ticks
+        // while any relay is streaming, and a page paged down to its ceiling is
+        // fifteen hundred notes: parsing every one each time put that whole cost
+        // on the render thread once a second to produce the list already on
+        // screen. The feed keeps its cards the same way (`buildReuseIndex`).
+        //
+        // A name landing changes only the notes that mention somebody, since
+        // that label is the one thing baked into the text; those are parsed
+        // again and the rest are kept.
+        const names_same = g_profile_notes_names == g_names_generation;
+        g_profile_notes_names = g_names_generation;
+        const old = self.thread_notes[0..self.thread_notes_len];
+        const slots = buildReuseIndex(old);
+        const n = @min(result.events.len, self.thread_notes.len);
+        // In place, oldest first. The page almost always gains notes, above
+        // the ones it holds (newer) or below them (an older page), so a note
+        // moves to the same index or a later one, and walking up from the
+        // bottom writes each slot after the note that was in it has moved. When
+        // one was removed and a note moves the other way, its slot may have
+        // been written first; `heldIndex` compares the full id, finds nothing,
+        // and the note is parsed.
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            const ev = result.events[i];
+            if (heldIndex(slots, old, ev.id)) |at| {
+                if (names_same or self.thread_notes[at].mentions.len == 0) {
+                    if (at != i) self.thread_notes[i] = self.thread_notes[at];
+                    continue;
+                }
+            }
+            self.thread_notes[i] = noteFrom(ev, now_s);
+            g_profile_parses +%= 1;
         }
         self.thread_notes_len = n;
+    }
+
+    /// Moves the level's notes onto a buffer of at least `want`, keeping what is
+    /// in them. A profile is the only level that asks for more than a thread's
+    /// cap; every other one stays on the buffer it started with.
+    ///
+    /// Doubling, so paging down a long page is a handful of allocations. The
+    /// buffer it leaves is freed, as the feed's is: there is one model and it
+    /// moves with the buffer. A `Note` is several kilobytes, so the 200, 400 and
+    /// 800 note buffers a page grows through would otherwise stay behind as
+    /// megabytes nothing reads. The first buffer is static and stays.
+    fn growLevelNotes(self: *Model, want: usize) void {
+        if (self.thread_notes.len >= want) return;
+        if (g_level_notes.len >= want) {
+            if (self.thread_notes.ptr != g_level_notes.ptr) {
+                const held = @min(self.thread_notes_len, self.thread_notes.len);
+                @memcpy(g_level_notes[0..held], self.thread_notes[0..held]);
+            }
+            self.thread_notes = g_level_notes;
+            return;
+        }
+        var next = @max(g_level_notes.len, thread_reply_cap);
+        while (next < want) next *|= 2;
+        const grown = std.heap.page_allocator.alloc(Note, next) catch return;
+        const keep = @min(self.thread_notes_len, self.thread_notes.len);
+        @memcpy(grown[0..keep], self.thread_notes[0..keep]);
+        for (grown[keep..]) |*note| note.* = .{};
+        if (g_level_notes.ptr != @as([*]Note, &g_level_boot)) std.heap.page_allocator.free(g_level_notes);
+        g_level_notes = grown;
+        self.thread_notes = grown;
     }
 
     /// Which of the profile's two tabs a note belongs to. "Notes" is what they
@@ -13093,7 +13190,7 @@ pub const Model = struct {
 
         var n: usize = 0;
         for (ids[0..id_count]) |id| {
-            if (n >= self.thread_notes.len) break;
+            if (n >= thread_reply_cap) break;
             var se = (store.getEvent(std.heap.page_allocator, id) catch continue) orelse continue;
             defer se.deinit();
             // A muted person's reply is hidden the same way their note is. The
@@ -13746,6 +13843,27 @@ fn feedKeyOf(id: [32]u8) i64 {
 /// thing that can be done.
 var g_feed_notes: []Note = &.{};
 var g_feed_scratch: []Note = &.{};
+
+/// What a level's notes start on, and the larger buffer a long profile moves to.
+/// Process-wide like the feed's, for the same reason: there is one reader and
+/// one level on screen, and a model that is made (or copied) already points at
+/// storage it can write to.
+var g_level_boot: [thread_reply_cap]Note = [_]Note{.{}} ** thread_reply_cap;
+var g_level_notes: []Note = &g_level_boot;
+/// The names generation the open person's notes were parsed under.
+var g_profile_notes_names: u64 = std.math.maxInt(u64);
+/// How many notes the person's page has parsed, rather than carried over. For a
+/// test, which has no clock that could tell the two apart.
+var g_profile_parses: usize = 0;
+
+pub fn profileParsesForTest() usize {
+    return g_profile_parses;
+}
+
+/// The refresh the tick runs when the store moved.
+pub fn refreshProfileNotesForTest(model: *Model) void {
+    model.refreshProfileNotes(nowSeconds());
+}
 
 /// Makes room for `want` notes, returning what is actually available. A failed
 /// growth keeps what it had, so a feed that cannot grow stops growing instead of
@@ -18028,6 +18146,9 @@ pub const Msg = union(enum) {
     blossom_add,
     /// Drop one server from the list, by its row.
     blossom_remove: u8,
+    /// The reader reached the end of a person's page: another page of their
+    /// notes, from the store and then from the relays.
+    profile_older,
     /// A press that landed on a modal's own card rather than on a control in it.
     ///
     /// It does nothing, and that IS the job. A press does not land where it
@@ -18099,6 +18220,7 @@ pub const Msg = union(enum) {
         "reply_submit",
         "toggle_expand",
         "load_older",
+        "profile_older",
         "absorb_press",
         "open_notary_window",
         "copy_note_text",
@@ -21315,11 +21437,14 @@ const RowExtents = struct {
     }
 };
 
-/// Rows a level can price: a thread's replies, or an article's body rows plus its
-/// head and foot, whichever is larger.
-const row_extent_cap = @max(thread_reply_cap * 2, article.max_chunks + 2);
-
 const row_extents_magic: u64 = 0x524f57455854_4142;
+
+/// Rows one retained table can price. A thread holds at most its cap plus the
+/// rows around the replies; an article holds its body rows plus its head and
+/// foot; a person's page holds as many notes as it will plus its header and
+/// footer. Past it a row falls back to the quiet extent rather than being
+/// priced, which is the estimate being wrong, not a crash.
+const row_extent_cap = @max(thread_reply_cap * 2, @max(article.max_chunks + 2, profile_notes_max + 4));
 
 /// Who and what is ON SCREEN in a level right now: the authors whose faces are
 /// being drawn, and the notes whose pictures are.
@@ -22446,6 +22571,11 @@ pub const Screen = struct {
     note: Note = .{},
     /// Whose profile this level shows, when it is one.
     profile: ?[32]u8 = null,
+    /// How far down that person's notes the reader had paged. Back reads this
+    /// many again, so the list is as long as it was and the scroll offset the
+    /// list kept lands on the note they left from, not past the end of a list
+    /// cut back to its first page.
+    profile_limit: usize = profile_page,
     /// Whether this level is the bookmark list.
     bookmarks: bool = false,
     /// The topic this level shows, when it is one. A VALUE rather than a slice:
@@ -26821,7 +26951,7 @@ fn profilePanel(
     // and the index it yields then indexes `notes` with whatever layout left on
     // that word. The arena survives to the top of the next build, which is
     // exactly as long as the retained table needs it.
-    const indices = ui.arena.alloc(usize, thread_reply_cap) catch return ui.column(.{}, .{});
+    const indices = ui.arena.alloc(usize, notes.len) catch return ui.column(.{}, .{});
     // An occluded level still reports its REAL row count: the retained list keeps
     // its scroll offset from the count and the extents, so claiming two rows here
     // would collapse the person's scroll and Back would land at the top.
@@ -26846,6 +26976,10 @@ fn profilePanel(
         .notes = notes,
         .shown = shown,
         .loading = loading,
+        .footer = switch (header) {
+            .person => |pk| profileFooter(model, pk, shown.len),
+            else => .none,
+        },
     };
     const table = &g_profile_extents[@min(level, g_profile_extents.len - 1)];
     table.reset();
@@ -26870,9 +27004,18 @@ fn profilePanel(
         .grow = 1,
         .viewport_fallback = window_height,
         .semantics = .{ .label = "Profile" },
+        // Only a person's page pages. A topic and the bookmark list hold what
+        // the store was asked for and have nothing older to reach.
+        .on_reach_end = switch (header) {
+            .person => .profile_older,
+            else => null,
+        },
     };
     const window = ui.virtualWindow(options);
     if (!occluded) recordProfileVisible(rows_ctx, level, window.first_visible_index, window.last_visible_index);
+    if (!occluded and header == .person) {
+        g_profile_bottom_in_view = window.start_index + window.itemCount() >= rows_ctx.count();
+    }
     // An occluded level builds no rows, for the same reason a thread's does not:
     // the offset survives on the list's id and its content height, and six built
     // levels of anything cross the 1024-node ceiling that refuses a view whole.
@@ -26909,8 +27052,10 @@ const ProfileRows = struct {
     notes: []const Note,
     shown: []const usize,
     loading: bool,
+    /// What closes the list. Only a person's page has one.
+    footer: ProfileFooter = .none,
 
-    const Row = union(enum) { person, topic, bookmarks, note: usize, empty };
+    const Row = union(enum) { person, topic, bookmarks, note: usize, empty, footer };
 
     /// The person this level is about, or all-zero when it is not about one.
     /// The callers below are all person-only paths reached from a `.person`
@@ -26924,7 +27069,8 @@ const ProfileRows = struct {
 
     fn count(self: *const ProfileRows) usize {
         // The person, then a row per note, or one quiet line when there are none.
-        return 1 + if (self.shown.len == 0) @as(usize, 1) else self.shown.len;
+        const body: usize = if (self.shown.len == 0) 1 else self.shown.len;
+        return 1 + body + @intFromBool(self.footer != .none);
     }
 
     fn rowAt(self: *const ProfileRows, index: usize) Row {
@@ -26935,10 +27081,58 @@ const ProfileRows = struct {
         };
         if (self.shown.len == 0) return .empty;
         const i = index - 1;
+        if (i == self.shown.len and self.footer != .none) return .footer;
         if (i >= self.shown.len) return .empty;
         return .{ .note = self.shown[i] };
     }
 };
+
+/// How a person's list ends.
+const ProfileFooter = enum {
+    /// More may be on the way, or the reader has not asked yet.
+    none,
+    /// A page of older notes is being fetched.
+    loading,
+    /// Every relay asked said there is nothing older.
+    end,
+    /// The page holds as many notes as it will, and there may be more.
+    ceiling,
+};
+
+/// What closes the open person's list right now. Read at build time from the
+/// round in flight and the latch, both of which the tick moves.
+fn profileFooter(model: *const Model, pubkey: [32]u8, shown: usize) ProfileFooter {
+    // An empty tab has its own line, and a list that says "that is all" before
+    // it shows anything is saying something else.
+    if (shown == 0) return .none;
+    if (model.thread_notes_len >= profile_notes_max) return .ceiling;
+    if (profileEndReached(pubkey)) return .end;
+    if (g_profile_older_busy.load(.monotonic)) return .loading;
+    return .none;
+}
+
+pub fn profileFooterForTest(model: *const Model, pubkey: [32]u8, shown: usize) u8 {
+    return @intFromEnum(profileFooter(model, pubkey, shown));
+}
+
+/// The line under the last note.
+fn profileFooterRow(ui: *AppUi, footer: ProfileFooter) AppUi.Node {
+    const p = theme.palette;
+    const text: []const u8 = switch (footer) {
+        .loading => "Looking for older notes…",
+        .end => "That is everything the relays have from them.",
+        .ceiling => ui.fmt("This page holds their latest {d} notes.", .{profile_notes_max}),
+        .none => "",
+    };
+    // Under the notes, in their column, rather than at the window's left edge.
+    return ui.row(.{ .grow = 1, .main = .center, .height = quiet_row_extent }, .{
+        ui.row(.{ .width = feed_column_width, .cross = .center, .gap = 0 }, .{
+            hgap(ui, row_pad_side),
+            ui.paragraph(.{ .wrap = true, .style = .{ .foreground = p.text_dim } }, &.{.{ .text = text, .scale = mono_hint_scale }}),
+            hgap(ui, row_pad_side),
+        }),
+    });
+}
 
 /// One person-page row's height, from the live rows. Typed for the same reason
 /// `threadRowHeight` is.
@@ -26951,7 +27145,7 @@ fn profileRowHeight(rows: *const ProfileRows, index: usize) f32 {
         .topic => 96,
         .bookmarks => 96,
         .note => |ni| noteRowEstimate(&rows.notes[ni], feed_row_chrome),
-        .empty => quiet_row_extent,
+        .empty, .footer => quiet_row_extent,
     };
 }
 
@@ -26965,6 +27159,7 @@ fn profileRowAt(ui: *AppUi, rows: *const ProfileRows, index: usize) AppUi.Node {
         .bookmarks => bookmarksCard(ui),
         .note => |ni| noteCard(ui, &rows.notes[ni]),
         .empty => profileEmptyRow(ui, rows),
+        .footer => profileFooterRow(ui, rows.footer),
     };
 }
 
@@ -33505,6 +33700,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // The open paths call these directly, so a thread still fills
                 // the moment it is opened; this only skips the repeat.
                 refreshOpenLevel(model, now);
+                // And the bottom of the open person's list, which may be in view
+                // with nothing left to scroll that would ask for more.
+                loadAtProfileBottom(model);
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
@@ -33792,7 +33990,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // reader has to make it again every morning.
             saveSettings();
         },
-        .profile_tab => |which| model.profile_tab = if (which == 1) .replies else .notes,
+        .profile_tab => |which| {
+            model.profile_tab = if (which == 1) .replies else .notes;
+            model.profile_autofill = 0;
+        },
         .toggle_notifications => {
             model.notifications_open = !model.notifications_open;
             // Opening IS reading: the reader is looking at them. The mark moves
@@ -34519,6 +34720,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 fetchOlderNotes(model.notes[model.notes_len - 1].created_at - 1);
             }
         },
+        .profile_older => loadOlderProfile(model),
         .close_settings => {
             model.logout_pending = false;
             model.stage = .ready;
@@ -39390,7 +39592,7 @@ fn pushCurrentScreen(model: *Model) void {
         return;
     }
     if (model.viewing_profile) |pk| {
-        model.thread_stack[model.thread_stack_len] = .{ .profile = pk };
+        model.thread_stack[model.thread_stack_len] = .{ .profile = pk, .profile_limit = model.profile_limit };
         model.thread_stack_len += 1;
         return;
     }
@@ -39659,6 +39861,11 @@ fn enterProfile(model: *Model, pubkey: [32]u8) void {
     model.reply_buffer.clear();
     wantProfile(pubkey);
     model.profile_tab = .notes;
+    model.profile_limit = profile_page;
+    model.profile_autofill = 0;
+    model.profile_asked_until = 0;
+    g_profile_bottom_in_view = false;
+    armProfileReach(pubkey, true);
     const now = nowSeconds();
     const seq = g_thread_seq.fetchAdd(1, .monotonic) + 1;
     model.thread_seq = seq;
@@ -40674,6 +40881,11 @@ fn closeThread(model: *Model) void {
             model.topic_len = 0;
             model.viewing_profile = pk;
             model.viewing_thread = 0;
+            model.profile_limit = prev.profile_limit;
+            model.profile_autofill = 0;
+            model.profile_asked_until = 0;
+            g_profile_bottom_in_view = false;
+            armProfileReach(pk, false);
             model.refreshProfileNotes(now);
             model.thread_loading = model.thread_notes_len == 0;
             fetchProfileNotes(pk, seq);
@@ -40807,6 +41019,9 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
 /// notes collected, folding into the same engagement table the feed and threads
 /// use. Without the second phase every row on a profile shows zero counts.
 fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
+    // Opening a page is asking again, so the end of its history is forgotten:
+    // the relays may hold more than they did, and the relay set may be another.
+    resetProfileEnd();
     if (!relayFetchAllowed()) {
         g_thread_done_seq.store(seq, .release);
         return;
@@ -40819,35 +41034,219 @@ fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
 }
 
 fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
+    defer g_thread_done_seq.store(seq, .release);
+    _ = profileRound(pubkey, null);
+}
+
+/// What one pass over the relays learned, for deciding whether history ended.
+const ProfileRound = struct {
+    /// Relays that took the subscription.
+    asked: usize = 0,
+    /// Relays that answered it to the end.
+    answered: usize = 0,
+    /// Notes that were new to the store.
+    added: usize = 0,
+    /// Notes the relays returned that are strictly older than the cursor asked
+    /// from. This, not `added`, is what says whether there was anything to find:
+    /// a note can be a duplicate because another fetch stored it a moment
+    /// earlier, which says nothing about whether history has ended.
+    older: usize = 0,
+    /// How far back this round brought their notes without leaving a hole (see
+    /// `roundReach`). Null when it brought none.
+    reach: ?i64 = null,
+};
+
+/// One note a round brought: when it was written, and which one it is.
+pub const ProfileSeen = struct { at: i64, key: i64 };
+
+/// Where a round's notes stop being complete. Each relay sent its newest page
+/// below the cursor, and below the oldest note of the shortest page another
+/// relay may hold notes that nobody has sent yet. So the cut is the
+/// `profile_relay_page`-th newest distinct note across them all, and every note
+/// above it is in hand from every relay asked. When there were fewer than a page,
+/// every relay sent all it had, and the oldest is the cut.
+///
+/// Jumble cuts its merged page the same way: it sorts what the relays sent and
+/// keeps `limit` of it before taking the oldest as the next cursor
+/// (services/client.service.ts:749-755).
+fn roundReach(seen: []ProfileSeen) ?i64 {
+    if (seen.len == 0) return null;
+    std.mem.sort(ProfileSeen, seen, {}, struct {
+        fn newer(_: void, a: ProfileSeen, b: ProfileSeen) bool {
+            if (a.at != b.at) return a.at > b.at;
+            return a.key < b.key;
+        }
+    }.newer);
+    var distinct: usize = 0;
+    var cut = seen[0].at;
+    for (seen, 0..) |note, i| {
+        if (i > 0 and note.key == seen[i - 1].key and note.at == seen[i - 1].at) continue;
+        distinct += 1;
+        cut = note.at;
+        if (distinct == profile_relay_page) break;
+    }
+    return cut;
+}
+
+pub fn roundReachForTest(seen: []ProfileSeen) ?i64 {
+    return roundReach(seen);
+}
+
+/// The most connections one older-notes round makes: the author's own write
+/// relays, then the reader's read relays.
+const profile_round_targets = outbox_relays_per_author + max_relays;
+
+/// The write relays a relay list names, as owned strings, in the order the list
+/// gives them. The same selection the feed's routing makes, from the same
+/// function, so the two cannot disagree about where somebody publishes.
+fn writeRelaysOf(ev: nostr.event.Event, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
+    var raw: [32][]const u8 = undefined;
+    var selected: [outbox_relays_per_author][]const u8 = undefined;
+    const chosen = selectWriteRelays(raw[0..writeTagUrls(ev, &raw)], &selected);
+    for (selected[0..chosen], 0..) |url, i| {
+        @memcpy(out[i][0..url.len], url);
+        lens[i] = @intCast(url.len);
+    }
+    return chosen;
+}
+
+pub fn writeRelaysOfForTest(ev: nostr.event.Event, out: *[outbox_relays_per_author][96]u8, lens: *[outbox_relays_per_author]u8) usize {
+    return writeRelaysOf(ev, out, lens);
+}
+
+/// Where to ask for somebody's older notes: the relays they publish to, which
+/// is where the outbox model says their notes are, then the reader's own read
+/// relays. Jumble does the same, `relayList.write` followed by its defaults
+/// (Profile/ProfileFeed.tsx:140).
+///
+/// The author's list is read from the store, so it is whatever the routing has
+/// already fetched, and a person whose list has not arrived is asked of the
+/// reader's relays alone, which is also what the first page does.
+fn profileTargets(pubkey: [32]u8, out: *[profile_round_targets][96]u8, lens: *[profile_round_targets]u8) usize {
+    var n: usize = 0;
+    if (g_store) |store| {
+        const kinds = [_]u16{relay_list_kind};
+        const authors = [_][32]u8{pubkey};
+        if (store.query(std.heap.page_allocator, .{ .authors = &authors, .kinds = &kinds, .limit = 1 })) |res| {
+            var result = res;
+            defer result.deinit();
+            if (result.events.len > 0) {
+                var own: [outbox_relays_per_author][96]u8 = undefined;
+                var own_lens: [outbox_relays_per_author]u8 = undefined;
+                const got = writeRelaysOf(result.events[0], &own, &own_lens);
+                for (0..got) |i| {
+                    @memcpy(out[n][0..own_lens[i]], own[i][0..own_lens[i]]);
+                    lens[n] = own_lens[i];
+                    n += 1;
+                }
+            }
+        } else |_| {}
+    }
+    for (0..relaySlots()) |ri| {
+        if (n >= out.len) break;
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(ri, &url_buf) orelse continue;
+        if (!entry.read) continue;
+        var seen = false;
+        for (0..n) |i| {
+            if (relayUrlEql(out[i][0..lens[i]], entry.url)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        @memcpy(out[n][0..entry.url.len], entry.url);
+        lens[n] = @intCast(entry.url.len);
+        n += 1;
+    }
+    return n;
+}
+
+pub fn profileTargetsForTest(pubkey: [32]u8, out: *[profile_round_targets][96]u8, lens: *[profile_round_targets]u8) usize {
+    return profileTargets(pubkey, out, lens);
+}
+
+/// The filter that asks for a person's notes older than `until`. `until` is
+/// inclusive in NIP-01, so the note it was taken from comes back once and the
+/// store drops it as a duplicate; asking for `until - 1` instead would lose
+/// every other note written in that same second.
+pub fn buildProfileOlderFilter(authors: []const [32]u8, until: i64) nostr.filter.Filter {
+    return .{
+        .authors = authors,
+        .kinds = &profile_note_kinds,
+        .until = until,
+        .limit = profile_relay_page,
+    };
+}
+
+const profile_note_kinds = [_]u16{ 1, comment_kind };
+
+/// The filter for a person's newest notes, the page their profile opens with.
+/// Comments as well as notes, the same kinds an older page asks for: the next
+/// page starts where this one reached, so a kind left out here is a kind
+/// nothing ever asks for in the newest stretch of somebody's history.
+pub fn buildProfileNewestFilter(authors: []const [32]u8) nostr.filter.Filter {
+    return .{ .authors = authors, .kinds = &profile_note_kinds, .limit = profile_relay_page };
+}
+
+/// One pass over the relays for a person's notes. With no `until` it is the
+/// page a profile opens with: the newest notes, their profile and contact list,
+/// from the reader's read relays. With one it is the next page back, from the
+/// relays the person publishes to as well.
+///
+/// Either way a second subscription then collects the reactions on what came
+/// back, into the table every row reads its counts from.
+fn profileRound(pubkey: [32]u8, until: ?i64) ProfileRound {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
-    defer g_thread_done_seq.store(seq, .release);
 
-    const kinds = [_]u16{1};
+    var round = ProfileRound{};
     const authors = [_][32]u8{pubkey};
     // Their profile too: the screen needs an about, a banner and a lud16, none
     // of which the name-and-face cache models.
     const meta_kinds = [_]u16{ 0, contact_list_kind };
-    const filters = [_]nostr.filter.Filter{
-        .{ .authors = &authors, .kinds = &kinds, .limit = thread_reply_cap },
+    const first_filters = [_]nostr.filter.Filter{
+        buildProfileNewestFilter(&authors),
         .{ .authors = &authors, .kinds = &meta_kinds, .limit = 2 },
     };
+    // Every note the round brought, for where it reached. A relay that sends more
+    // than it was asked for has the rest left out, which only makes the cut newer.
+    var brought: [profile_round_targets * profile_relay_page]ProfileSeen = undefined;
+    var brought_len: usize = 0;
+    const older_filters = [_]nostr.filter.Filter{buildProfileOlderFilter(&authors, until orelse 0)};
+    const filters: []const nostr.filter.Filter = if (until != null) &older_filters else &first_filters;
 
-    for (0..relaySlots()) |ri| {
-        var url_buf: [96]u8 = undefined;
-        const entry = relaySnapshot(ri, &url_buf) orelse continue;
-        if (!entry.read) continue;
-        var relay = nostr.relay.dial(gpa, io, entry.url) catch continue;
+    var targets: [profile_round_targets][96]u8 = undefined;
+    var target_lens: [profile_round_targets]u8 = undefined;
+    var target_count: usize = 0;
+    if (until != null) {
+        target_count = profileTargets(pubkey, &targets, &target_lens);
+    } else {
+        for (0..relaySlots()) |ri| {
+            var url_buf: [96]u8 = undefined;
+            const entry = relaySnapshot(ri, &url_buf) orelse continue;
+            if (!entry.read or target_count >= targets.len) continue;
+            @memcpy(targets[target_count][0..entry.url.len], entry.url);
+            target_lens[target_count] = @intCast(entry.url.len);
+            target_count += 1;
+        }
+    }
+
+    for (0..target_count) |ti| {
+        const target_url = targets[ti][0..target_lens[ti]];
+        var relay = nostr.relay.dial(gpa, io, target_url) catch continue;
         // Declared AFTER deinit so it runs BEFORE it: the keeper must have
         // let go of this pointer before the connection is freed.
         defer relay.deinit();
         const watched = watchOneShot(io, relay, one_shot_budget_ms);
         defer releaseOneShot(watched);
-        relay.subscribe("plaza-person", &filters) catch continue;
+        relay.subscribe(if (until != null) "plaza-person-older" else "plaza-person", filters) catch continue;
+        round.asked += 1;
+        var relay_older: usize = 0;
 
         var ids: [engagement_watch_cap][64]u8 = undefined;
         var watch: [engagement_watch_cap]i64 = undefined;
@@ -40872,8 +41271,29 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                             countEngagement(e.event, watch[0..watch_len]);
                         continue;
                     }
-                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, entry.url) catch continue;
+                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, target_url) catch continue;
                     if (result == .invalid) continue;
+                    // Theirs, and a note: a relay can send anything down any
+                    // subscription, and somebody else's note says nothing about
+                    // how far back this person's history goes.
+                    const theirs = std.mem.eql(u8, &e.event.pubkey, &pubkey);
+                    if (theirs and (e.event.kind == 1 or e.event.kind == comment_kind)) {
+                        if (result == .added) round.added += 1;
+                        // `until` is inclusive, so the note the cursor came from
+                        // comes back. It is not news, and counting it would let
+                        // a page that found nothing older read as progress.
+                        const below = if (until) |cursor| e.event.created_at < cursor else true;
+                        if (below) {
+                            if (until != null) {
+                                round.older += 1;
+                                relay_older += 1;
+                            }
+                            if (brought_len < brought.len) {
+                                brought[brought_len] = .{ .at = e.event.created_at, .key = noteIdOf(e.event) };
+                                brought_len += 1;
+                            }
+                        }
+                    }
                     if (e.event.kind == 1 and id_count < ids.len) {
                         hexLower(&ids[id_count], e.event.id);
                         watch[watch_len] = noteIdOf(e.event);
@@ -40882,6 +41302,9 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                     }
                 },
                 .eose => {
+                    // "I have looked and that is all of it", which is the only
+                    // message that lets an empty page mean the end.
+                    if (!engagement_open) round.answered += 1;
                     if (engagement_open or id_count == 0) break;
                     engagement_open = true;
                     var evals: [engagement_watch_cap][]const u8 = undefined;
@@ -40894,7 +41317,263 @@ fn fetchProfileWorker(pubkey: [32]u8, seq: u64) void {
                 else => continue,
             }
         }
+        // A full page from one relay is the page, whether or not the store had
+        // those notes already. The rest of the list is for the next time the
+        // reader reaches the end. Counting only what was new to the store made a
+        // page of notes the store already held dial every relay in the list.
+        if (until != null and relay_older >= profile_relay_page) break;
     }
+    round.reach = roundReach(brought[0..brought_len]);
+    if (round.reach) |at| noteProfileReach(pubkey, at);
+    return round;
+}
+
+// ---------------------------------------------------- a person's older notes
+//
+// The same shape as the feed's paging above, and for the same reasons: the
+// store first, the relays only once the store has nothing older, one round at a
+// time, and an end of history that only a relay answering "nothing older" can
+// declare.
+
+/// Whether an older-notes round is out, so a reader who keeps scrolling does not
+/// stack one dial per relay per frame.
+var g_profile_older_busy = std.atomic.Value(bool).init(false);
+/// Whose history a round found the end of. A key rather than a flag, because a
+/// round for one person can land after the reader has walked to another, and
+/// "that is all of it" is only true of the person it was asked about.
+var g_profile_end = std.atomic.Value(u64).init(0);
+/// The last older-notes ask, recorded before the network is consulted so a test
+/// (which never opens a socket) can see what would have been sent.
+var g_profile_older_ask: ?ProfileOlderAsk = null;
+
+pub const ProfileOlderAsk = struct { pubkey: [32]u8, until: i64 };
+
+fn profileEndKey(pubkey: [32]u8) u64 {
+    return std.mem.readInt(u64, pubkey[0..8], .big) | 1;
+}
+
+fn profileEndReached(pubkey: [32]u8) bool {
+    return g_profile_end.load(.monotonic) == profileEndKey(pubkey);
+}
+
+fn resetProfileEnd() void {
+    g_profile_end.store(0, .monotonic);
+}
+
+pub fn profileEndReachedForTest(pubkey: [32]u8) bool {
+    return profileEndReached(pubkey);
+}
+
+pub fn setProfileEndForTest(pubkey: [32]u8) void {
+    g_profile_end.store(profileEndKey(pubkey), .monotonic);
+}
+
+pub fn resetProfileEndForTest() void {
+    resetProfileEnd();
+    g_profile_older_busy.store(false, .monotonic);
+    g_profile_older_ask = null;
+}
+
+pub fn profileOlderAskForTest() ?ProfileOlderAsk {
+    return g_profile_older_ask;
+}
+
+/// How far back the relays have brought the open person's notes on this visit:
+/// the oldest cut any round has made (`roundReach`), the first page included.
+///
+/// The next page is asked from here, never from the oldest note in hand. The
+/// store holds whatever any surface ever fetched, so beyond the run the relays
+/// paged through it can hold one old note of theirs from a thread or a quote,
+/// with a year of their history missing in between. Paging from that note
+/// skipped the year, and since it was still the oldest note in hand on the next
+/// visit, skipped it every time. Jumble pages from the refs its relays sent and
+/// not from its cache (NoteList/index.tsx:519-523).
+///
+/// Written by the round's thread, read by the tick, so it is guarded. Only the
+/// person the page is open on is recorded: a round for somebody the reader has
+/// walked away from lands here as a no-op.
+var g_profile_reach: struct { key: u64 = 0, at: i64 = no_profile_reach } = .{};
+var g_profile_reach_lock = std.atomic.Value(bool).init(false);
+const no_profile_reach = std.math.maxInt(i64);
+
+fn lockProfileReach() void {
+    while (g_profile_reach_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+
+fn unlockProfileReach() void {
+    g_profile_reach_lock.store(false, .release);
+}
+
+/// Starts recording for `pubkey`. A fresh visit forgets how far an earlier one
+/// got, because the person may have written since; Back to the same person keeps
+/// it, along with the depth the list was paged to.
+fn armProfileReach(pubkey: [32]u8, fresh: bool) void {
+    const key = profileEndKey(pubkey);
+    lockProfileReach();
+    defer unlockProfileReach();
+    if (!fresh and g_profile_reach.key == key) return;
+    g_profile_reach = .{ .key = key };
+}
+
+fn noteProfileReach(pubkey: [32]u8, at: i64) void {
+    const key = profileEndKey(pubkey);
+    lockProfileReach();
+    defer unlockProfileReach();
+    if (g_profile_reach.key != key) return;
+    g_profile_reach.at = @min(g_profile_reach.at, at);
+}
+
+fn profileReach(pubkey: [32]u8) ?i64 {
+    const key = profileEndKey(pubkey);
+    lockProfileReach();
+    defer unlockProfileReach();
+    if (g_profile_reach.key != key or g_profile_reach.at == no_profile_reach) return null;
+    return g_profile_reach.at;
+}
+
+/// Records that a round for `pubkey` reached back to `at`, the way a relay
+/// answer does, for a test that has no relay.
+pub fn noteProfileReachForTest(pubkey: [32]u8, at: i64) void {
+    noteProfileReach(pubkey, at);
+}
+
+pub fn profileReachForTest(pubkey: [32]u8) ?i64 {
+    return profileReach(pubkey);
+}
+
+/// Where the next relay page for the open person starts. Before any round has
+/// brought a note there is no run to continue, so the page asks for their
+/// newest, from the moment the page opened: the first page only asked the
+/// reader's own relays, and the next one also asks theirs.
+fn profileOlderCursor(model: *const Model, pubkey: [32]u8) i64 {
+    return profileReach(pubkey) orelse model.thread_open_at;
+}
+
+fn fetchOlderProfile(pubkey: [32]u8, until: i64) void {
+    g_profile_older_ask = .{ .pubkey = pubkey, .until = until };
+    if (!relayFetchAllowed()) return;
+    if (g_profile_older_busy.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, fetchProfileOlderWorker, .{ pubkey, until }) catch {
+        g_profile_older_busy.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+fn fetchProfileOlderWorker(pubkey: [32]u8, until: i64) void {
+    defer g_profile_older_busy.store(false, .release);
+    const round = profileRound(pubkey, until);
+    if (profileRoundEnded(round)) g_profile_end.store(profileEndKey(pubkey), .monotonic);
+}
+
+/// Nothing anywhere had anything older, AND somebody was there to say so. The
+/// same two-part rule as the feed: a round that reached nobody says nothing, and
+/// the next scroll asks again.
+fn profileRoundEnded(round: ProfileRound) bool {
+    return feedEndLatches(round.asked, round.answered, round.older);
+}
+
+pub fn profileRoundEndedForTest(asked: usize, answered: usize, added: usize, older: usize) bool {
+    return profileRoundEnded(.{ .asked = asked, .answered = answered, .added = added, .older = older });
+}
+
+/// Puts the page's first fetch back in flight, or lands it, for a test that has
+/// no socket to do either.
+pub fn setFirstProfileFetchOutForTest(model: *Model, out: bool) void {
+    const done = g_thread_done_seq.load(.acquire);
+    if (out) {
+        model.thread_seq = done + 1;
+    } else {
+        g_thread_done_seq.store(model.thread_seq, .release);
+    }
+}
+
+/// The reader reached the end of a person's list: one more page of their notes.
+///
+/// Store first. A read that came back full may have more behind it, so the limit
+/// goes up a page and the list is read again; that is a disk read and the screen
+/// grows at once. Only when the store had nothing more to give are the relays
+/// asked, for what comes before where they have reached (`g_profile_reach`).
+/// Jumble's order:
+/// `_loadMoreTimeline` serves from its cached refs and only then queries with
+/// `{ ...filter, until, limit }` (services/client.service.ts:731-751).
+fn loadOlderProfile(model: *Model) void {
+    const pk = model.viewing_profile orelse return;
+    const held = model.thread_notes_len;
+    if (held >= model.profile_limit and model.profile_limit < profile_notes_max) {
+        model.profile_limit = @min(model.profile_limit + profile_page, profile_notes_max);
+        model.refreshProfileNotes(nowSeconds());
+        if (model.thread_notes_len > held) return;
+    }
+    if (held == 0 or held >= profile_notes_max) return;
+    if (profileEndReached(pk)) return;
+    // The page's own first fetch is still out. A short list reaches its end the
+    // moment it opens, and paging from the one note the store had then would ask
+    // for history the first fetch is already bringing, and find the end of it
+    // by being second.
+    if (g_thread_done_seq.load(.acquire) < model.thread_seq) return;
+    const cursor = profileOlderCursor(model, pk);
+    model.profile_asked_until = cursor;
+    fetchOlderProfile(pk, cursor);
+}
+
+pub fn loadOlderProfileForTest(model: *Model) void {
+    loadOlderProfile(model);
+}
+
+/// How many rows the open person's current tab holds.
+fn profileTabCount(model: *const Model, pubkey: [32]u8) usize {
+    var n: usize = 0;
+    for (model.thread_notes[0..model.thread_notes_len]) |note| {
+        if (!std.mem.eql(u8, &note.pubkey, &pubkey)) continue;
+        if ((model.profile_tab == .replies) != note.has_reply_parent) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Whether the last row of the open person's list is built, which is to say on
+/// screen or within the overscan beside it. Written by the view, read by the
+/// tick, one frame stale like the other visible sets.
+var g_profile_bottom_in_view: bool = false;
+
+/// The list's bottom edge, watched rather than waited for.
+///
+/// `on_reach_end` fires once per approach and re-arms only after the reader has
+/// scrolled well away, which is right for a long list and wrong for two cases.
+/// A tab too short to scroll has no end to reach, and a list that has just
+/// grown by less than a screen is still at its end with the trigger spent. Both
+/// leave the reader at the bottom with nothing coming and no way to ask. This is
+/// Jumble's bottom sentinel (an IntersectionObserver on the element
+/// under the list, hooks/useInfiniteScroll.tsx:113-118 and NoteList/index.tsx:582):
+/// while the bottom is in view and there may be more, ask.
+///
+/// Stops where asking again would be asking the same question. A round that
+/// brought nothing older leaves the cursor where it was, and the next manual
+/// reach-end is the reader's way of trying again.
+fn loadAtProfileBottom(model: *Model) void {
+    const pk = model.viewing_profile orelse return;
+    if (!g_profile_bottom_in_view) return;
+    if (model.thread_notes_len == 0) return;
+    // The page's own first fetch is still out. Asking for older notes before the
+    // newest have landed would page from a cursor that is about to move.
+    if (g_thread_done_seq.load(.acquire) < model.thread_seq) return;
+    if (g_profile_older_busy.load(.monotonic) or profileEndReached(pk)) return;
+    // The store has nothing more and the relays were already asked from here.
+    if (model.thread_notes_len < model.profile_limit and profileOlderCursor(model, pk) == model.profile_asked_until) return;
+    // A short tab is the case a reader cannot scroll out of, so it is bounded:
+    // an account with no replies at all would otherwise walk its whole history
+    // for a tab that stays empty.
+    if (profileTabCount(model, pk) < profile_fill_rows) {
+        if (model.profile_autofill >= profile_autofill_max) return;
+        model.profile_autofill += 1;
+    }
+    loadOlderProfile(model);
+}
+
+pub fn loadAtProfileBottomForTest(model: *Model, bottom_in_view: bool) void {
+    g_profile_bottom_in_view = bottom_in_view;
+    loadAtProfileBottom(model);
 }
 
 /// How many frames one relay gets to answer a profile's backfill before this
