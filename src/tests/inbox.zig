@@ -1340,3 +1340,68 @@ test "a quoted note in a notification preview is a label, not sixty characters o
     const n = main.collapseEventRefsForTest(&out, src);
     try testing.expectEqualStrings("look at this [Note] and [Note] too, note1 is not one", out[0..n]);
 }
+
+test "a notification is filed off the UI thread and its words baked on it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD4} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+    main.forgetWantedProfilesForTest();
+    defer main.forgetWantedProfilesForTest();
+    main.forgetInboxBodyStampForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/inbox-thread.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    const me_hex = std.fmt.bytesToHex(me, .lower);
+
+    // A covered reply that mentions somebody nobody has named yet, the way a
+    // relay reader hands it over: stored first, then filed.
+    const carol = [_]u8{0xC3} ** 32;
+    const npub = try nostr.nip19.encodeNpub(arena, carol);
+    var reply = inboxEvent(1, 0xD5, &.{ &.{ "p", &me_hex }, &.{ "content-warning", "spoilers" } }, 1_800_000_000);
+    reply.content = try std.fmt.allocPrint(arena, "ask nostr:{s} about the ending", .{npub});
+    _ = try store.ingest(arena, reply, .{});
+    try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
+    // And a reaction, whose glyph is its own content.
+    var like = inboxEvent(7, 0xD6, &.{&.{ "p", &me_hex }}, 1_800_000_001);
+    like.content = "\u{1F525}";
+    try testing.expect(main.inboxAddForTest(like, 1_800_000_001));
+
+    // Filing touched none of the UI thread's caches: no name was looked up or
+    // asked for, so the words are not written yet.
+    try testing.expect(!main.profileWantedForTest(carol));
+    try testing.expect(!main.profileWantedForTest(reply.pubkey));
+    var buf: [4]main.InboxItem = undefined;
+    {
+        const shown = main.inboxItems(&buf, false);
+        try testing.expectEqual(@as(usize, 2), shown.len);
+        for (shown) |item| try testing.expectEqual(@as(u8, 0), item.body_len);
+        try testing.expectEqualStrings("\u{1F525}", shown[0].reactionGlyph());
+    }
+
+    // The tick and the sheet, on the UI thread: names asked for, words baked,
+    // and the reply's content warning carried with them.
+    main.welcomeInboxArrivalsForTest();
+    try testing.expect(main.profileWantedForTest(reply.pubkey));
+    main.resolveInboxBodiesForTest();
+    try testing.expect(main.profileWantedForTest(carol));
+    const shown = main.inboxItems(&buf, false);
+    const baked = shown[1];
+    try testing.expect(std.mem.startsWith(u8, baked.body(), "ask @npub1"));
+    try testing.expect(std.mem.endsWith(u8, baked.body(), "about the ending"));
+    try testing.expect(baked.warned);
+}

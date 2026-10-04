@@ -134,6 +134,11 @@ pub const InboxItem = struct {
     /// generation it was baked under.
     names_pending: bool = false,
     names_generation: u64 = 0,
+    /// Admitted and not yet looked at on the UI thread. `inboxAdd` runs on the
+    /// relay readers, and the profile and quote caches that baking the words and
+    /// asking for the author's name touch are the UI thread's alone, so those
+    /// wait for `resolveInboxBodies`.
+    fresh: bool = false,
     /// Where each person's name sits in the words, so the row styles the whole
     /// name the way the feed does, `@Ada Lovelace` and not just `@Ada`.
     mentions: MentionList = .{},
@@ -434,50 +439,65 @@ pub fn inboxAdd(ev: nostr.event.Event, now_s: i64) bool {
         .created_at = believableStamp(if (claim) |c| c.created_at else ev.created_at, now_s),
         .verb = verb,
         .msat = if (claim) |c| c.msat else 0,
+        .fresh = true,
     };
+    // A reaction's own glyph, before the item is copied into the inbox. It is
+    // the event's content and needs nothing else. The words wait: rendering
+    // them looks names up in the profile cache, which belongs to the UI thread,
+    // and this runs on whichever relay reader the event came in on. The event
+    // is already in the store, so `resolveInboxBodies` reads them from there.
+    if (verb == .like) bakeReactionGlyph(&item, ev);
 
     if (!inboxAdmitLocked(item)) return false;
-    // And WHO it is from, for the same reason. Nothing else ever asked: the
-    // profile round fetches kind:0 for the people the reader follows, the people
-    // a note mentions, and the reader themself, and somebody who likes or zaps
-    // you is in none of those sets. So the notifications page listed raw npubs
-    // for exactly the people it is about, which is the one screen where a name
-    // is the entire content of the row.
-    wantProfile(author);
-    bakeInboxText(&item, ev, verb, target);
-    // Fetch what it is about, if this is the first we have heard of it. The row
-    // is pressable, so the note behind it should be on its way before the reader
-    // ever gets there.
-    if (item.hasTarget() and !haveEvent(item.target_id)) wantQuote(item.target_id);
     g_inbox_dirty = true;
+    g_inbox_fresh.store(true, .release);
+    g_inbox_unbaked.store(true, .release);
     return true;
 }
 
-/// Fills the row's words once, when the item is admitted.
+/// Set when an item is admitted that the UI thread has not welcomed yet.
+var g_inbox_fresh = std.atomic.Value(bool).init(false);
+/// Set when an item is admitted whose words are not baked yet, so the next
+/// resolve runs even when the store did not move (an event the store already
+/// held is admitted without adding to its count).
+var g_inbox_unbaked = std.atomic.Value(bool).init(false);
+
+/// Welcomes every item admitted since the last call. On the UI thread: the tick
+/// calls it, so a name and a target are asked for as notifications arrive and
+/// not only once the sheet is open.
+pub fn welcomeInboxArrivals() void {
+    if (!g_inbox_fresh.swap(false, .acq_rel)) return;
+    lockInbox();
+    defer unlockInbox();
+    for (g_inbox[0..g_inbox_len]) |*item| {
+        if (item.used and item.fresh) welcomeInboxItem(item);
+    }
+}
+
+/// The UI thread's share of admitting an item: its author's name and the note
+/// it is about, asked for once.
 ///
-/// A reply and a mention carry their own text, so those are free. A reaction, a
-/// repost and a zap are about a note of the reader's own, which means one store
-/// read here. Once per item, never per frame: a row that resolved itself while
-/// drawing would put a database query in the scroll path of a two hundred row
-/// list.
-///
-/// A miss is not an error. The note may not have arrived yet, `wantQuote` just
-/// asked for it, and a row with a name and no body still says who did what.
-fn bakeInboxText(item: *InboxItem, ev: nostr.event.Event, verb: InboxVerb, target: [32]u8) void {
-    switch (verb) {
-        // Their words, already in hand.
-        .reply, .mention => bakeBody(item, ev),
-        .like => {
-            // The reaction as sent. NIP-25 allows `+`, `-`, an empty string and
-            // a `:shortcode:`; `+` and empty both mean a like, and the row draws
-            // its usual heart for those rather than printing a plus sign.
-            const content = std.mem.trim(u8, ev.content, " \t\r\n");
-            if (content.len > 0 and !std.mem.eql(u8, content, "+")) {
-                item.glyph_len = fillClipped(&item.glyph_buf, content);
-            }
-            bakeTargetBody(item, target);
-        },
-        .repost, .zap => bakeTargetBody(item, target),
+/// WHO it is from, because nothing else ever asked: the profile round fetches
+/// kind:0 for the people the reader follows, the people a note mentions, and the
+/// reader themself, and somebody who likes or zaps you is in none of those sets.
+/// So the notifications page listed raw npubs for exactly the people it is
+/// about, which is the one screen where a name is the entire content of the row.
+/// And the note it is about, if this is the first we have heard of it: the row
+/// is pressable, so the note behind it should be on its way before the reader
+/// ever gets there.
+fn welcomeInboxItem(item: *InboxItem) void {
+    item.fresh = false;
+    wantProfile(item.author);
+    if (item.hasTarget() and !haveEvent(item.target_id)) wantQuote(item.target_id);
+}
+
+/// The reaction as sent. NIP-25 allows `+`, `-`, an empty string and a
+/// `:shortcode:`; `+` and empty both mean a like, and the row draws its usual
+/// heart for those rather than printing a plus sign.
+fn bakeReactionGlyph(item: *InboxItem, ev: nostr.event.Event) void {
+    const content = std.mem.trim(u8, ev.content, " \t\r\n");
+    if (content.len > 0 and !std.mem.eql(u8, content, "+")) {
+        item.glyph_len = fillClipped(&item.glyph_buf, content);
     }
 }
 
@@ -603,9 +623,11 @@ pub var g_inbox_body_names: u64 = std.math.maxInt(u64);
 /// A row whose note never arrives keeps an empty body and still says who did
 /// what, which is what it did before any of this.
 pub fn resolveInboxBodies() void {
+    welcomeInboxArrivals();
     const store = main.g_store orelse return;
     const stamp = store.eventCount() catch return;
-    if (stamp == g_inbox_body_stamp and profile_cache.g_names_generation == g_inbox_body_names) return;
+    const fresh = g_inbox_unbaked.swap(false, .acq_rel);
+    if (!fresh and stamp == g_inbox_body_stamp and profile_cache.g_names_generation == g_inbox_body_names) return;
     g_inbox_body_stamp = stamp;
     g_inbox_body_names = profile_cache.g_names_generation;
     lockInbox();
@@ -1089,6 +1111,10 @@ pub fn bakeBodyForTest(item: *InboxItem, ev: nostr.event.Event) void {
 }
 pub fn collapseEventRefsForTest(dst: []u8, src: []const u8) usize {
     return collapseEventRefs(dst, src);
+}
+
+pub fn welcomeInboxArrivalsForTest() void {
+    welcomeInboxArrivals();
 }
 
 pub fn resolveInboxBodiesForTest() void {

@@ -476,7 +476,9 @@ test "somebody who turns up in your notifications gets a name fetched" {
     ev.pubkey = stranger;
     try testing.expect(main.inboxAddForTest(ev, 1_800_000_000));
 
-    // Filing the notification is what arms the question.
+    // Filing the notification is what arms the question, on the next tick: a
+    // relay reader files it, and the wanted list is the UI thread's.
+    main.welcomeInboxArrivalsForTest();
     try testing.expect(main.profileWantedForTest(stranger));
 }
 test "a display name cannot push the pill out of the sheet" {

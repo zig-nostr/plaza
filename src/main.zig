@@ -3448,6 +3448,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 refreshEventFetch(model);
                 refreshAddressFetch(model);
                 searchTick(model, awakeMs());
+                // Notifications the relay readers admitted since the last tick:
+                // their senders' names and their notes are asked for here, on
+                // the thread those caches belong to.
+                welcomeInboxArrivals();
                 flushPlaceIds(now);
                 model.refresh(now);
                 // Keep the open thread's replies current: late replies appear and
@@ -6041,6 +6045,8 @@ pub const saveInbox = inbox.saveInbox;
 pub const subscribeInbox = inbox.subscribeInbox;
 pub const unlockInbox = inbox.unlockInbox;
 pub const wantInboxProfiles = inbox.wantInboxProfiles;
+pub const welcomeInboxArrivals = inbox.welcomeInboxArrivals;
+pub const welcomeInboxArrivalsForTest = inbox.welcomeInboxArrivalsForTest;
 
 // re-exports: image_cache.zig
 pub const avatarUrlForTest = image_cache.avatarUrlForTest;
