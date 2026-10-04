@@ -541,3 +541,46 @@ test "the relay list note sits under its field instead of spilling out of it" {
     try testing.expect(note_frame.y >= field.y + field.height - 0.5);
     try testing.expect(note_frame.y + note_frame.height <= next.y);
 }
+
+test "Edit profile keeps Close and Save inside the sheet at the window's smallest size" {
+    // The sheet was a column of seven fields with nothing to give, 675pt tall
+    // against the 632 a modal gets at the 680pt floor: the buttons were drawn
+    // under the sheet's edge and off the bottom of the window.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    const floor_h: f32 = 680; // app.zon min_height
+    const p = try painted.Painted.renderAt(arena, &model, main.window_min_width, floor_h);
+    var sheet_index: ?usize = null;
+    for (p.layout.nodes, 0..) |node, i| {
+        if (node.widget.kind == .dialog and std.mem.eql(u8, node.widget.semantics.label, "Edit profile")) sheet_index = i;
+    }
+    const si = sheet_index orelse return error.NoSheet;
+    const sheet = p.layout.nodes[si].widget.frame;
+    try testing.expect(sheet.y + sheet.height <= floor_h);
+    var buttons: usize = 0;
+    for (p.layout.nodes, 0..) |node, i| {
+        if (node.widget.kind != .button) continue;
+        const t = node.widget.text;
+        if (!std.mem.eql(u8, t, "Close") and !std.mem.eql(u8, t, "Save")) continue;
+        if (!layoutDescends(p.layout, i, si)) continue;
+        buttons += 1;
+        const f = node.widget.frame;
+        try testing.expect(f.y + f.height <= sheet.y + sheet.height + 0.5);
+    }
+    try testing.expectEqual(@as(usize, 2), buttons);
+}
+
+/// Whether layout node `i` sits somewhere under node `ancestor`.
+fn layoutDescends(layout: canvas.WidgetLayoutTree, i: usize, ancestor: usize) bool {
+    var at: ?usize = layout.nodes[i].parent_index;
+    while (at) |a| {
+        if (a == ancestor) return true;
+        at = layout.nodes[a].parent_index;
+    }
+    return false;
+}

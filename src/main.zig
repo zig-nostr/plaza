@@ -7108,6 +7108,7 @@ pub const modalScrim = view_sheets.modalScrim;
 pub const nameSheet = view_sheets.nameSheet;
 pub const pendingText = view_sheets.pendingText;
 pub const profileSheet = view_sheets.profileSheet;
+pub const profile_fields_height = view_sheets.profile_fields_height;
 pub const toastOverlay = view_sheets.toastOverlay;
 
 // re-exports: view_settings.zig

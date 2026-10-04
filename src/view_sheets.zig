@@ -128,18 +128,41 @@ pub fn nameSheet(ui: *AppUi, model: *const Model) AppUi.Node {
 pub fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     const status = model.profile_status();
-    return modalScrim(ui, "Edit profile", Msg.close_profile_edit, ui.el(.dialog, .{
-        .width = profile_edit_card_width,
-        .on_dismiss = Msg.close_profile_edit,
-        .semantics = .{ .label = "Edit profile" },
-    }, .{
-        // The card pads itself. A second 20 inside it was 44 on every side,
-        // and those 40 rows were what pushed the buttons off the card.
-        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = 10 }, .{
-            ui.paragraph(
-                .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
-            ),
+
+    // The lines under the fields, only the ones that have something to say. A
+    // column charges its gap for every child, an empty spacer included, so the
+    // three that are usually empty used to cost the sheet 30pt of nothing.
+    var notes: [3]AppUi.Node = undefined;
+    var notes_n: usize = 0;
+    var notes_lines: usize = 0;
+    const lines: [3]struct { text: []const u8, color: canvas.Color } = .{
+        .{ .text = model.profile_invalid(), .color = p.status_warning_text },
+        .{ .text = if (uploads.g_profile_upload_unsaved) "The new picture is not published until you press Save." else "", .color = p.text_dim },
+        .{ .text = status, .color = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim },
+    };
+    for (lines) |line| {
+        if (line.text.len == 0) continue;
+        notes[notes_n] = ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = line.color } },
+            &.{.{ .text = line.text, .scale = mono_hint_scale }},
+        );
+        notes_n += 1;
+        notes_lines += profileNoteLines(line.text);
+    }
+
+    var kids: [6]AppUi.Node = undefined;
+    var n: usize = 0;
+    kids[n] = ui.paragraph(
+        .{ .style = .{ .foreground = p.text_primary } },
+        &.{.{ .text = "Edit profile", .weight = .bold, .scale = 1.15 }},
+    );
+    n += 1;
+    // The fields scroll inside a box the sheet can always hold, so Close and
+    // Save stay inside the sheet and on screen at the window's smallest height.
+    // A note under the fields takes its room out of the box, not the window.
+    const notes_room: f32 = @as(f32, @floatFromInt(notes_n)) * profile_sheet_gap + @as(f32, @floatFromInt(notes_lines)) * profile_note_line_height;
+    kids[n] = ui.scroll(.{ .height = @max(profile_fields_height - notes_room, profile_fields_min_height) }, .{
+        ui.column(.{ .gap = profile_sheet_gap }, .{
             // The introduction gives way to whatever else needs the room. Seven
             // fields, three lines of introduction and a two-line status do not fit
             // a window at its minimum height: the button row was drawn below the
@@ -160,44 +183,58 @@ pub fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             // by anyone, in any client, until its owner opened something else.
             profileField(ui, "Lightning address", model.profile_lud16(), "you@wallet.example", .profile_lud16_edit),
             profileField(ui, "NIP-05 identifier", model.profile_nip05(), "you@example.com", .profile_nip05_edit),
-            if (model.profile_invalid().len > 0)
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.status_warning_text } },
-                    &.{.{ .text = model.profile_invalid(), .scale = mono_hint_scale }},
-                )
-            else
-                ui.spacer(0),
-            if (uploads.g_profile_upload_unsaved)
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
-                    &.{.{ .text = "The new picture is not published until you press Save.", .scale = mono_hint_scale }},
-                )
-            else
-                ui.spacer(0),
-            if (status.len > 0)
-                ui.paragraph(
-                    .{ .wrap = true, .style = .{ .foreground = if (model.profile_stage == .failed) p.status_warning_text else p.text_dim } },
-                    &.{.{ .text = status, .scale = mono_hint_scale }},
-                )
-            else
-                ui.spacer(0),
-            ui.row(.{ .gap = 8, .cross = .center }, .{
-                ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
-                ui.spacer(1),
-                if (model.profile_can_retry())
-                    ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
-                else
-                    ui.spacer(0),
-                if (model.profile_can_retry()) hgap(ui, 8) else ui.spacer(0),
-                ui.button(.{
-                    .size = .sm,
-                    .variant = .primary,
-                    .disabled = !model.profile_can_save(),
-                    .on_press = Msg.profile_save,
-                }, if (model.profile_confirm_new) "Publish first profile" else "Save"),
-            }),
-        })),
+        }),
+    });
+    n += 1;
+    for (notes[0..notes_n]) |note| {
+        kids[n] = note;
+        n += 1;
+    }
+    kids[n] = ui.row(.{ .gap = 8, .cross = .center }, .{
+        ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
+        ui.spacer(1),
+        if (model.profile_can_retry())
+            ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
+        else
+            ui.spacer(0),
+        if (model.profile_can_retry()) hgap(ui, 8) else ui.spacer(0),
+        ui.button(.{
+            .size = .sm,
+            .variant = .primary,
+            .disabled = !model.profile_can_save(),
+            .on_press = Msg.profile_save,
+        }, if (model.profile_confirm_new) "Publish first profile" else "Save"),
+    });
+    n += 1;
+
+    return modalScrim(ui, "Edit profile", Msg.close_profile_edit, ui.el(.dialog, .{
+        .width = profile_edit_card_width,
+        .on_dismiss = Msg.close_profile_edit,
+        .semantics = .{ .label = "Edit profile" },
+    }, .{
+        // The card pads itself. A second 20 inside it was 44 on every side,
+        // and those 40 rows were what pushed the buttons off the card.
+        modalCard(ui, profile_edit_card_width, ui.column(.{ .grow = 1, .gap = profile_sheet_gap }, .{kids[0..n]})),
     }));
+}
+
+const profile_sheet_gap: f32 = 10;
+/// The fields' box, sized so the whole sheet fits the 632pt a modal gets inside
+/// the window's smallest height (680, less the scrim's 24 above and below):
+/// 632 less the card's 24 on both sides, the 21pt title, two 10pt gaps and the
+/// 28pt button row. Every field but the last shows whole; the rest is a short
+/// scroll away.
+pub const profile_fields_height: f32 = 514;
+/// Never less than this, however much the notes under the fields say: two
+/// fields stay in view to type in.
+const profile_fields_min_height: f32 = 140;
+const profile_note_line_height: f32 = 18;
+
+/// How many lines a note under the fields wraps to in the sheet's column, at
+/// about 52 characters to a line of the hint register.
+fn profileNoteLines(text: []const u8) usize {
+    const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
+    return @max(1, (chars + 51) / 52);
 }
 
 fn profileIntro(ui: *AppUi) AppUi.Node {
