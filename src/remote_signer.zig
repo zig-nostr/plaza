@@ -14,6 +14,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const PendingUndo = main.PendingUndo;
 const slotIdForTest = main.slotIdForTest;
 const Effects = main.Effects;
 const LoginError = main.LoginError;
@@ -134,6 +135,9 @@ const PendingRemote = struct {
     // THIS request so the draft that comes back gets its own warning when several
     // signs are out at once.
     warn: WarnCarry = .{},
+    // sign_event only: what this press changed, put back if this request fails
+    // and released when it is signed. Owned by the slot, like `content`.
+    undo: PendingUndo = .none,
 
     pub fn id(self: *const PendingRemote) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -182,6 +186,12 @@ pub fn pendingUnlock() void {
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
 pub fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry) bool {
+    return registerPendingWith(req_id, method, content, restorable, route, half_index, half_id, warn, .none);
+}
+
+/// `registerPending` for a sign that carries an undo. The slot takes ownership
+/// of `undo` only when this returns true.
+fn registerPendingWith(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry, undo: PendingUndo) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -199,6 +209,7 @@ pub fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]con
             .restorable = restorable,
             .route = route,
             .warn = if (restorable) warn else .{},
+            .undo = undo,
         };
         @memcpy(slot.id_buf[0..req_id.len], req_id);
         return true;
@@ -265,6 +276,7 @@ pub fn clearPending() void {
     for (&g_pending) |*slot| {
         if (!slot.active) continue;
         if (slot.content) |c| gpa.free(c);
+        releaseUndo(slot.undo);
         slot.* = .{};
     }
 }
@@ -477,15 +489,17 @@ pub fn sendConnect(gpa: std.mem.Allocator) void {
 /// `created_at`) and send a `sign_event` request. The signed event returns to
 /// the listener, which stores and publishes it. `restorable` is true only for a
 /// composer draft, so a failed reaction never lands "+"-text in the composer.
-pub fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
-    requestRemoteSignAs(.sign_event, gpa, created_at, kind, tags, content_owned, restorable, route);
+pub fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute, undo: PendingUndo) void {
+    requestRemoteSignAs(.sign_event, gpa, created_at, kind, tags, content_owned, restorable, route, undo);
 }
 
 /// The same request, tracked as `method`: an upload token is signed the same way
 /// and answered to a different place.
-pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
-    // `content_owned` is handed to the pending slot (so a timeout can restore
-    // it to the composer); it is freed here only on an early return.
+pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute, undo: PendingUndo) void {
+    // `content_owned` and `undo` are handed to the pending slot (so a timeout
+    // can restore them); they are freed here only on an early return.
+    var handed = false;
+    defer if (!handed) releaseUndo(undo);
     // A canonical unsigned event (the bunker fills in the signature). The id is
     // computed against the user's pubkey so the bunker's result matches it.
     const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, kind, tags, content_owned) catch {
@@ -514,10 +528,11 @@ pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags))) {
+    if (!registerPendingWith(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags), undo)) {
         gpa.free(content_owned);
         return;
     }
+    handed = true;
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
 }
@@ -793,19 +808,19 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
             parkUploadSign(json);
         },
         .sign_event => {
-            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
+            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return releaseUndo(pending.undo);
             defer parsed.deinit();
             // Signed as the account we asked it to sign as. The verify further
             // down the write path checks that an event's signature matches its
             // OWN pubkey, which a stranger's event also satisfies, so this is
             // the check that says the note is this reader's.
-            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return;
+            if (!std.mem.eql(u8, &parsed.value.pubkey, &g_remote_pubkey)) return releaseUndo(pending.undo);
             // A process-lifetime copy of the content: `parsed` is freed on
             // return, but the detached publisher reads it afterwards. Our
             // composer produces tagless kind:1 notes, so an empty tag set still
             // matches the signed id, and the write seam verifies that before
             // trusting it into the feed.
-            const owned = gpa.dupe(u8, parsed.value.content) catch return;
+            const owned = gpa.dupe(u8, parsed.value.content) catch return releaseUndo(pending.undo);
             var out = parsed.value;
             out.content = owned;
             // Preserve the signed tags (a reaction carries e/p/k); forcing them
@@ -813,10 +828,11 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
             // it. Deep-copied because `parsed` is freed on return.
             // Whole, or not published: the id is computed over these tags, so
             // a partial copy is an event the verify below would drop anyway.
-            out.tags = dupeTags(gpa, parsed.value.tags) orelse return;
+            out.tags = dupeTags(gpa, parsed.value.tags) orelse return releaseUndo(pending.undo);
             // Signed, so there is nothing to take back. Same reasoning as the
             // built-in signer's: released on the signature, not on the ingest.
-            releaseUndo();
+            // This request's own record, never another one still out.
+            releaseUndo(pending.undo);
             ingestAndPublish(gpa, out, signer, pending.route);
         },
     }
@@ -835,7 +851,9 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var restore: ?[]const u8 = null;
     var restore_warn: WarnCarry = .{};
     var sign_failed = false;
-    var any_sign_failed = false;
+    // Each failed sign's own record, put back after the lock is released.
+    var undos: [max_pending_remote]PendingUndo = undefined;
+    var undos_len: usize = 0;
     var connect_failed = false;
     var seal_failed = false;
     var upload_sign_failed = false;
@@ -853,9 +871,13 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         const slot_explicit = slot.failed;
         const slot_restorable = slot.restorable;
         const slot_warn = slot.warn;
+        const slot_undo = slot.undo;
         slot.* = .{};
         if (stale) {
             if (content) |c| gpa.free(c);
+            // The session it belonged to is gone, and the state it would put
+            // back went with it.
+            releaseUndo(slot_undo);
             // An ask that died with its session leaves the half "asking"
             // forever, and nothing would ask again: the reader's list would
             // stay read-only until a restart. Back to idle, so the next tick
@@ -879,8 +901,9 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 }
                 if (slot_restorable) sign_failed = true;
                 // Any failed signature, restorable or not, may have been a
-                // follow press whose list already moved.
-                any_sign_failed = true;
+                // follow press whose list already moved: this one's own.
+                undos[undos_len] = slot_undo;
+                undos_len += 1;
             },
             .connect => {
                 if (content) |c| gpa.free(c);
@@ -976,7 +999,7 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         gpa.free(c);
     }
     if (sign_failed) g_remote_sign_notice.store(true, .release);
-    if (any_sign_failed) applyUndo(model);
+    for (undos[0..undos_len]) |u| applyUndo(model, u);
     if (upload_sign_failed) uploadSignFailed();
     if (connect_failed and g_remote_status.load(.acquire) == 1) g_remote_status.store(3, .release);
 }

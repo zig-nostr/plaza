@@ -66,6 +66,69 @@ test "a refused reply goes back to its own thread, never into the open one" {
     try testing.expectEqualStrings("Not signed. Reply kept under the newer one.", model.toast_text());
 }
 
+test "a bunker's refused reply comes back, and the like pressed after it stays" {
+    // A bunker has several signatures out at once. The undo record used to be
+    // one global slot, so the like pressed while the reply was still on the
+    // phone freed the reply's text and took its place. When the reply was then
+    // refused, the like was the one taken back, and the reply was gone.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    main.setIdentityForTest([_]u8{0x84} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const a = bareRoot(0xa4);
+    const liked: i64 = 0x1ced;
+
+    const kept = try std.heap.page_allocator.dupe(u8, "an answer to a");
+    main.signAndPublishWithUndoForTest(&fx, 1_800_000_000, 1, "an answer to a", .{ .reply = .{ .text = kept, .root = a.event_id } });
+    main.rememberLikeForTest(liked, [_]u8{0x41} ** 32);
+    main.signAndPublishWithUndoForTest(&fx, 1_800_000_001, 7, "+", .{ .like = liked });
+
+    // The reply is refused. The like is still with the signer.
+    try testing.expect(main.failPendingByContentForTest("an answer to a"));
+    main.scanPendingRemoteForTest(&model, &fx);
+    const back = main.keptReplyDraftForTest(a.event_id) orelse return error.ReplyWasLost;
+    try testing.expectEqualStrings("an answer to a", back);
+    try testing.expect(main.isLikedForTest(liked));
+
+    // And when the like is refused too, it is the like that goes back.
+    try testing.expect(main.failPendingByContentForTest("+"));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(!main.isLikedForTest(liked));
+}
+
+test "a reply waits for Notary to finish the sign it is already doing" {
+    // Every other write asks `signerReady` first. A reply did not, so one sent
+    // while Notary was signing something else took that request's slot, and
+    // the note being signed lost the copy it would be handed back from.
+    main.setIdentityForTest([_]u8{0x85} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+
+    main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "the note being signed", true);
+    main.enterThreadForTest(&model, bareRoot(0xa5));
+    model.reply_buffer.set("a reply pressed meanwhile");
+    main.update(&model, .reply_submit, &fx);
+
+    try testing.expectEqualStrings("a reply pressed meanwhile", model.reply_draft());
+    try testing.expectEqualStrings("Your signer is busy. Try that again in a moment.", model.toast_text());
+    // The note's copy is still the one held.
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("the note being signed", model.draft());
+}
+
 test "a refused reply is never dropped, and never said to be back when it is not" {
     main.setIdentityForTest([_]u8{0x84} ** 32);
     defer main.clearIdentityForTest();

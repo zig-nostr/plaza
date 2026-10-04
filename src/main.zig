@@ -6160,7 +6160,6 @@ pub const forgetFollowsForTest = follows.forgetFollowsForTest;
 pub const ingestContactListForTest = follows.ingestContactListForTest;
 pub const loadFollowsFromStoreForTest = follows.loadFollowsFromStoreForTest;
 pub const pendingFollowCountForTest = follows.pendingFollowCountForTest;
-pub const pendingUndoIsNoneForTest = follows.pendingUndoIsNoneForTest;
 pub const setFollowsForTest = follows.setFollowsForTest;
 pub const setHomeScopeForTest = follows.setHomeScopeForTest;
 pub const setPendingFollowBaseForTest = follows.setPendingFollowBaseForTest;
@@ -6170,7 +6169,6 @@ pub const FollowWrite = follows.FollowWrite;
 pub const HomeScope = follows.HomeScope;
 pub const PendingUndo = follows.PendingUndo;
 pub const applyUndo = follows.applyUndo;
-pub const armUndo = follows.armUndo;
 pub const bookmark_list_kind = follows.bookmark_list_kind;
 pub const buildFeedFilters = follows.buildFeedFilters;
 pub const bumpIdentityGeneration = follows.bumpIdentityGeneration;
@@ -6586,6 +6584,7 @@ pub const uploadButtonsForTest = view_upload.uploadButtonsForTest;
 pub const uploadStrip = view_upload.uploadStrip;
 
 // re-exports: compose.zig
+pub const signAndPublishWithUndoForTest = compose.signAndPublishWithUndoForTest;
 pub const contentTagsForTest = compose.contentTagsForTest;
 pub const countOutboxRoundForTest = compose.countOutboxRoundForTest;
 pub const deletableTargetKindForTest = compose.deletableTargetKindForTest;

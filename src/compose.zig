@@ -301,9 +301,10 @@ pub fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: 
     // forgotten: a new write does not compile until it has said what its undo
     // is, and `.none` is a decision spelled out loud rather than an omission.
     //
-    // It also fixes the ordering hazard. Arming after the write dispatched
-    // could release a record the response had already consumed.
-    armUndo(undo);
+    // It rides the signer's request together with the event it waits on, so a
+    // failure puts back this press and no other, and a signature releases this
+    // record and no other.
+    //
     // Here, rather than at each call site, because this is the ONE door every
     // published event goes through: a switch the reader turned on has to hold for
     // the note they write, the note they repost and the note they quote, and a
@@ -323,8 +324,8 @@ pub fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: 
     // by the time it fires the reader may be standing somewhere else.
     const route = route_in orelse routeForOpenPlace();
     switch (keyholder.g_signer_kind) {
-        .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable, route),
-        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable, route),
+        .remote => requestRemoteSign(gpa, created, kind, tags, content_owned, restorable, route, undo),
+        .helper => requestHelperSign(fx, gpa, created, kind, tags, content_owned, restorable, route, undo),
     }
 }
 
@@ -486,6 +487,13 @@ fn publishReply(model: *Model, fx: *Effects, route: ?PlaceRoute) void {
     const root = model.noteById(model.viewing_thread) orelse return;
     const text = std.mem.trim(u8, model.reply_buffer.text(), " \t\r\n");
     if (text.len == 0) return;
+    // Asked first, like every other write. Notary signs one thing at a time, and
+    // a reply sent while something else is out took that request's slot and its
+    // undo with it. The text stays in the box.
+    if (!signerReady()) {
+        setToast(model, "Your signer is busy. Try that again in a moment.");
+        return;
+    }
     const gpa = std.heap.page_allocator;
     const content = gpa.dupe(u8, text) catch return;
     const id_hex = hexAlloc(gpa, root.event_id) orelse return;
@@ -1427,6 +1435,13 @@ pub fn signAndPublishForTest(fx: *Effects, created: i64, kind: u16, tags: []cons
     const gpa = std.heap.page_allocator;
     const owned = gpa.dupe(u8, content) catch return;
     signAndPublish(fx, gpa, created, kind, tags, owned, false, .none, null);
+}
+
+/// The same, carrying what the press changed, as every real write does.
+pub fn signAndPublishWithUndoForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, undo: PendingUndo) void {
+    const gpa = std.heap.page_allocator;
+    const owned = gpa.dupe(u8, content) catch return;
+    signAndPublish(fx, gpa, created, kind, &.{}, owned, false, undo, null);
 }
 pub fn replyHeldForTest() bool {
     return g_reply_due_s != 0;

@@ -16,6 +16,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const PendingUndo = main.PendingUndo;
 const copyBounded = main.copyBounded;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -760,6 +761,9 @@ const HelperSign = struct {
     /// What is out for signing is an upload token, not something to publish:
     /// its failure belongs to the upload card, not to the composer.
     upload_auth: bool = false,
+    /// What this press changed, put back if the signature never comes. Owned
+    /// by the slot.
+    undo: PendingUndo = .none,
 };
 pub var g_helper_sign: HelperSign = .{};
 
@@ -788,7 +792,7 @@ pub const helper_sign_timeout_ms: u32 = @intCast(helper_sign_timeout_s * 1000);
 /// Remembers a note handed to the daemon, so a failure has something to give
 /// back. Called BEFORE the request is built, because building it can fail too
 /// and those paths used to lose the note just as quietly.
-fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool, route: PlaceRoute, warn: WarnCarry) void {
+fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: bool, route: PlaceRoute, warn: WarnCarry, undo: PendingUndo) void {
     releaseHelperSign();
     g_helper_sign = .{
         .active = true,
@@ -798,12 +802,14 @@ fn rememberHelperSign(gpa: std.mem.Allocator, content: []const u8, restorable: b
         .deadline_s = nowSeconds() + helper_sign_timeout_s,
         .content = if (restorable) gpa.dupe(u8, content) catch null else null,
         .warn = if (restorable) warn else .{},
+        .undo = undo,
     };
 }
 
 /// Drops the slot without restoring: the signature came back.
 pub fn releaseHelperSign() void {
     if (g_helper_sign.content) |c| std.heap.page_allocator.free(c);
+    releaseUndo(g_helper_sign.undo);
     g_helper_sign = .{};
 }
 
@@ -823,6 +829,7 @@ pub fn scanHelperSign(model: *Model) void {
     const content = g_helper_sign.content;
     const warn = g_helper_sign.warn;
     const upload_auth = g_helper_sign.upload_auth;
+    const undo = g_helper_sign.undo;
     g_helper_sign = .{};
     const gpa = std.heap.page_allocator;
     if (upload_auth) uploadSignFailed();
@@ -845,7 +852,7 @@ pub fn scanHelperSign(model: *Model) void {
     if (restorable) g_helper_sign_notice.store(true, .release);
     // Fires whether or not the note was restorable. A follow write carries no
     // draft to give back, which is exactly why its failure used to be silent.
-    applyUndo(model);
+    applyUndo(model, undo);
 }
 
 /// A helper sign that failed, surfaced once in the composer so a restored draft
@@ -907,11 +914,11 @@ pub var g_test_signer_silent: bool = false;
 /// event, ingested and published like any other. `content_owned` and `tags` are
 /// process-lifetime (the local and remote paths reference them too), so this
 /// does not free them.
-pub fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute) void {
-    const pk = activePubkey() orelse return;
+pub fn requestHelperSign(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute, undo: PendingUndo) void {
+    const pk = activePubkey() orelse return releaseUndo(undo);
     // Recorded first. Every `catch return` below is a path that used to end with
     // the note gone and the app saying "Posted".
-    rememberHelperSign(gpa, content_owned, restorable, route, WarnCarry.fromTags(tags));
+    rememberHelperSign(gpa, content_owned, restorable, route, WarnCarry.fromTags(tags), undo);
     g_helper_sign.upload_auth = kind == blossom.auth_kind;
     const id = nostr.event.computeId(gpa, pk, created, kind, tags, content_owned) catch {
         failHelperSign();
@@ -1177,11 +1184,9 @@ pub fn handleHelperSigned(response: native_sdk.EffectResponse) void {
     // held for a restore is dropped and any earlier failure notice retired.
     releaseHelperSign();
     g_helper_sign_notice.store(false, .release);
-    // There is nothing left to take back: this press is signed. Dropped here
-    // rather than when the event is ingested, because an ingest that fails
-    // would otherwise leave the record armed and let a LATER unrelated failure
-    // revert a press that really was published.
-    releaseUndo();
+    // There is nothing left to take back: this press is signed. Its undo went
+    // with the slot above, rather than when the event is ingested, because an
+    // ingest that fails would otherwise leave the record armed.
     // The room this write was submitted FROM, not the one on screen now: the
     // keyholder can ask a person, and the reader can walk out while it waits.
     ingestAndPublish(gpa, out, null, route);
@@ -1321,7 +1326,7 @@ pub fn helperSignRestorableForTest() bool {
 }
 
 pub fn requestHelperSignForTest(fx: *Effects, created: i64, kind: u16, content: []const u8, restorable: bool) void {
-    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none);
+    requestHelperSign(fx, std.heap.page_allocator, created, kind, &.{}, content, restorable, .none, .none);
 }
 
 /// The same, submitted from a place that writes to `relay` and, when
@@ -1330,7 +1335,7 @@ pub fn requestHelperSignRoutedForTest(fx: *Effects, created: i64, content: []con
     var route: PlaceRoute = .{ .exclusive = exclusive };
     route.lens[0] = @intCast(copyBounded(&route.urls[0], relay));
     route.len = 1;
-    requestHelperSign(fx, std.heap.page_allocator, created, 1, &.{}, content, true, route);
+    requestHelperSign(fx, std.heap.page_allocator, created, 1, &.{}, content, true, route, .none);
 }
 
 /// The route the last published event was handed to the publish with. Only

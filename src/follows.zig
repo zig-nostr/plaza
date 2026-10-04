@@ -789,13 +789,14 @@ pub fn releasePendingFollowBase(stored_at: i64) void {
 /// One name, one direction and the stamp to go back to. A press toggles exactly
 /// one person, so undoing it needs nothing more than that.
 ///
-/// ONE slot, for every kind of write, because only one signature is ever in
-/// flight: every write goes through `signerReady()`, which is
-/// `.helper => !g_helper_sign.active`, so a second press is refused while the
-/// first is still out. That is also what makes this correct where a free
-/// standing flag was not. The slot always describes the write whose signature
-/// just failed, so a failed note cannot revert a follow that really was
-/// published.
+/// Held WITH the request it belongs to: in `g_helper_sign` for Notary, in the
+/// request's own `g_pending` slot for a bunker. It used to be one global slot,
+/// on the reasoning that only one signature is ever in flight. That holds for
+/// Notary and not for a bunker, whose table has eight slots: a like pressed
+/// while a reply was still on the phone freed the reply's text, and when the
+/// reply was then refused the like was the one taken back. Kept with its own
+/// request, a failure puts back exactly what that press changed, and a success
+/// releases exactly that.
 pub const PendingUndo = union(enum) {
     none,
     follow: ListPress,
@@ -817,31 +818,24 @@ pub const PendingUndo = union(enum) {
     const Unlike = struct { note_id: i64, reaction_id: [32]u8 };
 };
 
-pub var g_pending_undo: PendingUndo = .none;
-
-/// Records what a press changed, immediately before it changes it.
-pub fn armUndo(u: PendingUndo) void {
-    releaseUndo();
-    g_pending_undo = u;
-}
-
-/// Drops the record without applying it: the signature came back.
-pub fn releaseUndo() void {
-    switch (g_pending_undo) {
+/// Drops a record without applying it: the signature came back, or the request
+/// it rode with is gone with its session.
+pub fn releaseUndo(u: PendingUndo) void {
+    switch (u) {
         .reply => |r| std.heap.page_allocator.free(r.text),
         else => {},
     }
-    g_pending_undo = .none;
 }
-/// Puts back whatever the last press changed, after a signature that never
-/// arrived, and says so.
+
+/// The record a test arms by hand, standing in for the one a request carries.
+var g_test_undo: PendingUndo = .none;
+/// Puts back what one press changed, after its signature never arrived, and
+/// says so. Takes ownership of `undo`.
 ///
 /// Silence was the whole defect. A reader who unfollows somebody, or mutes
 /// them, and is shown the state they asked for has no way to learn that nothing
 /// was published; on the next launch the person is still there.
-pub fn applyUndo(model: *Model) void {
-    const undo = g_pending_undo;
-    g_pending_undo = .none;
+pub fn applyUndo(model: *Model, undo: PendingUndo) void {
     switch (undo) {
         .none => return,
         .follow => |p| {
@@ -1026,9 +1020,6 @@ pub fn followSetForTest() []const [32]u8 {
 pub fn setHomeScopeForTest(next: HomeScope) void {
     setHomeScope(next);
 }
-pub fn pendingUndoIsNoneForTest() bool {
-    return g_pending_undo == .none;
-}
 
 /// Arms an undo directly, for the writes whose real path needs a live note, a
 /// live `Effects` or a relay behind it. Arming itself is not what these check:
@@ -1036,15 +1027,18 @@ pub fn pendingUndoIsNoneForTest() bool {
 /// the signer without one. What they check is that each record puts the right
 /// thing back.
 pub fn armUndoForTest(u: PendingUndo) void {
-    armUndo(u);
+    releaseUndo(g_test_undo);
+    g_test_undo = u;
 }
 
 pub fn armUnlikeUndoForTest(note_id: i64, reaction_id: [32]u8) void {
-    armUndo(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
+    armUndoForTest(.{ .unlike = .{ .note_id = note_id, .reaction_id = reaction_id } });
 }
 
 pub fn applyUndoForTest(model: *Model) void {
-    applyUndo(model);
+    const u = g_test_undo;
+    g_test_undo = .none;
+    applyUndo(model, u);
 }
 
 /// Puts the app in the state a bunker or a Notary key leaves it in: a contact

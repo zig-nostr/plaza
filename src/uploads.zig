@@ -379,8 +379,8 @@ pub fn uploadGo(model: *Model, fx: *Effects) void {
     job.signing_since_s = created;
     job.setPhase(.signing);
     switch (keyholder.g_signer_kind) {
-        .remote => requestRemoteSignAs(.sign_upload_auth, gpa, created, blossom.auth_kind, tags, content, false, .none),
-        .helper => requestHelperSign(fx, gpa, created, blossom.auth_kind, tags, content, false, .none),
+        .remote => requestRemoteSignAs(.sign_upload_auth, gpa, created, blossom.auth_kind, tags, content, false, .none, .none),
+        .helper => requestHelperSign(fx, gpa, created, blossom.auth_kind, tags, content, false, .none, .none),
     }
 }
 
