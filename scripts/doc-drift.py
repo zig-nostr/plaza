@@ -20,6 +20,7 @@ elsewhere in the file, usually one that now has no doc of its own.
     python3 scripts/doc-drift.py [file...]
 """
 
+import glob
 import re
 import sys
 
@@ -82,4 +83,6 @@ def main(paths):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:] or ["src/main.zig"]))
+    # Every app file by default; the tests are prose of another kind.
+    app_files = [p for p in sorted(glob.glob("src/*.zig")) if not p.endswith("tests.zig")]
+    sys.exit(main(sys.argv[1:] or app_files))
