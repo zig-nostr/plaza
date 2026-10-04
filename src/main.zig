@@ -6244,6 +6244,16 @@ fn handleHelperSigned(response: native_sdk.EffectResponse) void {
 // and stop, so an old bunker's listener never processes into a new session (or
 // a dead one). Correlating this into every pending request is the teardown fix.
 var g_remote_generation = std.atomic.Value(u64).init(0);
+
+/// A connect or a reconnect starts a new generation, and with it a new chance
+/// for a signer that said no. A half the previous session's bunker declined or
+/// never answered is put back to idle, so the next tick asks the signer that is
+/// connected now. Logout bumps the generation directly: it forgets the halves
+/// outright and has nothing to re-ask.
+fn newRemoteGeneration() u64 {
+    rearmPrivateHalves(0, true);
+    return g_remote_generation.fetchAdd(1, .monotonic) + 1;
+}
 // A remote sign that never came back, surfaced once in the composer identity
 // line so a restored draft is explained rather than silently reappearing.
 // Set by the timeout scan, cleared on the next edit or a later success.
@@ -6258,16 +6268,22 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 // access, across threads that deliberately never share one).
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
-const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip44_encrypt };
+const no_half_id = [_]u8{0} ** 32;
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
     id_len: usize = 0,
     method: RemoteMethod = .connect,
-    /// `nip44_decrypt` only: which `g_private_halves` slot this answers. The
+    /// A decrypt only: which `g_private_halves` slot this answers. The
     /// response arrives with nothing but a request id on it, so the slot has to
     /// be remembered here or the plaintext has no home.
     half_index: u8 = 0,
+    /// A decrypt only: `privateHalfId` of the ciphertext that was asked. The slot
+    /// index alone says where an answer would go, not whose it is: a sign-out
+    /// frees the slots while this ask is still out, and the next account can be
+    /// holding that slot by the time the answer lands.
+    half_id: [32]u8 = [_]u8{0} ** 32,
     deadline_s: i64 = 0,
     generation: u64 = 0,
     // The listener flags a failed response here; the UI tick, which owns the
@@ -6303,6 +6319,8 @@ const PendingRemote = struct {
 const HalfInbox = struct {
     used: bool = false,
     index: u8 = 0,
+    /// The ciphertext the ask was about, carried from `PendingRemote.half_id`.
+    half_id: [32]u8 = [_]u8{0} ** 32,
     ok: bool = false,
     plain_buf: [4096]u8 = undefined,
     plain_len: u16 = 0,
@@ -6332,7 +6350,7 @@ fn pendingUnlock() void {
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
 /// the caller still owns `content`.
-fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, warn: WarnCarry) bool {
+fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u8, restorable: bool, route: PlaceRoute, half_index: u8, half_id: [32]u8, warn: WarnCarry) bool {
     if (req_id.len > 24) return false;
     pendingLock();
     defer pendingUnlock();
@@ -6342,6 +6360,7 @@ fn registerPending(req_id: []const u8, method: RemoteMethod, content: ?[]const u
             .active = true,
             .method = method,
             .half_index = half_index,
+            .half_id = half_id,
             .id_len = req_id.len,
             .deadline_s = nowSeconds() + remote_sign_timeout_s,
             .generation = g_remote_generation.load(.acquire),
@@ -6392,7 +6411,7 @@ fn failPending(req_id: []const u8) bool {
 // logic), exercised without threads or a live bunker.
 pub const RemoteMethodForTest = RemoteMethod;
 pub fn registerPendingForTest(req_id: []const u8, method: RemoteMethod, content: ?[]const u8) bool {
-    return registerPending(req_id, method, content, content != null, .none, 0, .{});
+    return registerPending(req_id, method, content, content != null, .none, 0, no_half_id, .{});
 }
 pub fn takePendingContentForTest(req_id: []const u8) ?struct { method: RemoteMethod, content: ?[]const u8 } {
     const taken = takePending(req_id) orelse return null;
@@ -6419,7 +6438,7 @@ pub fn failPendingByContentForTest(content: []const u8) bool {
     return false;
 }
 pub fn bumpRemoteGenerationForTest() void {
-    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    _ = newRemoteGeneration();
 }
 pub fn scanPendingRemoteForTest(model: *Model, fx: *Effects) void {
     scanPendingRemote(model, fx);
@@ -20604,6 +20623,12 @@ pub const BookmarkWrite = enum {
     /// This account's bookmark list has not been read back yet. Publishing one
     /// now would replace whatever is really out there with a list of one note.
     no_list_yet,
+    /// The list has a private half the signer has not opened yet. Nothing is
+    /// published; the answer lands on a later tick.
+    private_half_waiting,
+    /// The signer refused to open it, or never answered. Nothing is published,
+    /// and the press has asked it again.
+    private_half_declined,
     /// The list has a private half this app could not decrypt, so it cannot
     /// carry it forward and will not write without it.
     private_half_unreadable,
@@ -20619,6 +20644,12 @@ pub const MuteWrite = enum {
     /// This account's mute list has not been read back yet. Publishing one now
     /// would replace whatever is really out there with a list of one name.
     no_list_yet,
+    /// The list has a private half the signer has not opened yet. Nothing is
+    /// published; the answer lands on a later tick.
+    private_half_waiting,
+    /// The signer refused to open it, or never answered. Nothing is published,
+    /// and the press has asked it again.
+    private_half_declined,
     /// The list has a private half this app could not decrypt, so it cannot
     /// carry it forward and will not write without it.
     private_half_unreadable,
@@ -20666,9 +20697,12 @@ fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
 
     if (!have_base and !g_identity_minted_here) return .no_list_yet;
 
-    if (base_content.len > 0 and !privateHalfIsReadable(gpa, base_content)) {
-        return .private_half_unreadable;
-    }
+    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+        .readable => {},
+        .waiting => return .private_half_waiting,
+        .declined => return .private_half_declined,
+        .unreadable => return .private_half_unreadable,
+    };
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     var handed_off = false;
@@ -20745,7 +20779,12 @@ fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWr
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_content: []const u8 = if (previous) |prev| prev.json else "";
     if (previous == null and !g_identity_minted_here) return .no_list_yet;
-    if (base_content.len > 0 and !privateHalfIsReadable(gpa, base_content)) return .private_half_unreadable;
+    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+        .readable => {},
+        .waiting => return .private_half_waiting,
+        .declined => return .private_half_declined,
+        .unreadable => return .private_half_unreadable,
+    };
 
     const plaintext = privateBookmarkPlaintext(gpa, base_content, event_id, adding) orelse {
         // Either nothing to do (already private, or not private), or the half
@@ -21030,16 +21069,19 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     // an empty list when the decrypt throws, and the write then sets `content`
     // to `''`, publishing away every private mute the reader had. A bunker
     // reader hits that path every time, because the decrypt needs a NIP-46 round
-    // trip this app does not make.
+    // trip.
     //
-    // So: content that is present and cannot be read means no write at all. The
-    // reader keeps their private mutes and is told the app cannot do this one.
-    if (base_content.len > 0) {
-        var probe: [max_mutes][32]u8 = undefined;
-        if (privateMutes(gpa, base_content, &probe) == 0 and !privateHalfIsReadable(gpa, base_content)) {
-            return .private_half_unreadable;
-        }
-    }
+    // This app makes that round trip: the half is opened by whoever holds the
+    // key, through the same cache bookmarks use, and what is carried forward is
+    // the ciphertext the reader already has. So content that is present and not
+    // yet opened means no write at all, and the reader is told which of waiting,
+    // declined or unreadable it is.
+    if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
+        .readable => {},
+        .waiting => return .private_half_waiting,
+        .declined => return .private_half_declined,
+        .unreadable => return .private_half_unreadable,
+    };
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     var handed_off = false;
@@ -21100,15 +21142,6 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     return .published;
 }
 
-/// Whether an encrypted content opens at all.
-///
-/// `privateMutes` returns zero for two completely different situations: a half
-/// that decrypted fine and simply names nobody, and a half that could not be
-/// decrypted. Carrying the first one forward is ordinary; carrying the second is
-/// the only thing this write must never do. This is what tells them apart, and
-/// the name says "readable" rather than "empty" on purpose: a reader glancing at
-/// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
-/// opposite of what the guard is for.
 /// The decrypted private half of a NIP-51 list, once Notary has opened it.
 ///
 /// NIP-51 puts the private half of a list in `content`, encrypted to yourself.
@@ -21126,10 +21159,17 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
 /// is why the guard exists.
 const PrivateHalf = struct {
     used: bool = false,
-    state: enum { idle, asking, open, refused } = .idle,
+    state: enum { idle, asking, open, refused, unreadable } = .idle,
     /// The ciphertext this entry is about, by hash: the ciphertext itself runs
     /// to kilobytes and this only has to tell two of them apart.
     id: [32]u8 = [_]u8{0} ** 32,
+    /// `refused` only: when a refusal that was really a silence may be asked
+    /// again without a press, in seconds. Zero means only a press (or a new
+    /// connection) re-asks, which is what an explicit "no" gets.
+    retry_at_s: i64 = 0,
+    /// The ask in flight over Notary's door, if that is who was asked. The
+    /// answer comes back with nothing but a key, so the key carries this.
+    ask_seq: u32 = 0,
     plain_buf: [4096]u8 = undefined,
     plain_len: u16 = 0,
 
@@ -21155,6 +21195,58 @@ var g_private_ciphertext: [4]PrivateCiphertext = [_]PrivateCiphertext{.{}} ** 4;
 
 /// Effect keys for the decrypts, one per slot.
 const private_half_key_base: u64 = 48;
+
+/// How long a silence from the bunker is left alone before the half is asked
+/// again, after the ask itself has already waited out `remote_sign_timeout_s`.
+const private_half_retry_s: i64 = 60;
+
+/// Each ask over Notary's door gets the next number, and the key carries it
+/// above the slot, so an answer can be told from one for an earlier ask of the
+/// same slot. The slot alone cannot say: a sign-out frees it while the answer
+/// is on the wire, and the next account can have taken it by then. Never
+/// reused, never reset by a sign-out, for the same reason.
+var g_half_ask_seq: u32 = 0;
+
+fn privateHalfKey(i: usize, seq: u32) u64 {
+    return (@as(u64, seq) << 16) | (private_half_key_base + @as(u64, @intCast(i)));
+}
+
+/// Marks slot `i` as asked over Notary's door and returns the key to ask under.
+fn beginHelperAsk(i: usize) u64 {
+    g_half_ask_seq +%= 1;
+    if (g_half_ask_seq == 0) g_half_ask_seq = 1;
+    const h = &g_private_halves[i];
+    h.state = .asking;
+    h.ask_seq = g_half_ask_seq;
+    return privateHalfKey(i, g_half_ask_seq);
+}
+
+/// The half an answer is for, if it is still waiting for one: the slot is in
+/// use, holds the same ciphertext that was asked, and is in the asking state.
+/// Anything else is an answer to a question nobody is asking any more (the
+/// reader signed out, the slot was given to another list, or the ask was
+/// already retired), and applying it would hand one account's plaintext, or its
+/// refusal, to another's list.
+fn halfAwaiting(index: usize, id: [32]u8) ?*PrivateHalf {
+    if (index >= g_private_halves.len) return null;
+    const h = &g_private_halves[index];
+    if (!h.used or h.state != .asking) return null;
+    if (!std.mem.eql(u8, &h.id, &id)) return null;
+    return h;
+}
+
+/// Puts refused halves back to idle so the next tick asks again: those whose
+/// retry stamp has passed, or all of them with `all`, which is what a new
+/// connection to the signer means. Never touches `unreadable`, which no second
+/// ask can change.
+fn rearmPrivateHalves(now: i64, all: bool) void {
+    for (&g_private_halves) |*h| {
+        if (!h.used or h.state != .refused) continue;
+        if (!all and (h.retry_at_s == 0 or now < h.retry_at_s)) continue;
+        h.state = .idle;
+        h.retry_at_s = 0;
+    }
+}
 /// And one for the encrypt, of which there is only ever one in flight: it is
 /// driven by a press, and `signerReady` already refuses a second press while a
 /// signature is out.
@@ -21218,13 +21310,19 @@ fn privateHalfOpened(content: []const u8) ?[]const u8 {
 /// goes out on a later tick than the read that noticed it was needed.
 fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     if (content.len > g_private_ciphertext[i].buf.len) return null;
+    // Notary's own door opens NIP-44 and nothing else, so a NIP-04 half is not
+    // something it can be asked for. No slot: the half reads as unreadable, which
+    // is the truth, rather than as a refusal that a press would keep re-asking.
+    if (g_signer_kind == .helper and isNip04Payload(content)) return null;
     g_private_halves[i] = .{ .used = true, .state = .idle, .id = id };
     @memcpy(g_private_ciphertext[i].buf[0..content.len], content);
     g_private_ciphertext[i].len = @intCast(content.len);
     // A test has no tick to fire the ask on, so its stand-in keyholder answers
     // here. In the app this returns null and the answer arrives a tick later,
-    // which is the whole reason this is a cache and not a call.
-    if (builtin.is_test) {
+    // which is the whole reason this is a cache and not a call. A bunker never
+    // answers inline, in a test or out of one: its answer is parked by the
+    // listener and applied by the sweep.
+    if (builtin.is_test and g_signer_kind == .helper) {
         answerPrivateHalfForTest(std.heap.page_allocator, i, content);
         if (g_private_halves[i].state == .open) return g_private_halves[i].plain();
     }
@@ -21250,37 +21348,118 @@ pub fn claimPrivateHalfPendingForTest(content: []const u8) ?u8 {
 
 /// What the listener thread does when the bunker answers a `nip44_decrypt`.
 pub fn parkRemoteHalfAnswerForTest(index: u8, plain: []const u8) void {
+    parkHalfAnswer(index, slotIdForTest(index), plain);
+}
+
+/// The same for an ask that was made about `ciphertext`, whoever holds the slot
+/// by the time the answer lands.
+pub fn parkRemoteHalfAnswerForCiphertextForTest(index: u8, ciphertext: []const u8, plain: []const u8) void {
+    parkHalfAnswer(index, privateHalfId(ciphertext), plain);
+}
+
+fn slotIdForTest(index: u8) [32]u8 {
+    if (index >= g_private_halves.len) return no_half_id;
+    return g_private_halves[index].id;
+}
+
+fn parkHalfAnswer(index: u8, id: [32]u8, plain: []const u8) void {
     pendingLock();
     defer pendingUnlock();
     for (&g_half_inbox) |*box| {
         if (box.used) continue;
         const n = @min(plain.len, box.plain_buf.len);
-        box.* = .{ .used = true, .index = index, .ok = true, .plain_len = @intCast(n) };
+        box.* = .{ .used = true, .index = index, .half_id = id, .ok = true, .plain_len = @intCast(n) };
         @memcpy(box.plain_buf[0..n], plain[0..n]);
         return;
     }
 }
 
-/// A `nip44_decrypt` the bunker refused or never answered.
+pub const HalfAskEnd = enum {
+    /// The bunker answered with an error.
+    failed,
+    /// The deadline passed with no answer.
+    timed_out,
+};
+
+/// A decrypt the bunker refused or never answered, for the ask made about
+/// `ciphertext`.
+pub fn endRemoteHalfAskForTest(index: u8, ciphertext: []const u8, end: HalfAskEnd) bool {
+    return endHalfAsk(index, privateHalfId(ciphertext), end);
+}
+
+/// A `nip44_decrypt` the bunker refused: an explicit error.
 pub fn failRemoteHalfForTest(index: u8) bool {
+    return endHalfAsk(index, slotIdForTest(index), .failed);
+}
+
+/// A `nip44_decrypt` the bunker never answered before the deadline.
+pub fn timeoutRemoteHalfForTest(index: u8) bool {
+    return endHalfAsk(index, slotIdForTest(index), .timed_out);
+}
+
+fn endHalfAsk(index: u8, id: [32]u8, end: HalfAskEnd) bool {
     var idbuf: [24]u8 = undefined;
     const req_id = std.fmt.bufPrint(&idbuf, "half{d}", .{index}) catch return false;
-    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index, .{})) return false;
+    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, index, id, .{})) return false;
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
-        if (slot.active and std.mem.eql(u8, slot.id(), req_id)) slot.failed = true;
+        if (!slot.active or !std.mem.eql(u8, slot.id(), req_id)) continue;
+        switch (end) {
+            .failed => slot.failed = true,
+            .timed_out => slot.deadline_s = -1,
+        }
     }
     return true;
 }
 
+/// Whether any parked bunker answer is still waiting for the tick, or still
+/// holds plaintext.
+pub fn halfInboxHoldsForTest() bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_half_inbox) |*box| {
+        if (box.used or box.plain_len != 0) return true;
+    }
+    return false;
+}
+
+/// What the tick does for every idle half when a bunker is the signer: the ask
+/// goes out and the half waits for it. The test has no relay to send to.
+pub fn markIdleHalvesAskedForTest() void {
+    for (&g_private_halves) |*h| {
+        if (h.used and h.state == .idle) h.state = .asking;
+    }
+}
+
+/// A decrypt request registered for the half in `index`, with no outcome yet,
+/// as `requestRemoteDecrypt` does.
+pub fn registerRemoteHalfAskForTest(index: u8, method: RemoteMethod) bool {
+    return registerPending("halfask", method, null, false, .none, index, slotIdForTest(index), .{});
+}
+
+pub fn privateHalfRetryAtForTest(index: u8) i64 {
+    if (index >= g_private_halves.len) return -1;
+    return g_private_halves[index].retry_at_s;
+}
+
+pub fn privateHalfRetryDelayForTest() i64 {
+    return private_half_retry_s;
+}
+
+/// The sweep `scanPrivateHalves` runs each tick, with the clock stated.
+pub fn rearmPrivateHalvesForTest(now: i64) void {
+    rearmPrivateHalves(now, false);
+}
+
 pub fn privateHalfStateForTest(index: u8) []const u8 {
-    if (index >= g_private_halves.len) return "none";
+    if (index >= g_private_halves.len or !g_private_halves[index].used) return "none";
     return switch (g_private_halves[index].state) {
         .idle => "idle",
         .asking => "asking",
         .open => "open",
         .refused => "refused",
+        .unreadable => "unreadable",
     };
 }
 
@@ -21303,11 +21482,15 @@ pub fn openPrivateHalfForTest(content: []const u8, plain: []const u8) void {
 fn scanPrivateHalves(fx: *Effects) void {
     if (!signerIsHealthy()) return;
     const me = activePubkey() orelse return;
+    // A silence from the bunker is not an answer: once its wait is over the
+    // half is asked again, by the same state machine that asked it the first
+    // time, so it is never asked twice at once.
+    rearmPrivateHalves(nowSeconds(), false);
     for (&g_private_halves, 0..) |*h, i| {
         if (!h.used or h.state != .idle) continue;
         const content = g_private_ciphertext[i].slice();
         if (content.len == 0) {
-            h.state = .refused;
+            h.state = .unreadable;
             continue;
         }
         const gpa = std.heap.page_allocator;
@@ -21316,7 +21499,12 @@ fn scanPrivateHalves(fx: *Effects) void {
         // an external signer asked a daemon that does not hold their key.
         if (g_signer_kind == .remote) {
             h.state = .asking;
-            if (!requestRemoteDecrypt(gpa, i, content)) h.state = .refused;
+            if (!requestRemoteDecrypt(gpa, i, content)) {
+                // Nothing was sent (no room to track it, no id): a delay and
+                // not an answer, so it is asked again shortly.
+                h.state = .refused;
+                h.retry_at_s = nowSeconds() + private_half_retry_s;
+            }
             return;
         }
         var peer_hex: [64]u8 = undefined;
@@ -21325,23 +21513,38 @@ fn scanPrivateHalves(fx: *Effects) void {
         // which is what NIP-51 means by a half encrypted to yourself.
         const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{content} }).toJson(gpa) catch return;
         defer gpa.free(body);
-        h.state = .asking;
         if (builtin.is_test) {
             answerPrivateHalfForTest(gpa, i, content);
             return;
         }
-        helperFetch(fx, private_half_key_base + @as(u64, @intCast(i)), "/nip44/decrypt", body, Effects.responseMsg(.private_half));
+        helperFetch(fx, beginHelperAsk(i), "/nip44/decrypt", body, Effects.responseMsg(.private_half));
         return;
     }
 }
 
 /// Notary's answer: the plaintext, or a refusal this reader has to live with.
+///
+/// Two kinds of "no". A 403, a 409, a dead daemon: the keyholder did not open
+/// it, and might if asked again, so the half is `refused` and a press asks
+/// again. A 422, or a 200 that does not parse: the keyholder looked at this
+/// ciphertext and cannot read it, and asking again gets the same answer, so the
+/// half is `unreadable` and nothing re-asks it.
 fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
-    if (response.key < private_half_key_base) return;
-    const i = response.key - private_half_key_base;
+    const low = response.key & 0xffff;
+    if (low < private_half_key_base) return;
+    const i = low - private_half_key_base;
     if (i >= g_private_halves.len) return;
+    const seq: u32 = @truncate(response.key >> 16);
     const h = &g_private_halves[@intCast(i)];
-    if (!h.used) return;
+    // Only the ask this slot is waiting on. A sign-out frees the slot while an
+    // answer is still on its way, and the next account can be asking from the
+    // same slot by the time it lands: the answer is then for a ciphertext that
+    // is no longer here and must not be applied to the one that is.
+    if (!h.used or h.state != .asking or seq == 0 or h.ask_seq != seq) return;
+    if (response.outcome == .ok and response.status == 422) {
+        h.state = .unreadable;
+        return;
+    }
     if (response.outcome != .ok or response.status != 200) {
         // Refused, or the keyholder is not there. NOT "the half is empty": the
         // whole point of this cache is that unreadable and empty are different
@@ -21351,7 +21554,7 @@ fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
     }
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
-        h.state = .refused;
+        h.state = .unreadable;
         return;
     };
     defer parsed.deinit();
@@ -21377,25 +21580,39 @@ fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []const u
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     const kp = signer.keyPairFromSecretKey(secret) catch return;
+    const key = beginHelperAsk(i);
     const plain = nostr.nip44.decrypt(gpa, signer, kp.secret_key, kp.public_key, content) catch {
-        g_private_halves[i].state = .refused;
+        // Notary would answer 422: it looked, and the ciphertext does not open.
+        handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 422, .body = "{\"error\":\"unreadable\"}" });
         return;
     };
     defer gpa.free(plain);
     const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
     defer gpa.free(body);
-    handlePrivateHalf(.{ .key = private_half_key_base + @as(u64, @intCast(i)), .outcome = .ok, .status = 200, .body = body });
+    handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 200, .body = body });
 }
 
 /// Delivers one decrypt answer for slot zero the way the runtime would, so a
 /// test can drive a keyholder that refuses.
 pub fn deliverPrivateHalfForTest(status: u16, body: []const u8) void {
-    handlePrivateHalf(.{ .key = private_half_key_base, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
+    deliverPrivateHalfKeyedForTest(privateHalfAskKeyForTest(0), status, body);
+}
+
+/// The same under a stated key, so an answer can be delivered after the ask it
+/// belongs to is long gone.
+pub fn deliverPrivateHalfKeyedForTest(key: u64, status: u16, body: []const u8) void {
+    handlePrivateHalf(.{ .key = key, .outcome = if (status == 0) .connect_failed else .ok, .status = status, .body = body });
+}
+
+/// The key the ask now in flight on slot `index` went out under.
+pub fn privateHalfAskKeyForTest(index: u8) u64 {
+    return privateHalfKey(index, g_private_halves[index].ask_seq);
 }
 
 /// Puts slot zero in the "asked, waiting" state for a given ciphertext.
 pub fn askPrivateHalfForTest(content: []const u8) void {
-    g_private_halves[0] = .{ .used = true, .state = .asking, .id = privateHalfId(content) };
+    g_private_halves[0] = .{ .used = true, .state = .idle, .id = privateHalfId(content) };
+    _ = beginHelperAsk(0);
     const n = @min(content.len, g_private_ciphertext[0].buf.len);
     @memcpy(g_private_ciphertext[0].buf[0..n], content[0..n]);
     g_private_ciphertext[0].len = @intCast(n);
@@ -21410,9 +21627,40 @@ pub fn privateHalfIsReadableForTest(content: []const u8) bool {
 }
 
 pub fn forgetPrivateHalvesForTest() void {
-    g_private_halves = [_]PrivateHalf{.{}} ** 4;
+    forgetPrivateHalves();
 }
 
+/// What was concluded about the leaving account's encrypted lists, and what they
+/// said. Keyed by the ciphertext, so a stranger's list would never be read as
+/// the previous reader's, but the plaintext of their private mutes has no
+/// business sitting in memory after they sign out, and an ask that was still in
+/// flight must not be left to be mistaken for an answer.
+fn forgetPrivateHalves() void {
+    for (&g_private_halves) |*h| {
+        std.crypto.secureZero(u8, &h.plain_buf);
+        h.* = .{};
+    }
+    for (&g_private_ciphertext) |*c| c.len = 0;
+    // A bunker's answer the listener parked and the tick has not applied yet
+    // holds the plaintext too, and would otherwise be applied by the next
+    // sweep to whatever list holds that slot by then.
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_half_inbox) |*box| {
+        std.crypto.secureZero(u8, &box.plain_buf);
+        box.* = .{};
+    }
+}
+
+/// Whether an encrypted content opens at all.
+///
+/// `privateMutes` returns zero for two completely different situations: a half
+/// that decrypted fine and simply names nobody, and a half that could not be
+/// decrypted. Carrying the first one forward is ordinary; carrying the second is
+/// the only thing this write must never do. This is what tells them apart, and
+/// the name says "readable" rather than "empty" on purpose: a reader glancing at
+/// `!privateHalfIsEmpty(...)` at the call site would take it to mean the
+/// opposite of what the guard is for.
 fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
     const plain = privateHalfOpened(content) orelse return false;
     const parsed = std.json.parseFromSlice([]const []const []const u8, gpa, plain, .{}) catch return false;
@@ -21420,6 +21668,54 @@ fn privateHalfIsReadable(gpa: std.mem.Allocator, content: []const u8) bool {
     // It decrypted and parsed. Whatever is in it, this app understood the half it
     // is about to carry forward, which is the whole question.
     return true;
+}
+
+/// Why a write may not go ahead over a private half, in the three ways it can
+/// fail. They all refuse, and none of them publishes; what differs is what the
+/// reader is told and whether a press asks again.
+const HalfGate = enum {
+    /// Opened and understood. Carry it forward.
+    readable,
+    /// The signer has been asked, or is about to be, and has not answered. A
+    /// bunker answers on a human timescale, so this is the common first press.
+    waiting,
+    /// The signer refused, or never answered. Not "empty": a refusal that read
+    /// as an empty half is the one way to publish a list with every private
+    /// entry stripped out of it.
+    declined,
+    /// There is no way to open it from here: too large to hold, a NIP-04 half
+    /// behind Notary's NIP-44 door, or a plaintext that is not a tag list.
+    unreadable,
+};
+
+/// The gate every write over a NIP-51 list goes through before it carries a
+/// private half forward.
+///
+/// A press on a declined half asks again. Amethyst's decrypt cache keeps a
+/// refusal or a timeout as "can try again" rather than as an answer, and without
+/// that a reader who dismissed one prompt on their bunker would have a
+/// read-only list until they restarted. A signer that stayed silent is also
+/// asked again once a while has passed (`rearmPrivateHalves`), and every new
+/// connection to the signer starts over. Each path moves the half back to idle
+/// and the one ask goes out from there, so at most one prompt is ever out: a
+/// second press while the first is open lands on `.waiting`. What the signer
+/// said it cannot read at all is `.unreadable` and is never asked again.
+fn privateHalfGate(gpa: std.mem.Allocator, content: []const u8) HalfGate {
+    if (privateHalfIsReadable(gpa, content)) return .readable;
+    const h = privateHalfFor(content) orelse return .unreadable;
+    switch (h.state) {
+        .idle, .asking => return .waiting,
+        .refused => {
+            h.state = .idle;
+            h.retry_at_s = 0;
+            return .declined;
+        },
+        .open, .unreadable => return .unreadable,
+    }
+}
+
+pub fn privateHalfGateNameForTest(content: []const u8) []const u8 {
+    return @tagName(privateHalfGate(std.heap.page_allocator, content));
 }
 
 pub fn writeMuteForTest(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
@@ -21462,13 +21758,12 @@ fn ingestMuteList(ev: nostr.event.Event) void {
 /// The private half of a mute list: `content` is a JSON array of tags,
 /// encrypted to yourself, which NIP-51 says may be NIP-04 or NIP-44.
 ///
-/// Only readable with a LOCAL key. A bunker holds the secret and would have to
-/// be asked to decrypt over NIP-46, which is a round trip this path does not
-/// have; those readers see their public mutes honoured and their private ones
-/// not, which is the honest failure, and it is why part two of this must refuse
-/// to write a list whose private half it could not read. Jumble has exactly that
-/// bug: a failed decrypt leaves it writing an empty content, which publishes
-/// away every private mute the reader had.
+/// Opened by whoever holds the key, never here: Notary over its loopback door,
+/// or a bunker over NIP-46 (`nip44_decrypt`, or `nip04_decrypt` for a legacy
+/// half). Until the answer lands the half reads as no mutes AND as unreadable,
+/// and `writeMute` refuses on the second of those, because a failed decrypt that
+/// is allowed to look like an empty half is how Jumble publishes away every
+/// private mute the reader had.
 fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usize {
     if (content.len == 0 or out.len == 0) return 0;
     // From the cache Notary fills, not from a secret key here. A miss queues
@@ -31537,10 +31832,15 @@ fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
         .nothing_to_do => {},
         .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
         .no_list_yet => setToast(model, "Still fetching your bookmarks. Try again in a moment."),
-        // Not "try again": the right move is to leave the list alone until the
-        // half can be read, because writing without it would erase every
-        // private bookmark in it.
-        .private_half_unreadable => setToast(model, "Part of your bookmark list is encrypted and could not be opened, so nothing was published."),
+        // Waiting is a delay and says so. Declined has already asked again on
+        // this press, so it says where to approve it. Unreadable is a limit, so
+        // it does not say "try again": the right move is to leave the list
+        // alone, because writing without the half would erase every private
+        // bookmark in it. All three stay inside the toast's 48 bytes, so none
+        // is cut.
+        .private_half_waiting => setToast(model, "Opening your private bookmarks. Try again soon."),
+        .private_half_declined => setToast(model, "Signer declined. Asked again, approve it there."),
+        .private_half_unreadable => setToast(model, "Cannot open private bookmarks. Nothing was sent."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
 }
@@ -31552,13 +31852,26 @@ fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
         .nothing_to_do => {},
         .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
         .no_list_yet => setToast(model, "Still fetching your mute list. Try again in a moment."),
-        // The one message that is about a limit rather than a delay, so it does
-        // not say "try again": trying again will do the same thing. The reader's
-        // private mutes are safe precisely because nothing was published.
-        .private_half_unreadable => setToast(model, "Your mute list has private entries Plaza cannot read, so nothing was changed."),
+        // Waiting is a delay and says so. Declined has already asked again on
+        // this press, so it says where to approve it. Unreadable is the one
+        // message about a limit rather than a delay, so it does not say "try again":
+        // trying again will do the same thing. The reader's private mutes are
+        // safe precisely because nothing was published. All three stay inside
+        // the toast's 48 bytes, so none is cut.
+        .private_half_waiting => setToast(model, "Opening your private mutes. Try again shortly."),
+        .private_half_declined => setToast(model, "Signer declined. Asked again, approve it there."),
+        .private_half_unreadable => setToast(model, "Cannot read your private mutes. Nothing changed."),
         .would_shrink => setToast(model, "That would have changed more than one name, so nothing was published."),
         .failed => setToast(model, "That did not save, and nothing was published."),
     }
+}
+
+pub fn sayMuteWriteForTest(model: *Model, outcome: MuteWrite, muting: bool) void {
+    sayMuteWrite(model, outcome, muting);
+}
+
+pub fn sayBookmarkWriteForTest(model: *Model, outcome: BookmarkWrite, adding: bool) void {
+    sayBookmarkWrite(model, outcome, adding);
 }
 
 fn setToast(model: *Model, text: []const u8) void {
@@ -35958,7 +36271,7 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
 
     // A fresh generation: any prior listener (a reconnect to a second bunker)
     // stops processing, and every request registered from here carries it.
-    const generation = g_remote_generation.fetchAdd(1, .monotonic) + 1;
+    const generation = newRemoteGeneration();
 
     const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch {
         g_remote_status.store(3, .release);
@@ -36002,7 +36315,7 @@ fn sendConnect(gpa: std.mem.Allocator) void {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return;
-    if (!registerPending(req_id, .connect, null, false, .none, 0, .{})) return;
+    if (!registerPending(req_id, .connect, null, false, .none, 0, no_half_id, .{})) return;
     const params = [_][]const u8{ &hexbuf, g_remote_secret_buf[0..g_remote_secret_len] };
     sendRequest(gpa, .{ .id = req_id, .method = "connect", .params = &params });
 }
@@ -36042,12 +36355,32 @@ fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: [
     };
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0, WarnCarry.fromTags(tags))) {
+    if (!registerPending(req_id, .sign_event, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags))) {
         gpa.free(content_owned);
         return;
     }
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
+}
+
+/// Which NIP-46 method opens this private half.
+///
+/// NIP-51 lets the private half be NIP-04 or NIP-44, and the two are told apart
+/// by shape: a NIP-04 payload is `base64?iv=base64` and a NIP-44 one is bare
+/// base64, which can never contain a `?`. Jumble and Amethyst both choose on
+/// that marker. A legacy list sent to `nip44_decrypt` comes back as an error,
+/// which reads as a refusal and leaves the reader with a list they can never
+/// write.
+fn isNip04Payload(payload: []const u8) bool {
+    return std.mem.indexOf(u8, payload, "?iv=") != null;
+}
+
+fn remoteDecryptMethod(payload: []const u8) RemoteMethod {
+    return if (isNip04Payload(payload)) .nip04_decrypt else .nip44_decrypt;
+}
+
+pub fn remoteDecryptMethodNameForTest(payload: []const u8) []const u8 {
+    return @tagName(remoteDecryptMethod(payload));
 }
 
 /// Remote path for a private half: ask the bunker to open it.
@@ -36068,9 +36401,10 @@ fn requestRemoteDecrypt(gpa: std.mem.Allocator, half_index: usize, ciphertext: [
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return false;
-    if (!registerPending(req_id, .nip44_decrypt, null, false, .none, @intCast(half_index), .{})) return false;
+    const method = remoteDecryptMethod(ciphertext);
+    if (!registerPending(req_id, method, null, false, .none, @intCast(half_index), privateHalfId(ciphertext), .{})) return false;
     const params = [_][]const u8{ &hexbuf, ciphertext };
-    sendRequest(gpa, .{ .id = req_id, .method = "nip44_decrypt", .params = &params });
+    sendRequest(gpa, .{ .id = req_id, .method = @tagName(method), .params = &params });
     return true;
 }
 
@@ -36081,7 +36415,7 @@ fn requestRemoteEncrypt(gpa: std.mem.Allocator, plaintext: []const u8) bool {
     hexLower(&hexbuf, g_remote_pubkey);
     var idbuf: [24]u8 = undefined;
     const req_id = newRequestId(&idbuf) orelse return false;
-    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0, .{})) return false;
+    if (!registerPending(req_id, .nip44_encrypt, null, false, .none, 0, no_half_id, .{})) return false;
     const params = [_][]const u8{ &hexbuf, plaintext };
     sendRequest(gpa, .{ .id = req_id, .method = "nip44_encrypt", .params = &params });
     return true;
@@ -36250,13 +36584,13 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
             g_seal_inbox.used = true;
             g_seal_inbox.ok = n > 0;
         },
-        .nip44_decrypt => {
+        .nip44_decrypt, .nip04_decrypt => {
             pendingLock();
             defer pendingUnlock();
             for (&g_half_inbox) |*box| {
                 if (box.used) continue;
                 const n = @min(resp.value.result.len, box.plain_buf.len);
-                box.* = .{ .used = true, .index = pending.half_index, .ok = true, .plain_len = @intCast(n) };
+                box.* = .{ .used = true, .index = pending.half_index, .half_id = pending.half_id, .ok = true, .plain_len = @intCast(n) };
                 @memcpy(box.plain_buf[0..n], resp.value.result[0..n]);
                 break;
             }
@@ -36317,11 +36651,21 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         const method = slot.method;
         const content = slot.content;
         const slot_half = slot.half_index;
+        const slot_half_id = slot.half_id;
+        const slot_explicit = slot.failed;
         const slot_restorable = slot.restorable;
         const slot_warn = slot.warn;
         slot.* = .{};
         if (stale) {
             if (content) |c| gpa.free(c);
+            // An ask that died with its session leaves the half "asking"
+            // forever, and nothing would ask again: the reader's list would
+            // stay read-only until a restart. Back to idle, so the next tick
+            // asks. Only the half that ask was about: the slot may belong to
+            // another list by now.
+            if (method == .nip44_decrypt or method == .nip04_decrypt) {
+                if (halfAwaiting(slot_half, slot_half_id)) |h| h.state = .idle;
+            }
             continue;
         }
         switch (method) {
@@ -36348,9 +36692,17 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
             // distinction is the whole reason this cache exists, and collapsing
             // the two is what publishes an empty content over somebody's
             // private list.
-            .nip44_decrypt => {
+            //
+            // An error from the bunker is a "no" and waits for a press. A
+            // deadline that passed is a silence: the prompt may be sitting
+            // unseen on a phone, or the answer lost on the way, so the half
+            // is asked again once `private_half_retry_s` has passed.
+            .nip44_decrypt, .nip04_decrypt => {
                 if (content) |c| gpa.free(c);
-                if (slot_half < g_private_halves.len) g_private_halves[slot_half].state = .refused;
+                if (halfAwaiting(slot_half, slot_half_id)) |h| {
+                    h.state = .refused;
+                    h.retry_at_s = if (slot_explicit) 0 else now + private_half_retry_s;
+                }
             },
             // A seal the bunker refused or never answered. The list is left
             // exactly as it was, which is the only safe outcome: the reader
@@ -36366,9 +36718,9 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     var opened = false;
     for (&g_half_inbox) |*box| {
         if (!box.used) continue;
-        const i = box.index;
-        if (i < g_private_halves.len and g_private_halves[i].used) {
-            const h = &g_private_halves[i];
+        // Only into the half that was asked: a slot freed by a sign-out and
+        // taken by another list is not this answer's home.
+        if (halfAwaiting(box.index, box.half_id)) |h| {
             if (box.ok and box.plain_len > 0) {
                 const n = @min(box.plain_len, h.plain_buf.len);
                 @memcpy(h.plain_buf[0..n], box.plain_buf[0..n]);
@@ -36379,6 +36731,7 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
                 h.state = .refused;
             }
         }
+        std.crypto.secureZero(u8, &box.plain_buf);
         box.* = .{};
     }
     // The bunker's ciphertext, if one arrived. Applied here so the splice and
@@ -36881,7 +37234,7 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
     g_remote_sign_notice.store(false, .release);
 
     // A fresh generation for this reconnected session (see `connectRemoteSigner`).
-    const generation = g_remote_generation.fetchAdd(1, .monotonic) + 1;
+    const generation = newRemoteGeneration();
     const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch return false;
     thread.detach();
     sendConnect(gpa);
@@ -37422,6 +37775,7 @@ fn performLogout(model: *Model, fx: *Effects) void {
     forgetFollows();
     forgetMutes();
     forgetBookmarks();
+    forgetPrivateHalves();
     resetInbox();
     forgetPlaces();
     // And a note this account was about to sign. It is held on the near side of

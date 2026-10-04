@@ -12777,6 +12777,336 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
     try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
 }
 
+test "a legacy half is asked of the bunker as nip04_decrypt, and a current one as nip44_decrypt" {
+    // NIP-51 lets the private half be either, and a bunker answers each with its
+    // own method. A NIP-04 half sent as nip44_decrypt comes back an error, which
+    // reads as a refusal: the reader would have a mute list they could never
+    // write to. Both clients tell the two apart by the `?iv=` marker.
+    try testing.expectEqualStrings("nip04_decrypt", main.remoteDecryptMethodNameForTest("AqRcpq0Cw2h2Vd5Tk1Fk5w==?iv=Zm9vYmFyYmF6cXV4MTIzNA=="));
+    try testing.expectEqualStrings("nip44_decrypt", main.remoteDecryptMethodNameForTest("AqRcpq0Cw2h2Vd5Tk1Fk5wAqRcpq0Cw2h2Vd5Tk1Fk5w=="));
+    // A NIP-44 payload is base64, which has no `?` in it to be mistaken.
+    try testing.expectEqualStrings("nip44_decrypt", main.remoteDecryptMethodNameForTest(""));
+}
+
+test "a NIP-04 half is the bunker's to open and not Notary's" {
+    // Notary's loopback door opens NIP-44 and nothing else. Asking it for a
+    // NIP-04 half can only fail, and recording that failure as a refusal would
+    // have every press re-ask a door that cannot answer. So it reads as
+    // unreadable, which is the truth. A bunker can open it, so there it waits.
+    const legacy = "AqRcpq0Cw2h2Vd5Tk1Fk5w==?iv=Zm9vYmFyYmF6cXV4MTIzNA==";
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    main.setSignerKindForTest("helper");
+    try testing.expectEqualStrings("unreadable", main.privateHalfGateNameForTest(legacy));
+
+    main.forgetPrivateHalvesForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    try testing.expectEqualStrings("waiting", main.privateHalfGateNameForTest(legacy));
+}
+
+test "a declined private half is asked again on the next press, never read as empty" {
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    try testing.expectEqualStrings("waiting", main.privateHalfGateNameForTest(ciphertext));
+
+    // The reader dismisses the prompt on their bunker, or it times out.
+    if (!main.failRemoteHalfForTest(index)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(index));
+
+    // The press says so and puts the ask back for the next tick. It does not
+    // report the half as readable or as empty at any point.
+    try testing.expectEqualStrings("declined", main.privateHalfGateNameForTest(ciphertext));
+    try testing.expectEqualStrings("idle", main.privateHalfStateForTest(index));
+    // A second press while that ask is out is a wait, not a second prompt.
+    try testing.expectEqualStrings("waiting", main.privateHalfGateNameForTest(ciphertext));
+
+    // The tick sends it, and the reader approves this time.
+    main.markIdleHalvesAskedForTest();
+    main.parkRemoteHalfAnswerForTest(index, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("readable", main.privateHalfGateNameForTest(ciphertext));
+}
+
+test "an ask that died with its session is asked again" {
+    // A reconnect bumps the generation, and a request from the old one is
+    // dropped by the sweep. The half it was about stayed "asking" for ever, and
+    // nothing asks a half that is already being asked, so the list was read-only
+    // until a restart.
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearPendingForTest();
+
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    try testing.expectEqual(@as(u8, 0), index);
+    try testing.expect(main.registerRemoteHalfAskForTest(index, .nip04_decrypt));
+    main.bumpRemoteGenerationForTest();
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("idle", main.privateHalfStateForTest(index));
+}
+
+test "signing out forgets what the private halves said" {
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    defer main.clearIdentityForTest();
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+
+    const ciphertext = "a-half-that-belonged-to-the-last-reader";
+    main.openPrivateHalfForTest(ciphertext, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
+    try testing.expectEqualStrings("open", main.privateHalfStateForTest(0));
+
+    main.performLogoutForTest(&model, &fx);
+    try testing.expectEqualStrings("none", main.privateHalfStateForTest(0));
+}
+
+test "what the private-half refusals say fits the toast whole" {
+    // The toast holds 48 bytes and `setToast` cuts at the buffer, so a longer
+    // sentence reaches the reader as half of one. Every sentence here ends in a
+    // full stop, and a cut one would not. The declined one is asked again by the
+    // very press that shows it, so it points at the signer and not at the button.
+    const declined_toast = "Signer declined. Asked again, approve it there.";
+    try testing.expect(declined_toast.len <= 48);
+    var model = main.initialModel();
+    for ([_]main.MuteWrite{ .private_half_waiting, .private_half_declined, .private_half_unreadable }) |outcome| {
+        main.sayMuteWriteForTest(&model, outcome, true);
+        try testing.expect(model.toast_len > 0);
+        try testing.expectEqual(@as(u8, '.'), model.toast_buf[model.toast_len - 1]);
+        if (outcome == .private_half_declined) try testing.expectEqualStrings(declined_toast, model.toast_text());
+        model.toast_len = 0;
+    }
+    for ([_]main.BookmarkWrite{ .private_half_waiting, .private_half_declined, .private_half_unreadable }) |outcome| {
+        main.sayBookmarkWriteForTest(&model, outcome, true);
+        try testing.expect(model.toast_len > 0);
+        try testing.expectEqual(@as(u8, '.'), model.toast_buf[model.toast_len - 1]);
+        if (outcome == .private_half_declined) try testing.expectEqualStrings(declined_toast, model.toast_text());
+        model.toast_len = 0;
+    }
+}
+
+test "a bunker that stays silent is asked again once the wait is over, and one that said no is not" {
+    // A timeout is not an answer. The prompt can sit unseen on a phone or the
+    // reply can be lost on the way, and a half marked refused for the whole
+    // session leaves the reader's private mutes unenforced until they happen
+    // to press a write. An explicit error is different: that is a no, and it
+    // waits for a press.
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearPendingForTest();
+
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+
+    // Silence: refused, with a stamp saying when it may be asked again.
+    if (!main.timeoutRemoteHalfForTest(index)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(index));
+    const retry_at = main.privateHalfRetryAtForTest(index);
+    try testing.expect(retry_at > 0);
+
+    // Not before the wait is over, and not by anything but that.
+    main.rearmPrivateHalvesForTest(retry_at - 1);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(index));
+    main.rearmPrivateHalvesForTest(retry_at);
+    try testing.expectEqualStrings("idle", main.privateHalfStateForTest(index));
+    try testing.expectEqual(@as(i64, 0), main.privateHalfRetryAtForTest(index));
+
+    // Idle is what the tick asks from, and an ask in flight is never moved:
+    // at most one prompt is out per half.
+    main.forgetPrivateHalvesForTest();
+    const second = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    main.rearmPrivateHalvesForTest(std.math.maxInt(i64));
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(second));
+
+    // An explicit error from the bunker is a no: no stamp, no timed re-ask.
+    if (!main.failRemoteHalfForTest(second)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
+    try testing.expectEqual(@as(i64, 0), main.privateHalfRetryAtForTest(second));
+    main.rearmPrivateHalvesForTest(std.math.maxInt(i64));
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
+}
+
+test "a reconnect to the bunker asks the halves it refused again" {
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearPendingForTest();
+
+    const refused_text = "AsAQ==?iv=refusedciphertext";
+    const r = main.claimPrivateHalfPendingForTest(refused_text) orelse return error.NoSlot;
+    if (!main.failRemoteHalfForTest(r)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(r));
+    const waiting = main.claimPrivateHalfPendingForTest("AsAQ==?iv=stillasking") orelse return error.NoSlot;
+
+    main.bumpRemoteGenerationForTest();
+    try testing.expectEqualStrings("idle", main.privateHalfStateForTest(r));
+    // A half whose ask is still out is not the reconnect's to move: that ask is
+    // retired by the stale sweep.
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(waiting));
+}
+
+test "what the keyholder says it cannot read is never asked again, and a refusal is" {
+    // 422 is Notary saying it looked at this ciphertext and it does not open;
+    // so is a 200 whose body is not an answer. Reporting those as "declined"
+    // had every press ask a question whose answer cannot change. A 403, a 409
+    // or a dead daemon are refusals: they might say yes next time.
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    main.clearIdentityForTest();
+    const ciphertext = "a-half-notary-cannot-read";
+
+    main.askPrivateHalfForTest(ciphertext);
+    main.deliverPrivateHalfForTest(422, "{\"error\":\"unreadable\"}");
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(0));
+    // Every press reads the same, and none of them goes back to idle.
+    for (0..3) |_| try testing.expectEqualStrings("unreadable", main.privateHalfGateNameForTest(ciphertext));
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(0));
+    // Nor does a new connection or a timer.
+    main.rearmPrivateHalvesForTest(std.math.maxInt(i64));
+    main.bumpRemoteGenerationForTest();
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(0));
+
+    main.forgetPrivateHalvesForTest();
+    main.askPrivateHalfForTest(ciphertext);
+    main.deliverPrivateHalfForTest(200, "this is not json");
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(0));
+    try testing.expectEqualStrings("unreadable", main.privateHalfGateNameForTest(ciphertext));
+
+    for ([_]u16{ 403, 409, 500, 0 }) |status| {
+        main.forgetPrivateHalvesForTest();
+        main.askPrivateHalfForTest(ciphertext);
+        main.deliverPrivateHalfForTest(status, "{\"error\":\"refused\"}");
+        try testing.expectEqualStrings("refused", main.privateHalfStateForTest(0));
+        // The press says declined and puts the ask back; a second one waits.
+        try testing.expectEqualStrings("declined", main.privateHalfGateNameForTest(ciphertext));
+        try testing.expectEqualStrings("waiting", main.privateHalfGateNameForTest(ciphertext));
+    }
+}
+
+test "an answer that lands after a sign-out is not applied to the next account's half" {
+    // The answer carries a slot index and nothing else, and a sign-out frees
+    // the slots while answers are parked or on the wire. Account A's plaintext
+    // arriving once account B holds slot zero must change nothing in B's half.
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    defer main.clearIdentityForTest();
+    main.clearPendingForTest();
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+
+    const a_text = "AsAQ==?iv=accountAciphertext";
+    const b_text = "AsAQ==?iv=accountBciphertext";
+    const a_plain = "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]";
+
+    // A's ask is out, a parked answer for it is waiting, and A signs out.
+    const a = main.claimPrivateHalfPendingForTest(a_text) orelse return error.NoSlot;
+    main.parkRemoteHalfAnswerForTest(a, a_plain);
+    main.performLogoutForTest(&model, &fx);
+    main.setSignerKindForTest("remote");
+
+    // B signs in and asks from the same slot.
+    const b = main.claimPrivateHalfPendingForTest(b_text) orelse return error.NoSlot;
+    try testing.expectEqual(a, b);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(b));
+
+    // Then A's answer arrives after all, as the listener would park it, and
+    // so does A's timeout and A's refusal. None of them is B's.
+    main.parkRemoteHalfAnswerForCiphertextForTest(a, a_text, a_plain);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(b));
+    try testing.expect(!main.privateHalfIsReadableForTest(b_text));
+
+    try testing.expect(main.endRemoteHalfAskForTest(a, a_text, .timed_out));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(b));
+    try testing.expect(main.endRemoteHalfAskForTest(a, a_text, .failed));
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(b));
+
+    // B's own answer still lands.
+    main.parkRemoteHalfAnswerForCiphertextForTest(b, b_text, "[]");
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("open", main.privateHalfStateForTest(b));
+}
+
+test "an answer from Notary that lands after a sign-out is not applied either" {
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    defer main.clearIdentityForTest();
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+
+    main.askPrivateHalfForTest("a-half-of-the-first-account");
+    const first_key = main.privateHalfAskKeyForTest(0);
+    main.performLogoutForTest(&model, &fx);
+
+    // The reply for the first account's ask finds nothing waiting for it.
+    main.deliverPrivateHalfKeyedForTest(first_key, 200, "{\"items\":[\"[]\"]}");
+    try testing.expectEqualStrings("none", main.privateHalfStateForTest(0));
+
+    // And once the next account is asking from the same slot, it is still not
+    // that ask's answer.
+    main.askPrivateHalfForTest("a-half-of-the-second-account");
+    main.deliverPrivateHalfKeyedForTest(first_key, 200, "{\"items\":[\"[]\"]}");
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(0));
+    main.deliverPrivateHalfForTest(200, "{\"items\":[\"[]\"]}");
+    try testing.expectEqualStrings("open", main.privateHalfStateForTest(0));
+}
+
+test "signing out clears an answer the bunker had already handed over" {
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    defer main.clearIdentityForTest();
+    main.setIdentityForTest([_]u8{0x8E} ** 32);
+
+    const text = "AsAQ==?iv=sameciphertextbothtimes";
+    const idx = main.claimPrivateHalfPendingForTest(text) orelse return error.NoSlot;
+    main.parkRemoteHalfAnswerForTest(idx, "[[\"p\",\"" ++ "ab" ** 32 ++ "\"]]");
+    try testing.expect(main.halfInboxHoldsForTest());
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(!main.halfInboxHoldsForTest());
+
+    // Even for the very same ciphertext, a new session has to ask again: what
+    // was parked is gone, not merely unmatched.
+    main.setSignerKindForTest("remote");
+    _ = main.claimPrivateHalfPendingForTest(text) orelse return error.NoSlot;
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateForTest(idx));
+}
+
 test "delete is offered on my own note and refuses anything but a kind 1 of mine" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -12981,6 +13311,9 @@ test "a bookmark splices onto the list and never publishes over an unreadable ha
     defer store2.deinit();
     main.releaseHelperSignForTest();
     _ = try bookmarkFixture(arena, &signer, &store2, &existing, "not-openable-ciphertext");
+    // The keyholder looked at it and could not open it (Notary answers 422 for
+    // a ciphertext that does not decrypt). That is a limit and not a refusal,
+    // so it says so and no press asks again. Nothing is published either way.
     try testing.expectEqual(
         main.BookmarkWrite.private_half_unreadable,
         main.writeBookmarkForTest(&fx, fresh, true),
@@ -19256,6 +19589,152 @@ test "a private half this app CAN read survives a public mute" {
     try testing.expect(main.isMuted(secretly));
     try testing.expect(main.isMuted(publicly));
     try testing.expect(main.isMuted(fresh));
+}
+
+test "a bunker reader's private mutes are opened by the bunker and carried through a mute" {
+    // The case this started from: signed in through a bunker, the private half
+    // of the mute list has to be opened by a NIP-46 round trip, and a write
+    // before the answer must refuse rather than publish an empty content.
+    main.forgetMutesForTest();
+    defer {
+        main.setSignerKindForTest("helper");
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var model = main.initialModel();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bunkerhalf.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const secretly = [_]u8{0x8A} ** 32;
+    var secretly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&secretly_hex, "{x}", .{secretly});
+    const plain = try std.fmt.allocPrint(arena, "[[\"p\",\"{s}\"]]", .{secretly_hex});
+    const ck = try nostr.nip44.conversationKey(signer, kp.secret_key, kp.public_key);
+    const sealed = try nostr.nip44.encryptWithConversationKey(arena, ck, plain, [_]u8{0x5C} ** 32);
+
+    const publicly = [_]u8{0x8B} ** 32;
+    var publicly_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&publicly_hex, "{x}", .{publicly});
+    const existing = [_]nostr.event.Tag{&.{ "p", &publicly_hex }};
+    _ = try muteFixture(arena, &signer, &store, &existing, sealed);
+
+    // From here this reader's key is in a bunker, which answers over a relay
+    // and never inline. The fixture's keyholder opened the half; forget that.
+    main.setSignerKindForTest("remote");
+    main.setRemotePubkeyForTest(kp.public_key);
+    main.forgetPrivateHalvesForTest();
+    main.loadMutesFromStoreForTest();
+    try testing.expect(!main.isMuted(secretly));
+    try testing.expect(main.isMuted(publicly));
+
+    // A mute before the bunker has answered is refused, says why, and writes
+    // nothing: the stored list is exactly the one that was read.
+    var fx: main.EffectsForTest = undefined;
+    const fresh = [_]u8{0x8C} ** 32;
+    try testing.expectEqual(main.MuteWrite.private_half_waiting, main.writeMuteForTest(&fx, fresh, true));
+    main.markIdleHalvesAskedForTest();
+    const unchanged = main.ownRecordContentForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(unchanged);
+    try testing.expectEqualStrings(sealed, unchanged);
+    try testing.expect(!main.isMuted(fresh));
+
+    // The bunker answers. The listener parks the plaintext and the tick applies
+    // it, and the private mute is in force again.
+    main.parkRemoteHalfAnswerForTest(0, plain);
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(main.isMuted(secretly));
+
+    // Now the write goes through, and carries the bunker's ciphertext through
+    // byte for byte. Signing is the other half of a bunker and is not what is
+    // under test, so the keyholder signs.
+    main.setSignerKindForTest("helper");
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, fresh, true));
+    const content = main.ownRecordContentForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings(sealed, content);
+    try testing.expect(main.isMuted(secretly));
+    try testing.expect(main.isMuted(publicly));
+    try testing.expect(main.isMuted(fresh));
+}
+
+test "a bunker that never opens the private half leaves the mute list untouched" {
+    main.forgetMutesForTest();
+    defer {
+        main.setSignerKindForTest("helper");
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var model = main.initialModel();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bunkerrefuse.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const secret = [_]u8{0x81} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const plain = try std.fmt.allocPrint(arena, "[[\"p\",\"{s}\"]]", .{"8a" ** 32});
+    const ck = try nostr.nip44.conversationKey(signer, kp.secret_key, kp.public_key);
+    const sealed = try nostr.nip44.encryptWithConversationKey(arena, ck, plain, [_]u8{0x5C} ** 32);
+    const kept = [_]u8{0x8B} ** 32;
+    var kept_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&kept_hex, "{x}", .{kept});
+    const existing = [_]nostr.event.Tag{&.{ "p", &kept_hex }};
+    _ = try muteFixture(arena, &signer, &store, &existing, sealed);
+
+    main.setSignerKindForTest("remote");
+    main.setRemotePubkeyForTest(kp.public_key);
+    main.forgetPrivateHalvesForTest();
+    main.loadMutesFromStoreForTest();
+
+    var fx: main.EffectsForTest = undefined;
+    const fresh = [_]u8{0x8C} ** 32;
+    // The ask is out, and the reader refuses it.
+    try testing.expectEqual(main.MuteWrite.private_half_waiting, main.writeMuteForTest(&fx, fresh, true));
+    main.markIdleHalvesAskedForTest();
+    if (!main.failRemoteHalfForTest(0)) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx);
+
+    // Every press after that refuses without publishing: the first says the
+    // signer declined and asks again, the next waits on that ask.
+    try testing.expectEqual(main.MuteWrite.private_half_declined, main.writeMuteForTest(&fx, fresh, true));
+    try testing.expectEqual(main.MuteWrite.private_half_waiting, main.writeMuteForTest(&fx, fresh, true));
+
+    // Nothing was ever published: the list in the store is the one that was
+    // read, tags and sealed content alike. An empty content here is the
+    // Jumble bug.
+    const content = main.ownRecordContentForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings(sealed, content);
+    const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000).?;
+    defer testing.allocator.free(tags);
+    try testing.expect(std.mem.indexOf(u8, tags, &kept_hex) != null);
+    var fresh_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&fresh_hex, "{x}", .{fresh});
+    try testing.expect(std.mem.indexOf(u8, tags, &fresh_hex) == null);
 }
 
 test "the profile offers Mute, and says why when it cannot" {
