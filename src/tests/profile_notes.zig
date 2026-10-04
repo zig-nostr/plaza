@@ -419,6 +419,37 @@ test "a person with no notes stops loading when a relay never answers" {
     try testing.expect(!model.thread_loading);
 }
 
+test "a profile round gives up on a relay that never answers, watched or not" {
+    // A relay that takes the subscription and then says nothing. With the
+    // keeper's table full the read had no deadline, so this thread, and the
+    // older-notes round it belongs to, waited on it for good.
+    const Quiet = struct {
+        timed_reads: usize = 0,
+        unbounded_reads: usize = 0,
+        pub fn subscribe(self: *@This(), id: []const u8, filters: []const nostr.filter.Filter) !void {
+            _ = self;
+            _ = id;
+            _ = filters;
+        }
+        pub fn receiveTimeout(self: *@This(), timeout: std.Io.Timeout) !?nostr.message.ParsedRelayMessage {
+            if (timeout == .none) return self.receive();
+            self.timed_reads += 1;
+            return error.Timeout;
+        }
+        pub fn receive(self: *@This()) !?nostr.message.ParsedRelayMessage {
+            // Where a real silent relay would park the thread for good.
+            self.unbounded_reads += 1;
+            return null;
+        }
+    };
+    var quiet: Quiet = .{};
+    const read_by: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+    const older = main.profileRelayPassForTest(&quiet, [_]u8{0x71} ** 32, read_by);
+    try testing.expectEqual(@as(?usize, 0), older);
+    try testing.expectEqual(@as(usize, 0), quiet.unbounded_reads);
+    try testing.expect(quiet.timed_reads >= 1);
+}
+
 test "a short page does not page while its own first fetch is still out" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

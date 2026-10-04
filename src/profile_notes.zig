@@ -23,6 +23,7 @@ const hexLower = main.hexLower;
 const max_relays = main.max_relays;
 const noteIdOf = main.noteIdOf;
 const nowSeconds = main.nowSeconds;
+const oneShotDeadline = main.oneShotDeadline;
 const one_shot_budget_ms = main.one_shot_budget_ms;
 const outbox_relays_per_author = main.outbox_relays_per_author;
 const plazaIngestFrom = main.plazaIngestFrom;
@@ -233,79 +234,11 @@ pub fn profileRound(pubkey: [32]u8, until: ?i64) ProfileRound {
         defer relay.deinit();
         const watched = watchOneShot(io, relay, one_shot_budget_ms) orelse continue;
         defer releaseOneShot(watched);
-        relay.subscribe(if (until != null) "plaza-person-older" else "plaza-person", filters) catch continue;
-        round.asked += 1;
-        var relay_older: usize = 0;
-
-        var ids: [engagement_watch_cap][64]u8 = undefined;
-        var watch: [engagement_watch_cap]i64 = undefined;
-        var watch_len: usize = 0;
-        var id_count: usize = 0;
-        var engagement_open = false;
-        var seen: usize = 0;
-        // Bounded, because `relay.receive()` has no deadline and a relay that
-        // accepts a subscription and then goes quiet would hold this thread for
-        // the life of the process.
-        while (seen < profile_fetch_messages) : (seen += 1) {
-            var msg = (relay.receive() catch break) orelse break;
-            defer msg.deinit();
-            switch (msg.value) {
-                .event => |e| {
-                    // Phase 2's answers are REACTIONS, and a reaction that is
-                    // only stored changes no count on any row: the table the
-                    // rows read is filled by `countEngagement`, which is the
-                    // whole reason phase 2 exists.
-                    if (engagement_open) {
-                        if (nostr.event.verify(gpa, signer, e.event) catch false)
-                            countEngagement(e.event, watch[0..watch_len]);
-                        continue;
-                    }
-                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, target_url) catch continue;
-                    if (result == .invalid) continue;
-                    // Theirs, and a note: a relay can send anything down any
-                    // subscription, and somebody else's note says nothing about
-                    // how far back this person's history goes.
-                    const theirs = std.mem.eql(u8, &e.event.pubkey, &pubkey);
-                    if (theirs and (e.event.kind == 1 or e.event.kind == comment_kind)) {
-                        if (result == .added) round.added += 1;
-                        // `until` is inclusive, so the note the cursor came from
-                        // comes back. It is not news, and counting it would let
-                        // a page that found nothing older read as progress.
-                        const below = if (until) |cursor| e.event.created_at < cursor else true;
-                        if (below) {
-                            if (until != null) {
-                                round.older += 1;
-                                relay_older += 1;
-                            }
-                            if (brought_len < brought.len) {
-                                brought[brought_len] = .{ .at = e.event.created_at, .key = noteIdOf(e.event) };
-                                brought_len += 1;
-                            }
-                        }
-                    }
-                    if (e.event.kind == 1 and id_count < ids.len) {
-                        hexLower(&ids[id_count], e.event.id);
-                        watch[watch_len] = noteIdOf(e.event);
-                        watch_len += 1;
-                        id_count += 1;
-                    }
-                },
-                .eose => {
-                    // "I have looked and that is all of it", which is the only
-                    // message that lets an empty page mean the end.
-                    if (!engagement_open) round.answered += 1;
-                    if (engagement_open or id_count == 0) break;
-                    engagement_open = true;
-                    var evals: [engagement_watch_cap][]const u8 = undefined;
-                    for (0..id_count) |i| evals[i] = &ids[i];
-                    const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..id_count] }};
-                    const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
-                    relay.subscribe("plaza-person-engagement", &eng_filters) catch break;
-                },
-                .closed => break,
-                else => continue,
-            }
-        }
+        // The reads carry the keeper's budget as a deadline of their own, so a
+        // relay that goes quiet ends them on time without waiting for the
+        // keeper to cut the socket, and `g_profile_older_busy` with them.
+        const read_by = oneShotDeadline(io);
+        const relay_older = profileRelayPass(relay, gpa, signer, pubkey, until, target_url, filters, read_by, &round, &brought, &brought_len) orelse continue;
         // A full page from one relay is the page, whether or not the store had
         // those notes already. The rest of the list is for the next time the
         // reader reaches the end. Counting only what was new to the store made a
@@ -315,6 +248,114 @@ pub fn profileRound(pubkey: [32]u8, until: ?i64) ProfileRound {
     round.reach = roundReach(brought[0..brought_len]);
     if (round.reach) |at| noteProfileReach(pubkey, at);
     return round;
+}
+
+/// One relay's part of a round: the subscription, the notes it sends until its
+/// EOSE, then the reactions on them. Returns how many of the notes were older
+/// than the cursor, or null when the relay refused the subscription.
+///
+/// `relay` is anything with a connection's `subscribe` and `receiveTimeout`, so
+/// a test can stand in a relay that never says anything.
+fn profileRelayPass(
+    relay: anytype,
+    gpa: std.mem.Allocator,
+    signer: nostr.keys.Signer,
+    pubkey: [32]u8,
+    until: ?i64,
+    target_url: []const u8,
+    filters: []const nostr.filter.Filter,
+    read_by: std.Io.Timeout,
+    round: *ProfileRound,
+    brought: []ProfileSeen,
+    brought_len: *usize,
+) ?usize {
+    relay.subscribe(if (until != null) "plaza-person-older" else "plaza-person", filters) catch return null;
+    round.asked += 1;
+    var relay_older: usize = 0;
+
+    var ids: [engagement_watch_cap][64]u8 = undefined;
+    var watch: [engagement_watch_cap]i64 = undefined;
+    var watch_len: usize = 0;
+    var id_count: usize = 0;
+    var engagement_open = false;
+    var seen: usize = 0;
+    // Bounded twice: by a message count, and by `read_by`, because a relay
+    // that accepts a subscription and then goes quiet would otherwise hold
+    // this thread for the life of the process.
+    while (seen < profile_fetch_messages) : (seen += 1) {
+        var msg = (relay.receiveTimeout(read_by) catch break) orelse break;
+        defer msg.deinit();
+        switch (msg.value) {
+            .event => |e| {
+                // Phase 2's answers are REACTIONS, and a reaction that is
+                // only stored changes no count on any row: the table the
+                // rows read is filled by `countEngagement`, which is the
+                // whole reason phase 2 exists.
+                if (engagement_open) {
+                    if (nostr.event.verify(gpa, signer, e.event) catch false)
+                        countEngagement(e.event, watch[0..watch_len]);
+                    continue;
+                }
+                const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, target_url) catch continue;
+                if (result == .invalid) continue;
+                // Theirs, and a note: a relay can send anything down any
+                // subscription, and somebody else's note says nothing about
+                // how far back this person's history goes.
+                const theirs = std.mem.eql(u8, &e.event.pubkey, &pubkey);
+                if (theirs and (e.event.kind == 1 or e.event.kind == comment_kind)) {
+                    if (result == .added) round.added += 1;
+                    // `until` is inclusive, so the note the cursor came from
+                    // comes back. It is not news, and counting it would let
+                    // a page that found nothing older read as progress.
+                    const below = if (until) |cursor| e.event.created_at < cursor else true;
+                    if (below) {
+                        if (until != null) {
+                            round.older += 1;
+                            relay_older += 1;
+                        }
+                        if (brought_len.* < brought.len) {
+                            brought[brought_len.*] = .{ .at = e.event.created_at, .key = noteIdOf(e.event) };
+                            brought_len.* += 1;
+                        }
+                    }
+                }
+                if (e.event.kind == 1 and id_count < ids.len) {
+                    hexLower(&ids[id_count], e.event.id);
+                    watch[watch_len] = noteIdOf(e.event);
+                    watch_len += 1;
+                    id_count += 1;
+                }
+            },
+            .eose => {
+                // "I have looked and that is all of it", which is the only
+                // message that lets an empty page mean the end.
+                if (!engagement_open) round.answered += 1;
+                if (engagement_open or id_count == 0) break;
+                engagement_open = true;
+                var evals: [engagement_watch_cap][]const u8 = undefined;
+                for (0..id_count) |i| evals[i] = &ids[i];
+                const eng_tags = [_]nostr.filter.TagFilter{.{ .letter = 'e', .values = evals[0..id_count] }};
+                const eng_filters = [_]nostr.filter.Filter{engagementFilter(&eng_tags)};
+                relay.subscribe("plaza-person-engagement", &eng_filters) catch break;
+            },
+            .closed => break,
+            else => continue,
+        }
+    }
+    return relay_older;
+}
+
+/// One pass of a round against `relay`, for a test: what came back, and how
+/// long it waited is whatever `read_by` allows.
+pub fn profileRelayPassForTest(relay: anytype, pubkey: [32]u8, read_by: std.Io.Timeout) ?usize {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var round = ProfileRound{};
+    var brought: [profile_relay_page]ProfileSeen = undefined;
+    var brought_len: usize = 0;
+    const authors = [_][32]u8{pubkey};
+    const filters = [_]nostr.filter.Filter{buildProfileNewestFilter(&authors)};
+    return profileRelayPass(relay, std.heap.page_allocator, signer, pubkey, null, "wss://quiet.example.com", &filters, read_by, &round, &brought, &brought_len);
 }
 
 // ---------------------------------------------------- a person's older notes

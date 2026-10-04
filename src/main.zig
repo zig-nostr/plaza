@@ -6836,6 +6836,7 @@ pub const noteProfileReachForTest = profile_notes.noteProfileReachForTest;
 pub const profileEndReachedForTest = profile_notes.profileEndReachedForTest;
 pub const profileOlderAskForTest = profile_notes.profileOlderAskForTest;
 pub const profileReachForTest = profile_notes.profileReachForTest;
+pub const profileRelayPassForTest = profile_notes.profileRelayPassForTest;
 pub const profileRoundEndedForTest = profile_notes.profileRoundEndedForTest;
 pub const profileTargetsForTest = profile_notes.profileTargetsForTest;
 pub const resetProfileEndForTest = profile_notes.resetProfileEndForTest;
