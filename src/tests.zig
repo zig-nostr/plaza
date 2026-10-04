@@ -30718,3 +30718,215 @@ test "a server address that is not an origin is refused in the field and nothing
     main.update(&model, .{ .blossom_edit = .{ .insert_text = "x" } }, &fx);
     try testing.expect(std.mem.indexOf(u8, model.blossom_status(), "starts with https") == null);
 }
+
+test "a notification names the person it mentions instead of printing their key" {
+    // The row handed the raw content to `contentSpans`, which styles a token it
+    // finds and never rewrites one, so a reply saying `nostr:npub1...` showed the
+    // bech32 itself. The feed rewrites the same token when it builds the note.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD1} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mention.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const alice = [_]u8{0xA1} ** 32;
+    const bob = [_]u8{0xB2} ** 32;
+    main.setProfileNameForTest(alice, "Alice");
+    const npub = try nostr.nip19.encodeNpub(arena, alice);
+    const nprofile = try nostr.nip19.encodeNprofile(arena, bob, &.{});
+
+    const text = try std.fmt.allocPrint(arena, "thanks nostr:{s} and nostr:{s}, see you", .{ npub, nprofile });
+    var reply = inboxEvent(1, 0xC7, &.{&.{ "p", &me_hex }}, 1_800_000_000);
+    reply.id[0] = 0xC7;
+    reply.content = text;
+    _ = try store.ingest(arena, reply, .{});
+    try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
+
+    main.forgetInboxBodyStampForTest();
+    main.resolveInboxBodiesForTest();
+    var buf: [4]main.InboxItem = undefined;
+    const shown = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    const body = shown[0].body();
+
+    // Alice is known, so she is named. Bob is not, so he reads as a short key
+    // for now, and what matters is that neither token is printed whole.
+    try testing.expect(std.mem.startsWith(u8, body, "thanks @Alice and @npub1"));
+    try testing.expect(std.mem.indexOf(u8, body, "nostr:") == null);
+    try testing.expect(std.mem.indexOf(u8, body, npub) == null);
+    try testing.expect(std.mem.indexOf(u8, body, nprofile) == null);
+    try testing.expect(std.mem.endsWith(u8, body, ", see you"));
+
+    // Each name is marked in the words with the person it names, which is what
+    // lets the row style the whole name the way the feed does.
+    const refs = shown[0].mentions.all();
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings("@Alice", body[refs[0].off..][0..refs[0].len]);
+    try testing.expectEqualSlices(u8, &alice, &main.mentionLinkPubkey(refs[0].link()).?);
+    try testing.expect(std.mem.startsWith(u8, body[refs[1].off..][0..refs[1].len], "@npub1"));
+    try testing.expectEqualSlices(u8, &bob, &main.mentionLinkPubkey(refs[1].link()).?);
+
+    // And Bob's name lands later: the row is baked again rather than keeping the
+    // label it was first given.
+    main.setProfileNameForTest(bob, "Bob");
+    main.resolveInboxBodiesForTest();
+    const again = main.inboxItems(&buf, false);
+    try testing.expectEqualStrings("thanks @Alice and @Bob, see you", again[0].body());
+    const moved = again[0].mentions.all();
+    try testing.expectEqual(@as(usize, 2), moved.len);
+    try testing.expectEqualStrings("@Bob", again[0].body()[moved[1].off..][0..moved[1].len]);
+
+    // On screen the whole name is one styled run, and it carries no link. The
+    // row is drawn from a copy on the sheet's own stack, which is gone by the
+    // time the runtime copies a span's link, and the paragraph has no handler
+    // that a link could reach.
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notifications_open = true;
+    const tree = try buildTree(arena, &model);
+    const name = findSpan(tree.root, "@Bob") orelse return error.NameNotStyled;
+    try testing.expect(name.weight == .medium);
+    try testing.expectEqual(@as(usize, 0), name.link.len);
+}
+
+/// The first paragraph span whose text is exactly `text`.
+fn findSpan(widget: canvas.Widget, text: []const u8) ?canvas.TextSpan {
+    for (widget.spans) |span| {
+        if (std.mem.eql(u8, span.text, text)) return span;
+    }
+    for (widget.children) |child| {
+        if (findSpan(child, text)) |found| return found;
+    }
+    return null;
+}
+
+test "a name that falls past the clipped end of a preview is not marked" {
+    // The preview keeps the first hundred and eighty bytes. A mention after that
+    // is not in the words any more, so there is nothing to mark, and marking
+    // where it used to be would put a link on whatever text sits there now.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD3} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/clipped.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const erin = [_]u8{0xE5} ** 32;
+    main.setProfileNameForTest(erin, "Erin");
+    const npub = try nostr.nip19.encodeNpub(arena, erin);
+    const text = try std.fmt.allocPrint(arena, "{s} nostr:{s}", .{ "word " ** 60, npub });
+
+    var reply = inboxEvent(1, 0xC9, &.{&.{ "p", &me_hex }}, 1_800_000_000);
+    reply.id[0] = 0xC9;
+    reply.content = text;
+    _ = try store.ingest(arena, reply, .{});
+    try testing.expect(main.inboxAddForTest(reply, 1_800_000_000));
+    main.forgetInboxBodyStampForTest();
+    main.resolveInboxBodiesForTest();
+
+    var buf: [4]main.InboxItem = undefined;
+    const shown = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    try testing.expect(std.mem.endsWith(u8, shown[0].body(), "\u{2026}"));
+    try testing.expect(std.mem.indexOf(u8, shown[0].body(), "Erin") == null);
+    try testing.expectEqual(@as(usize, 0), shown[0].mentions.all().len);
+}
+
+test "a reaction preview reads the reader's own note the same way" {
+    // A like, a repost and a zap are about a note of the reader's own, and its
+    // words are copied by a different function than a reply's.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0xD2} ** 32);
+    defer main.clearIdentityForTest();
+    main.resetInboxForTest();
+    defer main.resetInboxForTest();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/liked.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+
+    const me = main.activePubkeyForTest().?;
+    var me_hex: [64]u8 = undefined;
+    for (me, 0..) |b, i| _ = std.fmt.bufPrint(me_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+
+    const carol = [_]u8{0xC3} ** 32;
+    main.setProfileNameForTest(carol, "Carol");
+    const npub = try nostr.nip19.encodeNpub(arena, carol);
+
+    // The reader's own note, mentioning Carol.
+    var mine = inboxEventBy(1, me, &.{}, 1_700_000_000);
+    mine.id = [_]u8{0x31} ** 32;
+    mine.content = try std.fmt.allocPrint(arena, "gm nostr:{s}", .{npub});
+    _ = try store.ingest(arena, mine, .{});
+
+    var target_hex: [64]u8 = undefined;
+    for (mine.id, 0..) |b, i| _ = std.fmt.bufPrint(target_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    var like = inboxEvent(7, 0xC8, &.{ &.{ "p", &me_hex }, &.{ "e", &target_hex } }, 1_800_000_000);
+    like.id[0] = 0xC8;
+    try testing.expect(main.inboxAddForTest(like, 1_800_000_000));
+
+    main.forgetInboxBodyStampForTest();
+    main.resolveInboxBodiesForTest();
+    var buf: [4]main.InboxItem = undefined;
+    const shown = main.inboxItems(&buf, false);
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    try testing.expectEqualStrings("gm @Carol", shown[0].body());
+}
+
+test "a quoted note in a notification preview is a label, not sixty characters of bech32" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const id = [_]u8{0x7e} ** 32;
+    const note = try nostr.nip19.encodeNote(arena, id);
+    const src = try std.fmt.allocPrint(arena, "look at this nostr:{s} and {s} too, note1 is not one", .{ note, note });
+    var out: [512]u8 = undefined;
+    const n = main.collapseEventRefsForTest(&out, src);
+    try testing.expectEqualStrings("look at this [Note] and [Note] too, note1 is not one", out[0..n]);
+}

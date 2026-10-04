@@ -9472,6 +9472,15 @@ pub const InboxItem = struct {
     warning_buf: [warning_reason_bytes]u8 = [_]u8{0} ** warning_reason_bytes,
     warning_len: u8 = 0,
     body_key: i64 = 0,
+    /// Whether the baked words name somebody, so they are worth baking again
+    /// when a name lands. A mention label is written into the text at bake time,
+    /// the same as a note's is, and the same thing keeps it honest: the names
+    /// generation it was baked under.
+    names_pending: bool = false,
+    names_generation: u64 = 0,
+    /// Where each person's name sits in the words, so the row styles the whole
+    /// name the way the feed does, `@Ada Lovelace` and not just `@Ada`.
+    mentions: MentionList = .{},
 
     pub fn hasTarget(self: InboxItem) bool {
         return !std.mem.allEqual(u8, &self.target_id, 0);
@@ -9833,7 +9842,7 @@ fn bakeTargetBody(item: *InboxItem, target: [32]u8) void {
 
 /// Copies an event's words into the row, and its content warning with them.
 fn bakeBody(item: *InboxItem, ev: nostr.event.Event) void {
-    item.body_len = fillClipped(&item.body_buf, ev.content);
+    bakeInboxBody(item, ev.content);
     item.body_key = feedKeyOf(ev.id);
     item.warned = false;
     item.warning_len = 0;
@@ -9852,12 +9861,95 @@ pub fn notificationRowForTest(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     return notificationRow(ui, item);
 }
 
+/// The shortest bech32 run an event reference can be. A real `nevent1` carries a
+/// 32 byte id and is far past this; the floor is only here so a bare word that
+/// happens to begin `note1` is not taken for one.
+const event_ref_min_len = 20;
+
+/// Writes `src` into `dst` with every event reference replaced by `[Note]`, and
+/// returns the length. `dst` must be at least as long as `src`: the label is
+/// shorter than any token it replaces, so it never overflows.
+///
+/// Jumble's notification preview does the same (`[Note]` for an embedded event,
+/// ContentPreview/Content.tsx:47-49). The feed draws a quote card for the first
+/// one; a two line preview has no room for a card, and sixty characters of
+/// bech32 are not something a reader can use.
+fn collapseEventRefs(dst: []u8, src: []const u8) usize {
+    const label = "[Note]";
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (isEventRefStart(src, i)) {
+            var j = i;
+            if (std.mem.startsWith(u8, src[j..], "nostr:")) j += "nostr:".len;
+            const run_start = j;
+            while (j < src.len and isBech32Char(src[j])) j += 1;
+            if (j - run_start >= event_ref_min_len) {
+                @memcpy(dst[out..][0..label.len], label);
+                out += label.len;
+                i = j;
+                continue;
+            }
+        }
+        dst[out] = src[i];
+        out += 1;
+        i += 1;
+    }
+    return out;
+}
+
+pub fn collapseEventRefsForTest(dst: []u8, src: []const u8) usize {
+    return collapseEventRefs(dst, src);
+}
+
+/// Fills a row's words from a note's content, the way a note is drawn rather
+/// than the way it was typed.
+///
+/// A `nostr:npub1…` or `nostr:nprofile1…` in the text becomes the person's name,
+/// from the profile cache, exactly as `noteFrom` does it for the feed. The row
+/// used to copy the raw content and hand it to `contentSpans`, which only
+/// STYLES a token it finds and never rewrites one, so the preview showed the
+/// bech32 itself. The old comment on the row claimed otherwise, and nothing
+/// tested it.
+///
+/// The words are rendered BEFORE they are clipped. Clipping first cuts a
+/// seventy character token in half, and half a token is not a mention.
+fn bakeInboxBody(item: *InboxItem, content: []const u8) void {
+    var rendered: [note_content_cap]u8 = undefined;
+    var mentions = MentionList{};
+    const wrote = renderContentInto(&rendered, content, &.{}, &mentions);
+    var collapsed: [note_content_cap]u8 = undefined;
+    const kept = collapseEventRefs(&collapsed, rendered[0..wrote]);
+    item.body_len = fillClipped(&item.body_buf, collapsed[0..kept]);
+    item.names_pending = mentions.len > 0;
+    item.names_generation = g_names_generation;
+    item.mentions = .{};
+    // The offsets recorded while rendering describe the text BEFORE whitespace
+    // was folded, event references were shortened and the end was clipped, so
+    // they are found again in the words that were kept. Each label is a literal
+    // run of the text, and they come in the order they were written. One that
+    // was clipped away, or whose spacing was folded, is simply not marked.
+    const body = item.body();
+    var from: usize = 0;
+    for (mentions.all()) |ref| {
+        const label = rendered[ref.off..][0..ref.len];
+        const at = std.mem.indexOfPos(u8, body, from, label) orelse continue;
+        item.mentions.refs[item.mentions.len] = ref;
+        item.mentions.refs[item.mentions.len].off = @intCast(at);
+        item.mentions.len += 1;
+        from = at + label.len;
+    }
+}
+
 /// The rows the notifications window last put on screen. Written by the view,
 /// read by the pass that lends avatar ids on the next tick.
 var g_inbox_visible: struct { first: usize = 0, last: usize = 0, len: usize = 0 } = .{};
 
 /// The store generation the inbox last tried to fill its missing bodies at.
 var g_inbox_body_stamp: usize = std.math.maxInt(usize);
+/// The names generation the rows were last baked under, so a name arriving
+/// reaches a row that already names somebody.
+var g_inbox_body_names: u64 = std.math.maxInt(u64);
 
 /// Fills in the note behind every row that is still missing one.
 ///
@@ -9871,12 +9963,19 @@ var g_inbox_body_stamp: usize = std.math.maxInt(usize);
 fn resolveInboxBodies() void {
     const store = g_store orelse return;
     const stamp = store.eventCount() catch return;
-    if (stamp == g_inbox_body_stamp) return;
+    if (stamp == g_inbox_body_stamp and g_names_generation == g_inbox_body_names) return;
     g_inbox_body_stamp = stamp;
+    g_inbox_body_names = g_names_generation;
     lockInbox();
     defer unlockInbox();
     for (g_inbox[0..g_inbox_len]) |*item| {
-        if (!item.used or item.body_len > 0) continue;
+        if (!item.used) continue;
+        // A row that names somebody is baked again when a name has landed since,
+        // which is the only thing that can change what it should say. The same
+        // rule the quote cache follows, and it keeps the cost to the rows that
+        // have a mention in them.
+        const stale = item.body_len > 0 and item.names_pending and item.names_generation != g_names_generation;
+        if (item.body_len > 0 and !stale) continue;
         // A reply or a mention IS the event, so its own id holds their words.
         // Skipping these was wrong: `inboxAdd` copies the content as the event
         // arrives, but `loadInbox` rebuilds the inbox from the store at launch
@@ -9885,6 +9984,28 @@ fn resolveInboxBodies() void {
         const from: [32]u8 = if (item.verb == .reply or item.verb == .mention) item.id else item.target_id;
         bakeTargetBody(item, from);
     }
+}
+
+pub fn resolveInboxBodiesForTest() void {
+    resolveInboxBodies();
+}
+
+/// Forgets what the last pass saw, so a test with a store of its own is not
+/// skipped because an earlier test left the same event count behind.
+pub fn forgetInboxBodyStampForTest() void {
+    g_inbox_body_stamp = std.math.maxInt(usize);
+    g_inbox_body_names = std.math.maxInt(u64);
+}
+
+/// Gives `pubkey` a display name the way a landed kind:0 does, including the
+/// names generation moving, which is what tells the surfaces that baked an
+/// older label to bake it again.
+pub fn setProfileNameForTest(pubkey: [32]u8, name: []const u8) void {
+    const p = upsertProfile(pubkey) orelse return;
+    var buf: [160]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"name\":\"{s}\"}}", .{name}) catch return;
+    parseMetadataInto(p, json);
+    g_names_generation +%= 1;
 }
 
 /// Asks for the metadata of everyone the inbox names.
@@ -19468,6 +19589,22 @@ fn inboxAge(ui: *AppUi, created_at: i64) []const u8 {
 }
 
 /// One thing somebody did.
+/// A notification's words as spans: styled the way the feed styles a note, and
+/// carrying no link payloads.
+///
+/// The row is drawn from a copy the sheet made on its own stack (`inboxItems`
+/// into a local buffer). A paragraph copies its span text into the frame, but
+/// not a span's `link`: the runtime copies that after the view has returned,
+/// when the stack it pointed into is gone. And this paragraph has no link
+/// handler, so a payload pressed nothing anyway. A press anywhere on the row
+/// opens the note.
+fn inboxBodySpans(ui: *AppUi, body: []const u8, mentions: []const MentionRef) []const canvas.TextSpan {
+    const styled = contentSpansIn(ui, body, mentions, 0);
+    const spans = ui.arena.dupe(canvas.TextSpan, styled) catch return &.{};
+    for (spans) |*span| span.link = "";
+    return spans;
+}
+
 fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
     const p = theme.palette;
     const read = item.created_at <= inboxReadThrough();
@@ -19541,11 +19678,11 @@ fn notificationRow(ui: *AppUi, item: *const InboxItem) AppUi.Node {
         // Two lines and stop, cut in the spans before layout because the SDK
         // has no multi-line clamp. The same rule an ancestor's body follows, so
         // a long note cannot turn one notification into half a screen.
-        // Through the same renderer the feed uses, so a `nostr:npub…` reads as a
-        // name and a `nostr:nevent…` does not dump sixty characters of bech32
-        // into the preview. It was raw before, which is the one thing a preview
-        // must not be.
-        const spans = clampSpansToLines(ui, contentSpans(ui, body), notification_body_lines);
+        // The words were rendered when the row was admitted (`bakeInboxBody`),
+        // the way the feed renders a note, so a `nostr:npub…` is already a name
+        // here and a `nostr:nevent…` is already a short label. What is left to
+        // do is mark the names, from the offsets that bake recorded.
+        const spans = clampSpansToLines(ui, inboxBodySpans(ui, body, item.mentions.all()), notification_body_lines);
         kids[kids_len] = ui.paragraph(
             .{ .wrap = true, .style = .{ .foreground = if (own) p.text_muted_alt else p.text_body } },
             spans,
