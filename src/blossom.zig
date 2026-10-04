@@ -587,6 +587,86 @@ fn stripWebp(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
     return .{ .bytes = out, .orientation = 0 };
 }
 
+/// Comment extensions and every application extension but the two that make a
+/// GIF loop (`NETSCAPE2.0`, `ANIMEXTS1.0`) are dropped; everything else, the
+/// pictures, their palettes, timing and transparency, is kept byte for byte, and
+/// whatever follows the trailer is not sent. An application extension is where
+/// an editor writes XMP (`XMP DataXMP`), which can carry a location.
+///
+/// Walked by the GIF89a block structure. A file that runs out before its
+/// trailer, or holds a block that is none of the three the format has, is
+/// refused rather than half stripped: what follows the point it stopped making
+/// sense is unknown, and sending it is the thing this is here to prevent.
+fn stripGif(gpa: std.mem.Allocator, b: []const u8) !?Stripped {
+    if (b.len < 13) return null;
+    if (!std.mem.eql(u8, b[0..6], "GIF87a") and !std.mem.eql(u8, b[0..6], "GIF89a")) return null;
+    var pos: usize = 13;
+    // The global colour table, when the screen descriptor says there is one.
+    if (b[10] & 0x80 != 0) pos += 3 * (@as(usize, 2) << @intCast(b[10] & 0x07));
+    if (pos > b.len) return null;
+    var keep: Ranges = .{};
+    defer keep.list.deinit(gpa);
+    try keep.add(gpa, 0, pos);
+    while (true) {
+        if (pos >= b.len) return null;
+        const start = pos;
+        switch (b[pos]) {
+            // Trailer: the end of the file as far as any decoder reads it.
+            0x3b => {
+                try keep.add(gpa, start, pos + 1);
+                break;
+            },
+            // Image descriptor: nine bytes, a local colour table if it has
+            // one, the LZW code size, then the data's sub-blocks.
+            0x2c => {
+                if (pos + 10 > b.len) return null;
+                const packed_fields = b[pos + 9];
+                pos += 10;
+                if (packed_fields & 0x80 != 0) pos += 3 * (@as(usize, 2) << @intCast(packed_fields & 0x07));
+                pos += 1;
+                pos = gifSubBlocksEnd(b, pos) orelse return null;
+                try keep.add(gpa, start, pos);
+            },
+            // Extension: a label, then sub-blocks.
+            0x21 => {
+                if (pos + 2 > b.len) return null;
+                const label = b[pos + 1];
+                const body = pos + 2;
+                pos = gifSubBlocksEnd(b, body) orelse return null;
+                const drop = switch (label) {
+                    0xfe => true,
+                    0xff => !gifLoopExtension(b[body..pos]),
+                    else => false,
+                };
+                if (!drop) try keep.add(gpa, start, pos);
+            },
+            else => return null,
+        }
+    }
+    return .{ .bytes = try assemble(gpa, b, keep.list.items), .orientation = 0 };
+}
+
+/// Where a run of GIF sub-blocks starting at `pos` ends, past its zero
+/// terminator. Null when it runs off the end.
+fn gifSubBlocksEnd(b: []const u8, start: usize) ?usize {
+    var pos = start;
+    while (true) {
+        if (pos >= b.len) return null;
+        const n = b[pos];
+        pos += 1;
+        if (n == 0) return pos;
+        pos += n;
+    }
+}
+
+/// Whether an application extension's sub-blocks are one of the two that set
+/// how many times an animation plays.
+fn gifLoopExtension(blocks: []const u8) bool {
+    if (blocks.len < 12 or blocks[0] != 11) return false;
+    const id = blocks[1..12];
+    return std.mem.eql(u8, id, "NETSCAPE2.0") or std.mem.eql(u8, id, "ANIMEXTS1.0");
+}
+
 /// The EXIF orientation a JPEG carries, read without copying anything.
 fn jpegOrientation(b: []const u8) u8 {
     var pos: usize = 2;
@@ -800,11 +880,12 @@ pub fn prepare(gpa: std.mem.Allocator, file: []u8) PrepareError!Prepared {
 
     var orientation: u8 = 0;
     var changed = false;
-    if (fmt != .gif) {
+    {
         const stripped = switch (fmt) {
             .jpeg => try stripJpeg(gpa, file),
             .png => try stripPng(gpa, file),
-            else => try stripWebp(gpa, file),
+            .gif => try stripGif(gpa, file),
+            .webp => try stripWebp(gpa, file),
         } orelse return error.Damaged;
         orientation = stripped.orientation;
         if (std.mem.eql(u8, stripped.bytes, file)) {
@@ -1466,6 +1547,65 @@ test "webp drops exif and xmp chunks and fixes the sizes it wrote" {
     try std.testing.expectEqual(@as(u8, 0), prepared.bytes[20] & 0x0c);
     try std.testing.expectEqual(@as(u32, 100), prepared.width);
     try std.testing.expectEqual(@as(u32, 50), prepared.height);
+}
+
+/// A 1x1 GIF89a: a two colour global table, then whatever `middle` holds, then
+/// one graphic control block, the picture and the trailer.
+fn testGif(gpa: std.mem.Allocator, middle: []const u8) ![]u8 {
+    var f = std.ArrayList(u8).empty;
+    errdefer f.deinit(gpa);
+    try f.appendSlice(gpa, "GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00");
+    try f.appendSlice(gpa, middle);
+    try f.appendSlice(gpa, "\x21\xf9\x04\x01\x00\x00\x00\x00");
+    try f.appendSlice(gpa, "\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00");
+    try f.appendSlice(gpa, "\x3b");
+    return f.toOwnedSlice(gpa);
+}
+
+const gif_loop = "\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00";
+const gif_xmp = "\x21\xff\x0bXMP DataXMP\x0dlat=52.37 gps\x00";
+const gif_comment = "\x21\xfe\x0awhere I am\x00";
+
+test "a gif loses its xmp and comment and still reads" {
+    const gpa = std.testing.allocator;
+    const clean = try testGif(gpa, "");
+    defer gpa.free(clean);
+    var prepared = try prepare(gpa, try testGif(gpa, gif_xmp ++ gif_comment));
+    defer prepared.deinit(gpa);
+    try std.testing.expect(prepared.stripped);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.bytes, "gps") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.bytes, "where I am") == null);
+    // Exactly the picture without them, so it decodes as the same picture.
+    try std.testing.expectEqualSlices(u8, clean, prepared.bytes);
+    try std.testing.expectEqual(@as(u32, 1), prepared.width);
+    try std.testing.expect(prepared.blurhash_len > 0);
+}
+
+test "an animated gif keeps the block that makes it loop" {
+    const gpa = std.testing.allocator;
+    const looped = try testGif(gpa, gif_loop);
+    defer gpa.free(looped);
+    var prepared = try prepare(gpa, try testGif(gpa, gif_loop ++ gif_xmp));
+    defer prepared.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, looped, prepared.bytes);
+    // And one with nothing to take out is sent as it came.
+    var untouched = try prepare(gpa, try gpa.dupe(u8, looped));
+    defer untouched.deinit(gpa);
+    try std.testing.expect(!untouched.stripped);
+}
+
+test "a gif that ends early or holds a block it cannot have is refused, not half stripped" {
+    const gpa = std.testing.allocator;
+    const whole = try testGif(gpa, gif_xmp);
+    defer gpa.free(whole);
+    // Cut before its trailer, and cut inside the xmp block.
+    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, whole[0 .. whole.len - 1])));
+    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, whole[0..30])));
+    // A byte where a block should start that starts none.
+    var odd = try gpa.dupe(u8, whole);
+    defer gpa.free(odd);
+    odd[19] = 0x99;
+    try std.testing.expectError(error.Damaged, prepare(gpa, try gpa.dupe(u8, odd)));
 }
 
 test "what is not a picture is refused by its bytes, and a damaged one is not sent" {
