@@ -178,6 +178,9 @@ const PrivateSeal = struct {
     account: [32]u8 = [_]u8{0} ** 32,
     /// Which ask over Notary's door this is, carried in the effect key.
     ask_seq: u32 = 0,
+    /// How long the plaintext was. NIP-44 pads to an exact length, so this says
+    /// exactly how long the ciphertext that comes back must be.
+    plain_len: usize = 0,
 };
 pub var g_private_seal: PrivateSeal = .{};
 
@@ -277,16 +280,34 @@ fn claimPrivateHalf(i: usize, id: [32]u8, content: []const u8) ?[]const u8 {
     }
     return null;
 }
+/// Parks a decrypt answer for the tick. One too long to hold is parked as
+/// unreadable, never cut: a cut plaintext is a list missing its tail, and a
+/// write over it would publish the list without those entries.
 pub fn parkHalfAnswer(index: u8, id: [32]u8, plain: []const u8) void {
     pendingLock();
     defer pendingUnlock();
     for (&remote_signer.g_half_inbox) |*box| {
         if (box.used) continue;
-        const n = @min(plain.len, box.plain_buf.len);
-        box.* = .{ .used = true, .index = index, .half_id = id, .ok = true, .plain_len = @intCast(n) };
-        @memcpy(box.plain_buf[0..n], plain[0..n]);
+        if (plain.len > box.plain_buf.len) {
+            box.* = .{ .used = true, .index = index, .half_id = id, .ok = false, .too_large = true };
+            return;
+        }
+        box.* = .{ .used = true, .index = index, .half_id = id, .ok = true, .plain_len = @intCast(plain.len) };
+        @memcpy(box.plain_buf[0..plain.len], plain);
         return;
     }
+}
+
+/// Parks a bunker's seal for the tick, whole or not at all.
+pub fn parkSealAnswer(result: []const u8) void {
+    pendingLock();
+    defer pendingUnlock();
+    remote_signer.g_seal_inbox.used = true;
+    remote_signer.g_seal_inbox.ok = result.len > 0 and result.len <= remote_signer.g_seal_inbox.buf.len;
+    remote_signer.g_seal_inbox.len = 0;
+    if (!remote_signer.g_seal_inbox.ok) return;
+    @memcpy(remote_signer.g_seal_inbox.buf[0..result.len], result);
+    remote_signer.g_seal_inbox.len = @intCast(result.len);
 }
 
 pub const HalfAskEnd = enum {
@@ -397,9 +418,14 @@ pub fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
         return;
     }
     const plain = parsed.value.items[0];
-    const n = @min(plain.len, h.plain_buf.len);
-    @memcpy(h.plain_buf[0..n], plain[0..n]);
-    h.plain_len = @intCast(n);
+    // Too long to hold is unreadable, never cut: a cut plaintext is a list
+    // missing its tail.
+    if (plain.len > h.plain_buf.len) {
+        h.state = .unreadable;
+        return;
+    }
+    @memcpy(h.plain_buf[0..plain.len], plain);
+    h.plain_len = @intCast(plain.len);
     h.state = .open;
     // The mute set was read with this half closed, so it is short by whatever
     // was in it. Read it again now that it can be.
@@ -549,6 +575,11 @@ pub fn markIdleHalvesAskedForTest() void {
 pub fn privateHalfRetryAtForTest(index: u8) i64 {
     if (index >= g_private_halves.len) return -1;
     return g_private_halves[index].retry_at_s;
+}
+
+/// How long an opened private half can be before it cannot be held.
+pub fn privateHalfPlainCapForTest() usize {
+    return g_private_halves[0].plain_buf.len;
 }
 
 pub fn privateHalfRetryDelayForTest() i64 {

@@ -14,6 +14,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const parkHalfAnswer = main.parkHalfAnswer;
+const parkSealAnswer = main.parkSealAnswer;
 const forgetPrivateSeal = main.forgetPrivateSeal;
 const PendingUndo = main.PendingUndo;
 const slotIdForTest = main.slotIdForTest;
@@ -161,19 +163,68 @@ const HalfInbox = struct {
     /// The ciphertext the ask was about, carried from `PendingRemote.half_id`.
     half_id: [32]u8 = [_]u8{0} ** 32,
     ok: bool = false,
+    /// The answer was longer than this can hold, so it was not kept at all.
+    too_large: bool = false,
     plain_buf: [4096]u8 = undefined,
     plain_len: u16 = 0,
 };
 pub var g_half_inbox: [max_pending_remote]HalfInbox = [_]HalfInbox{.{}} ** max_pending_remote;
 
-/// The same crossing for a seal, of which only one is ever in flight.
+/// The same crossing for a seal, of which only one is ever in flight. Sized
+/// for the largest ciphertext NIP-44 can produce, so a real list always fits,
+/// and an answer longer than that is refused whole rather than cut: a cut
+/// ciphertext published as a list's content is a private half no client can
+/// open, which is every private entry in it gone.
 const SealInbox = struct {
     used: bool = false,
     ok: bool = false,
-    buf: [4096]u8 = undefined,
-    len: u16 = 0,
+    buf: [max_private_cipher_len]u8 = undefined,
+    len: u32 = 0,
 };
 pub var g_seal_inbox: SealInbox = .{};
+
+/// The longest plaintext NIP-44 v2 encrypts.
+pub const max_private_plain_len: usize = 65535;
+
+/// The longest ciphertext it produces, for that plaintext.
+pub const max_private_cipher_len: usize = nip44CiphertextLen(max_private_plain_len);
+
+/// NIP-44 v2's padded length for a plaintext of `len` bytes, as the spec
+/// computes it. Padding is what makes the length of a ciphertext exact.
+fn nip44PaddedLen(len: usize) usize {
+    if (len <= 32) return 32;
+    const next_power = @as(usize, 1) << (std.math.log2_int(usize, len - 1) + 1);
+    const chunk: usize = if (next_power <= 256) 32 else next_power / 8;
+    return chunk * (((len - 1) / chunk) + 1);
+}
+
+/// The base64 length of a NIP-44 v2 payload sealing `plain_len` bytes: a
+/// version byte, a 32-byte nonce, the two-byte length, the padded text and a
+/// 32-byte MAC.
+fn nip44CiphertextLen(plain_len: usize) usize {
+    return std.base64.standard.Encoder.calcSize(1 + 32 + 2 + nip44PaddedLen(plain_len) + 32);
+}
+
+/// Whether `ciphertext` is what a NIP-44 v2 seal of `plain_len` bytes looks
+/// like: exactly the right length, base64 that decodes, and version 2.
+pub fn plausibleSeal(ciphertext: []const u8, plain_len: usize) bool {
+    if (plain_len == 0 or plain_len > max_private_plain_len) return false;
+    if (ciphertext.len != nip44CiphertextLen(plain_len)) return false;
+    const decoder = std.base64.standard.Decoder;
+    const raw_len = decoder.calcSizeForSlice(ciphertext) catch return false;
+    if (raw_len != 1 + 32 + 2 + nip44PaddedLen(plain_len) + 32) return false;
+    var first: [4]u8 = undefined;
+    decoder.decode(&first, ciphertext[0..4]) catch return false;
+    return first[0] == 2;
+}
+
+pub fn nip44CiphertextLenForTest(plain_len: usize) usize {
+    return nip44CiphertextLen(plain_len);
+}
+
+pub fn plausibleSealForTest(ciphertext: []const u8, plain_len: usize) bool {
+    return plausibleSeal(ciphertext, plain_len);
+}
 
 var g_pending_lock = std.atomic.Value(bool).init(false);
 pub var g_pending: [max_pending_remote]PendingRemote = [_]PendingRemote{.{}} ** max_pending_remote;
@@ -805,26 +856,8 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
         // The plaintext of a private half. Parked for the UI tick rather than
         // written straight into `g_private_halves`, which the view reads every
         // frame and `scanPrivateHalves` writes on the other thread.
-        .nip44_encrypt => {
-            pendingLock();
-            defer pendingUnlock();
-            const n = @min(resp.value.result.len, g_seal_inbox.buf.len);
-            @memcpy(g_seal_inbox.buf[0..n], resp.value.result[0..n]);
-            g_seal_inbox.len = @intCast(n);
-            g_seal_inbox.used = true;
-            g_seal_inbox.ok = n > 0;
-        },
-        .nip44_decrypt, .nip04_decrypt => {
-            pendingLock();
-            defer pendingUnlock();
-            for (&g_half_inbox) |*box| {
-                if (box.used) continue;
-                const n = @min(resp.value.result.len, box.plain_buf.len);
-                box.* = .{ .used = true, .index = pending.half_index, .half_id = pending.half_id, .ok = true, .plain_len = @intCast(n) };
-                @memcpy(box.plain_buf[0..n], resp.value.result[0..n]);
-                break;
-            }
-        },
+        .nip44_encrypt => parkSealAnswer(resp.value.result),
+        .nip44_decrypt, .nip04_decrypt => parkHalfAnswer(pending.half_index, pending.half_id, resp.value.result),
         // A relay's NIP-42 challenge, signed. Never published and never stored:
         // it goes to the one relay that asked, by way of the slot that is
         // waiting for it, and `authDeliverSigned` checks it before it can.
@@ -1024,12 +1057,14 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
         // Only into the half that was asked: a slot freed by a sign-out and
         // taken by another list is not this answer's home.
         if (halfAwaiting(box.index, box.half_id)) |h| {
-            if (box.ok and box.plain_len > 0) {
-                const n = @min(box.plain_len, h.plain_buf.len);
-                @memcpy(h.plain_buf[0..n], box.plain_buf[0..n]);
-                h.plain_len = @intCast(n);
+            if (box.ok and box.plain_len > 0 and box.plain_len <= h.plain_buf.len) {
+                @memcpy(h.plain_buf[0..box.plain_len], box.plain_buf[0..box.plain_len]);
+                h.plain_len = box.plain_len;
                 h.state = .open;
                 opened = true;
+            } else if (box.too_large or box.plain_len > h.plain_buf.len) {
+                // Asking again gets the same answer.
+                h.state = .unreadable;
             } else {
                 h.state = .refused;
             }
@@ -1039,14 +1074,17 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
     }
     // The bunker's ciphertext, if one arrived. Applied here so the splice and
     // the publish happen on this thread, like every other write.
-    var sealed: ?[]const u8 = null;
-    var sealed_buf: [4096]u8 = undefined;
+    var sealed: ?[]u8 = null;
+    defer if (sealed) |s| gpa.free(s);
     if (g_seal_inbox.used) {
         if (g_seal_inbox.ok and g_seal_inbox.len > 0) {
-            @memcpy(sealed_buf[0..g_seal_inbox.len], g_seal_inbox.buf[0..g_seal_inbox.len]);
-            sealed = sealed_buf[0..g_seal_inbox.len];
+            // Copied out whole, or the seal fails: never a part of it.
+            sealed = gpa.dupe(u8, g_seal_inbox.buf[0..g_seal_inbox.len]) catch null;
+            if (sealed == null) seal_failed = true;
         } else seal_failed = true;
-        g_seal_inbox = .{};
+        g_seal_inbox.used = false;
+        g_seal_inbox.ok = false;
+        g_seal_inbox.len = 0;
     }
     pendingUnlock();
     if (stale_seal) forgetPrivateSeal();

@@ -53,6 +53,37 @@ test "a bunker can open a private half, and a refusal is not an empty one" {
     main.scanPendingRemoteForTest(&model, &fx_scan);
     try testing.expectEqualStrings("refused", main.privateHalfStateForTest(second));
 }
+
+test "an opened private half too long to hold is unreadable, never cut" {
+    // Both signers' answers were copied with the length clamped to the buffer.
+    // A cut plaintext is a list missing its tail, and a write over it publishes
+    // the list without those entries.
+    const gpa = std.heap.page_allocator;
+    var model = main.initialModel();
+    var fx_scan: main.EffectsForTest = undefined;
+    main.forgetPrivateHalvesForTest();
+    defer main.forgetPrivateHalvesForTest();
+    const long = try gpa.alloc(u8, main.privateHalfPlainCapForTest() + 1);
+    defer gpa.free(long);
+    @memset(long, 'x');
+
+    // The bunker's answer.
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    const ciphertext = "AsAQ==?iv=notreallyciphertext";
+    const index = main.claimPrivateHalfPendingForTest(ciphertext) orelse return error.NoSlot;
+    main.parkRemoteHalfAnswerForTest(index, long);
+    main.scanPendingRemoteForTest(&model, &fx_scan);
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(index));
+
+    // Notary's.
+    main.forgetPrivateHalvesForTest();
+    main.askPrivateHalfForTest("AqRcpq0Cw2h2Vd5Tk1Fk5wAqRcpq0Cw2h2Vd5Tk1Fk5w==");
+    const body = try (nostr.signer_ipc.CipherResult{ .items = &.{long} }).toJson(gpa);
+    defer gpa.free(body);
+    main.deliverPrivateHalfForTest(200, body);
+    try testing.expectEqualStrings("unreadable", main.privateHalfStateForTest(0));
+}
 test "a NIP-04 half is the bunker's to open and not Notary's" {
     // Notary's loopback door opens NIP-44 and nothing else. Asking it for a
     // NIP-04 half can only fail, and recording that failure as a refusal would

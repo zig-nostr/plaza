@@ -19,6 +19,7 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const bookmarkFixture = harness.bookmarkFixture;
 const FreshStore = harness.FreshStore;
 const buildTree = harness.buildTree;
 const closedMsg = harness.closedMsg;
@@ -502,6 +503,153 @@ test "a profile that lands between the two presses is shown, not merged over" {
     try testing.expectEqualStrings(real_json, content);
     try testing.expectEqualStrings("keep me", model.profile_about_buffer.text());
     try testing.expectEqualStrings("pay@real.example", model.profile_lud16_buffer.text());
+}
+
+test "the length a seal must come back at is the length NIP-44 produces" {
+    // The check before a sealed half is published compares its length with the
+    // one this plaintext seals to. Wrong by a byte, it would refuse every good
+    // seal of that size, so it is held against the real encryption across the
+    // padding's chunk boundaries.
+    const gpa = std.heap.page_allocator;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x91} ** 32);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const plain = try gpa.alloc(u8, 65535);
+    defer gpa.free(plain);
+    @memset(plain, 'x');
+    for ([_]usize{ 1, 31, 32, 33, 255, 256, 257, 300, 1000, 1025, 2560, 2561, 4096, 30000, 65535 }) |n| {
+        const sealed = try nostr.nip44.encrypt(gpa, threaded.io(), signer, kp.secret_key, kp.public_key, plain[0..n]);
+        defer gpa.free(sealed);
+        try testing.expectEqual(sealed.len, main.nip44CiphertextLenForTest(n));
+        try testing.expect(main.plausibleSealForTest(sealed, n));
+        try testing.expect(!main.plausibleSealForTest(sealed[0 .. sealed.len - 4], n));
+    }
+}
+
+/// Signs in a reader whose bookmark list holds `count` private bookmarks and
+/// nothing public, with its private half open, and returns their key.
+fn privateBookmarksFixture(arena: std.mem.Allocator, signer: *nostr.keys.Signer, store: *nostr.store.Store, count: usize) !nostr.keys.KeyPair {
+    var plain = std.ArrayList(u8).empty;
+    try plain.append(arena, '[');
+    for (0..count) |i| {
+        if (i > 0) try plain.append(arena, ',');
+        var id = [_]u8{0xd0} ** 32;
+        id[31] = @intCast(i);
+        try plain.print(arena, "[\"e\",\"{x}\"]", .{&id});
+    }
+    try plain.append(arena, ']');
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x84} ** 32);
+    var threaded = std.Io.Threaded.init(arena, .{});
+    defer threaded.deinit();
+    const sealed = try nostr.nip44.encrypt(arena, threaded.io(), signer.*, kp.secret_key, kp.public_key, plain.items);
+    return bookmarkFixture(arena, signer, store, &.{}, sealed);
+}
+
+test "a bunker's seal of a long private bookmark list is published whole" {
+    // Thirty-five private bookmarks seal to under 4096 bytes and thirty-six to
+    // over it. The bunker's answer was copied into a 4096-byte buffer with the
+    // length clamped to fit, and the cut copy was published as the list's
+    // content: a private half no client can decrypt, so every private bookmark
+    // was gone, on every relay, the moment the 36th was added.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateSealForTest();
+    defer {
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.clearPendingForTest();
+        main.setSignerKindLocalForTest();
+        main.forgetLastPublishedForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmlong.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    const kp = try privateBookmarksFixture(arena, &signer, &store, 35);
+    const thirty_sixth = [_]u8{0xd1} ** 32;
+
+    // The press goes to the bunker.
+    var fx_dummy: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    main.setRemotePubkeyForTest(kp.public_key);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx_dummy, thirty_sixth, true));
+
+    // The bunker seals exactly what was asked, and it is longer than 4096.
+    var threaded = std.Io.Threaded.init(arena, .{});
+    defer threaded.deinit();
+    const sealed = try nostr.nip44.encrypt(arena, threaded.io(), signer, kp.secret_key, kp.public_key, main.lastSealPlaintextForTest());
+    try testing.expect(sealed.len > 4096);
+    main.parkSealAnswerForTest(sealed);
+
+    // The splice is signed by the keyholder a test has, so it can be read back.
+    main.setSignerKindLocalForTest();
+    main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    main.scanPendingRemoteForTest(&model, &fx_dummy);
+    const published = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqual(@as(u16, 10003), published.kind);
+    try testing.expectEqualStrings(sealed, published.content);
+    const opened = try nostr.nip44.decrypt(arena, signer, kp.secret_key, kp.public_key, published.content);
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{&thirty_sixth});
+    try testing.expect(std.mem.indexOf(u8, opened, &hex) != null);
+}
+
+test "a seal that comes back the wrong length is not published" {
+    // Whatever cut or mangled it, a ciphertext that is not the length this
+    // plaintext seals to would replace every private bookmark with bytes
+    // nobody can open.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateSealForTest();
+    defer {
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.clearPendingForTest();
+        main.setSignerKindLocalForTest();
+        main.forgetLastPublishedForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmcut.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    const kp = try privateBookmarksFixture(arena, &signer, &store, 3);
+
+    var fx_dummy: main.EffectsForTest = undefined;
+    main.setSignerKindForTest("remote");
+    main.setRemotePubkeyForTest(kp.public_key);
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx_dummy, [_]u8{0xd2} ** 32, true));
+    var threaded = std.Io.Threaded.init(arena, .{});
+    defer threaded.deinit();
+    const sealed = try nostr.nip44.encrypt(arena, threaded.io(), signer, kp.secret_key, kp.public_key, main.lastSealPlaintextForTest());
+    main.parkSealAnswerForTest(sealed[0 .. sealed.len - 8]);
+
+    main.setSignerKindLocalForTest();
+    main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    main.scanPendingRemoteForTest(&model, &fx_dummy);
+    try testing.expect(main.lastPublishedForTest() == null);
+    try testing.expectEqualStrings("That seal came back damaged. Nothing was sent.", model.toast_text());
 }
 
 test "a private bookmark is not published over a list that landed while it was sealed" {

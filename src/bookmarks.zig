@@ -15,6 +15,10 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const parkSealAnswer = main.parkSealAnswer;
+const max_private_cipher_len = main.max_private_cipher_len;
+const plausibleSeal = main.plausibleSeal;
+const max_private_plain_len = main.max_private_plain_len;
 const privateSealKey = main.privateSealKey;
 const sayBookmarkWrite = main.sayBookmarkWrite;
 const Effects = main.Effects;
@@ -337,10 +341,17 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
         return .nothing_to_do;
     };
     defer gpa.free(plaintext);
+    // Past what NIP-44 can seal. No signer can do it, so nothing is asked.
+    if (plaintext.len > max_private_plain_len) return .failed;
+    if (builtin.is_test) {
+        const n = @min(plaintext.len, g_test_seal_plain.len);
+        @memcpy(g_test_seal_plain[0..n], plaintext[0..n]);
+        g_test_seal_plain_len = n;
+    }
 
     private_lists.g_seal_ask_seq +%= 1;
     if (private_lists.g_seal_ask_seq == 0) private_lists.g_seal_ask_seq = 1;
-    private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null, .account = me, .ask_seq = private_lists.g_seal_ask_seq };
+    private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null, .account = me, .ask_seq = private_lists.g_seal_ask_seq, .plain_len = plaintext.len };
 
     if (keyholder.g_signer_kind == .remote) {
         private_lists.g_private_seal.awaiting_remote = true;
@@ -410,6 +421,14 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     // Sealed for the account that pressed, and published only as that account.
     const me = activePubkey() orelse return;
     if (!std.mem.eql(u8, &me, &seal.account)) return;
+    // What came back is checked before it becomes the list's content. A
+    // ciphertext of any other length than this plaintext seals to was cut or
+    // mangled on the way, and publishing it would replace every private
+    // bookmark with bytes nobody can open.
+    if (!plausibleSeal(ciphertext, seal.plain_len)) {
+        setToast(model, "That seal came back damaged. Nothing was sent.");
+        return;
+    }
     const gpa = std.heap.page_allocator;
 
     var previous: ?OwnProfile = null;
@@ -481,8 +500,22 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
     setToast(model, if (seal.adding) "Bookmarked privately" else "Bookmark removed");
 }
-pub var g_test_sealed: [4096]u8 = undefined;
-pub var g_test_sealed_len: u16 = 0;
+pub var g_test_sealed: [max_private_cipher_len]u8 = undefined;
+pub var g_test_sealed_len: usize = 0;
+
+/// The plaintext the last private bookmark press asked to have sealed.
+var g_test_seal_plain: [max_private_plain_len]u8 = undefined;
+
+var g_test_seal_plain_len: usize = 0;
+
+pub fn lastSealPlaintextForTest() []const u8 {
+    return g_test_seal_plain[0..g_test_seal_plain_len];
+}
+
+/// What the listener does with a bunker's `nip44_encrypt` answer.
+pub fn parkSealAnswerForTest(result: []const u8) void {
+    parkSealAnswer(result);
+}
 /// The private tag array a bookmark write should seal, as JSON.
 ///
 /// Built from the CURRENT private half plus or minus the one entry the press is
@@ -562,8 +595,12 @@ pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8)
         return;
     };
     defer gpa.free(sealed);
-    g_test_sealed_len = @intCast(@min(sealed.len, g_test_sealed.len));
-    @memcpy(g_test_sealed[0..g_test_sealed_len], sealed[0..g_test_sealed_len]);
+    if (sealed.len > g_test_sealed.len) {
+        private_lists.g_private_seal = .{};
+        return;
+    }
+    g_test_sealed_len = sealed.len;
+    @memcpy(g_test_sealed[0..sealed.len], sealed);
 }
 
 pub fn lastSealedForTest() []const u8 {

@@ -6231,6 +6231,8 @@ pub const unlockMutes = mutes.unlockMutes;
 pub const writeMute = mutes.writeMute;
 
 // re-exports: bookmarks.zig
+pub const parkSealAnswerForTest = bookmarks.parkSealAnswerForTest;
+pub const lastSealPlaintextForTest = bookmarks.lastSealPlaintextForTest;
 pub const finishPrivateBookmarkForTest = bookmarks.finishPrivateBookmarkForTest;
 pub const forgetBookmarksForTest = bookmarks.forgetBookmarksForTest;
 pub const lastSealedForTest = bookmarks.lastSealedForTest;
@@ -6253,6 +6255,8 @@ pub const writeBookmark = bookmarks.writeBookmark;
 pub const writePrivateBookmark = bookmarks.writePrivateBookmark;
 
 // re-exports: private_lists.zig
+pub const privateHalfPlainCapForTest = private_lists.privateHalfPlainCapForTest;
+pub const parkSealAnswer = private_lists.parkSealAnswer;
 pub const deliverPrivateSealForTest = private_lists.deliverPrivateSealForTest;
 pub const privateSealKeyForTest = private_lists.privateSealKeyForTest;
 pub const privateSealActiveForTest = private_lists.privateSealActiveForTest;
@@ -6391,6 +6395,11 @@ pub const spawnHelper = keyholder.spawnHelper;
 pub const spawnNotaryWindow = keyholder.spawnNotaryWindow;
 
 // re-exports: remote_signer.zig
+pub const plausibleSealForTest = remote_signer.plausibleSealForTest;
+pub const nip44CiphertextLenForTest = remote_signer.nip44CiphertextLenForTest;
+pub const max_private_cipher_len = remote_signer.max_private_cipher_len;
+pub const plausibleSeal = remote_signer.plausibleSeal;
+pub const max_private_plain_len = remote_signer.max_private_plain_len;
 pub const remoteClientSecretLingersForTest = remote_signer.remoteClientSecretLingersForTest;
 pub const wipeRemoteSecrets = remote_signer.wipeRemoteSecrets;
 pub const remoteClientSecretForTest = remote_signer.remoteClientSecretForTest;
