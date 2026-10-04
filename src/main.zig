@@ -4240,7 +4240,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const sep: []const u8 = if (existing.len == 0) "" else "\n\n";
             const text = std.fmt.bufPrint(&line, "{s}{s}nostr:{s}", .{ existing, sep, addr }) catch return;
             model.draft_buffer.set(text);
-            model.viewing_thread = 0;
+            // The level stays as it is. The composer draws over any of them,
+            // and clearing the thread from under it left the stack, a reply
+            // held under its pause and the way back to Notifications all
+            // pointing at a level that was no longer open.
             model.composing = true;
         },
         // Switching somebody off, or back on. Keyed on the pubkey rather than a

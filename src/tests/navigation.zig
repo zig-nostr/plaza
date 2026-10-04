@@ -94,6 +94,46 @@ test "when the kept replies run out, the oldest one makes room" {
     try testing.expectEqualStrings("a reply, rewritten", main.keptReplyDraftForTest(bareRoot(0x10).event_id).?);
     try testing.expectEqualStrings("the ninth", main.keptReplyDraftForTest(bareRoot(0x30).event_id).?);
 }
+
+test "quoting from inside a thread leaves the thread and its way back alone" {
+    main.setIdentityForTest([_]u8{0x85} ** 32);
+    defer main.clearIdentityForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x86} ** 32);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+    model.notes[0] = main.noteFrom(try signedNote(arena, signer, kp, 1_800_000_000, "the first"), 1_800_000_000);
+    model.notes[1] = main.noteFrom(try signedNote(arena, signer, kp, 1_800_000_001, "the second"), 1_800_000_000);
+    model.notes_len = 2;
+    const first = model.notes[0].id;
+    const second = model.notes[1].id;
+
+    // Two threads deep, with a reply typed in the open one.
+    main.update(&model, Msg{ .open_thread = first }, &fx);
+    main.update(&model, Msg{ .open_thread = second }, &fx);
+    try testing.expectEqual(@as(usize, 1), model.thread_stack_len);
+    model.reply_buffer.set("half a reply");
+
+    // Quote the open thread's own note. The composer opens over the thread.
+    main.update(&model, Msg{ .quote_note = second }, &fx);
+    try testing.expect(model.composing);
+    try testing.expect(std.mem.startsWith(u8, model.draft_buffer.text(), "nostr:nevent1"));
+    try testing.expectEqual(second, model.viewing_thread);
+    try testing.expectEqual(@as(usize, 1), model.thread_stack_len);
+    try testing.expectEqualStrings("half a reply", model.reply_draft());
+
+    // Closing the composer is back in the thread, and Back is one level up.
+    model.composing = false;
+    main.closeThreadForTest(&model);
+    try testing.expectEqual(first, model.viewing_thread);
+}
 test "each thread level keeps its own page and its own held section" {
     // One shared page and one shared flag meant walking into a reply and back
     // collapsed the thread underneath, which is the opposite of why the stack
