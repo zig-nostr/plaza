@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const own_lists = @import("own_lists.zig");
+const private_lists = @import("private_lists.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -308,7 +309,7 @@ pub fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite
 /// the reader wondering what happened to it.
 pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     if (!signerReady()) return .signer_busy;
-    if (main.g_private_seal.active) return .signer_busy;
+    if (private_lists.g_private_seal.active) return .signer_busy;
     const me = activePubkey() orelse return .failed;
     const gpa = std.heap.page_allocator;
 
@@ -332,12 +333,12 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     };
     defer gpa.free(plaintext);
 
-    main.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null };
+    private_lists.g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null };
 
     if (main.g_signer_kind == .remote) {
-        main.g_private_seal.awaiting_remote = true;
+        private_lists.g_private_seal.awaiting_remote = true;
         if (!requestRemoteEncrypt(gpa, plaintext)) {
-            main.g_private_seal = .{};
+            private_lists.g_private_seal = .{};
             return .failed;
         }
         return .published;
@@ -345,13 +346,13 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
 
     var peer_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&peer_hex, "{x}", .{me}) catch {
-        main.g_private_seal = .{};
+        private_lists.g_private_seal = .{};
         return .failed;
     };
     // To yourself: NIP-51's private half is encrypted to your own key, so both
     // sides of the conversation key are this account's.
     const body = (nostr.signer_ipc.Cipher{ .peer = &peer_hex, .items = &.{plaintext} }).toJson(gpa) catch {
-        main.g_private_seal = .{};
+        private_lists.g_private_seal = .{};
         return .failed;
     };
     defer gpa.free(body);
@@ -367,21 +368,21 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
 /// exactly as it was.
 pub fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.EffectResponse) void {
     if (response.key != private_seal_key) return;
-    if (!main.g_private_seal.active) return;
+    if (!private_lists.g_private_seal.active) return;
     if (response.outcome != .ok or response.status != 200) {
-        main.g_private_seal = .{};
+        private_lists.g_private_seal = .{};
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
     const gpa = std.heap.page_allocator;
     var parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch {
-        main.g_private_seal = .{};
+        private_lists.g_private_seal = .{};
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     };
     defer parsed.deinit();
     if (parsed.value.items.len == 0) {
-        main.g_private_seal = .{};
+        private_lists.g_private_seal = .{};
         setToast(model, "Keyholder could not seal that. Nothing was sent.");
         return;
     }
@@ -395,8 +396,8 @@ pub fn handlePrivateSeal(model: *Model, fx: *Effects, response: native_sdk.Effec
 /// the list can have moved in between, and a splice built against a record that
 /// is no longer current is what the read-before-write rule exists to stop.
 pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) void {
-    const seal = main.g_private_seal;
-    main.g_private_seal = .{};
+    const seal = private_lists.g_private_seal;
+    private_lists.g_private_seal = .{};
     if (!seal.active) return;
     const gpa = std.heap.page_allocator;
 
