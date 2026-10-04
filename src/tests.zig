@@ -20203,6 +20203,63 @@ test "a muted person's reply is hidden, but the thread they are in still opens" 
     try testing.expectEqualStrings("the opening note", model.thread_root.content());
 }
 
+test "a thread nobody has replied to stops loading once the fetch is done or has waited long enough" {
+    main.setIdentityForTest([_]u8{0x6B} ** 32);
+    defer {
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quiet-thread.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    const op = try signer.keyPairFromSecretKey([_]u8{0x6C} ** 32);
+    const root = try signedNote(arena, signer, op, 1_800_000_000, "nobody has answered this");
+    _ = try store.ingest(arena, root, .{});
+
+    const opened: i64 = 1_800_000_300;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = main.noteFrom(root, opened).id;
+    model.thread_root = main.noteFrom(root, opened);
+    model.thread_seq = 7_000_001;
+    model.thread_open_at = opened;
+    model.thread_loading = true;
+
+    // The first tick sees the store move (it has never looked) and reads it. The
+    // skeletons stay: the fetch is out and the grace has not passed.
+    main.tickOpenLevelForTest(&model, opened + 1);
+    try testing.expect(model.thread_loading);
+
+    // The store never changes again, because nothing is coming. The tick used to
+    // settle the loading state only when the store moved, so this never ended.
+    main.tickOpenLevelForTest(&model, opened + 3);
+    try testing.expect(model.thread_loading);
+    main.tickOpenLevelForTest(&model, opened + 8);
+    try testing.expect(!model.thread_loading);
+    try testing.expectEqual(@as(usize, 0), model.thread_notes_len);
+
+    // The same when the relays answer before the grace is up.
+    model.thread_loading = true;
+    model.thread_open_at = opened + 100;
+    main.tickOpenLevelForTest(&model, opened + 101);
+    try testing.expect(model.thread_loading);
+    main.markThreadFetchDoneForTest(model.thread_seq);
+    main.tickOpenLevelForTest(&model, opened + 102);
+    try testing.expect(!model.thread_loading);
+}
+
 // -- A client you can make quiet ----------------------------------------------
 
 test "hiding a count stops the app asking relays for it" {

@@ -13329,16 +13329,32 @@ pub const Model = struct {
         // Whether this thread's own fetch has asked every relay and come back, or
         // given up waiting on one that never sends its EOSE. Until then the
         // replies are still streaming in and belong to one batch.
-        const done = g_thread_done_seq.load(.acquire) == self.thread_seq;
-        const timed_out = now_s - self.thread_open_at > thread_loading_grace_s;
-        stampArrival(arrivalTableFor(self.thread_stack_len, self.thread_root.event_id), self.thread_notes[0..n], done or timed_out);
+        const settled = self.threadFetchSettled(now_s);
+        stampArrival(arrivalTableFor(self.thread_stack_len, self.thread_root.event_id), self.thread_notes[0..n], settled);
         // In reading order, so seat each reply under the note it answers.
         arrangeThread(self.thread_notes[0..n], self.thread_root.event_id);
         self.thread_notes_len = n;
-        // Stop the loading skeletons once replies are in hand, OR once the fetch
-        // is done or timed out. Otherwise skeletons would stall forever under a
-        // note that simply has no replies.
-        if (self.thread_loading and (n > 0 or done or timed_out)) self.thread_loading = false;
+        self.settleThreadLoading(now_s);
+    }
+
+    /// Whether the open thread's own fetch has asked every relay and come back,
+    /// or been given up on after `thread_loading_grace_s` for a relay that never
+    /// sends its EOSE.
+    fn threadFetchSettled(self: *const Model, now_s: i64) bool {
+        const done = g_thread_done_seq.load(.acquire) == self.thread_seq;
+        const timed_out = now_s - self.thread_open_at > thread_loading_grace_s;
+        return done or timed_out;
+    }
+
+    /// Stops the loading skeletons once replies are in hand, or once the fetch is
+    /// done or timed out, so a note that simply has no replies resolves to
+    /// "No replies yet" rather than stalling under skeletons. Runs every tick,
+    /// not only when the store moved: a quiet relay and an unchanged store is
+    /// exactly the case where the answer is "there is nothing", and nothing
+    /// changing is what would otherwise never let the skeletons retire.
+    fn settleThreadLoading(self: *Model, now_s: i64) void {
+        if (!self.thread_loading) return;
+        if (self.thread_notes_len > 0 or self.threadFetchSettled(now_s)) self.thread_loading = false;
     }
 
     /// The reply count for the thread breadcrumb: the crowd count the feed's
@@ -13915,6 +13931,16 @@ pub fn resetFeedWork() void {
 /// a rebuild produces.
 pub fn tickForTest(model: *Model, now_s: i64) void {
     model.refresh(now_s);
+}
+
+/// The open thread's or profile's share of a tick, on its own.
+pub fn tickOpenLevelForTest(model: *Model, now_s: i64) void {
+    refreshOpenLevel(model, now_s);
+}
+
+/// Marks a thread's reply fetch as finished, the way its worker does.
+pub fn markThreadFetchDoneForTest(seq: u64) void {
+    g_thread_done_seq.store(seq, .release);
 }
 
 /// Empties the arrival buffer and asks for a full read next time, so a test
@@ -33877,6 +33903,11 @@ fn refreshOpenLevel(model: *Model, now: i64) void {
     if (model.viewing_profile != null) {
         model.thread_loading = model.thread_notes_len == 0 and
             g_thread_done_seq.load(.acquire) < model.thread_seq;
+    } else if (model.viewing_thread != 0) {
+        // Every tick, not only when the store moved: a thread nobody answered
+        // leaves the store unchanged, and that is exactly when the skeletons
+        // have to give way to "No replies yet".
+        model.settleThreadLoading(now);
     }
     model.settleTopicLoading(now);
 }
