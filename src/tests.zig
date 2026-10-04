@@ -10179,6 +10179,17 @@ test "a zap total is a plain figure in the verb row, not a control" {
         const hidden = try buildTree(arena, &model);
         try testing.expect(findAnyTextContainingText(hidden.root, " sat") == null);
     }
+    main.setHidden(.zap_totals, false);
+
+    // The three verbs off and zaps left on is a reader asking for the totals
+    // alone. The row stays for a note that has one.
+    main.setHidden(.replies, true);
+    main.setHidden(.reposts, true);
+    main.setHidden(.reactions, true);
+    {
+        const alone = try buildTree(arena, &model);
+        try testing.expect(findAnyText(alone.root, "1 sat") != null);
+    }
 }
 
 test "a zap total no invoice could hold does not take the screen down with it" {

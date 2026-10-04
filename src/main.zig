@@ -30249,8 +30249,26 @@ const verb_icon_size: f32 = 15;
 /// send a zap yet, so it is drawn as text rather than as a control that
 /// answers a press with nothing.
 fn engagementRow(ui: *AppUi, note: *const Note) AppUi.Node {
-    if (!anyVerbShown()) return ui.spacer(0);
+    if (!verbRowShown(note)) return ui.spacer(0);
     return engagementRowAt(ui, note, true);
+}
+
+/// Whether a note's row (with its counts) draws anything: a verb, or a zap
+/// total on its own. Turning the three verbs off while keeping zaps on is a
+/// reader asking for the totals and nothing else, so the row stays for a note
+/// that has one. The count table is only read in that case, which is rare: with
+/// any verb on, the row is drawn anyway.
+fn verbRowShown(note: *const Note) bool {
+    if (anyVerbShown()) return true;
+    return zapTotalSats(engagementFor(note.id), true) > 0;
+}
+
+/// A note's zap total in sats as the row draws it, or 0 when there is none to
+/// draw: zaps taken away, the totals hidden, or a row told to leave its counts
+/// off.
+fn zapTotalSats(c: Counts, counts: bool) u64 {
+    if (isTakenAway(.zaps) or !counts or countHidden(.zaps, .zap_totals)) return 0;
+    return c.zap_msat / 1000;
 }
 
 /// Whether the verb row has anything left to draw.
@@ -30285,7 +30303,7 @@ fn engagementRowAt(ui: *AppUi, note: *const Note, counts: bool) AppUi.Node {
         // Plaza cannot send a zap yet, so the total is a figure and not a verb:
         // no bolt, no hover, nothing to press. It is the summed sats (msat /
         // 1000), and nothing at all when there are none or the count is hidden.
-        if (isTakenAway(.zaps) or !counts or countHidden(.zaps, .zap_totals)) ui.spacer(0) else zapTotal(ui, c.zap_msat / 1000),
+        zapTotal(ui, zapTotalSats(c, counts)),
     });
 }
 
@@ -31564,7 +31582,7 @@ fn noteCard(ui: *AppUi, note: *const Note) AppUi.Node {
                         if (showsImage(note)) vgap(ui, 8) else ui.spacer(0),
                         if (showsImage(note)) noteGallery(ui, note) else ui.spacer(0),
                         if (showsLink(note)) (if (note.link_is_video) videoCard(ui, note) else linkCard(ui, note)) else ui.spacer(0),
-                        if (anyVerbShown()) vgap(ui, 10) else ui.spacer(0),
+                        if (verbRowShown(note)) vgap(ui, 10) else ui.spacer(0),
                         engagementRow(ui, note),
                     }),
                     hgap(ui, row_pad_side),
