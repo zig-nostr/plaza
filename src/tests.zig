@@ -25735,6 +25735,69 @@ test "a note that never turns up says so rather than waiting forever" {
     try testing.expectEqual(@as(i64, 0), model.viewing_thread);
 }
 
+/// A store in a temp dir and a model at the feed, with a way to paste into
+/// the address field: what the address tests below start from.
+const AddressFixture = struct {
+    tmp: testing.TmpDir,
+    store: nostr.store.Store,
+    model: main.Model,
+    fx: main.EffectsForTest = undefined,
+
+    fn up(self: *AddressFixture, name: []const u8) !void {
+        self.tmp = testing.tmpDir(.{});
+        var pbuf: [128]u8 = undefined;
+        const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/{s}.mdb", .{ self.tmp.sub_path, name });
+        self.store = try nostr.store.Store.open(db_path, .{});
+        main.setStoreForTest(&self.store);
+        main.resetPlacesForTest();
+        main.resetQuotesForTest();
+        self.model = main.initialModel();
+        self.model.stage = .ready;
+    }
+
+    fn down(self: *AddressFixture) void {
+        main.resetPlacesForTest();
+        main.setStoreForTest(null);
+        self.store.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn paste(self: *AddressFixture, text: []const u8) void {
+        main.update(&self.model, Msg.open_address, &self.fx);
+        main.update(&self.model, Msg{ .address_edit = .{ .insert_text = text } }, &self.fx);
+        main.update(&self.model, Msg.address_submit, &self.fx);
+    }
+};
+
+test "an address opened over Settings leaves Settings so the result is seen" {
+    // Cmd+L works over Settings, and the destination is drawn UNDER it. Press
+    // Open and the dialog closed, Settings stayed up, and nothing visible
+    // happened; the page only appeared after Close.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("oversettings");
+    defer f.down();
+
+    const who = [_]u8{0x3f} ** 32;
+    main.update(&f.model, Msg.open_settings, &f.fx);
+    try testing.expectEqual(main.Stage.settings, f.model.stage);
+    f.paste(try nostr.nip19.encodeNpub(arena, who));
+
+    try testing.expectEqual(main.Stage.ready, f.model.stage);
+    try testing.expect(!f.model.address_open);
+    try testing.expectEqual(@as(?[32]u8, who), f.model.viewing_profile);
+
+    // A refusal is not a destination: the sheet stays up over Settings with
+    // what was typed, and Settings stays put under it.
+    main.update(&f.model, Msg.open_settings, &f.fx);
+    f.paste("not an address");
+    try testing.expectEqual(main.Stage.settings, f.model.stage);
+    try testing.expect(f.model.address_open);
+}
+
 test "a note that arrives after you have walked away does not drag you back" {
     // The window has to close when the reader goes somewhere else, or a note
     // fetched fifteen seconds ago yanks them out of whatever they picked up
@@ -32611,4 +32674,37 @@ test "a half written reply survives a trip to a hashtag page or an article, and 
     main.refreshAddressFetchForTest(&model);
     try testing.expect(std.mem.eql(u8, &model.thread_root.event_id, &second.id));
     try testing.expectEqualStrings("about the article", model.reply_draft());
+}
+
+test "a person found by name or by NIP-05 over Settings leaves Settings" {
+    // The search field is the address field, and Cmd+L opens it over Settings.
+    // A pressed result or a domain's answer opens a person's page, which is
+    // drawn under Settings, so it has to leave Settings the way an address does.
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    var fx: main.EffectsForTest = undefined;
+
+    {
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.update(&model, Msg.open_settings, &fx);
+        main.update(&model, Msg.open_address, &fx);
+        try testing.expectEqual(main.Stage.settings, model.stage);
+        const pk = [_]u8{0x4e} ** 32;
+        main.update(&model, Msg{ .search_pick = pk }, &fx);
+        try testing.expectEqual(main.Stage.ready, model.stage);
+        try testing.expectEqualSlices(u8, &pk, &(model.viewing_profile orelse return error.NoProfile));
+    }
+    {
+        const hex = "4f" ** 32;
+        var model = main.initialModel();
+        model.stage = .ready;
+        main.update(&model, Msg.open_settings, &fx);
+        typeIntoSearch(&model, "alice@example.com");
+        main.update(&model, Msg.address_submit, &fx);
+        try testing.expectEqual(main.Stage.settings, model.stage);
+        main.handleNip05FoundForTest(&model, .{ .key = main.nip05AskKeyForTest(), .status = 200, .body = "{\"names\":{\"alice\":\"" ++ hex ++ "\"}}" });
+        try testing.expectEqual(main.Stage.ready, model.stage);
+        try testing.expectEqualSlices(u8, &([_]u8{0x4f} ** 32), &(model.viewing_profile orelse return error.NoProfile));
+    }
 }

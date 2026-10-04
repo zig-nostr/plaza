@@ -35059,10 +35059,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .profile_older => loadOlderProfile(model),
-        .close_settings => {
-            model.logout_pending = false;
-            model.stage = .ready;
-        },
+        .close_settings => leaveSettings(model),
         // The bare npub stays an npub. It is the account's identifier and the
         // form every tool that takes a key accepts, so it carries no relays; the
         // form that does is `copy_nprofile`, from the account menu.
@@ -35208,6 +35205,13 @@ fn setToast(model: *Model, text: []const u8) void {
     @memcpy(model.toast_buf[0..n], text[0..n]);
     model.toast_len = n;
     model.toast_until = nowSeconds() + 3;
+}
+
+/// Puts Settings away. Shared by its own Close and by anything opened over it
+/// that goes somewhere, because the page it goes to is drawn under Settings.
+fn leaveSettings(model: *Model) void {
+    model.logout_pending = false;
+    model.stage = .ready;
 }
 
 /// The one door into Settings. Every field on the screen that edits a live
@@ -40461,6 +40465,10 @@ fn openAddress(model: *Model, fx: *Effects) void {
     };
 
     closeAddress(model);
+    // The address can be opened over Settings, and the destination is drawn
+    // under it. Leave Settings first, or the reader presses Open and sees
+    // nothing happen.
+    if (model.stage == .settings) leaveSettings(model);
     switch (hit.target) {
         // The hints go in FIRST, so that if the note is not held the fetch
         // `openEvent` starts already knows where to look. `wantQuote` inside
@@ -41072,6 +41080,8 @@ fn handleNip05Found(model: *Model, response: native_sdk.EffectResponse) void {
         return;
     };
     closeAddress(model);
+    // The page is drawn under Settings, as an opened address is.
+    if (model.stage == .settings) leaveSettings(model);
     wantProfileHinted(hit.pubkey, hit.relays);
     openPerson(model, hit.pubkey);
 }
@@ -41079,6 +41089,7 @@ fn handleNip05Found(model: *Model, response: native_sdk.EffectResponse) void {
 /// Pressing a result.
 fn searchPick(model: *Model, pubkey: [32]u8) void {
     closeAddress(model);
+    if (model.stage == .settings) leaveSettings(model);
     openPerson(model, pubkey);
 }
 
